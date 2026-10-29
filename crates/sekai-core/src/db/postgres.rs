@@ -219,6 +219,8 @@ const PACKAGE_FEED_CURSORS_SCHEMA: &str = include_str!("postgres/0130_package_fe
 const ADHOC_TRANSFORM_RUNS_SCHEMA: &str = include_str!("postgres/0131_adhoc_transform_runs.sql");
 const TRANSFORM_READERS_SCHEMA: &str = include_str!("postgres/0132_transform_readers.sql");
 const FEDERATED_RECEIPTS_SCHEMA: &str = include_str!("postgres/0133_federated_receipts.sql");
+const TRANSFORM_OBJECT_SET_PINS_SCHEMA: &str =
+    include_str!("postgres/0134_transform_object_set_pins.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1042,6 +1044,12 @@ const MIGRATIONS: &[Migration] = &[
         132,
         "federated_receipts",
         FEDERATED_RECEIPTS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        133,
+        "transform_object_set_pins",
+        TRANSFORM_OBJECT_SET_PINS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

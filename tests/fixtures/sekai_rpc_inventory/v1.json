@@ -759,6 +759,22 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "FederatedAggregate",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/federated_receipt.rs",
+        "docs/decisions/0134-federated-aggregate-queries.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExportObjectSet",
       "kind": "persistent",
       "surfaces": [

@@ -21,9 +21,23 @@ impl RuntimeDb {
     /// the record commit together. The output dataset itself is untouched;
     /// the branch is promoted by proposing and merging it, or discarded by
     /// deleting it.
+    /// A replay of a definition without object-set inputs; one with them is
+    /// refused, as its pinned sets must be re-authorized by the caller.
     pub fn replay_governed_transform(
         &self,
         request: &ReplayTransform,
+        now_ms: i64,
+    ) -> Result<TransformReplay, String> {
+        self.replay_governed_transform_with_object_sets(request, &[], now_ms)
+    }
+
+    /// Replays a stored definition, or a candidate, at its pins. Object-set
+    /// inputs read `object_sets`: the sets their run pinned, which the caller
+    /// re-authorized for the replaying principal (ADR 0140).
+    pub fn replay_governed_transform_with_object_sets(
+        &self,
+        request: &ReplayTransform,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
         now_ms: i64,
     ) -> Result<TransformReplay, String> {
         let stored = self
@@ -38,12 +52,21 @@ impl RuntimeDb {
         if transform.is_isolated_process() {
             return Err(dataset_branch::BRANCH_RUN_ISOLATED.into());
         }
+        // Pinned sets answer the stored definition's descriptors; a candidate
+        // reading other sets has no pinned rows to replay.
+        if transform.object_set_inputs() != stored.object_set_inputs() {
+            return Err(transform_replay::REPLAY_OBJECT_SETS_CHANGED.into());
+        }
         let bindings = transform.input_bindings();
-        if let Some(stray) = request
-            .input_versions
-            .keys()
-            .find(|pinned| !bindings.iter().any(|(_, dataset_id)| dataset_id == *pinned))
-        {
+        let object_set_keys: Vec<String> = transform
+            .object_set_inputs()
+            .into_iter()
+            .map(|(alias, _)| format!("{}{alias}", crate::sekai::object_set_input::PIN_PREFIX))
+            .collect();
+        if let Some(stray) = request.input_versions.keys().find(|pinned| {
+            !bindings.iter().any(|(_, dataset_id)| dataset_id == *pinned)
+                && !object_set_keys.contains(pinned)
+        }) {
             return Err(format!("{REPLAY_PIN_NOT_AN_INPUT}: {stray}"));
         }
         let mut pins = BTreeMap::new();
@@ -137,6 +160,7 @@ impl RuntimeDb {
             // delete cannot interleave with.
             &stored.definition_digest,
             &describe,
+            object_sets,
         )
     }
 
@@ -166,6 +190,7 @@ impl RuntimeDb {
         baseline_version_id: &str,
         definition_digest: &str,
         describe: &transform_replay::Describe<'_>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<TransformReplay, String> {
         match self {
             Self::Sqlite(db) => db.replay_transform_into_branch(
@@ -179,6 +204,7 @@ impl RuntimeDb {
                 baseline_version_id,
                 definition_digest,
                 describe,
+                object_sets,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.replay_transform_into_branch(
@@ -192,6 +218,7 @@ impl RuntimeDb {
                     baseline_version_id,
                     definition_digest,
                     describe,
+                    object_sets,
                 )
             }),
         }

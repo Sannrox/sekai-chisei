@@ -2,8 +2,9 @@
 //!
 //! A tenant publishes an [`Allowance`]: which object type, dimensions,
 //! measures and functions a federated query may use, and the minimum group
-//! size `k`. [`coverage`] decides whether a tenant takes part in a query and,
-//! if not, why. [`tenant_partial`] turns that tenant's grouped rows into a
+//! size `k`. A tenant is the namespace that publishes the allowance.
+//! [`coverage`] decides whether a tenant takes part in a query and, if not,
+//! why. [`tenant_partial`] turns that tenant's grouped rows into a
 //! partial that holds only group keys, counts and sums, drops groups smaller
 //! than `k`, and optionally adds Laplace noise. [`combine`] merges partials
 //! and suppresses again at the largest `k`. Stores and RPCs build on these
@@ -132,8 +133,7 @@ pub struct Measure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Query {
     pub requester: String,
-    /// The namespace whose object type is queried; an allowance covers one.
-    pub namespace: String,
+    /// The object type queried in every participating namespace.
     pub object_type: String,
     pub dimensions: Vec<String>,
     pub measures: Vec<Measure>,
@@ -165,15 +165,29 @@ pub enum ExclusionReason {
     Measure,
     Function,
     Requester,
+    /// A queried property is classified restricted in the schema, which
+    /// the federation principal may not query. Decided by the plane, like
+    /// [`ExclusionReason::Unavailable`].
+    RestrictedProperty,
+    /// The tenant cannot evaluate the type now (its index is missing,
+    /// stale or quarantined). Not part of [`coverage`]: the plane decides
+    /// it from the tenant's state before any data is read.
+    Unavailable,
 }
 
-/// Whether `allowance` covers `query`; the first uncovered part otherwise.
-pub fn coverage(allowance: Option<&Allowance>, query: &Query) -> Result<(), ExclusionReason> {
+/// Whether `allowance` lets the tenant `namespace` take part in `query`; the
+/// first uncovered part otherwise.
+pub fn coverage(
+    allowance: Option<&Allowance>,
+    namespace: &str,
+    query: &Query,
+) -> Result<(), ExclusionReason> {
     let Some(allowance) = allowance else {
         return Err(ExclusionReason::NoAllowance);
     };
-    // Object types are namespace-scoped, so another namespace is another type.
-    if allowance.namespace != query.namespace || allowance.object_type != query.object_type {
+    // Object types are namespace-scoped, so another namespace's allowance
+    // covers another type.
+    if allowance.namespace != namespace || allowance.object_type != query.object_type {
         return Err(ExclusionReason::ObjectType);
     }
     if !allowance.requesters.contains(&query.requester) {
@@ -262,9 +276,9 @@ fn laplace(scale: f64, random: &mut dyn RandomSource) -> f64 {
     -scale * centered.signum() * (1.0 - 2.0 * centered.abs()).ln()
 }
 
-/// The properties `query` sums, in first-appearance order. An average sums
-/// its property too.
-fn summed_properties(query: &Query) -> Vec<&str> {
+/// The properties `query` sums, in first-appearance order: the order a
+/// [`Row`]'s values follow. An average sums its property too.
+pub fn summed_properties(query: &Query) -> Vec<&str> {
     let mut summed: Vec<&str> = Vec::new();
     for measure in &query.measures {
         if let Some(property) = measure.property.as_deref()
@@ -323,7 +337,7 @@ pub fn tenant_partial(
     random: &mut dyn RandomSource,
 ) -> Result<Partial, FederatedAggregateError> {
     let allowance_digest = allowance.digest()?;
-    if let Err(reason) = coverage(Some(allowance), query) {
+    if let Err(reason) = coverage(Some(allowance), tenant, query) {
         return Err(FederatedAggregateError::Invalid(format!(
             "the allowance does not cover this query: {reason:?}"
         )));
@@ -520,9 +534,13 @@ mod tests {
     use super::*;
 
     fn allowance(k: u64) -> Allowance {
+        allowance_in("acme", k)
+    }
+
+    fn allowance_in(namespace: &str, k: u64) -> Allowance {
         Allowance {
             schema: ALLOWANCE_SCHEMA.into(),
-            namespace: "supply".into(),
+            namespace: namespace.into(),
             object_type: "shipment".into(),
             dimensions: BTreeSet::from(["region".into()]),
             measures: BTreeSet::from(["weight".into()]),
@@ -540,7 +558,6 @@ mod tests {
     fn query() -> Query {
         Query {
             requester: "buyer".into(),
-            namespace: "supply".into(),
             object_type: "shipment".into(),
             dimensions: vec!["region".into()],
             measures: vec![
@@ -603,16 +620,20 @@ mod tests {
     #[test]
     fn coverage_reports_each_exclusion_with_a_reason() {
         let allowed = allowance(2);
-        assert_eq!(coverage(Some(&allowed), &query()), Ok(()));
-        assert_eq!(coverage(None, &query()), Err(ExclusionReason::NoAllowance));
+        assert_eq!(coverage(Some(&allowed), "acme", &query()), Ok(()));
+        assert_eq!(
+            coverage(None, "acme", &query()),
+            Err(ExclusionReason::NoAllowance)
+        );
+        // Another namespace's allowance covers another type.
+        assert_eq!(
+            coverage(Some(&allowed), "finance", &query()),
+            Err(ExclusionReason::ObjectType)
+        );
         type Change = fn(&mut Query);
-        let cases: [(Change, ExclusionReason); 6] = [
+        let cases: [(Change, ExclusionReason); 5] = [
             (
                 |q| q.object_type = "invoice".into(),
-                ExclusionReason::ObjectType,
-            ),
-            (
-                |q| q.namespace = "finance".into(),
                 ExclusionReason::ObjectType,
             ),
             (|q| q.requester = "rival".into(), ExclusionReason::Requester),
@@ -632,12 +653,12 @@ mod tests {
         for (change, reason) in cases {
             let mut changed = query();
             change(&mut changed);
-            assert_eq!(coverage(Some(&allowed), &changed), Err(reason));
+            assert_eq!(coverage(Some(&allowed), "acme", &changed), Err(reason));
         }
         let mut sum_only = allowance(2);
         sum_only.functions = BTreeSet::from([AggregateFunction::Sum]);
         assert_eq!(
-            coverage(Some(&sum_only), &query()),
+            coverage(Some(&sum_only), "acme", &query()),
             Err(ExclusionReason::Function)
         );
     }
@@ -655,7 +676,7 @@ mod tests {
         .unwrap();
         let second = tenant_partial(
             "globex",
-            &allowance(2),
+            &allowance_in("globex", 2),
             &query(),
             rows(&[("north", &[4.0, 6.0])]),
             &mut no_noise(),
@@ -683,7 +704,7 @@ mod tests {
         assert!(!acme.groups.contains_key(&vec!["south".to_string()]));
         let globex = tenant_partial(
             "globex",
-            &allowance(3),
+            &allowance_in("globex", 3),
             &query(),
             rows(&[("east", &[1.0, 1.0, 1.0])]),
             &mut no_noise(),
@@ -766,7 +787,7 @@ mod tests {
         assert!(lifted.groups[&vec!["north".to_string()]].count > 5.0);
         let strict = tenant_partial(
             "globex",
-            &allowance(5),
+            &allowance_in("globex", 5),
             &query(),
             rows(&[("east", &[1.0; 5])]),
             &mut no_noise(),
@@ -787,7 +808,7 @@ mod tests {
         // A tenant's partial counts once.
         assert!(combine(&query(), &[strict.clone(), strict.clone()], BTreeMap::new()).is_err());
         // An average over a noisy count below one is withheld, not infinite.
-        let mut sunk = allowance(2);
+        let mut sunk = allowance_in("initech", 2);
         sunk.noise_scale = Some(50.0);
         let sunk = tenant_partial(
             "initech",

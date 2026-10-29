@@ -155,7 +155,16 @@ impl PostgresDb {
             transform_id,
         )?
         .ok_or_else(|| "governed transform not found".to_string())?;
-        let (run, _) = branch_run_pg(&mut tx, &transform, branch, None, actor, tenant, now_ms)?;
+        let (run, _) = branch_run_pg(
+            &mut tx,
+            &transform,
+            branch,
+            None,
+            actor,
+            tenant,
+            now_ms,
+            &[],
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
@@ -175,6 +184,7 @@ impl PostgresDb {
         baseline_version_id: &str,
         definition_digest: &str,
         describe: &crate::sekai::transform_replay::Describe<'_>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<crate::sekai::transform_replay::TransformReplay, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
@@ -200,6 +210,7 @@ impl PostgresDb {
             actor,
             tenant,
             now_ms,
+            object_sets,
         )?;
         if !baseline_version_id.is_empty() {
             require_live_version_pg(&mut tx, &run.output_dataset_id, baseline_version_id)?;
@@ -610,6 +621,7 @@ pub fn write_branch_rows_pg(
 /// One branch run inside `tx`; see [`PostgresDb::run_governed_transform_on_branch`].
 /// With `pins`, each input reads its pinned version instead, and the output
 /// branch must be new.
+#[allow(clippy::too_many_arguments)]
 fn branch_run_pg(
     tx: &mut Transaction<'_>,
     transform: &crate::sekai::governed_transform::GovernedTransform,
@@ -618,9 +630,11 @@ fn branch_run_pg(
     actor: &str,
     tenant: &str,
     now_ms: i64,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<(DatasetBranchRun, Rows), String> {
-    // Branch and caused runs cannot read object sets yet (ADR 0140).
-    crate::sekai::object_set_input::require_evaluated(transform, &[])?;
+    // A branch run reads no object sets; a replay reads the ones its run
+    // pinned, re-authorized by the caller (ADR 0140).
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     use crate::db::postgres_audit::lock_object_lifecycle;
     use crate::db::postgres_governed_transform::{
         load_dataset_column_names, load_dataset_object_id, load_object_marking_token,
@@ -690,6 +704,30 @@ fn branch_run_pg(
         loaded.push((alias.clone(), columns, records));
         let object_id = load_dataset_object_id(tx, dataset_id)?;
         tokens.push(load_object_marking_token(tx, &object_id)?);
+    }
+    // A replay's pinned object sets follow the datasets, read under the
+    // same budget and folded into the markings (ADR 0140).
+    for set in object_sets {
+        if let Some(budget) = budget.as_mut()
+            && !set.rows.iter().all(|row| budget.charge(row))
+        {
+            return Err(format!(
+                "branch run refused: {}",
+                budget.exceeded.unwrap_or_default()
+            ));
+        }
+        if pins.is_some() {
+            read.push(crate::sekai::transform_replay::ReplayInput {
+                alias: set.alias.clone(),
+                dataset_id: set.pin_key(),
+                version_id: set.digest(),
+                rows: set.rows.len() as i64,
+                digest: dataset_branch::rows_digest(&set.rows),
+                columns: set.columns.clone(),
+            });
+        }
+        loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
+        tokens.extend(set.marking_tokens.iter().cloned());
     }
     let output_object_id = load_dataset_object_id(tx, &output)?;
     // Held to commit, so the marking checked here is the one the branch

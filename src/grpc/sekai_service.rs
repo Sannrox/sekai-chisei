@@ -19,6 +19,8 @@ mod catalog_rpc;
 mod computed_response;
 #[path = "data_export_rpc.rs"]
 mod data_export_rpc;
+#[path = "federated_aggregate_rpc.rs"]
+mod federated_aggregate_rpc;
 #[path = "federated_allowance_rpc.rs"]
 mod federated_allowance_rpc;
 use data_export_rpc::{
@@ -259,6 +261,7 @@ impl SekaiService for SekaiServiceImpl {
         publish_federated_aggregate_allowance => publish_federated_aggregate_allowance_rpc(PublishFederatedAggregateAllowanceRequest) -> PublishFederatedAggregateAllowanceResponse;
         withdraw_federated_aggregate_allowance => withdraw_federated_aggregate_allowance_rpc(WithdrawFederatedAggregateAllowanceRequest) -> WithdrawFederatedAggregateAllowanceResponse;
         get_federated_aggregate_allowance => get_federated_aggregate_allowance_rpc(GetFederatedAggregateAllowanceRequest) -> GetFederatedAggregateAllowanceResponse;
+        federated_aggregate => federated_aggregate_rpc(FederatedAggregateRequest) -> FederatedAggregateResponse;
         put_export_definition => put_export_definition_rpc(PutExportDefinitionRequest) -> PutExportDefinitionResponse;
         get_export_definition => get_export_definition_rpc(GetExportDefinitionRequest) -> GetExportDefinitionResponse;
         delete_export_definition => delete_export_definition_rpc(DeleteExportDefinitionRequest) -> DeleteExportDefinitionResponse;

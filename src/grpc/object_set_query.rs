@@ -731,7 +731,7 @@ impl SekaiServiceImpl {
                 layers.push(Vec::new());
                 continue;
             }
-            let mut query = if index == 0 {
+            let query = if index == 0 {
                 crate::sekai::dataset::RowQuery {
                     filters: bound
                         .descriptor
@@ -772,38 +772,14 @@ impl SekaiServiceImpl {
                     properties,
                 )?;
             }
-            let mut visible = Vec::new();
-            loop {
-                meter.charge(0).map_err(map_object_set_error)?;
-                query.limit = (meter.limit.max_rows_scanned - meter.rows)
-                    .saturating_add(1)
-                    .clamp(1, INDEX_SCAN_BATCH_SIZE);
-                let members = self
-                    .db
-                    .runtime()
-                    .list_visible_index_members_projected(
-                        &bound.descriptor.namespace,
-                        &kind,
-                        &query,
-                        if constrained { None } else { Some(needed) },
-                    )
-                    .map_err(Status::internal)?;
-                let scanned = members.len() as i32;
-                meter.charge(scanned).map_err(map_object_set_error)?;
-                for mut member in members {
-                    if let Some(object) =
-                        self.authorized_index_object(&member, authority, status.indexed_at_ms)?
-                    {
-                        member.properties = object.properties.into_iter().collect();
-                        visible.push(member);
-                    }
-                    meter.charge(0).map_err(map_object_set_error)?;
-                }
-                if scanned < query.limit {
-                    break;
-                }
-                query.offset = query.offset.saturating_add(scanned);
-            }
+            let visible = self.scan_index_layer(
+                &bound.descriptor.namespace,
+                &kind,
+                query,
+                if constrained { None } else { Some(needed) },
+                &mut meter,
+                |member| self.authorized_index_object(member, authority, status.indexed_at_ms),
+            )?;
             layers.push(visible);
         }
         self.require_hop_projection_ready(bound, hops)?;
@@ -955,6 +931,58 @@ impl SekaiServiceImpl {
                 })
                 .collect(),
         }))
+    }
+}
+
+impl SekaiServiceImpl {
+    /// Every index member of one kind that `admit` lets through, read in
+    /// batches under `meter`: of `query.limit` members when it is set,
+    /// else of the default batch size. `admit` returns the object as the reader may
+    /// see it, whose properties replace the member's, or `None` to leave
+    /// the member out. Shared by object-set aggregation and federated
+    /// aggregates (#1997), so both scan and authorize one way.
+    pub(super) fn scan_index_layer(
+        &self,
+        namespace: &str,
+        kind: &str,
+        mut query: crate::sekai::dataset::RowQuery,
+        needed: Option<&[String]>,
+        meter: &mut crate::sekai::object_set::CostMeter,
+        mut admit: impl FnMut(
+            &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        ) -> Result<Option<domain::Object>, Status>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, Status> {
+        let batch = if query.limit > 0 {
+            query.limit
+        } else {
+            INDEX_SCAN_BATCH_SIZE
+        };
+        let mut visible = Vec::new();
+        loop {
+            meter.charge(0).map_err(map_object_set_error)?;
+            query.limit = (meter.limit.max_rows_scanned - meter.rows)
+                .saturating_add(1)
+                .clamp(1, batch);
+            let members = self
+                .db
+                .runtime()
+                .list_visible_index_members_projected(namespace, kind, &query, needed)
+                .map_err(Status::internal)?;
+            let scanned = members.len() as i32;
+            meter.charge(scanned).map_err(map_object_set_error)?;
+            for mut member in members {
+                if let Some(object) = admit(&member)? {
+                    member.properties = object.properties.into_iter().collect();
+                    visible.push(member);
+                }
+                meter.charge(0).map_err(map_object_set_error)?;
+            }
+            if scanned < query.limit {
+                break;
+            }
+            query.offset = query.offset.saturating_add(scanned);
+        }
+        Ok(visible)
     }
 }
 
@@ -3647,6 +3675,232 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// A replay reads the rows its run pinned, not the live set, and is
+    /// refused once the caller can no longer read a pinned object.
+    #[tokio::test]
+    async fn replays_read_pinned_object_sets_and_re_authorize_them() {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+        let svc = service();
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        for id in ["ops-orders", "ops-out"] {
+            svc.db
+                .runtime()
+                .create_dataset(&Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: vec![ColumnDef {
+                        name: "customer".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    }],
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                })
+                .unwrap();
+        }
+        let order =
+            |customer: &str| HashMap::from([("customer".to_string(), customer.to_string())]);
+        svc.db
+            .runtime()
+            .append_rows("ops-orders", &[order("c-eu-2"), order("c-eu-3")])
+            .unwrap();
+        let customers = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let definition = || GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: "named".into(),
+            output_dataset_id: "ops-out".into(),
+            profile: ANALYTICAL_CLASS.into(),
+            sql: "SELECT o.customer, c.name FROM orders o \
+                  JOIN customers c ON c.id = o.customer ORDER BY o.customer"
+                .into(),
+            inputs: vec![
+                TransformInput {
+                    alias: "orders".into(),
+                    dataset_id: "ops-orders".into(),
+                    object_set: String::new(),
+                },
+                TransformInput {
+                    alias: "customers".into(),
+                    dataset_id: String::new(),
+                    object_set: customers.clone(),
+                },
+            ],
+            ..GovernedTransform::default()
+        };
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(definition()),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let run = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "named".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .run
+            .unwrap();
+        let pin = run.input_versions["object-set:customers"].clone();
+
+        // The objects change; the replay still reads what the run read.
+        let mut renamed = svc.db.runtime().get_object("c-eu-2").unwrap().unwrap();
+        renamed.name = "Renamed".into();
+        renamed.updated += 1;
+        svc.db.runtime().update_object(&renamed).unwrap();
+        let replay = || {
+            svc.replay_governed_transform(with_named_principal(
+                ReplayGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "named".into(),
+                    ..Default::default()
+                },
+                "local",
+            ))
+        };
+        let replayed = replay().await.unwrap().into_inner().replay.unwrap();
+        assert!(replayed.diff.as_ref().unwrap().reproduced, "{replayed:?}");
+        assert_eq!(replayed.output_digest, run.output_digest);
+        let input = replayed
+            .inputs
+            .iter()
+            .find(|input| input.dataset_id == "object-set:customers")
+            .expect("the pinned set is a replay input");
+        assert_eq!(input.version_id, pin);
+
+        // A pinned property restricted since is refused, though the caller
+        // may read it: object-set rows never carry restricted properties.
+        let property = |name: &str, classification: &str| PropertyDef {
+            name: name.into(),
+            r#type: "string".into(),
+            classification: classification.into(),
+            ..Default::default()
+        };
+        let restrict = |classification: &'static str| {
+            svc.create_schema_type(with_named_principal(
+                CreateSchemaTypeRequest {
+                    r#type: Some(ObjectType {
+                        kind: "Customer".into(),
+                        properties: vec![property("region", classification)],
+                        ..Default::default()
+                    }),
+                },
+                "local",
+            ))
+        };
+        restrict("internal").await.unwrap();
+        let restricted = replay().await.unwrap_err();
+        assert_eq!(
+            restricted.code(),
+            tonic::Code::PermissionDenied,
+            "{restricted:?}"
+        );
+        assert!(restricted.message().contains("property"), "{restricted:?}");
+        restrict("public").await.unwrap();
+        assert!(replay().await.is_ok());
+
+        // An object classified since raises the replay's marking with it,
+        // which a branch of an unmarked output refuses.
+        let mut marked = svc.db.runtime().get_object("c-eu-3").unwrap().unwrap();
+        marked.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        );
+        marked.updated += 1;
+        svc.db.runtime().update_object(&marked).unwrap();
+        let raised = replay().await.unwrap_err();
+        assert!(raised.message().contains("marking"), "{raised:?}");
+        marked
+            .properties
+            .remove(crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY);
+        marked.updated += 1;
+        svc.db.runtime().update_object(&marked).unwrap();
+        assert!(replay().await.is_ok());
+
+        // A pinned object moved to another kind is not the object read.
+        let mut moved = svc.db.runtime().get_object("c-eu-3").unwrap().unwrap();
+        moved.kind = "Order".into();
+        moved.updated += 1;
+        svc.db.runtime().update_object(&moved).unwrap();
+        let moved_away = replay().await.unwrap_err();
+        assert_eq!(
+            moved_away.code(),
+            tonic::Code::PermissionDenied,
+            "{moved_away:?}"
+        );
+        moved.kind = "Customer".into();
+        moved.updated += 1;
+        svc.db.runtime().update_object(&moved).unwrap();
+        assert!(replay().await.is_ok());
+
+        // A pinned object the caller can no longer read refuses the replay.
+        let owner = security::Grant {
+            id: "owner-c-eu-2".into(),
+            object_id: "c-eu-2".into(),
+            principal: "bob".into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&owner).unwrap();
+        svc.security.add_grant(&owner);
+        let refused = replay().await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied, "{refused:?}");
+
+        // A redefinition reading another set under the same alias finds no
+        // pin of its own, rather than the old set's rows.
+        let us = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "us".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut redefined = definition();
+        redefined.inputs[1].object_set = us;
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(redefined),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let other = replay().await.unwrap_err();
+        assert_eq!(other.code(), tonic::Code::FailedPrecondition, "{other:?}");
+        assert!(other.message().contains("descriptor"), "{other:?}");
     }
 
     /// An isolated run streams the object set its putter reads, matching

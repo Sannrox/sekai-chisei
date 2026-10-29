@@ -1,8 +1,14 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::audit::Decision;
-use crate::sekai::retention::contains_subject_reference;
+use crate::sekai::retention::{
+    ArchiveErasureSubject, ArchivedErasure, CONTENT_EVENT_ERASED_REASON, erase_archived_record,
+};
 use crate::sekai::retention::{
     ArchiveRun, ArchiveVerification, RetentionPolicy, SubjectErasureRequest, SubjectErasureResult,
+};
+use crate::sekai::retention::{
+    legacy_redact_subject_value as redact_subject_value,
+    legacy_value_mentions_subject as value_mentions_subject,
 };
 use postgres::{GenericClient, Row};
 use sha2::{Digest, Sha256};
@@ -19,11 +25,10 @@ impl PostgresDb {
         if policy.dataset.trim().is_empty() {
             return Err("dataset is required".into());
         }
-        if !matches!(
-            policy.dataset.as_str(),
-            "audit" | "llm_calls" | "task_observations"
-        ) {
-            return Err("dataset must be audit, llm_calls, or task_observations".into());
+        if !crate::sekai::retention::RETENTION_DATASETS.contains(&policy.dataset.as_str()) {
+            return Err(
+                "dataset must be audit, llm_calls, task_observations, or content_events".into(),
+            );
         }
         if policy.retention_days <= 0 {
             return Err("retention_days must be positive".into());
@@ -95,11 +100,36 @@ impl PostgresDb {
             subject_hash: subject_hash.clone(),
             ..SubjectErasureResult::default()
         };
+        // The references the hot path tombstones below, read before the
+        // residue scan so the archived events of them are erased first.
+        let archived_reference_ids = tx
+            .query(
+                "SELECT reference_id,actor,operation_id,causal_identity
+                 FROM sekai_content_references",
+                &[],
+            )
+            .map_err(err)?
+            .into_iter()
+            .filter(|row| {
+                content_reference_matches(
+                    [row.get(1), row.get(2), row.get(3)],
+                    &request.subject_kind,
+                    &request.subject,
+                )
+            })
+            .map(|row| row.get::<_, String>(0))
+            .collect();
         redact_archived_subject(
             &mut tx,
-            &request.subject_kind,
-            &request.subject,
-            &subject_hash,
+            &ArchiveErasureSubject {
+                kind: &request.subject_kind,
+                subject: &request.subject,
+                hash: &subject_hash,
+                // Only content events are archived here; their rule is by
+                // reference, not by object.
+                object_ids: &[],
+                reference_ids: &archived_reference_ids,
+            },
             request.timestamp,
         )?;
         erase_supported_subject_data(&mut tx, request, &subject_hash, &mut result)?;
@@ -137,15 +167,11 @@ impl PostgresDb {
             .map_err(err)?
             .into_iter()
             .filter(|row| {
-                let values = match request.subject_kind.as_str() {
-                    "work_unit" => [row.get::<_, String>(4), row.get::<_, String>(5)].to_vec(),
-                    "agent" | "user" => [row.get::<_, String>(3)].to_vec(),
-                    _ => unreachable!(),
-                };
-                values.iter().any(|value| {
-                    value == &request.subject
-                        || value_mentions_subject(value, &request.subject_kind, &request.subject)
-                })
+                content_reference_matches(
+                    [row.get(3), row.get(4), row.get(5)],
+                    &request.subject_kind,
+                    &request.subject,
+                )
             })
             .collect::<Vec<_>>();
         if rows.iter().any(|row| {
@@ -217,10 +243,8 @@ impl PostgresDb {
             )
             .map_err(err)?;
             tx.execute(
-                "UPDATE sekai_content_events
-                 SET actor=$1,reason='subject erasure tombstone'
-                 WHERE reference_id=$2",
-                &[&subject_hash, &reference_id],
+                "UPDATE sekai_content_events SET actor=$1,reason=$2 WHERE reference_id=$3",
+                &[&subject_hash, &CONTENT_EVENT_ERASED_REASON, &reference_id],
             )
             .map_err(err)?;
             tx.execute(
@@ -262,6 +286,104 @@ impl PostgresDb {
     /// event table. References, payloads, objects, and reconciliation decisions
     /// stay in place so archive maintenance cannot sever lineage.
     pub fn archive_lifecycle_records(&self, cutoff_ms: i64) -> Result<ArchiveRun, String> {
+        let mut run = self.archive_content_events(cutoff_ms, false)?;
+        // Earlier callers read the count here.
+        run.audit_archived = run.content_events_archived;
+        Ok(run)
+    }
+
+    /// The retention entry point on PostgreSQL (ADR 0141). This layer
+    /// archives content events by their stored policy; the other datasets
+    /// follow in later layers and are left in place here.
+    pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        let policies = self.list_retention_policies()?;
+        let Some(policy) = policies.iter().find(|policy| {
+            policy.dataset == crate::sekai::retention::CONTENT_EVENTS_DATASET
+                && policy.namespace.is_empty()
+                && policy.data_class.is_empty()
+        }) else {
+            return Ok(ArchiveRun {
+                dry_run,
+                ..ArchiveRun::default()
+            });
+        };
+        let cutoff = now - i64::from(policy.retention_days) * 86_400_000;
+        self.archive_content_events(cutoff, dry_run)
+    }
+
+    /// Verify every batch of the in-database archive; an empty one verifies.
+    pub fn verify_retention_archive(&self) -> Result<ArchiveVerification, String> {
+        let mut connection = self.connection()?;
+        // One snapshot for every query, so a concurrent erasure or run is
+        // seen whole or not at all.
+        let mut tx = connection
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(err)?;
+        let verification = verify_retention_archive_pg(&mut tx)?;
+        tx.commit().map_err(err)?;
+        Ok(verification)
+    }
+
+    /// Batches and archived records per dataset in the in-database archive.
+    pub fn retention_archive_status(
+        &self,
+    ) -> Result<crate::sekai::retention::ArchiveStatus, String> {
+        let mut connection = self.connection()?;
+        let summary = connection
+            .query_one(
+                "SELECT COUNT(*), MAX(cutoff_ms) FROM sekai_archive_batches",
+                &[],
+            )
+            .map_err(err)?;
+        let records = connection
+            .query(
+                "SELECT dataset, COUNT(*) FROM sekai_archive_records
+                 GROUP BY dataset ORDER BY dataset",
+                &[],
+            )
+            .map_err(err)?
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+            .collect();
+        Ok(crate::sekai::retention::ArchiveStatus {
+            batches: summary.get(0),
+            records,
+            last_cutoff_ms: summary.get(1),
+        })
+    }
+
+    /// Archive content events created before `cutoff_ms` and remove them from
+    /// the hot table in one transaction; `dry_run` rolls it back.
+    fn archive_content_events(&self, cutoff_ms: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        // As on SQLite: a dry run counts in one pass; a run moves bounded
+        // batches, one transaction each, until none is left.
+        if dry_run {
+            return self.archive_content_event_batch(cutoff_ms, true, i64::MAX);
+        }
+        let limit =
+            i64::try_from(crate::sekai::retention::RETENTION_BATCH_SIZE).unwrap_or(i64::MAX);
+        let mut total = ArchiveRun::default();
+        loop {
+            let batch = self.archive_content_event_batch(cutoff_ms, false, limit)?;
+            if batch.batch_id.is_empty() {
+                return Ok(total);
+            }
+            total.batches += 1;
+            total.content_events_archived += batch.content_events_archived;
+            total.batch_id = batch.batch_id;
+            total.content_hash = batch.content_hash;
+        }
+    }
+
+    fn archive_content_event_batch(
+        &self,
+        cutoff_ms: i64,
+        dry_run: bool,
+        limit: i64,
+    ) -> Result<ArchiveRun, String> {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction().map_err(err)?;
         tx.query_one("SELECT pg_advisory_xact_lock_shared(251,251)", &[])
@@ -274,8 +396,8 @@ impl PostgresDb {
         let mut records = tx
             .query(
                 "SELECT id,event_kind,blob_id,reference_id,actor,reason,created_at_ms
-                 FROM sekai_content_events WHERE created_at_ms<$1 ORDER BY id FOR UPDATE",
-                &[&cutoff_ms],
+                 FROM sekai_content_events WHERE created_at_ms<$1 ORDER BY id LIMIT $2 FOR UPDATE",
+                &[&cutoff_ms, &limit],
             )
             .map_err(err)?
             .into_iter()
@@ -293,12 +415,24 @@ impl PostgresDb {
                 .to_string(),
             })
             .collect::<Vec<_>>();
+        // Hot rows are deleted by their own ids; the archive keys them opaquely.
+        let event_ids = records
+            .iter()
+            .map(|record| record.source_key.clone())
+            .collect::<Vec<_>>();
+        for record in &mut records {
+            record.source_key =
+                crate::sekai::retention::archive_source_key(&record.dataset, &record.source_key);
+        }
         records.sort_by(|left, right| {
             (&left.dataset, &left.source_key).cmp(&(&right.dataset, &right.source_key))
         });
         if records.is_empty() {
             tx.commit().map_err(err)?;
-            return Ok(ArchiveRun::default());
+            return Ok(ArchiveRun {
+                dry_run,
+                ..ArchiveRun::default()
+            });
         }
         let hashes = records.iter().map(record_hash).collect::<Vec<_>>();
         let content_hash = hash_json(&hashes)?;
@@ -363,18 +497,21 @@ impl PostgresDb {
             .map_err(err)?;
         }
         verify_batch(&mut tx, &batch_id)?;
-        for record in &records {
-            tx.execute(
-                "DELETE FROM sekai_content_events WHERE id=$1",
-                &[&record.source_key],
-            )
-            .map_err(err)?;
+        for id in &event_ids {
+            tx.execute("DELETE FROM sekai_content_events WHERE id=$1", &[id])
+                .map_err(err)?;
         }
-        tx.commit().map_err(err)?;
+        if dry_run {
+            tx.rollback().map_err(err)?;
+        } else {
+            tx.commit().map_err(err)?;
+        }
         Ok(ArchiveRun {
             batch_id,
             content_hash,
-            audit_archived: records.len() as i32,
+            content_events_archived: records.len() as i32,
+            dry_run,
+            batches: 1,
             ..ArchiveRun::default()
         })
     }
@@ -1082,13 +1219,29 @@ fn tombstone_decisions(
     Ok(())
 }
 
+/// Whether a content reference, by its `[actor, operation_id,
+/// causal_identity]`, belongs to the subject: actors for agents and users,
+/// the operation and causal identity for work units.
+fn content_reference_matches(columns: [String; 3], kind: &str, subject: &str) -> bool {
+    let [actor, operation_id, causal_identity] = columns;
+    let values = match kind {
+        "work_unit" => vec![operation_id, causal_identity],
+        _ => vec![actor],
+    };
+    values
+        .iter()
+        .any(|value| value == subject || value_mentions_subject(value, kind, subject))
+}
+
+/// Erase the subject from every archived record by its dataset's hot-path
+/// rule ([`erase_archived_record`]), record each rewrite, and recompute the
+/// content hash and count of each batch it touched.
 fn redact_archived_subject(
     client: &mut impl GenericClient,
-    subject_kind: &str,
-    subject: &str,
-    subject_hash: &str,
+    subject: &ArchiveErasureSubject<'_>,
     now_ms: i64,
 ) -> Result<(), String> {
+    let subject_hash = subject.hash;
     let batch_ids = client
         .query("SELECT id FROM sekai_archive_batches ORDER BY id", &[])
         .map_err(err)?
@@ -1110,11 +1263,36 @@ fn redact_archived_subject(
         let dataset: String = row.get(0);
         let source_key: String = row.get(1);
         let payload: String = row.get(2);
-        if !value_mentions_subject(&payload, subject_kind, subject) {
-            continue;
-        }
+        let redacted_payload = match erase_archived_record(&dataset, &payload, subject) {
+            ArchivedErasure::Keep => continue,
+            ArchivedErasure::Rewrite(redacted) => redacted,
+            ArchivedErasure::Delete => {
+                for batch in client
+                    .query(
+                        "SELECT batch_id FROM sekai_archive_batch_records
+                         WHERE dataset=$1 AND source_key=$2",
+                        &[&dataset, &source_key],
+                    )
+                    .map_err(err)?
+                {
+                    touched_batches.insert(batch.get::<_, String>(0));
+                }
+                for table in [
+                    "sekai_archive_batch_records",
+                    "sekai_archive_redactions",
+                    "sekai_archive_records",
+                ] {
+                    client
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE dataset=$1 AND source_key=$2"),
+                            &[&dataset, &source_key],
+                        )
+                        .map_err(err)?;
+                }
+                continue;
+            }
+        };
         let old_hash: String = row.get(3);
-        let redacted_payload = redact_subject_value(&payload, subject_kind, subject, subject_hash);
         let record = ArchiveRecord {
             dataset: dataset.clone(),
             source_key: source_key.clone(),
@@ -1170,97 +1348,65 @@ fn redact_archived_subject(
             .collect::<Vec<_>>();
         client
             .execute(
-                "UPDATE sekai_archive_batches SET content_hash=$1 WHERE id=$2",
-                &[&hash_json(&hashes)?, &batch_id],
+                "UPDATE sekai_archive_batches SET content_hash=$1,record_count=$2 WHERE id=$3",
+                &[&hash_json(&hashes)?, &(hashes.len() as i64), &batch_id],
             )
             .map_err(err)?;
     }
     Ok(())
 }
 
-fn redact_subject_value(
-    value: &str,
-    subject_kind: &str,
-    subject: &str,
-    subject_hash: &str,
-) -> String {
-    if !value_mentions_subject(value, subject_kind, subject) {
-        return value.to_string();
-    }
-    fn redact_json(
-        value: &mut serde_json::Value,
-        subject_kind: &str,
-        subject: &str,
-        subject_hash: &str,
-    ) {
-        match value {
-            serde_json::Value::String(text)
-                if text == subject || contains_subject_reference(text, subject_kind, subject) =>
-            {
-                *text = if text == subject {
-                    subject_hash.to_string()
-                } else {
-                    "[redacted subject reference]".into()
-                };
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    redact_json(value, subject_kind, subject, subject_hash);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                let original = std::mem::take(values);
-                for (key, mut value) in original {
-                    redact_json(&mut value, subject_kind, subject, subject_hash);
-                    let key = if key == subject {
-                        subject_hash.to_string()
-                    } else if contains_subject_reference(&key, subject_kind, subject) {
-                        format!("[redacted-subject-key]-{}", &sha256(key.as_bytes())[..16])
-                    } else {
-                        key
-                    };
-                    values.insert(key, value);
-                }
-            }
-            _ => {}
-        }
-    }
-    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(value) {
-        redact_json(&mut json, subject_kind, subject, subject_hash);
-        return json.to_string();
-    }
-    if value == subject {
-        subject_hash.into()
-    } else {
-        "[redacted subject reference]".into()
-    }
-}
-
-fn value_mentions_subject(value: &str, subject_kind: &str, subject: &str) -> bool {
-    fn json_mentions(value: &serde_json::Value, subject_kind: &str, subject: &str) -> bool {
-        match value {
-            serde_json::Value::String(value) => {
-                value == subject || contains_subject_reference(value, subject_kind, subject)
-            }
-            serde_json::Value::Array(values) => values
-                .iter()
-                .any(|value| json_mentions(value, subject_kind, subject)),
-            serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
-                key == subject
-                    || contains_subject_reference(key, subject_kind, subject)
-                    || json_mentions(value, subject_kind, subject)
-            }),
-            _ => false,
-        }
-    }
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .is_some_and(|value| json_mentions(&value, subject_kind, subject))
-        || contains_subject_reference(value, subject_kind, subject)
-}
-
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// Verify every batch of the in-database archive, and that no record lacks
+/// a batch manifest; an empty archive verifies.
+fn verify_retention_archive_pg(
+    client: &mut impl GenericClient,
+) -> Result<ArchiveVerification, String> {
+    let batch_ids = client
+        .query("SELECT id FROM sekai_archive_batches ORDER BY id", &[])
+        .map_err(err)?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    let mut verification = ArchiveVerification {
+        ok: true,
+        ..ArchiveVerification::default()
+    };
+    // As on SQLite: a record no batch manifest names (its manifest lost)
+    // fails verification, not only records reachable from a batch.
+    let orphans: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM sekai_archive_records r
+             WHERE NOT EXISTS (
+                SELECT 1 FROM sekai_archive_batch_records link
+                JOIN sekai_archive_batches batch ON batch.id=link.batch_id
+                WHERE link.dataset=r.dataset AND link.source_key=r.source_key)",
+            &[],
+        )
+        .map_err(err)?
+        .get(0);
+    if orphans > 0 {
+        verification.ok = false;
+        verification.error = "archive contains records without a batch manifest".into();
+        return Ok(verification);
+    }
+    for batch_id in batch_ids {
+        match verify_batch(client, &batch_id) {
+            Ok((records, batches)) => {
+                verification.records_checked += records;
+                verification.batches_checked += batches;
+            }
+            Err(error) => {
+                verification.ok = false;
+                verification.error = error;
+                return Ok(verification);
+            }
+        }
+    }
+    Ok(verification)
 }
 
 fn verify_batch(client: &mut impl GenericClient, batch_id: &str) -> Result<(i64, i64), String> {
@@ -1402,6 +1548,22 @@ mod tests {
             )
             .unwrap();
         assert!(!db.verify_lifecycle_archive(&archived.batch_id).unwrap().ok);
+        // Remove the corrupted batch: other tests verify the whole archive
+        // of this shared database.
+        connection
+            .batch_execute(&format!(
+                "DELETE FROM sekai_archive_redactions WHERE (dataset,source_key) IN
+                   (SELECT dataset,source_key FROM sekai_archive_batch_records WHERE batch_id='{id}');
+                 CREATE TEMP TABLE corrupt_keys AS
+                   SELECT dataset,source_key FROM sekai_archive_batch_records WHERE batch_id='{id}';
+                 DELETE FROM sekai_archive_batch_records WHERE batch_id='{id}';
+                 DELETE FROM sekai_archive_records WHERE (dataset,source_key) IN
+                   (SELECT dataset,source_key FROM corrupt_keys);
+                 DELETE FROM sekai_archive_batches WHERE id='{id}';
+                 DROP TABLE corrupt_keys;",
+                id = archived.batch_id
+            ))
+            .unwrap();
 
         connection
             .execute(
@@ -1416,5 +1578,28 @@ mod tests {
             db.put_scoped_content(&scope, &replay, b"original", 300)
                 .is_err()
         );
+    }
+
+    /// A record no batch manifest names fails verification, as on SQLite.
+    /// The orphan exists only inside a transaction that is rolled back, so
+    /// nothing invalid is ever visible to other tests or agents.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_orphan_archive_records_fail_verification() {
+        let db = database();
+        let key = format!("orphan-{}", uuid::Uuid::new_v4().simple());
+        let mut connection = db.connection().unwrap();
+        let mut tx = connection.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO sekai_archive_records
+             (dataset,source_key,payload,payload_hash,archived_at_ms)
+             VALUES('content_events',$1,'{}','x',1)",
+            &[&key],
+        )
+        .unwrap();
+        let verification = verify_retention_archive_pg(&mut tx).unwrap();
+        tx.rollback().unwrap();
+        assert!(!verification.ok);
+        assert!(verification.error.contains("without a batch manifest"));
     }
 }

@@ -501,6 +501,38 @@ impl RuntimeDb {
         self.run_governed_transform_owned(namespace, transform_id, incremental, now_ms, "", "")
     }
 
+    /// See [`crate::db::sekai::SekaiDb::load_object_set_pin`].
+    pub fn load_object_set_pin(
+        &self,
+        namespace: &str,
+        alias: &str,
+        digest: &str,
+        budget: &mut crate::sekai::governed_transform::InputLoadBudget,
+    ) -> Result<Option<crate::sekai::object_set_input::PinnedObjectSet>, String> {
+        match self {
+            Self::Sqlite(db) => db.load_object_set_pin(namespace, alias, digest, budget),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.load_object_set_pin(namespace, alias, digest, budget)
+            }),
+        }
+    }
+
+    /// See [`crate::db::sekai::SekaiDb::object_set_pin_at`].
+    pub fn object_set_pin_at(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        alias: &str,
+        as_of_ms: i64,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.object_set_pin_at(namespace, transform_id, alias, as_of_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.object_set_pin_at(namespace, transform_id, alias, as_of_ms)
+            }),
+        }
+    }
+
     /// See [`crate::db::sekai::SekaiDb::set_transform_reader`].
     pub fn set_transform_reader(
         &self,
@@ -8327,17 +8359,39 @@ impl RuntimeDb {
         }
     }
 
-    pub fn archive_retained_records(
-        &self,
-        archive_path: impl AsRef<Path>,
-        now: i64,
-    ) -> Result<ArchiveRun, String> {
+    /// The retention entry point (ADR 0141): move records past their policy
+    /// cutoff into the in-database archive and remove or redact them in the
+    /// hot tables, one transaction per batch. Idempotent and safe to run on
+    /// several replicas at once. `dry_run` reports the counts and writes
+    /// nothing. PostgreSQL covers content events in this release.
+    pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         match self {
-            Self::Sqlite(db) => db.archive_retained_records(archive_path, now),
-            Self::Postgres(_) => Err(
-                "archive_retained_records is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
+            Self::Sqlite(db) => db.archive_retained_records(now, dry_run),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.archive_retained_records(now, dry_run))
+            }
+        }
+    }
+
+    /// Verify the in-database retention archive.
+    pub fn verify_retention_archive(&self) -> Result<ArchiveVerification, String> {
+        match self {
+            Self::Sqlite(db) => db.verify_retention_archive(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.verify_retention_archive())
+            }
+        }
+    }
+
+    /// What the in-database retention archive holds.
+    pub fn retention_archive_status(
+        &self,
+    ) -> Result<crate::sekai::retention::ArchiveStatus, String> {
+        match self {
+            Self::Sqlite(db) => db.retention_archive_status(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.retention_archive_status())
+            }
         }
     }
 
