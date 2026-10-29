@@ -50,6 +50,12 @@
           "type": "string",
           "required": false,
           "description": "Evidence references retained as a single string value."
+        },
+        {
+          "name": "finding_class",
+          "type": "string",
+          "required": false,
+          "description": "The class of weakness the finding belongs to, which agent disposition precision is measured per (#1990). Absent means unclassified."
         }
       ]
     },
@@ -273,6 +279,28 @@
           "type": "string",
           "required": false,
           "description": "On a needs-review disposition: the fact's value that reopened it."
+        },
+        {
+          "name": "recorded_by",
+          "type": "string",
+          "required": false,
+          "description": "The principal that submitted the disposition. Stamped at write; a caller cannot set it (#1990)."
+        },
+        {
+          "name": "recorder_revision",
+          "type": "string",
+          "required": false,
+          "description": "The definition revision of the site agent that recorded the disposition, when an agent did. Stamped at write (#1990)."
+        },
+        {
+          "name": "recorder_kind",
+          "type": "enum",
+          "required": false,
+          "description": "Whether the recorder was an agent when it recorded the disposition: agent or human. Stamped at write, so a later registry change does not rewrite history (#1990).",
+          "enum_values": [
+            "agent",
+            "human"
+          ]
         }
       ]
     }

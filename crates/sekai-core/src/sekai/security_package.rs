@@ -34,6 +34,13 @@
 //!   chain. The reopen's id derives from the disposition it reopens, so a
 //!   repeated pass reopens it once.
 //!
+//! - A disposition records who decided it (#1990): `recorded_by` is the
+//!   submitting principal, `recorder_kind` whether it was an agent then, and
+//!   `recorder_revision` the definition revision of the site agent behind
+//!   it, all stamped at write so a caller cannot claim another recorder's
+//!   history and a later registry change cannot rewrite it. Agent disposition precision is
+//!   measured from them ([`crate::sekai::security_precision`]).
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -54,12 +61,13 @@ use crate::sekai::schema::{
 
 pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
 pub const PACKAGE_VERSION: &str = "1";
-/// The current certification. Dispositions (#1924) changed the certified
-/// members, so the package is certified again under a new id that succeeds
-/// the first one where a namespace holds it.
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.2";
+/// The current certification. A change to the certified members certifies
+/// the package again under a new id that succeeds the previous one where a
+/// namespace holds it; v1.3 adds the recorder and finding class (#1990).
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.3";
 /// Certifications this one succeeds, newest first.
 const PREVIOUS_CERTIFICATION_IDS: &[&str] = &[
+    "cert:security.finding-exposure/v1.2",
     "cert:security.finding-exposure/v1.1",
     "cert:security.finding-exposure/v1",
 ];
@@ -68,6 +76,18 @@ pub const KIND_OCCURRENCE: &str = "security_finding_occurrence";
 pub const KIND_HYPOTHESIS: &str = "security_hypothesis";
 pub const KIND_EXPOSURE: &str = "security_exposure";
 pub const KIND_DISPOSITION: &str = "security_disposition";
+
+/// The package's kinds, written only through its Actions.
+pub fn is_package_kind(kind: &str) -> bool {
+    [
+        KIND_FINDING,
+        KIND_OCCURRENCE,
+        KIND_HYPOTHESIS,
+        KIND_EXPOSURE,
+        KIND_DISPOSITION,
+    ]
+    .contains(&kind)
+}
 pub const ACTION_DISPOSITION_RECORD: &str = "security.disposition.record";
 pub const ACTION_DISPOSITION_SUPERSEDE: &str = "security.disposition.supersede";
 pub const ACTION_DISPOSITION_REOPEN: &str = "security.disposition.reopen";
@@ -84,6 +104,18 @@ pub const BASIS_FACTS: [&str; 5] = [
 ];
 /// An exposure's reachable markings when no marked data is reachable.
 pub const NO_MARKINGS: &str = "none";
+/// The submitting principal of a disposition, stamped at write.
+pub const PROPERTY_RECORDED_BY: &str = "recorded_by";
+/// [`RECORDER_AGENT`] or [`RECORDER_HUMAN`]: the recorder as classified when
+/// it recorded the disposition, stamped at write.
+pub const PROPERTY_RECORDER_KIND: &str = "recorder_kind";
+pub const RECORDER_AGENT: &str = "agent";
+pub const RECORDER_HUMAN: &str = "human";
+/// The site agent definition revision behind a disposition, stamped at write.
+pub const PROPERTY_RECORDER_REVISION: &str = "recorder_revision";
+/// A finding's class of weakness; absent reads as [`UNCLASSIFIED`].
+pub const PROPERTY_FINDING_CLASS: &str = "finding_class";
+pub const UNCLASSIFIED: &str = "unclassified";
 /// The reopened fact of a disposition that expired.
 pub const FACT_EXPIRES_AT: &str = "expires_at_ms";
 /// Properties a reopen copies from the disposition it reopens.
@@ -343,11 +375,12 @@ fn fixture_digest(bytes: &[u8]) -> String {
 }
 
 /// Package write rules on top of the ObjectType schema. Stamps each kind's
-/// identity into `external_id` and checks references to other package
-/// objects. Other kinds pass through.
+/// identity into `external_id`, a disposition's recorder from `submitter`,
+/// and checks references to other package objects. Other kinds pass through.
 pub fn validate_object_write(
     db: &RuntimeDb,
     object: &mut Object,
+    submitter: Option<crate::sekai::action_object_mutation::Submitter<'_>>,
     now_ms: i64,
 ) -> Result<(), String> {
     let identity = match object.kind.as_str() {
@@ -384,6 +417,7 @@ pub fn validate_object_write(
                     "a disposition cannot be changed; supersede it with a new disposition".into(),
                 );
             }
+            stamp_recorder(db, object, submitter)?;
             let exposure = require_exposure(db, object)?;
             match required(object, "disposition")? {
                 DISPOSITION_ACCEPT_RISK => {
@@ -410,6 +444,50 @@ pub fn validate_object_write(
         }
     }
     object.external_id = identity;
+    Ok(())
+}
+
+/// Overwrites whatever the caller sent: the recorder is a fact of the
+/// admission, not a parameter. A write without a submitter (a transform)
+/// records no recorder, so it never counts as anyone's decision.
+fn stamp_recorder(
+    db: &RuntimeDb,
+    object: &mut Object,
+    submitter: Option<crate::sekai::action_object_mutation::Submitter<'_>>,
+) -> Result<(), String> {
+    object.properties.remove(PROPERTY_RECORDED_BY);
+    object.properties.remove(PROPERTY_RECORDER_KIND);
+    object.properties.remove(PROPERTY_RECORDER_REVISION);
+    let Some(submitter) = submitter.filter(|submitter| !submitter.principal.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let principal = submitter.principal;
+    let site_agent = crate::sekai::site_agent_instance::definition_revision_for(
+        db,
+        &object.namespace,
+        principal,
+    )?;
+    // A site agent's principal need not look like an agent's.
+    // As admission classified it at submission, which a parked grant keeps;
+    // admission counts a site agent's principal as an agent too.
+    let is_agent = site_agent.is_some() || submitter.agent;
+    if let Some(revision) = site_agent.filter(|revision| !revision.is_empty()) {
+        object
+            .properties
+            .insert(PROPERTY_RECORDER_REVISION.into(), revision);
+    }
+    let kind = if is_agent {
+        RECORDER_AGENT
+    } else {
+        RECORDER_HUMAN
+    };
+    object
+        .properties
+        .insert(PROPERTY_RECORDER_KIND.into(), kind.into());
+    object
+        .properties
+        .insert(PROPERTY_RECORDED_BY.into(), principal.into());
     Ok(())
 }
 
@@ -1796,7 +1874,16 @@ mod tests {
         changed
             .properties
             .insert("disposition".into(), "fixed".into());
-        let message = validate_object_write(&runtime, &mut changed, 2_000).unwrap_err();
+        let message = validate_object_write(
+            &runtime,
+            &mut changed,
+            Some(crate::sekai::action_object_mutation::Submitter {
+                principal: ACTOR,
+                agent: false,
+            }),
+            2_000,
+        )
+        .unwrap_err();
         assert!(message.contains("cannot be changed"), "{message}");
         let message = failed_precondition(admit(
             &runtime,
@@ -2358,7 +2445,10 @@ mod tests {
                 &type_def,
                 NAMESPACE,
                 &accept.to_string(),
-                Some(ACTOR),
+                Some(crate::sekai::action_object_mutation::Submitter {
+                    principal: ACTOR,
+                    agent: false,
+                }),
                 None,
                 2_000,
             )

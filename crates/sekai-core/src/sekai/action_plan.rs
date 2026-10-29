@@ -343,7 +343,10 @@ fn predicted_effect(
         &type_def,
         namespace,
         &step.parameters_json,
-        Some(context.actor),
+        Some(action_object_mutation::Submitter::classified_now(
+            db,
+            context.actor,
+        )),
         None,
         context.now_ms,
     ) {

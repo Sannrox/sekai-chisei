@@ -41,6 +41,12 @@
           "type": "string",
           "required": false,
           "description": "Evidence references retained as a single string value."
+        },
+        {
+          "name": "finding_class",
+          "type": "string",
+          "required": false,
+          "description": "The class of weakness the finding belongs to; absent means unclassified."
         }
       ]
     },
@@ -247,6 +253,24 @@
           "type": "string",
           "required": false,
           "description": "On a needs-review disposition: the fact's value that reopened it."
+        },
+        {
+          "name": "recorded_by",
+          "type": "string",
+          "required": false,
+          "description": "The principal that submitted the disposition, stamped at write."
+        },
+        {
+          "name": "recorder_revision",
+          "type": "string",
+          "required": false,
+          "description": "The definition revision of the site agent that recorded it, stamped at write."
+        },
+        {
+          "name": "recorder_kind",
+          "type": "string",
+          "required": false,
+          "description": "agent or human, as the recorder was classified when it recorded the disposition; stamped at write."
         }
       ]
     }

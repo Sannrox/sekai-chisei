@@ -213,7 +213,7 @@ pub fn preview_object_action(
         &type_def,
         &object.namespace,
         parameters_json,
-        Some(actor),
+        Some(action_object_mutation::Submitter::classified_now(db, actor)),
         // A preview admits nothing, so nothing is derived to inherit.
         None,
         chrono::Utc::now().timestamp_millis(),

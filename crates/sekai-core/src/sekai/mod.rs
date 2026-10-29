@@ -87,6 +87,7 @@ pub mod handoff;
 pub mod handoff_lifecycle;
 pub mod image;
 pub mod security_package;
+pub mod security_precision;
 pub mod site_agent_instance;
 pub mod site_agent_memory;
 pub mod streaming_transform_apply;

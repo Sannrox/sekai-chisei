@@ -1,16 +1,17 @@
-//! sekaictl admin autonomy commands (#715, #1469).
+//! sekaictl admin autonomy commands (#715, #1469, #1990).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::agent_autonomy::{self, AutonomyThreshold};
 use crate::sekai::autonomous_envelope::{self, AutonomousEnvelope};
+use crate::sekai::security_precision;
 use chrono::Utc;
 use std::path::PathBuf;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy offer --namespace <ns> --principal <agent> --type <type_id> [--actor <principal>]\n  sekaictl admin autonomy grant-auto-apply --namespace <ns> --principal <agent> --type <type_id> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy revoke-auto-apply --namespace <ns> --principal <agent> --type <type_id> --reason <reason> [--actor <principal>]"
+    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy offer --namespace <ns> --principal <agent> --type <type_id> [--actor <principal>]\n  sekaictl admin autonomy grant-auto-apply --namespace <ns> --principal <agent> --type <type_id> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy revoke-auto-apply --namespace <ns> --principal <agent> --type <type_id> --reason <reason> [--actor <principal>]\n  sekaictl admin autonomy disposition-precision --namespace <ns>"
 }
 
 pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -24,6 +25,7 @@ pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("offer") => offer(parse_grant(&args[1..], false, false)?).await,
         Some("grant-auto-apply") => grant_auto_apply(parse_grant(&args[1..], true, false)?).await,
         Some("revoke-auto-apply") => revoke_auto_apply(parse_grant(&args[1..], false, true)?).await,
+        Some("disposition-precision") => disposition_precision(parse_namespace(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -155,6 +157,30 @@ async fn offer(config: GrantArgs) -> Result<(), BoxErr> {
     .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&snapshot)?);
     Ok(())
+}
+
+/// Security disposition precision per agent recorder, revision and finding
+/// class, over the production window.
+async fn disposition_precision(namespace: String) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let rows = security_precision::disposition_precision(
+        db.as_ref(),
+        &namespace,
+        security_precision::PrecisionWindow::production(),
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
+}
+
+fn parse_namespace(args: &[String]) -> Result<String, String> {
+    match args {
+        [flag, namespace] if flag == "--namespace" && !namespace.trim().is_empty() => {
+            Ok(namespace.clone())
+        }
+        _ => Err("disposition-precision needs --namespace <ns>".into()),
+    }
 }
 
 async fn grant_auto_apply(config: GrantArgs) -> Result<(), BoxErr> {

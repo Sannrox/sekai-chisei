@@ -108,9 +108,29 @@ impl PlannedObjectMutation {
     }
 }
 
-/// Plans the object an admitted Action writes. `submitter` is the principal
-/// that submitted the instance, `None` where there is none (a streaming
-/// transform). `marking` is the instance's
+/// Who submitted an Action instance, and whether admission classified it as
+/// an agent when it was submitted. A parked instance keeps that
+/// classification through its grant, whatever the registry says by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submitter<'a> {
+    pub principal: &'a str,
+    pub agent: bool,
+}
+
+impl<'a> Submitter<'a> {
+    /// A submitter classified now, for previews and simulations that admit
+    /// nothing. Fails closed to agent when the registry cannot answer.
+    pub fn classified_now(db: &RuntimeDb, principal: &'a str) -> Self {
+        Self {
+            principal,
+            agent: crate::sekai::write_freeze::actor_is_agent(db, principal, None, false)
+                .unwrap_or(true),
+        }
+    }
+}
+
+/// Plans the object an admitted Action writes. `submitter` submitted the
+/// instance, `None` where there is none (a streaming transform). `marking` is the instance's
 /// marking (#1706), `None` where no instance is admitted (previews,
 /// transforms that stamp their own): the written object carries the least
 /// upper bound of it, the object's current marking and any marking the
@@ -122,7 +142,7 @@ pub fn plan(
     type_def: &GovernedActionType,
     namespace: &str,
     parameters_json: &str,
-    submitter: Option<&str>,
+    submitter: Option<Submitter<'_>>,
     marking: Option<&str>,
     now_ms: i64,
 ) -> Result<Option<PlannedObjectMutation>, ActionObjectMutationError> {
@@ -286,7 +306,7 @@ fn plan_catalog_curation(
     mutation: &str,
     namespace: &str,
     parameters_json: &str,
-    submitter: Option<&str>,
+    submitter: Option<Submitter<'_>>,
     marking: Option<&str>,
     now_ms: i64,
 ) -> Result<PlannedObjectMutation, ActionObjectMutationError> {
@@ -328,7 +348,9 @@ fn plan_catalog_curation(
     let edits = object_properties(&parameters)?;
     let mut planned = curate(
         &existing,
-        submitter.unwrap_or_default(),
+        submitter
+            .map(|submitter| submitter.principal)
+            .unwrap_or_default(),
         edits,
         lattice.as_ref(),
     )
@@ -603,16 +625,22 @@ fn package_references(
 fn validate_object_write(
     db: &RuntimeDb,
     planned: &mut Object,
-    submitter: Option<&str>,
+    submitter: Option<Submitter<'_>>,
     now_ms: i64,
 ) -> Result<(), ActionObjectMutationError> {
     crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
-        .and_then(|()| crate::sekai::security_package::validate_object_write(db, planned, now_ms))
+        .and_then(|()| {
+            crate::sekai::security_package::validate_object_write(db, planned, submitter, now_ms)
+        })
         .and_then(|()| {
             crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms)
         })
         .and_then(|()| {
-            crate::sekai::site_agent_memory::validate_object_write(db, planned, submitter)
+            crate::sekai::site_agent_memory::validate_object_write(
+                db,
+                planned,
+                submitter.map(|submitter| submitter.principal),
+            )
         })
         .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
         .map_err(ActionObjectMutationError::FailedPrecondition)
