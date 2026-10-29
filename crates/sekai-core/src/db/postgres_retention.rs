@@ -797,20 +797,25 @@ impl PostgresDb {
                 &[],
             )
             .map_err(err)?;
-        let records = connection
+        let mut records = Vec::new();
+        let mut last_archived_at_ms = Vec::new();
+        for row in connection
             .query(
-                "SELECT dataset, COUNT(*) FROM sekai_archive_records
+                "SELECT dataset, COUNT(*), MAX(archived_at_ms) FROM sekai_archive_records
                  GROUP BY dataset ORDER BY dataset",
                 &[],
             )
             .map_err(err)?
-            .into_iter()
-            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
-            .collect();
+        {
+            let dataset: String = row.get(0);
+            records.push((dataset.clone(), row.get(1)));
+            last_archived_at_ms.push((dataset, row.get(2)));
+        }
         Ok(crate::sekai::retention::ArchiveStatus {
             batches: summary.get(0),
             records,
             last_cutoff_ms: summary.get(1),
+            last_archived_at_ms,
         })
     }
 

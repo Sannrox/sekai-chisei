@@ -68,6 +68,7 @@ pub mod provenance;
 pub mod provider_credentials;
 pub mod quality_cli;
 pub mod quality_trend;
+pub mod retention_cli;
 pub mod tenant_invitation;
 pub mod tenant_lifecycle;
 pub use chisei_provider::provider_profile;

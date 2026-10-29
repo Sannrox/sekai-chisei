@@ -503,6 +503,13 @@ fn exercise_retention_archive(
             .find(|(dataset, _)| dataset == "content_events")
             .map_or(0, |(_, count)| *count)
     };
+    assert!(
+        after
+            .last_archived_at_ms
+            .iter()
+            .any(|(dataset, at)| dataset == "content_events" && *at > 0),
+        "{after:?}"
+    );
     // Every archived event counted once: no record twice, none lost.
     assert_eq!(
         count(&after),

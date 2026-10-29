@@ -1209,7 +1209,14 @@ pub fn run_for_plane(
 
     let evidence_db = execution_evidence_runtime(&stores);
     Ok(async move {
-        spawn_service_background_tasks(&config, evidence_db, &sekai_svc, &chisei_svc, plane);
+        spawn_service_background_tasks(
+            &config,
+            evidence_db,
+            stores.clone(),
+            &sekai_svc,
+            &chisei_svc,
+            plane,
+        );
         let actor_rate_gate = crate::chisei::actor_limit::ActorRateGate::from_config(&config);
 
         if let Some(ops_port) = config.ops_port {
@@ -1677,6 +1684,7 @@ fn hosted_embedding_route(
 fn spawn_service_background_tasks(
     config: &Config,
     db: Arc<RuntimeDb>,
+    stores: Arc<CombinedStoreLayout>,
     sekai_svc: &Arc<sekai_service::SekaiServiceImpl>,
     chisei_svc: &Arc<chisei_service::ChiseiServiceImpl>,
     plane: ProcessPlane,
@@ -1698,6 +1706,7 @@ fn spawn_service_background_tasks(
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
+        spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
     }
@@ -1774,6 +1783,41 @@ fn spawn_admission_reconciler(
                 Err(error) => {
                     tracing::error!(%error, "admission reservation reconciliation task failed")
                 }
+            }
+        }
+    });
+}
+
+/// Run retention on a schedule (#1987, ADR 0129). Every replica may run it;
+/// `archive_retained_records` is idempotent per dataset and cutoff, so a
+/// crash mid-run is safe to repeat and two ticks archive each record once.
+fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let stores = stores.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::retention_cli::archive_admitted(
+                    &db,
+                    &stores,
+                    chrono::Utc::now().timestamp_millis(),
+                    false,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(run)) if run.batches == 0 => {}
+                Ok(Ok(run)) => tracing::info!(
+                    batches = run.batches,
+                    audit = run.audit_archived,
+                    llm_calls = run.llm_calls_archived,
+                    content_events = run.content_events_archived,
+                    "retention tick archived"
+                ),
+                Ok(Err(error)) => tracing::error!(%error, "retention tick failed"),
+                Err(error) => tracing::error!(%error, "retention tick task failed"),
             }
         }
     });

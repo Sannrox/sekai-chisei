@@ -8361,7 +8361,7 @@ impl RuntimeDb {
     /// cutoff into the in-database archive and remove or redact them in the
     /// hot tables, one transaction per batch. Idempotent and safe to run on
     /// several replicas at once. `dry_run` reports the counts and writes
-    /// nothing. PostgreSQL covers content events in this release.
+    /// nothing. The plane tick and `sekaictl admin retention` call this.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         match self {
             Self::Sqlite(db) => db.archive_retained_records(now, dry_run),

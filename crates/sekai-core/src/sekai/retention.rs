@@ -116,6 +116,8 @@ pub struct ArchiveStatus {
     pub records: Vec<(String, i64)>,
     /// Cutoff of the newest batch, Unix milliseconds.
     pub last_cutoff_ms: Option<i64>,
+    /// Latest `archived_at_ms` per dataset: the last run that archived it.
+    pub last_archived_at_ms: Vec<(String, i64)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3158,21 +3160,32 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT dataset, COUNT(*) FROM sekai_archive_records
+                "SELECT dataset, COUNT(*), MAX(archived_at_ms) FROM sekai_archive_records
                  GROUP BY dataset ORDER BY dataset",
             )
             .map_err(|e| e.to_string())?;
-        let records = stmt
+        let mut records = Vec::new();
+        let mut last_archived_at_ms = Vec::new();
+        let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        for (dataset, count, archived_at) in rows {
+            records.push((dataset.clone(), count));
+            last_archived_at_ms.push((dataset, archived_at));
+        }
         Ok(ArchiveStatus {
             batches,
             records,
             last_cutoff_ms,
+            last_archived_at_ms,
         })
     }
 

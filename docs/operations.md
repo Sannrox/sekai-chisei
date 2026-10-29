@@ -150,7 +150,12 @@ object changes and content events are rewritten as in the hot tables, and
 attestations of an erased decision are removed. Content events are archived only once a `content_events`
 policy is set. Archive files written by earlier releases are kept as they
 are and verify with `SekaiDb::verify_archive`; nothing is imported from them.
-No operator command runs retention yet (#1987). On PostgreSQL decisions,
+Every Sekai plane instance runs a retention tick (ADR 0129): it calls
+`archive_retained_records` on a one-minute interval. Replicas do not elect a
+scheduler; an interrupted run resumes, and two ticks archive each record once.
+`sekaictl admin retention status` reports per-dataset counts and the last
+archive time; `dry-run` reports the counts without writing; `run` performs them.
+The same commands work on SQLite and PostgreSQL. On PostgreSQL decisions,
 attestations, object changes, LLM calls, task observations and content
 events are covered (migration 0135 adds the observation `data_class` and
 `retention_tombstone` columns). Object changes follow the dataset-wide

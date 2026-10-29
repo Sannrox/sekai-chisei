@@ -597,5 +597,11 @@ mod tests {
                 && !closed.contains("replay_redemption"),
             "dual-backend permit redeem, reconcile, and delegation must not look sqlite-only"
         );
+        assert!(
+            !closed.contains("archive_retained_records")
+                && !closed.contains("retention_archive_status")
+                && !closed.contains("verify_retention_archive"),
+            "dual-backend retention archive must not look sqlite-only"
+        );
     }
 }
