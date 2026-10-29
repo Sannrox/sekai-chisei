@@ -2157,14 +2157,11 @@ pub(super) async fn run_adhoc_governed_transform(
         &transform.namespace,
         false,
     )?;
-    if transform.is_isolated_process() {
-        return Err(Status::unimplemented(
-            "isolated-process ad-hoc runs are not available yet",
-        ));
-    }
+    let isolated = transform.is_isolated_process();
     // The analytical profile carries the input memory and time budgets that
-    // bound a reader-callable run before its output is checked.
-    if transform.analytical.is_none() {
+    // bound an in-process reader-callable run before its output is checked;
+    // an isolated run is bounded by its JobSpec envelope (#1966).
+    if !isolated && transform.analytical.is_none() {
         return Err(Status::invalid_argument(
             "ad-hoc runs need the analytical profile",
         ));
@@ -2191,13 +2188,19 @@ pub(super) async fn run_adhoc_governed_transform(
     }
     let quota = service.quota_runtime();
     let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
-    let held = admit_tenant_transform(
-        quota.as_ref(),
-        &gate,
-        tenant_context.as_ref(),
-        &format!("transform-adhoc:{}", request.identity()),
-        false,
-    )?;
+    // Isolated work is admitted against quota when a worker claims it, as
+    // for stored runs.
+    let held = if isolated {
+        None
+    } else {
+        admit_tenant_transform(
+            quota.as_ref(),
+            &gate,
+            tenant_context.as_ref(),
+            &format!("transform-adhoc:{}", request.identity()),
+            false,
+        )?
+    };
     let owner_tenant = tenant_context
         .as_ref()
         .and_then(|context| context.tenant.as_ref())
@@ -2221,7 +2224,11 @@ pub(super) async fn run_adhoc_governed_transform(
             abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
             return Err(if error == ADHOC_COLUMN_DENIED {
                 Status::permission_denied("access denied")
-            } else if error == ADHOC_OUTPUT_BUDGET {
+            } else if error == ADHOC_OUTPUT_BUDGET
+                || error == crate::sekai::adhoc_transform::ADHOC_QUEUE_FULL
+                || error == crate::sekai::transform_engine::BUDGET_MEMORY
+                || error == crate::sekai::transform_engine::BUDGET_TIME
+            {
                 Status::resource_exhausted(error)
             } else if error == ADHOC_IDENTITY_CONFLICT {
                 Status::already_exists(error)
@@ -2235,6 +2242,8 @@ pub(super) async fn run_adhoc_governed_transform(
     } else {
         // The store holds the scratch grant; this plane's cache learns it now.
         service.security.add_grant(&scratch_grant(&request, now));
+    }
+    if !outcome.replayed && !isolated {
         let recorded = record_tenant_transform_usage(
             quota.as_ref(),
             tenant_context
@@ -3546,7 +3555,15 @@ fn check_isolated_transform_datasets(
             .map(|(_, dataset_id)| dataset_id)
             .collect()
     };
+    let adhoc = run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC;
     for dataset_id in dataset_ids {
+        // Scratch datasets are granted to the ad-hoc run's caller only, who
+        // was authorized for them at submission; the worker reads the
+        // admitted snapshot and writes the output under the run's fenced
+        // claim, even once an input's retention has removed it (ADR 0138).
+        if adhoc && crate::sekai::adhoc_transform::is_scratch_dataset_id(&dataset_id) {
+            continue;
+        }
         let dataset = service
             .db
             .runtime()

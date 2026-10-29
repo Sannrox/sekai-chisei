@@ -94,7 +94,7 @@ declare requirements once every plane serving the store is upgraded.
 Definitions without `requires` keep their digest.
 
 Experimental `RunAdHocGovernedTransform` (ADR 0138) runs an inline analytical
-definition once for any caller with read access to the namespace. Inputs pass
+or isolated-process definition once for any caller with read access to the namespace. Inputs pass
 the preview read checks; an input whose columns the caller may only partly
 read is refused. The run is keyed by namespace, caller, `session_label` and
 `idempotency_key`, so a retry returns the same run and the same key with
@@ -106,7 +106,9 @@ writes nothing. The receipt has trigger cause `adhoc` and the session label as
 its trigger reference. The definition is never stored or listed, and scratch
 datasets stay out of `ListDatasets`. `TickGovernedTransforms` deletes expired
 scratch outputs, their rows and versions; the run and its receipt stay.
-Isolated-process ad-hoc runs are not available yet.
+An `isolated_process` ad-hoc definition is queued on the transform claim
+queue like a stored run; the worker's write-back fills the scratch output, and
+an output over the budget fails the run with that code and writes nothing.
 
 The plane's `/metrics` exports the isolated-process queue as three gauges per
 `profile` (`isolated_process`; other profiles run in the request) and worker

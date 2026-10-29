@@ -517,3 +517,207 @@ fn postgres_runtime_claim_transform_conformance() {
         .block_on(exercise_transform(db.clone(), &prefix));
     drop(db);
 }
+
+/// An isolated-process ad-hoc run (#1966) is claimed, read and written back
+/// through the published claim client into its scratch output; an output over
+/// the plane budget fails the run and writes nothing.
+async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
+    use sekai_chisei::sekai::adhoc_transform::{
+        ADHOC_OUTPUT_BUDGET, ADHOC_QUEUE_FULL, AdHocRequest, AdHocSubmission,
+        MAX_QUEUED_PER_CALLER, OutputBudget, SWEEP_BATCH, TRANSFORM_TRIGGER_ADHOC, run, sweep,
+    };
+    db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
+        .unwrap();
+    let input = format!("{prefix}-in");
+    db.create_dataset(&Dataset {
+        id: input.clone(),
+        name: "in".into(),
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: "string".into(),
+            classification: "public".into(),
+        }],
+        object_id: String::new(),
+        created: 1,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    seed_dataset_rows(&db, &input, &[HashMap::from([("id".into(), "1".into())])]);
+    let submit = |key: &str, input: &str| {
+        let request = AdHocRequest {
+            namespace: NAMESPACE.into(),
+            caller: "analyst".into(),
+            session_label: "explore".into(),
+            idempotency_key: format!("{prefix}-{key}"),
+        };
+        let transform = request
+            .bind(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: String::new(),
+                transform_id: String::new(),
+                input_dataset_id: input.to_string(),
+                output_dataset_id: String::new(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    inputs: Vec::new(),
+                    requires: Default::default(),
+                    code: TRANSFORM_CODE.into(),
+                }),
+                schedule: None,
+                trigger: None,
+            })
+            .prepare()
+            .unwrap();
+        let admitted = tokio::task::block_in_place(|| {
+            run(
+                &db,
+                &AdHocSubmission {
+                    request: &request,
+                    transform: &transform,
+                    budget: &OutputBudget::default(),
+                    column_allowlists: &HashMap::new(),
+                    expires_at_ms: i64::MAX,
+                    tenant_id: "",
+                },
+                30,
+            )
+        });
+        if let Ok(admitted) = &admitted {
+            assert_eq!(admitted.run.trigger_cause, TRANSFORM_TRIGGER_ADHOC);
+        }
+        admitted
+    };
+    let plane = ServingPlane::start(db.clone()).await;
+    let client = plane.client().await;
+    let claim = client.runtime_claim();
+    let claim_and_write = |admitted: sekai_chisei::sekai::adhoc_transform::AdHocRun,
+                           output: Vec<HashMap<String, String>>| {
+        let claim = &claim;
+        async move {
+            let claimed = match claim
+                .claim_transform_work("runner-a", &admitted.run.run_id, Duration::from_secs(30))
+                .await
+                .unwrap()
+            {
+                ClaimAttempt::Claimed(claimed) => claimed,
+                other => panic!("expected the ad-hoc run, got {other:?}"),
+            };
+            assert_eq!(claimed.transform.as_ref().unwrap().code, TRANSFORM_CODE);
+            let fence = TransformFence::from_work(&claimed.work.unwrap(), "runner-a");
+            let mut stream = claim
+                .read_transform_inputs(&fence, "", "", 0, 100)
+                .await
+                .unwrap();
+            let mut read = 0;
+            while let Some(item) = stream.next().await {
+                item.unwrap();
+                read += 1;
+            }
+            assert_eq!(read, 1);
+            claim
+                .write_transform_result(
+                    &fence,
+                    TransformWrite {
+                        rows: output
+                            .iter()
+                            .map(|values| TransformRunInputRow {
+                                alias: String::new(),
+                                dataset_id: admitted.scratch_dataset_id.clone(),
+                                row_id: 0,
+                                values: values.clone(),
+                                partition_key: String::new(),
+                            })
+                            .collect(),
+                        output_digest: rows_digest(&output),
+                        quarantined: false,
+                        quality_rule: String::new(),
+                        partitions: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap()
+                .run
+                .expect("completed run")
+        }
+    };
+
+    let admitted = submit("ok", &input).unwrap();
+    let scratch = admitted.scratch_dataset_id.clone();
+    assert!(
+        !tokio::task::block_in_place(|| sweep(&db, i64::MAX, SWEEP_BATCH))
+            .unwrap()
+            .contains(&scratch),
+        "a queued run's output waits for the run"
+    );
+    let written = claim_and_write(admitted, vec![HashMap::from([("id".into(), "1".into())])]).await;
+    assert_eq!(written.dispatch_status, "completed");
+    assert!(!written.quarantined);
+    assert_eq!(written.trigger_ref, "explore");
+    assert_eq!(
+        tokio::task::block_in_place(|| db.query_rows(&scratch, &Default::default()))
+            .unwrap()
+            .len(),
+        1
+    );
+    // A chained run admitted on that output still reads its snapshot after
+    // the output's retention removes it.
+    let chained = submit("chained", &scratch).unwrap();
+    assert!(
+        tokio::task::block_in_place(|| sweep(&db, i64::MAX, SWEEP_BATCH))
+            .unwrap()
+            .contains(&scratch),
+        "a finished run's output leaves at expiry"
+    );
+    let chained_written =
+        claim_and_write(chained, vec![HashMap::from([("id".into(), "1".into())])]).await;
+    assert!(!chained_written.quarantined);
+
+    let over = submit("over", &input).unwrap();
+    let over_scratch = over.scratch_dataset_id.clone();
+    let rows = (0..OutputBudget::default().max_rows + 1)
+        .map(|index| HashMap::from([("id".to_string(), index.to_string())]))
+        .collect();
+    let failed = claim_and_write(over, rows).await;
+    assert!(failed.quarantined);
+    assert_eq!(failed.quality_rule, ADHOC_OUTPUT_BUDGET);
+    assert!(
+        tokio::task::block_in_place(|| db.query_rows(&over_scratch, &Default::default()))
+            .unwrap()
+            .is_empty(),
+        "an over-budget output writes nothing"
+    );
+
+    // A caller holds a bounded number of queued isolated runs.
+    for index in 0..MAX_QUEUED_PER_CALLER {
+        submit(&format!("queued-{index}"), &input).unwrap();
+    }
+    assert_eq!(
+        submit("one-too-many", &input).unwrap_err(),
+        ADHOC_QUEUE_FULL
+    );
+    plane.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_runtime_claim_adhoc_isolated_conformance() {
+    exercise_adhoc_isolated(RuntimeDb::memory(), "sqlite-adhoc").await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_runtime_claim_adhoc_isolated_conformance() {
+    let scratch = ScratchDatabase::create();
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-adhoc-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_adhoc_isolated(db.clone(), &prefix));
+    drop(db);
+}

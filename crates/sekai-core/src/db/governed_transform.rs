@@ -456,6 +456,9 @@ impl SekaiDb {
                 .prepare(
                     "SELECT identity, dataset_id, namespace FROM sekai_adhoc_transform_run
                      WHERE expires_at_ms <= ?1 AND dataset_id != ''
+                       AND NOT EXISTS (SELECT 1 FROM sekai_transform_work work
+                            WHERE work.run_id = sekai_adhoc_transform_run.run_id
+                              AND work.status IN ('pending', 'claimed'))
                      ORDER BY expires_at_ms, identity LIMIT ?2",
                 )
                 .map_err(|error| error.to_string())?;
@@ -633,26 +636,57 @@ impl SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        let run = run_in_process_tx(
-            &tx,
-            transform,
-            &InProcessRun {
-                incremental: false,
-                trigger_cause: TRANSFORM_TRIGGER_ADHOC,
-                trigger_ref: &request.session_label,
+        let run = if transform.is_isolated_process() {
+            // Queued for a worker; write-back checks the budget and fills
+            // the scratch output (#1966).
+            // A caller holds a bounded number of queued runs, each with a
+            // stored input snapshot.
+            let queued: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_adhoc_transform_run run
+                     JOIN sekai_transform_work work ON work.run_id = run.run_id
+                     WHERE run.namespace = ?1 AND run.caller = ?2
+                       AND work.status IN ('pending', 'claimed')",
+                    params![request.namespace, request.caller],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if queued >= crate::sekai::adhoc_transform::MAX_QUEUED_PER_CALLER {
+                return Err(crate::sekai::adhoc_transform::ADHOC_QUEUE_FULL.into());
+            }
+            let mut run = admit_isolated_process_tx(
+                &tx,
+                transform,
                 now_ms,
                 tenant_id,
-                stored: false,
-                output_budget: Some(budget),
-                column_allowlists: Some(column_allowlists),
-            },
-        )?;
-        let output = live_output_rows(&tx, &transform.output_dataset_id)?;
-        tx.execute(
-            "UPDATE sekai_datasets SET columns = ?2 WHERE id = ?1",
-            params![transform.output_dataset_id, scratch_columns(&output)],
-        )
-        .map_err(|error| error.to_string())?;
+                Some(column_allowlists),
+            )?;
+            run.stamp_trigger(TRANSFORM_TRIGGER_ADHOC, &request.session_label);
+            persist_transform_run(&tx, &run)?;
+            run
+        } else {
+            let run = run_in_process_tx(
+                &tx,
+                transform,
+                &InProcessRun {
+                    incremental: false,
+                    trigger_cause: TRANSFORM_TRIGGER_ADHOC,
+                    trigger_ref: &request.session_label,
+                    now_ms,
+                    tenant_id,
+                    stored: false,
+                    output_budget: Some(budget),
+                    column_allowlists: Some(column_allowlists),
+                },
+            )?;
+            let output = live_output_rows(&tx, &transform.output_dataset_id)?;
+            tx.execute(
+                "UPDATE sekai_datasets SET columns = ?2 WHERE id = ?1",
+                params![transform.output_dataset_id, scratch_columns(&output)],
+            )
+            .map_err(|error| error.to_string())?;
+            run
+        };
         tx.execute(
             "INSERT INTO sekai_adhoc_transform_run
              (identity, namespace, caller, session_label, definition_digest, run_id, dataset_id,
@@ -1842,7 +1876,7 @@ fn run_governed_transform_tx(
     if transform.is_isolated_process() {
         // Operator RunGovernedTransform is not the scheduler cap; ticks and
         // change triggers consult can_admit_namespace.
-        let mut run = admit_isolated_process_tx(tx, &transform, now_ms, tenant_id)?;
+        let mut run = admit_isolated_process_tx(tx, &transform, now_ms, tenant_id, None)?;
         run.stamp_trigger(trigger_cause, trigger_ref);
         persist_transform_run(tx, &run)?;
         clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
@@ -2095,6 +2129,7 @@ fn admit_isolated_process_tx(
     transform: &GovernedTransform,
     now_ms: i64,
     tenant_id: &str,
+    column_allowlists: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<TransformRun, String> {
     let bindings = transform.input_bindings();
     for (_, dataset_id) in &bindings {
@@ -2107,11 +2142,23 @@ fn admit_isolated_process_tx(
     }
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
     let mut input_object_tokens: Vec<Option<String>> = Vec::new();
+    // An ad-hoc admission reads under the default input budget: a reader
+    // may submit it, and the snapshot is materialized here (ADR 0138).
+    let mut load_budget = column_allowlists
+        .map(|_| crate::sekai::governed_transform::InputLoadBudget::for_preview(transform));
     for (alias, dataset_id) in &bindings {
+        let records = list_row_records_after(tx, dataset_id, 0, load_budget.as_mut())?;
+        if let Some(reason) = load_budget.as_ref().and_then(|budget| budget.exceeded) {
+            return Err(reason.into());
+        }
+        crate::sekai::adhoc_transform::require_allowed_columns(
+            column_allowlists.and_then(|allowlists| allowlists.get(dataset_id)),
+            &records,
+        )?;
         loaded.push((
             alias.clone(),
             load_dataset_column_names(tx, dataset_id)?,
-            list_row_records_after(tx, dataset_id, 0, None)?,
+            records,
         ));
         let object_id = load_dataset_object_id(tx, dataset_id)?;
         input_object_tokens.push(load_object_marking_token(tx, &object_id)?);
@@ -2583,6 +2630,18 @@ fn write_transform_run_tx(
     let quality_error = evaluate_quality(quality_rows, &transform.quality_rule)
         .err()
         .map(|error| error.message());
+    // An ad-hoc run's output over the plane budget fails the run and writes
+    // nothing; it keeps no checkpoint and fires nothing downstream (ADR 0138).
+    let adhoc = run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC;
+    let quality_error = quality_error.or_else(|| {
+        (adhoc && !command.quarantined)
+            .then(|| {
+                crate::sekai::adhoc_transform::OutputBudget::default()
+                    .admit(quality_rows)
+                    .err()
+            })
+            .flatten()
+    });
     let quarantined = command.quarantined || quality_error.is_some();
     let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
     if quarantined {
@@ -2612,11 +2671,13 @@ fn write_transform_run_tx(
         let compute_ms = compute_since_claim(tx, &run.run_id, now_ms)?;
         record_run_finish(tx, &run.run_id, now_ms, compute_ms)?;
         delete_run_input_snapshot(tx, &run.run_id)?;
-        after_run_committed_tx(tx, &transform, &run, now_ms)?;
+        if !adhoc {
+            after_run_committed_tx(tx, &transform, &run, now_ms)?;
+        }
         return Ok(run);
     }
     let live = match load_checkpoint(tx, &transform.namespace, &transform.transform_id)? {
-        Some(((_, live_run_id, _), _)) if !live_run_id.is_empty() => {
+        Some(((_, live_run_id, _), _)) if !adhoc && !live_run_id.is_empty() => {
             load_transform_run(tx, &live_run_id)?
         }
         _ => None,
@@ -2657,7 +2718,17 @@ fn write_transform_run_tx(
     let compute_ms = compute_since_claim(tx, &run.run_id, now_ms)?;
     record_run_finish(tx, &run.run_id, now_ms, compute_ms)?;
     record_run_output_version(tx, &run.run_id, &transform.output_dataset_id)?;
-    tx.execute(
+    if adhoc {
+        tx.execute(
+            "UPDATE sekai_datasets SET columns = ?2 WHERE id = ?1",
+            params![
+                transform.output_dataset_id,
+                crate::sekai::adhoc_transform::scratch_columns(&command.rows)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        tx.execute(
         "INSERT OR REPLACE INTO sekai_governed_transform_checkpoint
          (namespace, transform_id, definition_digest, last_input_row_id, live_run_id, live_output_digest)
          VALUES (?1,?2,?3,?4,?5,?6)",
@@ -2671,12 +2742,15 @@ fn write_transform_run_tx(
         ],
     )
     .map_err(|error| error.to_string())?;
+    }
     let mut done = work;
     done.status = TRANSFORM_WORK_COMPLETED.into();
     persist_transform_work(tx, &done)?;
     persist_transform_usage_pending_tx(tx, &run.run_id, &done.tenant_id, now_ms)?;
     delete_run_input_snapshot(tx, &run.run_id)?;
-    after_run_committed_tx(tx, &transform, &run, now_ms)?;
+    if !adhoc {
+        after_run_committed_tx(tx, &transform, &run, now_ms)?;
+    }
     Ok(run)
 }
 

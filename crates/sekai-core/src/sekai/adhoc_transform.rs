@@ -23,6 +23,11 @@ pub const TRANSFORM_TRIGGER_ADHOC: &str = "adhoc";
 pub const ADHOC_OUTPUT_BUDGET: &str = "transform_adhoc_output_budget";
 /// Error of a run reading a column the caller may not read.
 pub const ADHOC_COLUMN_DENIED: &str = "transform_adhoc_column_denied";
+/// Error of an isolated submission while the caller has
+/// [`MAX_QUEUED_PER_CALLER`] isolated runs queued or claimed.
+pub const ADHOC_QUEUE_FULL: &str = "transform_adhoc_queue_full";
+/// Isolated ad-hoc runs one caller may have queued or claimed in a namespace.
+pub const MAX_QUEUED_PER_CALLER: i64 = 4;
 /// Error of a retried identity carrying a different definition.
 pub const ADHOC_IDENTITY_CONFLICT: &str =
     "an ad-hoc run with this session and idempotency key ran a different definition";
@@ -178,7 +183,8 @@ pub const SWEEP_BATCH: i64 = 256;
 /// Deletes up to `limit` expired scratch outputs (#1965): their rows,
 /// version snapshots, branches, health state and alerts, search and
 /// embedding entries, dataset, scratch object and grant. Decision audit
-/// stays. The run and its
+/// stays. An output whose isolated run is still queued or claimed waits
+/// until that run finishes. The run and its
 /// receipt stay; a replay of a swept identity returns the run with no
 /// scratch dataset. Each output is removed in its own transaction, claimed
 /// by clearing its dataset on the identity record, so planes sweeping at once
@@ -216,6 +222,13 @@ pub(crate) const SWEEP_STATEMENTS: &[&str] = &[
     "DELETE FROM sekai_object_changes WHERE object_id = {object}",
     "DELETE FROM sekai_objects WHERE id = {object}",
 ];
+
+/// Whether `id` has the shape of a scratch output dataset's id.
+pub fn is_scratch_dataset_id(id: &str) -> bool {
+    id.strip_prefix("scratch-").is_some_and(|digest| {
+        digest.len() == 32 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
 
 /// Whether `dataset` is a scratch output, kept out of catalog listings.
 pub fn is_scratch_dataset(dataset: &crate::sekai::dataset::Dataset) -> bool {
