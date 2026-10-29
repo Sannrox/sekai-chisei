@@ -4,6 +4,7 @@ use base64::Engine as _;
 use sekai_chisei::chisei::governed_subject_provenance::{
     ExportRecord, ProvenanceEnvelope, signing_key_from_hex,
 };
+use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::{postgres::PostgresDb, runtime_db::RuntimeDb};
 use std::sync::Arc;
 

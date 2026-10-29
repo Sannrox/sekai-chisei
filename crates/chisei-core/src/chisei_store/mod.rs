@@ -20,6 +20,7 @@ mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
 pub mod ext;
+pub mod governed_subject_provenance;
 mod handle;
 mod learning_change_store;
 pub mod policy_shadow;

@@ -20,6 +20,7 @@ use ed25519_dalek::VerifyingKey;
 use sekai_core::db::runtime_db::RuntimeDb;
 use sekai_core::sekai::evidence::EvidenceClassification;
 use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
+use sekai_types::governed_subject_provenance::ExportRecord;
 use sekai_types::principal::PrincipalContext;
 
 fn verify_evaluation_manifest(
@@ -765,6 +766,19 @@ pub trait ChiseiRuntimeDb {
         host_site_id: &str,
         now_ms: i64,
     ) -> Result<Redemption, String>;
+
+    fn put_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+        record: &ExportRecord,
+    ) -> Result<(ExportRecord, bool), String>;
+
+    fn get_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+    ) -> Result<Option<ExportRecord>, String>;
 }
 
 impl ChiseiRuntimeDb for RuntimeDb {
@@ -2802,6 +2816,33 @@ impl ChiseiRuntimeDb for RuntimeDb {
                     host_site_id,
                     now_ms,
                 )
+            }),
+        }
+    }
+
+    fn put_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+        record: &ExportRecord,
+    ) -> Result<(ExportRecord, bool), String> {
+        match self {
+            Self::Sqlite(db) => db.put_governed_subject_provenance_export(actor, export_id, record),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.put_governed_subject_provenance_export(actor, export_id, record)
+            }),
+        }
+    }
+
+    fn get_governed_subject_provenance_export(
+        &self,
+        actor: &str,
+        export_id: &str,
+    ) -> Result<Option<ExportRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_governed_subject_provenance_export(actor, export_id),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.get_governed_subject_provenance_export(actor, export_id)
             }),
         }
     }

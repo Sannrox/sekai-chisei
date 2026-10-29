@@ -57,7 +57,6 @@ use crate::sekai::security::*;
 use ed25519_dalek::VerifyingKey;
 use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use sekai_types::evolve;
-use sekai_types::governed_subject_provenance::ExportRecord;
 use sekai_types::principal::PrincipalContext;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -2201,33 +2200,6 @@ impl RuntimeDb {
                     namespace,
                     revision_digest,
                 )
-            }),
-        }
-    }
-
-    pub fn put_governed_subject_provenance_export(
-        &self,
-        actor: &str,
-        export_id: &str,
-        record: &ExportRecord,
-    ) -> Result<(ExportRecord, bool), String> {
-        match self {
-            Self::Sqlite(db) => db.put_governed_subject_provenance_export(actor, export_id, record),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.put_governed_subject_provenance_export(actor, export_id, record)
-            }),
-        }
-    }
-
-    pub fn get_governed_subject_provenance_export(
-        &self,
-        actor: &str,
-        export_id: &str,
-    ) -> Result<Option<ExportRecord>, String> {
-        match self {
-            Self::Sqlite(db) => db.get_governed_subject_provenance_export(actor, export_id),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.get_governed_subject_provenance_export(actor, export_id)
             }),
         }
     }

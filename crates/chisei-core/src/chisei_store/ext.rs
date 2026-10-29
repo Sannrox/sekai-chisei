@@ -7,6 +7,9 @@ pub use super::eval_run::{EvalRunPostgresDbExt, EvalRunRuntimeDbExt, EvalRunSeka
 pub use super::evaluation_execution::EvaluationExecutionSekaiDbExt;
 pub use super::evaluation_manifest::EvaluationManifestSekaiDbExt;
 pub use super::evaluation_plan::EvaluationPlanSekaiDbExt;
+pub use super::governed_subject_provenance::{
+    GovernedSubjectProvenancePostgresDbExt, GovernedSubjectProvenanceSekaiDbExt,
+};
 pub use super::learning_change_store::LearningChangeStoreSekaiDbExt;
 pub use super::policy_shadow::{PolicyShadowPostgresDbExt, PolicyShadowSekaiDbExt};
 pub use super::postgres_chisei_receipts::PostgresChiseiReceiptsPostgresDbExt;
