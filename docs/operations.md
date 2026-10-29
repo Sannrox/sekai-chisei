@@ -150,8 +150,11 @@ object changes and content events are rewritten as in the hot tables, and
 attestations of an erased decision are removed. Content events are archived only once a `content_events`
 policy is set. Archive files written by earlier releases are kept as they
 are and verify with `SekaiDb::verify_archive`; nothing is imported from them.
-No operator command runs retention yet (#1987). On PostgreSQL only content
-events are covered so far; see [postgres-sekai-parity.md](postgres-sekai-parity.md).
+No operator command runs retention yet (#1987). On PostgreSQL LLM calls,
+task observations and content events are covered so far (migration 0135
+adds the observation `data_class` and `retention_tombstone` columns); audit
+records and object changes follow. See
+[postgres-sekai-parity.md](postgres-sekai-parity.md).
 
 ## Gateway safeguards
 

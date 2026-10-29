@@ -7,6 +7,11 @@ use crate::sekai::retention::{
     ArchiveRun, ArchiveVerification, RetentionPolicy, SubjectErasureRequest, SubjectErasureResult,
 };
 use crate::sekai::retention::{
+    CONTENT_EVENTS_DATASET, DAY_MS, LLM_CALLS_DATASET, ObservationPlan, RETENTION_BATCH_SIZE,
+    RETENTION_TOMBSTONE_CONTEXT, RetainedObservation, effective_policy, fold_observation_baseline,
+    llm_call_expired, plan_observation_retention,
+};
+use crate::sekai::retention::{
     legacy_redact_subject_value as redact_subject_value,
     legacy_value_mentions_subject as value_mentions_subject,
 };
@@ -125,8 +130,8 @@ impl PostgresDb {
                 kind: &request.subject_kind,
                 subject: &request.subject,
                 hash: &subject_hash,
-                // Only content events are archived here; their rule is by
-                // reference, not by object.
+                // PostgreSQL's hot rules for the datasets archived here do
+                // not follow related objects; see `postgres_hot_rule_deletes`.
                 object_ids: &[],
                 reference_ids: &archived_reference_ids,
             },
@@ -286,29 +291,285 @@ impl PostgresDb {
     /// event table. References, payloads, objects, and reconciliation decisions
     /// stay in place so archive maintenance cannot sever lineage.
     pub fn archive_lifecycle_records(&self, cutoff_ms: i64) -> Result<ArchiveRun, String> {
-        let mut run = self.archive_content_events(cutoff_ms, false)?;
+        let mut run = self.archive_content_events(cutoff_ms)?;
         // Earlier callers read the count here.
         run.audit_archived = run.content_events_archived;
         Ok(run)
     }
 
-    /// The retention entry point on PostgreSQL (ADR 0141). This layer
-    /// archives content events by their stored policy; the other datasets
-    /// follow in later layers and are left in place here.
+    /// The retention entry point on PostgreSQL (ADR 0141), as on SQLite:
+    /// LLM calls, task observations and content events past their stored
+    /// policies move into the in-database archive and are deleted or
+    /// redacted in the hot tables, in batches of at most
+    /// `RETENTION_BATCH_SIZE` records per dataset, one transaction each,
+    /// until nothing is left. Each batch claims the archive lock for its
+    /// transaction and locks the rows it reads, so replicas running at once
+    /// take turns batch by batch and archive every record once; a crash
+    /// loses only the uncommitted batch, which a rerun redoes. A dry run
+    /// counts everything in one pass and rolls it back. Audit records and
+    /// object changes are not archived here yet (#1985, #1986).
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        if dry_run {
+            return self.archive_retained_batch(
+                now,
+                true,
+                i64::MAX,
+                &mut RetentionCursor::default(),
+            );
+        }
+        let limit = i64::try_from(RETENTION_BATCH_SIZE).unwrap_or(i64::MAX);
+        let mut cursor = RetentionCursor::default();
+        let mut total = ArchiveRun::default();
+        while !cursor.done() {
+            let batch = self.archive_retained_batch(now, false, limit, &mut cursor)?;
+            if !batch.batch_id.is_empty() {
+                total.absorb(batch);
+            }
+        }
+        self.finish_retention_run(now, total.llm_calls_archived > 0)?;
+        Ok(total)
+    }
+
+    /// After a run's last batch, on every run: drop calls past their policy
+    /// from the `llm_calls` versions and branches, so a run that crashed
+    /// before this step is completed by the next one. Records an `archive`
+    /// version when this run archived calls.
+    fn finish_retention_run(&self, now: i64, archived_calls: bool) -> Result<(), String> {
         let policies = self.list_retention_policies()?;
-        let Some(policy) = policies.iter().find(|policy| {
-            policy.dataset == crate::sekai::retention::CONTENT_EVENTS_DATASET
-                && policy.namespace.is_empty()
-                && policy.data_class.is_empty()
-        }) else {
-            return Ok(ArchiveRun {
-                dry_run,
-                ..ArchiveRun::default()
-            });
+        let mut connection = self.connection()?;
+        let mut tx = connection.transaction().map_err(err)?;
+        // The order erasure takes: the retention lock, then the dataset rows.
+        tx.query_one("SELECT pg_advisory_xact_lock_shared(251,251)", &[])
+            .map_err(err)?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, LLM_CALLS_DATASET)?;
+        erase_expired_llm_call_versions(&mut tx, &policies, now, archived_calls)?;
+        tx.commit().map_err(err)
+    }
+
+    /// One batch: at most `limit` records per dataset, moved and removed in
+    /// one transaction. Records already moved are gone from the hot tables or
+    /// marked, so the next batch, or a rerun after a crash, starts where this
+    /// one ended.
+    fn archive_retained_batch(
+        &self,
+        now: i64,
+        dry_run: bool,
+        limit: i64,
+        cursor: &mut RetentionCursor,
+    ) -> Result<ArchiveRun, String> {
+        let policies = self.list_retention_policies()?;
+        let mut connection = self.connection()?;
+        let mut tx = connection.transaction().map_err(err)?;
+        // Shared with other batches, exclusive against erasure; then the
+        // per-batch claim every replica's batch takes, so batches never
+        // interleave; then the rows lock `llm_calls` writers take.
+        tx.query_one("SELECT pg_advisory_xact_lock_shared(251,251)", &[])
+            .map_err(err)?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended('sekai.lifecycle.archive',251))",
+            &[],
+        )
+        .map_err(err)?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, LLM_CALLS_DATASET)?;
+        let full = |rows: usize| i64::try_from(rows).unwrap_or(i64::MAX) >= limit;
+        let mut records = Vec::<ArchiveRecord>::new();
+
+        let mut llm_ids = Vec::new();
+        if !cursor.llm_done {
+            let rows = tx
+                .query(
+                    "SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=$1 AND id>$2
+                     ORDER BY id LIMIT $3 FOR UPDATE",
+                    &[&LLM_CALLS_DATASET, &cursor.llm_after, &limit],
+                )
+                .map_err(err)?;
+            cursor.llm_done = !full(rows.len());
+            if let Some(last) = rows.last() {
+                cursor.llm_after = last.get(0);
+            }
+            for row in rows {
+                let id: i64 = row.get(0);
+                let data: String = row.get(1);
+                let values = serde_json::from_str(&data).unwrap_or_default();
+                if llm_call_expired(&values, &policies, now) {
+                    llm_ids.push(id);
+                    records.push(ArchiveRecord {
+                        dataset: LLM_CALLS_DATASET.into(),
+                        source_key: id.to_string(),
+                        payload: data,
+                    });
+                }
+            }
+        }
+
+        let mut observations = Vec::new();
+        if !cursor.observations_done {
+            let (component, timestamp, request) = cursor.observation_after.clone().map_or(
+                (None, 0, String::new()),
+                |(component, timestamp, request)| (Some(component), timestamp, request),
+            );
+            let rows = tx
+                .query(
+                    "SELECT request_id,namespace,data_class,component_id,model,status,timestamp,
+                            packages_json,context_json,retention_tombstone
+                     FROM sekai_task_observations
+                     WHERE $1::TEXT IS NULL OR (component_id,timestamp,request_id) > ($1,$2,$3)
+                     ORDER BY component_id,timestamp,request_id LIMIT $4 FOR UPDATE",
+                    &[&component, &timestamp, &request, &limit],
+                )
+                .map_err(err)?;
+            cursor.observations_done = !full(rows.len());
+            observations = rows
+                .into_iter()
+                .map(|row| RetainedObservation {
+                    key: (row.get::<_, String>(0), row.get::<_, String>(3)),
+                    request_id: row.get(0),
+                    namespace: row.get(1),
+                    data_class: row.get(2),
+                    component_id: row.get(3),
+                    model: row.get(4),
+                    status: row.get(5),
+                    timestamp: row.get(6),
+                    packages_json: row.get(7),
+                    context_json: row.get(8),
+                    retention_tombstone: row.get(9),
+                })
+                .collect::<Vec<_>>();
+            if let Some(last) = observations.last() {
+                cursor.observation_after = Some((
+                    last.component_id.clone(),
+                    last.timestamp,
+                    last.request_id.clone(),
+                ));
+            }
+        }
+        let ObservationPlan {
+            records: observation_records,
+            folded,
+            redacted,
+        } = plan_observation_retention(
+            observations,
+            &policies,
+            now,
+            &mut cursor.retained_components,
+        );
+        let observations_archived = observation_records.len();
+        records.extend(observation_records.into_iter().map(ArchiveRecord::from));
+
+        // Content events carry no namespace or class: only the dataset-wide
+        // policy applies.
+        let mut event_ids = Vec::new();
+        if let (false, Some(policy)) = (
+            cursor.content_events_done,
+            effective_policy(&policies, CONTENT_EVENTS_DATASET, "", ""),
+        ) {
+            let cutoff = now - i64::from(policy.retention_days) * DAY_MS;
+            let rows = tx
+                .query(
+                    "SELECT id,event_kind,blob_id,reference_id,actor,reason,created_at_ms
+                     FROM sekai_content_events WHERE created_at_ms<$1
+                     ORDER BY id LIMIT $2 FOR UPDATE",
+                    &[&cutoff, &limit],
+                )
+                .map_err(err)?;
+            cursor.content_events_done = !full(rows.len());
+            for row in rows {
+                event_ids.push(row.get::<_, String>(0));
+                records.push(content_event_record(&row));
+            }
+        } else {
+            cursor.content_events_done = true;
+        }
+
+        let mut run = ArchiveRun {
+            llm_calls_archived: llm_ids.len() as i32,
+            task_observations_archived: observations_archived as i32,
+            task_observations_redacted: redacted.len() as i32,
+            content_events_archived: event_ids.len() as i32,
+            dry_run,
+            ..ArchiveRun::default()
         };
-        let cutoff = now - i64::from(policy.retention_days) * 86_400_000;
-        self.archive_content_events(cutoff, dry_run)
+        if records.is_empty() {
+            tx.commit().map_err(err)?;
+            return Ok(run);
+        }
+        (run.batch_id, run.content_hash) = write_archive_batch(&mut tx, now, records)?;
+        run.batches = 1;
+        for id in &event_ids {
+            tx.execute("DELETE FROM sekai_content_events WHERE id=$1", &[id])
+                .map_err(err)?;
+        }
+        for id in &llm_ids {
+            tx.execute("DELETE FROM sekai_dataset_rows WHERE id=$1", &[id])
+                .map_err(err)?;
+        }
+        // A dry run does the once-per-run version work here and rolls it
+        // back; a run does it after its last batch.
+        if dry_run && !llm_ids.is_empty() {
+            erase_expired_llm_call_versions(&mut tx, &policies, now, true)?;
+        }
+        for (component_id, (namespace, rows)) in folded {
+            let baseline = tx
+                .query_opt(
+                    "SELECT task_total,task_succeeded,consecutive_failures
+                     FROM sekai_task_observation_baselines WHERE component_id=$1 FOR UPDATE",
+                    &[&component_id],
+                )
+                .map_err(err)?
+                .map_or((0, 0, 0), |row| (row.get(0), row.get(1), row.get(2)));
+            let statuses = rows
+                .iter()
+                .map(|(_, status)| status.clone())
+                .collect::<Vec<_>>();
+            let (total, succeeded, failures) = fold_observation_baseline(baseline, &statuses);
+            tx.execute(
+                "INSERT INTO sekai_task_observation_baselines
+                 (component_id,namespace,task_total,task_succeeded,consecutive_failures,created)
+                 VALUES($1,$2,$3,$4,$5,$6)
+                 ON CONFLICT(component_id) DO UPDATE SET namespace=excluded.namespace,
+                   task_total=excluded.task_total,task_succeeded=excluded.task_succeeded,
+                   consecutive_failures=excluded.consecutive_failures,created=excluded.created",
+                &[
+                    &component_id,
+                    &namespace,
+                    &total,
+                    &succeeded,
+                    &failures,
+                    &(now / 1000),
+                ],
+            )
+            .map_err(err)?;
+            for ((request_id, component_id), _) in rows {
+                tx.execute(
+                    "DELETE FROM sekai_task_observations WHERE request_id=$1 AND component_id=$2",
+                    &[&request_id, &component_id],
+                )
+                .map_err(err)?;
+            }
+        }
+        for (request_id, component_id) in redacted {
+            // As on SQLite: the row stays, as a marked tombstone that keeps
+            // nothing of the observation.
+            tx.execute(
+                "UPDATE sekai_task_observations
+                 SET request_id=$1,namespace='',data_class='unclassified',model='[redacted]',
+                     packages_json='[]',context_json=$2,retention_tombstone=TRUE
+                 WHERE request_id=$3 AND component_id=$4",
+                &[
+                    &format!("retention-tombstone:{}", uuid::Uuid::new_v4().simple()),
+                    &RETENTION_TOMBSTONE_CONTEXT,
+                    &request_id,
+                    &component_id,
+                ],
+            )
+            .map_err(err)?;
+        }
+        if dry_run {
+            tx.rollback().map_err(err)?;
+        } else {
+            tx.commit().map_err(err)?;
+        }
+        Ok(run)
     }
 
     /// Verify every batch of the in-database archive; an empty one verifies.
@@ -355,33 +616,24 @@ impl PostgresDb {
         })
     }
 
-    /// Archive content events created before `cutoff_ms` and remove them from
-    /// the hot table in one transaction; `dry_run` rolls it back.
-    fn archive_content_events(&self, cutoff_ms: i64, dry_run: bool) -> Result<ArchiveRun, String> {
-        // As on SQLite: a dry run counts in one pass; a run moves bounded
-        // batches, one transaction each, until none is left.
-        if dry_run {
-            return self.archive_content_event_batch(cutoff_ms, true, i64::MAX);
-        }
-        let limit =
-            i64::try_from(crate::sekai::retention::RETENTION_BATCH_SIZE).unwrap_or(i64::MAX);
+    /// Archive content events created before `cutoff_ms` and remove them
+    /// from the hot table, in bounded batches, one transaction each, until
+    /// none is left.
+    fn archive_content_events(&self, cutoff_ms: i64) -> Result<ArchiveRun, String> {
+        let limit = i64::try_from(RETENTION_BATCH_SIZE).unwrap_or(i64::MAX);
         let mut total = ArchiveRun::default();
         loop {
-            let batch = self.archive_content_event_batch(cutoff_ms, false, limit)?;
+            let batch = self.archive_content_event_batch(cutoff_ms, limit)?;
             if batch.batch_id.is_empty() {
                 return Ok(total);
             }
-            total.batches += 1;
-            total.content_events_archived += batch.content_events_archived;
-            total.batch_id = batch.batch_id;
-            total.content_hash = batch.content_hash;
+            total.absorb(batch);
         }
     }
 
     fn archive_content_event_batch(
         &self,
         cutoff_ms: i64,
-        dry_run: bool,
         limit: i64,
     ) -> Result<ArchiveRun, String> {
         let mut connection = self.connection()?;
@@ -393,124 +645,32 @@ impl PostgresDb {
             &[],
         )
         .map_err(err)?;
-        let mut records = tx
+        let rows = tx
             .query(
                 "SELECT id,event_kind,blob_id,reference_id,actor,reason,created_at_ms
                  FROM sekai_content_events WHERE created_at_ms<$1 ORDER BY id LIMIT $2 FOR UPDATE",
                 &[&cutoff_ms, &limit],
             )
-            .map_err(err)?
-            .into_iter()
-            .map(|row| ArchiveRecord {
-                dataset: "content_events".into(),
-                source_key: row.get(0),
-                payload: serde_json::json!({
-                    "event_kind": row.get::<_, String>(1),
-                    "blob_id": row.get::<_, String>(2),
-                    "reference_id": row.get::<_, Option<String>>(3),
-                    "actor": row.get::<_, String>(4),
-                    "reason": row.get::<_, String>(5),
-                    "created_at_ms": row.get::<_, i64>(6),
-                })
-                .to_string(),
-            })
-            .collect::<Vec<_>>();
+            .map_err(err)?;
+        if rows.is_empty() {
+            tx.commit().map_err(err)?;
+            return Ok(ArchiveRun::default());
+        }
+        let records = rows.iter().map(content_event_record).collect();
+        let (batch_id, content_hash) = write_archive_batch(&mut tx, cutoff_ms, records)?;
         // Hot rows are deleted by their own ids; the archive keys them opaquely.
-        let event_ids = records
-            .iter()
-            .map(|record| record.source_key.clone())
-            .collect::<Vec<_>>();
-        for record in &mut records {
-            record.source_key =
-                crate::sekai::retention::archive_source_key(&record.dataset, &record.source_key);
-        }
-        records.sort_by(|left, right| {
-            (&left.dataset, &left.source_key).cmp(&(&right.dataset, &right.source_key))
-        });
-        if records.is_empty() {
-            tx.commit().map_err(err)?;
-            return Ok(ArchiveRun {
-                dry_run,
-                ..ArchiveRun::default()
-            });
-        }
-        let hashes = records.iter().map(record_hash).collect::<Vec<_>>();
-        let content_hash = hash_json(&hashes)?;
-        let batch_id = hash_json(&(cutoff_ms, &content_hash))?;
-        tx.execute(
-            "INSERT INTO sekai_archive_batches
-             (id,cutoff_ms,content_hash,record_count,created_at_ms)
-             VALUES($1,$2,$3,$4,$2) ON CONFLICT(id) DO NOTHING",
-            &[
-                &batch_id,
-                &cutoff_ms,
-                &content_hash,
-                &(records.len() as i64),
-            ],
-        )
-        .map_err(err)?;
-        let batch = tx
-            .query_one(
-                "SELECT cutoff_ms,content_hash,record_count FROM sekai_archive_batches WHERE id=$1",
-                &[&batch_id],
-            )
-            .map_err(err)?;
-        if batch.get::<_, i64>(0) != cutoff_ms
-            || batch.get::<_, String>(1) != content_hash
-            || batch.get::<_, i64>(2) != records.len() as i64
-        {
-            return Err("archive batch identity conflicts with existing content".into());
-        }
-        for (record, payload_hash) in records.iter().zip(&hashes) {
+        for row in &rows {
             tx.execute(
-                "INSERT INTO sekai_archive_records
-                 (dataset,source_key,payload,payload_hash,archived_at_ms)
-                 VALUES($1,$2,$3,$4,$5) ON CONFLICT(dataset,source_key) DO NOTHING",
-                &[
-                    &record.dataset,
-                    &record.source_key,
-                    &record.payload,
-                    &payload_hash,
-                    &cutoff_ms,
-                ],
-            )
-            .map_err(err)?;
-            let stored: String = tx
-                .query_one(
-                    "SELECT payload_hash FROM sekai_archive_records
-                     WHERE dataset=$1 AND source_key=$2",
-                    &[&record.dataset, &record.source_key],
-                )
-                .map_err(err)?
-                .get(0);
-            if stored != *payload_hash {
-                return Err(format!(
-                    "archive record {}:{} conflicts with existing content",
-                    record.dataset, record.source_key
-                ));
-            }
-            tx.execute(
-                "INSERT INTO sekai_archive_batch_records(batch_id,dataset,source_key)
-                 VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
-                &[&batch_id, &record.dataset, &record.source_key],
+                "DELETE FROM sekai_content_events WHERE id=$1",
+                &[&row.get::<_, String>(0)],
             )
             .map_err(err)?;
         }
-        verify_batch(&mut tx, &batch_id)?;
-        for id in &event_ids {
-            tx.execute("DELETE FROM sekai_content_events WHERE id=$1", &[id])
-                .map_err(err)?;
-        }
-        if dry_run {
-            tx.rollback().map_err(err)?;
-        } else {
-            tx.commit().map_err(err)?;
-        }
+        tx.commit().map_err(err)?;
         Ok(ArchiveRun {
             batch_id,
             content_hash,
-            content_events_archived: records.len() as i32,
-            dry_run,
+            content_events_archived: rows.len() as i32,
             batches: 1,
             ..ArchiveRun::default()
         })
@@ -535,6 +695,226 @@ impl PostgresDb {
             }),
         }
     }
+}
+
+/// Where a PostgreSQL retention run has got to, carried from batch to
+/// batch so each batch reads at most one page per dataset. Content events
+/// leave the hot table and restart at the oldest remaining; LLM calls and
+/// observations, which keep rows a batch did not archive, resume after the
+/// last key read.
+#[derive(Debug, Default)]
+struct RetentionCursor {
+    llm_after: i64,
+    llm_done: bool,
+    /// `(component_id, timestamp, request_id)` of the last observation read.
+    observation_after: Option<(String, i64, String)>,
+    /// Components with a retained row read so far: their later expired rows
+    /// are redacted in place rather than folded.
+    retained_components: std::collections::BTreeSet<String>,
+    observations_done: bool,
+    content_events_done: bool,
+}
+
+impl RetentionCursor {
+    fn done(&self) -> bool {
+        self.llm_done && self.observations_done && self.content_events_done
+    }
+}
+
+impl From<crate::sekai::retention::ArchiveRecord> for ArchiveRecord {
+    fn from(record: crate::sekai::retention::ArchiveRecord) -> Self {
+        Self {
+            dataset: record.dataset.into(),
+            source_key: record.source_key,
+            payload: record.payload,
+        }
+    }
+}
+
+/// A content event row (`id,event_kind,blob_id,reference_id,actor,reason,
+/// created_at_ms`) as its archive record; the same payload SQLite archives.
+fn content_event_record(row: &Row) -> ArchiveRecord {
+    ArchiveRecord {
+        dataset: CONTENT_EVENTS_DATASET.into(),
+        source_key: row.get(0),
+        payload: serde_json::json!({
+            "event_kind": row.get::<_, String>(1),
+            "blob_id": row.get::<_, String>(2),
+            "reference_id": row.get::<_, Option<String>>(3),
+            "actor": row.get::<_, String>(4),
+            "reason": row.get::<_, String>(5),
+            "created_at_ms": row.get::<_, i64>(6),
+        })
+        .to_string(),
+    }
+}
+
+/// Write one archive batch of `records` (natural keys; keyed opaquely here)
+/// and verify it, returning its id and content hash. Idempotent: the batch
+/// id is a hash of `cutoff_ms` and its content, and a record already there
+/// must hold the same payload.
+fn write_archive_batch(
+    tx: &mut impl GenericClient,
+    cutoff_ms: i64,
+    mut records: Vec<ArchiveRecord>,
+) -> Result<(String, String), String> {
+    for record in &mut records {
+        record.source_key =
+            crate::sekai::retention::archive_source_key(&record.dataset, &record.source_key);
+    }
+    records.sort_by(|left, right| {
+        (&left.dataset, &left.source_key).cmp(&(&right.dataset, &right.source_key))
+    });
+    let hashes = records.iter().map(record_hash).collect::<Vec<_>>();
+    let content_hash = hash_json(&hashes)?;
+    let batch_id = hash_json(&(cutoff_ms, &content_hash))?;
+    tx.execute(
+        "INSERT INTO sekai_archive_batches
+         (id,cutoff_ms,content_hash,record_count,created_at_ms)
+         VALUES($1,$2,$3,$4,$2) ON CONFLICT(id) DO NOTHING",
+        &[
+            &batch_id,
+            &cutoff_ms,
+            &content_hash,
+            &(records.len() as i64),
+        ],
+    )
+    .map_err(err)?;
+    let batch = tx
+        .query_one(
+            "SELECT cutoff_ms,content_hash,record_count FROM sekai_archive_batches WHERE id=$1",
+            &[&batch_id],
+        )
+        .map_err(err)?;
+    if batch.get::<_, i64>(0) != cutoff_ms
+        || batch.get::<_, String>(1) != content_hash
+        || batch.get::<_, i64>(2) != records.len() as i64
+    {
+        return Err("archive batch identity conflicts with existing content".into());
+    }
+    for (record, payload_hash) in records.iter().zip(&hashes) {
+        tx.execute(
+            "INSERT INTO sekai_archive_records
+             (dataset,source_key,payload,payload_hash,archived_at_ms)
+             VALUES($1,$2,$3,$4,$5) ON CONFLICT(dataset,source_key) DO NOTHING",
+            &[
+                &record.dataset,
+                &record.source_key,
+                &record.payload,
+                &payload_hash,
+                &cutoff_ms,
+            ],
+        )
+        .map_err(err)?;
+        let stored: String = tx
+            .query_one(
+                "SELECT payload_hash FROM sekai_archive_records
+                 WHERE dataset=$1 AND source_key=$2",
+                &[&record.dataset, &record.source_key],
+            )
+            .map_err(err)?
+            .get(0);
+        if stored != *payload_hash {
+            return Err(format!(
+                "archive record {}:{} conflicts with existing content",
+                record.dataset, record.source_key
+            ));
+        }
+        tx.execute(
+            "INSERT INTO sekai_archive_batch_records(batch_id,dataset,source_key)
+             VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+            &[&batch_id, &record.dataset, &record.source_key],
+        )
+        .map_err(err)?;
+    }
+    verify_batch(tx, &batch_id)?;
+    Ok((batch_id, content_hash))
+}
+
+/// Drop calls past their policy from the `llm_calls` branches and versions,
+/// and record an `archive` version when `snapshot`. Only the rows the policy
+/// selects go: branches, change-bundle previews included, keep every other
+/// row, and nothing is written when no row has expired. Unreadable version
+/// rows go too, as on SQLite. The caller holds the rows lock.
+fn erase_expired_llm_call_versions(
+    tx: &mut postgres::Transaction<'_>,
+    policies: &[RetentionPolicy],
+    now: i64,
+    snapshot: bool,
+) -> Result<(), String> {
+    let expired = |data: &str| {
+        serde_json::from_str(data).is_ok_and(|values| llm_call_expired(&values, policies, now))
+    };
+    let branch_rows = tx
+        .query(
+            "SELECT name,row_id,data FROM sekai_dataset_branch_rows
+             WHERE dataset_id=$1 FOR UPDATE",
+            &[&LLM_CALLS_DATASET],
+        )
+        .map_err(err)?
+        .into_iter()
+        .filter(|row| expired(row.get(2)))
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+    let version_rows = tx
+        .query(
+            "SELECT version_id,row_id,data FROM sekai_dataset_version_rows
+             WHERE dataset_id=$1 FOR UPDATE",
+            &[&LLM_CALLS_DATASET],
+        )
+        .map_err(err)?
+        .into_iter()
+        .filter(|row| {
+            let data: &str = row.get(2);
+            serde_json::from_str::<std::collections::HashMap<String, String>>(data).is_err()
+                || expired(data)
+        })
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+    for (name, row_id) in &branch_rows {
+        tx.execute(
+            "DELETE FROM sekai_dataset_branch_rows
+             WHERE dataset_id=$1 AND name=$2 AND row_id=$3",
+            &[&LLM_CALLS_DATASET, name, row_id],
+        )
+        .map_err(err)?;
+    }
+    for (version_id, row_id) in &version_rows {
+        tx.execute(
+            "DELETE FROM sekai_dataset_version_rows
+             WHERE dataset_id=$1 AND version_id=$2 AND row_id=$3",
+            &[&LLM_CALLS_DATASET, version_id, row_id],
+        )
+        .map_err(err)?;
+    }
+    if !version_rows.is_empty() {
+        tx.execute(
+            "UPDATE sekai_dataset_versions SET row_count = (
+                SELECT COUNT(*) FROM sekai_dataset_version_rows
+                WHERE dataset_id = sekai_dataset_versions.dataset_id
+                  AND version_id = sekai_dataset_versions.version_id
+             ) WHERE dataset_id=$1",
+            &[&LLM_CALLS_DATASET],
+        )
+        .map_err(err)?;
+    }
+    if snapshot {
+        match crate::db::postgres_dataset::snapshot_dataset_version_pg(
+            tx,
+            LLM_CALLS_DATASET,
+            "",
+            "",
+            "archive",
+            "",
+            now,
+        ) {
+            Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
+            other => {
+                other?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn append_subject_erasure_decision(
@@ -754,6 +1134,29 @@ fn erase_supported_subject_data(
                     &[&values[0], &values[1]],
                 )
                 .map_err(err)? as i32;
+        }
+    }
+    // Retention folds expired observations into a component baseline that
+    // keeps the component and namespace: the same rule removes it.
+    for row in client
+        .query(
+            "SELECT component_id,namespace FROM sekai_task_observation_baselines
+             ORDER BY component_id FOR UPDATE",
+            &[],
+        )
+        .map_err(err)?
+    {
+        let component_id: String = row.get(0);
+        let namespace: String = row.get(1);
+        if [&component_id, &namespace].iter().any(|value| {
+            *value == subject || value_mentions_subject(value, &request.subject_kind, subject)
+        }) {
+            client
+                .execute(
+                    "DELETE FROM sekai_task_observation_baselines WHERE component_id=$1",
+                    &[&component_id],
+                )
+                .map_err(err)?;
         }
     }
 
@@ -1219,6 +1622,40 @@ fn tombstone_decisions(
     Ok(())
 }
 
+/// Whether PostgreSQL's own hot erasure would delete this archived record:
+/// an LLM call whose data mentions the subject, or an observation with a
+/// column that does (see `erase_supported_subject_data`). Archived records
+/// are erased by the shared per-dataset rules on top, so the archive is
+/// never weaker than the hot table on either backend.
+fn postgres_hot_rule_deletes(
+    dataset: &str,
+    payload: &str,
+    subject: &ArchiveErasureSubject<'_>,
+) -> bool {
+    let mentions = |value: &str| {
+        value == subject.subject || value_mentions_subject(value, subject.kind, subject.subject)
+    };
+    match dataset {
+        LLM_CALLS_DATASET => mentions(payload),
+        crate::sekai::retention::TASK_OBSERVATIONS_DATASET => {
+            serde_json::from_str::<serde_json::Value>(payload).is_ok_and(|row| {
+                [
+                    "request_id",
+                    "component_id",
+                    "namespace",
+                    "model",
+                    "status",
+                    "packages_json",
+                    "context_json",
+                ]
+                .iter()
+                .any(|field| row[field].as_str().is_some_and(mentions))
+            })
+        }
+        _ => false,
+    }
+}
+
 /// Whether a content reference, by its `[actor, operation_id,
 /// causal_identity]`, belongs to the subject: actors for agents and users,
 /// the operation and causal identity for work units.
@@ -1263,7 +1700,12 @@ fn redact_archived_subject(
         let dataset: String = row.get(0);
         let source_key: String = row.get(1);
         let payload: String = row.get(2);
-        let redacted_payload = match erase_archived_record(&dataset, &payload, subject) {
+        let erasure = if postgres_hot_rule_deletes(&dataset, &payload, subject) {
+            ArchivedErasure::Delete
+        } else {
+            erase_archived_record(&dataset, &payload, subject)
+        };
+        let redacted_payload = match erasure {
             ArchivedErasure::Keep => continue,
             ArchivedErasure::Rewrite(redacted) => redacted,
             ArchivedErasure::Delete => {
@@ -1509,9 +1951,163 @@ mod tests {
         }
     }
 
+    /// Serializes the tests here that archive: they share one database.
+    static ARCHIVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn archiving() -> std::sync::MutexGuard<'static, ()> {
+        ARCHIVING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A run that committed one batch and then died, plus a batch rolled
+    /// back mid-way, leave a rerun to archive every remaining record once:
+    /// nothing duplicated, nothing lost.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_retention_resumes_after_an_interrupted_run() {
+        let _serial = archiving();
+        let db = database();
+        let prefix = format!("resume-{}", uuid::Uuid::new_v4().simple());
+        let backlog = 600;
+        let _ = db.create_dataset(&crate::sekai::dataset::Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        });
+        db.append_dataset_rows(
+            LLM_CALLS_DATASET,
+            &(0..backlog)
+                .map(|index| {
+                    std::collections::HashMap::from([
+                        ("project".to_string(), prefix.clone()),
+                        ("call".to_string(), index.to_string()),
+                        ("timestamp_ms".to_string(), "1".to_string()),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: prefix.clone(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let now = 2 * DAY_MS;
+        let first = db
+            .archive_retained_batch(
+                now,
+                false,
+                i64::try_from(RETENTION_BATCH_SIZE).unwrap(),
+                &mut RetentionCursor::default(),
+            )
+            .unwrap();
+        assert!(first.llm_calls_archived > 0);
+        // A batch that dies before commit: the dry run's rolled-back batch.
+        db.archive_retained_records(now, true).unwrap();
+        db.archive_retained_records(now, false).unwrap();
+        let mut connection = db.connection().unwrap();
+        let count = |connection: &mut postgres::Client, sql: &str| -> i64 {
+            connection
+                .query_one(sql, &[&format!("%\"{prefix}\"%")])
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(
+            count(
+                &mut connection,
+                "SELECT COUNT(*) FROM sekai_archive_records
+                 WHERE dataset='llm_calls' AND payload LIKE $1"
+            ),
+            backlog
+        );
+        assert_eq!(
+            count(
+                &mut connection,
+                "SELECT COUNT(*) FROM sekai_dataset_rows
+                 WHERE dataset_id='llm_calls' AND data LIKE $1"
+            ),
+            0
+        );
+        assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    /// Retention leaves `llm_calls` change-bundle previews alone: a run with
+    /// nothing expiring writes nothing to them, and a run drops only the
+    /// preview rows its policy selects.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_retention_keeps_change_bundle_previews() {
+        let _serial = archiving();
+        let db = database();
+        let prefix = format!("preview-{}", uuid::Uuid::new_v4().simple());
+        let branch = format!(
+            "{}{prefix}",
+            crate::sekai::dataset_branch::BUNDLE_BRANCH_PREFIX
+        );
+        let call = |at: i64| {
+            serde_json::json!({"project": prefix, "timestamp_ms": at.to_string()}).to_string()
+        };
+        let mut connection = db.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO sekai_dataset_branches (dataset_id,name,created_at_ms)
+                 VALUES('llm_calls',$1,1)",
+                &[&branch],
+            )
+            .unwrap();
+        for (row_id, at) in [(1_i64, 1_i64), (2, 10 * DAY_MS)] {
+            connection
+                .execute(
+                    "INSERT INTO sekai_dataset_branch_rows (dataset_id,name,row_id,data)
+                     VALUES('llm_calls',$1,$2,$3)",
+                    &[&branch, &row_id, &call(at)],
+                )
+                .unwrap();
+        }
+        let rows = |connection: &mut postgres::Client| -> Vec<i64> {
+            connection
+                .query(
+                    "SELECT row_id FROM sekai_dataset_branch_rows
+                     WHERE dataset_id='llm_calls' AND name=$1 ORDER BY row_id",
+                    &[&branch],
+                )
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        // No policy for this project yet: nothing expires, nothing changes.
+        db.archive_retained_records(3 * DAY_MS, false).unwrap();
+        assert_eq!(rows(&mut connection), [1, 2]);
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: prefix.clone(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.archive_retained_records(3 * DAY_MS, false).unwrap();
+        assert_eq!(rows(&mut connection), [2]);
+        connection
+            .batch_execute(&format!(
+                "DELETE FROM sekai_dataset_branch_rows WHERE name='{branch}';
+                 DELETE FROM sekai_dataset_branches WHERE name='{branch}';"
+            ))
+            .unwrap();
+    }
+
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     fn postgres_corrupt_archives_and_blobs_fail_closed() {
+        let _serial = archiving();
         let db = database();
         let prefix = format!("corrupt-{}", uuid::Uuid::new_v4().simple());
         let scope = ContentScope {
