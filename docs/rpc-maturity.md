@@ -171,6 +171,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ClaimAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatAgentTurnClaim` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.AckAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListSiteAgentWorkingMemory` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |

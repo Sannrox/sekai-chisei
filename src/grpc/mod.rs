@@ -773,7 +773,8 @@ fn guest_namespace_rpc(service: &str, method: &str) -> bool {
                 | "DiscoverCapabilities"
                 // Operator read of an instance's turns (#2001): the same
                 // marking as GetObject of the instance.
-                | "ListSiteAgentInstanceTurns"
+                | "ListSiteAgentInstanceTurns" // ListSiteAgentWorkingMemory is an agent-turn read (#1968).
+                                               // Guests inspect memory through GetObject.
         )
 }
 
@@ -908,6 +909,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ClaimAgentTurn"
             | "HeartbeatAgentTurnClaim"
             | "AckAgentTurn"
+            // Dual-principal working-memory read (#1968): the handler
+            // scopes it to the instance and, with a turn token, that turn.
+            | "ListSiteAgentWorkingMemory"
             | "PutServicePrincipal"
             | "GetServicePrincipal"
             | "DeleteServicePrincipal"

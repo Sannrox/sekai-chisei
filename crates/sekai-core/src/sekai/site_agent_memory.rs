@@ -17,11 +17,13 @@
 //!
 //! Working memory is neither Kioku (epistemic memory Chisei derives from
 //! operation outcomes) nor decision memory (precedents of parked reviews).
-//! Reading it as both the agent and the person it acts for is #1968.
-//! SQLite is the reference store, as for site agent instances (ADR 0136).
+//! `ListSiteAgentWorkingMemory` (#1968) is the agent-turn read: an item is
+//! returned only when the instance principal and the requester can each
+//! read it. SQLite is the reference store, as for site agent instances
+//! (ADR 0136).
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::Object;
+use crate::domain::{ListFilter, Object, PropertyFilter};
 use crate::sekai::governed_action_type::{
     EFFECT_KIND_NOTIFY, GovernedActionType, OBJECT_MUTATION_CREATE, OBJECT_MUTATION_UPDATE,
 };
@@ -207,6 +209,28 @@ pub fn is_forgotten(object: &Object) -> bool {
             .get(FORGOTTEN_PROPERTY)
             .map(String::as_str)
             == Some("true")
+}
+
+/// Live (not forgotten) working memory of `instance_id` in `namespace`,
+/// newest id last. Visibility is applied by the caller (#1968).
+pub fn list_live_for_instance(
+    db: &RuntimeDb,
+    namespace: &str,
+    instance_id: &str,
+) -> Result<Vec<Object>, String> {
+    let mut items = db.list_all_objects(&ListFilter {
+        kind: Some(KIND.into()),
+        namespace: Some(namespace.into()),
+        property_filters: vec![PropertyFilter {
+            key: INSTANCE_PROPERTY.into(),
+            op: "eq".into(),
+            value: instance_id.into(),
+        }],
+        ..Default::default()
+    })?;
+    items.retain(|object| !is_forgotten(object));
+    items.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(items)
 }
 
 /// Memory rules on a governed object write, submitted by `submitter`.
@@ -523,6 +547,53 @@ mod tests {
         assert!(is_action_only_kind(KIND));
         assert!(is_action_only_kind(crate::sekai::site_agent_instance::KIND));
         assert!(!is_action_only_kind("component"));
+    }
+
+    #[test]
+    fn list_live_omits_forgotten_items_and_other_instances() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        db.create_object(&Object {
+            id: "note-other".into(),
+            kind: KIND.into(),
+            name: "note-other".into(),
+            namespace: NAMESPACE.into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (INSTANCE_PROPERTY.into(), "other".into()),
+                (CONTENT_PROPERTY.into(), "elsewhere".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        db.create_object(&Object {
+            id: "note-live".into(),
+            kind: KIND.into(),
+            name: "note-live".into(),
+            namespace: NAMESPACE.into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (INSTANCE_PROPERTY.into(), "line-7".into()),
+                (CONTENT_PROPERTY.into(), "kept".into()),
+            ]),
+            created: 2,
+            updated: 2,
+        })
+        .unwrap();
+        let live = list_live_for_instance(&db, NAMESPACE, "line-7").unwrap();
+        assert_eq!(
+            live.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            ["note-live"]
+        );
     }
 
     /// A freeze committing between planning and the write denies the

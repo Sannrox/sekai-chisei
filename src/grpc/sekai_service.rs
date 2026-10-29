@@ -257,6 +257,7 @@ impl SekaiService for SekaiServiceImpl {
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
+        list_site_agent_working_memory => list_site_agent_working_memory_rpc(ListSiteAgentWorkingMemoryRequest) -> ListSiteAgentWorkingMemoryResponse;
         grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;
         revoke_namespace_export => revoke_namespace_export_rpc(RevokeNamespaceExportRequest) -> RevokeNamespaceExportResponse;
         publish_federated_aggregate_allowance => publish_federated_aggregate_allowance_rpc(PublishFederatedAggregateAllowanceRequest) -> PublishFederatedAggregateAllowanceResponse;

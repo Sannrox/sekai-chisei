@@ -31,12 +31,14 @@ pub const RUNTIME_TOKEN_METHODS: &[&str] = &[
     "ReportActionClaimEvent",
 ];
 
-/// gRPC methods a turn token authenticates: its claim's follow-up calls and
-/// the Actions the turn submits as its instance principal (ADR 0142).
+/// gRPC methods a turn token authenticates: its claim's follow-up calls,
+/// the Actions the turn submits as its instance principal (ADR 0142), and
+/// the dual-principal read of that instance's live working memory (#1968).
 pub const TURN_TOKEN_METHODS: &[&str] = &[
     "HeartbeatAgentTurnClaim",
     "AckAgentTurn",
     "SubmitActionInstance",
+    "ListSiteAgentWorkingMemory",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
