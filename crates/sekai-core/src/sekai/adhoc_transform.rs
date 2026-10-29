@@ -159,6 +159,8 @@ pub struct AdHocSubmission<'a> {
     pub column_allowlists: &'a HashMap<String, Vec<String>>,
     pub expires_at_ms: i64,
     pub tenant_id: &'a str,
+    /// Object-set inputs evaluated as the caller (ADR 0140).
+    pub object_sets: &'a [crate::sekai::object_set_input::PinnedObjectSet],
 }
 
 /// Runs `submission`. A repeated identity returns its run; the same identity
@@ -457,6 +459,7 @@ mod tests {
                 column_allowlists,
                 expires_at_ms,
                 tenant_id,
+                object_sets: &[],
             },
             now_ms,
         )

@@ -457,6 +457,23 @@ fn prepare_traversal(
     Ok(traversal.far_kind.clone())
 }
 
+/// The property names an object-type member declares, in either the map or
+/// the list form of `properties`.
+pub fn declared_property_names(object_type: &DefinitionMember) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<Value>(&object_type.definition_json) else {
+        return Vec::new();
+    };
+    match value.get("properties") {
+        Some(Value::Object(properties)) => properties.keys().cloned().collect(),
+        Some(Value::Array(properties)) => properties
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn declared_property_type(object_type: &DefinitionMember, key: &str) -> Option<String> {
     let value: Value = serde_json::from_str(&object_type.definition_json).ok()?;
     match value.get("properties")? {

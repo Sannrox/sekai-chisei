@@ -64,6 +64,85 @@ written through governed Actions, and no domain-specific core RPC.
    operator-configured principal (`SEKAI_SECURITY_REOPEN_RUN_AS`), checked
    for namespace write and write freezes like an Action binding's run, and
    keeps each namespace's feed position in a compare-and-set cursor.
+8. **Agent disposition precision is measured, not asserted** (#1990). A
+   disposition records `recorded_by`, the submitting principal,
+   `recorder_kind`, whether it was an agent at that time, and
+   `recorder_revision`, the definition revision of the site agent behind it.
+   All three are stamped when the write is planned, overwriting any caller
+   value, so an agent cannot claim another recorder's history and retiring a
+   principal later does not rewrite it. `recorder_kind` comes from the
+   Action instance's classification at submission, so a write parked for
+   review keeps both its original submitter and how it was classified;
+   admission counts a principal bound to a site agent instance as an agent.
+   `recorder_revision` is read from the instance bindings when the write is
+   planned, outside the commit fence: a parked write granted after its
+   instance moved to a new revision counts toward the new one, and a
+   revision change racing the commit can attribute that one disposition to
+   the revision it replaced. Revision changes are rare operator Actions, and
+   a misattributed disposition only moves evidence between two revisions of
+   the same agent. A principal bound to a site agent instance is an
+   agent whatever its name; instances that share a principal on different
+   revisions stamp `ambiguous`, which no single revision's record absorbs. A
+   measurement as of a time ignores later dispositions. Generic object
+   writes of every package kind are refused, as the package rules and the
+   stamped recorder hold only on the Action path; a streaming write-back
+   plans through the Action rules with no submitter and so records no
+   recorder. An agent's disposition is
+   overturned by a reopen for a changed basis fact or a human supersede with
+   a different disposition, and confirmed by a human supersede with the same
+   one, a reopen for its own expiry, or standing unsuperseded for the settle
+   period. A supersede by another agent resolves nothing. Precision is
+   counted per recorder, revision and finding class (`finding_class` on the
+   finding, `unclassified` when absent) over a trailing window, and a group
+   below the minimum resolved count reads `incomplete` with no rate. The
+   metrics are read by `sekaictl admin autonomy disposition-precision`. The
+   certification moves to `cert:security.finding-exposure/v1.3`.
+
+9. **A fix needs a regression probe** (#1989). While a `fixed` disposition
+   heads an exposure's chain and no probe is bound to it, the exposure reads
+   `needs-probe`. `security.probe.bind` binds a `security_regression_probe`
+   to that disposition with the probe's results on the vulnerable and fixed
+   revisions, and is refused unless the probe failed on the first and
+   passed on the second, the revisions differ, and the disposition is the
+   current fixed head. It is marked at least as high as the disposition it
+   names, so only a caller cleared for that marking binds it. The probe names a Chisei isolation catalogue entry or
+   an external test reference; running it stays with its suite. Binding to
+   the disposition rather than the exposure needs no commit fence: if the
+   chain moves on, the new head decides the state. One probe per
+   disposition is checked at plan time only; a concurrent duplicate also
+   clears `needs-probe` and does no harm. The certification moves to
+   `cert:security.finding-exposure/v1.4`.
+
+10. **Measured precision decides an agent's disposition autonomy** (#1991).
+    An agent's disposition record or supersede parks for review in the
+    `security.dispositions` queue unless its group (recorder, revision and
+    the exposure's finding class) is promoted: measured, at least 95%
+    precision, at most 5% overturned, over the 90-day window with at least
+    20 resolved dispositions. These thresholds are package configuration,
+    read with `sekaictl admin autonomy disposition-autonomy`. A promoted
+    agent's submission skips only propose-only; a policy that requires
+    approval still parks it. Admission evaluates the group when the agent
+    submits, so a crossing is recorded at its next submission: a decision
+    receipt naming the group, its counts and rates, and the thresholds. The
+    latest receipt is the group's standing. A promotion applies only once
+    its receipt is durable, and a gate that cannot answer keeps the agent
+    under review. Each receipt's id derives from the group and its position
+    in the group's history, which is read before the evidence, so instances
+    racing on one crossing record it once and one working from older
+    evidence cannot follow a newer receipt. Two instances that read the same
+    position with different evidence write one receipt between them; a
+    standing set from the earlier evidence is corrected at the agent's next
+    submission.
+11. **Action types are versioned with their bodies.** A governed Action
+    type's body is immutable per version, so a namespace installed earlier
+    refuses a changed body at the same version. The package registers its
+    types at version 2 (adding `finding_class` and the disposition review
+    queue), next to version 1, which stays for instances and clients that
+    submit it. The reopen pass submits the newest version the namespace
+    holds, so a server running ahead of a namespace's reinstall keeps
+    reopening, and replays an attempt at the version it was first submitted
+    at, so a reopen parked before a reinstall still replays. A test pins the version's bodies so a change cannot land
+    without a new version.
 
 ## Alternatives considered
 

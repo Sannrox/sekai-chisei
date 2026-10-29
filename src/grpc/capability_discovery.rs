@@ -64,6 +64,7 @@ impl SekaiServiceImpl {
         entries.push(scheduler_transform_capability(experimental));
         entries.push(preview_transform_capability(experimental));
         entries.push(adhoc_transform_capability(experimental));
+        entries.push(object_set_inputs_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -446,6 +447,27 @@ fn scheduler_transform_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+/// Object-set transform inputs (ADR 0140): read as the run's principal,
+/// pinned per run, and streamed to isolated workers that registered
+/// `sekai.input.object-set=v1`.
+fn object_set_inputs_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::governed_transform::OBJECT_SET_INPUTS_CAPABILITY.into(),
+        "Read an object set as a governed transform input, evaluated as the run's principal and pinned per run.".into(),
+        "transform",
+        "sekai.PutGovernedTransformRequest",
+        "sekai.PutGovernedTransformResponse",
+    );
+    entry.required_scopes = vec!["namespace:read".into(), "object:read".into()];
+    entry.policy_decision_points = vec![
+        "namespace_access".into(),
+        "marking".into(),
+        "property_grant".into(),
+    ];
     entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
     entry
 }

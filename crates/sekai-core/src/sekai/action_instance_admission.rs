@@ -400,13 +400,21 @@ impl<'a> ActionInstanceAdmission<'a> {
             ));
         }
 
+        // A principal a site agent instance acts as is an agent whatever its
+        // name. The instance keeps this classification, so a parked grant
+        // stamps it even if the binding changed meanwhile (#1990).
         let agent_action = crate::sekai::write_freeze::actor_is_agent(
             self.db,
             actor,
             request.delegating_actor.as_deref(),
             self.machine_credential,
         )
-        .map_err(ActionInstanceAdmissionError::Internal)?;
+        .map_err(ActionInstanceAdmissionError::Internal)?
+            || crate::sekai::site_agent_instance::definition_revision_for(
+                self.db, &namespace, actor,
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?
+            .is_some();
         let tenant =
             crate::sekai::write_freeze::acting_or_registered_tenant(self.db, self.tenant, actor)
                 .map_err(ActionInstanceAdmissionError::Internal)?;
@@ -452,6 +460,25 @@ impl<'a> ActionInstanceAdmission<'a> {
             )
         } else {
             None
+        };
+        // An agent whose security dispositions earned it (#1991) records
+        // them as a human would: propose-only lifts, policy approvals stay.
+        // A gate that cannot answer keeps the agent propose-only.
+        let autonomy = match autonomy {
+            Some(crate::sekai::agent_autonomy::AdmissionAutonomy::ProposeOnly)
+                if crate::sekai::security_precision::promotes_disposition(
+                    self.db,
+                    &namespace,
+                    actor,
+                    request.type_id.trim(),
+                    &request.parameters_json,
+                    now,
+                )
+                .unwrap_or(false) =>
+            {
+                None
+            }
+            other => other,
         };
         let auto_apply_envelope = match &autonomy {
             Some(crate::sekai::agent_autonomy::AdmissionAutonomy::AutoApply { envelope_id }) => {
@@ -844,7 +871,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &type_def,
                 &stored.namespace,
                 &stored.parameters_json,
-                Some(&stored.principal),
+                Some(action_object_mutation::Submitter {
+                    principal: &stored.principal,
+                    agent: stored.agent_action,
+                }),
                 Some(&stored.marking),
                 now,
             ) {
@@ -1309,7 +1339,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             &type_def,
             &instance.namespace,
             &instance.parameters_json,
-            Some(&instance.principal),
+            Some(action_object_mutation::Submitter {
+                principal: &instance.principal,
+                agent: instance.agent_action,
+            }),
             Some(&instance.marking),
             now,
         ) {

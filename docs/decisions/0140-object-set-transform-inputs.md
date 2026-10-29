@@ -50,9 +50,9 @@ replayed is that consumer.
    does not drift with later object changes. It first checks that the
    replaying principal may still read every pinned object; if not, the
    replay is refused rather than silently changing its input.
-6. **Markings follow the objects.** Object markings and the classifications
-   of the properties read join `markings_in` and reach `markings_out`, as
-   they do for dataset inputs.
+6. **Markings follow the objects.** The markings of the objects read join
+   `markings_in` and reach `markings_out`, as a dataset's object marking
+   does; restricted properties a principal may not read are not in its rows.
 7. **Workers opt in.** Isolated-process work with an object-set input is
    placed only on runtimes that registered the label
    `sekai.input.object-set=v1`, through the existing placement requirement
@@ -62,7 +62,28 @@ replayed is that consumer.
    `DiscoverCapabilities` reports `sekai.transforms.object-set-inputs`.
 
 Delivery is in layers: the input contract, evaluation and pinning with the
-in-process path; the isolated-process claim path; and replay.
+in-process path; the isolated-process claim path, where the admitted input
+snapshot keeps the set's rows under its pin key; and replay. The first layer
+reads plain sets (no aggregation or traversal) over unindexed kinds, needs a
+dataset input beside them, and refuses object-set inputs on a definition with
+a schedule or trigger, which runs with no caller to read the set as. The
+putter's reader record names the definition digest it put, so a run of any
+other definition finds no reader. A deployment with an enterprise extension
+reads only with an authenticated context, which a stored run does not keep
+for its putter; there, stored runs with object-set inputs are refused and an
+ad-hoc run reads the set as its caller. Until replay lands, a retried
+ad-hoc identity reads its sets again as its caller before it returns the
+committed run, and returns it only when each set's digest matches the pin:
+the run keeps row digests, not members, so an unchanged digest is the check
+that the caller still reads every pinned object. A set that changed, or no
+longer reads, refuses the retry. An empty set keeps the columns its kind
+declares. Restricted properties stay out of every reader's rows in this
+layer, and a set may not filter on one: their classifications have no
+marking that would carry them into the output. Branch runs, and any path
+that cannot evaluate a definition's object sets, refuse it. Rows carry
+stored properties, not computed ones, whose dependency reads and
+classifications this layer cannot bound. The budget bounds a set's read
+before the run starts.
 
 ## Alternatives considered
 

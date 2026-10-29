@@ -260,6 +260,13 @@ impl SekaiDb {
                     created_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (run_id, checkpoint)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_transform_reader (
+                    namespace TEXT NOT NULL,
+                    transform_id TEXT NOT NULL,
+                    principal TEXT NOT NULL,
+                    definition_digest TEXT NOT NULL,
+                    PRIMARY KEY (namespace, transform_id)
+                );
                 CREATE TABLE IF NOT EXISTS sekai_adhoc_transform_run (
                     identity TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,
@@ -333,6 +340,19 @@ impl SekaiDb {
         created_at_ms: i64,
         tenant_id: &str,
     ) -> Result<(), String> {
+        self.put_governed_transform_read_as(transform, created_at_ms, tenant_id, None)
+    }
+
+    /// Puts `transform` and, in the same transaction, records `reader` as
+    /// the principal its object-set inputs are read as, bound to this
+    /// definition's digest (ADR 0140). `None` clears any recorded reader.
+    pub fn put_governed_transform_read_as(
+        &self,
+        transform: &GovernedTransform,
+        created_at_ms: i64,
+        tenant_id: &str,
+        reader: Option<&str>,
+    ) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -360,6 +380,13 @@ impl SekaiDb {
             &transform.namespace,
             &transform.transform_id,
             tenant_id,
+        )?;
+        write_transform_reader_tx(
+            &tx,
+            &transform.namespace,
+            &transform.transform_id,
+            reader,
+            &transform.definition_digest,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
@@ -439,6 +466,75 @@ impl SekaiDb {
             now_ms,
             tenant_id,
             expected_definition_digest,
+            &[],
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(run)
+    }
+
+    /// Records `principal` as the one a stored definition's object-set
+    /// inputs are read as (ADR 0140).
+    pub fn set_transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        principal: &str,
+        definition_digest: &str,
+    ) -> Result<(), String> {
+        write_transform_reader_tx(
+            &self.conn(),
+            namespace,
+            transform_id,
+            Some(principal),
+            definition_digest,
+        )
+    }
+
+    /// The principal a stored definition's object-set inputs are read as,
+    /// with the digest of the definition it put.
+    pub fn transform_reader(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        self.conn()
+            .query_row(
+                "SELECT principal, definition_digest FROM sekai_transform_reader
+                 WHERE namespace = ?1 AND transform_id = ?2",
+                params![namespace, transform_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Runs a stored definition whose object-set inputs the plane evaluated
+    /// as the run's principal (ADR 0140). Never incremental: the sets are
+    /// read whole for each run.
+    pub fn run_governed_transform_with_object_sets(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+        now_ms: i64,
+        tenant_id: &str,
+        expected_definition_digest: &str,
+    ) -> Result<TransformRun, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let run = run_governed_transform_tx(
+            &tx,
+            namespace,
+            transform_id,
+            false,
+            TRANSFORM_TRIGGER_MANUAL,
+            "",
+            now_ms,
+            tenant_id,
+            expected_definition_digest,
+            object_sets,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
@@ -564,6 +660,7 @@ impl SekaiDb {
             column_allowlists,
             expires_at_ms,
             tenant_id,
+            object_sets,
         } = *submission;
         use crate::sekai::adhoc_transform::{
             ADHOC_IDENTITY_CONFLICT, AdHocRun, TRANSFORM_TRIGGER_ADHOC, scratch_columns,
@@ -660,6 +757,7 @@ impl SekaiDb {
                 now_ms,
                 tenant_id,
                 Some(column_allowlists),
+                object_sets,
             )?;
             run.stamp_trigger(TRANSFORM_TRIGGER_ADHOC, &request.session_label);
             persist_transform_run(&tx, &run)?;
@@ -677,6 +775,7 @@ impl SekaiDb {
                     stored: false,
                     output_budget: Some(budget),
                     column_allowlists: Some(column_allowlists),
+                    object_sets,
                 },
             )?;
             let output = live_output_rows(&tx, &transform.output_dataset_id)?;
@@ -1747,7 +1846,9 @@ impl SekaiDb {
         now_ms: i64,
         tenant_id: &str,
         column_allowlists: &HashMap<String, Vec<String>>,
+        object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
     ) -> Result<PreviewGovernedTransformResult, String> {
+        crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1759,6 +1860,7 @@ impl SekaiDb {
             now_ms,
             tenant_id,
             column_allowlists,
+            object_sets,
         )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(result)
@@ -1865,6 +1967,7 @@ fn run_governed_transform_tx(
     now_ms: i64,
     tenant_id: &str,
     expected_definition_digest: &str,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<TransformRun, String> {
     let transform =
         load_transform(tx, namespace, transform_id)?.ok_or("governed transform not found")?;
@@ -1876,7 +1979,8 @@ fn run_governed_transform_tx(
     if transform.is_isolated_process() {
         // Operator RunGovernedTransform is not the scheduler cap; ticks and
         // change triggers consult can_admit_namespace.
-        let mut run = admit_isolated_process_tx(tx, &transform, now_ms, tenant_id, None)?;
+        let mut run =
+            admit_isolated_process_tx(tx, &transform, now_ms, tenant_id, None, object_sets)?;
         run.stamp_trigger(trigger_cause, trigger_ref);
         persist_transform_run(tx, &run)?;
         clear_pending_for_transform(tx, &transform.namespace, &transform.transform_id)?;
@@ -1894,6 +1998,7 @@ fn run_governed_transform_tx(
             stored: true,
             output_budget: None,
             column_allowlists: None,
+            object_sets,
         },
     )
 }
@@ -1914,6 +2019,8 @@ pub(crate) struct InProcessRun<'a> {
     /// Per input dataset, the columns the caller may read; a loaded row
     /// with any other key refuses the run (ad-hoc runs, ADR 0138).
     pub column_allowlists: Option<&'a HashMap<String, Vec<String>>>,
+    /// Object-set inputs the plane evaluated as the run's principal.
+    pub object_sets: &'a [crate::sekai::object_set_input::PinnedObjectSet],
 }
 
 /// Runs `transform` in process inside `tx` and records the run.
@@ -1931,7 +2038,9 @@ pub(crate) fn run_in_process_tx(
         stored,
         output_budget,
         column_allowlists,
+        object_sets,
     } = *options;
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     let namespace = transform.namespace.as_str();
     let transform_id = transform.transform_id.as_str();
     // In-process compute is measured from here until this run's output is
@@ -1988,6 +2097,22 @@ pub(crate) fn run_in_process_tx(
             .is_some_and(|budget| budget.exceeded.is_some())
         {
             break;
+        }
+    }
+    // Object-set inputs follow the datasets, read under the same budget;
+    // none join once the budget is spent (ADR 0140).
+    if load_budget
+        .as_ref()
+        .is_none_or(|budget| budget.exceeded.is_none())
+    {
+        for set in object_sets {
+            if let Some(budget) = load_budget.as_mut()
+                && !set.rows.iter().all(|row| budget.charge(row))
+            {
+                break;
+            }
+            loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
+            input_object_tokens.extend(set.marking_tokens.iter().cloned());
         }
     }
     if let Some(budget) = load_budget.as_mut() {
@@ -2055,6 +2180,9 @@ pub(crate) fn run_in_process_tx(
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
         }
+        for set in object_sets {
+            run.input_versions.insert(set.pin_key(), set.digest());
+        }
         insert_transform_run(tx, &run)?;
         record_in_process_finish(tx, &run.run_id, started)?;
         if stored {
@@ -2078,6 +2206,9 @@ pub(crate) fn run_in_process_tx(
         &mut run,
     )?;
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
+    for set in object_sets {
+        run.input_versions.insert(set.pin_key(), set.digest());
+    }
     insert_transform_run(tx, &run)?;
     if stored {
         tx.execute(
@@ -2124,13 +2255,18 @@ fn persist_transform_usage_pending_tx(
     .map_err(|error| error.to_string())
 }
 
+/// Admits an isolated run: its inputs are read now, as a snapshot the
+/// claiming worker streams. Object sets were evaluated by the caller and
+/// follow the datasets in the snapshot under their pin key (ADR 0140).
 fn admit_isolated_process_tx(
     tx: &Transaction<'_>,
     transform: &GovernedTransform,
     now_ms: i64,
     tenant_id: &str,
     column_allowlists: Option<&HashMap<String, Vec<String>>>,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<TransformRun, String> {
+    crate::sekai::object_set_input::require_evaluated(transform, object_sets)?;
     let bindings = transform.input_bindings();
     for (_, dataset_id) in &bindings {
         if !dataset_exists(tx, dataset_id)? {
@@ -2163,6 +2299,15 @@ fn admit_isolated_process_tx(
         let object_id = load_dataset_object_id(tx, dataset_id)?;
         input_object_tokens.push(load_object_marking_token(tx, &object_id)?);
     }
+    for set in object_sets {
+        if let Some(budget) = load_budget.as_mut()
+            && !set.rows.iter().all(|row| budget.charge(row))
+        {
+            return Err(budget.exceeded.unwrap_or_default().into());
+        }
+        loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
+        input_object_tokens.extend(set.marking_tokens.iter().cloned());
+    }
     let lattice = load_lattice(tx, &transform.namespace)?;
     let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
     let prior_token = load_object_marking_token(tx, &output_object_id)?;
@@ -2190,6 +2335,9 @@ fn admit_isolated_process_tx(
     run.markings_out = markings_out;
     run.input_partitions = input_receipts_from_loaded(tx, &bindings, &loaded)?;
     run.input_versions = input_version_pins(tx, &bindings, now_ms, true)?;
+    for set in object_sets {
+        run.input_versions.insert(set.pin_key(), set.digest());
+    }
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -2329,6 +2477,7 @@ fn preview_governed_transform_tx(
     now_ms: i64,
     tenant_id: &str,
     column_allowlists: &HashMap<String, Vec<String>>,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
 ) -> Result<PreviewGovernedTransformResult, String> {
     let bindings = transform.input_bindings();
     let mut loaded: Vec<(String, Vec<String>, Vec<DatasetRowRecord>)> = Vec::new();
@@ -2353,6 +2502,21 @@ fn preview_governed_transform_tx(
         loaded.push((alias.clone(), columns, records));
         if load_budget.exceeded.is_some() {
             break;
+        }
+    }
+    // Object-set inputs, sampled like datasets (ADR 0140).
+    if load_budget.exceeded.is_none() {
+        for set in object_sets {
+            let records: Vec<DatasetRowRecord> = set.records().into_iter().take(row_cap).collect();
+            if !records.iter().all(|(_, row)| load_budget.charge(row)) {
+                break;
+            }
+            inputs.push(PreviewInputStat {
+                alias: set.alias.clone(),
+                dataset_id: set.pin_key(),
+                rows_read: i32::try_from(records.len()).unwrap_or(i32::MAX),
+            });
+            loaded.push((set.alias.clone(), set.columns.clone(), records));
         }
     }
     load_budget.expire_if_past();
@@ -2876,6 +3040,31 @@ fn upsert_transform_work(
     .map_err(|error| error.to_string())
 }
 
+/// Records `reader` for a definition, or clears it when `None`.
+fn write_transform_reader_tx(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    transform_id: &str,
+    reader: Option<&str>,
+    definition_digest: &str,
+) -> Result<(), String> {
+    match reader {
+        Some(principal) => conn.execute(
+            "INSERT INTO sekai_transform_reader (namespace, transform_id, principal, definition_digest)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (namespace, transform_id) DO UPDATE SET
+                principal = excluded.principal, definition_digest = excluded.definition_digest",
+            params![namespace, transform_id, principal, definition_digest],
+        ),
+        None => conn.execute(
+            "DELETE FROM sekai_transform_reader WHERE namespace = ?1 AND transform_id = ?2",
+            params![namespace, transform_id],
+        ),
+    }
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
 fn persist_transform_quota_owner_tx(
     tx: &Transaction<'_>,
     namespace: &str,
@@ -3088,8 +3277,19 @@ fn persist_run_input_snapshot(
     loaded: &[(String, Vec<String>, Vec<DatasetRowRecord>)],
 ) -> Result<(), String> {
     // Snapshot is the admitted pin: persist the full loaded set, not a stream.
-    for ((alias, dataset_id), (_, _, records)) in bindings.iter().zip(loaded.iter()) {
-        let keys = load_dataset_partition_keys(tx, dataset_id)?;
+    // Datasets come first, one per binding; object sets follow, recorded
+    // under their pin key and unpartitioned (ADR 0140).
+    for (index, (alias, _, records)) in loaded.iter().enumerate() {
+        let (dataset_id, keys) = match bindings.get(index) {
+            Some((_, dataset_id)) => (
+                dataset_id.clone(),
+                load_dataset_partition_keys(tx, dataset_id)?,
+            ),
+            None => (
+                format!("{}{alias}", crate::sekai::object_set_input::PIN_PREFIX),
+                Vec::new(),
+            ),
+        };
         for (row_id, values) in records {
             let values_json = serde_json::to_string(values).map_err(|error| error.to_string())?;
             let partition_key = partition_value(&keys, values);
@@ -4870,6 +5070,7 @@ fn admit_pending_transform_tx(
         now_ms,
         &owner,
         "",
+        &[],
     )?;
     Ok(Some(run))
 }
@@ -6277,10 +6478,12 @@ mod tests {
                     TransformInput {
                         alias: "customers".into(),
                         dataset_id: "customers".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "orders".into(),
                         dataset_id: "orders".into(),
+                        ..Default::default()
                     },
                 ],
                 sql: "SELECT c.region AS region, COUNT(*) AS orders, SUM(o.amount) AS total FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
@@ -6386,10 +6589,12 @@ mod tests {
                     TransformInput {
                         alias: "customers".into(),
                         dataset_id: "customers".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "orders".into(),
                         dataset_id: "orders".into(),
+                        ..Default::default()
                     },
                 ],
                 sql: "SELECT c.region AS region, COUNT(*) AS orders FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
@@ -6445,6 +6650,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "in".into(),
+                    ..Default::default()
                 }],
                 sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t"
                     .into(),
@@ -6503,6 +6709,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "in".into(),
+                    ..Default::default()
                 }],
                 sql: "SELECT * FROM input".into(),
                 memory_limit_bytes: 80,
@@ -6563,6 +6770,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "in".into(),
+                    ..Default::default()
                 }],
                 sql: "SELECT * FROM input".into(),
                 memory_limit_bytes: 80,
@@ -6719,10 +6927,12 @@ mod tests {
                     TransformInput {
                         alias: "customers".into(),
                         dataset_id: "customers".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "orders".into(),
                         dataset_id: "orders".into(),
+                        ..Default::default()
                     },
                 ],
                 sql: "SELECT c.region AS region, COUNT(*) AS orders FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
@@ -6833,10 +7043,12 @@ mod tests {
                     TransformInput {
                         alias: "customers".into(),
                         dataset_id: "customers".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "orders".into(),
                         dataset_id: "orders".into(),
+                        ..Default::default()
                     },
                 ],
                 sql: "SELECT c.region AS region, COUNT(*) AS orders FROM orders o JOIN customers c ON o.customer_id = c.id GROUP BY c.region".into(),
@@ -8516,6 +8728,95 @@ mod tests {
     }
 
     #[test]
+    fn isolated_object_set_inputs_reach_only_labelled_runtimes() {
+        use crate::sekai::governed_transform::{OBJECT_SET_INPUT_LABEL, TransformInput};
+        use crate::sekai::object_set_input::PinnedObjectSet;
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+            .unwrap();
+        let mut transform = isolated_transform();
+        transform.isolated_process.as_mut().unwrap().inputs = vec![
+            TransformInput {
+                alias: "orders".into(),
+                dataset_id: "in".into(),
+                ..Default::default()
+            },
+            TransformInput {
+                alias: "customers".into(),
+                object_set: r#"{"namespace":"sales","kind":"Customer"}"#.into(),
+                ..Default::default()
+            },
+        ];
+        transform.definition_digest.clear();
+        let transform = transform.prepare().unwrap();
+        // The plane requires the label itself.
+        assert_eq!(
+            transform.isolated_process.as_ref().unwrap().requires[OBJECT_SET_INPUT_LABEL],
+            "v1"
+        );
+        db.put_governed_transform(&transform, 10).unwrap();
+        let customer = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "North".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let set = PinnedObjectSet::from_objects("customers", &[], &[customer], &HashMap::new());
+        let run = db
+            .run_governed_transform_with_object_sets(
+                "ops",
+                "iso1",
+                std::slice::from_ref(&set),
+                20,
+                "",
+                "",
+            )
+            .unwrap();
+        assert_eq!(run.input_versions["object-set:customers"], set.digest());
+
+        // A runtime without the label is not offered the work.
+        db.register_transform_runtime("ops", "plain", &BTreeMap::new(), "local", 25)
+            .unwrap();
+        assert!(
+            db.claim_transform_work("ops", "plain", "", 60_000, 30)
+                .unwrap()
+                .is_none()
+        );
+        let labels = BTreeMap::from([(OBJECT_SET_INPUT_LABEL.to_string(), "v1".to_string())]);
+        db.register_transform_runtime("ops", "sets", &labels, "local", 25)
+            .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "sets", "", 60_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        let customers = db
+            .read_transform_run_input(
+                &WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    ..WriteTransformRunCommand::default()
+                },
+                "customers",
+                "",
+                0,
+                100,
+                40,
+            )
+            .unwrap();
+        assert_eq!(customers.len(), 1);
+        assert_eq!(customers[0].dataset_id, "object-set:customers");
+        assert_eq!(customers[0].values, set.rows[0]);
+    }
+
+    #[test]
     fn isolated_process_reads_the_admitted_input_snapshot() {
         let db = db();
         db.create_dataset(&dataset("in")).unwrap();
@@ -8757,10 +9058,12 @@ mod tests {
                     TransformInput {
                         alias: "left".into(),
                         dataset_id: "left".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "right".into(),
                         dataset_id: "right".into(),
+                        ..Default::default()
                     },
                 ],
                 requires: Default::default(),
@@ -8834,10 +9137,12 @@ mod tests {
                     TransformInput {
                         alias: "left".into(),
                         dataset_id: "left".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "right".into(),
                         dataset_id: "right".into(),
+                        ..Default::default()
                     },
                 ],
                 requires: Default::default(),
@@ -8902,6 +9207,51 @@ mod tests {
         }
         .prepare()
         .unwrap()
+    }
+
+    #[test]
+    fn a_run_without_its_evaluated_object_sets_is_refused() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let transform = GovernedTransform {
+            steps: Vec::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![
+                    TransformInput {
+                        alias: "orders".into(),
+                        dataset_id: "in".into(),
+                        ..Default::default()
+                    },
+                    TransformInput {
+                        alias: "customers".into(),
+                        object_set: r#"{"namespace":"sales","kind":"Customer"}"#.into(),
+                        ..Default::default()
+                    },
+                ],
+                sql: "SELECT * FROM orders".into(),
+                ..Default::default()
+            }),
+            ..projection("t-os", "in", "out")
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        // An operator run from the store, or a branch run, cannot read the set.
+        let refused = [
+            db.run_governed_transform("ops", "t-os", false, 20)
+                .map(|_| ())
+                .unwrap_err(),
+            db.run_governed_transform_on_branch("ops", "t-os", "b1", "local", "", 20)
+                .map(|_| ())
+                .unwrap_err(),
+        ];
+        for refused in refused {
+            assert!(
+                refused.starts_with(crate::sekai::object_set_input::OBJECT_SETS_UNEVALUATED),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -9843,10 +10193,12 @@ mod tests {
                     TransformInput {
                         alias: "left".into(),
                         dataset_id: "in".into(),
+                        ..Default::default()
                     },
                     TransformInput {
                         alias: "right".into(),
                         dataset_id: "in".into(),
+                        ..Default::default()
                     },
                 ],
                 requires: Default::default(),
@@ -10181,6 +10533,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "other".into(),
+                    ..Default::default()
                 }],
                 requires: Default::default(),
                 code: String::new(),
@@ -10372,7 +10725,7 @@ mod tests {
         .unwrap();
         let transform = analytical_filter();
         let preview = db
-            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new())
+            .preview_governed_transform(&transform, 256, 20, "", &HashMap::new(), &[])
             .unwrap();
         assert!(
             preview
@@ -10425,6 +10778,7 @@ mod tests {
                 inputs: vec![TransformInput {
                     alias: "input".into(),
                     dataset_id: "in".into(),
+                    ..Default::default()
                 }],
                 sql: "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT n FROM t"
                     .into(),
@@ -10437,7 +10791,7 @@ mod tests {
         }
         .prepare()
         .unwrap();
-        let failed = db.preview_governed_transform(&hog, 256, 20, "", &HashMap::new());
+        let failed = db.preview_governed_transform(&hog, 256, 20, "", &HashMap::new(), &[]);
         assert_eq!(
             failed.unwrap_err(),
             crate::sekai::transform_engine::BUDGET_TIME
@@ -10469,7 +10823,7 @@ mod tests {
         )
         .unwrap();
         let preview = db
-            .preview_governed_transform(&analytical_filter(), 3, 20, "", &HashMap::new())
+            .preview_governed_transform(&analytical_filter(), 3, 20, "", &HashMap::new(), &[])
             .unwrap();
         assert_eq!(preview.inputs[0].rows_read, 3);
         assert_eq!(preview.rows.len(), 3);
@@ -10514,7 +10868,7 @@ mod tests {
         .prepare()
         .unwrap();
         let preview = db
-            .preview_governed_transform(&transform, 1, 20, "", &HashMap::new())
+            .preview_governed_transform(&transform, 1, 20, "", &HashMap::new(), &[])
             .unwrap();
         assert!(preview.rows.is_empty());
         let claimed = db

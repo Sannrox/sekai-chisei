@@ -692,6 +692,8 @@ fn branch_run_tx(
     tenant: &str,
     now_ms: i64,
 ) -> Result<(DatasetBranchRun, Vec<HashMap<String, String>>), String> {
+    // Branch and caused runs cannot read object sets yet (ADR 0140).
+    crate::sekai::object_set_input::require_evaluated(transform, &[])?;
     use crate::db::governed_transform::{
         dataset_exists, list_row_records_after, load_dataset_column_names, load_dataset_object_id,
         load_lattice, load_object_marking_token,

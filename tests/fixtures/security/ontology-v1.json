@@ -41,6 +41,12 @@
           "type": "string",
           "required": false,
           "description": "Evidence references retained as a single string value."
+        },
+        {
+          "name": "finding_class",
+          "type": "string",
+          "required": false,
+          "description": "The class of weakness the finding belongs to; absent means unclassified."
         }
       ]
     },
@@ -247,6 +253,79 @@
           "type": "string",
           "required": false,
           "description": "On a needs-review disposition: the fact's value that reopened it."
+        },
+        {
+          "name": "recorded_by",
+          "type": "string",
+          "required": false,
+          "description": "The principal that submitted the disposition, stamped at write."
+        },
+        {
+          "name": "recorder_revision",
+          "type": "string",
+          "required": false,
+          "description": "The definition revision of the site agent that recorded it, stamped at write."
+        },
+        {
+          "name": "recorder_kind",
+          "type": "string",
+          "required": false,
+          "description": "agent or human, as the recorder was classified when it recorded the disposition; stamped at write."
+        }
+      ]
+    },
+    {
+      "name": "RegressionProbe",
+      "description": "A regression probe bound to a fixed disposition: it fails on the vulnerable revision and passes on the fixed one.",
+      "mapped_kind": "security_regression_probe",
+      "properties": [
+        {
+          "name": "disposition_id",
+          "type": "string",
+          "required": true,
+          "description": "The fixed disposition this probe proves. Bound to the disposition, not the exposure, so a later disposition decides afresh."
+        },
+        {
+          "name": "exposure_id",
+          "type": "string",
+          "required": false,
+          "description": "The exposure the disposition decides. Stamped at write."
+        },
+        {
+          "name": "probe_kind",
+          "type": "string",
+          "required": true,
+          "description": "catalogue for a Chisei isolation catalogue probe, external for a test in another repository."
+        },
+        {
+          "name": "probe_ref",
+          "type": "string",
+          "required": true,
+          "description": "The catalogue probe id, or the external test reference."
+        },
+        {
+          "name": "vulnerable_revision",
+          "type": "string",
+          "required": true,
+          "description": "The revision the probe ran on with the weakness present."
+        },
+        {
+          "name": "vulnerable_result",
+          "type": "string",
+          "required": true,
+          "description": "The probe's result on the vulnerable revision; it must fail."
+        },
+        {
+          "name": "fixed_revision",
+          "type": "string",
+          "required": true,
+          "description": "The revision the probe ran on with the fix."
+        },
+        {
+          "name": "fixed_result",
+          "type": "string",
+          "required": true,
+          "description": "The probe's result on the fixed revision; it must pass."
         }
       ]
     }
@@ -281,6 +360,12 @@
       "description": "A disposition decides an exposure.",
       "domain": "Disposition",
       "range": "Exposure"
+    },
+    {
+      "name": "proves",
+      "description": "A regression probe proves a fixed disposition.",
+      "domain": "RegressionProbe",
+      "range": "Disposition"
     }
   ],
   "provenance": [

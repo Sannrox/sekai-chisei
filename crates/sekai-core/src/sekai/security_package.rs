@@ -34,6 +34,21 @@
 //!   chain. The reopen's id derives from the disposition it reopens, so a
 //!   repeated pass reopens it once.
 //!
+//! - A disposition records who decided it (#1990): `recorded_by` is the
+//!   submitting principal, `recorder_kind` whether it was an agent then, and
+//!   `recorder_revision` the definition revision of the site agent behind
+//!   it, all stamped at write so a caller cannot claim another recorder's
+//!   history and a later registry change cannot rewrite it. Agent disposition precision is
+//!   measured from them ([`crate::sekai::security_precision`]).
+//!
+//! - A `fixed` disposition needs a regression probe (#1989). While a `fixed`
+//!   disposition heads the chain and no probe is bound to it, the exposure
+//!   reads `needs-probe` ([`exposure_state`]). A probe is bound to that
+//!   disposition, not the exposure, so a later disposition decides afresh,
+//!   and it must have failed on the vulnerable revision and passed on the
+//!   fixed one. Running the probe stays with its suite; the binding records
+//!   the results.
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -53,13 +68,24 @@ use crate::sekai::schema::{
 };
 
 pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
-pub const PACKAGE_VERSION: &str = "1";
-/// The current certification. Dispositions (#1924) changed the certified
-/// members, so the package is certified again under a new id that succeeds
-/// the first one where a namespace holds it.
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.2";
+/// The version the package registers its Action types at. A type's body is
+/// immutable per version, so any change to one (its schema, description or
+/// review queue) needs a new version; installing again then registers it next
+/// to the previous one, which stays for instances and clients that use it.
+/// Version 2: `finding_class` (#1990) and the disposition review queue
+/// (#1991). `action_types_are_versioned` pins the bodies.
+pub const PACKAGE_VERSION: &str = "2";
+/// Earlier registered versions, newest first.
+const PREVIOUS_PACKAGE_VERSIONS: &[&str] = &["1"];
+/// The current certification. A change to the certified members certifies
+/// the package again under a new id that succeeds the previous one where a
+/// namespace holds it; v1.3 adds the recorder and finding class (#1990),
+/// v1.4 regression probes (#1989).
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.4";
 /// Certifications this one succeeds, newest first.
 const PREVIOUS_CERTIFICATION_IDS: &[&str] = &[
+    "cert:security.finding-exposure/v1.3",
+    "cert:security.finding-exposure/v1.2",
     "cert:security.finding-exposure/v1.1",
     "cert:security.finding-exposure/v1",
 ];
@@ -68,10 +94,28 @@ pub const KIND_OCCURRENCE: &str = "security_finding_occurrence";
 pub const KIND_HYPOTHESIS: &str = "security_hypothesis";
 pub const KIND_EXPOSURE: &str = "security_exposure";
 pub const KIND_DISPOSITION: &str = "security_disposition";
+pub const KIND_PROBE: &str = "security_regression_probe";
+
+/// The package's kinds, written only through its Actions.
+pub fn is_package_kind(kind: &str) -> bool {
+    [
+        KIND_FINDING,
+        KIND_OCCURRENCE,
+        KIND_HYPOTHESIS,
+        KIND_EXPOSURE,
+        KIND_DISPOSITION,
+        KIND_PROBE,
+    ]
+    .contains(&kind)
+}
 pub const ACTION_DISPOSITION_RECORD: &str = "security.disposition.record";
 pub const ACTION_DISPOSITION_SUPERSEDE: &str = "security.disposition.supersede";
 pub const ACTION_DISPOSITION_REOPEN: &str = "security.disposition.reopen";
 pub const ACTION_EXPOSURE_BASIS: &str = "security.exposure.basis";
+pub const ACTION_PROBE_BIND: &str = "security.probe.bind";
+pub const DISPOSITION_FIXED: &str = "fixed";
+/// The review queue agent dispositions park in (#1991).
+pub const DISPOSITION_REVIEW_QUEUE: &str = "security.dispositions";
 pub const DISPOSITION_ACCEPT_RISK: &str = "accept-risk";
 pub const DISPOSITION_NEEDS_REVIEW: &str = "needs-review";
 /// Validity basis facts an exposure records the current value of.
@@ -84,6 +128,18 @@ pub const BASIS_FACTS: [&str; 5] = [
 ];
 /// An exposure's reachable markings when no marked data is reachable.
 pub const NO_MARKINGS: &str = "none";
+/// The submitting principal of a disposition, stamped at write.
+pub const PROPERTY_RECORDED_BY: &str = "recorded_by";
+/// [`RECORDER_AGENT`] or [`RECORDER_HUMAN`]: the recorder as classified when
+/// it recorded the disposition, stamped at write.
+pub const PROPERTY_RECORDER_KIND: &str = "recorder_kind";
+pub const RECORDER_AGENT: &str = "agent";
+pub const RECORDER_HUMAN: &str = "human";
+/// The site agent definition revision behind a disposition, stamped at write.
+pub const PROPERTY_RECORDER_REVISION: &str = "recorder_revision";
+/// A finding's class of weakness; absent reads as [`UNCLASSIFIED`].
+pub const PROPERTY_FINDING_CLASS: &str = "finding_class";
+pub const UNCLASSIFIED: &str = "unclassified";
 /// The reopened fact of a disposition that expired.
 pub const FACT_EXPIRES_AT: &str = "expires_at_ms";
 /// Properties a reopen copies from the disposition it reopens.
@@ -226,6 +282,18 @@ fn register_action_types(
     let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON)
         .map_err(|error| format!("security action-types fixture: {error}"))?;
     for action in document.actions {
+        // An agent's disposition parks until its precision earns it (#1991);
+        // the parked ones wait in one review queue.
+        let review_queue = if [ACTION_DISPOSITION_RECORD, ACTION_DISPOSITION_SUPERSEDE]
+            .contains(&action.type_id.as_str())
+        {
+            crate::sekai::review_queue::ReviewQueueSpec {
+                queue_id: DISPOSITION_REVIEW_QUEUE.into(),
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
         let parameter_schema_json = serde_json::to_string(&action.parameter_schema)
             .map_err(|error| format!("security action parameter schema: {error}"))?;
         db.put_governed_action_type(
@@ -239,6 +307,7 @@ fn register_action_types(
                 object_kind: action.object_kind,
                 object_mutation: action.object_mutation,
                 enabled: true,
+                review_queue,
                 ..Default::default()
             },
             actor,
@@ -256,6 +325,25 @@ fn certify(
 ) -> Result<CapabilityPackageCertification, String> {
     let certification = certification_for(db, namespace, actor)?;
     certify_package(db, actor, &certification, now_ms)
+}
+
+/// The newest version of `type_id` registered in `namespace`, so a server
+/// that runs ahead of the namespace's install submits a version it holds.
+fn registered_version(
+    db: &RuntimeDb,
+    namespace: &str,
+    type_id: &str,
+) -> Result<&'static str, String> {
+    for version in std::iter::once(PACKAGE_VERSION).chain(PREVIOUS_PACKAGE_VERSIONS.iter().copied())
+    {
+        if db
+            .get_governed_action_type(namespace, type_id, version)?
+            .is_some()
+        {
+            return Ok(version);
+        }
+    }
+    Ok(PACKAGE_VERSION)
 }
 
 /// The package's current certification, succeeding an earlier live one.
@@ -343,11 +431,12 @@ fn fixture_digest(bytes: &[u8]) -> String {
 }
 
 /// Package write rules on top of the ObjectType schema. Stamps each kind's
-/// identity into `external_id` and checks references to other package
-/// objects. Other kinds pass through.
+/// identity into `external_id`, a disposition's recorder from `submitter`,
+/// and checks references to other package objects. Other kinds pass through.
 pub fn validate_object_write(
     db: &RuntimeDb,
     object: &mut Object,
+    submitter: Option<crate::sekai::action_object_mutation::Submitter<'_>>,
     now_ms: i64,
 ) -> Result<(), String> {
     let identity = match object.kind.as_str() {
@@ -384,6 +473,7 @@ pub fn validate_object_write(
                     "a disposition cannot be changed; supersede it with a new disposition".into(),
                 );
             }
+            stamp_recorder(db, object, submitter)?;
             let exposure = require_exposure(db, object)?;
             match required(object, "disposition")? {
                 DISPOSITION_ACCEPT_RISK => {
@@ -393,6 +483,12 @@ pub fn validate_object_write(
                 _ => {}
             }
             disposition_identity(db, object)?
+        }
+        KIND_PROBE => {
+            if db.get_object(&object.id)?.is_some() {
+                return Err("a regression probe binding cannot be changed".into());
+            }
+            validate_probe(db, object)?
         }
         _ => return Ok(()),
     };
@@ -410,6 +506,50 @@ pub fn validate_object_write(
         }
     }
     object.external_id = identity;
+    Ok(())
+}
+
+/// Overwrites whatever the caller sent: the recorder is a fact of the
+/// admission, not a parameter. A write without a submitter (a transform)
+/// records no recorder, so it never counts as anyone's decision.
+fn stamp_recorder(
+    db: &RuntimeDb,
+    object: &mut Object,
+    submitter: Option<crate::sekai::action_object_mutation::Submitter<'_>>,
+) -> Result<(), String> {
+    object.properties.remove(PROPERTY_RECORDED_BY);
+    object.properties.remove(PROPERTY_RECORDER_KIND);
+    object.properties.remove(PROPERTY_RECORDER_REVISION);
+    let Some(submitter) = submitter.filter(|submitter| !submitter.principal.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let principal = submitter.principal;
+    let site_agent = crate::sekai::site_agent_instance::definition_revision_for(
+        db,
+        &object.namespace,
+        principal,
+    )?;
+    // A site agent's principal need not look like an agent's.
+    // As admission classified it at submission, which a parked grant keeps;
+    // admission counts a site agent's principal as an agent too.
+    let is_agent = site_agent.is_some() || submitter.agent;
+    if let Some(revision) = site_agent.filter(|revision| !revision.is_empty()) {
+        object
+            .properties
+            .insert(PROPERTY_RECORDER_REVISION.into(), revision);
+    }
+    let kind = if is_agent {
+        RECORDER_AGENT
+    } else {
+        RECORDER_HUMAN
+    };
+    object
+        .properties
+        .insert(PROPERTY_RECORDER_KIND.into(), kind.into());
+    object
+        .properties
+        .insert(PROPERTY_RECORDED_BY.into(), principal.into());
     Ok(())
 }
 
@@ -484,6 +624,7 @@ fn reference_ids(object: &Object) -> Vec<String> {
             .into_iter()
             .chain(property("supersedes"))
             .collect(),
+        KIND_PROBE => property("disposition_id").into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -522,6 +663,10 @@ fn duplicate_message(object: &Object, existing: &Object) -> String {
             "this exposure already has a disposition {}; supersede it instead",
             existing.id
         ),
+        KIND_PROBE => format!(
+            "that disposition already has regression probe {}",
+            existing.id
+        ),
         _ => format!(
             "an exposure for this finding and target already exists as {}",
             existing.id
@@ -550,6 +695,120 @@ fn require_exposure(db: &RuntimeDb, object: &Object) -> Result<Object, String> {
 /// The first disposition of an exposure, or the one successor of a previous
 /// disposition of the same exposure. Either is unique, so the history of an
 /// exposure's dispositions is one chain.
+/// A probe binds to the `fixed` disposition that heads its exposure's chain,
+/// with a failing result on the vulnerable revision and a passing one on the
+/// fixed revision. Stamps the exposure and answers the identity: one probe
+/// per disposition, checked at plan time only. Two concurrent bindings can
+/// both land; either clears `needs-probe`, so a duplicate does no harm.
+fn validate_probe(db: &RuntimeDb, object: &mut Object) -> Result<String, String> {
+    let disposition_id = required(object, "disposition_id")?.to_string();
+    let disposition = db
+        .get_object(&disposition_id)?
+        .filter(|found| found.namespace == object.namespace && found.kind == KIND_DISPOSITION)
+        .ok_or_else(|| format!("disposition {disposition_id} not found in this namespace"))?;
+    if disposition
+        .properties
+        .get("disposition")
+        .map(String::as_str)
+        != Some(DISPOSITION_FIXED)
+    {
+        return Err(format!(
+            "disposition {disposition_id} is not fixed; a regression probe proves a fix"
+        ));
+    }
+    let exposure_id = required(&disposition, "exposure_id")?.to_string();
+    let head = disposition_chain_head(db, &object.namespace, &exposure_id)?;
+    if head.as_ref().map(|head| head.id.as_str()) != Some(disposition_id.as_str()) {
+        return Err(format!(
+            "disposition {disposition_id} is superseded; bind the probe to the current one"
+        ));
+    }
+    required(object, "probe_kind")?;
+    required(object, "probe_ref")?;
+    let vulnerable = required(object, "vulnerable_revision")?;
+    if required(object, "fixed_revision")? == vulnerable {
+        return Err("the vulnerable and fixed revisions must differ".into());
+    }
+    if required(object, "vulnerable_result")? != PROBE_FAIL {
+        return Err(
+            "the probe must fail on the vulnerable revision; one that passes there does not detect the weakness"
+                .into(),
+        );
+    }
+    if required(object, "fixed_result")? != PROBE_PASS {
+        return Err("the probe must pass on the fixed revision".into());
+    }
+    // The binding names the disposition and copies its exposure, so it is
+    // marked at least as high as the disposition; admission then admits
+    // only a caller cleared for that marking.
+    if let Some(needed) = crate::sekai::markings::object_marking_token(&disposition) {
+        let lattice = namespace_lattice(db, &object.namespace)?;
+        let held = crate::sekai::markings::object_marking_token(object).unwrap_or_default();
+        if held.is_empty() || !lattice.dominates(held, needed)? {
+            return Err(format!(
+                "a probe for disposition {disposition_id} needs a marking at least {needed}"
+            ));
+        }
+    }
+    object.properties.insert("exposure_id".into(), exposure_id);
+    Ok(format!("probe:{disposition_id}"))
+}
+
+const PROBE_FAIL: &str = "fail";
+const PROBE_PASS: &str = "pass";
+
+/// Where an exposure stands with its dispositions (#1989).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposureState {
+    /// No disposition yet.
+    Undecided,
+    /// Reopened: a `needs-review` disposition heads the chain.
+    NeedsReview,
+    /// A `fixed` disposition heads the chain and no probe is bound to it.
+    NeedsProbe,
+    /// Decided, and a `fixed` decision has its probe.
+    Decided,
+}
+
+impl ExposureState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Undecided => "undecided",
+            Self::NeedsReview => DISPOSITION_NEEDS_REVIEW,
+            Self::NeedsProbe => "needs-probe",
+            Self::Decided => "decided",
+        }
+    }
+}
+
+/// The state of `exposure_id` in `namespace`, from its chain head.
+pub fn exposure_state(
+    db: &RuntimeDb,
+    namespace: &str,
+    exposure_id: &str,
+) -> Result<ExposureState, String> {
+    let Some(head) = disposition_chain_head(db, namespace, exposure_id)? else {
+        return Ok(ExposureState::Undecided);
+    };
+    Ok(
+        match head.properties.get("disposition").map(String::as_str) {
+            Some(DISPOSITION_NEEDS_REVIEW) => ExposureState::NeedsReview,
+            Some(DISPOSITION_FIXED) => {
+                let bound = db
+                    .find_all_by_external_id(&format!("probe:{}", head.id))?
+                    .into_iter()
+                    .any(|probe| probe.namespace == namespace && probe.kind == KIND_PROBE);
+                if bound {
+                    ExposureState::Decided
+                } else {
+                    ExposureState::NeedsProbe
+                }
+            }
+            _ => ExposureState::Decided,
+        },
+    )
+}
+
 fn disposition_identity(db: &RuntimeDb, object: &Object) -> Result<String, String> {
     let exposure_id = required(object, "exposure_id")?;
     let Some(previous_id) = object.properties.get("supersedes") else {
@@ -1145,11 +1404,20 @@ fn reopen(
         previous.id,
         &format!("{:x}", Sha256::digest(parameters.to_string().as_bytes()))[..16]
     );
+    let newest = registered_version(db, &previous.namespace, ACTION_DISPOSITION_REOPEN)?;
     let admit = |idempotency_key: String| {
+        // A replayed attempt keeps the version it was first submitted at, so
+        // one parked before the package was installed again still replays;
+        // only a new attempt takes the newest version the namespace holds.
+        let version =
+            match db.get_action_instance_by_idempotency(&previous.namespace, &idempotency_key) {
+                Ok(Some(existing)) => existing.version,
+                _ => newest.to_string(),
+            };
         let request = crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest {
             namespace: previous.namespace.clone(),
             type_id: ACTION_DISPOSITION_REOPEN.into(),
-            version: PACKAGE_VERSION.into(),
+            version,
             parameters_json: parameters.to_string(),
             idempotency_key,
             evidence_submission_ids: Vec::new(),
@@ -1796,7 +2064,16 @@ mod tests {
         changed
             .properties
             .insert("disposition".into(), "fixed".into());
-        let message = validate_object_write(&runtime, &mut changed, 2_000).unwrap_err();
+        let message = validate_object_write(
+            &runtime,
+            &mut changed,
+            Some(crate::sekai::action_object_mutation::Submitter {
+                principal: ACTOR,
+                agent: false,
+            }),
+            2_000,
+        )
+        .unwrap_err();
         assert!(message.contains("cannot be changed"), "{message}");
         let message = failed_precondition(admit(
             &runtime,
@@ -2358,7 +2635,10 @@ mod tests {
                 &type_def,
                 NAMESPACE,
                 &accept.to_string(),
-                Some(ACTOR),
+                Some(crate::sekai::action_object_mutation::Submitter {
+                    principal: ACTOR,
+                    agent: false,
+                }),
                 None,
                 2_000,
             )
@@ -2649,5 +2929,300 @@ mod tests {
             head(&runtime).properties["reopened_fact"],
             "dependency_closure_digest"
         );
+    }
+
+    fn probe(object_id: &str, disposition_id: &str, vulnerable: &str, fixed: &str) -> Value {
+        json!({
+            "object_id": object_id,
+            "disposition_id": disposition_id,
+            "probe_kind": "catalogue",
+            "probe_ref": "isolation:cross-tenant-read",
+            "vulnerable_revision": "rev-a",
+            "vulnerable_result": vulnerable,
+            "fixed_revision": "rev-b",
+            "fixed_result": fixed,
+        })
+    }
+
+    fn state_of(runtime: &RuntimeDb) -> ExposureState {
+        exposure_state(runtime, NAMESPACE, "e-1").unwrap()
+    }
+
+    /// A fixed exposure reads needs-probe until a probe that fails on the
+    /// vulnerable revision and passes on the fixed one is bound to its fix;
+    /// one that passes on both is refused (#1989).
+    #[test]
+    fn a_fixed_exposure_needs_a_probe_that_fails_before_the_fix() {
+        let runtime = with_exposure();
+        assert_eq!(state_of(&runtime), ExposureState::Undecided);
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", DISPOSITION_FIXED, None),
+            "d-1",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+        assert_eq!(state_of(&runtime).as_str(), "needs-probe");
+
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "pass", "pass"),
+            "p-passes",
+        ));
+        assert!(
+            message.contains("must fail on the vulnerable revision"),
+            "{message}"
+        );
+        assert!(runtime.get_object("p-1").unwrap().is_none());
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+
+        admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-1",
+        )
+        .unwrap();
+        let bound = runtime.get_object("p-1").unwrap().unwrap();
+        assert_eq!(bound.properties["exposure_id"], "e-1");
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-2", "d-1", "fail", "pass"),
+            "p-2",
+        ));
+        assert!(
+            message.contains("already has regression probe p-1"),
+            "{message}"
+        );
+    }
+
+    /// A probe proves only the fix that heads the chain: not another
+    /// disposition, not a superseded fix, and a newer fix needs its own.
+    #[test]
+    fn a_probe_binds_only_to_the_current_fix() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-1",
+        ));
+        assert!(message.contains("is not fixed"), "{message}");
+
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-2", DISPOSITION_FIXED, Some("d-1")),
+            "d-2",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-2", "d-2", "fail", "pass"),
+            "p-2",
+        )
+        .unwrap();
+        admit(
+            &runtime,
+            ACTION_DISPOSITION_SUPERSEDE,
+            disposition("d-3", DISPOSITION_FIXED, Some("d-2")),
+            "d-3",
+        )
+        .unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::NeedsProbe);
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-3", "d-2", "fail", "pass"),
+            "p-3",
+        ));
+        assert!(message.contains("is superseded"), "{message}");
+        let mut same = probe("p-4", "d-3", "fail", "pass");
+        same["fixed_revision"] = "rev-a".into();
+        let message = failed_precondition(admit(&runtime, ACTION_PROBE_BIND, same, "p-4"));
+        assert!(message.contains("must differ"), "{message}");
+    }
+
+    /// A probe for a marked disposition is marked at least as high, so only
+    /// a caller cleared for that marking binds it.
+    #[test]
+    fn a_probe_is_marked_at_least_as_high_as_its_disposition() {
+        let runtime = with_exposure();
+        let mut fixed = disposition("d-1", DISPOSITION_FIXED, None);
+        fixed["access_marking"] = "confidential".into();
+        admit(&runtime, ACTION_DISPOSITION_RECORD, fixed, "d-1").unwrap();
+
+        let message = failed_precondition(admit(
+            &runtime,
+            ACTION_PROBE_BIND,
+            probe("p-1", "d-1", "fail", "pass"),
+            "p-unmarked",
+        ));
+        assert!(message.contains("at least confidential"), "{message}");
+        let mut marked = probe("p-1", "d-1", "fail", "pass");
+        marked["access_marking"] = "confidential".into();
+        assert!(
+            admit_cleared(
+                &runtime,
+                ACTION_PROBE_BIND,
+                marked.clone(),
+                "p-low",
+                "internal"
+            )
+            .is_err()
+        );
+        assert!(runtime.get_object("p-1").unwrap().is_none());
+        admit_cleared(&runtime, ACTION_PROBE_BIND, marked, "p-1", "confidential").unwrap();
+        assert_eq!(state_of(&runtime), ExposureState::Decided);
+    }
+
+    /// The Action type bodies at [`PACKAGE_VERSION`]. A changed body needs a
+    /// new version: an installed namespace refuses a changed body at its
+    /// version. Update the digest only together with the version.
+    #[test]
+    fn action_types_are_versioned() {
+        let runtime = installed();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        let mut bodies = Vec::new();
+        for action in document.actions {
+            let stored = runtime
+                .get_governed_action_type(NAMESPACE, &action.type_id, PACKAGE_VERSION)
+                .unwrap()
+                .unwrap();
+            bodies.push(format!(
+                "{} {}",
+                action.type_id,
+                crate::sekai::governed_action_type::body_fingerprint(&stored).unwrap()
+            ));
+        }
+        bodies.sort();
+        assert_eq!(
+            (
+                PACKAGE_VERSION,
+                fixture_digest(bodies.join("\n").as_bytes()).as_str()
+            ),
+            (PACKAGE_VERSION, PINNED_ACTION_BODIES)
+        );
+    }
+
+    const PINNED_ACTION_BODIES: &str =
+        "sha256:e3a6dbbb2600175194fea02a1430575b97df1e2c89f73b212f00e2511c53f9b7";
+
+    /// A namespace installed by the previous release, whose types differ at
+    /// version 1, installs again: the new version registers next to the old
+    /// one, and a reopen submits the newest version the namespace holds.
+    #[test]
+    fn an_earlier_install_upgrades_in_place() {
+        let runtime = RuntimeDb::memory();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        for action in &document.actions {
+            runtime
+                .put_governed_action_type(
+                    GovernedActionType {
+                        namespace: NAMESPACE.into(),
+                        type_id: action.type_id.clone(),
+                        version: "1".into(),
+                        description: format!("{} as first released", action.type_id),
+                        parameter_schema_json: action.parameter_schema.to_string(),
+                        allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                        object_kind: action.object_kind.clone(),
+                        object_mutation: action.object_mutation.clone(),
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    ACTOR,
+                    500,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            registered_version(&runtime, NAMESPACE, ACTION_DISPOSITION_REOPEN).unwrap(),
+            "1"
+        );
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        assert!(
+            runtime
+                .get_governed_action_type(NAMESPACE, ACTION_DISPOSITION_RECORD, "1")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            registered_version(&runtime, NAMESPACE, ACTION_DISPOSITION_REOPEN).unwrap(),
+            PACKAGE_VERSION
+        );
+    }
+
+    /// A reopen parked at version 1 replays at version 1 after the package
+    /// registers version 2, instead of conflicting on its idempotency key.
+    #[test]
+    fn a_reopen_parked_before_an_upgrade_replays_at_its_version() {
+        let runtime = RuntimeDb::memory();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        for action in &document.actions {
+            runtime
+                .put_governed_action_type(
+                    GovernedActionType {
+                        namespace: NAMESPACE.into(),
+                        type_id: action.type_id.clone(),
+                        version: "1".into(),
+                        description: action.description.clone(),
+                        parameter_schema_json: action.parameter_schema.to_string(),
+                        allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                        object_kind: action.object_kind.clone(),
+                        object_mutation: action.object_mutation.clone(),
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    ACTOR,
+                    500,
+                )
+                .unwrap();
+        }
+        register_object_types(&runtime).unwrap();
+        let admit_v1 = |type_id: &str, parameters: Value, key: &str| {
+            let mut admission = request(type_id, &parameters, key);
+            admission.version = "1".into();
+            ActionInstanceAdmission::new(&runtime, None)
+                .admit(admission, ACTOR, 2_000)
+                .unwrap();
+        };
+        admit_v1(ACTION_FINDING, finding("f-1", "sig-1"), "f");
+        admit_v1(ACTION_EXPOSURE, exposure("e-1", VERDICT_UNKNOWN, None), "e");
+        admit_v1(
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        );
+        admit_v1(ACTION_EXPOSURE_BASIS, basis("sha256:closure-b"), "b");
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(NAMESPACE);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        runtime.upsert_action_policy(&policy).unwrap();
+        let parked = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert!(parked.reopened.is_empty());
+        assert!(parked.failures.is_empty(), "{:?}", parked.failures);
+
+        install(&runtime, NAMESPACE, ACTOR, 3_500).unwrap();
+        let again = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 4_000).unwrap();
+        assert!(again.failures.is_empty(), "{:?}", again.failures);
+        let parked_versions: Vec<_> = runtime
+            .list_action_instances_page(NAMESPACE, Some(ACTION_DISPOSITION_REOPEN), None, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.version)
+            .collect();
+        assert_eq!(parked_versions, ["1"]);
     }
 }

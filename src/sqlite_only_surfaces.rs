@@ -22,7 +22,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
         "/crates/chisei-core/src/chisei_store/runtime.rs"
     ))
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 9;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

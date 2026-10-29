@@ -170,6 +170,18 @@ impl SekaiServiceImpl {
         let descriptor = parse_object_set_descriptor(
             descriptor.ok_or_else(|| Status::invalid_argument("object-set descriptor required"))?,
         )?;
+        self.authorize_domain_object_set_read(principals, tenant_context, descriptor)
+    }
+
+    /// The checks on an object set's namespace and kind that do not depend
+    /// on its definition revision: tenant, team, source namespace, and the
+    /// reserved governance kinds.
+    pub(super) fn authorize_object_set_scope(
+        &self,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        descriptor: &DomainObjectSetDescriptor,
+    ) -> Result<(), Status> {
         enforce_namespace_tenant_context(
             self.db.runtime(),
             tenant_context,
@@ -192,6 +204,17 @@ impl SekaiServiceImpl {
         {
             return Err(Status::not_found("object set unavailable"));
         }
+        Ok(())
+    }
+
+    /// [`Self::authorize_object_set_read`] for a parsed descriptor.
+    pub(super) fn authorize_domain_object_set_read(
+        &self,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        descriptor: DomainObjectSetDescriptor,
+    ) -> Result<crate::sekai::object_set::BoundObjectSet, Status> {
+        self.authorize_object_set_scope(principals, tenant_context, &descriptor)?;
         let published = self
             .db
             .runtime()
@@ -3624,5 +3647,580 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    /// An isolated run streams the object set its putter reads, matching
+    /// `EvaluateObjectSet` for the same principal, to a labelled worker only.
+    #[tokio::test]
+    async fn isolated_runs_stream_object_set_inputs_to_labelled_workers() {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{ISOLATED_CLASS, OBJECT_SET_INPUT_LABEL};
+        let svc = service();
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        for id in ["ops-orders", "ops-out"] {
+            svc.db
+                .runtime()
+                .create_dataset(&Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: vec![ColumnDef {
+                        name: "customer".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    }],
+                    object_id: String::new(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                })
+                .unwrap();
+        }
+        let eu = || ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            limit: 100,
+            ..Default::default()
+        };
+        let domain_eu = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(GovernedTransform {
+                    contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+                    namespace: "ops".into(),
+                    transform_id: "iso-sets".into(),
+                    output_dataset_id: "ops-out".into(),
+                    profile: ISOLATED_CLASS.into(),
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    code: "print('ok')".into(),
+                    inputs: vec![
+                        TransformInput {
+                            alias: "orders".into(),
+                            dataset_id: "ops-orders".into(),
+                            object_set: String::new(),
+                        },
+                        TransformInput {
+                            alias: "customers".into(),
+                            dataset_id: String::new(),
+                            object_set: domain_eu,
+                        },
+                    ],
+                    ..GovernedTransform::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let run = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "iso-sets".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .run
+            .unwrap();
+        assert!(run.input_versions.contains_key("object-set:customers"));
+
+        let db = svc.db.runtime();
+        db.register_transform_runtime("ops", "plain", &Default::default(), "local", 1)
+            .unwrap();
+        assert!(
+            db.claim_transform_work("ops", "plain", "", 60_000, 2)
+                .unwrap()
+                .is_none()
+        );
+        let labels = std::collections::BTreeMap::from([(
+            OBJECT_SET_INPUT_LABEL.to_string(),
+            "v1".to_string(),
+        )]);
+        db.register_transform_runtime("ops", "sets", &labels, "local", 1)
+            .unwrap();
+        let (work, _) = db
+            .claim_transform_work("ops", "sets", "", 60_000, 2)
+            .unwrap()
+            .expect("claimable work");
+        let streamed = db
+            .read_transform_run_input(
+                &crate::sekai::governed_transform::WriteTransformRunCommand {
+                    run_id: work.run_id,
+                    runtime_id: work.claim_owner,
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token,
+                    ..Default::default()
+                },
+                "customers",
+                "",
+                0,
+                100,
+                3,
+            )
+            .unwrap();
+        let mut streamed: Vec<String> = streamed
+            .iter()
+            .map(|row| row.values["id"].clone())
+            .collect();
+        streamed.sort();
+        let evaluated = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(eu()),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut expected: Vec<String> = evaluated
+            .members
+            .iter()
+            .map(|object| object.id.clone())
+            .collect();
+        expected.sort();
+        assert!(!expected.is_empty());
+        assert_eq!(streamed, expected);
+    }
+
+    /// #1977: a transform joins a dataset with an object set read as its
+    /// principal; the run pins the set; markings follow; partial access
+    /// narrows the rows; no access refuses put, preview and run.
+    #[tokio::test]
+    async fn object_set_inputs_read_as_the_principal_and_pin() {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+        let svc = service();
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        let mut marked = svc.db.runtime().get_object("c-eu-3").unwrap().unwrap();
+        marked.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "internal".into(),
+        );
+        marked.updated += 1;
+        svc.db.runtime().update_object(&marked).unwrap();
+        // A marked input needs an output bound to an object.
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: "ops-out-object".into(),
+                kind: "artifact".into(),
+                name: "out".into(),
+                namespace: "ops".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        for (id, object_id) in [("ops-orders", ""), ("ops-out", "ops-out-object")] {
+            svc.db
+                .runtime()
+                .create_dataset(&Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: vec![ColumnDef {
+                        name: "customer".into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    }],
+                    object_id: object_id.into(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                })
+                .unwrap();
+        }
+        let order = |customer: &str, amount: &str| {
+            HashMap::from([
+                ("customer".to_string(), customer.to_string()),
+                ("amount".to_string(), amount.to_string()),
+            ])
+        };
+        svc.db
+            .runtime()
+            .append_rows(
+                "ops-orders",
+                &[
+                    order("c-eu-2", "5"),
+                    order("c-eu-3", "9"),
+                    order("c-us-2", "7"),
+                ],
+            )
+            .unwrap();
+        let customers = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: "eu".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let definition = |transform_id: &str| GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ops".into(),
+            transform_id: transform_id.into(),
+            output_dataset_id: "ops-out".into(),
+            profile: ANALYTICAL_CLASS.into(),
+            sql: "SELECT o.customer, o.amount, c.name FROM orders o \
+                  JOIN customers c ON c.id = o.customer ORDER BY o.customer"
+                .into(),
+            inputs: vec![
+                TransformInput {
+                    alias: "orders".into(),
+                    dataset_id: "ops-orders".into(),
+                    object_set: String::new(),
+                },
+                TransformInput {
+                    alias: "customers".into(),
+                    dataset_id: String::new(),
+                    object_set: customers.clone(),
+                },
+            ],
+            ..GovernedTransform::default()
+        };
+        let adhoc = |principal: &'static str, key: &'static str| {
+            svc.run_ad_hoc_governed_transform(with_named_principal(
+                RunAdHocGovernedTransformRequest {
+                    transform: Some(definition("adhoc")),
+                    session_label: "join".into(),
+                    idempotency_key: key.into(),
+                },
+                principal,
+            ))
+        };
+
+        // Joined with the eu customers, read as the caller and pinned.
+        let joined = adhoc("local", "k1").await.unwrap().into_inner();
+        let run = joined.run.unwrap();
+        assert!(run.input_versions.contains_key("object-set:customers"));
+        assert!(run.input_versions.contains_key("ops-orders"));
+        let rows = svc
+            .db
+            .runtime()
+            .query_rows(&joined.scratch_dataset_id, &Default::default())
+            .unwrap();
+        let mut names: Vec<_> = rows.iter().map(|row| row["name"].clone()).collect();
+        names.sort();
+        assert_eq!(names, ["North", "South"]);
+        // A retry replays while the caller still reads the rows it pinned.
+        assert!(adhoc("local", "k1").await.unwrap().into_inner().replayed);
+
+        // A restricted property stays out of the rows, even for a reader
+        // allowed to see it: no marking carries its classification out.
+        let property = |name: &str, classification: &str| PropertyDef {
+            name: name.into(),
+            r#type: "string".into(),
+            classification: classification.into(),
+            ..Default::default()
+        };
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(ObjectType {
+                    kind: "Customer".into(),
+                    properties: vec![property("region", "public"), property("tier", "internal")],
+                    ..Default::default()
+                }),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let everything = svc
+            .run_ad_hoc_governed_transform(with_named_principal(
+                RunAdHocGovernedTransformRequest {
+                    transform: Some(GovernedTransform {
+                        sql: "SELECT c.* FROM customers c JOIN orders o ON o.customer = c.id"
+                            .into(),
+                        ..definition("adhoc")
+                    }),
+                    session_label: "all".into(),
+                    idempotency_key: "k-restricted".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let rows = svc
+            .db
+            .runtime()
+            .query_rows(&everything.scratch_dataset_id, &Default::default())
+            .unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row.contains_key("region") && !row.contains_key("tier")),
+            "{rows:?}"
+        );
+        // A filter on the restricted property is refused, as it would shape
+        // public output by values no marking carries.
+        let by_tier = serde_json::to_string(&crate::sekai::object_set::ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![domain::PropertyFilter {
+                key: "tier".into(),
+                op: "eq".into(),
+                value: "3".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let mut filtered = definition("adhoc");
+        filtered.inputs[1].object_set = by_tier;
+        let refused = svc
+            .run_ad_hoc_governed_transform(with_named_principal(
+                RunAdHocGovernedTransformRequest {
+                    transform: Some(filtered),
+                    session_label: "tier".into(),
+                    idempotency_key: "k-tier".into(),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument, "{refused:?}");
+        assert!(refused.message().contains("restricted"), "{refused:?}");
+        assert!(
+            run.markings_out.contains("internal"),
+            "{}",
+            run.markings_out
+        );
+
+        // A stored definition reads as its putter.
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(definition("stored")),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        let stored = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "stored".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .run
+            .unwrap();
+        assert!(stored.input_versions.contains_key("object-set:customers"));
+        assert_eq!(
+            svc.db.runtime().transform_reader("ops", "stored").unwrap(),
+            Some(("local".to_string(), stored.definition_digest.clone()))
+        );
+        assert_eq!(stored.rows_out, 2);
+
+        // An object the principal may not read is left out.
+        let owner = security::Grant {
+            id: "owner-c-eu-2".into(),
+            object_id: "c-eu-2".into(),
+            principal: "bob".into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&owner).unwrap();
+        svc.security.add_grant(&owner);
+        let narrowed = adhoc("alice", "k2").await.unwrap().into_inner();
+        let rows = svc
+            .db
+            .runtime()
+            .query_rows(&narrowed.scratch_dataset_id, &Default::default())
+            .unwrap();
+        assert!(
+            rows.iter().all(|row| row["customer"] != "c-eu-2"),
+            "{rows:?}"
+        );
+        // A pinned member the caller can no longer read refuses the replay.
+        assert_eq!(
+            adhoc("local", "k1").await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        // A namespace the principal may not read refuses put, preview and run.
+        grant_namespace(&svc, "sales", "bob");
+        assert_eq!(
+            adhoc("alice", "k3").await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        let preview = svc
+            .preview_governed_transform(with_named_principal(
+                PreviewGovernedTransformRequest {
+                    transform: Some(definition("preview")),
+                    row_cap: 0,
+                    preview_id: String::new(),
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(preview.code(), tonic::Code::PermissionDenied);
+        svc.db
+            .runtime()
+            .set_transform_reader("ops", "stored", "alice", &stored.definition_digest)
+            .unwrap();
+        let refused = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "stored".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+
+        // A reader recorded for another definition is no reader.
+        svc.db
+            .runtime()
+            .set_transform_reader("ops", "stored", "local", "sha256:another")
+            .unwrap();
+        let mismatched = svc
+            .run_governed_transform(with_named_principal(
+                RunGovernedTransformRequest {
+                    namespace: "ops".into(),
+                    transform_id: "stored".into(),
+                    incremental: false,
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatched.code(), tonic::Code::PermissionDenied);
+
+        // A set larger than the input budget stops while it is read.
+        let tiny = svc
+            .put_governed_transform(with_named_principal(
+                PutGovernedTransformRequest {
+                    transform: Some(GovernedTransform {
+                        memory_limit_bytes: 64,
+                        ..definition("tiny")
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(tiny.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            svc.db
+                .runtime()
+                .get_governed_transform("ops", "tiny")
+                .unwrap()
+                .is_none()
+        );
+
+        // A put without object-set inputs clears the reader in its own write.
+        let mut plain = definition("stored");
+        plain.inputs.truncate(1);
+        plain.sql = "SELECT customer, amount FROM orders".into();
+        svc.put_governed_transform(with_named_principal(
+            PutGovernedTransformRequest {
+                transform: Some(plain),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.db.runtime().transform_reader("ops", "stored").unwrap(),
+            None
+        );
+
+        // Object-set pins share the run's input keys; datasets beside them,
+        // and new datasets, may not take their prefix.
+        let mut prefixed = definition("prefixed");
+        prefixed.inputs[0].dataset_id = "object-set:customers".into();
+        let refused = svc
+            .put_governed_transform(with_named_principal(
+                PutGovernedTransformRequest {
+                    transform: Some(prefixed),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        let refused = svc
+            .create_dataset(with_named_principal(
+                CreateDatasetRequest {
+                    dataset: Some(crate::grpc::pb::sekai::Dataset {
+                        id: "object-set:customers".into(),
+                        name: "shadow".into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+        // A committed identity is refused, like a new one, once its sets no
+        // longer read.
+        svc.db
+            .runtime()
+            .register_object_type_datasource(
+                &crate::sekai::object_type_index::ObjectTypeDatasource {
+                    contract_version: "v1".into(),
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    definition_digest: digest.clone(),
+                    dataset_id: "ops-orders".into(),
+                    key_column: "customer".into(),
+                    property_mapping: Default::default(),
+                    hidden_column: String::new(),
+                    edits_only: false,
+                },
+                99,
+            )
+            .unwrap();
+        for key in ["k1", "k-new"] {
+            assert_eq!(
+                adhoc("local", key).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 }

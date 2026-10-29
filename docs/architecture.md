@@ -69,8 +69,13 @@ immutable content, legal and operational holds, integrity-checked lifecycle
 archives (`archive_lifecycle_records`), and reversible object reconciliation.
 PostgreSQL collectors serialize per namespace so concurrent release, hold,
 reconciliation, and archive attempts cannot double-delete a payload or lose a
-retaining obligation. The SQLite `run_retention` / `purge_old_records` /
-`archive_retained_records` helpers remain SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair
+retaining obligation. Retention archives into `sekai_archive_*` tables in the same database on
+both backends (ADR 0141): `RuntimeDb::archive_retained_records(now, dry_run)`
+moves records past their policy cutoff and removes or redacts them in one
+transaction. SQLite covers decisions, attestations, object changes, LLM calls,
+task observations and content events; PostgreSQL covers content events, with
+the other datasets following. `run_retention` and `purge_old_records` remain
+SQLite-only. Selecting `SEKAI_DB_BACKEND=postgres` with Combined dest-pair
 `SEKAI_DATABASE_URL` + `CHISEI_DATABASE_URL` activates these reusable surfaces as the community
 runtime backend; it still does not add tenant, OIDC, OAuth, or identity
 capabilities.

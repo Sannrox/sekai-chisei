@@ -93,6 +93,27 @@ and a repeated key is refused. Only planes from this release honor
 declare requirements once every plane serving the store is upgraded.
 Definitions without `requires` keep their digest.
 
+An analytical or isolated-process input may name an object set instead of a
+dataset (ADR 0140):
+`object_set` carries a descriptor as JSON, and `dataset_id` stays empty. The
+plane reads the set with `EvaluateObjectSet`'s read policy as the caller for
+put, preview and ad-hoc runs, and as the principal that put the definition
+for `RunGovernedTransform`. A kind or namespace that principal may not read
+refuses the call; objects it may not read are left out. Each object is a row
+of `id`, `name` and its readable properties in name order, and the run's
+`input_versions` pins a digest of the rows under `object-set:<alias>`. Plain
+sets over unindexed kinds are read, beside at least one dataset input, and a
+definition with object-set inputs cannot carry a schedule or trigger. With an
+enterprise extension, `RunGovernedTransform` refuses such a definition; run it
+ad hoc instead.
+
+An isolated-process definition with an object-set input requires the
+placement label `sekai.input.object-set=v1`, which the plane adds to its
+`requires`: only a runtime that registered the label is offered the work.
+The admitted snapshot keeps the set's rows, and `ReadTransformRunInputs`
+streams them under the input's alias, with `dataset_id` set to the pin key.
+`DiscoverCapabilities` reports `sekai.transforms.object-set-inputs`.
+
 Experimental `RunAdHocGovernedTransform` (ADR 0138) runs an inline analytical
 or isolated-process definition once for any caller with read access to the namespace. Inputs pass
 the preview read checks; an input whose columns the caller may only partly

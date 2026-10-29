@@ -213,6 +213,40 @@ pub fn frozen_instance_for(
         .map(|instance| instance.id))
 }
 
+/// Stands for several instances that act as one principal on different
+/// definition revisions, so no one revision answers for their decisions.
+pub const AMBIGUOUS_REVISION: &str = "ambiguous";
+
+/// The definition revision behind `principal` in `namespace`: `None` when no
+/// site agent instance acts as it, otherwise the revision digest its
+/// instances share, empty when they record none, or [`AMBIGUOUS_REVISION`]
+/// when they differ. Security dispositions stamp it so precision is
+/// measured per revision (#1990). It is read when the write is planned and
+/// is not fenced at commit (ADR 0135).
+pub fn definition_revision_for(
+    db: &RuntimeDb,
+    namespace: &str,
+    principal: &str,
+) -> Result<Option<String>, String> {
+    let revisions: std::collections::BTreeSet<String> = db
+        .find_by_property(KIND, "principal_id", principal)?
+        .into_iter()
+        .filter(|instance| instance.namespace == namespace)
+        .map(|instance| {
+            instance
+                .properties
+                .get("definition_revision_digest")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    Ok(match revisions.len() {
+        0 => None,
+        1 => revisions.into_iter().next(),
+        _ => Some(AMBIGUOUS_REVISION.into()),
+    })
+}
+
 /// Refuse a wake of `instance` while it is frozen (#1934).
 pub fn require_not_frozen(instance: &Object) -> Result<(), String> {
     if instance.properties.get(FROZEN_PROPERTY).map(String::as_str) == Some("true") {
@@ -418,6 +452,39 @@ mod tests {
             Err(ActionInstanceAdmissionError::FailedPrecondition(message)) => message,
             other => panic!("expected FailedPrecondition, got {other:?}"),
         }
+    }
+
+    /// A principal's revision is its instances' shared revision, and
+    /// instances on different revisions answer [`AMBIGUOUS_REVISION`]
+    /// (#1990).
+    #[test]
+    fn a_principal_answers_for_one_revision_or_is_ambiguous() {
+        let runtime = RuntimeDb::memory();
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        let first = published_revision(&runtime, "", true);
+        let second = published_revision(&runtime, &first, true);
+        let principal = "org:line-7-agent";
+        assert_eq!(
+            definition_revision_for(&runtime, NAMESPACE, principal).unwrap(),
+            None
+        );
+        admit(&runtime, ACTION_CREATE, instance(&first, "triage"), "a").unwrap();
+        assert_eq!(
+            definition_revision_for(&runtime, NAMESPACE, principal).unwrap(),
+            Some(first)
+        );
+        let mut other = instance(&second, "triage");
+        other["object_id"] = "line-8".into();
+        other["responsibility"] = "line:8".into();
+        admit(&runtime, ACTION_CREATE, other, "b").unwrap();
+        assert_eq!(
+            definition_revision_for(&runtime, NAMESPACE, principal).unwrap(),
+            Some(AMBIGUOUS_REVISION.into())
+        );
+        assert_eq!(
+            definition_revision_for(&runtime, "elsewhere", principal).unwrap(),
+            None
+        );
     }
 
     /// Instances are created and updated through their Actions, each with a

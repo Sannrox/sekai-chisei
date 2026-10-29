@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 9,
+  "limit": 8,
   "surfaces": [
     {
       "id": "SekaiService.DeleteOntologyClass",
@@ -42,11 +42,6 @@
       "id": "admin.learning-change",
       "kind": "admin",
       "methods": ["put_learning_change", "get_learning_change"]
-    },
-    {
-      "id": "admin.retention",
-      "kind": "admin",
-      "methods": ["archive_retained_records"]
     }
   ]
 }

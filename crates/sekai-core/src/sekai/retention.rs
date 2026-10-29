@@ -2,13 +2,62 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub const AUDIT_DATASET: &str = "audit";
 pub const LLM_CALLS_DATASET: &str = "llm_calls";
 pub const TASK_OBSERVATIONS_DATASET: &str = "task_observations";
+/// Records per dataset moved in one retention batch, one transaction each
+/// (ADR 0141), so a run never holds the write lock for a whole backlog.
+pub const RETENTION_BATCH_SIZE: usize = 500;
+
+/// Where a retention run has got to, carried from batch to batch so each
+/// batch reads at most one page per dataset. Datasets whose archived rows
+/// leave the hot table (audit, object changes, content events) restart at
+/// the oldest remaining row; datasets that keep rows a batch did not archive
+/// (LLM calls, task observations) resume after the last key read.
+#[derive(Debug, Default)]
+struct RetentionCursor {
+    ledger_verified: bool,
+    audit_done: bool,
+    object_changes_done: bool,
+    content_events_done: bool,
+    llm_after: i64,
+    llm_done: bool,
+    /// `(component_id, timestamp, rowid)` of the last observation read.
+    observation_after: Option<(String, i64, i64)>,
+    /// Components with a retained row read so far: their later expired rows
+    /// are redacted in place rather than folded.
+    retained_components: std::collections::BTreeSet<String>,
+    observations_done: bool,
+}
+
+impl RetentionCursor {
+    fn done(&self) -> bool {
+        self.audit_done
+            && self.object_changes_done
+            && self.content_events_done
+            && self.llm_done
+            && self.observations_done
+    }
+}
+
+/// `limit` as a SQL `LIMIT`; `usize::MAX` means no limit.
+fn sql_limit(limit: usize) -> i64 {
+    i64::try_from(limit).unwrap_or(i64::MAX)
+}
+/// Content lifecycle events (ADR 0141). No default policy: archived only
+/// once an operator sets one.
+pub const CONTENT_EVENTS_DATASET: &str = "content_events";
+/// Every dataset a retention policy may name.
+pub const RETENTION_DATASETS: [&str; 4] = [
+    AUDIT_DATASET,
+    LLM_CALLS_DATASET,
+    TASK_OBSERVATIONS_DATASET,
+    CONTENT_EVENTS_DATASET,
+];
 
 const DAY_MS: i64 = 86_400_000;
 const RETENTION_TOMBSTONE_CONTEXT: &str = r#"{"retention_tombstone":"true"}"#;
@@ -38,6 +87,21 @@ pub struct ArchiveRun {
     pub llm_calls_archived: i32,
     pub task_observations_archived: i32,
     pub task_observations_redacted: i32,
+    pub content_events_archived: i32,
+    /// Counted and checked, then rolled back: nothing was written.
+    pub dry_run: bool,
+    /// Batches committed; `batch_id` and `content_hash` name the last one.
+    pub batches: i32,
+}
+
+/// What the in-database archive holds (ADR 0141).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveStatus {
+    pub batches: i64,
+    /// Archived records per dataset (`audit.decisions`, `llm_calls`, ...).
+    pub records: Vec<(String, i64)>,
+    /// Cutoff of the newest batch, Unix milliseconds.
+    pub last_cutoff_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -69,12 +133,546 @@ fn archive_record_hash(record: &ArchiveRecord) -> String {
     archive_payload_hash(record.dataset, &record.source_key, &record.payload)
 }
 
+/// The archive's identity for a record: a SHA-256 of the namespaced
+/// `(dataset, natural key)`, so the archive stores no identifier in clear
+/// (some natural keys name a subject, such as an observation's request id)
+/// and the same record always maps to the same key, which keeps re-archiving
+/// idempotent. Shared by both backends. Known limit: the hash is unkeyed, so
+/// a guessed identifier can be confirmed against it; the store keeps no
+/// erasure or redaction secret to key it with (docs/operations.md).
+pub(crate) fn archive_source_key(dataset: &str, natural_key: &str) -> String {
+    format!(
+        "sha256:{}",
+        sha256_hex(
+            serde_json::to_string(&("sekai.archive.source-key/v1", dataset, natural_key))
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+    )
+}
+
 fn archive_payload_hash(dataset: &str, source_key: &str, payload: &str) -> String {
     sha256_hex(
         serde_json::to_string(&(dataset, source_key, payload))
             .unwrap_or_default()
             .as_bytes(),
     )
+}
+
+/// A string field that itself holds a JSON object or array, such as an
+/// observation's `packages_json`, parsed so matching and redaction reach
+/// inside it.
+fn embedded_json(text: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .filter(|value| value.is_object() || value.is_array())
+}
+
+/// The walker behind archive erasure on both backends. It decides with the
+/// hot path's own predicates, so the two cannot drift: keys by
+/// [`key_matches_subject`] (the key and its value are redacted), values by
+/// [`keyed_value_matches_subject`], strings by [`contains_subject_reference`],
+/// and keyed filters and typed objects as [`json_matches_subject`] reads
+/// them; JSON held in a string field is walked too, as the hot path parses
+/// `packages_json`. Returns whether anything changed, so matching is exactly
+/// "redaction would change it".
+fn redact_json_subject(
+    value: &mut serde_json::Value,
+    kind: &str,
+    subject: &str,
+    subject_hash: &str,
+) -> bool {
+    const REFERENCE: &str = "[redacted subject reference]";
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(mut inner) = embedded_json(text) {
+                let changed = redact_json_subject(&mut inner, kind, subject, subject_hash);
+                if changed {
+                    *text = inner.to_string();
+                }
+                return changed;
+            }
+            // The earlier archive redactor's rule, kept so erasure is never
+            // weaker than before: a value equal to the subject anywhere.
+            if text == subject {
+                *text = subject_hash.to_string();
+                return true;
+            }
+            if contains_subject_reference(text, kind, subject) {
+                *text = REFERENCE.into();
+                return true;
+            }
+            false
+        }
+        serde_json::Value::Array(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= redact_json_subject(value, kind, subject, subject_hash);
+            }
+            changed
+        }
+        serde_json::Value::Object(values) => {
+            let mut changed = false;
+            // A keyed filter, `{"key": "user", "op": "in", "value": "a,b"}`.
+            let filter_key = values
+                .get("key")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let is_in = values
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|op| op == "in");
+            if let (Some(key), Some(serde_json::Value::String(filter))) =
+                (filter_key, values.get_mut("value"))
+            {
+                if is_in {
+                    let mut hit = false;
+                    let parts: Vec<String> = filter
+                        .split(',')
+                        .map(|candidate| {
+                            if keyed_value_matches_subject(&key, candidate.trim(), kind, subject) {
+                                hit = true;
+                                subject_hash.to_string()
+                            } else {
+                                candidate.to_string()
+                            }
+                        })
+                        .collect();
+                    if hit {
+                        *filter = parts.join(",");
+                        changed = true;
+                    }
+                } else if keyed_value_matches_subject(&key, filter, kind, subject) {
+                    *filter = subject_hash.to_string();
+                    changed = true;
+                }
+            }
+            // A typed object, `{"kind": "user", "id": "alice"}`.
+            if values
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value_kind| value_kind == kind)
+            {
+                for field in ["name", "id", "external_id", "subject"] {
+                    if let Some(serde_json::Value::String(text)) = values.get_mut(field)
+                        && text == subject
+                    {
+                        *text = subject_hash.to_string();
+                        changed = true;
+                    }
+                }
+            }
+            let original = std::mem::take(values);
+            for (key, mut child) in original {
+                if key == subject
+                    || key_matches_subject(&key, kind, subject)
+                    || contains_subject_reference(&key, kind, subject)
+                {
+                    // The key names the subject: neither it nor its value stays.
+                    values.insert(
+                        format!(
+                            "[redacted-subject-key]-{}",
+                            &sha256_hex(key.as_bytes())[..16]
+                        ),
+                        serde_json::Value::String(REFERENCE.into()),
+                    );
+                    changed = true;
+                    continue;
+                }
+                if let serde_json::Value::String(text) = &mut child
+                    && keyed_value_matches_subject(&key, text, kind, subject)
+                {
+                    *text = if text == subject {
+                        subject_hash.to_string()
+                    } else {
+                        REFERENCE.into()
+                    };
+                    changed = true;
+                }
+                changed |= redact_json_subject(&mut child, kind, subject, subject_hash);
+                values.insert(key, child);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+/// An archived decision tombstoned as the hot ledger tombstones it, with
+/// [`decision_matches_for_erasure`]; `None` when it does not match. Returns
+/// the new payload and the decision's original id. The chain fields stay.
+fn tombstone_archived_decision(
+    payload: &str,
+    kind: &str,
+    subject: &str,
+    subject_hash: &str,
+    erased_at: i64,
+    subject_object_ids: &[String],
+) -> Option<(String, String)> {
+    let mut json = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let text = |field: &str| json[field].as_str().unwrap_or_default().to_string();
+    let decision = Decision {
+        id: text("id"),
+        timestamp: json["timestamp"].as_i64().unwrap_or_default(),
+        actor: text("actor"),
+        action: text("action"),
+        reason: text("reason"),
+        evidence: serde_json::from_str(&text("evidence")).unwrap_or_default(),
+        target_id: text("target_id"),
+        outcome: text("outcome"),
+    };
+    if !decision_matches_for_erasure(&decision, kind, subject, subject_object_ids) {
+        return None;
+    }
+    let id = if decision_id_matches_subject(&decision.id, kind, subject, subject_object_ids) {
+        format!("erased-decision:{}", uuid::Uuid::new_v4().simple())
+    } else {
+        decision.id.clone()
+    };
+    for (field, value) in [
+        ("id", id),
+        ("actor", "[erased]".into()),
+        ("action", "[erased]".into()),
+        ("reason", "subject content erased".into()),
+        (
+            "evidence",
+            decision_tombstone(kind, subject_hash, erased_at),
+        ),
+        ("target_id", "[erased]".into()),
+        ("outcome", "[erased]".into()),
+        ("namespace", String::new()),
+        ("data_class", "unclassified".into()),
+    ] {
+        json[field] = serde_json::Value::String(value);
+    }
+    Some((json.to_string(), decision.id))
+}
+
+/// The shared walker alone on one payload, `None` when nothing matches;
+/// [`erase_archived_record`] applies it to every dataset.
+#[cfg(test)]
+fn redact_archived_payload(
+    payload: &str,
+    kind: &str,
+    subject: &str,
+    subject_hash: &str,
+) -> Option<String> {
+    let mut json = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    redact_json_subject(&mut json, kind, subject, subject_hash).then(|| json.to_string())
+}
+
+/// What erasure does to one archived record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArchivedErasure {
+    Keep,
+    Rewrite(String),
+    /// The hot path deletes such a row, so the archive drops the record.
+    Delete,
+}
+
+/// The subject of one erasure, as the archive needs it: the related objects
+/// and content references the hot path found in the same transaction.
+pub(crate) struct ArchiveErasureSubject<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) subject: &'a str,
+    pub(crate) hash: &'a str,
+    pub(crate) object_ids: &'a [String],
+    pub(crate) reference_ids: &'a std::collections::BTreeSet<String>,
+}
+
+/// Erase `subject` from one archived record of `dataset` (not decisions or
+/// attestations, which need the whole archive). The record is read back into
+/// the hot row and judged by that dataset's own hot-path predicate and
+/// transform, related objects and content references included; the shared
+/// walker then applies on top, so the archive is never weaker than either.
+pub(crate) fn erase_archived_record(
+    dataset: &str,
+    payload: &str,
+    subject: &ArchiveErasureSubject<'_>,
+) -> ArchivedErasure {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return ArchivedErasure::Keep;
+    };
+    let ArchiveErasureSubject {
+        kind,
+        subject: name,
+        hash,
+        object_ids,
+        reference_ids,
+    } = *subject;
+    let mut changed = false;
+    match dataset {
+        LLM_CALLS_DATASET => {
+            if let Ok(values) = serde_json::from_value(json.clone())
+                && llm_call_matches_subject(&values, kind, name, object_ids)
+            {
+                return ArchivedErasure::Delete;
+            }
+        }
+        TASK_OBSERVATIONS_DATASET => {
+            if let Ok(row) = serde_json::from_value::<TaskObservationRow>(json.clone())
+                && task_observation_matches_subject(&row, kind, name, object_ids)
+            {
+                return ArchivedErasure::Delete;
+            }
+        }
+        OBJECT_CHANGES_ARCHIVE_DATASET => {
+            if let Ok(change) = serde_json::from_value::<ObjectChangeRow>(json.clone())
+                && let Some(erased) = erase_object_change(&change, kind, name, object_ids)
+            {
+                for (field, value) in [
+                    ("object_id", erased.object_id),
+                    ("field", erased.field),
+                    ("changed_by", erased.changed_by),
+                    ("old_value", erased.old_value),
+                    ("new_value", erased.new_value),
+                ] {
+                    json[field] = serde_json::Value::String(value);
+                }
+                changed = true;
+            }
+        }
+        CONTENT_EVENTS_DATASET
+            if json["reference_id"]
+                .as_str()
+                .is_some_and(|reference_id| reference_ids.contains(reference_id)) =>
+        {
+            json["actor"] = serde_json::Value::String(hash.to_string());
+            json["reason"] = serde_json::Value::String(CONTENT_EVENT_ERASED_REASON.into());
+            changed = true;
+        }
+        _ => {}
+    }
+    changed |= redact_json_subject(&mut json, kind, name, hash);
+    if changed {
+        ArchivedErasure::Rewrite(json.to_string())
+    } else {
+        ArchivedErasure::Keep
+    }
+}
+
+/// The reason a content event of an erased reference keeps, hot or archived.
+pub(crate) const CONTENT_EVENT_ERASED_REASON: &str = "subject erasure tombstone";
+/// Object changes as the archive names them.
+const OBJECT_CHANGES_ARCHIVE_DATASET: &str = "audit.object_changes";
+
+/// Whether erasure deletes this `llm_calls` row (hot or archived).
+fn llm_call_matches_subject(
+    values: &std::collections::HashMap<String, String>,
+    kind: &str,
+    subject: &str,
+    object_ids: &[String],
+) -> bool {
+    map_matches_subject(values, kind, subject)
+        || values.iter().any(|(key, value)| {
+            key_matches_subject(key, kind, subject)
+                || contains_subject_reference(value, kind, subject)
+                || object_ids.iter().any(|object_id| {
+                    contains_identifier(value, object_id) || contains_key_identifier(key, object_id)
+                })
+        })
+}
+
+/// The task observation columns erasure reads, hot or archived.
+#[derive(serde::Deserialize)]
+struct TaskObservationRow {
+    request_id: String,
+    namespace: String,
+    component_id: String,
+    model: String,
+    status: String,
+    packages_json: String,
+    context_json: String,
+}
+
+/// Whether erasure deletes this task observation (hot or archived).
+fn task_observation_matches_subject(
+    row: &TaskObservationRow,
+    kind: &str,
+    subject: &str,
+    object_ids: &[String],
+) -> bool {
+    let context: std::collections::HashMap<String, String> =
+        serde_json::from_str(&row.context_json).unwrap_or_default();
+    let metadata_matches = [
+        row.request_id.as_str(),
+        row.namespace.as_str(),
+        row.component_id.as_str(),
+        row.model.as_str(),
+        row.status.as_str(),
+        row.packages_json.as_str(),
+    ]
+    .iter()
+    .any(|value| {
+        contains_subject_reference(value, kind, subject)
+            || object_ids
+                .iter()
+                .any(|object_id| contains_identifier(value, object_id))
+    }) || serde_json::from_str::<serde_json::Value>(&row.packages_json)
+        .ok()
+        .is_some_and(|json| {
+            json_matches_subject(&json, kind, subject)
+                || object_ids
+                    .iter()
+                    .any(|object_id| json_matches_subject(&json, kind, object_id))
+        });
+    metadata_matches
+        || llm_call_matches_subject(&context, kind, subject, object_ids)
+        || (kind == "work_unit" && row.request_id == subject)
+}
+
+/// The object change columns erasure reads and rewrites, hot or archived.
+#[derive(Debug, serde::Deserialize)]
+struct ObjectChangeRow {
+    object_id: String,
+    field: String,
+    changed_by: String,
+    old_value: String,
+    new_value: String,
+}
+
+/// An object change with every column that names the subject (or a related
+/// object) replaced by `[erased]`; `None` when nothing matches.
+fn erase_object_change(
+    change: &ObjectChangeRow,
+    kind: &str,
+    subject: &str,
+    object_ids: &[String],
+) -> Option<ObjectChangeRow> {
+    let field = change.field.as_str();
+    let object_matches = change.object_id == subject || object_ids.contains(&change.object_id);
+    let actor_matches = principal_matches_subject(&change.changed_by, kind, subject);
+    let field_matches = contains_typed_subject(field, kind, subject)
+        || contains_delimited_identifier(field, subject)
+        || object_ids
+            .iter()
+            .any(|object_id| contains_delimited_identifier(field, object_id));
+    let identity_value_matches = |value: &str| match field {
+        "id" | "object_id" | "external_id" => contains_delimited_identifier(value, subject),
+        "_created" | "_deleted" => value
+            .split_once('/')
+            .is_some_and(|(_, name)| contains_delimited_identifier(name, subject)),
+        _ => false,
+    };
+    let value_matches = |value: &str| {
+        object_matches
+            || keyed_value_matches_subject(field, value, kind, subject)
+            || contains_subject_reference(value, kind, subject)
+            || identity_value_matches(value)
+            || object_ids
+                .iter()
+                .any(|object_id| contains_identifier(value, object_id))
+    };
+    let old_matches = value_matches(&change.old_value);
+    let new_matches = value_matches(&change.new_value);
+    if !(object_matches || actor_matches || field_matches || old_matches || new_matches) {
+        return None;
+    }
+    let erase = |matches: bool, value: &str| {
+        if matches {
+            "[erased]".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    Some(ObjectChangeRow {
+        object_id: erase(object_matches, &change.object_id),
+        field: erase(field_matches, field),
+        changed_by: erase(actor_matches, &change.changed_by),
+        old_value: erase(old_matches, &change.old_value),
+        new_value: erase(new_matches, &change.new_value),
+    })
+}
+
+/// The PostgreSQL hot path's redactor, unchanged from before ADR 0141; the
+/// baseline archive redaction must never fall below.
+pub(crate) fn legacy_redact_subject_value(
+    value: &str,
+    subject_kind: &str,
+    subject: &str,
+    subject_hash: &str,
+) -> String {
+    if !legacy_value_mentions_subject(value, subject_kind, subject) {
+        return value.to_string();
+    }
+    fn redact_json(
+        value: &mut serde_json::Value,
+        subject_kind: &str,
+        subject: &str,
+        subject_hash: &str,
+    ) {
+        match value {
+            serde_json::Value::String(text)
+                if text == subject || contains_subject_reference(text, subject_kind, subject) =>
+            {
+                *text = if text == subject {
+                    subject_hash.to_string()
+                } else {
+                    "[redacted subject reference]".into()
+                };
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    redact_json(value, subject_kind, subject, subject_hash);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                let original = std::mem::take(values);
+                for (key, mut value) in original {
+                    redact_json(&mut value, subject_kind, subject, subject_hash);
+                    let key = if key == subject {
+                        subject_hash.to_string()
+                    } else if contains_subject_reference(&key, subject_kind, subject) {
+                        format!(
+                            "[redacted-subject-key]-{}",
+                            &sha256_hex(key.as_bytes())[..16]
+                        )
+                    } else {
+                        key
+                    };
+                    values.insert(key, value);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(value) {
+        redact_json(&mut json, subject_kind, subject, subject_hash);
+        return json.to_string();
+    }
+    if value == subject {
+        subject_hash.into()
+    } else {
+        "[redacted subject reference]".into()
+    }
+}
+
+/// The PostgreSQL hot path's matcher, unchanged from before ADR 0141.
+pub(crate) fn legacy_value_mentions_subject(
+    value: &str,
+    subject_kind: &str,
+    subject: &str,
+) -> bool {
+    fn json_mentions(value: &serde_json::Value, subject_kind: &str, subject: &str) -> bool {
+        match value {
+            serde_json::Value::String(value) => {
+                value == subject || contains_subject_reference(value, subject_kind, subject)
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| json_mentions(value, subject_kind, subject)),
+            serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+                key == subject
+                    || contains_subject_reference(key, subject_kind, subject)
+                    || json_mentions(value, subject_kind, subject)
+            }),
+            _ => false,
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .is_some_and(|value| json_mentions(&value, subject_kind, subject))
+        || contains_subject_reference(value, subject_kind, subject)
 }
 
 fn redact_retained_task_observation(tx: &Transaction<'_>, rowid: i64) -> Result<usize, String> {
@@ -87,109 +685,6 @@ fn redact_retained_task_observation(tx: &Transaction<'_>, rowid: i64) -> Result<
         params![RETENTION_TOMBSTONE_CONTEXT, rowid],
     )
     .map_err(|e| e.to_string())
-}
-
-fn parent_dir(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
-fn resolved_path(path: &Path) -> Result<PathBuf, String> {
-    if path.exists() {
-        return path.canonicalize().map_err(|e| e.to_string());
-    }
-    let parent = parent_dir(path);
-    let name = path
-        .file_name()
-        .ok_or_else(|| "archive path must name a file".to_string())?;
-    Ok(parent.canonicalize().map_err(|e| e.to_string())?.join(name))
-}
-
-fn same_file(left: &Path, right: &Path) -> Result<bool, String> {
-    if resolved_path(left)? == resolved_path(right)? {
-        return Ok(true);
-    }
-    if left.exists() && right.exists() {
-        return same_file::is_same_file(left, right).map_err(|e| e.to_string());
-    }
-    Ok(false)
-}
-
-fn belongs_to_database(database: &Path, candidate: &Path) -> Result<bool, String> {
-    if same_file(database, candidate)? {
-        return Ok(true);
-    }
-    let database = database.as_os_str().to_string_lossy();
-    for suffix in ["-wal", "-shm", "-journal"] {
-        if same_file(Path::new(&format!("{database}{suffix}")), candidate)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn open_archive(path: &Path) -> Result<Connection, String> {
-    if path.as_os_str().is_empty() || path == Path::new(":memory:") {
-        return Err("archive path must be a persistent SQLite file".into());
-    }
-    let parent = parent_dir(path);
-    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    if !path.exists() {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        if let Err(error) = options.open(path)
-            && error.kind() != std::io::ErrorKind::AlreadyExists
-        {
-            return Err(error.to_string());
-        }
-    }
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::from_bits_retain(rusqlite::ffi::SQLITE_OPEN_NOFOLLOW);
-    let conn = Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| e.to_string())?;
-    }
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS archive_records (
-            dataset TEXT NOT NULL,
-            source_key TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            payload_hash TEXT NOT NULL,
-            archived_at INTEGER NOT NULL,
-            PRIMARY KEY (dataset, source_key)
-         );
-         CREATE TABLE IF NOT EXISTS archive_batches (
-            id TEXT PRIMARY KEY,
-            cutoff INTEGER NOT NULL,
-            content_hash TEXT NOT NULL,
-            record_count INTEGER NOT NULL,
-            created INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS archive_batch_records (
-            batch_id TEXT NOT NULL,
-            dataset TEXT NOT NULL,
-            source_key TEXT NOT NULL,
-            PRIMARY KEY (batch_id, dataset, source_key),
-            FOREIGN KEY (batch_id) REFERENCES archive_batches(id),
-            FOREIGN KEY (dataset, source_key) REFERENCES archive_records(dataset, source_key)
-         );",
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +1088,48 @@ fn audit_matches_subject(decision: &Decision, kind: &str, subject: &str) -> bool
             .any(|value| contains_subject_reference(value, kind, subject))
 }
 
+/// Whether a decision's own id names the subject (hot path and archive).
+fn decision_id_matches_subject(
+    id: &str,
+    kind: &str,
+    subject: &str,
+    subject_object_ids: &[String],
+) -> bool {
+    id == subject
+        || contains_typed_subject(id, kind, subject)
+        || contains_delimited_identifier(id, subject)
+        || subject_object_ids
+            .iter()
+            .any(|object_id| contains_key_identifier(id, object_id))
+}
+
+/// Whether subject erasure tombstones `decision`: the one rule the hot
+/// ledger and the retention archive both apply.
+fn decision_matches_for_erasure(
+    decision: &Decision,
+    kind: &str,
+    subject: &str,
+    subject_object_ids: &[String],
+) -> bool {
+    audit_matches_subject(decision, kind, subject)
+        || decision_id_matches_subject(&decision.id, kind, subject, subject_object_ids)
+        || subject_object_ids.contains(&decision.target_id)
+        || subject_object_ids
+            .iter()
+            .any(|object_id| audit_contains_identifier(decision, object_id))
+}
+
+/// The tombstone evidence an erased decision carries.
+fn decision_tombstone(kind: &str, subject_hash: &str, erased_at: i64) -> String {
+    serde_json::to_string(&std::collections::HashMap::from([
+        ("erasure_tombstone".to_string(), "true".to_string()),
+        ("subject_kind".to_string(), kind.to_string()),
+        ("subject_hash".to_string(), subject_hash.to_string()),
+        ("erased_at".to_string(), erased_at.to_string()),
+    ]))
+    .unwrap_or_default()
+}
+
 fn audit_contains_identifier(decision: &Decision, identifier: &str) -> bool {
     [
         decision.actor.as_str(),
@@ -748,16 +1285,23 @@ fn rechain_decisions(tx: &Transaction<'_>) -> Result<(i64, String), String> {
     Ok((head_seq, prev_hash))
 }
 
+/// The last `seq` of the expired audit prefix, at most `limit` decisions in,
+/// reading at most `limit + 1` decisions, and whether the prefix ends within
+/// them (nothing more to archive after this one).
 fn expired_audit_prefix(
     tx: &Transaction<'_>,
     policies: &[RetentionPolicy],
     now: i64,
-) -> Result<Option<i64>, String> {
+    limit: usize,
+) -> Result<(Option<i64>, bool), String> {
     let rows = {
         let mut stmt = tx
-            .prepare("SELECT seq,timestamp,namespace,data_class FROM sekai_decisions ORDER BY seq")
+            .prepare(
+                "SELECT seq,timestamp,namespace,data_class FROM sekai_decisions
+                 ORDER BY seq LIMIT ?1",
+            )
             .map_err(|e| e.to_string())?;
-        stmt.query_map([], |row| {
+        stmt.query_map(params![sql_limit(limit.saturating_add(1))], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
@@ -769,26 +1313,26 @@ fn expired_audit_prefix(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?
     };
+    let more = rows.len() > limit;
     let mut prefix_end = None;
-    for (seq, timestamp, namespace, data_class) in rows {
+    for (seq, timestamp, namespace, data_class) in rows.into_iter().take(limit) {
         let Some(policy) = effective_policy(policies, AUDIT_DATASET, &namespace, &data_class)
         else {
-            break;
+            return Ok((prefix_end, true));
         };
         if timestamp >= now - i64::from(policy.retention_days) * DAY_MS {
-            break;
+            return Ok((prefix_end, true));
         }
         prefix_end = Some(seq);
     }
-    Ok(prefix_end)
+    Ok((prefix_end, !more))
 }
 
 fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
-    if !matches!(
-        policy.dataset.as_str(),
-        AUDIT_DATASET | LLM_CALLS_DATASET | TASK_OBSERVATIONS_DATASET
-    ) {
-        return Err("dataset must be audit, llm_calls, or task_observations".into());
+    if !RETENTION_DATASETS.contains(&policy.dataset.as_str()) {
+        return Err(
+            "dataset must be audit, llm_calls, task_observations, or content_events".into(),
+        );
     }
     if policy.retention_days <= 0 {
         return Err("retention_days must be positive".into());
@@ -828,7 +1372,25 @@ impl SekaiDb {
                 retention_days INTEGER NOT NULL,
                 updated INTEGER NOT NULL,
                 PRIMARY KEY (dataset, namespace, data_class)
-            );",
+            );
+            -- The retention archive (ADR 0141), the same shape as PostgreSQL's.
+            CREATE TABLE IF NOT EXISTS sekai_archive_batches (
+                id TEXT PRIMARY KEY, cutoff_ms INTEGER NOT NULL, content_hash TEXT NOT NULL,
+                record_count INTEGER NOT NULL, created_at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS sekai_archive_records (
+                dataset TEXT NOT NULL, source_key TEXT NOT NULL, payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL, archived_at_ms INTEGER NOT NULL,
+                PRIMARY KEY(dataset,source_key));
+            CREATE TABLE IF NOT EXISTS sekai_archive_batch_records (
+                batch_id TEXT NOT NULL REFERENCES sekai_archive_batches(id),
+                dataset TEXT NOT NULL, source_key TEXT NOT NULL,
+                PRIMARY KEY(batch_id,dataset,source_key),
+                FOREIGN KEY(dataset,source_key) REFERENCES sekai_archive_records(dataset,source_key));
+            CREATE TABLE IF NOT EXISTS sekai_archive_redactions (
+                id TEXT PRIMARY KEY, dataset TEXT NOT NULL, source_key TEXT NOT NULL,
+                old_payload_hash TEXT NOT NULL, new_payload_hash TEXT NOT NULL,
+                subject_hash TEXT NOT NULL, redacted_at_ms INTEGER NOT NULL,
+                FOREIGN KEY(dataset,source_key) REFERENCES sekai_archive_records(dataset,source_key));",
         )
         .map_err(|e| e.to_string())?;
         let now = chrono::Utc::now().timestamp_millis();
@@ -1032,10 +1594,8 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?;
             tx.execute(
-                "UPDATE sekai_content_events
-                 SET actor=?1,reason='subject erasure tombstone'
-                 WHERE reference_id=?2",
-                params![subject_hash, reference_id],
+                "UPDATE sekai_content_events SET actor=?1,reason=?2 WHERE reference_id=?3",
+                params![subject_hash, CONTENT_EVENT_ERASED_REASON, reference_id],
             )
             .map_err(|error| error.to_string())?;
             tx.execute(
@@ -1075,6 +1635,18 @@ impl SekaiDb {
             &request.subject,
             &known_subject_object_ids,
         )?;
+        // The archive is part of this database now (ADR 0141): the subject is
+        // redacted there too, in the same transaction, with the related
+        // objects the hot path uses.
+        redact_archived_subject(
+            &tx,
+            &request.subject_kind,
+            &request.subject,
+            &subject_hash,
+            request.timestamp,
+            &subject_object_ids,
+            &subject_reference_ids,
+        )?;
 
         let usage_rows = {
             let mut stmt = tx
@@ -1090,20 +1662,12 @@ impl SekaiDb {
         for (id, data) in usage_rows {
             let values: std::collections::HashMap<String, String> =
                 serde_json::from_str(&data).unwrap_or_default();
-            if map_matches_subject(&values, &request.subject_kind, &request.subject)
-                || values.iter().any(|(key, value)| {
-                    key_matches_subject(key, &request.subject_kind, &request.subject)
-                        || contains_subject_reference(
-                            value,
-                            &request.subject_kind,
-                            &request.subject,
-                        )
-                        || subject_object_ids.iter().any(|object_id| {
-                            contains_identifier(value, object_id)
-                                || contains_key_identifier(key, object_id)
-                        })
-                })
-            {
+            if llm_call_matches_subject(
+                &values,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            ) {
                 result.llm_calls_deleted += tx
                     .execute("DELETE FROM sekai_dataset_rows WHERE id = ?1", params![id])
                     .map_err(|e| e.to_string())? as i32;
@@ -1113,19 +1677,12 @@ impl SekaiDb {
             &tx,
             "llm_calls",
             &|values: &std::collections::HashMap<String, String>| {
-                map_matches_subject(values, &request.subject_kind, &request.subject)
-                    || values.iter().any(|(key, value)| {
-                        key_matches_subject(key, &request.subject_kind, &request.subject)
-                            || contains_subject_reference(
-                                value,
-                                &request.subject_kind,
-                                &request.subject,
-                            )
-                            || subject_object_ids.iter().any(|object_id| {
-                                contains_identifier(value, object_id)
-                                    || contains_key_identifier(key, object_id)
-                            })
-                    })
+                llm_call_matches_subject(
+                    values,
+                    &request.subject_kind,
+                    &request.subject,
+                    &subject_object_ids,
+                )
             },
         )?;
         if result.llm_calls_deleted > 0 {
@@ -1274,46 +1831,21 @@ impl SekaiDb {
             context_json,
         ) in observations
         {
-            let context: std::collections::HashMap<String, String> =
-                serde_json::from_str(&context_json).unwrap_or_default();
-            let metadata_matches = [
-                request_id.as_str(),
-                namespace.as_str(),
-                component_id.as_str(),
-                model.as_str(),
-                status.as_str(),
-                packages_json.as_str(),
-            ]
-            .iter()
-            .any(|value| {
-                contains_subject_reference(value, &request.subject_kind, &request.subject)
-                    || subject_object_ids
-                        .iter()
-                        .any(|object_id| contains_identifier(value, object_id))
-            }) || serde_json::from_str::<serde_json::Value>(&packages_json)
-                .ok()
-                .is_some_and(|json| {
-                    json_matches_subject(&json, &request.subject_kind, &request.subject)
-                        || subject_object_ids.iter().any(|object_id| {
-                            json_matches_subject(&json, &request.subject_kind, object_id)
-                        })
-                });
-            if metadata_matches
-                || map_matches_subject(&context, &request.subject_kind, &request.subject)
-                || context.iter().any(|(key, value)| {
-                    key_matches_subject(key, &request.subject_kind, &request.subject)
-                        || contains_subject_reference(
-                            value,
-                            &request.subject_kind,
-                            &request.subject,
-                        )
-                        || subject_object_ids.iter().any(|object_id| {
-                            contains_identifier(value, object_id)
-                                || contains_key_identifier(key, object_id)
-                        })
-                })
-                || (request.subject_kind == "work_unit" && request_id == request.subject)
-            {
+            let row = TaskObservationRow {
+                request_id,
+                namespace,
+                component_id,
+                model,
+                status,
+                packages_json,
+                context_json,
+            };
+            if task_observation_matches_subject(
+                &row,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            ) {
                 result.task_observations_deleted +=
                     tx.execute(
                         "DELETE FROM sekai_task_observations WHERE rowid = ?1",
@@ -2124,28 +2656,24 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?
         };
         let mut erased_decision_ids = Vec::new();
+        let subject_object_ids: Vec<String> = subject_object_ids.to_vec();
         for decision in decisions {
-            let decision_id_matches = decision.id == request.subject
-                || contains_typed_subject(&decision.id, &request.subject_kind, &request.subject)
-                || contains_delimited_identifier(&decision.id, &request.subject)
-                || subject_object_ids
-                    .iter()
-                    .any(|object_id| contains_key_identifier(&decision.id, object_id));
-            if !audit_matches_subject(&decision, &request.subject_kind, &request.subject)
-                && !decision_id_matches
-                && !subject_object_ids.contains(&decision.target_id)
-                && !subject_object_ids
-                    .iter()
-                    .any(|object_id| audit_contains_identifier(&decision, object_id))
-            {
+            let decision_id_matches = decision_id_matches_subject(
+                &decision.id,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            );
+            if !decision_matches_for_erasure(
+                &decision,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            ) {
                 continue;
             }
-            let tombstone = std::collections::HashMap::from([
-                ("erasure_tombstone".to_string(), "true".to_string()),
-                ("subject_kind".to_string(), request.subject_kind.clone()),
-                ("subject_hash".to_string(), subject_hash.clone()),
-                ("erased_at".to_string(), request.timestamp.to_string()),
-            ]);
+            let tombstone =
+                decision_tombstone(&request.subject_kind, &subject_hash, request.timestamp);
             let original_id = decision.id;
             let replacement_id = if decision_id_matches {
                 format!("erased-decision:{}", uuid::Uuid::new_v4().simple())
@@ -2157,11 +2685,7 @@ impl SekaiDb {
                  reason='subject content erased', evidence=?2,
                  target_id='[erased]', outcome='[erased]', namespace='',
                  data_class='unclassified' WHERE id=?3",
-                params![
-                    replacement_id,
-                    serde_json::to_string(&tombstone).map_err(|e| e.to_string())?,
-                    original_id
-                ],
+                params![replacement_id, tombstone, original_id],
             )
             .map_err(|e| e.to_string())?;
             erased_decision_ids.push(original_id);
@@ -2198,69 +2722,30 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?
         };
         for (id, object_id, field, changed_by, old_value, new_value) in object_changes {
-            let object_matches =
-                object_id == request.subject || subject_object_ids.contains(&object_id);
-            let actor_matches =
-                principal_matches_subject(&changed_by, &request.subject_kind, &request.subject);
-            let field_matches =
-                contains_typed_subject(&field, &request.subject_kind, &request.subject)
-                    || contains_delimited_identifier(&field, &request.subject)
-                    || subject_object_ids
-                        .iter()
-                        .any(|object_id| contains_delimited_identifier(&field, object_id));
-            let identity_value_matches = |value: &str| match field.as_str() {
-                "id" | "object_id" | "external_id" => {
-                    contains_delimited_identifier(value, &request.subject)
-                }
-                "_created" | "_deleted" => value
-                    .split_once('/')
-                    .is_some_and(|(_, name)| contains_delimited_identifier(name, &request.subject)),
-                _ => false,
+            let change = ObjectChangeRow {
+                object_id,
+                field,
+                changed_by,
+                old_value,
+                new_value,
             };
-            let old_matches = object_matches
-                || keyed_value_matches_subject(
-                    &field,
-                    &old_value,
-                    &request.subject_kind,
-                    &request.subject,
-                )
-                || contains_subject_reference(&old_value, &request.subject_kind, &request.subject)
-                || identity_value_matches(&old_value)
-                || subject_object_ids
-                    .iter()
-                    .any(|object_id| contains_identifier(&old_value, object_id));
-            let new_matches = object_matches
-                || keyed_value_matches_subject(
-                    &field,
-                    &new_value,
-                    &request.subject_kind,
-                    &request.subject,
-                )
-                || contains_subject_reference(&new_value, &request.subject_kind, &request.subject)
-                || identity_value_matches(&new_value)
-                || subject_object_ids
-                    .iter()
-                    .any(|object_id| contains_identifier(&new_value, object_id));
-            if !(object_matches || actor_matches || field_matches || old_matches || new_matches) {
+            let Some(erased) = erase_object_change(
+                &change,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            ) else {
                 continue;
-            }
+            };
             tx.execute(
                 "UPDATE sekai_object_changes SET object_id=?1, field=?2, changed_by=?3,
                  old_value=?4, new_value=?5 WHERE id=?6",
                 params![
-                    if object_matches {
-                        "[erased]"
-                    } else {
-                        &object_id
-                    },
-                    if field_matches { "[erased]" } else { &field },
-                    if actor_matches {
-                        "[erased]"
-                    } else {
-                        &changed_by
-                    },
-                    if old_matches { "[erased]" } else { &old_value },
-                    if new_matches { "[erased]" } else { &new_value },
+                    erased.object_id,
+                    erased.field,
+                    erased.changed_by,
+                    erased.old_value,
+                    erased.new_value,
                     id
                 ],
             )
@@ -2388,7 +2873,7 @@ impl SekaiDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         verify_decisions_in_transaction(&tx)?;
-        let prefix_end = expired_audit_prefix(&tx, policies, now)?;
+        let (prefix_end, _) = expired_audit_prefix(&tx, policies, now, usize::MAX)?;
         let mut deleted = 0;
         if let Some(prefix_end) = prefix_end {
             let anchor_hash: String = tx
@@ -2434,161 +2919,138 @@ impl SekaiDb {
         Ok(deleted)
     }
 
+    /// Verify an archive file written by releases before ADR 0141. Such files
+    /// are kept and stay verifiable; nothing is imported from them, and new
+    /// runs archive into the database (`verify_retention_archive`).
     pub fn verify_archive(archive_path: impl AsRef<Path>) -> Result<ArchiveVerification, String> {
         let archive_path = archive_path.as_ref();
         if !archive_path.is_file() {
             return Err("archive file does not exist".into());
         }
         let archive = Connection::open(archive_path).map_err(|e| e.to_string())?;
-        let mut verification = ArchiveVerification {
-            ok: true,
-            ..Default::default()
-        };
-        let records = {
-            let mut stmt = archive
-                .prepare(
-                    "SELECT dataset,source_key,payload,payload_hash
-                     FROM archive_records ORDER BY dataset,source_key",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
-        for (dataset, source_key, payload, stored_hash) in records {
-            verification.records_checked += 1;
-            if archive_payload_hash(&dataset, &source_key, &payload) != stored_hash {
-                verification.ok = false;
-                verification.error = format!("archive record {dataset}:{source_key} was altered");
-                return Ok(verification);
-            }
-        }
+        verify_archive_tables(&archive, "archive_", true)
+    }
 
-        let broken_references: i64 = archive
-            .query_row(
-                "SELECT COUNT(*) FROM archive_batch_records link
-                 LEFT JOIN archive_batches batch ON batch.id=link.batch_id
-                 LEFT JOIN archive_records record
-                   ON record.dataset=link.dataset AND record.source_key=link.source_key
-                 WHERE batch.id IS NULL OR record.dataset IS NULL",
-                [],
-                |row| row.get(0),
-            )
+    /// Verify the in-database archive (ADR 0141): every record's hash, every
+    /// manifest reference, and every batch's content hash. An empty archive
+    /// verifies.
+    pub fn verify_retention_archive(&self) -> Result<ArchiveVerification, String> {
+        let mut conn = self.conn();
+        // One read transaction on one connection: every query sees the same
+        // snapshot, whatever a concurrent erasure or run commits meanwhile.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|e| e.to_string())?;
-        if broken_references > 0 {
-            verification.ok = false;
-            verification.error = "archive contains broken manifest references".into();
-            return Ok(verification);
-        }
-        let unbatched_records: i64 = archive
-            .query_row(
-                "SELECT COUNT(*) FROM archive_records r
-                 WHERE NOT EXISTS (
-                    SELECT 1 FROM archive_batch_records link
-                    JOIN archive_batches batch ON batch.id=link.batch_id
-                    WHERE link.dataset=r.dataset AND link.source_key=r.source_key
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if unbatched_records > 0 {
-            verification.ok = false;
-            verification.error = "archive contains records without a batch manifest".into();
-            return Ok(verification);
-        }
-
-        let batches = {
-            let mut stmt = archive
-                .prepare("SELECT id,content_hash,record_count FROM archive_batches ORDER BY id")
-                .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-        };
-        if batches.is_empty() {
-            verification.ok = false;
-            verification.error = "archive contains no batch manifests".into();
-            return Ok(verification);
-        }
-        for (batch_id, stored_hash, record_count) in batches {
-            verification.batches_checked += 1;
-            let hashes = {
-                let mut stmt = archive
-                    .prepare(
-                        "SELECT r.payload_hash FROM archive_batch_records b
-                         JOIN archive_records r ON r.dataset=b.dataset AND r.source_key=b.source_key
-                         WHERE b.batch_id=?1 ORDER BY b.dataset,b.source_key",
-                    )
-                    .map_err(|e| e.to_string())?;
-                stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| e.to_string())?
-            };
-            let computed_hash = sha256_hex(
-                serde_json::to_string(&hashes)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            if hashes.len() as i64 != record_count || computed_hash != stored_hash {
-                verification.ok = false;
-                verification.error = format!("archive batch {batch_id} manifest does not match");
-                return Ok(verification);
-            }
-        }
+        let verification = verify_archive_tables(&tx, "sekai_archive_", false)?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(verification)
     }
 
-    /// Move records outside their hot-store retention windows into a separate
-    /// SQLite archive before deleting them from the operational database.
-    /// Archive records are content-hashed and keyed by their stable source
-    /// identity, making a retry after an interrupted hot-store commit safe.
-    pub fn archive_retained_records(
-        &self,
-        archive_path: impl AsRef<Path>,
-        now: i64,
-    ) -> Result<ArchiveRun, String> {
-        let archive_path = archive_path.as_ref();
-        if archive_path.as_os_str().is_empty() || archive_path == Path::new(":memory:") {
-            return Err("archive path must be a persistent SQLite file".into());
-        }
-        if std::fs::symlink_metadata(archive_path)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
-            return Err("archive path must not be a symbolic link".into());
-        }
-        std::fs::create_dir_all(parent_dir(archive_path)).map_err(|e| e.to_string())?;
-        let archive_resolved = resolved_path(archive_path)?;
-        let policies = self.list_retention_policies()?;
-        let mut conn = self.conn();
-        let hot_path: String = conn
+    /// Batches and archived records per dataset in the in-database archive.
+    pub fn retention_archive_status(&self) -> Result<ArchiveStatus, String> {
+        let conn = self.conn();
+        let (batches, last_cutoff_ms) = conn
             .query_row(
-                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                "SELECT COUNT(*), MAX(cutoff_ms) FROM sekai_archive_batches",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
             )
             .map_err(|e| e.to_string())?;
-        if !hot_path.is_empty() && belongs_to_database(Path::new(&hot_path), &archive_resolved)? {
-            return Err("archive path must differ from the operational database".into());
-        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT dataset, COUNT(*) FROM sekai_archive_records
+                 GROUP BY dataset ORDER BY dataset",
+            )
+            .map_err(|e| e.to_string())?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(ArchiveStatus {
+            batches,
+            records,
+            last_cutoff_ms,
+        })
+    }
 
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+    /// Move records outside their retention windows into the in-database
+    /// archive (`sekai_archive_*`, ADR 0141) and delete or redact them in the
+    /// hot tables, in batches of at most [`RETENTION_BATCH_SIZE`] records per
+    /// dataset, one transaction each, until nothing is left. A crash keeps the
+    /// batches already committed and loses none in progress; a rerun resumes.
+    /// Each batch takes the write lock up front, so concurrent runs
+    /// interleave batches and never archive a record twice. A dry run counts
+    /// everything in one pass and rolls it back.
+    pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        // A dry run moves nothing, so it counts everything in one pass.
+        if dry_run {
+            return self.archive_retained_batch(
+                now,
+                true,
+                usize::MAX,
+                &mut RetentionCursor::default(),
+            );
+        }
+        let mut cursor = RetentionCursor::default();
+        let mut total = ArchiveRun::default();
+        while !cursor.done() {
+            let batch =
+                self.archive_retained_batch(now, false, RETENTION_BATCH_SIZE, &mut cursor)?;
+            if batch.batch_id.is_empty() {
+                continue;
+            }
+            total.batches += 1;
+            total.batch_id = batch.batch_id;
+            total.content_hash = batch.content_hash;
+            total.audit_archived += batch.audit_archived;
+            total.llm_calls_archived += batch.llm_calls_archived;
+            total.task_observations_archived += batch.task_observations_archived;
+            total.task_observations_redacted += batch.task_observations_redacted;
+            total.content_events_archived += batch.content_events_archived;
+        }
+        self.finish_retention_run(now, total.llm_calls_archived > 0)?;
+        Ok(total)
+    }
+
+    /// After a run's last batch, on every run: drop calls past their policy
+    /// from the `llm_calls` versions, so a run that crashed before this step
+    /// is completed by the next one even when it has nothing new to archive
+    /// (one pass over the version rows; nothing matches once clean). Records
+    /// an `archive` version when this run archived calls.
+    fn finish_retention_run(&self, now: i64, archived_calls: bool) -> Result<(), String> {
+        let policies = self.list_retention_policies()?;
+        let mut conn = self.conn();
+        // Immediate, like a batch: two runs finishing at once queue for the
+        // write lock instead of failing on a stale read snapshot.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        erase_expired_llm_call_versions(&tx, &policies, now)?;
+        if archived_calls {
+            snapshot_llm_calls(&tx, now)?;
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    /// One batch: at most `limit` records per dataset, moved and removed in
+    /// one transaction (an audit batch also takes the attestations of its
+    /// decisions). Records already moved are gone from the hot tables, so the
+    /// next batch, or a rerun after a crash, starts where this one ended.
+    fn archive_retained_batch(
+        &self,
+        now: i64,
+        dry_run: bool,
+        limit: usize,
+        cursor: &mut RetentionCursor,
+    ) -> Result<ArchiveRun, String> {
+        let policies = self.list_retention_policies()?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let audit_cutoff = policies
             .iter()
             .find(|policy| {
@@ -2597,15 +3059,25 @@ impl SekaiDb {
                     && policy.data_class.is_empty()
             })
             .map(|policy| now - i64::from(policy.retention_days) * DAY_MS);
-        if policies
-            .iter()
-            .any(|policy| policy.dataset == AUDIT_DATASET)
+        // The ledger is verified once per run, in its first batch.
+        if !cursor.ledger_verified
+            && policies
+                .iter()
+                .any(|policy| policy.dataset == AUDIT_DATASET)
         {
             verify_decisions_in_transaction(&tx)?;
         }
-        let prefix_end = expired_audit_prefix(&tx, &policies, now)?;
+        cursor.ledger_verified = true;
+        let prefix_end = if cursor.audit_done {
+            None
+        } else {
+            let (prefix_end, done) = expired_audit_prefix(&tx, &policies, now, limit)?;
+            cursor.audit_done = done;
+            prefix_end
+        };
 
         let mut records = Vec::<ArchiveRecord>::new();
+        let mut object_change_ids = Vec::new();
         if let Some(prefix_end) = prefix_end {
             let mut stmt = tx
                 .prepare(
@@ -2665,15 +3137,17 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
             records.extend(rows);
         }
-        if let Some(cutoff) = audit_cutoff {
+        if cursor.object_changes_done {
+        } else if let Some(cutoff) = audit_cutoff {
             let mut stmt = tx
                 .prepare(
                     "SELECT id,object_id,field,old_value,new_value,changed_by,timestamp
-                     FROM sekai_object_changes WHERE timestamp < ?1 ORDER BY timestamp,id",
+                     FROM sekai_object_changes WHERE timestamp < ?1 ORDER BY timestamp,id
+                     LIMIT ?2",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
-                .query_map(params![cutoff], |row| {
+                .query_map(params![cutoff, sql_limit(limit)], |row| {
                     let id: String = row.get(0)?;
                     let payload = serde_json::json!({
                         "id": id, "object_id": row.get::<_, String>(1)?, "field": row.get::<_, String>(2)?,
@@ -2689,19 +3163,35 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
+            cursor.object_changes_done = rows.len() < limit;
+            object_change_ids.extend(rows.iter().map(|record| record.source_key.clone()));
             records.extend(rows);
+        } else {
+            cursor.object_changes_done = true;
         }
 
-        let llm_rows = {
+        let llm_rows = if cursor.llm_done {
+            Vec::new()
+        } else {
             let mut stmt = tx
-                .prepare("SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=?1 ORDER BY id")
+                .prepare(
+                    "SELECT id,data FROM sekai_dataset_rows WHERE dataset_id=?1 AND id > ?2
+                     ORDER BY id LIMIT ?3",
+                )
                 .map_err(|e| e.to_string())?;
-            stmt.query_map(params![LLM_CALLS_DATASET], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+            let rows = stmt
+                .query_map(
+                    params![LLM_CALLS_DATASET, cursor.llm_after, sql_limit(limit)],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            cursor.llm_done = rows.len() < limit;
+            if let Some((last, _)) = rows.last() {
+                cursor.llm_after = *last;
+            }
+            rows
         };
         let mut llm_ids = Vec::new();
         for (id, data) in llm_rows {
@@ -2729,37 +3219,56 @@ impl SekaiDb {
             }
         }
 
-        let observation_rows = {
+        let observation_rows = if cursor.observations_done {
+            Vec::new()
+        } else {
+            let (component, timestamp, rowid) = cursor
+                .observation_after
+                .clone()
+                .map_or((None, 0, 0), |(component, timestamp, rowid)| {
+                    (Some(component), timestamp, rowid)
+                });
             let mut stmt = tx
                 .prepare(
                     "SELECT rowid,request_id,namespace,data_class,component_id,model,status,timestamp,
                             packages_json,context_json,retention_tombstone
-                     FROM sekai_task_observations ORDER BY component_id,timestamp,rowid",
+                     FROM sekai_task_observations
+                     WHERE ?1 IS NULL OR (component_id,timestamp,rowid) > (?1,?2,?3)
+                     ORDER BY component_id,timestamp,rowid LIMIT ?4",
                 )
                 .map_err(|e| e.to_string())?;
-            stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, bool>(10)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+            let rows = stmt
+                .query_map(
+                    params![component, timestamp, rowid, sql_limit(limit)],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, bool>(10)?,
+                        ))
+                    },
+                )
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            cursor.observations_done = rows.len() < limit;
+            if let Some(last) = rows.last() {
+                cursor.observation_after = Some((last.4.clone(), last.7, last.0));
+            }
+            rows
         };
         let mut expired_observations =
             std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
         let mut redacted_observation_ids = Vec::new();
-        let mut retained_components = std::collections::BTreeSet::new();
+        let mut retained_components = std::mem::take(&mut cursor.retained_components);
         for (
             rowid,
             request_id,
@@ -2813,6 +3322,54 @@ impl SekaiDb {
             }
         }
 
+        cursor.retained_components = retained_components;
+        // Content events carry no namespace or class: only the dataset-wide
+        // policy applies.
+        let content_cutoff = effective_policy(&policies, CONTENT_EVENTS_DATASET, "", "")
+            .map(|policy| now - i64::from(policy.retention_days) * DAY_MS);
+        let mut content_event_ids = Vec::new();
+        if cursor.content_events_done {
+        } else if let Some(cutoff) = content_cutoff
+            && sqlite_table_exists(&tx, "sekai_content_events")?
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id,event_kind,blob_id,reference_id,actor,reason,created_at_ms
+                     FROM sekai_content_events WHERE created_at_ms < ?1 ORDER BY id
+                     LIMIT ?2",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![cutoff, sql_limit(limit)], |row| {
+                    let id: String = row.get(0)?;
+                    // The same payload PostgreSQL archives for this dataset.
+                    let payload = serde_json::json!({
+                        "event_kind": row.get::<_, String>(1)?,
+                        "blob_id": row.get::<_, String>(2)?,
+                        "reference_id": row.get::<_, Option<String>>(3)?,
+                        "actor": row.get::<_, String>(4)?,
+                        "reason": row.get::<_, String>(5)?,
+                        "created_at_ms": row.get::<_, i64>(6)?,
+                    });
+                    Ok(ArchiveRecord {
+                        dataset: CONTENT_EVENTS_DATASET,
+                        source_key: id,
+                        payload: payload.to_string(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            cursor.content_events_done = rows.len() < limit;
+            content_event_ids.extend(rows.iter().map(|record| record.source_key.clone()));
+            records.extend(rows);
+        } else {
+            cursor.content_events_done = true;
+        }
+
+        for record in &mut records {
+            record.source_key = archive_source_key(record.dataset, &record.source_key);
+        }
         records.sort_by(|left, right| {
             (&left.dataset, &left.source_key).cmp(&(&right.dataset, &right.source_key))
         });
@@ -2840,26 +3397,31 @@ impl SekaiDb {
                 .filter(|record| record.dataset == "task_observations")
                 .count() as i32,
             task_observations_redacted: redacted_observation_ids.len() as i32,
+            content_events_archived: content_event_ids.len() as i32,
+            dry_run,
+            batches: 1,
         };
         if records.is_empty() {
             run.batch_id.clear();
             run.content_hash.clear();
+            run.batches = 0;
             tx.commit().map_err(|e| e.to_string())?;
             return Ok(run);
         }
 
-        let mut archive = open_archive(&archive_resolved)?;
-        let archive_tx = archive.transaction().map_err(|e| e.to_string())?;
+        let archive_tx = &tx;
         archive_tx
             .execute(
-                "INSERT OR IGNORE INTO archive_batches (id,cutoff,content_hash,record_count,created)
+                "INSERT OR IGNORE INTO sekai_archive_batches
+                 (id,cutoff_ms,content_hash,record_count,created_at_ms)
                  VALUES (?1,?2,?3,?4,?5)",
                 params![batch_id, now, content_hash, records.len() as i64, now],
             )
             .map_err(|e| e.to_string())?;
         let batch_matches: bool = archive_tx
             .query_row(
-                "SELECT cutoff=?2 AND content_hash=?3 AND record_count=?4 FROM archive_batches WHERE id=?1",
+                "SELECT cutoff_ms=?2 AND content_hash=?3 AND record_count=?4
+                 FROM sekai_archive_batches WHERE id=?1",
                 params![batch_id, now, content_hash, records.len() as i64],
                 |row| row.get(0),
             )
@@ -2870,8 +3432,9 @@ impl SekaiDb {
         for (record, payload_hash) in records.iter().zip(&record_hashes) {
             archive_tx
                 .execute(
-                    "INSERT OR IGNORE INTO archive_records
-                     (dataset,source_key,payload,payload_hash,archived_at) VALUES (?1,?2,?3,?4,?5)",
+                    "INSERT OR IGNORE INTO sekai_archive_records
+                     (dataset,source_key,payload,payload_hash,archived_at_ms)
+                     VALUES (?1,?2,?3,?4,?5)",
                     params![
                         record.dataset,
                         record.source_key,
@@ -2883,7 +3446,8 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
             let stored_hash: String = archive_tx
                 .query_row(
-                    "SELECT payload_hash FROM archive_records WHERE dataset=?1 AND source_key=?2",
+                    "SELECT payload_hash FROM sekai_archive_records
+                     WHERE dataset=?1 AND source_key=?2",
                     params![record.dataset, record.source_key],
                     |row| row.get(0),
                 )
@@ -2896,13 +3460,16 @@ impl SekaiDb {
             }
             archive_tx
                 .execute(
-                    "INSERT OR IGNORE INTO archive_batch_records (batch_id,dataset,source_key)
+                    "INSERT OR IGNORE INTO sekai_archive_batch_records (batch_id,dataset,source_key)
                      VALUES (?1,?2,?3)",
                     params![batch_id, record.dataset, record.source_key],
                 )
                 .map_err(|e| e.to_string())?;
         }
-        archive_tx.commit().map_err(|e| e.to_string())?;
+        for id in &content_event_ids {
+            tx.execute("DELETE FROM sekai_content_events WHERE id=?1", params![id])
+                .map_err(|e| e.to_string())?;
+        }
 
         if let Some(prefix_end) = prefix_end {
             let anchor_hash: String = tx
@@ -2935,51 +3502,19 @@ impl SekaiDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        if let Some(cutoff) = audit_cutoff {
-            tx.execute(
-                "DELETE FROM sekai_object_changes WHERE timestamp < ?1",
-                params![cutoff],
-            )
-            .map_err(|e| e.to_string())?;
+        for id in &object_change_ids {
+            tx.execute("DELETE FROM sekai_object_changes WHERE id=?1", params![id])
+                .map_err(|e| e.to_string())?;
         }
         for id in &llm_ids {
             tx.execute("DELETE FROM sekai_dataset_rows WHERE id=?1", params![id])
                 .map_err(|e| e.to_string())?;
         }
-        crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
-            &tx,
-            LLM_CALLS_DATASET,
-            &|row: &std::collections::HashMap<String, String>| {
-                let namespace = row.get("project").map(String::as_str).unwrap_or_default();
-                let data_class = row
-                    .get("data_class")
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                let timestamp = row
-                    .get("timestamp_ms")
-                    .and_then(|value| value.parse::<i64>().ok());
-                matches!(
-                    (timestamp, effective_policy(&policies, LLM_CALLS_DATASET, namespace, data_class)),
-                    (Some(timestamp), Some(policy))
-                        if timestamp < now - i64::from(policy.retention_days) * DAY_MS
-                )
-            },
-        )?;
-        if !llm_ids.is_empty() {
-            match crate::sekai::dataset::snapshot_dataset_version_tx(
-                &tx,
-                LLM_CALLS_DATASET,
-                "",
-                "",
-                "archive",
-                "",
-                now,
-            ) {
-                Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => {}
-                other => {
-                    other?;
-                }
-            }
+        // A dry run does the once-per-run version work here and rolls it
+        // back; a run does it after its last batch.
+        if dry_run && !llm_ids.is_empty() {
+            erase_expired_llm_call_versions(&tx, &policies, now)?;
+            snapshot_llm_calls(&tx, now)?;
         }
         for (component_id, (namespace, rows)) in expired_observations {
             let baseline = tx
@@ -3036,6 +3571,11 @@ impl SekaiDb {
         }
         for rowid in redacted_observation_ids {
             redact_retained_task_observation(&tx, rowid)?;
+        }
+        if dry_run {
+            // Dropped without commit: every write above is rolled back.
+            drop(tx);
+            return Ok(run);
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(run)
@@ -3257,93 +3797,365 @@ impl SekaiDb {
     }
 }
 
+/// Drop LLM calls past their policy from the `llm_calls` dataset versions.
+fn erase_expired_llm_call_versions(
+    tx: &Transaction<'_>,
+    policies: &[RetentionPolicy],
+    now: i64,
+) -> Result<(), String> {
+    crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
+        tx,
+        LLM_CALLS_DATASET,
+        &|row: &std::collections::HashMap<String, String>| {
+            let namespace = row.get("project").map(String::as_str).unwrap_or_default();
+            let data_class = row
+                .get("data_class")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let timestamp = row
+                .get("timestamp_ms")
+                .and_then(|value| value.parse::<i64>().ok());
+            matches!(
+                (timestamp, effective_policy(policies, LLM_CALLS_DATASET, namespace, data_class)),
+                (Some(timestamp), Some(policy))
+                    if timestamp < now - i64::from(policy.retention_days) * DAY_MS
+            )
+        },
+    )
+}
+
+/// Record an `archive` version of the `llm_calls` dataset, if it exists.
+fn snapshot_llm_calls(tx: &Transaction<'_>, now: i64) -> Result<(), String> {
+    match crate::sekai::dataset::snapshot_dataset_version_tx(
+        tx,
+        LLM_CALLS_DATASET,
+        "",
+        "",
+        "archive",
+        "",
+        now,
+    ) {
+        Err(error) if error == crate::sekai::dataset_version::DATASET_NOT_FOUND => Ok(()),
+        other => other.map(drop),
+    }
+}
+
+/// Erase `subject` from every archived record by its dataset's hot-path rule
+/// ([`erase_archived_record`]; decisions by the ledger rule, attestations
+/// with their decision), record each rewrite, and recompute the content hash
+/// and count of each batch it touched, as PostgreSQL does. Refuses, writing
+/// nothing, when the archive does not verify first.
+fn redact_archived_subject(
+    tx: &Transaction<'_>,
+    subject_kind: &str,
+    subject: &str,
+    subject_hash: &str,
+    now_ms: i64,
+    subject_object_ids: &[String],
+    subject_reference_ids: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    if !sqlite_table_exists(tx, "sekai_archive_records")? {
+        return Ok(());
+    }
+    let verification = verify_archive_tables(tx, "sekai_archive_", false)?;
+    if !verification.ok {
+        return Err(format!(
+            "retention archive does not verify before erasure: {}",
+            verification.error
+        ));
+    }
+    let rows = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT dataset,source_key,payload,payload_hash FROM sekai_archive_records
+                 ORDER BY dataset,source_key",
+            )
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    // Archived decisions follow the hot ledger's rule and tombstone; the
+    // attestations of a tombstoned decision are deleted, as in the hot table.
+    let mut erased_decisions = std::collections::BTreeSet::new();
+    let mut tombstoned = std::collections::BTreeMap::new();
+    for (dataset, source_key, payload, _) in &rows {
+        if dataset == "audit.decisions"
+            && let Some((redacted, original_id)) = tombstone_archived_decision(
+                payload,
+                subject_kind,
+                subject,
+                subject_hash,
+                now_ms,
+                subject_object_ids,
+            )
+        {
+            erased_decisions.insert(original_id);
+            tombstoned.insert(source_key.clone(), redacted);
+        }
+    }
+    let subject = ArchiveErasureSubject {
+        kind: subject_kind,
+        subject,
+        hash: subject_hash,
+        object_ids: subject_object_ids,
+        reference_ids: subject_reference_ids,
+    };
+    let mut touched = std::collections::BTreeSet::new();
+    for (dataset, source_key, payload, old_hash) in rows {
+        let batches_of = |tx: &Transaction<'_>| -> Result<Vec<String>, String> {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT batch_id FROM sekai_archive_batch_records
+                     WHERE dataset=?1 AND source_key=?2",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![dataset, source_key], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        };
+        let erasure = if dataset == "audit.attestations" {
+            if serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|json| json["decision_id"].as_str().map(str::to_string))
+                .is_some_and(|decision_id| erased_decisions.contains(&decision_id))
+            {
+                ArchivedErasure::Delete
+            } else {
+                erase_archived_record(&dataset, &payload, &subject)
+            }
+        } else if dataset == "audit.decisions" {
+            tombstoned
+                .remove(&source_key)
+                .map_or(ArchivedErasure::Keep, ArchivedErasure::Rewrite)
+        } else {
+            erase_archived_record(&dataset, &payload, &subject)
+        };
+        let redacted = match erasure {
+            ArchivedErasure::Keep => continue,
+            ArchivedErasure::Rewrite(redacted) => redacted,
+            ArchivedErasure::Delete => {
+                touched.extend(batches_of(tx)?);
+                for table in [
+                    "sekai_archive_batch_records",
+                    "sekai_archive_redactions",
+                    "sekai_archive_records",
+                ] {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE dataset=?1 AND source_key=?2"),
+                        params![dataset, source_key],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                continue;
+            }
+        };
+        let new_hash = archive_payload_hash(&dataset, &source_key, &redacted);
+        tx.execute(
+            "UPDATE sekai_archive_records SET payload=?1,payload_hash=?2
+             WHERE dataset=?3 AND source_key=?4",
+            params![redacted, new_hash, dataset, source_key],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_archive_redactions
+             (id,dataset,source_key,old_payload_hash,new_payload_hash,subject_hash,redacted_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                format!("archive-redaction-{}", uuid::Uuid::new_v4().simple()),
+                dataset,
+                source_key,
+                old_hash,
+                new_hash,
+                subject_hash,
+                now_ms
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let mut stmt = tx
+            .prepare(
+                "SELECT batch_id FROM sekai_archive_batch_records WHERE dataset=?1 AND source_key=?2",
+            )
+            .map_err(|e| e.to_string())?;
+        for batch in stmt
+            .query_map(params![dataset, source_key], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+        {
+            touched.insert(batch.map_err(|e| e.to_string())?);
+        }
+    }
+    for batch_id in touched {
+        let hashes = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT r.payload_hash FROM sekai_archive_batch_records b
+                     JOIN sekai_archive_records r ON r.dataset=b.dataset AND r.source_key=b.source_key
+                     WHERE b.batch_id=?1 ORDER BY b.dataset,b.source_key",
+                )
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let content_hash = sha256_hex(
+            serde_json::to_string(&hashes)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        tx.execute(
+            "UPDATE sekai_archive_batches SET content_hash=?1, record_count=?2 WHERE id=?3",
+            params![content_hash, hashes.len() as i64, batch_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Verify the archive tables named `<prefix>records`, `<prefix>batches` and
+/// `<prefix>batch_records` in `conn`.
+fn verify_archive_tables(
+    conn: &Connection,
+    prefix: &str,
+    require_batches: bool,
+) -> Result<ArchiveVerification, String> {
+    let mut verification = ArchiveVerification {
+        ok: true,
+        ..Default::default()
+    };
+    let records = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT dataset,source_key,payload,payload_hash
+                     FROM {prefix}records ORDER BY dataset,source_key"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    for (dataset, source_key, payload, stored_hash) in records {
+        verification.records_checked += 1;
+        if archive_payload_hash(&dataset, &source_key, &payload) != stored_hash {
+            verification.ok = false;
+            verification.error = format!("archive record {dataset}:{source_key} was altered");
+            return Ok(verification);
+        }
+    }
+
+    let broken_references: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {prefix}batch_records link
+                 LEFT JOIN {prefix}batches batch ON batch.id=link.batch_id
+                 LEFT JOIN {prefix}records record
+                   ON record.dataset=link.dataset AND record.source_key=link.source_key
+                 WHERE batch.id IS NULL OR record.dataset IS NULL"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if broken_references > 0 {
+        verification.ok = false;
+        verification.error = "archive contains broken manifest references".into();
+        return Ok(verification);
+    }
+    let unbatched_records: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM {prefix}records r
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM {prefix}batch_records link
+                    JOIN {prefix}batches batch ON batch.id=link.batch_id
+                    WHERE link.dataset=r.dataset AND link.source_key=r.source_key
+                 )"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if unbatched_records > 0 {
+        verification.ok = false;
+        verification.error = "archive contains records without a batch manifest".into();
+        return Ok(verification);
+    }
+
+    let batches = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id,content_hash,record_count FROM {prefix}batches ORDER BY id"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    // A file archive is never empty; the database archive may be.
+    if batches.is_empty() && require_batches {
+        verification.ok = false;
+        verification.error = "archive contains no batch manifests".into();
+        return Ok(verification);
+    }
+    for (batch_id, stored_hash, record_count) in batches {
+        verification.batches_checked += 1;
+        let hashes = {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT r.payload_hash FROM {prefix}batch_records b
+                         JOIN {prefix}records r ON r.dataset=b.dataset AND r.source_key=b.source_key
+                         WHERE b.batch_id=?1 ORDER BY b.dataset,b.source_key"
+                ))
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(params![batch_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        let computed_hash = sha256_hex(
+            serde_json::to_string(&hashes)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        if hashes.len() as i64 != record_count || computed_hash != stored_hash {
+            verification.ok = false;
+            verification.error = format!("archive batch {batch_id} manifest does not match");
+            return Ok(verification);
+        }
+    }
+    Ok(verification)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sekai::audit::Decision;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use std::collections::HashMap;
-
-    fn archive_path() -> PathBuf {
-        std::env::temp_dir().join(format!("sekai-archive-{}.db", uuid::Uuid::new_v4()))
-    }
-
-    #[test]
-    fn resolves_relative_archive_filename_against_current_directory() {
-        let resolved = resolved_path(Path::new("archive.db")).unwrap();
-        assert_eq!(
-            resolved,
-            std::env::current_dir().unwrap().join("archive.db")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_hard_link_to_operational_database_as_archive() {
-        let directory =
-            std::env::temp_dir().join(format!("sekai-archive-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let hot_path = directory.join("hot.db");
-        let archive_path = directory.join("archive.db");
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
-        ));
-        std::fs::hard_link(&hot_path, &archive_path).unwrap();
-
-        let error = db
-            .archive_retained_records(&archive_path, 2 * DAY_MS)
-            .unwrap_err();
-        assert!(error.contains("must differ"));
-        drop(db);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rejects_operational_database_sidecars_as_archives() {
-        let directory =
-            std::env::temp_dir().join(format!("sekai-sidecar-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let hot_path = directory.join("hot.db");
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
-        ));
-
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = PathBuf::from(format!("{}{suffix}", hot_path.display()));
-            let error = db
-                .archive_retained_records(&sidecar, 2 * DAY_MS)
-                .unwrap_err();
-            assert!(error.contains("must differ"));
-        }
-        db.ping().unwrap();
-        drop(db);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_dangling_archive_symlink_to_database_sidecar() {
-        use std::os::unix::fs::symlink;
-
-        let directory =
-            std::env::temp_dir().join(format!("sekai-symlink-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let hot_path = directory.join("hot.db");
-        let archive_path = directory.join("archive.db");
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
-            SekaiDb::new(hot_path.to_str().unwrap()).unwrap(),
-        ));
-        let sidecar = PathBuf::from(format!("{}-journal", hot_path.display()));
-        symlink(&sidecar, &archive_path).unwrap();
-
-        let error = db
-            .archive_retained_records(&archive_path, 2 * DAY_MS)
-            .unwrap_err();
-        assert!(error.contains("symbolic link"));
-        assert!(!sidecar.exists());
-        drop(db);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
 
     #[test]
     fn typed_subject_matching_preserves_kind_and_full_scoped_values() {
@@ -3679,8 +4491,7 @@ mod tests {
         .unwrap();
         let before = crate::sekai::observation::task_observation_stats(&db, "component").unwrap();
 
-        let path = archive_path();
-        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
 
         assert_eq!(run.task_observations_archived, 2);
         assert_eq!(run.task_observations_redacted, 1);
@@ -3696,16 +4507,838 @@ mod tests {
                 .iter()
                 .any(|row| row.request_id.starts_with("retention-tombstone:"))
         );
-        let archive = Connection::open(path).unwrap();
+        let archive = db.as_sqlite().expect("sqlite").conn();
         let archived_payload: String = archive
             .query_row(
-                "SELECT payload FROM archive_records
+                "SELECT payload FROM sekai_archive_records
                  WHERE dataset='task_observations' AND payload LIKE '%sensitive-later%'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert!(archived_payload.contains("private-model"));
+    }
+
+    /// After subject erasure no archive table holds the subject id in clear:
+    /// not in a payload, a record key, a batch link or a redaction record,
+    /// even where the natural key names the subject (an observation's
+    /// request id).
+    #[test]
+    fn erasure_leaves_no_plaintext_subject_in_the_archive() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let subject = "wu-secret-42";
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "INSERT INTO sekai_task_observations
+                 (request_id,namespace,component_id,model,status,timestamp)
+                 VALUES (?1,'','component','','done',1)",
+                params![subject],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: TASK_OBSERVATIONS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.task_observations_archived, 1);
+        db.erase_subject(&SubjectErasureRequest {
+            subject_kind: "work_unit".into(),
+            subject: subject.into(),
+            requested_by: "privacy-operator".into(),
+            reason: "validated request".into(),
+            timestamp: 3 * DAY_MS,
+        })
+        .unwrap();
+        let conn = db.as_sqlite().expect("sqlite").conn();
+        for (table, columns) in [
+            (
+                "sekai_archive_records",
+                "dataset||source_key||payload||payload_hash",
+            ),
+            (
+                "sekai_archive_batch_records",
+                "batch_id||dataset||source_key",
+            ),
+            ("sekai_archive_batches", "id||content_hash"),
+            (
+                "sekai_archive_redactions",
+                "id||dataset||source_key||old_payload_hash||new_payload_hash||subject_hash",
+            ),
+        ] {
+            let leaked: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE ({columns}) LIKE ?1"),
+                    params![format!("%{subject}%")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(leaked, 0, "{table} holds the subject in clear");
+        }
+        let redactions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sekai_archive_redactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        // The hot path deletes such an observation, so the archive drops it.
+        assert_eq!(redactions, 0);
+        drop(conn);
+        assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    /// A backlog larger than one batch is archived in bounded batches, each
+    /// record exactly once; a run cut short after its first batch and run
+    /// again loses and duplicates nothing.
+    #[test]
+    fn archives_a_backlog_in_bounded_batches_and_resumes() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let backlog = RETENTION_BATCH_SIZE * 2 + 100;
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &(0..backlog)
+                .map(|index| {
+                    HashMap::from([
+                        ("timestamp_ms".into(), "1".into()),
+                        ("call".into(), index.to_string()),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for index in 0..backlog {
+            db.record_decision(&Decision {
+                id: format!("decision-{index}"),
+                timestamp: 1,
+                actor: "actor".into(),
+                action: "test".into(),
+                reason: String::new(),
+                evidence: HashMap::new(),
+                target_id: String::new(),
+                outcome: "ok".into(),
+            })
+            .unwrap();
+        }
+        for dataset in [LLM_CALLS_DATASET, AUDIT_DATASET] {
+            db.set_retention_policy(&RetentionPolicy {
+                dataset: dataset.into(),
+                namespace: String::new(),
+                data_class: String::new(),
+                retention_days: 1,
+                updated: 1,
+            })
+            .unwrap();
+        }
+        let dry = db.archive_retained_records(2 * DAY_MS, true).unwrap();
+        assert_eq!(dry.llm_calls_archived as usize, backlog);
+
+        // Interrupted after one batch: that batch is committed, nothing else.
+        let sqlite = db.as_sqlite().expect("sqlite");
+        let first = sqlite
+            .archive_retained_batch(
+                2 * DAY_MS,
+                false,
+                RETENTION_BATCH_SIZE,
+                &mut RetentionCursor::default(),
+            )
+            .unwrap();
+        assert_eq!(first.llm_calls_archived as usize, RETENTION_BATCH_SIZE);
+        assert_eq!(first.audit_archived as usize, RETENTION_BATCH_SIZE);
+
+        let versions_before = db.list_dataset_versions(LLM_CALLS_DATASET).unwrap().len();
+        let rest = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(rest.batches, 2);
+        assert_eq!(
+            first.llm_calls_archived + rest.llm_calls_archived,
+            backlog as i32
+        );
+        assert!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+        let status = db.retention_archive_status().unwrap();
+        assert_eq!(status.batches, 3);
+        let archived = |dataset: &str| {
+            status
+                .records
+                .iter()
+                .find(|(name, _)| name == dataset)
+                .map_or(0, |(_, count)| *count)
+        };
+        assert_eq!(archived("llm_calls") as usize, backlog);
+        assert_eq!(archived("audit.decisions") as usize, backlog);
+        assert!(db.verify_retention_archive().unwrap().ok);
+        let ledger = db.verify_ledger().unwrap();
+        assert!(ledger.ok, "{}", ledger.error);
+        // One version for the resumed run of two batches, not one per batch.
+        assert_eq!(
+            db.list_dataset_versions(LLM_CALLS_DATASET).unwrap().len(),
+            versions_before + 1
+        );
+    }
+
+    /// A run that crashed after its last batch, before the version cleanup,
+    /// is completed by the next run even though that run archives nothing.
+    #[test]
+    fn version_cleanup_left_by_a_crash_runs_on_the_next_run() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let sqlite = db.as_sqlite().expect("sqlite");
+        let version_rows = || -> i64 {
+            sqlite
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_dataset_version_rows WHERE dataset_id=?1",
+                    params![LLM_CALLS_DATASET],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        {
+            let mut conn = sqlite.conn();
+            let tx = conn.transaction().unwrap();
+            snapshot_llm_calls(&tx, 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let before = version_rows();
+        assert!(before > 0);
+        // Every batch, then the crash: no cleanup.
+        let mut cursor = RetentionCursor::default();
+        while !cursor.done() {
+            sqlite
+                .archive_retained_batch(2 * DAY_MS, false, RETENTION_BATCH_SIZE, &mut cursor)
+                .unwrap();
+        }
+        assert_eq!(
+            version_rows(),
+            before,
+            "the expired call is still in versions"
+        );
+
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.llm_calls_archived, 0);
+        assert_eq!(version_rows(), 0);
+    }
+
+    /// A backlog spread over several pages, with rows that stay hot between
+    /// rows that expire, gives the same archive and hot tables batched as in
+    /// one unbounded pass, and every batch reads at most one page per dataset.
+    #[test]
+    fn bounded_batches_match_an_unbounded_pass() {
+        fn fixture() -> RuntimeDb {
+            let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+            db.create_dataset(&Dataset {
+                id: LLM_CALLS_DATASET.into(),
+                name: "calls".into(),
+                columns: Vec::new(),
+                object_id: String::new(),
+                created: 0,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+            // Every third call is fresh and stays hot.
+            db.append_rows(
+                LLM_CALLS_DATASET,
+                &(0..1_300)
+                    .map(|index| {
+                        let at = if index % 3 == 0 { 5 * DAY_MS } else { 1 };
+                        HashMap::from([
+                            ("timestamp_ms".into(), at.to_string()),
+                            ("call".into(), index.to_string()),
+                        ])
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let conn = db.as_sqlite().expect("sqlite").conn();
+            for index in 0..1_300_i64 {
+                // Three components; a fresh row at 700 retains component 1,
+                // and a sensitive class expires sooner.
+                let component = format!("component-{}", index % 3);
+                let timestamp = if index == 700 { 400_000 } else { index };
+                let class = if index % 5 == 0 { "sensitive" } else { "" };
+                let status = if index % 4 == 0 { "failed" } else { "done" };
+                conn.execute(
+                    "INSERT INTO sekai_task_observations
+                     (request_id,namespace,data_class,component_id,model,status,timestamp)
+                     VALUES (?1,'',?2,?3,'',?4,?5)",
+                    params![
+                        format!("request-{index}"),
+                        class,
+                        component,
+                        status,
+                        timestamp
+                    ],
+                )
+                .unwrap();
+            }
+            drop(conn);
+            for (dataset, class, days) in [
+                (LLM_CALLS_DATASET, "", 1),
+                (TASK_OBSERVATIONS_DATASET, "", 4),
+                (TASK_OBSERVATIONS_DATASET, "sensitive", 1),
+            ] {
+                db.set_retention_policy(&RetentionPolicy {
+                    dataset: dataset.into(),
+                    namespace: String::new(),
+                    data_class: class.into(),
+                    retention_days: days,
+                    updated: 1,
+                })
+                .unwrap();
+            }
+            db
+        }
+        fn state(db: &RuntimeDb) -> Vec<String> {
+            let conn = db.as_sqlite().expect("sqlite").conn();
+            let mut out = Vec::new();
+            // Payloads compared as JSON: a row's stored key order may differ
+            // between two fixtures built from hash maps.
+            let mut stmt = conn
+                .prepare("SELECT dataset,source_key,payload FROM sekai_archive_records")
+                .unwrap();
+            out.extend(
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .map(|(dataset, key, payload)| {
+                    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                    format!("{dataset}|{key}|{payload}")
+                }),
+            );
+            drop(stmt);
+            for query in [
+                "SELECT 'row|'||id FROM sekai_dataset_rows",
+                "SELECT 'obs|'||request_id||'|'||status||'|'||retention_tombstone
+                 FROM sekai_task_observations",
+                "SELECT 'base|'||component_id||'|'||task_total||'|'||task_succeeded||'|'||consecutive_failures
+                 FROM sekai_task_observation_baselines",
+            ] {
+                let mut stmt = conn.prepare(query).unwrap();
+                out.extend(
+                    stmt.query_map([], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(Result::unwrap),
+                );
+            }
+            out.sort();
+            out
+        }
+        let now = 5 * DAY_MS;
+        let batched = fixture();
+        let run = batched.archive_retained_records(now, false).unwrap();
+        assert!(run.batches >= 3, "{run:?}");
+        assert_eq!(run.llm_calls_archived, 866);
+        let unbounded = fixture();
+        unbounded
+            .as_sqlite()
+            .expect("sqlite")
+            .archive_retained_batch(now, false, usize::MAX, &mut RetentionCursor::default())
+            .unwrap();
+        assert_eq!(state(&batched), state(&unbounded));
+
+        // One page per dataset per batch: a cursor advances by at most a
+        // page, whatever the backlog.
+        let paged = fixture();
+        let sqlite = paged.as_sqlite().expect("sqlite");
+        let mut cursor = RetentionCursor::default();
+        let first = sqlite
+            .archive_retained_batch(now, false, RETENTION_BATCH_SIZE, &mut cursor)
+            .unwrap();
+        assert!(first.llm_calls_archived as usize <= RETENTION_BATCH_SIZE);
+        assert!(first.task_observations_archived as usize <= RETENTION_BATCH_SIZE);
+        assert_eq!(cursor.llm_after as usize, RETENTION_BATCH_SIZE);
+        assert!(!cursor.llm_done && !cursor.observations_done);
+    }
+
+    /// Subject references inside JSON held in an archived string field (an
+    /// attestation's inputs) are matched and redacted, and stay JSON.
+    #[test]
+    fn erasure_redacts_subjects_inside_archived_json_strings() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.record_decision(&Decision {
+            id: "d-1".into(),
+            timestamp: 1,
+            actor: "operator".into(),
+            action: "apply".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: "other".into(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "INSERT INTO sekai_attestations
+                 (id,decision_id,policy_kind,policy_scope,policy_version,policy_snapshot,
+                  inputs,decision,content_hash,created)
+                 VALUES ('a1','d-1','k','s','v','{}',?1,'allow','h',1)",
+                params![r#"[{"kind":"user","id":"alice"}]"#],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        db.erase_subject(&SubjectErasureRequest {
+            subject_kind: "user".into(),
+            subject: "alice".into(),
+            requested_by: "privacy-operator".into(),
+            reason: "validated request".into(),
+            timestamp: 3 * DAY_MS,
+        })
+        .unwrap();
+        let payload: String = db
+            .as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .query_row(
+                "SELECT payload FROM sekai_archive_records WHERE dataset='audit.attestations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!payload.contains("alice"), "{payload}");
+        let packages: String =
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap()["inputs"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert!(embedded_json(&packages).is_some(), "still JSON: {packages}");
+        assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    /// Archived decisions are matched by the hot ledger's own rule, so a
+    /// decision on a work unit (`target_id`) or naming the subject in its id
+    /// is tombstoned in the archive as in the hot table, with its
+    /// attestations removed; an unrelated decision is not touched.
+    #[test]
+    fn archived_decisions_follow_the_hot_ledger_rule() {
+        let decision = |id: &str, target: &str| Decision {
+            id: id.into(),
+            timestamp: 1,
+            actor: "operator".into(),
+            action: "apply".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: target.into(),
+            outcome: "ok".into(),
+        };
+        // `obj-7` is an object related to the subject, as the hot path finds.
+        let related = vec!["obj-7".to_string()];
+        let fixtures = [
+            decision("d-target", "wu-42"),
+            decision("decision-wu-42", "other"),
+            decision("d-related-object", "obj-7"),
+            decision("d-unrelated", "other"),
+        ];
+        for fixture in &fixtures {
+            let payload = serde_json::json!({
+                "id": fixture.id, "timestamp": 1, "actor": fixture.actor, "action": fixture.action,
+                "reason": fixture.reason, "evidence": "{}", "target_id": fixture.target_id,
+                "outcome": fixture.outcome, "seq": 1, "prev_hash": "", "entry_hash": "",
+                "namespace": "", "data_class": "",
+            })
+            .to_string();
+            let hot = decision_matches_for_erasure(fixture, "work_unit", "wu-42", &related);
+            let archived = tombstone_archived_decision(
+                &payload,
+                "work_unit",
+                "wu-42",
+                "erasure:x",
+                9,
+                &related,
+            );
+            assert_eq!(archived.is_some(), hot, "{}", fixture.id);
+            assert_eq!(hot, fixture.id != "d-unrelated", "{}", fixture.id);
+            if let Some((tombstone, original)) = archived {
+                assert_eq!(original, fixture.id);
+                assert!(!tombstone.contains("wu-42"), "{tombstone}");
+            }
+        }
+
+        // End to end: the archived decision and its attestation.
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.record_decision(&decision("d-target", "wu-42")).unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "INSERT INTO sekai_attestations
+                 (id,decision_id,policy_kind,policy_scope,policy_version,policy_snapshot,
+                  inputs,decision,content_hash,created)
+                 VALUES ('a1','d-target','k','s','v','{}','{}','allow','h',1)",
+                [],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.audit_archived, 2);
+        db.erase_subject(&SubjectErasureRequest {
+            subject_kind: "work_unit".into(),
+            subject: "wu-42".into(),
+            requested_by: "privacy-operator".into(),
+            reason: "validated request".into(),
+            timestamp: 3 * DAY_MS,
+        })
+        .unwrap();
+        let conn = db.as_sqlite().expect("sqlite").conn();
+        let (decisions, attestations, leaked): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                   SUM(dataset='audit.decisions'), SUM(dataset='audit.attestations'),
+                   SUM(payload LIKE '%wu-42%')
+                 FROM sekai_archive_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((decisions, attestations, leaked), (1, 0, 0));
+        drop(conn);
+        assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    /// The archive walker decides exactly as the hot path's predicates do
+    /// on the same documents, and redacts whatever it matches.
+    #[test]
+    fn archive_matching_agrees_with_the_hot_path() {
+        fn hot_path(value: &serde_json::Value, kind: &str, subject: &str) -> bool {
+            json_matches_subject(value, kind, subject)
+                || match value {
+                    serde_json::Value::Object(values) => values.iter().any(|(key, value)| {
+                        key_matches_subject(key, kind, subject) || hot_path(value, kind, subject)
+                    }),
+                    serde_json::Value::Array(values) => {
+                        values.iter().any(|value| hot_path(value, kind, subject))
+                    }
+                    serde_json::Value::String(text) => {
+                        embedded_json(text).is_some_and(|inner| hot_path(&inner, kind, subject))
+                    }
+                    _ => false,
+                }
+        }
+        let fixtures = [
+            r#"{"key":"user","op":"in","value":"alice,bob"}"#,
+            r#"{"key":"region","op":"in","value":"alice,bob"}"#,
+            r#"{"alice_history":"private data"}"#,
+            r#"{"packages_json":"{\"alice_history\":\"private\"}"}"#,
+            r#"[{"kind":"user","id":"alice"}]"#,
+            r#"{"packages_json":"[{\"kind\":\"user\",\"id\":\"alice\"}]"}"#,
+            r#"{"user":"alice"}"#,
+            r#"{"actor":"user:alice"}"#,
+            r#"{"note":"alice"}"#,
+            r#"{"note":"talk to user:alice"}"#,
+            r#"{"owner":"bob","tags":["x","y"]}"#,
+            r#"{"kind":"agent","id":"alice"}"#,
+        ];
+        // Never weaker than the hot path's predicates, nor than the archive
+        // redactor before ADR 0141, for every dataset; and nothing either
+        // would match survives.
+        let no_references = std::collections::BTreeSet::new();
+        let alice = ArchiveErasureSubject {
+            kind: "user",
+            subject: "alice",
+            hash: "erasure:x",
+            object_ids: &[],
+            reference_ids: &no_references,
+        };
+        for dataset in [
+            "audit.attestations",
+            OBJECT_CHANGES_ARCHIVE_DATASET,
+            LLM_CALLS_DATASET,
+            TASK_OBSERVATIONS_DATASET,
+            CONTENT_EVENTS_DATASET,
+        ] {
+            for fixture in fixtures {
+                let parsed: serde_json::Value = serde_json::from_str(fixture).unwrap();
+                let hot = hot_path(&parsed, "user", "alice");
+                let legacy = legacy_value_mentions_subject(fixture, "user", "alice");
+                match erase_archived_record(dataset, fixture, &alice) {
+                    ArchivedErasure::Keep => {
+                        assert!(!(hot || legacy), "{dataset}: {fixture} must be erased")
+                    }
+                    ArchivedErasure::Delete => {}
+                    ArchivedErasure::Rewrite(redacted) => {
+                        let parsed: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+                        assert!(
+                            !hot_path(&parsed, "user", "alice"),
+                            "{fixture} -> {redacted}"
+                        );
+                        assert!(
+                            !legacy_value_mentions_subject(&redacted, "user", "alice"),
+                            "{fixture} -> {redacted}"
+                        );
+                    }
+                }
+            }
+        }
+        // Regression: a content event whose reason is exactly the subject.
+        let event = r#"{"event_kind":"put","blob_id":"b","reference_id":null,"actor":"svc","reason":"alice","created_at_ms":1}"#;
+        let redacted = redact_archived_payload(event, "agent", "alice", "erasure:x").unwrap();
+        assert!(!redacted.contains("alice"), "{redacted}");
+        let filter = redact_archived_payload(
+            r#"{"key":"user","op":"in","value":"alice,bob"}"#,
+            "user",
+            "alice",
+            "erasure:x",
+        )
+        .unwrap();
+        assert!(filter.contains("erasure:x,bob"), "{filter}");
+        let keyed = redact_archived_payload(
+            r#"{"alice_history":"private data"}"#,
+            "user",
+            "alice",
+            "erasure:x",
+        )
+        .unwrap();
+        assert!(
+            !keyed.contains("alice") && !keyed.contains("private data"),
+            "{keyed}"
+        );
+    }
+
+    /// Each archived dataset is judged by its own hot-path rule, related
+    /// objects and content references included: alice's `obj-7` change loses
+    /// its values as the hot row does, a call or observation naming `obj-7`
+    /// goes, and an event of alice's content reference is tombstoned.
+    #[test]
+    fn archived_records_follow_each_dataset_hot_rule() {
+        let related = vec!["obj-7".to_string()];
+        let references = std::collections::BTreeSet::from(["ref-alice".to_string()]);
+        let alice = ArchiveErasureSubject {
+            kind: "user",
+            subject: "alice",
+            hash: "erasure:x",
+            object_ids: &related,
+            reference_ids: &references,
+        };
+        for object_id in ["obj-7", "obj-8"] {
+            let payload = serde_json::json!({
+                "id": "c1", "object_id": object_id, "field": "phone",
+                "old_value": "+49 555 0100", "new_value": "+49 555 0199",
+                "changed_by": "importer", "timestamp": 1,
+            })
+            .to_string();
+            let row: ObjectChangeRow = serde_json::from_str(&payload).unwrap();
+            let hot = erase_object_change(&row, "user", "alice", &related);
+            match (
+                erase_archived_record(OBJECT_CHANGES_ARCHIVE_DATASET, &payload, &alice),
+                hot,
+            ) {
+                (ArchivedErasure::Rewrite(archived), Some(hot)) => {
+                    assert_eq!(object_id, "obj-7");
+                    let archived: serde_json::Value = serde_json::from_str(&archived).unwrap();
+                    for (field, value) in [
+                        ("object_id", hot.object_id),
+                        ("field", hot.field),
+                        ("changed_by", hot.changed_by),
+                        ("old_value", hot.old_value),
+                        ("new_value", hot.new_value),
+                    ] {
+                        assert_eq!(archived[field], value.as_str(), "{field}");
+                    }
+                    assert!(!archived.to_string().contains("555"), "{archived}");
+                }
+                (ArchivedErasure::Keep, None) => assert_eq!(object_id, "obj-8"),
+                other => panic!("{object_id}: {other:?}"),
+            }
+        }
+        for (call, matches) in [
+            (
+                serde_json::json!({"request_id": "r1", "object_ref": "obj-7"}),
+                true,
+            ),
+            (
+                serde_json::json!({"request_id": "r2", "user": "alice"}),
+                true,
+            ),
+            (serde_json::json!({"request_id": "r3", "model": "m"}), false),
+        ] {
+            let values: HashMap<String, String> = serde_json::from_value(call.clone()).unwrap();
+            let hot = llm_call_matches_subject(&values, "user", "alice", &related);
+            assert_eq!(hot, matches, "{call}");
+            assert_eq!(
+                erase_archived_record(LLM_CALLS_DATASET, &call.to_string(), &alice),
+                if hot {
+                    ArchivedErasure::Delete
+                } else {
+                    ArchivedErasure::Keep
+                },
+                "{call}"
+            );
+        }
+        for (context, matches) in [
+            (r#"{"customer":"obj-7"}"#, true),
+            (r#"{"user":"alice"}"#, true),
+            (r#"{"region":"eu"}"#, false),
+        ] {
+            let observation = serde_json::json!({
+                "request_id": "r1", "namespace": "ns", "component_id": "c", "data_class": "",
+                "model": "m", "status": "done", "timestamp": 1, "packages_json": "[]",
+                "context_json": context,
+            });
+            let row: TaskObservationRow = serde_json::from_value(observation.clone()).unwrap();
+            let hot = task_observation_matches_subject(&row, "user", "alice", &related);
+            assert_eq!(hot, matches, "{context}");
+            assert_eq!(
+                erase_archived_record(TASK_OBSERVATIONS_DATASET, &observation.to_string(), &alice),
+                if hot {
+                    ArchivedErasure::Delete
+                } else {
+                    ArchivedErasure::Keep
+                },
+                "{context}"
+            );
+        }
+        let event = |reference: &str| {
+            serde_json::json!({
+                "event_kind": "put", "blob_id": "b", "reference_id": reference,
+                "actor": "svc", "reason": "stored", "created_at_ms": 1,
+            })
+            .to_string()
+        };
+        let ArchivedErasure::Rewrite(tombstone) =
+            erase_archived_record(CONTENT_EVENTS_DATASET, &event("ref-alice"), &alice)
+        else {
+            panic!("an event of the subject's reference is tombstoned");
+        };
+        let tombstone: serde_json::Value = serde_json::from_str(&tombstone).unwrap();
+        assert_eq!(tombstone["actor"], "erasure:x");
+        assert_eq!(tombstone["reason"], CONTENT_EVENT_ERASED_REASON);
+        assert_eq!(
+            erase_archived_record(CONTENT_EVENTS_DATASET, &event("ref-bob"), &alice),
+            ArchivedErasure::Keep
+        );
+    }
+
+    /// End to end on SQLite: once alice's object `obj-7` is archived, its
+    /// change history keeps no personal value and a call naming it is gone;
+    /// the archive still verifies with the recounted batch.
+    #[test]
+    fn erasure_reaches_archived_changes_of_related_objects() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        {
+            let conn = db.as_sqlite().expect("sqlite").conn();
+            conn.execute(
+                "INSERT INTO sekai_objects (id,kind,name,created,updated)
+                 VALUES ('obj-7','user','alice',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sekai_object_changes
+                 (id,object_id,field,old_value,new_value,changed_by,timestamp)
+                 VALUES ('c1','obj-7','phone','+49 555 0100','+49 555 0199','importer',1)",
+                [],
+            )
+            .unwrap();
+        }
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([
+                ("timestamp_ms".into(), "1".into()),
+                ("object_ref".into(), "obj-7".into()),
+                ("prompt".into(), "call +49 555 0100".into()),
+            ])],
+        )
+        .unwrap();
+        for dataset in [AUDIT_DATASET, LLM_CALLS_DATASET] {
+            db.set_retention_policy(&RetentionPolicy {
+                dataset: dataset.into(),
+                namespace: String::new(),
+                data_class: String::new(),
+                retention_days: 1,
+                updated: 1,
+            })
+            .unwrap();
+        }
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!((run.audit_archived, run.llm_calls_archived), (1, 1));
+        db.erase_subject(&SubjectErasureRequest {
+            subject_kind: "user".into(),
+            subject: "alice".into(),
+            requested_by: "privacy-operator".into(),
+            reason: "validated request".into(),
+            timestamp: 3 * DAY_MS,
+        })
+        .unwrap();
+        let conn = db.as_sqlite().expect("sqlite").conn();
+        let (changes, calls, leaked): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT SUM(dataset='audit.object_changes'), SUM(dataset='llm_calls'),
+                        SUM(payload LIKE '%555%' OR payload LIKE '%obj-7%')
+                 FROM sekai_archive_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((changes, calls, leaked), (1, 0, 0));
+        drop(conn);
+        assert!(db.verify_retention_archive().unwrap().ok);
     }
 
     #[test]
@@ -3980,8 +5613,7 @@ mod tests {
             }
         }
 
-        let path = archive_path();
-        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
 
         assert_eq!(run.audit_archived, 2);
         assert_eq!(run.llm_calls_archived, 1);
@@ -4004,30 +5636,35 @@ mod tests {
         assert!(verification.ok, "{}", verification.error);
         assert_eq!(verification.anchor_seq, 1);
 
-        let archive = Connection::open(&path).unwrap();
-        let archived: i64 = archive
-            .query_row("SELECT COUNT(*) FROM archive_records", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(archived, 4);
-        let manifest: (String, i64) = archive
-            .query_row(
-                "SELECT content_hash,record_count FROM archive_batches WHERE id=?1",
-                params![run.batch_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(manifest, (run.content_hash, 4));
-        drop(archive);
-        let verification = SekaiDb::verify_archive(&path).unwrap();
+        {
+            let archive = db.as_sqlite().expect("sqlite").conn();
+            let archived: i64 = archive
+                .query_row("SELECT COUNT(*) FROM sekai_archive_records", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(archived, 4);
+            let manifest: (String, i64) = archive
+                .query_row(
+                    "SELECT content_hash,record_count FROM sekai_archive_batches WHERE id=?1",
+                    params![run.batch_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(manifest, (run.content_hash.clone(), 4));
+        }
+        let verification = db.verify_retention_archive().unwrap();
         assert!(verification.ok, "{}", verification.error);
         assert_eq!(verification.records_checked, 4);
         assert_eq!(verification.batches_checked, 1);
-        std::fs::remove_file(path).unwrap();
+        // A second run finds nothing left to move.
+        let again = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert!(again.batch_id.is_empty());
+        assert_eq!(db.retention_archive_status().unwrap().batches, 1);
     }
 
     #[test]
     fn archive_verification_detects_payload_tampering() {
-        let path = archive_path();
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
@@ -4043,21 +5680,20 @@ mod tests {
             &[HashMap::from([("timestamp_ms".into(), "1".into())])],
         )
         .unwrap();
-        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
-        Connection::open(&path)
-            .unwrap()
-            .execute("UPDATE archive_records SET payload='forged'", [])
+        db.archive_retained_records(100 * DAY_MS, false).unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute("UPDATE sekai_archive_records SET payload='forged'", [])
             .unwrap();
 
-        let verification = SekaiDb::verify_archive(&path).unwrap();
+        let verification = db.verify_retention_archive().unwrap();
         assert!(!verification.ok);
         assert!(verification.error.contains("was altered"));
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn archive_verification_detects_removed_batch_manifest() {
-        let path = archive_path();
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
         db.create_dataset(&Dataset {
             id: LLM_CALLS_DATASET.into(),
@@ -4073,54 +5709,69 @@ mod tests {
             &[HashMap::from([("timestamp_ms".into(), "1".into())])],
         )
         .unwrap();
-        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
+        db.archive_retained_records(100 * DAY_MS, false).unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM sekai_archive_batches;
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+
+        let verification = db.verify_retention_archive().unwrap();
+        assert!(!verification.ok);
+        assert!(verification.error.contains("broken manifest references"));
+    }
+
+    /// Archive files written before ADR 0141 are kept and stay verifiable;
+    /// nothing is imported from them. An empty file archive still fails.
+    #[test]
+    fn a_legacy_archive_file_still_verifies() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-legacy-archive-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
         let archive = Connection::open(&path).unwrap();
         archive
             .execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 DELETE FROM archive_batches;",
+                "CREATE TABLE archive_records (dataset TEXT, source_key TEXT, payload TEXT,
+                   payload_hash TEXT, archived_at INTEGER, PRIMARY KEY(dataset,source_key));
+                 CREATE TABLE archive_batches (id TEXT PRIMARY KEY, cutoff INTEGER,
+                   content_hash TEXT, record_count INTEGER, created INTEGER);
+                 CREATE TABLE archive_batch_records (batch_id TEXT, dataset TEXT, source_key TEXT,
+                   PRIMARY KEY(batch_id,dataset,source_key));",
+            )
+            .unwrap();
+        let empty = SekaiDb::verify_archive(&path).unwrap();
+        assert!(!empty.ok);
+        assert!(empty.error.contains("no batch manifests"));
+        let hash = archive_payload_hash("llm_calls", "1", "{}");
+        let content = sha256_hex(serde_json::to_string(&[&hash]).unwrap().as_bytes());
+        archive
+            .execute(
+                "INSERT INTO archive_records VALUES ('llm_calls','1','{}',?1,1)",
+                params![hash],
+            )
+            .unwrap();
+        archive
+            .execute(
+                "INSERT INTO archive_batches VALUES ('b1',1,?1,1,1)",
+                params![content],
+            )
+            .unwrap();
+        archive
+            .execute(
+                "INSERT INTO archive_batch_records VALUES ('b1','llm_calls','1')",
+                [],
             )
             .unwrap();
         drop(archive);
-
         let verification = SekaiDb::verify_archive(&path).unwrap();
-        assert!(!verification.ok);
-        assert!(verification.error.contains("broken manifest references"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn archive_verification_rejects_total_content_loss() {
-        let path = archive_path();
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
-        db.create_dataset(&Dataset {
-            id: LLM_CALLS_DATASET.into(),
-            name: "calls".into(),
-            columns: Vec::new(),
-            object_id: String::new(),
-            created: 0,
-            partition_keys: Vec::new(),
-        })
-        .unwrap();
-        db.append_rows(
-            LLM_CALLS_DATASET,
-            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
-        )
-        .unwrap();
-        db.archive_retained_records(&path, 100 * DAY_MS).unwrap();
-        Connection::open(&path)
-            .unwrap()
-            .execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 DELETE FROM archive_batch_records;
-                 DELETE FROM archive_records;
-                 DELETE FROM archive_batches;",
-            )
-            .unwrap();
-
-        let verification = SekaiDb::verify_archive(&path).unwrap();
-        assert!(!verification.ok);
-        assert!(verification.error.contains("no batch manifests"));
+        assert!(verification.ok, "{}", verification.error);
+        assert_eq!(verification.records_checked, 1);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -4155,61 +5806,65 @@ mod tests {
         })
         .unwrap();
 
-        let path = archive_path();
-        let error = db.archive_retained_records(&path, 2 * DAY_MS).unwrap_err();
+        let error = db.archive_retained_records(2 * DAY_MS, false).unwrap_err();
         assert!(error.contains("audit ledger hash invalid"), "{error}");
         assert!(db.get_decision("tampered").unwrap().is_some());
-        assert!(!path.exists());
+        assert_eq!(db.retention_archive_status().unwrap().batches, 0);
     }
 
     #[test]
     fn archive_conflicts_leave_hot_records_untouched() {
-        let path = archive_path();
-        for (index, model) in ["first", "changed"].into_iter().enumerate() {
-            let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
-            db.create_dataset(&Dataset {
-                id: LLM_CALLS_DATASET.into(),
-                name: "calls".into(),
-                columns: Vec::new(),
-                object_id: String::new(),
-                created: 0,
-                partition_keys: Vec::new(),
-            })
-            .unwrap();
-            db.append_rows(
-                LLM_CALLS_DATASET,
-                &[HashMap::from([
-                    ("timestamp_ms".into(), "1".into()),
-                    ("model".into(), model.into()),
-                ])],
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        // An archived record with the same identity but other content.
+        let row_id: i64 = db
+            .as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .query_row(
+                "SELECT id FROM sekai_dataset_rows WHERE dataset_id=?1",
+                params![LLM_CALLS_DATASET],
+                |row| row.get(0),
             )
             .unwrap();
-            db.set_retention_policy(&RetentionPolicy {
-                dataset: LLM_CALLS_DATASET.into(),
-                namespace: String::new(),
-                data_class: String::new(),
-                retention_days: 1,
-                updated: 1,
-            })
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "INSERT INTO sekai_archive_records VALUES ('llm_calls',?1,'other','x',1)",
+                params![archive_source_key(LLM_CALLS_DATASET, &row_id.to_string())],
+            )
             .unwrap();
-            let result = db.archive_retained_records(&path, 2 * DAY_MS);
-            if index == 0 {
-                assert!(result.is_ok());
-            } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("conflicts with existing content")
-                );
-                assert_eq!(
-                    db.query_rows(LLM_CALLS_DATASET, &Default::default())
-                        .unwrap()
-                        .len(),
-                    1
-                );
-            }
-        }
-        std::fs::remove_file(path).unwrap();
+        let error = db.archive_retained_records(2 * DAY_MS, false).unwrap_err();
+        assert!(error.contains("conflicts with existing content"), "{error}");
+        assert_eq!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.retention_archive_status().unwrap().batches, 0);
     }
 
     #[test]
@@ -4271,8 +5926,7 @@ mod tests {
         })
         .unwrap();
 
-        let path = archive_path();
-        let run = db.archive_retained_records(&path, 2 * DAY_MS).unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
         assert_eq!(run.audit_archived, 0);
         assert_eq!(run.llm_calls_archived, 1);
         assert!(
@@ -4281,7 +5935,6 @@ mod tests {
                 .is_empty()
         );
         assert!(db.verify_ledger().unwrap().ok);
-        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
