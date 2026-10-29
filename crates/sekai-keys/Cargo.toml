@@ -7,7 +7,7 @@ description = "Customer-managed key hierarchy and key-provider contract for stor
 
 [dependencies]
 aes-gcm = "0.10"
-rand = { version = "0.8", features = ["std"] }
+rand = { version = "0.10", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
