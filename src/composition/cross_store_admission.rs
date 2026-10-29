@@ -744,6 +744,7 @@ mod tests {
 
     fn request(operation_id: &str) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: "acme".into(),
             type_id: "dispatch".into(),
             version: "1".into(),

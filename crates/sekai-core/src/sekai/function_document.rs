@@ -602,6 +602,7 @@ fn park_extraction(
     let outcome = ActionInstanceAdmission::new(db, None)
         .admit(
             ActionInstanceAdmissionRequest {
+                agent_turn: None,
                 namespace: namespace.into(),
                 type_id: action.type_id.clone(),
                 version: action.version.clone(),
@@ -1298,6 +1299,7 @@ mod tests {
         for (key, now) in [("a", 10i64), ("b", 20)] {
             runtime
                 .put_action_instance(&ActionInstance {
+                    agent_turn: None,
                     instance_id: format!("inst-{key}"),
                     namespace: "records".into(),
                     type_id: "function.extract_object".into(),

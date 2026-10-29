@@ -686,6 +686,7 @@ mod tests {
 
     fn parked(db: &RuntimeDb, principal: &str, type_id: &str, key: &str, decision: &str, now: i64) {
         let instance = ActionInstance {
+            agent_turn: None,
             instance_id: format!("inst-{key}"),
             namespace: "acme".into(),
             type_id: type_id.into(),
@@ -824,6 +825,7 @@ mod tests {
         let db = setup();
         parked(&db, "agent:fixture", "dispatch", "a", DECISION_GRANT, 10);
         let failed = ActionInstance {
+            agent_turn: None,
             instance_id: "inst-stale".into(),
             namespace: "acme".into(),
             type_id: "dispatch".into(),
@@ -1181,6 +1183,7 @@ mod tests {
         db.upsert_action_policy(&policy).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);
         let req = |type_id: &str, key: &str| ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: "acme".into(),
             type_id: type_id.into(),
             version: "1".into(),

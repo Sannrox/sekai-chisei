@@ -592,6 +592,7 @@ fn closing_record(
 ) -> ActionInstance {
     let id = uuid::Uuid::new_v4().to_string();
     ActionInstance {
+        agent_turn: None,
         instance_id: id.clone(),
         namespace: plan.namespace.clone(),
         type_id: step.type_id.clone(),
@@ -798,6 +799,7 @@ mod tests {
             ActionInstanceAdmission::new(db, None)
                 .admit(
                     ActionInstanceAdmissionRequest {
+                        agent_turn: None,
                         namespace: NS.into(),
                         type_id: step.type_id.clone(),
                         version: step.version.clone(),

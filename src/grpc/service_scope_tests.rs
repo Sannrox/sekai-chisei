@@ -130,6 +130,7 @@ fn seed_effect(db: &RuntimeDb, effect_id: &str, namespace: &str, type_id: &str) 
     .remove(0);
     effect.effect_id = effect_id.into();
     db.put_action_instance(&ActionInstance {
+        agent_turn: None,
         instance_id: effect.instance_id.clone(),
         namespace: namespace.into(),
         type_id: type_id.into(),
