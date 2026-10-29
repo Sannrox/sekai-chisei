@@ -98,6 +98,21 @@ tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
 using their own credential. Claim RPCs are now available to tenant-scoped
 credentials under the same namespace and tenant checks as other Action RPCs.
 
+Agent-turn claims mint the same kind of token (ADR 0142, #2005).
+`ClaimAgentTurn` and `HeartbeatAgentTurnClaim` return `runtime_token` and
+`runtime_token_expires_at_ms` bound to the turn's namespace, turn, runtime and
+claim generation. The token acts as the instance's `principal_id`, with the
+claiming worker as its `act`, so both need access to the namespace. It
+authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn` and
+`SubmitActionInstance`, and only while the turn is claimed at that generation
+and its lease holds. A submission with it must name the turn's namespace and is
+refused while the instance is frozen. Its admission records the turn and
+generation, and commits only while the turn is still claimed at that
+generation: a submission still in flight when another worker reclaims the
+turn is denied with a receipt instead of writing. A heartbeat made with the token renews
+it for the same principal and worker. The agent-turn worker RPCs are available
+to tenant-scoped credentials under the same checks.
+
 ## Service principals
 
 Administrators (`root`, `local`, or an admin grant on `service_principals`)

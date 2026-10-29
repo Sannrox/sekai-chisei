@@ -18422,6 +18422,7 @@ async fn action_instance_reads_enforce_authenticated_tenant() {
 
 fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::ActionInstance {
     crate::sekai::action_instance::ActionInstance {
+        agent_turn: None,
         instance_id: "private-instance".into(),
         namespace: namespace.into(),
         type_id: "review".into(),

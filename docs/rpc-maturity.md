@@ -133,6 +133,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PublishFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.WithdrawFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetFederatedAggregateAllowance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.FederatedAggregate` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ExportObjectSet` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ExportDatasetVersion` | `sekai.dataset, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetExportReceipt` | `sekai.graph, sekai.audit` | yes | none | `experimental` |

@@ -542,6 +542,7 @@ mod tests {
         evidence_ids: Vec<String>,
     ) -> ActionInstanceAdmissionRequest {
         ActionInstanceAdmissionRequest {
+            agent_turn: None,
             namespace: NAMESPACE.into(),
             type_id: type_id.into(),
             version: PACKAGE_VERSION.into(),

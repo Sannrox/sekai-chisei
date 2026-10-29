@@ -44,6 +44,7 @@ fn seed_effect(db: &RuntimeDb, namespace: &str, prefix: &str) -> ActionEffect {
     db.put_action_effects(std::slice::from_ref(&effect))
         .unwrap();
     db.put_action_instance(&ActionInstance {
+        agent_turn: None,
         instance_id,
         namespace: namespace.into(),
         type_id: "invade".into(),

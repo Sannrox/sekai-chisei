@@ -101,6 +101,12 @@ pub struct ActionInstance {
     /// leases existed; those stay unfenced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_lease: Option<AdmissionLease>,
+    /// The agent turn whose token submitted this Action (ADR 0142): its
+    /// admission commits only while that turn is still claimed at this
+    /// generation, so a superseded worker's submission cannot outlive a
+    /// takeover. Absent for other submissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_turn: Option<AgentTurnFence>,
     /// The ontology digest the submit was bound to, kept so a takeover
     /// repairs the receipt with the original binding, not a retry's (#1931).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +159,25 @@ impl PlanReference {
 
 /// The holder of an admission reservation. A takeover (#1931) bumps the
 /// generation; an owner's writes are refused once it is not current.
+/// What an admission receipt's transaction checks before it commits the
+/// Action. A receipt that is the Action's commit checks its site agent and
+/// its turn; a parked submission's receipt, which commits it for approval,
+/// checks its turn; a denial, or a receipt after the object write already
+/// committed under these checks, checks neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitCheck {
+    None,
+    TurnFence,
+    SiteAgent,
+}
+
+/// The claim of the agent turn an Action was submitted under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTurnFence {
+    pub turn_id: String,
+    pub claim_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionLease {
     pub owner: String,
@@ -1025,6 +1050,11 @@ impl SekaiDb {
             .optional()
             .map_err(|error| error.to_string())?;
         let written = object_state_digest(persisted.as_ref())?;
+        // The turn's lease runs on while the write is made; check it again
+        // before the marker that would exempt this write from it.
+        if sqlite_turn_fence_refusal(&tx, instance_id)?.is_some() {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
         tx.execute(
             "UPDATE sekai_action_instances
              SET body_json = json_set(body_json,
@@ -1269,6 +1299,9 @@ pub(crate) fn sqlite_reservation_refusal(
     instance_id: &str,
     written: Option<&crate::domain::Object>,
 ) -> Result<Option<String>, String> {
+    if let Some(reason) = sqlite_turn_fence_refusal(tx, instance_id)? {
+        return Ok(Some(reason));
+    }
     let (namespace, principal): (String, String) = tx
         .query_row(
             "SELECT namespace, principal FROM sekai_action_instances WHERE instance_id = ?1",
@@ -1277,6 +1310,44 @@ pub(crate) fn sqlite_reservation_refusal(
         )
         .map_err(|error| error.to_string())?;
     sqlite_site_agent_refusal(tx, &namespace, &principal, written)
+}
+
+/// Why an Action submitted under an agent turn's token is refused as it
+/// commits (ADR 0142): its turn is no longer claimed at the submission's
+/// generation, or its lease lapsed on the lease clock. Every admission
+/// commits through it, a parked one included, so a superseded worker's
+/// submission never becomes approvable.
+pub(crate) fn sqlite_turn_fence_refusal(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+) -> Result<Option<String>, String> {
+    let (turn_id, turn_generation, write_committed): (Option<String>, Option<i64>, Option<bool>) =
+        tx.query_row(
+            "SELECT json_extract(body_json, '$.agent_turn.turn_id'),
+                    json_extract(body_json, '$.agent_turn.claim_generation'),
+                    json_extract(body_json, '$.admission_lease.write_committed')
+             FROM sekai_action_instances WHERE instance_id = ?1",
+            params![instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    // A write that committed under the fence stays authorized (#1931).
+    let Some(turn_id) = turn_id.filter(|_| write_committed != Some(true)) else {
+        return Ok(None);
+    };
+    let live: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM sekai_agent_turn
+             WHERE turn_id = ?1 AND status = 'claimed' AND claim_generation = ?2
+               AND claim_expires_at_ms > ?3",
+            params![turn_id, turn_generation.unwrap_or(-1), lease_clock_ms()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(live
+        .is_none()
+        .then(|| format!("agent turn {turn_id} is no longer claimed by this submission")))
 }
 
 /// Why a site agent write by `principal` in `namespace` is refused as it
@@ -1400,6 +1471,7 @@ mod tests {
 
     pub(super) fn sample(status: &str) -> ActionInstance {
         ActionInstance {
+            agent_turn: None,
             autonomous_envelope_id: String::new(),
             parked_object_digest: String::new(),
             decided_by: String::new(),
@@ -1851,7 +1923,8 @@ mod tests {
             artifact: None,
         };
         assert!(matches!(
-            db.put_admission_receipt_checked(&plain_id, &plain_lease, &receipt, true).unwrap(),
+            db.put_admission_receipt_checked(&plain_id, &plain_lease, &receipt, CommitCheck::SiteAgent)
+                .unwrap(),
             FencedAdmissionWrite::Refused(why) if why == reason
         ));
         assert!(
@@ -1863,6 +1936,222 @@ mod tests {
             db.get_action_instance(&plain_id).unwrap().unwrap().status,
             STATUS_DENIED
         );
+    }
+
+    /// An Action submitted under an agent turn's token commits only while
+    /// that turn is still claimed at the token's generation: once another
+    /// worker reclaims the turn, the superseded submission is refused and
+    /// its reservation denied (ADR 0142).
+    fn a_superseded_turn_refuses_the_commit(db: &crate::db::runtime_db::RuntimeDb, tag: &str) {
+        use crate::sekai::agent_turn;
+        let sample = tests::sample(STATUS_ADMITTED);
+        db.create_object_with_audit(
+            &crate::domain::Object {
+                id: format!("line-{tag}"),
+                kind: crate::sekai::site_agent_instance::KIND.into(),
+                name: format!("line-{tag}"),
+                namespace: sample.namespace.clone(),
+                external_id: String::new(),
+                properties: std::collections::HashMap::from([
+                    ("principal_id".into(), sample.principal.clone()),
+                    ("frozen".into(), "false".into()),
+                ]),
+                created: 500,
+                updated: 500,
+            },
+            "a",
+        )
+        .unwrap();
+        let turn = agent_turn::admit(
+            db,
+            agent_turn::Wake {
+                namespace: sample.namespace.clone(),
+                instance_id: format!("line-{tag}"),
+                cause: agent_turn::Cause::Manual,
+                cause_ref: format!("wake-{tag}"),
+                due_at_ms: 1,
+            },
+            "root",
+            1,
+        )
+        .unwrap();
+        // Claims run on the lease clock the commit reads.
+        let now = lease_clock_ms();
+        let held = agent_turn::claim(
+            db,
+            &sample.namespace,
+            "runner-a",
+            &turn.turn_id,
+            60_000,
+            now,
+        )
+        .unwrap();
+        let submitted = |instance_id: &str, generation: i64| {
+            let lease = AdmissionLease::first();
+            let mut instance = tests::sample(STATUS_ADMITTED);
+            instance.instance_id = instance_id.into();
+            instance.idempotency_key = format!("key-{instance_id}");
+            instance.operation_id = format!("op-{instance_id}");
+            instance.admission_lease = Some(lease.clone());
+            instance.agent_turn = Some(AgentTurnFence {
+                turn_id: turn.turn_id.clone(),
+                claim_generation: u64::try_from(generation).unwrap(),
+            });
+            db.put_action_instance(&instance).unwrap();
+            lease
+        };
+        let write = |id: &str| {
+            ParkedGrantWrite::Create(crate::domain::Object {
+                id: id.into(),
+                kind: "customer_record".into(),
+                name: id.into(),
+                namespace: sample.namespace.clone(),
+                external_id: String::new(),
+                properties: Default::default(),
+                created: 600,
+                updated: 600,
+            })
+        };
+        let apply = |instance_id: &str, lease: &AdmissionLease, object_id: &str| {
+            db.apply_admission_object_write(
+                instance_id,
+                lease,
+                &write(object_id),
+                None,
+                &[],
+                "a",
+                &crate::sekai::audit::ChangeAttribution::default(),
+            )
+            .unwrap()
+        };
+
+        // Under the live claim, the submission commits.
+        let live = format!("ai-live-{tag}");
+        let lease = submitted(&live, held.claim_generation);
+        assert!(!matches!(
+            apply(&live, &lease, &format!("rec-live-{tag}")),
+            FencedAdmissionWrite::Refused(_) | FencedAdmissionWrite::FenceLost
+        ));
+
+        // After the lease lapses and another worker reclaims the turn, a
+        // submission fenced on the old generation is refused.
+        let reclaimed = agent_turn::claim(
+            db,
+            &sample.namespace,
+            "runner-b",
+            &turn.turn_id,
+            60_000,
+            now + 61_000,
+        )
+        .unwrap();
+        assert!(reclaimed.claim_generation > held.claim_generation);
+        let stale = format!("ai-stale-{tag}");
+        let lease = submitted(&stale, held.claim_generation);
+        let refused = apply(&stale, &lease, &format!("rec-stale-{tag}"));
+        assert!(
+            matches!(&refused, FencedAdmissionWrite::Refused(why) if why.contains("no longer claimed")),
+            "{refused:?}"
+        );
+        assert!(
+            db.get_object(&format!("rec-stale-{tag}"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            db.get_action_instance(&stale).unwrap().unwrap().status,
+            STATUS_DENIED
+        );
+
+        // A submission that parks commits only its receipt, without the site
+        // agent check; the turn's fence still refuses it, so a superseded
+        // worker never leaves an approvable Action behind.
+        let parked = format!("ai-parked-{tag}");
+        let lease = submitted(&parked, held.claim_generation);
+        let instance = db.get_action_instance(&parked).unwrap().unwrap();
+        let receipt = sekai_domain::receipt::OperationReceipt {
+            version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+            operation_id: instance.operation_id.clone(),
+            parent_operation_id: None,
+            namespace: instance.namespace.clone(),
+            operation_class: "action_instance".into(),
+            initiating_actor: "a".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 300,
+            completed_at_ms: None,
+            events: vec![],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+            ontology_digest: None,
+            artifact: None,
+        };
+        assert!(matches!(
+            db.put_admission_receipt_checked(&parked, &lease, &receipt, CommitCheck::TurnFence)
+                .unwrap(),
+            FencedAdmissionWrite::Refused(why) if why.contains("no longer claimed")
+        ));
+        assert_eq!(
+            db.get_action_instance(&parked).unwrap().unwrap().status,
+            STATUS_DENIED
+        );
+        // The denial's own receipt records without a live turn.
+        let denial = sekai_domain::receipt::OperationReceipt {
+            operation_id: format!("op-{stale}"),
+            ..receipt.clone()
+        };
+        let stale_lease = db
+            .get_action_instance(&stale)
+            .unwrap()
+            .unwrap()
+            .admission_lease
+            .unwrap();
+        assert!(matches!(
+            db.put_admission_receipt_checked(&stale, &stale_lease, &denial, CommitCheck::None)
+                .unwrap(),
+            FencedAdmissionWrite::Applied(())
+        ));
+
+        // A write that committed under a live claim stays authorized when
+        // its receipt follows the claim's end.
+        let committed = format!("ai-committed-{tag}");
+        let lease = AdmissionLease {
+            write_committed: Some(true),
+            ..AdmissionLease::first()
+        };
+        let mut instance = tests::sample(STATUS_ADMITTED);
+        instance.instance_id = committed.clone();
+        instance.idempotency_key = format!("key-{committed}");
+        instance.operation_id = format!("op-{committed}");
+        instance.admission_lease = Some(lease.clone());
+        instance.agent_turn = Some(AgentTurnFence {
+            turn_id: turn.turn_id.clone(),
+            claim_generation: u64::try_from(held.claim_generation).unwrap(),
+        });
+        db.put_action_instance(&instance).unwrap();
+        let after_write = sekai_domain::receipt::OperationReceipt {
+            operation_id: instance.operation_id.clone(),
+            ..receipt.clone()
+        };
+        let recorded = db
+            .put_admission_receipt_checked(&committed, &lease, &after_write, CommitCheck::TurnFence)
+            .unwrap();
+        assert!(
+            matches!(recorded, FencedAdmissionWrite::Applied(())),
+            "{recorded:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_a_superseded_turn_refuses_the_commit() {
+        a_superseded_turn_refuses_the_commit(&crate::db::runtime_db::RuntimeDb::memory(), "s");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_a_superseded_turn_refuses_the_commit() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = crate::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        a_superseded_turn_refuses_the_commit(&db, "p");
     }
 
     #[test]

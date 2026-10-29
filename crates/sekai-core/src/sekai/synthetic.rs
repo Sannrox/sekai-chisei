@@ -1141,6 +1141,7 @@ pub fn apply(db: &RuntimeDb, plan: &SyntheticPlan) -> Result<(), String> {
         let outcome = admission
             .admit(
                 ActionInstanceAdmissionRequest {
+                    agent_turn: None,
                     namespace: plan.namespace.clone(),
                     type_id: action.type_id.clone(),
                     version: action.version.clone(),

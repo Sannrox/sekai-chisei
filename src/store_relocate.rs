@@ -2711,6 +2711,7 @@ mod tests {
         layout
             .sekai_runtime()
             .put_action_instance(&ActionInstance {
+                agent_turn: None,
                 autonomous_envelope_id: String::new(),
                 parked_object_digest: String::new(),
                 decided_by: String::new(),

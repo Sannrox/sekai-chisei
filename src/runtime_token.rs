@@ -1,8 +1,10 @@
-//! Short-lived runtime tokens for claimed Action work (#1507, ADR 0099).
+//! Short-lived runtime tokens for claimed Action work (#1507, ADR 0099) and
+//! claimed agent turns (#2005, ADR 0142).
 //!
 //! A granted claim returns one token bound to the claiming principal, the
 //! runtime, the tenant and namespace of the work, the effect and the claim
-//! generation. It expires no later than the claim, and the authentication
+//! generation. A turn's token is bound to the turn instead, and acts as the
+//! turn's instance principal with the claiming worker as its actor. It expires no later than the claim, and the authentication
 //! boundary admits it only for the follow-up calls on that claim. It is sealed
 //! with the configured identity-assertion key under its own prefix and
 //! version, so it never verifies as an identity assertion or the reverse.
@@ -21,11 +23,20 @@ pub const RUNTIME_TOKEN_PREFIX: &str = "srt1.";
 /// heartbeat instead of receiving one that lives as long as the claim.
 pub const RUNTIME_TOKEN_MAX_LIFETIME_MS: i64 = 15 * 60 * 1_000;
 
-/// gRPC methods a runtime token authenticates: the calls made for its claim.
+/// gRPC methods an Action-work token authenticates: the calls made for its
+/// claim.
 pub const RUNTIME_TOKEN_METHODS: &[&str] = &[
     "HeartbeatActionClaim",
     "AckActionWork",
     "ReportActionClaimEvent",
+];
+
+/// gRPC methods a turn token authenticates: its claim's follow-up calls and
+/// the Actions the turn submits as its instance principal (ADR 0142).
+pub const TURN_TOKEN_METHODS: &[&str] = &[
+    "HeartbeatAgentTurnClaim",
+    "AckAgentTurn",
+    "SubmitActionInstance",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +56,13 @@ pub struct RuntimeTokenClaims {
     pub space_role: Option<SpaceRole>,
     pub tenant_id: String,
     pub namespace: String,
+    /// The claimed Action effect; empty on a turn token.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub effect_id: String,
+    /// The claimed agent turn; empty on an Action-work token, and absent from
+    /// its encoding, so those tokens verify as before (ADR 0142).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
     pub runtime_id: String,
     pub claim_generation: u64,
     pub expires_at_ms: i64,
@@ -57,6 +74,17 @@ pub struct RuntimeTokenClaims {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub service_principal: bool,
     pub jti: String,
+}
+
+/// The agent turn a turn token is minted for.
+pub struct TurnBinding<'a> {
+    pub namespace: &'a str,
+    pub turn_id: &'a str,
+    /// The instance's principal, whom the token acts as.
+    pub principal: &'a str,
+    pub runtime_id: &'a str,
+    pub claim_generation: u64,
+    pub claim_expires_at_ms: i64,
 }
 
 /// The claim a runtime token is minted for.
@@ -94,6 +122,7 @@ impl RuntimeTokenClaims {
             tenant_id: tenant.tenant_id.clone(),
             namespace: claim.namespace.into(),
             effect_id: claim.effect_id.into(),
+            turn_id: String::new(),
             runtime_id: claim.runtime_id.into(),
             claim_generation: claim.claim_generation,
             expires_at_ms: claim
@@ -104,6 +133,71 @@ impl RuntimeTokenClaims {
             service_principal: crate::service_token::is_service_principal_context(context),
             jti: uuid::Uuid::new_v4().to_string(),
         })
+    }
+
+    /// Claims for an agent turn claimed by `context` (ADR 0142): the token
+    /// acts as the turn's instance principal, with the claiming worker as its
+    /// actor, under the worker's tenant. `None` where [`Self::for_claim`]
+    /// would mint none.
+    pub fn for_turn(
+        authority: &AssertionAuthority,
+        context: &AuthenticatedContext,
+        turn: TurnBinding<'_>,
+        now_ms: i64,
+    ) -> Option<Self> {
+        let mut claims = Self::for_claim(
+            authority,
+            context,
+            ClaimBinding {
+                namespace: turn.namespace,
+                effect_id: "",
+                runtime_id: turn.runtime_id,
+                claim_generation: turn.claim_generation,
+                claim_expires_at_ms: turn.claim_expires_at_ms,
+            },
+            now_ms,
+        )?;
+        if turn.principal.trim().is_empty() || turn.turn_id.trim().is_empty() {
+            return None;
+        }
+        claims.act = Some(context.principal.subject.clone());
+        claims.subject = turn.principal.into();
+        claims.turn_id = turn.turn_id.into();
+        // The worker's registration scopes the worker, not the principal.
+        claims.service_principal = false;
+        Some(claims)
+    }
+
+    /// Whether this token is bound to an agent turn rather than to Action
+    /// work.
+    pub fn is_turn(&self) -> bool {
+        !self.turn_id.is_empty()
+    }
+
+    /// Whether this token authenticates calls to `method`.
+    pub fn admits(&self, method: &str) -> bool {
+        let methods = if self.is_turn() {
+            TURN_TOKEN_METHODS
+        } else {
+            RUNTIME_TOKEN_METHODS
+        };
+        methods.contains(&method)
+    }
+
+    /// Whether this token covers a call on turn `turn_id` in `namespace` by
+    /// `runtime_id` at `claim_generation`.
+    pub fn covers_turn(
+        &self,
+        namespace: &str,
+        turn_id: &str,
+        runtime_id: &str,
+        claim_generation: u64,
+    ) -> bool {
+        self.is_turn()
+            && self.namespace == namespace
+            && self.turn_id == turn_id
+            && self.runtime_id == runtime_id
+            && self.claim_generation == claim_generation
     }
 
     pub fn sign(&self, authority: &AssertionAuthority) -> Result<String, String> {
@@ -135,13 +229,16 @@ impl RuntimeTokenClaims {
             &claims.subject,
             &claims.tenant_id,
             &claims.namespace,
-            &claims.effect_id,
             &claims.runtime_id,
             &claims.jti,
         ]
         .iter()
         .any(|value| value.trim().is_empty())
         {
+            return Err(AssertionReject::ScopeEscalation);
+        }
+        // Bound to exactly one claim: an effect or a turn.
+        if claims.effect_id.trim().is_empty() == claims.turn_id.trim().is_empty() {
             return Err(AssertionReject::ScopeEscalation);
         }
         Ok(claims)
@@ -156,7 +253,8 @@ impl RuntimeTokenClaims {
         runtime_id: &str,
         claim_generation: u64,
     ) -> bool {
-        self.namespace == namespace
+        !self.is_turn()
+            && self.namespace == namespace
             && self.effect_id == effect_id
             && self.runtime_id == runtime_id
             && self.claim_generation == claim_generation

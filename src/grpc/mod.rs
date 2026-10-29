@@ -288,6 +288,9 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "PutSyncScope"
                 | "ReadSyncSnapshot"
                 | "ReadSyncDeltas"
+                // Federated aggregates (#1997) write only receipts; the
+                // caller needs read on the requesting namespace.
+                | "FederatedAggregate"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -559,8 +562,7 @@ impl TokenAuthInterceptor {
         .map_err(|reject| refuse(assertion_reject_status(reject)))?;
         let claimed_work_rpc =
             rpc_identity::request_rpc_method(&req).is_some_and(|(service, method)| {
-                service == "sekai.SekaiService"
-                    && crate::runtime_token::RUNTIME_TOKEN_METHODS.contains(&method)
+                service == "sekai.SekaiService" && claims.admits(method)
             });
         if !claimed_work_rpc {
             return Err(Status::permission_denied(
@@ -826,6 +828,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PublishFederatedAggregateAllowance"
             | "WithdrawFederatedAggregateAllowance"
             | "GetFederatedAggregateAllowance"
+            // Federated aggregates (#1997): read on the requesting namespace.
+            | "FederatedAggregate"
             // Manual agent wakes (#1950): namespace admin per call.
             | "WakeSiteAgentInstance"
             | "ExportObjectSet"
@@ -892,6 +896,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "HeartbeatActionClaim"
             | "AckActionWork"
             | "ReportActionClaimEvent"
+            // Agent-turn worker calls (ADR 0142): handlers scope them to the
+            // tenant's namespace and a turn worker or the turn's token.
+            | "ListClaimableAgentTurns"
+            | "ClaimAgentTurn"
+            | "HeartbeatAgentTurnClaim"
+            | "AckAgentTurn"
             | "PutServicePrincipal"
             | "GetServicePrincipal"
             | "DeleteServicePrincipal"
@@ -2020,6 +2030,7 @@ mod tests {
             crate::sekai::action_instance_admission::ActionInstanceAdmission::new(&db, None)
                 .admit(
                     crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest {
+                        agent_turn: None,
                         namespace: "ops".into(),
                         type_id: type_id.into(),
                         version: package::PACKAGE_VERSION.into(),

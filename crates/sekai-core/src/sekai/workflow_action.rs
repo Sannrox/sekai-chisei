@@ -254,6 +254,7 @@ pub fn submit_step(
         .with_proposal(proposal)
         .admit(
             ActionInstanceAdmissionRequest {
+                agent_turn: None,
                 namespace: prepared.envelope.namespace.clone(),
                 type_id: prepared.envelope.type_id.clone(),
                 version: prepared.envelope.version.clone(),
