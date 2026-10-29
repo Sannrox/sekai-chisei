@@ -1,95 +1,8 @@
-//! Shared-class operation receipts and Chisei tables still opened from Sekai
-//! SQL functions (permit/action ensure). Family DDL lives in chisei-core.
+//! Shared-class operation receipts. Family DDL lives in chisei-core persist.
 
 use rusqlite::Connection;
 
 use super::sekai::SekaiDb;
-
-fn ensure_external_permit_tables_on(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chisei_external_action_permits (
-                permit_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL UNIQUE,
-                issuance_idempotency_key TEXT NOT NULL, permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_redemptions (
-                permit_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, execution_id TEXT NOT NULL,
-                redemption_json TEXT NOT NULL, redeemed_at_ms INTEGER NOT NULL,
-                invocation_ordinal INTEGER NOT NULL, redemption_id TEXT,
-                evidence_due_at_ms INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(permit_id,idempotency_key), UNIQUE(permit_id,execution_id),
-                UNIQUE(permit_id,invocation_ordinal)
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_revocations (
-                revocation_handle TEXT PRIMARY KEY, reason TEXT NOT NULL, revoked_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_kill_switches (
-                scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL, reason TEXT NOT NULL,
-                enabled_at_ms INTEGER NOT NULL, PRIMARY KEY(scope_kind,scope_value)
-             );
-             CREATE TABLE IF NOT EXISTS chisei_external_action_delegated_permits (
-                permit_id TEXT PRIMARY KEY, parent_permit_id TEXT NOT NULL,
-                permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
-             );
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_external_action_one_child_per_parent
-             ON chisei_external_action_delegated_permits(parent_permit_id);
-             CREATE TABLE IF NOT EXISTS chisei_external_permit_policies (
-                scope TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
-             );"
-        ).map_err(|error| error.to_string())?;
-    for (column, definition) in [
-        ("redemption_id", "TEXT"),
-        ("evidence_due_at_ms", "INTEGER NOT NULL DEFAULT 0"),
-    ] {
-        let exists = {
-            let mut statement = conn
-                .prepare("PRAGMA table_info(chisei_external_action_redemptions)")
-                .map_err(|error| error.to_string())?;
-            statement
-                .query_map([], |row| row.get::<_, String>(1))
-                .map_err(|error| error.to_string())?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| error.to_string())?
-                .iter()
-                .any(|name| name == column)
-        };
-        if !exists {
-            conn.execute_batch(&format!(
-                "ALTER TABLE chisei_external_action_redemptions ADD COLUMN {column} {definition}"
-            ))
-            .map_err(|error| error.to_string())?;
-        }
-    }
-    conn.execute_batch(
-        "UPDATE chisei_external_action_redemptions
-             SET redemption_id=COALESCE(
-                     redemption_id,
-                     json_extract(redemption_json,'$.redemption_id')
-                 ),
-                 evidence_due_at_ms=CASE
-                     WHEN evidence_due_at_ms=0 THEN COALESCE(
-                         json_extract(redemption_json,'$.evidence_due_at_ms'),
-                         (SELECT json_extract(p.permit_json,'$.expires_at_ms')
-                          FROM chisei_external_action_permits p
-                          WHERE p.permit_id=chisei_external_action_redemptions.permit_id),
-                         0
-                     )
-                     ELSE evidence_due_at_ms
-                 END
-             WHERE redemption_id IS NULL OR evidence_due_at_ms=0;
-             UPDATE chisei_external_action_redemptions
-             SET redemption_json=json_set(
-                 redemption_json,
-                 '$.evidence_due_at_ms',
-                 evidence_due_at_ms
-             )
-             WHERE COALESCE(json_extract(redemption_json,'$.evidence_due_at_ms'),0)
-                   != evidence_due_at_ms;
-             CREATE INDEX IF NOT EXISTS idx_external_action_redemptions_evidence_due
-             ON chisei_external_action_redemptions(evidence_due_at_ms,redemption_id);",
-    )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
-}
 
 impl SekaiDb {
     /// Per-store receipt table, including Combined Split admission receipts
@@ -141,51 +54,68 @@ impl SekaiDb {
         }
         Ok(())
     }
-
-    pub fn ensure_external_permit_tables(&self) -> Result<(), String> {
-        ensure_external_permit_tables_on(&self.conn())
-    }
-
-    pub fn ensure_external_action_tables(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_external_action_reservations (
-                    actor TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    mutations INTEGER NOT NULL,
-                    deletes INTEGER NOT NULL,
-                    PRIMARY KEY(actor, namespace, operation_id)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_authorizations (
-                    actor TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    authorization_id TEXT NOT NULL UNIQUE,
-                    record_json TEXT,
-                    claimed_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(actor, operation_id, idempotency_key)
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_releases (
-                    authorization_id TEXT PRIMARY KEY,
-                    released_at_ms INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS chisei_external_action_blast_claims (
-                    authorization_id TEXT PRIMARY KEY,
-                    actor TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    operation_id TEXT NOT NULL,
-                    mutations INTEGER NOT NULL,
-                    deletes INTEGER NOT NULL
-                );",
-            )
-            .map_err(|error| error.to_string())
-    }
 }
 
 #[cfg(test)]
 const TEST_CHISEI_SQL_FUNCTION_TABLES: &str = "
+CREATE TABLE IF NOT EXISTS chisei_external_action_permits (
+    permit_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL UNIQUE,
+    issuance_idempotency_key TEXT NOT NULL, permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_redemptions (
+    permit_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, execution_id TEXT NOT NULL,
+    redemption_json TEXT NOT NULL, redeemed_at_ms INTEGER NOT NULL,
+    invocation_ordinal INTEGER NOT NULL, redemption_id TEXT,
+    evidence_due_at_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(permit_id,idempotency_key), UNIQUE(permit_id,execution_id),
+    UNIQUE(permit_id,invocation_ordinal)
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_revocations (
+    revocation_handle TEXT PRIMARY KEY, reason TEXT NOT NULL, revoked_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_kill_switches (
+    scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL, reason TEXT NOT NULL,
+    enabled_at_ms INTEGER NOT NULL, PRIMARY KEY(scope_kind,scope_value)
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_delegated_permits (
+    permit_id TEXT PRIMARY KEY, parent_permit_id TEXT NOT NULL,
+    permit_json TEXT NOT NULL, issued_at_ms INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_external_action_one_child_per_parent
+ON chisei_external_action_delegated_permits(parent_permit_id);
+CREATE TABLE IF NOT EXISTS chisei_external_permit_policies (
+    scope TEXT PRIMARY KEY, policy_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_reservations (
+    actor TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    mutations INTEGER NOT NULL,
+    deletes INTEGER NOT NULL,
+    PRIMARY KEY(actor, namespace, operation_id)
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_authorizations (
+    actor TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    authorization_id TEXT NOT NULL UNIQUE,
+    record_json TEXT,
+    claimed_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(actor, operation_id, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_releases (
+    authorization_id TEXT PRIMARY KEY,
+    released_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chisei_external_action_blast_claims (
+    authorization_id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    mutations INTEGER NOT NULL,
+    deletes INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS chisei_budget_limits (
     scope_id TEXT NOT NULL,
     metric TEXT NOT NULL DEFAULT 'tokens',
@@ -313,8 +243,6 @@ impl SekaiDb {
     /// Tables for Chisei SQL functions that still compile into this crate.
     /// Production family DDL is applied by Chisei persist on store open.
     pub fn apply_chisei_sql_function_tables_for_tests(&self) -> Result<(), String> {
-        self.ensure_external_permit_tables()?;
-        self.ensure_external_action_tables()?;
         self.conn()
             .execute_batch(TEST_CHISEI_SQL_FUNCTION_TABLES)
             .map_err(|error| error.to_string())

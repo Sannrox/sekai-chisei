@@ -401,13 +401,11 @@ impl SekaiDb {
         &self,
         now_ms: i64,
     ) -> Result<Vec<ExecutionEvidenceAlert>, String> {
-        self.ensure_external_permit_tables()?;
         self.ensure_execution_evidence_tables()?;
         let mut conn = self.conn();
         let rows = {
-            let mut statement = conn
-                .prepare(
-                    "SELECT r.redemption_json,r.evidence_due_at_ms
+            let mut statement = match conn.prepare(
+                "SELECT r.redemption_json,r.evidence_due_at_ms
                      FROM chisei_external_action_redemptions r
                      LEFT JOIN sekai_external_action_execution_state s
                        ON s.redemption_id=r.redemption_id AND s.terminal=1
@@ -425,8 +423,13 @@ impl SekaiDb {
                      WHERE r.evidence_due_at_ms>0 AND r.evidence_due_at_ms<=?1
                        AND s.redemption_id IS NULL AND a.alert_id IS NULL
                      ORDER BY r.evidence_due_at_ms,r.redemption_id LIMIT 100",
-                )
-                .map_err(|error| error.to_string())?;
+            ) {
+                Ok(statement) => statement,
+                Err(error) if error.to_string().contains("no such table") => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             statement
                 .query_map([now_ms], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -862,6 +865,16 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("cannot enforce"));
         }
+    }
+
+    #[test]
+    fn reconcile_without_chisei_redemptions_is_empty() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        assert!(
+            db.reconcile_missing_execution_evidence(2_000)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

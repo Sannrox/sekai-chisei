@@ -3,6 +3,7 @@
 //! Chisei decides whether bounded external authority may be granted. It never
 //! executes the action. Permit signing and redemption live in `external_permit`.
 
+use crate::chisei_store::ChiseiSqliteSchema;
 use rusqlite::OptionalExtension;
 use sekai_core::db::sekai::SekaiDb;
 use serde::{Deserialize, Serialize};
