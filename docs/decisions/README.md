@@ -166,4 +166,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0138: Caller-scoped ad-hoc governed transform runs](0138-caller-scoped-ad-hoc-transform-runs.md)
 - [ADR 0139: Site agent working memory is governed objects the instance writes](0139-site-agent-working-memory.md)
 - [ADR 0140: Object-set inputs for governed transforms](0140-object-set-transform-inputs.md)
+- [ADR 0141: Retention archives into database tables on both backends](0141-retention-archives-in-database.md)
 <!-- adr-index:end -->
