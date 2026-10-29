@@ -136,10 +136,16 @@ impl PostgresDb {
             }
             return Err("idempotency key conflict: same key with different request digest".into());
         }
-        let body_json = serde_json::to_string(instance).map_err(|e| e.to_string())?;
+        let mut stored = instance.clone();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        postgres_redact_if_forgotten_writer(&mut tx, &mut stored)?;
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let evidence_json =
-            serde_json::to_string(&instance.evidence_submission_ids).map_err(|e| e.to_string())?;
-        let result = self.connection()?.execute(
+            serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        let result = tx.execute(
             "INSERT INTO sekai_action_instances
              (instance_id, namespace, type_id, version, principal, parameters_json,
               request_digest, idempotency_key, operation_id, status, deny_reason,
@@ -148,27 +154,29 @@ impl PostgresDb {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
              ON CONFLICT (namespace, idempotency_key) DO NOTHING",
             &[
-                &instance.instance_id,
-                &instance.namespace,
-                &instance.type_id,
-                &instance.version,
-                &instance.principal,
-                &instance.parameters_json,
-                &instance.request_digest,
-                &instance.idempotency_key,
-                &instance.operation_id,
-                &instance.status,
-                &instance.deny_reason,
+                &stored.instance_id,
+                &stored.namespace,
+                &stored.type_id,
+                &stored.version,
+                &stored.principal,
+                &stored.parameters_json,
+                &stored.request_digest,
+                &stored.idempotency_key,
+                &stored.operation_id,
+                &stored.status,
+                &stored.deny_reason,
                 &evidence_json,
-                &instance.policy_decision,
-                &instance.budget_decision,
-                &instance.created_at_ms,
-                &instance.decided_at_ms,
+                &stored.policy_decision,
+                &stored.budget_decision,
+                &stored.created_at_ms,
+                &stored.decided_at_ms,
                 &body_json,
             ],
         );
         match result {
             Ok(0) => {
+                drop(tx);
+                drop(connection);
                 if let Some(existing) = self.get_action_instance_by_idempotency(
                     &instance.namespace,
                     &instance.idempotency_key,
@@ -182,7 +190,10 @@ impl PostgresDb {
                 }
                 Err("idempotency key conflict".into())
             }
-            Ok(_) => Ok(instance.clone()),
+            Ok(_) => {
+                tx.commit().map_err(|error| error.to_string())?;
+                Ok(stored)
+            }
             Err(e) => Err(e.to_string()),
         }
     }
@@ -216,12 +227,29 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
-            return Ok(FencedAdmissionWrite::FenceLost);
-        }
         let written = match write {
             ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
         };
+        // Object then Action: the same order as forget redaction (#1969).
+        lock_object_lifecycle(&mut tx, &written.id)?;
+        if matches!(write, ParkedGrantWrite::Update(_)) {
+            // Keep PostgreSQL's monotonic revision token: an update that
+            // does not advance `updated` is a revision conflict, as on
+            // every other PostgreSQL object update.
+            let stored: Option<i64> = tx
+                .query_opt(
+                    "SELECT updated FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                    &[&written.id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| row.get(0));
+            if stored.is_some_and(|stored| written.updated <= stored) {
+                return Err("object revision conflict".into());
+            }
+        }
+        if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
+            return Ok(FencedAdmissionWrite::FenceLost);
+        }
         if let Some(reason) = postgres_reservation_refusal(&mut tx, instance_id, Some(written))? {
             postgres_deny_reservation(&mut tx, instance_id, &reason)?;
             tx.commit().map_err(|error| error.to_string())?;
@@ -238,26 +266,10 @@ impl PostgresDb {
                 insert_created_object_in(&mut tx, object, actor, None, attribution)?;
                 None
             }
-            ParkedGrantWrite::Update(object) => {
-                // Keep PostgreSQL's monotonic revision token: an update that
-                // does not advance `updated` is a revision conflict, as on
-                // every other PostgreSQL object update.
-                lock_object_lifecycle(&mut tx, &object.id)?;
-                let stored: Option<i64> = tx
-                    .query_opt(
-                        "SELECT updated FROM sekai_objects WHERE id = $1 FOR UPDATE",
-                        &[&object.id],
-                    )
-                    .map_err(|error| error.to_string())?
-                    .map(|row| row.get(0));
-                if stored.is_some_and(|stored| object.updated <= stored) {
-                    return Err("object revision conflict".into());
-                }
-                Some(
-                    update_object_in(&mut tx, object, expected, actor, None, attribution)?
-                        .ok_or_else(|| format!("object {} not found", object.id))?,
-                )
-            }
+            ParkedGrantWrite::Update(object) => Some(
+                update_object_in(&mut tx, object, expected, actor, None, attribution)?
+                    .ok_or_else(|| format!("object {} not found", object.id))?,
+            ),
         };
         // The commit marker a takeover reads (#1931), in this transaction.
         // The state as persisted, read back in this transaction.
@@ -299,6 +311,12 @@ impl PostgresDb {
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, true)? {
             return Ok(FencedAdmissionWrite::FenceLost);
         }
+        postgres_redact_forgotten_memory_actions(
+            &mut tx,
+            Some(match write {
+                ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+            }),
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(FencedAdmissionWrite::Applied(previous))
     }
@@ -421,9 +439,7 @@ impl PostgresDb {
         expired: &AdmissionLease,
         next: &AdmissionLease,
     ) -> Result<bool, String> {
-        let mut taken = instance.clone();
-        taken.admission_lease = Some(next.clone());
-        let body_json = serde_json::to_string(&taken).map_err(|error| error.to_string())?;
+        let lease_json = serde_json::to_string(next).map_err(|error| error.to_string())?;
         let generation = i64::try_from(expired.generation)
             .unwrap_or(i64::MAX)
             .to_string();
@@ -431,7 +447,8 @@ impl PostgresDb {
         let updated = self
             .connection()?
             .execute(
-                "UPDATE sekai_action_instances SET body_json = $2
+                "UPDATE sekai_action_instances
+                 SET body_json = jsonb_set(body_json::jsonb, '{admission_lease}', $2::text::jsonb)::text
                  WHERE instance_id = $1
                    AND body_json::jsonb #>> '{admission_lease,owner}' = $3
                    AND body_json::jsonb #>> '{admission_lease,generation}' = $4
@@ -441,7 +458,7 @@ impl PostgresDb {
                    AND status = $7",
                 &[
                     &instance.instance_id,
-                    &body_json,
+                    &lease_json,
                     &expired.owner,
                     &generation,
                     &now,
@@ -490,28 +507,49 @@ impl PostgresDb {
         expected_assignee: &str,
     ) -> Result<bool, String> {
         decided.validate_fields()?;
-        let body_json = serde_json::to_string(decided).map_err(|e| e.to_string())?;
-        self.connection()?
+        let mut stored = decided.clone();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        postgres_redact_if_forgotten_writer(&mut tx, &mut stored)?;
+        let existing_params: Option<String> = tx
+            .query_opt(
+                "SELECT parameters_json FROM sekai_action_instances WHERE instance_id = $1",
+                &[&decided.instance_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if crate::sekai::site_agent_memory::stored_writer_already_redacted(
+            existing_params.as_deref(),
+            &stored,
+        ) {
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+        }
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+        let updated = tx
             .execute(
                 "UPDATE sekai_action_instances
                  SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
-                     decided_at_ms = $6, body_json = $7
+                     decided_at_ms = $6, body_json = $7, parameters_json = $10
                  WHERE instance_id = $1 AND status = $8
                    AND coalesce(body_json::jsonb #>> '{review,assignee}', '') = $9",
                 &[
-                    &decided.instance_id,
-                    &decided.status,
-                    &decided.deny_reason,
-                    &decided.policy_decision,
-                    &decided.budget_decision,
-                    &decided.decided_at_ms,
+                    &stored.instance_id,
+                    &stored.status,
+                    &stored.deny_reason,
+                    &stored.policy_decision,
+                    &stored.budget_decision,
+                    &stored.decided_at_ms,
                     &body_json,
                     &expected_status,
                     &expected_assignee,
+                    &stored.parameters_json,
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(updated == 1)
     }
 
     /// Grants a parked instance and applies its object write in one
@@ -528,19 +566,39 @@ impl PostgresDb {
         claim: Option<&crate::sekai::action_instance::ExecutionClaim>,
     ) -> Result<ParkedGrantOutcome, String> {
         granted.validate_fields()?;
-        let body_json = serde_json::to_string(granted).map_err(|e| e.to_string())?;
+        let mut stored = granted.clone();
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let status: Option<String> = transaction
+        // Object then Action: the same order as forget redaction (#1969).
+        let current = if target_object_id.is_empty() {
+            None
+        } else {
+            lock_object_lifecycle(&mut transaction, target_object_id)?;
+            transaction
+                .query_opt(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                    &[&target_object_id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(row_to_object)
+                .transpose()?
+        };
+        let row = transaction
             .query_opt(
-                "SELECT status FROM sekai_action_instances WHERE instance_id = $1 FOR UPDATE",
+                "SELECT status, parameters_json FROM sekai_action_instances
+                 WHERE instance_id = $1 FOR UPDATE",
                 &[&granted.instance_id],
             )
-            .map_err(|error| error.to_string())?
-            .map(|row| row.get(0));
-        if status.as_deref() != Some(STATUS_PARKED) {
+            .map_err(|error| error.to_string())?;
+        let Some((status, existing_params)): Option<(String, String)> =
+            row.map(|row| (row.get(0), row.get(1)))
+        else {
+            return Ok(ParkedGrantOutcome::NotParked);
+        };
+        if status != STATUS_PARKED {
             return Ok(ParkedGrantOutcome::NotParked);
         }
         let written = write.map(|write| match write {
@@ -568,21 +626,10 @@ impl PostgresDb {
                 return Ok(ParkedGrantOutcome::ClaimLost);
             }
         }
-        if !target_object_id.is_empty() {
-            // Same order as postgres object update/delete: lifecycle lock, then row.
-            lock_object_lifecycle(&mut transaction, target_object_id)?;
-            let current = transaction
-                .query_opt(
-                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
-                     FROM sekai_objects WHERE id = $1 FOR UPDATE",
-                    &[&target_object_id],
-                )
-                .map_err(|error| error.to_string())?
-                .map(row_to_object)
-                .transpose()?;
-            if object_state_digest(current.as_ref())? != parked_object_digest {
-                return Ok(ParkedGrantOutcome::Stale);
-            }
+        if !target_object_id.is_empty()
+            && object_state_digest(current.as_ref())? != parked_object_digest
+        {
+            return Ok(ParkedGrantOutcome::Stale);
         }
         if postgres_changed_reference(&mut transaction, references)?.is_some() {
             return Ok(ParkedGrantOutcome::Stale);
@@ -617,29 +664,39 @@ impl PostgresDb {
             ),
             None => None,
         };
+        postgres_redact_if_forgotten_writer(&mut transaction, &mut stored)?;
+        if crate::sekai::site_agent_memory::stored_writer_already_redacted(
+            Some(&existing_params),
+            &stored,
+        ) {
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+        }
+        let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let updated = transaction
             .execute(
                 "UPDATE sekai_action_instances
                  SET status = $2, deny_reason = $3, policy_decision = $4, budget_decision = $5,
-                     decided_at_ms = $6, body_json = $7
+                     decided_at_ms = $6, body_json = $7, parameters_json = $10
                  WHERE instance_id = $1 AND status = $8
                    AND coalesce(body_json::jsonb #>> '{review,assignee}', '') = $9",
                 &[
-                    &granted.instance_id,
-                    &granted.status,
-                    &granted.deny_reason,
-                    &granted.policy_decision,
-                    &granted.budget_decision,
-                    &granted.decided_at_ms,
+                    &stored.instance_id,
+                    &stored.status,
+                    &stored.deny_reason,
+                    &stored.policy_decision,
+                    &stored.budget_decision,
+                    &stored.decided_at_ms,
                     &body_json,
                     &STATUS_PARKED,
-                    &granted.review.assignee,
+                    &stored.review.assignee,
+                    &stored.parameters_json,
                 ],
             )
             .map_err(|error| error.to_string())?;
         if updated != 1 {
             return Ok(ParkedGrantOutcome::NotParked);
         }
+        postgres_redact_forgotten_memory_actions(&mut transaction, written)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(ParkedGrantOutcome::Granted { previous })
     }
@@ -648,29 +705,18 @@ impl PostgresDb {
         &self,
         memory: &crate::sekai::decision_memory::DecisionMemory,
     ) -> Result<(), String> {
-        let body = serde_json::to_string(memory).map_err(|error| error.to_string())?;
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_action_decision_memory
-                 (memory_id, namespace, type_id, instance_id, decided_at_ms, body_json)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (memory_id) DO UPDATE SET
-                    namespace = EXCLUDED.namespace,
-                    type_id = EXCLUDED.type_id,
-                    instance_id = EXCLUDED.instance_id,
-                    decided_at_ms = EXCLUDED.decided_at_ms,
-                    body_json = EXCLUDED.body_json",
-                &[
-                    &memory.memory_id,
-                    &memory.namespace,
-                    &memory.type_id,
-                    &memory.instance_id,
-                    &memory.decided_at_ms,
-                    &body,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let mut stored = memory.clone();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if crate::sekai::site_agent_memory::is_writer_action(&stored.type_id)
+            && postgres_target_is_forgotten(&mut tx, &stored)?
+        {
+            crate::sekai::site_agent_memory::redact_decision_memory(&mut stored);
+        }
+        postgres_insert_decision_memory(&mut tx, &stored)?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn list_decision_memory(
@@ -796,6 +842,196 @@ pub(crate) fn postgres_turn_fence_refusal<C: postgres::GenericClient>(
     Ok(live
         .is_none()
         .then(|| format!("agent turn {turn_id} is no longer claimed by this submission")))
+}
+
+fn postgres_insert_decision_memory<C: postgres::GenericClient>(
+    client: &mut C,
+    memory: &crate::sekai::decision_memory::DecisionMemory,
+) -> Result<(), String> {
+    let body = serde_json::to_string(memory).map_err(|error| error.to_string())?;
+    client
+        .execute(
+            "INSERT INTO sekai_action_decision_memory
+             (memory_id, namespace, type_id, instance_id, decided_at_ms, body_json)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (memory_id) DO UPDATE SET
+                namespace = EXCLUDED.namespace,
+                type_id = EXCLUDED.type_id,
+                instance_id = EXCLUDED.instance_id,
+                decided_at_ms = EXCLUDED.decided_at_ms,
+                body_json = EXCLUDED.body_json",
+            &[
+                &memory.memory_id,
+                &memory.namespace,
+                &memory.type_id,
+                &memory.instance_id,
+                &memory.decided_at_ms,
+                &body,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn postgres_redact_if_forgotten_writer<C: postgres::GenericClient>(
+    client: &mut C,
+    instance: &mut ActionInstance,
+) -> Result<(), String> {
+    if postgres_writer_target_forgotten(client, instance)? {
+        crate::sekai::site_agent_memory::redact_writer_instance(instance);
+    }
+    Ok(())
+}
+
+fn postgres_writer_target_forgotten<C: postgres::GenericClient>(
+    client: &mut C,
+    instance: &ActionInstance,
+) -> Result<bool, String> {
+    if !crate::sekai::site_agent_memory::is_writer_action(&instance.type_id) {
+        return Ok(false);
+    }
+    let Some(object_id) =
+        crate::sekai::site_agent_memory::writer_object_id(&instance.parameters_json)
+    else {
+        return Ok(false);
+    };
+    let forgotten: Option<String> = client
+        .query_opt(
+            "SELECT properties::jsonb ->> 'forgotten' FROM sekai_objects
+             WHERE id = $1 AND kind = $2 AND namespace = $3 FOR UPDATE",
+            &[
+                &object_id,
+                &crate::sekai::site_agent_memory::KIND,
+                &instance.namespace,
+            ],
+        )
+        .map_err(|error| error.to_string())?
+        .and_then(|row| row.get(0));
+    Ok(forgotten.as_deref() == Some("true"))
+}
+
+fn postgres_target_is_forgotten<C: postgres::GenericClient>(
+    client: &mut C,
+    memory: &crate::sekai::decision_memory::DecisionMemory,
+) -> Result<bool, String> {
+    let Some(object_id) =
+        crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+            .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json))
+    else {
+        return Ok(false);
+    };
+    let forgotten: Option<String> = client
+        .query_opt(
+            "SELECT properties::jsonb ->> 'forgotten' FROM sekai_objects
+             WHERE id = $1 AND kind = $2 AND namespace = $3 FOR UPDATE",
+            &[
+                &object_id,
+                &crate::sekai::site_agent_memory::KIND,
+                &memory.namespace,
+            ],
+        )
+        .map_err(|error| error.to_string())?
+        .and_then(|row| row.get(0));
+    Ok(forgotten.as_deref() == Some("true"))
+}
+
+/// Empty forgotten memory `content` in writer Action parameters, in this
+/// transaction (#1969). Leaves each stored request digest as it was.
+pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClient>(
+    client: &mut C,
+    written: Option<&crate::domain::Object>,
+) -> Result<(), String> {
+    use crate::sekai::decision_memory::DecisionMemory;
+    use crate::sekai::site_agent_memory::{
+        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, is_forgotten, redact_writer_instance,
+    };
+    let Some(object) = written.filter(|object| is_forgotten(object)) else {
+        return Ok(());
+    };
+    let rows = client
+        .query(
+            "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
+             WHERE namespace = $1
+               AND type_id IN ($2, $3, $4)
+               AND parameters_json::jsonb ->> 'object_id' = $5
+             FOR UPDATE",
+            &[
+                &object.namespace,
+                &ACTION_CREATE,
+                &ACTION_UPDATE,
+                &ACTION_FORGET,
+                &object.id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let instance_id: String = row.get(0);
+        let parameters_json: String = row.get(1);
+        let body_json: String = row.get(2);
+        let mut instance: ActionInstance = serde_json::from_str(&body_json)
+            .map_err(|error| format!("corrupt action instance body: {error}"))?;
+        instance.parameters_json = parameters_json;
+        if !redact_writer_instance(&mut instance) {
+            continue;
+        }
+        let parameters_json = instance.parameters_json.clone();
+        let body_json = serde_json::to_string(&instance).map_err(|error| error.to_string())?;
+        updates.push((instance_id, parameters_json, body_json));
+    }
+    for (instance_id, parameters_json, body_json) in updates {
+        client
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET parameters_json = $2, body_json = $3
+                 WHERE instance_id = $1",
+                &[&instance_id, &parameters_json, &body_json],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let rows = match client.query(
+        "SELECT memory_id, body_json FROM sekai_action_decision_memory
+         WHERE namespace = $1 AND type_id IN ($2, $3, $4)
+         FOR UPDATE",
+        &[
+            &object.namespace,
+            &ACTION_CREATE,
+            &ACTION_UPDATE,
+            &ACTION_FORGET,
+        ],
+    ) {
+        Ok(rows) => rows,
+        Err(error) if error.to_string().contains("sekai_action_decision_memory") => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut updates = Vec::new();
+    for row in rows {
+        let memory_id: String = row.get(0);
+        let body_json: String = row.get(1);
+        let mut memory: DecisionMemory = serde_json::from_str(&body_json)
+            .map_err(|error| format!("corrupt decision memory: {error}"))?;
+        let object_id = crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+            .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json));
+        if object_id.as_deref() != Some(object.id.as_str()) {
+            continue;
+        }
+        if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
+            continue;
+        }
+        let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+        updates.push((memory_id, body_json));
+    }
+    for (memory_id, body_json) in updates {
+        client
+            .execute(
+                "UPDATE sekai_action_decision_memory SET body_json = $2 WHERE memory_id = $1",
+                &[&memory_id, &body_json],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Why a site agent write is refused as it commits (#1970); see the SQLite

@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-28
 - Owners: @Sannrox
-- Issue: #1612, read path in #1968
+- Issue: #1612, read path in #1968, forget redaction in #1969
 - Related: [ADR 0136](0136-site-agent-instances.md),
   [ADR 0137](0137-agent-turns-share-the-scheduling-split.md), #1403, #1465,
   #1706
@@ -44,9 +44,13 @@ note the person it acts for cannot read.
    Action empties `content` and sets `forgotten`. A forgotten item is never
    written again and leaves future context. Earlier values stay in the change
    history, where `content` has a restricted (`sensitive`) property
-   classification so only object admins read it, and in the parameters of
-   the Actions that wrote them, readable by whoever may read those Actions.
-   Erasing both needs new store work and is #1969.
+   classification so only object admins read it. Forget also empties
+   `content` in the retained parameters of the Actions that wrote the item
+   (#1969), in the same transaction as the object write, including any
+   offline base value of `content`. Later Action and decision-memory writes
+   that still name the forgotten item store empty `content` too. Each Action keeps its original request digest, so receipt
+   and digest verification still match the original submit. Change-history
+   values are not hard-erased.
 5. **Reads intersect the agent and its requester** (#1968). An agent reads its
    memory through an experimental RPC that returns an item only when the
    instance principal and the requester can each read it on their own. The
@@ -74,7 +78,10 @@ note the person it acts for cannot read.
 wired into boot. The freeze and ownership checks run when a write is planned
 and again inside the transaction that commits it (#1970), so a freeze or
 principal change committing in between denies the write with a receipt. The
-direct-write guards cover both kinds through one helper.
+direct-write guards cover both kinds through one helper. Forget redacts
+writer-Action parameters in that same transaction (#1969). Later inserts
+and transitions of those Actions, and decision-memory writes, re-apply the
+same redaction when the target is already forgotten.
 `ListSiteAgentWorkingMemory` (#1968) is the experimental agent-turn read:
 the calling subject is the instance principal, and an item is returned only
 when that principal and the requester can each read it on their own.
@@ -87,7 +94,9 @@ Crate tests cover:
 - a write by another principal refused, and the instance principal's write
   admitted with a receipt;
 - forget emptying the item, refusing a later update, and leaving a receipt,
-  with `content` restricted;
+  with `content` restricted, and emptying `content` in the writer Actions'
+  retained parameters while keeping their request digest, including a late
+  Action or decision-memory write after forget;
 - a frozen instance writing no memory, also for a write parked before the
   freeze;
 - an item keeping its marking when a lower one is submitted;
