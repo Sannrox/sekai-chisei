@@ -99,6 +99,11 @@ before the run starts.
 Transforms can join objects with datasets under object-level read policy.
 Runs keep more input in their snapshots, within the input budget. A stored
 definition's object-set inputs depend on its putter's continued access.
+Stored runs keep the object-set rows they read, keyed by digest, so replay
+can read them: the copy outlives a later change or deletion of its objects.
+A replay refuses such an object, as it cannot read it again, but the copy
+stays at rest; removing a deleted object's pinned rows (the rows carry its
+id) is follow-up work, as is expiring pins with dataset version retention.
 Live or incremental object-set inputs, and writing objects back, stay out of
 scope.
 

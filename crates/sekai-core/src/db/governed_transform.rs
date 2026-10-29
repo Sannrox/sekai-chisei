@@ -267,6 +267,25 @@ impl SekaiDb {
                     definition_digest TEXT NOT NULL,
                     PRIMARY KEY (namespace, transform_id)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_transform_object_set_pin (
+                    namespace TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    descriptor TEXT NOT NULL,
+                    columns_json TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, digest)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_transform_object_set_pin_row (
+                    namespace TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    row_id INTEGER NOT NULL,
+                    object_id TEXT NOT NULL,
+                    values_json TEXT NOT NULL,
+                    marking TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (namespace, digest, row_id)
+                );
+                CREATE INDEX IF NOT EXISTS sekai_transform_object_set_pin_row_object
+                    ON sekai_transform_object_set_pin_row (namespace, object_id);
                 CREATE TABLE IF NOT EXISTS sekai_adhoc_transform_run (
                     identity TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,
@@ -488,6 +507,96 @@ impl SekaiDb {
             Some(principal),
             definition_digest,
         )
+    }
+
+    /// The object set a stored run pinned as `digest`, read back for a
+    /// replay under `alias` and charged to `budget` row by row (ADR 0140).
+    /// `None` when no run kept it. Rows that no longer hash to their digest
+    /// are refused, not read.
+    pub fn load_object_set_pin(
+        &self,
+        namespace: &str,
+        alias: &str,
+        digest: &str,
+        budget: &mut crate::sekai::governed_transform::InputLoadBudget,
+    ) -> Result<Option<crate::sekai::object_set_input::PinnedObjectSet>, String> {
+        let conn = self.conn();
+        let head: Option<(String, String)> = conn
+            .query_row(
+                "SELECT descriptor, columns_json FROM sekai_transform_object_set_pin
+                 WHERE namespace = ?1 AND digest = ?2",
+                params![namespace, digest],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((descriptor, columns)) = head else {
+            return Ok(None);
+        };
+        let mut statement = conn
+            .prepare(
+                "SELECT values_json, marking FROM sekai_transform_object_set_pin_row
+                 WHERE namespace = ?1 AND digest = ?2 ORDER BY row_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = Vec::new();
+        for row in statement
+            .query_map(params![namespace, digest], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+        {
+            let (values, marking) = row.map_err(|error| error.to_string())?;
+            rows.push(crate::sekai::object_set_input::decode_pin_row(
+                &values, marking, budget,
+            )?);
+        }
+        crate::sekai::object_set_input::PinnedObjectSet::from_pin(
+            alias,
+            digest,
+            &descriptor,
+            &columns,
+            rows,
+        )
+        .map(Some)
+    }
+
+    /// The digest the latest stored run of a transform at or before
+    /// `as_of_ms` (the latest when 0) pinned for object-set input `alias`.
+    pub fn object_set_pin_at(
+        &self,
+        namespace: &str,
+        transform_id: &str,
+        alias: &str,
+        as_of_ms: i64,
+    ) -> Result<Option<String>, String> {
+        let key = format!("{}{alias}", crate::sekai::object_set_input::PIN_PREFIX);
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT input_versions FROM sekai_governed_transform_run
+                 WHERE namespace = ?1 AND transform_id = ?2
+                   AND (?3 = 0 OR created_at_ms <= ?3)
+                   AND instr(input_versions, ?4) > 0
+                 ORDER BY created_at_ms DESC, run_id DESC
+                 LIMIT 1",
+            )
+            .map_err(|error| error.to_string())?;
+        let quoted = format!("\"{key}\"");
+        let versions = statement
+            .query_map(params![namespace, transform_id, as_of_ms, quoted], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        for versions in versions {
+            let versions = versions.map_err(|error| error.to_string())?;
+            let pins: BTreeMap<String, String> =
+                serde_json::from_str(&versions).map_err(|error| error.to_string())?;
+            if let Some(digest) = pins.get(&key) {
+                return Ok(Some(digest.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// The principal a stored definition's object-set inputs are read as,
@@ -2180,9 +2289,8 @@ pub(crate) fn run_in_process_tx(
         if !incremental {
             run.output_digest = live_output_digest(tx, &transform.output_dataset_id)?;
         }
-        for set in object_sets {
-            run.input_versions.insert(set.pin_key(), set.digest());
-        }
+        // A quarantined run keeps its pins, not the rows (it does not snapshot).
+        pin_object_sets(tx, &mut run, object_sets, false, now_ms)?;
         insert_transform_run(tx, &run)?;
         record_in_process_finish(tx, &run.run_id, started)?;
         if stored {
@@ -2206,9 +2314,7 @@ pub(crate) fn run_in_process_tx(
         &mut run,
     )?;
     stamp_object_marking(tx, &output_object_id, &run, now_ms)?;
-    for set in object_sets {
-        run.input_versions.insert(set.pin_key(), set.digest());
-    }
+    pin_object_sets(tx, &mut run, object_sets, stored, now_ms)?;
     insert_transform_run(tx, &run)?;
     if stored {
         tx.execute(
@@ -2253,6 +2359,53 @@ fn persist_transform_usage_pending_tx(
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Records each object set's digest among the run's pins and, with
+/// `keep_rows` (a stored run that read them), keeps its rows so a replay
+/// reads them again (ADR 0140). Rows are
+/// keyed by digest: an unchanged set is kept once, and a retry rewrites
+/// nothing.
+fn pin_object_sets(
+    tx: &Transaction<'_>,
+    run: &mut TransformRun,
+    object_sets: &[crate::sekai::object_set_input::PinnedObjectSet],
+    keep_rows: bool,
+    now_ms: i64,
+) -> Result<(), String> {
+    for set in object_sets {
+        let digest = set.digest();
+        run.input_versions.insert(set.pin_key(), digest.clone());
+        if !keep_rows {
+            continue;
+        }
+        let columns = serde_json::to_string(&set.columns).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_transform_object_set_pin
+             (namespace, digest, descriptor, columns_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run.namespace, digest, set.descriptor, columns, now_ms],
+        )
+        .map_err(|error| error.to_string())?;
+        for ((row_id, row), marking) in set.records().iter().zip(&set.marking_tokens) {
+            let values = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT OR IGNORE INTO sekai_transform_object_set_pin_row
+                 (namespace, digest, row_id, object_id, values_json, marking)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run.namespace,
+                    digest,
+                    row_id,
+                    row.get("id").map(String::as_str).unwrap_or_default(),
+                    values,
+                    marking.as_deref().unwrap_or_default()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Admits an isolated run: its inputs are read now, as a snapshot the
@@ -9207,6 +9360,123 @@ mod tests {
         }
         .prepare()
         .unwrap()
+    }
+
+    #[test]
+    fn stored_runs_keep_their_object_sets_for_replay() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let transform = GovernedTransform {
+            steps: Vec::new(),
+            analytical: Some(AnalyticalSpec {
+                inputs: vec![
+                    TransformInput {
+                        alias: "orders".into(),
+                        dataset_id: "in".into(),
+                        ..Default::default()
+                    },
+                    TransformInput {
+                        alias: "customers".into(),
+                        object_set: r#"{"namespace":"sales","kind":"Customer"}"#.into(),
+                        ..Default::default()
+                    },
+                ],
+                sql: "SELECT * FROM orders".into(),
+                ..Default::default()
+            }),
+            ..projection("t-pin", "in", "out")
+        }
+        .prepare()
+        .unwrap();
+        db.put_governed_transform(&transform, 10).unwrap();
+        let customer = crate::domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "North".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let set = crate::sekai::object_set_input::PinnedObjectSet::from_objects(
+            "customers",
+            &["tier".into()],
+            &[customer],
+            &HashMap::new(),
+        );
+        // Run twice: the unchanged set is kept once, and a retry rewrites nothing.
+        for now in [20, 30] {
+            db.run_governed_transform_with_object_sets(
+                "ops",
+                "t-pin",
+                std::slice::from_ref(&set),
+                now,
+                "",
+                "",
+            )
+            .unwrap();
+        }
+        let digest = set.digest();
+        assert_eq!(
+            db.object_set_pin_at("ops", "t-pin", "customers", 25)
+                .unwrap(),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            db.object_set_pin_at("ops", "t-pin", "customers", 15)
+                .unwrap(),
+            None
+        );
+        let kept = db
+            .load_object_set_pin(
+                "ops",
+                "customers",
+                &digest,
+                &mut crate::sekai::governed_transform::InputLoadBudget::for_preview(&transform),
+            )
+            .unwrap()
+            .expect("the stored run kept its set");
+        assert_eq!(kept, set);
+        // A budget smaller than the pin stops loading it.
+        let mut tight = transform.clone();
+        tight.analytical.as_mut().unwrap().memory_limit_bytes = 1;
+        let mut tight = crate::sekai::governed_transform::InputLoadBudget::for_preview(&tight);
+        assert!(
+            db.load_object_set_pin("ops", "customers", &digest, &mut tight)
+                .is_err()
+        );
+        assert!(tight.exceeded.is_some());
+        assert_eq!(
+            db.load_object_set_pin(
+                "ops",
+                "customers",
+                "sha256:none",
+                &mut crate::sekai::governed_transform::InputLoadBudget::for_preview(&transform)
+            )
+            .unwrap(),
+            None
+        );
+        // Rows that no longer hash to their digest are refused.
+        db.conn()
+            .execute(
+                "UPDATE sekai_transform_object_set_pin_row SET values_json = '{}'",
+                [],
+            )
+            .unwrap();
+        let corrupt = db
+            .load_object_set_pin(
+                "ops",
+                "customers",
+                &digest,
+                &mut crate::sekai::governed_transform::InputLoadBudget::for_preview(&transform),
+            )
+            .unwrap_err();
+        assert!(
+            corrupt.starts_with(crate::sekai::object_set_input::OBJECT_SET_PIN_CORRUPT),
+            "{corrupt}"
+        );
     }
 
     #[test]

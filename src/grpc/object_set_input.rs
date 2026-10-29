@@ -41,6 +41,162 @@ impl SekaiServiceImpl {
             .collect()
     }
 
+    /// The sets a replay of `transform` reads: each object-set input's pin,
+    /// from `input_versions` or else the latest stored run at `as_of_ms`,
+    /// read back from the run's kept rows. Every pinned object is read again
+    /// as `principals`: one they may no longer read, or a pinned property
+    /// their read no longer carries, refuses the replay (ADR 0140).
+    pub(super) fn replay_object_sets(
+        &self,
+        transform: &GovernedTransform,
+        input_versions: &std::collections::BTreeMap<String, String>,
+        as_of_ms: i64,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+    ) -> Result<Vec<PinnedObjectSet>, Status> {
+        let runtime = self.db.runtime();
+        let schema = self
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        let policy_context = principal_policy_context_from(principals, tenant_context);
+        // Reading pins back and authorizing them is input work: the run's
+        // budget bounds it, shared by every set, from the first row read.
+        let mut budget = InputLoadBudget::for_preview(transform);
+        let mut sets = Vec::new();
+        for (alias, json) in transform.object_set_inputs() {
+            let descriptor = parse_descriptor(&alias, &json)?;
+            self.authorize_object_set_scope(principals, tenant_context, &descriptor)?;
+            let key = format!("{}{alias}", crate::sekai::object_set_input::PIN_PREFIX);
+            let digest = match input_versions.get(&key).filter(|digest| !digest.is_empty()) {
+                Some(digest) => digest.clone(),
+                None => runtime
+                    .object_set_pin_at(
+                        &transform.namespace,
+                        &transform.transform_id,
+                        &alias,
+                        as_of_ms,
+                    )
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "input {alias}: no stored run pinned this object set"
+                        ))
+                    })?,
+            };
+            let mut set = runtime
+                .load_object_set_pin(&transform.namespace, &alias, &digest, &mut budget)
+                .map_err(|error| {
+                    if error.starts_with(crate::sekai::object_set_input::OBJECT_SET_PIN_CORRUPT) {
+                        Status::data_loss(error)
+                    } else if budget.exceeded.is_some() {
+                        Status::resource_exhausted(format!(
+                            "input {alias}: object set exceeds the input budget ({error})"
+                        ))
+                    } else {
+                        Status::internal(error)
+                    }
+                })?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "input {alias}: the pinned object set is not kept"
+                    ))
+                })?;
+            // The pin must be of the set this definition asks for.
+            if set.descriptor != json {
+                return Err(Status::failed_precondition(format!(
+                    "input {alias}: the pinned object set was read with another descriptor"
+                )));
+            }
+            // Each object's current marking joins the one it was pinned
+            // with, so a replay's output is marked at least as it is now.
+            let mut current_markings = Vec::with_capacity(set.rows.len());
+            for (index, row) in set.rows.iter().enumerate() {
+                // Charged as loaded; authorizing it is bounded by the deadline.
+                budget.expire_if_past();
+                if let Some(exceeded) = budget.exceeded {
+                    return Err(Status::resource_exhausted(format!(
+                        "input {alias}: object set exceeds the input budget ({exceeded})"
+                    )));
+                }
+                let id = row.get("id").map(String::as_str).unwrap_or_default();
+                let readable = runtime
+                    .get_object_with_policy_context(id, &policy_context)
+                    .map_err(|_| Status::unavailable("object authorization unavailable"))?
+                    .filter(|object| {
+                        object_is_visible(
+                            runtime,
+                            &self.security,
+                            object,
+                            principals,
+                            tenant_context,
+                        )
+                    });
+                // The object must still be of the pinned set's kind and
+                // namespace: its policy is the one the values were read under.
+                let Some(object) = readable.filter(|object| {
+                    object.kind == descriptor.kind && object.namespace == descriptor.namespace
+                }) else {
+                    return Err(Status::permission_denied(format!(
+                        "input {alias}: a pinned object is no longer readable"
+                    )));
+                };
+                current_markings.push(
+                    crate::sekai::markings::object_marking_token(&object).map(str::to_string),
+                );
+                // Each pinned value must read now as the caller: the live
+                // object, with the values the run pinned, projected for them
+                // keeps every pinned value unchanged, so property and value
+                // grants apply to what replays. Restricted properties, which
+                // object-set rows never carry, are refused (ADR 0140).
+                let restricted = restricted_property_names_for_kind(&schema, &object.kind);
+                // The object as pinned: its pinned values and the marking
+                // it was read under. Its read is authorized again, so object
+                // predicates and the stored marking hold for those values.
+                let mut pinned = object;
+                for (column, value) in row {
+                    if column != "id" && column != "name" {
+                        pinned.properties.insert(column.clone(), value.clone());
+                    }
+                }
+                match set.marking_tokens.get(index).cloned().flatten() {
+                    Some(marking) => {
+                        pinned.properties.insert(
+                            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                            marking,
+                        );
+                    }
+                    None => {
+                        pinned
+                            .properties
+                            .remove(crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY);
+                    }
+                }
+                if !object_is_visible(runtime, &self.security, &pinned, principals, tenant_context)
+                {
+                    return Err(Status::permission_denied(format!(
+                        "input {alias}: a pinned object is no longer readable as pinned"
+                    )));
+                }
+                let projected =
+                    self.project_for_response(pinned, &schema, principals, tenant_context)?;
+                if row.iter().any(|(column, value)| {
+                    column != "id"
+                        && column != "name"
+                        && (restricted.contains(column)
+                            || projected.properties.get(column) != Some(value))
+                }) {
+                    return Err(Status::permission_denied(format!(
+                        "input {alias}: a pinned property is no longer readable"
+                    )));
+                }
+            }
+            set.marking_tokens.extend(current_markings);
+            sets.push(set);
+        }
+        Ok(sets)
+    }
+
     fn evaluate_object_set_input(
         &self,
         alias: &str,
@@ -145,9 +301,10 @@ impl SekaiServiceImpl {
         }
         let mut declared = self.declared_properties(&bound.descriptor)?;
         declared.retain(|name| !restricted.contains(name));
-        Ok(PinnedObjectSet::from_objects(
-            alias, &declared, &objects, &markings,
-        ))
+        Ok(
+            PinnedObjectSet::from_objects(alias, &declared, &objects, &markings)
+                .with_descriptor(json),
+        )
     }
 
     /// The properties the bound revision declares for the set's kind.
