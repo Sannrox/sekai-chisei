@@ -303,6 +303,75 @@
           ]
         }
       ]
+    },
+    {
+      "name": "RegressionProbe",
+      "description": "A regression probe bound to a fixed disposition: it fails on the vulnerable revision and passes on the fixed one (#1989).",
+      "mapped_kind": "security_regression_probe",
+      "kind_description": "A regression probe bound to a fixed security disposition.",
+      "properties": [
+        {
+          "name": "disposition_id",
+          "type": "string",
+          "required": true,
+          "description": "The fixed disposition this probe proves. Bound to the disposition, not the exposure, so a later disposition decides afresh."
+        },
+        {
+          "name": "exposure_id",
+          "type": "string",
+          "required": false,
+          "description": "The exposure the disposition decides. Stamped at write."
+        },
+        {
+          "name": "probe_kind",
+          "type": "enum",
+          "required": true,
+          "description": "catalogue for a Chisei isolation catalogue probe, external for a test in another repository.",
+          "enum_values": [
+            "catalogue",
+            "external"
+          ]
+        },
+        {
+          "name": "probe_ref",
+          "type": "string",
+          "required": true,
+          "description": "The catalogue probe id, or the external test reference."
+        },
+        {
+          "name": "vulnerable_revision",
+          "type": "string",
+          "required": true,
+          "description": "The revision the probe ran on with the weakness present."
+        },
+        {
+          "name": "vulnerable_result",
+          "type": "enum",
+          "required": true,
+          "description": "The probe's result on the vulnerable revision; it must fail.",
+          "enum_values": [
+            "fail",
+            "pass"
+          ]
+        },
+        {
+          "name": "fixed_revision",
+          "type": "string",
+          "required": true,
+          "description": "The revision the probe ran on with the fix."
+        },
+        {
+          "name": "fixed_result",
+          "type": "enum",
+          "required": true,
+          "description": "The probe's result on the fixed revision; it must pass.",
+          "enum_values": [
+            "fail",
+            "pass"
+          ]
+        }
+      ],
+      "ensure_kind": true
     }
   ],
   "relations": [
@@ -335,6 +404,12 @@
       "description": "A disposition decides an exposure.",
       "domain": "Disposition",
       "range": "Exposure"
+    },
+    {
+      "name": "proves",
+      "description": "A regression probe proves a fixed disposition.",
+      "domain": "RegressionProbe",
+      "range": "Disposition"
     }
   ]
 }

@@ -33244,6 +33244,7 @@ async fn security_package_objects_refuse_direct_writes() {
         crate::sekai::security_package::KIND_FINDING,
         crate::sekai::security_package::KIND_EXPOSURE,
         crate::sekai::security_package::KIND_DISPOSITION,
+        crate::sekai::security_package::KIND_PROBE,
     ] {
         let created = svc
             .create_object(with_principal(CreateObjectRequest {
