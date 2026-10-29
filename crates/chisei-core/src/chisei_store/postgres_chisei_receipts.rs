@@ -1,5 +1,6 @@
 //! PostgreSQL operation receipt and gateway request-alias persistence.
 
+use crate::chisei_store::ext::ReceiptChainPostgresDbExt;
 use sekai_core::db::postgres::PostgresDb;
 use sekai_domain::receipt::{OperationReceipt, ReceiptEventKind};
 

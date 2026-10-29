@@ -9,6 +9,7 @@ use crate::chisei_store::ChiseiSqliteSchema;
 use crate::chisei_store::chisei_eval_backend::{
     EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
 };
+use crate::chisei_store::ext::ReceiptChainSekaiDbExt;
 use sekai_core::db::sekai::SekaiDb;
 
 pub trait ChiseiSekaiDbExt {

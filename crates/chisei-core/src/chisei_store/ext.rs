@@ -28,5 +28,7 @@ pub use super::postgres_kioku::PostgresKiokuPostgresDbExt;
 pub use super::postgres_model_release_evidence::PostgresModelReleaseEvidencePostgresDbExt;
 pub use super::postgres_model_review::PostgresModelReviewPostgresDbExt;
 pub use super::postgres_portfolio::PostgresPortfolioPostgresDbExt;
+pub use super::postgres_receipt_chain::ReceiptChainPostgresDbExt;
 pub use super::postgres_routing_profile::PostgresRoutingProfilePostgresDbExt;
 pub use super::postgres_usage_ledger::PostgresUsageLedgerPostgresDbExt;
+pub use super::receipt_chain::ReceiptChainSekaiDbExt;

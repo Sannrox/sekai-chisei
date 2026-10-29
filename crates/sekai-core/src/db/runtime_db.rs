@@ -2467,18 +2467,6 @@ impl RuntimeDb {
         }
     }
 
-    pub fn export_receipt_chain(
-        &self,
-        namespace: &str,
-    ) -> Result<sekai_types::receipt_chain::ReceiptChainBundle, String> {
-        match self {
-            Self::Sqlite(db) => db.export_receipt_chain(namespace),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.export_receipt_chain(namespace))
-            }
-        }
-    }
-
     pub fn list_compliance_decisions_in_window(
         &self,
         namespace: &str,

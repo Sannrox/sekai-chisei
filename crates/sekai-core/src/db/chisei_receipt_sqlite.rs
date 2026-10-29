@@ -21,7 +21,7 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         upsert_operation_receipt(&tx, receipt)?;
-        self.append_operation_receipt_chain(&tx, receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, receipt)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -91,7 +91,7 @@ impl SekaiDb {
             return Ok(FencedAdmissionWrite::Refused(reason));
         }
         upsert_operation_receipt(&tx, receipt)?;
-        self.append_operation_receipt_chain(&tx, receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, receipt)?;
         // The marker a takeover checks (#1931), in this transaction.
         tx.execute(
             "UPDATE sekai_action_instances
@@ -219,7 +219,7 @@ impl SekaiDb {
             params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
         )
         .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&tx, &receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, &receipt)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(receipt)
     }
@@ -515,7 +515,7 @@ impl SekaiDb {
             params![updated_json, durable_at_ms, operation_id],
         )
         .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&tx, &receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, &receipt)?;
         tx.commit().map_err(|error| error.to_string())?;
         crate::db::chisei_receipt::record_receipt_durability_lag(produced_at_ms, durable_at_ms);
         Ok((receipt, true))
@@ -570,7 +570,7 @@ impl SekaiDb {
             params![updated_json, chrono::Utc::now().timestamp_millis(), operation_id],
         )
         .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&tx, &receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, &receipt)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }

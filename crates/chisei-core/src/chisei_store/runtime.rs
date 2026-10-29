@@ -23,6 +23,7 @@ use sekai_core::sekai::evidence::EvidenceClassification;
 use sekai_domain::receipt::{OperationReceipt, OperationReceiptEvent, ReceiptEventKind};
 use sekai_types::governed_subject_provenance::ExportRecord;
 use sekai_types::principal::PrincipalContext;
+use sekai_types::receipt_chain::ReceiptChainBundle;
 
 use super::operation_reservation::OperationReservation;
 
@@ -804,6 +805,8 @@ pub trait ChiseiRuntimeDb {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String>;
+
+    fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String>;
 
     fn budget_adjust_chain(
         &self,
@@ -3117,6 +3120,15 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.list_pending_operation_reservations(limit)
             }),
+        }
+    }
+
+    fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String> {
+        match self {
+            Self::Sqlite(db) => db.export_receipt_chain(namespace),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.export_receipt_chain(namespace))
+            }
         }
     }
 

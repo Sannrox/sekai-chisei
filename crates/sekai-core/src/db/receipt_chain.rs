@@ -1,4 +1,7 @@
-//! Chisei persistence for the signed per-namespace receipt chain (#1449).
+//! Dest-pair leftover: in-tx signed receipt-chain append, redact, and export
+//! helpers. Family DDL lives in chisei-core persist. Shared receipts and
+//! governed transforms append in the same transaction, so this SQL cannot
+//! leave `sekai-core` (ADR 0096).
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -75,34 +78,31 @@ pub fn kind_for_operation_receipt(receipt: &OperationReceipt) -> ReceiptKind {
     }
 }
 
-impl SekaiDb {
-    pub fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String> {
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let bundle = load_bundle(&tx, namespace)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(bundle)
-    }
+pub fn export_receipt_chain(db: &SekaiDb, namespace: &str) -> Result<ReceiptChainBundle, String> {
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(|error| error.to_string())?;
+    let bundle = load_bundle(&tx, namespace)?;
+    tx.commit().map_err(|error| error.to_string())?;
+    Ok(bundle)
+}
 
-    pub fn append_operation_receipt_chain(
-        &self,
-        conn: &Connection,
-        receipt: &OperationReceipt,
-    ) -> Result<(), String> {
-        let Some(keys) = current_signer()? else {
-            return Ok(());
-        };
-        let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
-        append_receipt(
-            conn,
-            &keys,
-            &receipt.namespace,
-            kind_for_operation_receipt(receipt),
-            &receipt.operation_id,
-            &receipt_json,
-            receipt.started_at_ms,
-        )
-    }
+pub fn append_operation_receipt_chain(
+    conn: &Connection,
+    receipt: &OperationReceipt,
+) -> Result<(), String> {
+    let Some(keys) = current_signer()? else {
+        return Ok(());
+    };
+    let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
+    append_receipt(
+        conn,
+        &keys,
+        &receipt.namespace,
+        kind_for_operation_receipt(receipt),
+        &receipt.operation_id,
+        &receipt_json,
+        receipt.started_at_ms,
+    )
 }
 
 pub fn append_transform_run_chain(conn: &Connection, run: &TransformRun) -> Result<(), String> {
@@ -814,7 +814,7 @@ mod tests {
             let conn = db.conn();
             append_transform_run_chain(&conn, &isolated_run("run-iso")).unwrap();
         }
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).expect("persisted bundle verifies");
         assert_eq!(bundle.entries.len(), 3);
@@ -835,7 +835,7 @@ mod tests {
             run.rows_out = 9;
             append_transform_run_chain(&conn, &run).unwrap();
         }
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -858,7 +858,7 @@ mod tests {
             stamp_run_dispatch(&tx, &run.run_id, TRANSFORM_WORK_FAILED).unwrap();
             tx.commit().unwrap();
         }
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -896,7 +896,7 @@ mod tests {
             redact_transform_partition_receipts(&tx, "in", true).unwrap();
             tx.commit().unwrap();
         }
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert_eq!(bundle.entries.len(), 1);
@@ -933,7 +933,7 @@ mod tests {
             redact_transform_partition_receipts(&tx, "in", true).unwrap_err()
         };
         assert!(error.contains("signing key"));
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert!(bundle.entries[0].receipt_json.contains("east"));
@@ -983,7 +983,7 @@ mod tests {
             redact_transform_partition_receipts(&tx, "in", true).unwrap();
             tx.commit().unwrap();
         }
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex_b = keys_b.current_public_key_hex();
         verify_bundle(&bundle, &[hex_b.as_str()]).unwrap();
         assert!(!bundle.entries[0].receipt_json.contains("east"));
@@ -1029,7 +1029,7 @@ mod tests {
             redact_transform_partition_receipts(&tx, "in", true).unwrap_err()
         };
         assert!(error.contains("entry_hash") || error.contains("position"));
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         assert!(verify_bundle(&bundle, &[hex.as_str()]).is_err());
         assert!(
@@ -1059,7 +1059,7 @@ mod tests {
         db.put_operation_receipt(&updated).unwrap();
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
             .unwrap();
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).expect("revision bundle verifies");
         assert_eq!(bundle.entries.len(), 3);
@@ -1088,7 +1088,7 @@ mod tests {
             .unwrap();
         db.authorize_operation_reporter("op-1", "bob", vec![ReceiptEventKind::ActionPerformed])
             .unwrap();
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -1204,7 +1204,7 @@ mod tests {
         let _guard = install_test_signer(trusted.clone());
         db.put_operation_receipt(&sample_receipt("op-2", ReceiptEventKind::ActionPerformed))
             .unwrap();
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let new_hex = trusted.current_public_key_hex();
         verify_bundle(&bundle, &[original_hex.as_str(), new_hex.as_str()]).unwrap();
         assert_eq!(bundle.entries.len(), 2);
@@ -1225,7 +1225,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let bundle = db.export_receipt_chain("ns").unwrap();
+        let bundle = export_receipt_chain(&db, "ns").unwrap();
         let hex = keys.current_public_key_hex();
         let error = verify_bundle(&bundle, &[hex.as_str()]).expect_err("tamper must fail");
         assert_eq!(error.position, 1);

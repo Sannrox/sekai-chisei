@@ -1558,7 +1558,14 @@ mod tests {
             let receipt = db.get_operation_receipt(&action.request_id).unwrap();
             assert!(receipt.is_some(), "{} has no receipt", action.request_id);
         }
-        let bundle = db.export_receipt_chain("synthetic-demo").unwrap();
+        let bundle = match &db {
+            crate::db::runtime_db::RuntimeDb::Sqlite(sqlite) => {
+                crate::db::receipt_chain::export_receipt_chain(sqlite, "synthetic-demo").unwrap()
+            }
+            crate::db::runtime_db::RuntimeDb::Postgres(_) => {
+                panic!("generated history test is sqlite-only")
+            }
+        };
         assert_eq!(bundle.entries.len(), plan.actions.len());
         verify_bundle(&bundle, &[keys.current_public_key_hex().as_str()])
             .expect("generated history verifies");

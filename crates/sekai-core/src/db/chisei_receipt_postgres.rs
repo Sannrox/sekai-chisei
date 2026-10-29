@@ -14,7 +14,7 @@ impl PostgresDb {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         self.upsert_operation_receipt_on(&mut tx, receipt)?;
-        self.append_operation_receipt_chain(&mut tx, receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, receipt)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -89,7 +89,7 @@ impl PostgresDb {
             return Ok(FencedAdmissionWrite::Refused(reason));
         }
         self.upsert_operation_receipt_on(&mut tx, receipt)?;
-        self.append_operation_receipt_chain(&mut tx, receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, receipt)?;
         // The marker a takeover checks (#1931); updating the row also makes
         // a waiting takeover recheck its condition against this commit.
         tx.execute(
@@ -286,7 +286,10 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(
+            &mut transaction,
+            &receipt,
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(receipt)
     }
@@ -579,7 +582,10 @@ impl PostgresDb {
                 &[&updated_json, &durable_at_ms, &operation_id],
             )
             .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(
+            &mut transaction,
+            &receipt,
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         crate::db::chisei_receipt::record_receipt_durability_lag(produced_at_ms, durable_at_ms);
         Ok((receipt, true))
@@ -646,7 +652,10 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        self.append_operation_receipt_chain(&mut transaction, &receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(
+            &mut transaction,
+            &receipt,
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(true)
     }
