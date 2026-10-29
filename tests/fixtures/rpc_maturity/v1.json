@@ -798,6 +798,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListSiteAgentInstanceTurns",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ListClaimableAgentTurns",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",

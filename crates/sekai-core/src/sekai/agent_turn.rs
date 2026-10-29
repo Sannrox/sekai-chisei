@@ -414,6 +414,99 @@ pub fn park(
     })
 }
 
+/// One entry of an instance's history: a turn, or a wake refused before it
+/// became one (a frozen instance's admission records no turn row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstanceEntry {
+    Turn(AgentTurn),
+    RefusedWake {
+        /// The turn the wake would have been; also its receipt's key.
+        turn_id: String,
+        namespace: String,
+        instance_id: String,
+        principal_id: String,
+        cause: String,
+        cause_ref: String,
+        refused_at_ms: i64,
+        refused_by: String,
+        reason: String,
+    },
+}
+
+impl InstanceEntry {
+    /// The paging key: newest first by time, then id.
+    pub fn key(&self) -> (i64, &str) {
+        match self {
+            Self::Turn(turn) => (turn.created_at_ms, &turn.turn_id),
+            Self::RefusedWake {
+                turn_id,
+                refused_at_ms,
+                ..
+            } => (*refused_at_ms, turn_id),
+        }
+    }
+
+    /// Wire token of [`Self::key`]: `{time_ms}|{id}`.
+    pub fn page_token(&self) -> String {
+        let (time_ms, id) = self.key();
+        format!("{time_ms}|{id}")
+    }
+}
+
+/// Parses a [`InstanceEntry::page_token`]. Empty is the first page.
+pub fn parse_page_token(token: &str) -> Result<Option<(i64, String)>, TurnError> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let Some((left, right)) = token.split_once('|') else {
+        return Err(TurnError::Invalid("invalid page token".into()));
+    };
+    if right.is_empty() {
+        return Err(TurnError::Invalid("invalid page token".into()));
+    }
+    let time_ms = left
+        .parse::<i64>()
+        .map_err(|_| TurnError::Invalid("invalid page token".into()))?;
+    Ok(Some((time_ms, right.to_string())))
+}
+
+/// `instance_id`'s turns and refused wakes in `namespace`, newest first,
+/// strictly before `before` (time, id), at most `limit`. Paging by the last
+/// entry's key returns each once. A claim refusal is its turn's row; an
+/// admission refusal, which has no row, comes from the decision ledger.
+pub fn list_for_instance(
+    db: &RuntimeDb,
+    namespace: &str,
+    instance_id: &str,
+    before: Option<(i64, &str)>,
+    limit: i64,
+) -> Result<Vec<InstanceEntry>, TurnError> {
+    let cap = if limit <= 0 { 50 } else { limit.min(500) };
+    let before = before.unwrap_or((i64::MAX, ""));
+    // An empty id sorts first, so `(i64::MAX, "")` admits every key at a
+    // smaller time; no key has time i64::MAX. Each source returns the next
+    // `cap` rows before the cursor; the merged page is among those keys.
+    let turns = match db {
+        RuntimeDb::Sqlite(store) => store.instance_agent_turns(namespace, instance_id, before, cap),
+        RuntimeDb::Postgres(store) => {
+            off_runtime(|| store.instance_agent_turns(namespace, instance_id, before, cap))
+        }
+    }?;
+    let refusals = match db {
+        RuntimeDb::Sqlite(store) => {
+            store.instance_refused_admissions(namespace, instance_id, before, cap)
+        }
+        RuntimeDb::Postgres(store) => {
+            off_runtime(|| store.instance_refused_admissions(namespace, instance_id, before, cap))
+        }
+    }?;
+    let mut entries: Vec<InstanceEntry> = turns.into_iter().map(InstanceEntry::Turn).collect();
+    entries.extend(refusals);
+    entries.sort_by(|left, right| right.key().cmp(&left.key()));
+    entries.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+    Ok(entries)
+}
+
 /// Claims `turn_id` for `runtime_id`. A turn whose instance is frozen since
 /// admission is refused, audited, and never claimable again.
 pub fn claim(
@@ -684,6 +777,8 @@ CREATE TABLE IF NOT EXISTS sekai_agent_turn (
 );
 CREATE INDEX IF NOT EXISTS sekai_agent_turn_queue
     ON sekai_agent_turn (status, due_at_ms);
+CREATE INDEX IF NOT EXISTS sekai_agent_turn_instance
+    ON sekai_agent_turn (namespace, instance_id, created_at_ms DESC, turn_id DESC);
 ";
 
 const COLUMNS: &str = "turn_id, namespace, instance_id, principal_id, cause, cause_ref, due_at_ms,
@@ -697,6 +792,47 @@ fn qualified_columns() -> String {
         .map(|column| format!("turn.{}", column.trim()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Turn id stored in an `agent_turn.refused` decision id (`{action}:{turn_id}`).
+fn refused_turn_id_sql(id: &str, like: &str, start: &str) -> String {
+    format!("CASE WHEN {id} LIKE {like} THEN substr({id}, {start}) ELSE {id} END")
+}
+
+fn refused_prefix_like_and_start() -> (String, i32) {
+    let prefix = format!("{REFUSED_DECISION}:");
+    let start = i32::try_from(prefix.len() + 1).unwrap_or(i32::MAX);
+    (format!("{prefix}%"), start)
+}
+
+fn map_refused_admission(
+    row: &Row<'_>,
+    namespace: &str,
+    instance_id: &str,
+) -> rusqlite::Result<InstanceEntry> {
+    let id: String = row.get(0)?;
+    let prefix = format!("{REFUSED_DECISION}:");
+    let turn_id = id.strip_prefix(&prefix).unwrap_or(&id).to_string();
+    let evidence_str: String = row.get(4)?;
+    let evidence: HashMap<String, String> =
+        serde_json::from_str(&evidence_str).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                format!("corrupt decision evidence for {id}: {error}").into(),
+            )
+        })?;
+    Ok(InstanceEntry::RefusedWake {
+        turn_id,
+        namespace: namespace.into(),
+        instance_id: instance_id.into(),
+        principal_id: evidence.get("principal_id").cloned().unwrap_or_default(),
+        cause: evidence.get("cause").cloned().unwrap_or_default(),
+        cause_ref: evidence.get("cause_ref").cloned().unwrap_or_default(),
+        refused_at_ms: row.get(1)?,
+        refused_by: row.get(2)?,
+        reason: row.get(3)?,
+    })
 }
 
 fn map_turn(row: &Row<'_>) -> rusqlite::Result<AgentTurn> {
@@ -827,6 +963,66 @@ impl SekaiDb {
         Ok(())
     }
 
+    fn instance_agent_turns(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        before: (i64, &str),
+        limit: i64,
+    ) -> Result<Vec<AgentTurn>, TurnError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM sekai_agent_turn
+             WHERE namespace = ?1 AND instance_id = ?2
+               AND (created_at_ms < ?3 OR (created_at_ms = ?3 AND turn_id < ?4))
+             ORDER BY created_at_ms DESC, turn_id DESC
+             LIMIT ?5"
+        ))?;
+        let rows = stmt.query_map(
+            params![namespace, instance_id, before.0, before.1, limit],
+            map_turn,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    fn instance_refused_admissions(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        before: (i64, &str),
+        limit: i64,
+    ) -> Result<Vec<InstanceEntry>, TurnError> {
+        let (prefix_like, prefix_start) = refused_prefix_like_and_start();
+        let turn_id_sql = refused_turn_id_sql("d.id", "?5", "?6");
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT d.id, d.timestamp, d.actor, d.reason, d.evidence
+             FROM sekai_decisions d
+             WHERE d.action = ?1 AND d.target_id = ?2
+               AND json_extract(d.evidence, '$.namespace') = ?3
+               AND (d.timestamp < ?4 OR (d.timestamp = ?4 AND {turn_id_sql} < ?7))
+               AND NOT EXISTS (
+                 SELECT 1 FROM sekai_agent_turn t WHERE t.turn_id = {turn_id_sql}
+               )
+             ORDER BY d.timestamp DESC, {turn_id_sql} DESC
+             LIMIT ?8"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                REFUSED_DECISION,
+                instance_id,
+                namespace,
+                before.0,
+                prefix_like,
+                prefix_start,
+                before.1,
+                limit
+            ],
+            |row| map_refused_admission(row, namespace, instance_id),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     fn claimable_agent_turns(
         &self,
         namespace: &str,
@@ -910,6 +1106,32 @@ impl SekaiDb {
     }
 }
 
+fn pg_refused_admission(
+    row: &postgres::Row,
+    namespace: &str,
+    instance_id: &str,
+) -> Result<InstanceEntry, TurnError> {
+    let id: String = row.try_get(0)?;
+    let prefix = format!("{REFUSED_DECISION}:");
+    let turn_id = id.strip_prefix(&prefix).unwrap_or(&id).to_string();
+    let evidence_str: String = row.try_get(4)?;
+    let evidence: HashMap<String, String> =
+        serde_json::from_str(&evidence_str).map_err(|error| {
+            TurnError::Internal(format!("corrupt decision evidence for {id}: {error}"))
+        })?;
+    Ok(InstanceEntry::RefusedWake {
+        turn_id,
+        namespace: namespace.into(),
+        instance_id: instance_id.into(),
+        principal_id: evidence.get("principal_id").cloned().unwrap_or_default(),
+        cause: evidence.get("cause").cloned().unwrap_or_default(),
+        cause_ref: evidence.get("cause_ref").cloned().unwrap_or_default(),
+        refused_at_ms: row.try_get(1)?,
+        refused_by: row.try_get(2)?,
+        reason: row.try_get(3)?,
+    })
+}
+
 fn pg_turn(row: &postgres::Row) -> Result<AgentTurn, TurnError> {
     Ok(AgentTurn {
         turn_id: row.try_get(0)?,
@@ -977,6 +1199,68 @@ impl PostgresDb {
             ],
         )?;
         Ok(())
+    }
+
+    fn instance_agent_turns(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        before: (i64, &str),
+        limit: i64,
+    ) -> Result<Vec<AgentTurn>, TurnError> {
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {COLUMNS} FROM sekai_agent_turn
+                     WHERE namespace = $1 AND instance_id = $2
+                       AND (created_at_ms < $3 OR (created_at_ms = $3 AND turn_id < $4))
+                     ORDER BY created_at_ms DESC, turn_id DESC
+                     LIMIT $5"
+                ),
+                &[&namespace, &instance_id, &before.0, &before.1, &limit],
+            )?
+            .iter()
+            .map(pg_turn)
+            .collect()
+    }
+
+    fn instance_refused_admissions(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        before: (i64, &str),
+        limit: i64,
+    ) -> Result<Vec<InstanceEntry>, TurnError> {
+        let (prefix_like, prefix_start) = refused_prefix_like_and_start();
+        let turn_id_sql = refused_turn_id_sql("d.id", "$5", "$6");
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT d.id, d.timestamp, d.actor, d.reason, d.evidence
+                     FROM sekai_decisions d
+                     WHERE d.action = $1 AND d.target_id = $2
+                       AND d.evidence::jsonb->>'namespace' = $3
+                       AND (d.timestamp < $4 OR (d.timestamp = $4 AND {turn_id_sql} < $7))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM sekai_agent_turn t WHERE t.turn_id = {turn_id_sql}
+                       )
+                     ORDER BY d.timestamp DESC, {turn_id_sql} DESC
+                     LIMIT $8"
+                ),
+                &[
+                    &REFUSED_DECISION,
+                    &instance_id,
+                    &namespace,
+                    &before.0,
+                    &prefix_like,
+                    &prefix_start,
+                    &before.1,
+                    &limit,
+                ],
+            )?
+            .iter()
+            .map(|row| pg_refused_admission(row, namespace, instance_id))
+            .collect()
     }
 
     fn claimable_agent_turns(
@@ -1598,9 +1882,92 @@ mod tests {
         park_after_decision_contract(&db, &raced);
     }
 
+    fn ack(db: &RuntimeDb, ns: &str, turn: &AgentTurn, at: i64) -> AgentTurn {
+        let held = claim(db, ns, "worker", &turn.turn_id, 1_000, at).unwrap();
+        acknowledge(
+            db,
+            &turn.turn_id,
+            "worker",
+            held.claim_generation,
+            &held.fencing_token,
+            Outcome::Completed,
+            "done",
+            at + 1,
+        )
+        .unwrap()
+    }
+
+    /// Two acknowledged turns and one refused wake list newest first, and
+    /// paging by the last key returns each once (#2001).
+    fn instance_history(db: &RuntimeDb, ns: &str) {
+        let line = seed(db, ns, "hist", false);
+        let first = admit(db, wake(ns, &line, Cause::Schedule, "100"), "plane", 10).unwrap();
+        ack(db, ns, &first, 100);
+        let second = admit(db, wake(ns, &line, Cause::Manual, "req-1"), "op", 20).unwrap();
+        ack(db, ns, &second, 200);
+        freeze(db, &line);
+        assert!(matches!(
+            admit(db, wake(ns, &line, Cause::Manual, "req-2"), "op", 30),
+            Err(TurnError::Frozen(_))
+        ));
+        let listed = list_for_instance(db, ns, &line, None, 10).unwrap();
+        assert_eq!(listed.len(), 3);
+        match &listed[0] {
+            InstanceEntry::RefusedWake {
+                cause,
+                cause_ref,
+                reason,
+                refused_at_ms,
+                ..
+            } => {
+                assert_eq!(
+                    (cause.as_str(), cause_ref.as_str(), *refused_at_ms),
+                    ("manual", "req-2", 30)
+                );
+                assert!(!reason.is_empty());
+            }
+            other => panic!("newest entry is the refused wake, got {other:?}"),
+        }
+        match &listed[1] {
+            InstanceEntry::Turn(turn) => assert_eq!(turn.turn_id, second.turn_id),
+            other => panic!("middle entry is the second turn, got {other:?}"),
+        }
+        match &listed[2] {
+            InstanceEntry::Turn(turn) => assert_eq!(turn.turn_id, first.turn_id),
+            other => panic!("oldest entry is the first turn, got {other:?}"),
+        }
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        for _ in 0..3 {
+            let before = cursor.as_ref().map(|(time_ms, id)| (*time_ms, id.as_str()));
+            let page = list_for_instance(db, ns, &line, before, 1).unwrap();
+            assert_eq!(page.len(), 1);
+            seen.push(page[0].page_token());
+            let (time_ms, id) = page[0].key();
+            cursor = Some((time_ms, id.to_string()));
+        }
+        let before = cursor.as_ref().map(|(time_ms, id)| (*time_ms, id.as_str()));
+        assert!(
+            list_for_instance(db, ns, &line, before, 1)
+                .unwrap()
+                .is_empty()
+        );
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 3, "paging returns each entry once");
+        assert_eq!(
+            parse_page_token("").unwrap(),
+            None,
+            "empty token is the first page"
+        );
+        assert!(parse_page_token("nope").is_err());
+    }
+
     #[test]
     fn sqlite_turns_follow_the_contract() {
         turn_contract(&RuntimeDb::memory(), "site");
+        instance_history(&RuntimeDb::memory(), "site");
     }
 
     #[test]
@@ -1619,6 +1986,7 @@ mod tests {
         let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
         let ns = format!("turns-{}-{}", std::process::id(), uuid::Uuid::new_v4());
         turn_contract(&db, &ns);
+        instance_history(&db, &ns);
     }
 
     #[test]

@@ -771,6 +771,9 @@ fn guest_namespace_rpc(service: &str, method: &str) -> bool {
                 | "UpdateObject"
                 | "DeleteObject"
                 | "DiscoverCapabilities"
+                // Operator read of an instance's turns (#2001): the same
+                // marking as GetObject of the instance.
+                | "ListSiteAgentInstanceTurns"
         )
 }
 
@@ -832,6 +835,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "FederatedAggregate"
             // Manual agent wakes (#1950): namespace admin per call.
             | "WakeSiteAgentInstance"
+            // Operator read of an instance's turns (#2001): same marking as
+            // GetObject of the instance.
+            | "ListSiteAgentInstanceTurns"
             | "ExportObjectSet"
             | "ExportDatasetVersion"
             | "GetExportReceipt"
@@ -2401,6 +2407,10 @@ mod tests {
             NamespaceAction::Discover
         );
         assert_eq!(rpc_namespace_action("GetObject"), NamespaceAction::Read);
+        assert_eq!(
+            rpc_namespace_action("ListSiteAgentInstanceTurns"),
+            NamespaceAction::Read
+        );
         assert_eq!(rpc_namespace_action("QueryRows"), NamespaceAction::Read);
         assert_eq!(
             rpc_namespace_action("EvaluateObjectSet"),
@@ -2426,11 +2436,13 @@ mod tests {
             (SpaceRole::Discoverer, "DescribeObjectAction", true),
             (SpaceRole::Discoverer, "DiscoverCapabilities", true),
             (SpaceRole::Discoverer, "GetObject", false),
+            (SpaceRole::Discoverer, "ListSiteAgentInstanceTurns", false),
             (SpaceRole::Discoverer, "QueryRows", false),
             (SpaceRole::Discoverer, "EvaluateObjectSet", false),
             (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),
             (SpaceRole::Viewer, "GetObject", true),
+            (SpaceRole::Viewer, "ListSiteAgentInstanceTurns", true),
             (SpaceRole::Viewer, "CompareDefinitionRevisions", true),
             (SpaceRole::Viewer, "PreviewObjectAction", false),
             (SpaceRole::Editor, "PreviewObjectAction", true),
@@ -2497,6 +2509,7 @@ mod tests {
             ("ListSchemaTypes", true),
             ("DiscoverCapabilities", true),
             ("GetObject", false),
+            ("ListSiteAgentInstanceTurns", false),
             ("QueryRows", false),
         ] {
             let authority = test_assertion_authority();

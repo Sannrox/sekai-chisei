@@ -1277,6 +1277,22 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListSiteAgentInstanceTurns",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn.rs",
+        "docs/decisions/0137-agent-turns-share-the-scheduling-split.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListClaimableAgentTurns",
       "kind": "persistent",
       "surfaces": [

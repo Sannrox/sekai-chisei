@@ -67,6 +67,47 @@ fn continuation_for(
     }))
 }
 
+fn entry_to_proto(entry: agent_turn::InstanceEntry) -> AgentTurn {
+    match entry {
+        agent_turn::InstanceEntry::Turn(turn) => {
+            let mut turn = to_proto(turn);
+            // Operator history is a read of the instance, not a claim.
+            turn.fencing_token.clear();
+            turn
+        }
+        agent_turn::InstanceEntry::RefusedWake {
+            turn_id,
+            namespace,
+            instance_id,
+            principal_id,
+            cause,
+            cause_ref,
+            refused_at_ms,
+            refused_by,
+            reason,
+        } => AgentTurn {
+            turn_id,
+            namespace,
+            instance_id,
+            principal_id,
+            cause,
+            cause_ref,
+            due_at_ms: 0,
+            admitted_by: refused_by,
+            status: "refused".into(),
+            claim_owner: String::new(),
+            claim_generation: 0,
+            fencing_token: String::new(),
+            claim_expires_at_ms: 0,
+            created_at_ms: refused_at_ms,
+            finished_at_ms: refused_at_ms,
+            reason,
+            parked_action_instance_id: String::new(),
+            park_count: 0,
+        },
+    }
+}
+
 /// What a worker call names: a namespace, or one turn in it. An ack may
 /// also name a turn it already acknowledged, so a lost response is retried.
 enum Scope<'a> {
@@ -314,6 +355,62 @@ impl SekaiServiceImpl {
         .map_err(turn_status)?;
         Ok(Response::new(WakeSiteAgentInstanceResponse {
             turn: Some(to_proto(turn)),
+        }))
+    }
+
+    pub(super) async fn list_site_agent_instance_turns_rpc(
+        &self,
+        req: Request<ListSiteAgentInstanceTurnsRequest>,
+    ) -> Result<Response<ListSiteAgentInstanceTurnsResponse>, Status> {
+        let (metadata, extensions, inner) = req.into_parts();
+        let visible = self
+            .get_visible_object(Request::from_parts(
+                metadata,
+                extensions,
+                GetObjectRequest {
+                    id: inner.instance_id.clone(),
+                },
+            ))
+            .await;
+        let object = match visible {
+            Ok(response) => response.into_inner().object,
+            Err(status) => return Err(status),
+        };
+        let Some(object) = object else {
+            return Err(Status::not_found("not found"));
+        };
+        if object.kind != crate::sekai::site_agent_instance::KIND
+            || object.namespace != inner.namespace
+        {
+            return Err(Status::not_found("not found"));
+        }
+        let before = agent_turn::parse_page_token(&inner.page_token).map_err(turn_status)?;
+        let turns = agent_turn::list_for_instance(
+            self.db.runtime(),
+            &inner.namespace,
+            &inner.instance_id,
+            before
+                .as_ref()
+                .map(|(time_ms, turn_id)| (*time_ms, turn_id.as_str())),
+            i64::from(inner.limit),
+        )
+        .map_err(turn_status)?;
+        let cap = if inner.limit <= 0 {
+            50
+        } else {
+            i64::from(inner.limit).min(500)
+        };
+        let next_page_token = if turns.len() as i64 == cap {
+            turns
+                .last()
+                .map(agent_turn::InstanceEntry::page_token)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(Response::new(ListSiteAgentInstanceTurnsResponse {
+            turns: turns.into_iter().map(entry_to_proto).collect(),
+            next_page_token,
         }))
     }
 

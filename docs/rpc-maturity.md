@@ -166,6 +166,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.RegisterTransformRuntime` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WakeSiteAgentInstance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListSiteAgentInstanceTurns` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListClaimableAgentTurns` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ClaimAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatAgentTurnClaim` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
