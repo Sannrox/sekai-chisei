@@ -19,9 +19,13 @@ pub use crate::sekai::governed_transform::OBJECT_SET_PIN_PREFIX as PIN_PREFIX;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedObjectSet {
     pub alias: String,
+    /// The canonical descriptor the set was read with; part of its digest,
+    /// so a pin names the set a definition asked for, not only its rows.
+    pub descriptor: String,
     pub columns: Vec<String>,
     pub rows: Vec<HashMap<String, String>>,
-    /// The marking of each object read, as datasets give their object's.
+    /// The marking of each object read, as datasets give their object's; a
+    /// replay appends each object's current marking after them.
     pub marking_tokens: Vec<Option<String>>,
 }
 
@@ -62,9 +66,18 @@ impl PinnedObjectSet {
             .collect();
         Self {
             alias: alias.into(),
+            descriptor: String::new(),
             columns,
             rows,
             marking_tokens,
+        }
+    }
+
+    /// This set as read with `descriptor`, the input's canonical JSON.
+    pub fn with_descriptor(self, descriptor: &str) -> Self {
+        Self {
+            descriptor: descriptor.into(),
+            ..self
         }
     }
 
@@ -74,19 +87,63 @@ impl PinnedObjectSet {
         (1i64..).zip(self.rows.iter().cloned()).collect()
     }
 
+    /// A set read back from a stored pin: its descriptor, `columns` as JSON,
+    /// and rows decoded with [`decode_pin_row`]. Refused unless the rows
+    /// still hash to `digest`.
+    pub fn from_pin(
+        alias: &str,
+        digest: &str,
+        descriptor: &str,
+        columns: &str,
+        rows: Vec<(HashMap<String, String>, Option<String>)>,
+    ) -> Result<Self, String> {
+        let columns: Vec<String> =
+            serde_json::from_str(columns).map_err(|error| error.to_string())?;
+        let (rows, marking_tokens) = rows.into_iter().unzip();
+        let set = Self {
+            alias: alias.into(),
+            descriptor: descriptor.into(),
+            columns,
+            rows,
+            marking_tokens,
+        };
+        if set.digest() != digest {
+            return Err(format!("{OBJECT_SET_PIN_CORRUPT}: {alias}"));
+        }
+        Ok(set)
+    }
+
     /// The key this set's pin is recorded under in `input_versions`.
     pub fn pin_key(&self) -> String {
         format!("{PIN_PREFIX}{}", self.alias)
     }
 
-    /// A digest of the rows read, independent of map order.
+    /// A digest of the set as read: its descriptor, its columns, then each
+    /// row and its marking, independent of map order. Two sets with the same
+    /// rows and another descriptor, schema or marking, empty ones included,
+    /// pin differently.
     pub fn digest(&self) -> String {
         let mut hasher = Sha256::new();
-        for row in &self.rows {
+        hasher.update((self.descriptor.len() as u64).to_be_bytes());
+        hasher.update(self.descriptor.as_bytes());
+        let columns = serde_json::to_vec(&self.columns).expect("strings serialize");
+        hasher.update((columns.len() as u64).to_be_bytes());
+        hasher.update(columns);
+        // Each row with the marking it was read under; markings a replay
+        // appends after the rows are not part of what was pinned.
+        let markings = self.marking_tokens.iter().map(Option::as_deref);
+        for (row, marking) in self
+            .rows
+            .iter()
+            .zip(markings.chain(std::iter::repeat(None)))
+        {
             let ordered: BTreeMap<&String, &String> = row.iter().collect();
             let encoded = serde_json::to_vec(&ordered).expect("string maps serialize");
             hasher.update((encoded.len() as u64).to_be_bytes());
             hasher.update(encoded);
+            let marking = marking.unwrap_or_default();
+            hasher.update((marking.len() as u64).to_be_bytes());
+            hasher.update(marking.as_bytes());
         }
         format!("sha256:{:x}", hasher.finalize())
     }
@@ -122,8 +179,30 @@ pub fn require_evaluated(
     }
 }
 
+/// Error prefix of a stored pin whose rows no longer hash to its digest.
+pub const OBJECT_SET_PIN_CORRUPT: &str = "transform_object_set_pin_corrupt";
+
 /// Error prefix of a run whose object-set inputs were not evaluated.
 pub const OBJECT_SETS_UNEVALUATED: &str = "transform_object_sets_unevaluated";
+
+/// One stored pin row, decoded under `budget` as it is read: its encoded
+/// size is allowed first, then its values charged, so a pin larger than the
+/// replay's budget stops loading instead of being materialized (ADR 0140).
+pub fn decode_pin_row(
+    values_json: &str,
+    marking: String,
+    budget: &mut crate::sekai::governed_transform::InputLoadBudget,
+) -> Result<(HashMap<String, String>, Option<String>), String> {
+    if !budget.allow_encoded(values_json.len() as u64) {
+        return Err(budget.exceeded.unwrap_or_default().into());
+    }
+    let values: HashMap<String, String> =
+        serde_json::from_str(values_json).map_err(|error| error.to_string())?;
+    if !budget.charge(&values) {
+        return Err(budget.exceeded.unwrap_or_default().into());
+    }
+    Ok((values, Some(marking).filter(|marking| !marking.is_empty())))
+}
 
 /// Whether an `input_versions` key pins an object set rather than a dataset.
 pub fn is_pin_key(key: &str) -> bool {
@@ -180,6 +259,12 @@ mod tests {
         let empty =
             PinnedObjectSet::from_objects("customers", &["tier".into()], &[], &HashMap::new());
         assert_eq!(empty.columns, ["id", "name", "tier"]);
+        let other_empty =
+            PinnedObjectSet::from_objects("customers", &["region".into()], &[], &HashMap::new());
+        assert_ne!(empty.digest(), other_empty.digest());
+        let mut remarked = changed.clone();
+        remarked.marking_tokens = vec![Some("internal".into())];
+        assert_ne!(changed.digest(), remarked.digest());
         // The stored marking holds when the reader's row does not carry it.
         let projected = PinnedObjectSet::from_objects(
             "customers",

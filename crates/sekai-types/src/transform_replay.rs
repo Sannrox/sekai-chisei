@@ -15,6 +15,10 @@ use crate::dataset_branch::rows_digest;
 use crate::governed_transform::GovernedTransform;
 use crate::object_type_index::ObjectTypeDatasource;
 
+/// A candidate replay whose object-set inputs differ from the stored
+/// definition's, whose pinned rows answer the stored descriptors (ADR 0140).
+pub const REPLAY_OBJECT_SETS_CHANGED: &str =
+    "a candidate definition must read the transform's object sets";
 pub const REPLAY_NOT_FOUND: &str = "transform replay not found";
 pub const REPLAY_OUTPUT_MISMATCH: &str =
     "a candidate definition must keep the transform's namespace, id and output dataset";
