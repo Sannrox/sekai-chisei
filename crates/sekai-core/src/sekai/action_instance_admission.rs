@@ -461,6 +461,25 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             None
         };
+        // An agent whose security dispositions earned it (#1991) records
+        // them as a human would: propose-only lifts, policy approvals stay.
+        // A gate that cannot answer keeps the agent propose-only.
+        let autonomy = match autonomy {
+            Some(crate::sekai::agent_autonomy::AdmissionAutonomy::ProposeOnly)
+                if crate::sekai::security_precision::promotes_disposition(
+                    self.db,
+                    &namespace,
+                    actor,
+                    request.type_id.trim(),
+                    &request.parameters_json,
+                    now,
+                )
+                .unwrap_or(false) =>
+            {
+                None
+            }
+            other => other,
+        };
         let auto_apply_envelope = match &autonomy {
             Some(crate::sekai::agent_autonomy::AdmissionAutonomy::AutoApply { envelope_id }) => {
                 envelope_id.clone()

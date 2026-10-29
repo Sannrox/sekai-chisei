@@ -68,7 +68,15 @@ use crate::sekai::schema::{
 };
 
 pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
-pub const PACKAGE_VERSION: &str = "1";
+/// The version the package registers its Action types at. A type's body is
+/// immutable per version, so any change to one (its schema, description or
+/// review queue) needs a new version; installing again then registers it next
+/// to the previous one, which stays for instances and clients that use it.
+/// Version 2: `finding_class` (#1990) and the disposition review queue
+/// (#1991). `action_types_are_versioned` pins the bodies.
+pub const PACKAGE_VERSION: &str = "2";
+/// Earlier registered versions, newest first.
+const PREVIOUS_PACKAGE_VERSIONS: &[&str] = &["1"];
 /// The current certification. A change to the certified members certifies
 /// the package again under a new id that succeeds the previous one where a
 /// namespace holds it; v1.3 adds the recorder and finding class (#1990),
@@ -106,6 +114,8 @@ pub const ACTION_DISPOSITION_REOPEN: &str = "security.disposition.reopen";
 pub const ACTION_EXPOSURE_BASIS: &str = "security.exposure.basis";
 pub const ACTION_PROBE_BIND: &str = "security.probe.bind";
 pub const DISPOSITION_FIXED: &str = "fixed";
+/// The review queue agent dispositions park in (#1991).
+pub const DISPOSITION_REVIEW_QUEUE: &str = "security.dispositions";
 pub const DISPOSITION_ACCEPT_RISK: &str = "accept-risk";
 pub const DISPOSITION_NEEDS_REVIEW: &str = "needs-review";
 /// Validity basis facts an exposure records the current value of.
@@ -272,6 +282,18 @@ fn register_action_types(
     let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON)
         .map_err(|error| format!("security action-types fixture: {error}"))?;
     for action in document.actions {
+        // An agent's disposition parks until its precision earns it (#1991);
+        // the parked ones wait in one review queue.
+        let review_queue = if [ACTION_DISPOSITION_RECORD, ACTION_DISPOSITION_SUPERSEDE]
+            .contains(&action.type_id.as_str())
+        {
+            crate::sekai::review_queue::ReviewQueueSpec {
+                queue_id: DISPOSITION_REVIEW_QUEUE.into(),
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
         let parameter_schema_json = serde_json::to_string(&action.parameter_schema)
             .map_err(|error| format!("security action parameter schema: {error}"))?;
         db.put_governed_action_type(
@@ -285,6 +307,7 @@ fn register_action_types(
                 object_kind: action.object_kind,
                 object_mutation: action.object_mutation,
                 enabled: true,
+                review_queue,
                 ..Default::default()
             },
             actor,
@@ -302,6 +325,25 @@ fn certify(
 ) -> Result<CapabilityPackageCertification, String> {
     let certification = certification_for(db, namespace, actor)?;
     certify_package(db, actor, &certification, now_ms)
+}
+
+/// The newest version of `type_id` registered in `namespace`, so a server
+/// that runs ahead of the namespace's install submits a version it holds.
+fn registered_version(
+    db: &RuntimeDb,
+    namespace: &str,
+    type_id: &str,
+) -> Result<&'static str, String> {
+    for version in std::iter::once(PACKAGE_VERSION).chain(PREVIOUS_PACKAGE_VERSIONS.iter().copied())
+    {
+        if db
+            .get_governed_action_type(namespace, type_id, version)?
+            .is_some()
+        {
+            return Ok(version);
+        }
+    }
+    Ok(PACKAGE_VERSION)
 }
 
 /// The package's current certification, succeeding an earlier live one.
@@ -1362,11 +1404,20 @@ fn reopen(
         previous.id,
         &format!("{:x}", Sha256::digest(parameters.to_string().as_bytes()))[..16]
     );
+    let newest = registered_version(db, &previous.namespace, ACTION_DISPOSITION_REOPEN)?;
     let admit = |idempotency_key: String| {
+        // A replayed attempt keeps the version it was first submitted at, so
+        // one parked before the package was installed again still replays;
+        // only a new attempt takes the newest version the namespace holds.
+        let version =
+            match db.get_action_instance_by_idempotency(&previous.namespace, &idempotency_key) {
+                Ok(Some(existing)) => existing.version,
+                _ => newest.to_string(),
+            };
         let request = crate::sekai::action_instance_admission::ActionInstanceAdmissionRequest {
             namespace: previous.namespace.clone(),
             type_id: ACTION_DISPOSITION_REOPEN.into(),
-            version: PACKAGE_VERSION.into(),
+            version,
             parameters_json: parameters.to_string(),
             idempotency_key,
             evidence_submission_ids: Vec::new(),
@@ -3036,5 +3087,142 @@ mod tests {
         assert!(runtime.get_object("p-1").unwrap().is_none());
         admit_cleared(&runtime, ACTION_PROBE_BIND, marked, "p-1", "confidential").unwrap();
         assert_eq!(state_of(&runtime), ExposureState::Decided);
+    }
+
+    /// The Action type bodies at [`PACKAGE_VERSION`]. A changed body needs a
+    /// new version: an installed namespace refuses a changed body at its
+    /// version. Update the digest only together with the version.
+    #[test]
+    fn action_types_are_versioned() {
+        let runtime = installed();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        let mut bodies = Vec::new();
+        for action in document.actions {
+            let stored = runtime
+                .get_governed_action_type(NAMESPACE, &action.type_id, PACKAGE_VERSION)
+                .unwrap()
+                .unwrap();
+            bodies.push(format!(
+                "{} {}",
+                action.type_id,
+                crate::sekai::governed_action_type::body_fingerprint(&stored).unwrap()
+            ));
+        }
+        bodies.sort();
+        assert_eq!(
+            (
+                PACKAGE_VERSION,
+                fixture_digest(bodies.join("\n").as_bytes()).as_str()
+            ),
+            (PACKAGE_VERSION, PINNED_ACTION_BODIES)
+        );
+    }
+
+    const PINNED_ACTION_BODIES: &str =
+        "sha256:e3a6dbbb2600175194fea02a1430575b97df1e2c89f73b212f00e2511c53f9b7";
+
+    /// A namespace installed by the previous release, whose types differ at
+    /// version 1, installs again: the new version registers next to the old
+    /// one, and a reopen submits the newest version the namespace holds.
+    #[test]
+    fn an_earlier_install_upgrades_in_place() {
+        let runtime = RuntimeDb::memory();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        for action in &document.actions {
+            runtime
+                .put_governed_action_type(
+                    GovernedActionType {
+                        namespace: NAMESPACE.into(),
+                        type_id: action.type_id.clone(),
+                        version: "1".into(),
+                        description: format!("{} as first released", action.type_id),
+                        parameter_schema_json: action.parameter_schema.to_string(),
+                        allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                        object_kind: action.object_kind.clone(),
+                        object_mutation: action.object_mutation.clone(),
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    ACTOR,
+                    500,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            registered_version(&runtime, NAMESPACE, ACTION_DISPOSITION_REOPEN).unwrap(),
+            "1"
+        );
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        assert!(
+            runtime
+                .get_governed_action_type(NAMESPACE, ACTION_DISPOSITION_RECORD, "1")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            registered_version(&runtime, NAMESPACE, ACTION_DISPOSITION_REOPEN).unwrap(),
+            PACKAGE_VERSION
+        );
+    }
+
+    /// A reopen parked at version 1 replays at version 1 after the package
+    /// registers version 2, instead of conflicting on its idempotency key.
+    #[test]
+    fn a_reopen_parked_before_an_upgrade_replays_at_its_version() {
+        let runtime = RuntimeDb::memory();
+        let document: ActionTypesDocument = serde_json::from_str(ACTION_TYPES_JSON).unwrap();
+        for action in &document.actions {
+            runtime
+                .put_governed_action_type(
+                    GovernedActionType {
+                        namespace: NAMESPACE.into(),
+                        type_id: action.type_id.clone(),
+                        version: "1".into(),
+                        description: action.description.clone(),
+                        parameter_schema_json: action.parameter_schema.to_string(),
+                        allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                        object_kind: action.object_kind.clone(),
+                        object_mutation: action.object_mutation.clone(),
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    ACTOR,
+                    500,
+                )
+                .unwrap();
+        }
+        register_object_types(&runtime).unwrap();
+        let admit_v1 = |type_id: &str, parameters: Value, key: &str| {
+            let mut admission = request(type_id, &parameters, key);
+            admission.version = "1".into();
+            ActionInstanceAdmission::new(&runtime, None)
+                .admit(admission, ACTOR, 2_000)
+                .unwrap();
+        };
+        admit_v1(ACTION_FINDING, finding("f-1", "sig-1"), "f");
+        admit_v1(ACTION_EXPOSURE, exposure("e-1", VERDICT_UNKNOWN, None), "e");
+        admit_v1(
+            ACTION_DISPOSITION_RECORD,
+            disposition("d-1", "false-positive", None),
+            "d-1",
+        );
+        admit_v1(ACTION_EXPOSURE_BASIS, basis("sha256:closure-b"), "b");
+        let mut policy = crate::sekai::action_policy::ActionPolicy::allow_all(NAMESPACE);
+        policy.default_decision = crate::sekai::action_policy::ActionDecision::RequireApproval;
+        runtime.upsert_action_policy(&policy).unwrap();
+        let parked = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 3_000).unwrap();
+        assert!(parked.reopened.is_empty());
+        assert!(parked.failures.is_empty(), "{:?}", parked.failures);
+
+        install(&runtime, NAMESPACE, ACTOR, 3_500).unwrap();
+        let again = reopen_changed_basis(&runtime, NAMESPACE, ACTOR, 0, 4_000).unwrap();
+        assert!(again.failures.is_empty(), "{:?}", again.failures);
+        let parked_versions: Vec<_> = runtime
+            .list_action_instances_page(NAMESPACE, Some(ACTION_DISPOSITION_REOPEN), None, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.version)
+            .collect();
+        assert_eq!(parked_versions, ["1"]);
     }
 }

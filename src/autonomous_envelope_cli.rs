@@ -1,4 +1,4 @@
-//! sekaictl admin autonomy commands (#715, #1469, #1990).
+//! sekaictl admin autonomy commands (#715, #1469, #1990, #1991).
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
@@ -11,7 +11,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy offer --namespace <ns> --principal <agent> --type <type_id> [--actor <principal>]\n  sekaictl admin autonomy grant-auto-apply --namespace <ns> --principal <agent> --type <type_id> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy revoke-auto-apply --namespace <ns> --principal <agent> --type <type_id> --reason <reason> [--actor <principal>]\n  sekaictl admin autonomy disposition-precision --namespace <ns>"
+    "sekaictl admin autonomy admit --envelope <file> [--actor <principal>]\n  sekaictl admin autonomy get --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy stop --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy rollback --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy note-lease-loss --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy invalidate-receipt --namespace <ns> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy offer --namespace <ns> --principal <agent> --type <type_id> [--actor <principal>]\n  sekaictl admin autonomy grant-auto-apply --namespace <ns> --principal <agent> --type <type_id> --envelope-id <id> [--actor <principal>]\n  sekaictl admin autonomy revoke-auto-apply --namespace <ns> --principal <agent> --type <type_id> --reason <reason> [--actor <principal>]\n  sekaictl admin autonomy disposition-precision --namespace <ns>\n  sekaictl admin autonomy disposition-autonomy --namespace <ns>"
 }
 
 pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -26,6 +26,7 @@ pub async fn run_autonomy_command(args: Vec<String>) -> Result<(), BoxErr> {
         Some("grant-auto-apply") => grant_auto_apply(parse_grant(&args[1..], true, false)?).await,
         Some("revoke-auto-apply") => revoke_auto_apply(parse_grant(&args[1..], false, true)?).await,
         Some("disposition-precision") => disposition_precision(parse_namespace(&args[1..])?).await,
+        Some("disposition-autonomy") => disposition_autonomy(parse_namespace(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -174,12 +175,33 @@ async fn disposition_precision(namespace: String) -> Result<(), BoxErr> {
     Ok(())
 }
 
+/// The package's autonomy thresholds and each agent group's standing.
+async fn disposition_autonomy(namespace: String) -> Result<(), BoxErr> {
+    let db = open_db().await?;
+    let thresholds = security_precision::AutonomyThresholds::production();
+    let groups = security_precision::disposition_autonomy(
+        db.as_ref(),
+        &namespace,
+        thresholds,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "thresholds": thresholds,
+            "groups": groups,
+        }))?
+    );
+    Ok(())
+}
+
 fn parse_namespace(args: &[String]) -> Result<String, String> {
     match args {
         [flag, namespace] if flag == "--namespace" && !namespace.trim().is_empty() => {
             Ok(namespace.clone())
         }
-        _ => Err("disposition-precision needs --namespace <ns>".into()),
+        _ => Err("this command needs --namespace <ns>".into()),
     }
 }
 
