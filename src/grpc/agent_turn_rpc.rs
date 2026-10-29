@@ -37,7 +37,34 @@ fn to_proto(turn: agent_turn::AgentTurn) -> AgentTurn {
         created_at_ms: turn.created_at_ms,
         finished_at_ms: turn.finished_at_ms,
         reason: turn.reason,
+        parked_action_instance_id: turn.parked_action_id,
+        park_count: turn.park_count,
     }
+}
+
+/// What a claim of a turn that parked resumes from: its Action as decided
+/// (ADR 0142). `None` for a turn that never parked.
+fn continuation_for(
+    db: &RuntimeDb,
+    turn: &agent_turn::AgentTurn,
+) -> Result<Option<AgentTurnContinuation>, Status> {
+    if turn.parked_action_id.is_empty() {
+        return Ok(None);
+    }
+    let action = db
+        .get_action_instance(&turn.parked_action_id)
+        .map_err(Status::internal)?;
+    Ok(Some(AgentTurnContinuation {
+        action_instance_id: turn.parked_action_id.clone(),
+        status: action
+            .as_ref()
+            .map_or_else(|| "missing".to_string(), |action| action.status.clone()),
+        approval_decision: action
+            .as_ref()
+            .map(|action| action.approval_decision.clone())
+            .unwrap_or_default(),
+        deny_reason: action.map(|action| action.deny_reason).unwrap_or_default(),
+    }))
 }
 
 /// What a worker call names: a namespace, or one turn in it. An ack may
@@ -325,10 +352,12 @@ impl SekaiServiceImpl {
         )
         .map_err(turn_status)?;
         let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;
+        let continuation = continuation_for(self.db.runtime(), &turn)?;
         Ok(Response::new(ClaimAgentTurnResponse {
             turn: Some(to_proto(turn)),
             runtime_token,
             runtime_token_expires_at_ms,
+            continuation,
         }))
     }
 
@@ -369,25 +398,40 @@ impl SekaiServiceImpl {
     ) -> Result<Response<AckAgentTurnResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::AckedTurn(&req.get_ref().turn_id))?;
         let inner = req.into_inner();
-        let outcome = match inner.outcome.as_str() {
-            "completed" => Outcome::Completed,
-            "failed" => Outcome::Failed,
+        let now = now_millis();
+        let turn = match inner.outcome.as_str() {
+            "completed" | "failed" => agent_turn::acknowledge(
+                self.db.runtime(),
+                &inner.turn_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                if inner.outcome == "completed" {
+                    Outcome::Completed
+                } else {
+                    Outcome::Failed
+                },
+                &inner.reason,
+                now,
+            ),
+            // The turn's Action awaits approval; the turn resumes after it
+            // is decided (ADR 0142).
+            "parked" => agent_turn::park(
+                self.db.runtime(),
+                &inner.turn_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                &inner.parked_action_instance_id,
+                &inner.reason,
+                now,
+            ),
             _ => {
                 return Err(Status::invalid_argument(
-                    "outcome must be completed or failed",
+                    "outcome must be completed, failed or parked",
                 ));
             }
-        };
-        let turn = agent_turn::acknowledge(
-            self.db.runtime(),
-            &inner.turn_id,
-            &inner.runtime_id,
-            inner.claim_generation,
-            &inner.fencing_token,
-            outcome,
-            &inner.reason,
-            now_millis(),
-        )
+        }
         .map_err(turn_status)?;
         Ok(Response::new(AckAgentTurnResponse {
             turn: Some(to_proto(turn)),

@@ -1249,6 +1249,12 @@ impl SekaiDb {
     }
 }
 
+/// A sample instance in `status`, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn sample_for_test(status: &str) -> ActionInstance {
+    tests::sample(status)
+}
+
 /// Stores a leased reservation, as admission does before its object write,
 /// and returns its instance id and lease.
 #[cfg(test)]

@@ -119,6 +119,20 @@ service principal whose registration lists the capability `agent_turn_worker`
 in its registered namespaces only, and needs no Action types of its own: it
 submits Actions only with a turn's token, as the turn's instance principal.
 
+A turn whose Action parks for approval acks `parked` with that Action's id
+(ADR 0142, #2007): the Action must have been submitted under the same claim
+and either still await approval or already have a standing decision. The
+claim ends and the turn is `parked`; it is not listed or claimable until the
+Action's decision stands: denied, or granted with the approval recorded on
+its receipt, since a grant whose recording fails is parked again. A decision
+that lands before the acknowledgement still records the continuation, and
+the turn is then immediately resumable. A frozen or deleted instance's parked turn is retired instead
+of reclaimed. Agent-turn queue gauges count parked turns whose decision
+stands. The next claim carries `continuation`: the
+Action's id, status and approval decision. A granted Action was applied, once,
+by its grant, so the resumed run reads the outcome instead of applying it
+again. A turn parks at most three times; a fourth park fails it.
+
 ## Service principals
 
 Administrators (`root`, `local`, or an admin grant on `service_principals`)

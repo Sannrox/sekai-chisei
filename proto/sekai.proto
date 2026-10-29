@@ -1229,7 +1229,7 @@ message AgentTurn {
   string cause_ref = 6;
   int64 due_at_ms = 7;
   string admitted_by = 8;
-  // pending, claimed, completed, failed or refused.
+  // pending, claimed, parked, completed, failed or refused.
   string status = 9;
   string claim_owner = 10;
   int64 claim_generation = 11;
@@ -1238,6 +1238,21 @@ message AgentTurn {
   int64 created_at_ms = 14;
   int64 finished_at_ms = 15;
   string reason = 16;
+  // The Action the turn parked on (ADR 0142); kept once it is reclaimed.
+  string parked_action_instance_id = 17;
+  // How often the turn parked; a turn parks at most three times.
+  int64 park_count = 18;
+}
+// What a reclaimed parked turn resumes from (ADR 0142): the Action it
+// parked on, as decided. A granted Action was applied, once, by its grant;
+// the resumed run reads the outcome and does not apply it again.
+message AgentTurnContinuation {
+  string action_instance_id = 1;
+  // The Action's status now: admitted, denied, or another decided status.
+  string status = 2;
+  // The approval decision recorded on the Action, when one was made.
+  string approval_decision = 3;
+  string deny_reason = 4;
 }
 message WakeSiteAgentInstanceRequest {
   string namespace = 1;
@@ -1269,6 +1284,8 @@ message ClaimAgentTurnResponse {
   string runtime_token = 2;
   // Never later than turn.claim_expires_at_ms. Zero when runtime_token is empty.
   int64 runtime_token_expires_at_ms = 3;
+  // Set when the turn resumes after parking on an Action.
+  AgentTurnContinuation continuation = 4;
 }
 message HeartbeatAgentTurnClaimRequest {
   string turn_id = 1;
@@ -1291,9 +1308,13 @@ message AckAgentTurnRequest {
   string runtime_id = 2;
   int64 claim_generation = 3;
   string fencing_token = 4;
-  // completed or failed.
+  // completed, failed or parked.
   string outcome = 5;
   string reason = 6;
+  // With outcome parked: the Action this claim submitted that parked for
+  // approval, or whose decision already stands. The turn is claimable
+  // again once that decision stands.
+  string parked_action_instance_id = 7;
 }
 message AckAgentTurnResponse {
   AgentTurn turn = 1;

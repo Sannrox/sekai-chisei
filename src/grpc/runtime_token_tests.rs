@@ -577,6 +577,7 @@ async fn a_turn_token_submits_only_for_its_live_claim() {
             &token,
             "AckAgentTurn",
             crate::grpc::pb::sekai::AckAgentTurnRequest {
+                parked_action_instance_id: String::new(),
                 turn_id: turn_id.clone(),
                 runtime_id: turn.claim_owner.clone(),
                 claim_generation: turn.claim_generation,
@@ -617,4 +618,163 @@ async fn a_turn_token_submits_only_for_its_live_claim() {
         .await
         .unwrap_err();
     assert_eq!(after.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
+    let plane = plane();
+    let turn_id = seed_turn(&plane, "a");
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let turn = claimed.turn.unwrap();
+    assert!(claimed.continuation.is_none());
+    // The turn's Action, submitted under this claim, awaits approval.
+    let db = plane.service.db.runtime();
+    db.put_action_instance(&ActionInstance {
+        agent_turn: Some(crate::sekai::action_instance::AgentTurnFence {
+            turn_id: turn_id.clone(),
+            claim_generation: u64::try_from(turn.claim_generation).unwrap(),
+        }),
+        instance_id: "parked-a".into(),
+        namespace: "ns-a".into(),
+        type_id: "dispatch".into(),
+        version: "1".into(),
+        principal: "agent:line-a".into(),
+        delegating_actor: None,
+        parameters_json: "{}".into(),
+        request_digest: "digest".into(),
+        idempotency_key: "idem-parked-a".into(),
+        operation_id: "operation-parked-a".into(),
+        status: crate::sekai::action_instance::STATUS_PARKED.into(),
+        deny_reason: String::new(),
+        evidence_submission_ids: Vec::new(),
+        policy_decision: "require_approval".into(),
+        budget_decision: "allow".into(),
+        created_at_ms: 10,
+        decided_at_ms: 0,
+        system_one_fill_json: String::new(),
+        parked_object_digest: String::new(),
+        decided_by: String::new(),
+        approval_decision: String::new(),
+        autonomous_envelope_id: String::new(),
+        review: Default::default(),
+        agent_action: true,
+        admission_tenant: String::new(),
+        resource_tenant: String::new(),
+        marking: String::new(),
+        conflict: None,
+        approval: None,
+        offline: None,
+        admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
+    })
+    .unwrap();
+    let parked = plane
+        .service
+        .ack_agent_turn(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckAgentTurn",
+            crate::grpc::pb::sekai::AckAgentTurnRequest {
+                turn_id: turn_id.clone(),
+                runtime_id: turn.claim_owner.clone(),
+                claim_generation: turn.claim_generation,
+                fencing_token: turn.fencing_token.clone(),
+                outcome: "parked".into(),
+                reason: "awaiting approval".into(),
+                parked_action_instance_id: "parked-a".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    assert_eq!(
+        (
+            parked.status.as_str(),
+            parked.park_count,
+            parked.reason.as_str()
+        ),
+        ("parked", 1, "awaiting approval")
+    );
+
+    // Undecided, the turn is not reclaimed.
+    let mut retry = Request::new(crate::grpc::pb::sekai::ClaimAgentTurnRequest {
+        namespace: "ns-a".into(),
+        runtime_id: "runner-a".into(),
+        turn_id: turn_id.clone(),
+        ttl_ms: 60_000,
+    });
+    let mut context = tenant_context("tenant-a");
+    context.principal.subject = TURN_WORKER.into();
+    retry.extensions_mut().insert(context);
+    retry
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static(TURN_WORKER));
+    assert_eq!(
+        plane
+            .service
+            .claim_agent_turn(retry)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    // Decided and recorded, the next claim carries the continuation.
+    db.put_operation_receipt(&sekai_domain::receipt::OperationReceipt {
+        version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+        operation_id: "operation-parked-a".into(),
+        parent_operation_id: None,
+        namespace: "ns-a".into(),
+        operation_class: "action_instance".into(),
+        initiating_actor: "approver".into(),
+        schema_version: "v1".into(),
+        policy_version: "v1".into(),
+        started_at_ms: 1,
+        completed_at_ms: None,
+        events: vec![sekai_domain::receipt::OperationReceiptEvent {
+            event_id: "parked-a-decided".into(),
+            operation_id: "operation-parked-a".into(),
+            parent_event_id: None,
+            timestamp_ms: 1,
+            kind: sekai_domain::receipt::ReceiptEventKind::ApprovalDecided,
+            surface: sekai_domain::receipt::ReceiptSurface::Approval,
+            actor: "approver".into(),
+            references: Vec::new(),
+            attributes: Default::default(),
+        }],
+        uncovered_surfaces: vec![],
+        reporter_grants: vec![],
+        ontology_digest: None,
+        artifact: None,
+    })
+    .unwrap();
+    if let RuntimeDb::Sqlite(store) = db {
+        store
+            .conn()
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET status = 'admitted', body_json = json_set(body_json, '$.status', 'admitted',
+                     '$.approval_decision', 'grant')
+                 WHERE instance_id = 'parked-a'",
+                [],
+            )
+            .unwrap();
+    }
+    let resumed = claim_turn(&plane, "a", &turn_id).await;
+    let continuation = resumed.continuation.unwrap();
+    assert_eq!(
+        (
+            continuation.action_instance_id.as_str(),
+            continuation.status.as_str(),
+            continuation.approval_decision.as_str()
+        ),
+        ("parked-a", "admitted", "grant")
+    );
+    assert_eq!(
+        resumed.turn.unwrap().claim_generation,
+        turn.claim_generation + 1
+    );
 }

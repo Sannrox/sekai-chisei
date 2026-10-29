@@ -33463,6 +33463,7 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
     let ack = |generation: i64| {
         svc.ack_agent_turn(with_named_principal(
             AckAgentTurnRequest {
+                parked_action_instance_id: String::new(),
                 turn_id: turn.turn_id.clone(),
                 runtime_id: "runner-a".into(),
                 claim_generation: generation,

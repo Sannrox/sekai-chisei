@@ -572,6 +572,7 @@ async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
                 &service_token(&plane),
                 "AckAgentTurn",
                 crate::grpc::pb::sekai::AckAgentTurnRequest {
+                    parked_action_instance_id: String::new(),
                     turn_id: in_scope,
                     runtime_id: turn.claim_owner,
                     claim_generation: turn.claim_generation,

@@ -42,6 +42,11 @@ const CLAIMED: &str = "claimed";
 const COMPLETED: &str = "completed";
 const FAILED: &str = "failed";
 const REFUSED: &str = "refused";
+const PARKED: &str = "parked";
+/// How often one turn may park on an Action before a further park fails it,
+/// as for runtime work (ADR 0142).
+pub const MAX_PARKS: i64 = 3;
+const PARKED_TOO_OFTEN: &str = "parked too often";
 const LEASE_EXHAUSTED: &str = "claim lapsed too often";
 
 /// What woke the turn.
@@ -153,12 +158,22 @@ pub struct AgentTurn {
     pub created_at_ms: i64,
     pub finished_at_ms: i64,
     pub reason: String,
+    /// The Action the turn parked on (ADR 0142); kept once the turn is
+    /// reclaimed, so its claim carries the continuation.
+    pub parked_action_id: String,
+    /// How often the turn parked; at most [`MAX_PARKS`].
+    pub park_count: i64,
 }
 
 impl AgentTurn {
-    /// Whether the turn was acknowledged, completed or failed.
+    /// Whether the turn was acknowledged: completed, failed or parked.
     pub fn is_acknowledged(&self) -> bool {
-        self.status == COMPLETED || self.status == FAILED
+        self.status == COMPLETED || self.status == FAILED || self.status == PARKED
+    }
+
+    /// Whether the turn is parked on an Action awaiting its decision.
+    pub fn is_parked(&self) -> bool {
+        self.status == PARKED
     }
 
     /// Whether the turn is claimed and its lease has not lapsed at `now_ms`.
@@ -225,6 +240,8 @@ pub fn admit(db: &RuntimeDb, wake: Wake, actor: &str, now_ms: i64) -> Result<Age
         created_at_ms: now_ms,
         finished_at_ms: 0,
         reason: String::new(),
+        parked_action_id: String::new(),
+        park_count: 0,
     };
     if let Err(message) = site_agent_instance::require_not_frozen(&instance) {
         refuse(db, &turn, actor, &message, now_ms)?;
@@ -254,12 +271,147 @@ pub fn list_claimable(
     limit: i64,
 ) -> Result<Vec<AgentTurn>, TurnError> {
     let cap = if limit <= 0 { 50 } else { limit.min(500) };
-    match db {
-        RuntimeDb::Sqlite(store) => store.claimable_agent_turns(namespace, now_ms, cap),
+    let mut claimable = match db {
+        RuntimeDb::Sqlite(store) => store.claimable_agent_turns(namespace, now_ms, cap)?,
         RuntimeDb::Postgres(store) => {
-            off_runtime(|| store.claimable_agent_turns(namespace, now_ms, cap))
+            off_runtime(|| store.claimable_agent_turns(namespace, now_ms, cap))?
         }
+    };
+    // A parked turn is listed once its Action is decided. Parked turns are
+    // read on their own, so ones still awaiting a decision never crowd out
+    // claimable turns or decided parks behind them.
+    claimable.extend(decided_parked_turns(db, Some(namespace), cap)?);
+    claimable.sort_by(|left, right| {
+        (left.due_at_ms, &left.turn_id).cmp(&(right.due_at_ms, &right.turn_id))
+    });
+    claimable.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
+    Ok(claimable)
+}
+
+/// Up to `want` parked turns, of `namespace` or of every namespace, whose
+/// Action's decision stands, oldest due first. The store selects only parks
+/// whose Action left `parked` or is gone, so turns still awaiting approval
+/// cost nothing however many there are; the durable check then reads just
+/// those, normally already-decided Actions.
+fn decided_parked_turns(
+    db: &RuntimeDb,
+    namespace: Option<&str>,
+    want: i64,
+) -> Result<Vec<AgentTurn>, TurnError> {
+    const PAGE: i64 = 200;
+    let mut decided = Vec::new();
+    let mut offset = 0;
+    while i64::try_from(decided.len()).unwrap_or(i64::MAX) < want {
+        let page = match db {
+            RuntimeDb::Sqlite(store) => store.resuming_agent_turns(namespace, offset, PAGE)?,
+            RuntimeDb::Postgres(store) => {
+                off_runtime(|| store.resuming_agent_turns(namespace, offset, PAGE))?
+            }
+        };
+        let read = i64::try_from(page.len()).unwrap_or(i64::MAX);
+        for turn in page {
+            if parked_action_decided(db, &turn.parked_action_id)? {
+                decided.push(turn);
+            }
+        }
+        if read < PAGE {
+            break;
+        }
+        offset = offset.saturating_add(read);
     }
+    decided.truncate(usize::try_from(want).unwrap_or(usize::MAX));
+    Ok(decided)
+}
+
+/// Whether the Action a turn parked on has a decision that stands (ADR
+/// 0142): it is gone, denied, or past `parked` with the approval recorded on
+/// its receipt. A grant whose recording fails is undone and parked again,
+/// so an Action's status alone is not yet a decision.
+fn parked_action_decided(db: &RuntimeDb, action_id: &str) -> Result<bool, TurnError> {
+    use crate::sekai::action_instance::{STATUS_DENIED, STATUS_PARKED};
+    let Some(action) = db.get_action_instance(action_id)? else {
+        return Ok(true);
+    };
+    if action.status == STATUS_PARKED {
+        return Ok(false);
+    }
+    if action.status == STATUS_DENIED {
+        return Ok(true);
+    }
+    Ok(db
+        .get_operation_receipt(&action.operation_id)?
+        .is_some_and(|receipt| {
+            receipt
+                .events
+                .iter()
+                .any(|event| event.kind == sekai_domain::receipt::ReceiptEventKind::ApprovalDecided)
+        }))
+}
+
+/// Parks the turn under its current, unexpired claim on `action_id`, an
+/// Action the turn submitted under this claim that parked for approval
+/// (ADR 0142). Approval may already stand; the turn still records the
+/// Action as its continuation and is then immediately resumable. The claim
+/// ends; the turn is claimable again once the Action is decided. A retry
+/// with the same claim and Action returns the same receipt. A turn parked
+/// [`MAX_PARKS`] times fails instead.
+#[allow(clippy::too_many_arguments)]
+pub fn park(
+    db: &RuntimeDb,
+    turn_id: &str,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    action_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<AgentTurn, TurnError> {
+    // Read before the turn's transaction, whose connection is not reentrant.
+    // A grant may land after submit returns parked and before this
+    // acknowledgement; a standing decision still lets the turn record its
+    // continuation.
+    let action = db
+        .get_action_instance(action_id)?
+        .ok_or_else(|| TurnError::Invalid(format!("action instance {action_id} not found")))?;
+    let submitted_here = action.agent_turn.as_ref().is_some_and(|fence| {
+        fence.turn_id == turn_id
+            && i64::try_from(fence.claim_generation).ok() == Some(claim_generation)
+    });
+    let awaiting_approval = action.status == crate::sekai::action_instance::STATUS_PARKED;
+    let decision_stands = parked_action_decided(db, action_id)?;
+    edit(db, turn_id, |turn| {
+        if !turn.fence_matches(runtime_id, claim_generation, fencing_token) {
+            return Err(TurnError::StaleClaim);
+        }
+        // A retry of this park replays its receipt, the failing fourth one
+        // included.
+        let parked_here =
+            turn.is_parked() || (turn.status == FAILED && turn.reason == PARKED_TOO_OFTEN);
+        if parked_here && turn.parked_action_id == action_id {
+            return Ok(());
+        }
+        if turn.status != CLAIMED || turn.claim_expires_at_ms <= now_ms {
+            return Err(TurnError::StaleClaim);
+        }
+        if !submitted_here || !(awaiting_approval || decision_stands) {
+            return Err(TurnError::Invalid(
+                "a turn parks only on an Action it submitted under this claim that awaits approval or whose decision stands"
+                    .into(),
+            ));
+        }
+        turn.park_count += 1;
+        turn.claim_expires_at_ms = 0;
+        turn.parked_action_id = action_id.into();
+        turn.reason = reason.into();
+        if turn.park_count > MAX_PARKS {
+            turn.status = FAILED.into();
+            turn.reason = PARKED_TOO_OFTEN.into();
+            turn.finished_at_ms = now_ms;
+            return Ok(());
+        }
+        turn.status = PARKED.into();
+        Ok(())
+    })
 }
 
 /// Claims `turn_id` for `runtime_id`. A turn whose instance is frozen since
@@ -293,15 +445,28 @@ pub fn claim(
     if let Err(message) = site_agent_instance::require_not_frozen(&instance) {
         // Audit first: a crash before the turn ends leaves it claimable, and
         // the next claim finds the refusal recorded and ends it.
-        if turn.claimable(now_ms) {
+        if turn.claimable(now_ms) || turn.is_parked() {
             refuse(db, &turn, runtime_id, &message, now_ms)?;
             retire(db, turn_id, &message, now_ms)?;
         }
         return Err(TurnError::Frozen(message));
     }
+    // A parked turn is claimable again once its Action is decided; read
+    // here, outside the claim's transaction. A decision never reverts, so
+    // a turn found resumable stays so (ADR 0142).
+    let resumes = turn.is_parked() && parked_action_decided(db, &turn.parked_action_id)?;
+    if turn.is_parked() && !resumes {
+        return Err(TurnError::NotClaimable);
+    }
+    let checked = (turn.claim_generation, turn.parked_action_id.clone());
     let mut exhausted = false;
     let claimed = edit(db, turn_id, |turn| {
-        if !turn.claimable(now_ms) {
+        // Resume only the park whose decision was read: a turn reclaimed and
+        // parked again meanwhile waits on its new Action.
+        let resuming = resumes
+            && turn.is_parked()
+            && (turn.claim_generation, &turn.parked_action_id) == (checked.0, &checked.1);
+        if !resuming && !turn.claimable(now_ms) {
             return Err(TurnError::NotClaimable);
         }
         if turn.status == CLAIMED {
@@ -385,10 +550,17 @@ pub fn acknowledge(
 /// no tenant or namespace label. Queued counts every unfinished turn no live
 /// claim holds; claimable those already due.
 pub fn pool_gauge(db: &RuntimeDb, now_ms: i64) -> Result<TransformPoolGauge, TurnError> {
-    let (queued, claimable, oldest_due) = match db {
+    let (mut queued, mut claimable, mut oldest_due) = match db {
         RuntimeDb::Sqlite(store) => store.agent_turn_depth(now_ms),
         RuntimeDb::Postgres(store) => off_runtime(|| store.agent_turn_depth(now_ms)),
     }?;
+    // A parked turn whose Action is decided is runnable work too; one still
+    // awaiting approval is not (ADR 0142).
+    for turn in decided_parked_turns(db, None, i64::MAX)? {
+        queued += 1;
+        claimable += 1;
+        oldest_due = Some(oldest_due.map_or(turn.due_at_ms, |due| due.min(turn.due_at_ms)));
+    }
     Ok(TransformPoolGauge {
         pool: "default".into(),
         queued,
@@ -402,7 +574,8 @@ pub fn pool_gauge(db: &RuntimeDb, now_ms: i64) -> Result<TransformPoolGauge, Tur
 /// finished turn is left alone.
 fn retire(db: &RuntimeDb, turn_id: &str, reason: &str, now_ms: i64) -> Result<(), TurnError> {
     let ended = edit(db, turn_id, |turn| {
-        if !turn.claimable(now_ms) {
+        // A parked turn holds no claim either; it ends with its instance.
+        if !turn.claimable(now_ms) && !turn.is_parked() {
             return Err(TurnError::NotClaimable);
         }
         turn.status = REFUSED.into();
@@ -505,7 +678,9 @@ CREATE TABLE IF NOT EXISTS sekai_agent_turn (
     lease_expiries INTEGER NOT NULL DEFAULT 0,
     created_at_ms INTEGER NOT NULL,
     finished_at_ms INTEGER NOT NULL DEFAULT 0,
-    reason TEXT NOT NULL DEFAULT ''
+    reason TEXT NOT NULL DEFAULT '',
+    parked_action_id TEXT NOT NULL DEFAULT '',
+    park_count INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS sekai_agent_turn_queue
     ON sekai_agent_turn (status, due_at_ms);
@@ -513,7 +688,16 @@ CREATE INDEX IF NOT EXISTS sekai_agent_turn_queue
 
 const COLUMNS: &str = "turn_id, namespace, instance_id, principal_id, cause, cause_ref, due_at_ms,
     admitted_by, status, claim_owner, claim_generation, fencing_token, claim_expires_at_ms,
-    lease_expiries, created_at_ms, finished_at_ms, reason";
+    lease_expiries, created_at_ms, finished_at_ms, reason, parked_action_id, park_count";
+
+/// [`COLUMNS`] of the `turn` alias, for queries that join the turn table.
+fn qualified_columns() -> String {
+    COLUMNS
+        .split(',')
+        .map(|column| format!("turn.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn map_turn(row: &Row<'_>) -> rusqlite::Result<AgentTurn> {
     let cause: String = row.get(4)?;
@@ -541,6 +725,8 @@ fn map_turn(row: &Row<'_>) -> rusqlite::Result<AgentTurn> {
         created_at_ms: row.get(14)?,
         finished_at_ms: row.get(15)?,
         reason: row.get(16)?,
+        parked_action_id: row.get(17)?,
+        park_count: row.get(18)?,
     })
 }
 
@@ -558,7 +744,7 @@ fn persist(conn: &rusqlite::Connection, turn: &AgentTurn) -> Result<(), TurnErro
     conn.execute(
         "UPDATE sekai_agent_turn SET status = ?2, claim_owner = ?3, claim_generation = ?4,
              fencing_token = ?5, claim_expires_at_ms = ?6, lease_expiries = ?7,
-             finished_at_ms = ?8, reason = ?9
+             finished_at_ms = ?8, reason = ?9, parked_action_id = ?10, park_count = ?11
          WHERE turn_id = ?1",
         params![
             turn.turn_id,
@@ -570,6 +756,8 @@ fn persist(conn: &rusqlite::Connection, turn: &AgentTurn) -> Result<(), TurnErro
             turn.lease_expiries,
             turn.finished_at_ms,
             turn.reason,
+            turn.parked_action_id,
+            turn.park_count,
         ],
     )?;
     Ok(())
@@ -579,14 +767,39 @@ impl SekaiDb {
     pub(crate) fn migrate_agent_turns(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // Parked turns (ADR 0142), added in place on an existing table.
+        for (column, definition) in [
+            ("parked_action_id", "TEXT NOT NULL DEFAULT ''"),
+            ("park_count", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let present: bool = self
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('sekai_agent_turn')
+                     WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if !present {
+                self.conn()
+                    .execute(
+                        &format!("ALTER TABLE sekai_agent_turn ADD COLUMN {column} {definition}"),
+                        [],
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     fn insert_agent_turn(&self, turn: &AgentTurn) -> Result<(), TurnError> {
         self.conn().execute(
             &format!(
                 "INSERT INTO sekai_agent_turn ({COLUMNS})
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                         ?18, ?19)
                  ON CONFLICT(turn_id) DO NOTHING"
             ),
             params![
@@ -607,6 +820,8 @@ impl SekaiDb {
                 turn.created_at_ms,
                 turn.finished_at_ms,
                 turn.reason,
+                turn.parked_action_id,
+                turn.park_count,
             ],
         )?;
         Ok(())
@@ -627,6 +842,32 @@ impl SekaiDb {
              LIMIT ?3"
         ))?;
         let rows = stmt.query_map(params![namespace, now_ms, limit], map_turn)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Parked turns of `namespace`, or of every namespace, whose Action left
+    /// `parked` or is gone, oldest due first (ADR 0142).
+    fn resuming_agent_turns(
+        &self,
+        namespace: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<AgentTurn>, TurnError> {
+        // The Action table is created on first use; a parked turn has one.
+        self.migrate_action_instances()?;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM sekai_agent_turn turn
+             LEFT JOIN sekai_action_instances action
+               ON action.instance_id = turn.parked_action_id
+             WHERE (?1 IS NULL OR turn.namespace = ?1) AND turn.status = '{PARKED}'
+               AND (action.instance_id IS NULL OR action.status != '{}')
+             ORDER BY turn.due_at_ms, turn.turn_id
+             LIMIT ?3 OFFSET ?2",
+            qualified_columns(),
+            crate::sekai::action_instance::STATUS_PARKED
+        ))?;
+        let rows = stmt.query_map(params![namespace, offset, limit], map_turn)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -688,6 +929,8 @@ fn pg_turn(row: &postgres::Row) -> Result<AgentTurn, TurnError> {
         created_at_ms: row.try_get(14)?,
         finished_at_ms: row.try_get(15)?,
         reason: row.try_get(16)?,
+        parked_action_id: row.try_get(17)?,
+        park_count: row.try_get(18)?,
     })
 }
 
@@ -707,7 +950,8 @@ impl PostgresDb {
         self.connection()?.execute(
             &format!(
                 "INSERT INTO sekai_agent_turn ({COLUMNS})
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                         $18, $19)
                  ON CONFLICT (turn_id) DO NOTHING"
             ),
             &[
@@ -728,6 +972,8 @@ impl PostgresDb {
                 &turn.created_at_ms,
                 &turn.finished_at_ms,
                 &turn.reason,
+                &turn.parked_action_id,
+                &turn.park_count,
             ],
         )?;
         Ok(())
@@ -756,6 +1002,34 @@ impl PostgresDb {
             .collect()
     }
 
+    /// See the SQLite store.
+    fn resuming_agent_turns(
+        &self,
+        namespace: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<AgentTurn>, TurnError> {
+        self.connection()?
+            .query(
+                &format!(
+                    "SELECT {} FROM sekai_agent_turn turn
+                     LEFT JOIN sekai_action_instances action
+                       ON action.instance_id = turn.parked_action_id
+                     WHERE ($1::TEXT IS NULL OR turn.namespace = $1)
+                       AND turn.status = '{PARKED}'
+                       AND (action.instance_id IS NULL OR action.status != '{}')
+                     ORDER BY turn.due_at_ms, turn.turn_id
+                     LIMIT $3 OFFSET $2",
+                    qualified_columns(),
+                    crate::sekai::action_instance::STATUS_PARKED
+                ),
+                &[&namespace, &offset, &limit],
+            )?
+            .iter()
+            .map(pg_turn)
+            .collect()
+    }
+
     fn edit_agent_turn(
         &self,
         turn_id: &str,
@@ -774,7 +1048,7 @@ impl PostgresDb {
         tx.execute(
             "UPDATE sekai_agent_turn SET status = $2, claim_owner = $3, claim_generation = $4,
                  fencing_token = $5, claim_expires_at_ms = $6, lease_expiries = $7,
-                 finished_at_ms = $8, reason = $9
+                 finished_at_ms = $8, reason = $9, parked_action_id = $10, park_count = $11
              WHERE turn_id = $1",
             &[
                 &turn.turn_id,
@@ -786,6 +1060,8 @@ impl PostgresDb {
                 &turn.lease_expiries,
                 &turn.finished_at_ms,
                 &turn.reason,
+                &turn.parked_action_id,
+                &turn.park_count,
             ],
         )?;
         tx.commit()?;
@@ -993,6 +1269,333 @@ mod tests {
             Err(TurnError::NotFound)
         );
         assert!(list_claimable(db, ns, 3_000, 10).unwrap().is_empty());
+    }
+
+    /// An Action of `instance`'s principal in `ns`, submitted under `turn`'s
+    /// claim at `generation`, that parked for approval.
+    fn parked_action(db: &RuntimeDb, ns: &str, turn: &AgentTurn, tag: &str) -> String {
+        let mut action = crate::sekai::action_instance::sample_for_test(
+            crate::sekai::action_instance::STATUS_PARKED,
+        );
+        action.instance_id = format!("{ns}-action-{tag}");
+        action.namespace = ns.into();
+        action.principal = turn.principal_id.clone();
+        action.idempotency_key = format!("{ns}-key-{tag}");
+        action.operation_id = format!("{ns}-op-{tag}");
+        action.agent_turn = Some(crate::sekai::action_instance::AgentTurnFence {
+            turn_id: turn.turn_id.clone(),
+            claim_generation: u64::try_from(turn.claim_generation).unwrap(),
+        });
+        db.put_action_instance(&action).unwrap();
+        action.instance_id
+    }
+
+    /// Decides a parked Action as `status`, as an approver's decision does:
+    /// a grant also records the decision on the Action's receipt, the point
+    /// after which it is no longer undone.
+    fn decide(db: &RuntimeDb, action_id: &str, status: &str) {
+        if status != crate::sekai::action_instance::STATUS_DENIED {
+            let action = db.get_action_instance(action_id).unwrap().unwrap();
+            db.put_operation_receipt(&sekai_domain::receipt::OperationReceipt {
+                version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+                operation_id: action.operation_id.clone(),
+                parent_operation_id: None,
+                namespace: action.namespace.clone(),
+                operation_class: "action_instance".into(),
+                initiating_actor: "approver".into(),
+                schema_version: "v1".into(),
+                policy_version: "v1".into(),
+                started_at_ms: 1,
+                completed_at_ms: None,
+                events: vec![sekai_domain::receipt::OperationReceiptEvent {
+                    event_id: format!("{action_id}-decided"),
+                    operation_id: action.operation_id,
+                    parent_event_id: None,
+                    timestamp_ms: 1,
+                    kind: sekai_domain::receipt::ReceiptEventKind::ApprovalDecided,
+                    surface: sekai_domain::receipt::ReceiptSurface::Approval,
+                    actor: "approver".into(),
+                    references: Vec::new(),
+                    attributes: Default::default(),
+                }],
+                uncovered_surfaces: vec![],
+                reporter_grants: vec![],
+                ontology_digest: None,
+                artifact: None,
+            })
+            .unwrap();
+        }
+        decide_status_only(db, action_id, status);
+    }
+
+    /// Moves a parked Action to `status` without recording a decision.
+    fn decide_status_only(db: &RuntimeDb, action_id: &str, status: &str) {
+        match db {
+            RuntimeDb::Sqlite(store) => {
+                store
+                    .conn()
+                    .execute(
+                        "UPDATE sekai_action_instances
+                         SET status = ?2, body_json = json_set(body_json, '$.status', ?2)
+                         WHERE instance_id = ?1",
+                        params![action_id, status],
+                    )
+                    .unwrap();
+            }
+            RuntimeDb::Postgres(store) => {
+                store
+                    .connection()
+                    .unwrap()
+                    .execute(
+                        "UPDATE sekai_action_instances
+                         SET status = $2,
+                             body_json = jsonb_set(body_json::jsonb, '{status}', to_jsonb($2::text))::text
+                         WHERE instance_id = $1",
+                        &[&action_id, &status],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Parking on one store (ADR 0142): a turn parks only on an Action it
+    /// submitted under its claim that awaits approval or whose decision
+    /// already stands, is not claimable until that Action is decided, then
+    /// resumes at a new generation with the parked Action named; a retry
+    /// replays; a fourth park fails it.
+    fn park_contract(db: &RuntimeDb, ns: &str) {
+        let line = seed(db, ns, "parker", false);
+        let turn = admit(db, wake(ns, &line, Cause::Manual, "park"), "plane", 1).unwrap();
+        let mut now = 100;
+        let mut held = claim(db, ns, "runner-a", &turn.turn_id, 1_000, now).unwrap();
+        let fence = |held: &AgentTurn| {
+            (
+                held.claim_owner.clone(),
+                held.claim_generation,
+                held.fencing_token.clone(),
+            )
+        };
+
+        // Not an Action of this claim: refused.
+        let mut other_claim = held.clone();
+        other_claim.claim_generation += 7;
+        let foreign = parked_action(db, ns, &other_claim, "foreign");
+        let (owner, generation, token) = fence(&held);
+        assert!(matches!(
+            park(
+                db,
+                &turn.turn_id,
+                &owner,
+                generation,
+                &token,
+                &foreign,
+                "awaiting approval",
+                now
+            ),
+            Err(TurnError::Invalid(_))
+        ));
+
+        for round in 1..=MAX_PARKS {
+            let action = parked_action(db, ns, &held, &format!("round-{round}"));
+            let (owner, generation, token) = fence(&held);
+            let parked = park(
+                db,
+                &turn.turn_id,
+                &owner,
+                generation,
+                &token,
+                &action,
+                "awaiting approval",
+                now,
+            )
+            .unwrap();
+            assert!(parked.is_parked());
+            assert_eq!(parked.reason, "awaiting approval");
+            assert_eq!(
+                (parked.parked_action_id.as_str(), parked.park_count),
+                (action.as_str(), round)
+            );
+            // A retry with the same claim and Action replays the receipt.
+            assert_eq!(
+                park(
+                    db,
+                    &turn.turn_id,
+                    &owner,
+                    generation,
+                    &token,
+                    &action,
+                    "awaiting approval",
+                    now
+                )
+                .unwrap(),
+                parked
+            );
+            // Awaiting its decision, the turn is neither listed nor claimable.
+            now += 10;
+            assert!(list_claimable(db, ns, now, 10).unwrap().is_empty());
+            assert_eq!(
+                claim(db, ns, "runner-b", &turn.turn_id, 1_000, now).unwrap_err(),
+                TurnError::NotClaimable
+            );
+            // Admitted but not yet recorded, a grant may still be undone:
+            // the turn waits.
+            decide_status_only(db, &action, "admitted");
+            assert!(list_claimable(db, ns, now, 10).unwrap().is_empty());
+            // Once decided it resumes at a new generation, naming the Action.
+            decide(db, &action, "admitted");
+            assert_eq!(list_claimable(db, ns, now, 10).unwrap().len(), 1);
+            let resumed = claim(db, ns, "runner-b", &turn.turn_id, 1_000, now).unwrap();
+            assert_eq!(resumed.claim_generation, held.claim_generation + 1);
+            assert_eq!(resumed.parked_action_id, action);
+            held = resumed;
+        }
+
+        // A further park fails the turn.
+        let last = parked_action(db, ns, &held, "last");
+        let (owner, generation, token) = fence(&held);
+        let failed = park(
+            db,
+            &turn.turn_id,
+            &owner,
+            generation,
+            &token,
+            &last,
+            "awaiting approval",
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            (failed.status.as_str(), failed.reason.as_str()),
+            (FAILED, PARKED_TOO_OFTEN)
+        );
+        // A lost response to it is retried to the same receipt.
+        assert_eq!(
+            park(
+                db,
+                &turn.turn_id,
+                &owner,
+                generation,
+                &token,
+                &last,
+                "awaiting approval",
+                now
+            )
+            .unwrap(),
+            failed
+        );
+    }
+
+    /// Approval may land after the Action parks and before the worker
+    /// acknowledges. The turn still records the Action as its continuation
+    /// and is immediately resumable.
+    fn park_after_decision_contract(db: &RuntimeDb, ns: &str) {
+        let line = seed(db, ns, "racer", false);
+        let turn = admit(db, wake(ns, &line, Cause::Manual, "race"), "plane", 1).unwrap();
+        let held = claim(db, ns, "runner-a", &turn.turn_id, 1_000, 100).unwrap();
+        let action = parked_action(db, ns, &held, "raced");
+        decide(db, &action, "admitted");
+        let parked = park(
+            db,
+            &turn.turn_id,
+            &held.claim_owner,
+            held.claim_generation,
+            &held.fencing_token,
+            &action,
+            "awaiting approval",
+            100,
+        )
+        .unwrap();
+        assert!(parked.is_parked());
+        assert_eq!(
+            (parked.parked_action_id.as_str(), parked.reason.as_str()),
+            (action.as_str(), "awaiting approval")
+        );
+        let listed = list_claimable(db, ns, 100, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].turn_id, turn.turn_id);
+        let resumed = claim(db, ns, "runner-b", &turn.turn_id, 1_000, 100).unwrap();
+        assert_eq!(resumed.claim_generation, held.claim_generation + 1);
+        assert_eq!(resumed.parked_action_id, action);
+    }
+
+    #[test]
+    fn a_decided_park_is_listed_behind_undecided_ones() {
+        let db = RuntimeDb::memory();
+        let ns = "queue";
+        let mut parked = Vec::new();
+        for (name, due) in [("older", 100), ("newer", 200)] {
+            let line = seed(&db, ns, name, false);
+            let turn = admit(
+                &db,
+                Wake {
+                    due_at_ms: due,
+                    ..wake(ns, &line, Cause::Manual, name)
+                },
+                "plane",
+                1,
+            )
+            .unwrap();
+            let held = claim(&db, ns, "runner-a", &turn.turn_id, 1_000, 300).unwrap();
+            let action = parked_action(&db, ns, &held, name);
+            park(
+                &db,
+                &turn.turn_id,
+                &held.claim_owner,
+                held.claim_generation,
+                &held.fencing_token,
+                &action,
+                "awaiting approval",
+                300,
+            )
+            .unwrap();
+            parked.push((turn.turn_id, action));
+        }
+        // Only the newer park is decided; a limit of one still finds it.
+        decide(&db, &parked[1].1, "denied");
+        let listed = list_claimable(&db, ns, 400, 1).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].turn_id, parked[1].0);
+        // The decided park is runnable work in the queue gauge; the one
+        // awaiting approval is not.
+        let gauge = pool_gauge(&db, 400).unwrap();
+        assert_eq!((gauge.queued, gauge.claimable), (1, 1));
+
+        // Its instance frozen, a claim retires it rather than leaving it
+        // listed for ever.
+        freeze(&db, &format!("{ns}-newer"));
+        assert!(matches!(
+            claim(&db, ns, "runner-b", &parked[1].0, 1_000, 400),
+            Err(TurnError::Frozen(_))
+        ));
+        assert_eq!(get(&db, &parked[1].0).unwrap().unwrap().status, REFUSED);
+        assert!(list_claimable(&db, ns, 400, 10).unwrap().is_empty());
+        assert_eq!(pool_gauge(&db, 400).unwrap().claimable, 0);
+    }
+
+    #[test]
+    fn sqlite_turns_park_and_resume() {
+        park_contract(&RuntimeDb::memory(), "park");
+        park_after_decision_contract(&RuntimeDb::memory(), "race");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_turns_park_and_resume() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
+        let ns = format!("parks-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        park_contract(&db, &ns);
+        let raced = format!("race-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        park_after_decision_contract(&db, &raced);
     }
 
     #[test]
