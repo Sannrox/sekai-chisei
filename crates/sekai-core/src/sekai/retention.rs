@@ -59,8 +59,8 @@ pub const RETENTION_DATASETS: [&str; 4] = [
     CONTENT_EVENTS_DATASET,
 ];
 
-const DAY_MS: i64 = 86_400_000;
-const RETENTION_TOMBSTONE_CONTEXT: &str = r#"{"retention_tombstone":"true"}"#;
+pub(crate) const DAY_MS: i64 = 86_400_000;
+pub(crate) const RETENTION_TOMBSTONE_CONTEXT: &str = r#"{"retention_tombstone":"true"}"#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -94,6 +94,20 @@ pub struct ArchiveRun {
     pub batches: i32,
 }
 
+impl ArchiveRun {
+    /// Add one committed batch to a run's totals, as both backends do.
+    pub(crate) fn absorb(&mut self, batch: ArchiveRun) {
+        self.batches += 1;
+        self.batch_id = batch.batch_id;
+        self.content_hash = batch.content_hash;
+        self.audit_archived += batch.audit_archived;
+        self.llm_calls_archived += batch.llm_calls_archived;
+        self.task_observations_archived += batch.task_observations_archived;
+        self.task_observations_redacted += batch.task_observations_redacted;
+        self.content_events_archived += batch.content_events_archived;
+    }
+}
+
 /// What the in-database archive holds (ADR 0141).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArchiveStatus {
@@ -113,10 +127,10 @@ pub struct ArchiveVerification {
 }
 
 #[derive(Debug, Clone)]
-struct ArchiveRecord {
-    dataset: &'static str,
-    source_key: String,
-    payload: String,
+pub(crate) struct ArchiveRecord {
+    pub(crate) dataset: &'static str,
+    pub(crate) source_key: String,
+    pub(crate) payload: String,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1340,7 +1354,140 @@ fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
     Ok(())
 }
 
-fn effective_policy<'a>(
+/// Whether an `llm_calls` row is past its policy, on either backend: by its
+/// `timestamp_ms`, under the policy for its `project` and `data_class`.
+pub(crate) fn llm_call_expired(
+    row: &std::collections::HashMap<String, String>,
+    policies: &[RetentionPolicy],
+    now: i64,
+) -> bool {
+    let namespace = row.get("project").map(String::as_str).unwrap_or_default();
+    let data_class = row
+        .get("data_class")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let timestamp = row
+        .get("timestamp_ms")
+        .and_then(|value| value.parse::<i64>().ok());
+    matches!(
+        (timestamp, effective_policy(policies, LLM_CALLS_DATASET, namespace, data_class)),
+        (Some(timestamp), Some(policy))
+            if timestamp < now - i64::from(policy.retention_days) * DAY_MS
+    )
+}
+
+/// One task observation as retention reads it; `key` names the hot row
+/// (`rowid` on SQLite, `(request_id, component_id)` on PostgreSQL).
+pub(crate) struct RetainedObservation<K> {
+    pub(crate) key: K,
+    pub(crate) request_id: String,
+    pub(crate) namespace: String,
+    pub(crate) data_class: String,
+    pub(crate) component_id: String,
+    pub(crate) model: String,
+    pub(crate) status: String,
+    /// Unix seconds.
+    pub(crate) timestamp: i64,
+    pub(crate) packages_json: String,
+    pub(crate) context_json: String,
+    pub(crate) retention_tombstone: bool,
+}
+
+/// What one batch does to the observations it read, on either backend.
+pub(crate) struct ObservationPlan<K> {
+    pub(crate) records: Vec<ArchiveRecord>,
+    /// Per component, its namespace and the expired rows (key, status) to
+    /// fold into the component's baseline and delete.
+    pub(crate) folded: std::collections::BTreeMap<String, (String, Vec<(K, String)>)>,
+    /// Expired rows of a component with a retained row: redacted in place.
+    pub(crate) redacted: Vec<K>,
+}
+
+/// Plan retention for observations read in `(component_id, timestamp)`
+/// order. Every expired row is archived; it is folded into its component's
+/// baseline and deleted while the component has no retained row yet, and
+/// redacted in place after one. `retained` carries those components from
+/// batch to batch.
+pub(crate) fn plan_observation_retention<K>(
+    rows: Vec<RetainedObservation<K>>,
+    policies: &[RetentionPolicy],
+    now: i64,
+    retained: &mut std::collections::BTreeSet<String>,
+) -> ObservationPlan<K> {
+    let mut plan = ObservationPlan {
+        records: Vec::new(),
+        folded: std::collections::BTreeMap::new(),
+        redacted: Vec::new(),
+    };
+    for row in rows {
+        if row.retention_tombstone {
+            retained.insert(row.component_id);
+            continue;
+        }
+        let expired = effective_policy(
+            policies,
+            TASK_OBSERVATIONS_DATASET,
+            &row.namespace,
+            &row.data_class,
+        )
+        .is_some_and(|policy| {
+            row.timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
+        });
+        if !expired {
+            retained.insert(row.component_id);
+            continue;
+        }
+        plan.records.push(ArchiveRecord {
+            dataset: "task_observations",
+            source_key: serde_json::to_string(&(&row.request_id, &row.component_id))
+                .unwrap_or_default(),
+            payload: serde_json::json!({
+                "request_id": row.request_id, "namespace": row.namespace,
+                "component_id": row.component_id, "data_class": row.data_class,
+                "model": row.model, "status": row.status, "timestamp": row.timestamp,
+                "packages_json": row.packages_json, "context_json": row.context_json,
+            })
+            .to_string(),
+        });
+        if retained.contains(&row.component_id) {
+            plan.redacted.push(row.key);
+        } else {
+            plan.folded
+                .entry(row.component_id)
+                .or_insert_with(|| (row.namespace, Vec::new()))
+                .1
+                .push((row.key, row.status));
+        }
+    }
+    plan
+}
+
+/// A component baseline `(task_total, task_succeeded, consecutive_failures)`
+/// after folding in expired rows with `statuses`, oldest first.
+pub(crate) fn fold_observation_baseline(
+    baseline: (i64, i64, i64),
+    statuses: &[String],
+) -> (i64, i64, i64) {
+    let rows = statuses.len() as i64;
+    let succeeded = statuses.iter().filter(|status| *status == "done").count() as i64;
+    let trailing_failures = statuses
+        .iter()
+        .rev()
+        .take_while(|status| *status != "done")
+        .count() as i64;
+    let consecutive_failures = if trailing_failures == rows {
+        baseline.2 + trailing_failures
+    } else {
+        trailing_failures
+    };
+    (
+        baseline.0 + rows,
+        baseline.1 + succeeded,
+        consecutive_failures,
+    )
+}
+
+pub(crate) fn effective_policy<'a>(
     policies: &'a [RetentionPolicy],
     dataset: &str,
     namespace: &str,
@@ -1852,6 +1999,44 @@ impl SekaiDb {
                         params![rowid],
                     )
                     .map_err(|e| e.to_string())? as i32;
+            }
+        }
+
+        // Retention folds expired observations into a component baseline that
+        // keeps the component and namespace: the hot observation rule removes
+        // it.
+        let baselines = {
+            let mut stmt = tx
+                .prepare("SELECT component_id,namespace FROM sekai_task_observation_baselines")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+        };
+        for (component_id, namespace) in baselines {
+            let row = TaskObservationRow {
+                request_id: String::new(),
+                namespace,
+                component_id,
+                model: String::new(),
+                status: String::new(),
+                packages_json: "[]".into(),
+                context_json: "{}".into(),
+            };
+            if task_observation_matches_subject(
+                &row,
+                &request.subject_kind,
+                &request.subject,
+                &subject_object_ids,
+            ) {
+                tx.execute(
+                    "DELETE FROM sekai_task_observation_baselines WHERE component_id=?1",
+                    params![row.component_id],
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
 
@@ -2999,17 +3184,9 @@ impl SekaiDb {
         while !cursor.done() {
             let batch =
                 self.archive_retained_batch(now, false, RETENTION_BATCH_SIZE, &mut cursor)?;
-            if batch.batch_id.is_empty() {
-                continue;
+            if !batch.batch_id.is_empty() {
+                total.absorb(batch);
             }
-            total.batches += 1;
-            total.batch_id = batch.batch_id;
-            total.content_hash = batch.content_hash;
-            total.audit_archived += batch.audit_archived;
-            total.llm_calls_archived += batch.llm_calls_archived;
-            total.task_observations_archived += batch.task_observations_archived;
-            total.task_observations_redacted += batch.task_observations_redacted;
-            total.content_events_archived += batch.content_events_archived;
         }
         self.finish_retention_run(now, total.llm_calls_archived > 0)?;
         Ok(total)
@@ -3197,19 +3374,7 @@ impl SekaiDb {
         for (id, data) in llm_rows {
             let row: std::collections::HashMap<String, String> =
                 serde_json::from_str(&data).unwrap_or_default();
-            let namespace = row.get("project").map(String::as_str).unwrap_or_default();
-            let data_class = row
-                .get("data_class")
-                .map(String::as_str)
-                .unwrap_or_default();
-            let timestamp = row
-                .get("timestamp_ms")
-                .and_then(|value| value.parse::<i64>().ok());
-            if let (Some(timestamp), Some(policy)) = (
-                timestamp,
-                effective_policy(&policies, LLM_CALLS_DATASET, namespace, data_class),
-            ) && timestamp < now - i64::from(policy.retention_days) * DAY_MS
-            {
+            if llm_call_expired(&row, &policies, now) {
                 llm_ids.push(id);
                 records.push(ArchiveRecord {
                     dataset: "llm_calls",
@@ -3241,19 +3406,19 @@ impl SekaiDb {
                 .query_map(
                     params![component, timestamp, rowid, sql_limit(limit)],
                     |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, i64>(7)?,
-                            row.get::<_, String>(8)?,
-                            row.get::<_, String>(9)?,
-                            row.get::<_, bool>(10)?,
-                        ))
+                        Ok(RetainedObservation {
+                            key: row.get::<_, i64>(0)?,
+                            request_id: row.get(1)?,
+                            namespace: row.get(2)?,
+                            data_class: row.get(3)?,
+                            component_id: row.get(4)?,
+                            model: row.get(5)?,
+                            status: row.get(6)?,
+                            timestamp: row.get(7)?,
+                            packages_json: row.get(8)?,
+                            context_json: row.get(9)?,
+                            retention_tombstone: row.get(10)?,
+                        })
                     },
                 )
                 .map_err(|e| e.to_string())?
@@ -3261,68 +3426,23 @@ impl SekaiDb {
                 .map_err(|e| e.to_string())?;
             cursor.observations_done = rows.len() < limit;
             if let Some(last) = rows.last() {
-                cursor.observation_after = Some((last.4.clone(), last.7, last.0));
+                cursor.observation_after =
+                    Some((last.component_id.clone(), last.timestamp, last.key));
             }
             rows
         };
-        let mut expired_observations =
-            std::collections::BTreeMap::<String, (String, Vec<(i64, String)>)>::new();
-        let mut redacted_observation_ids = Vec::new();
-        let mut retained_components = std::mem::take(&mut cursor.retained_components);
-        for (
-            rowid,
-            request_id,
-            namespace,
-            data_class,
-            component_id,
-            model,
-            status,
-            timestamp,
-            packages,
-            context,
-            retention_tombstone,
-        ) in observation_rows
-        {
-            if retention_tombstone {
-                retained_components.insert(component_id);
-                continue;
-            }
-            let expired = effective_policy(
-                &policies,
-                TASK_OBSERVATIONS_DATASET,
-                &namespace,
-                &data_class,
-            )
-            .is_some_and(|policy| {
-                timestamp < (now - i64::from(policy.retention_days) * DAY_MS) / 1000
-            });
-            if expired {
-                records.push(ArchiveRecord {
-                    dataset: "task_observations",
-                    source_key: serde_json::to_string(&(&request_id, &component_id))
-                        .unwrap_or_default(),
-                    payload: serde_json::json!({
-                        "request_id": request_id, "namespace": namespace, "component_id": component_id,
-                        "data_class": data_class, "model": model, "status": status, "timestamp": timestamp,
-                        "packages_json": packages, "context_json": context,
-                    })
-                    .to_string(),
-                });
-                if retained_components.contains(&component_id) {
-                    redacted_observation_ids.push(rowid);
-                } else {
-                    expired_observations
-                        .entry(component_id.clone())
-                        .or_insert_with(|| (namespace.clone(), Vec::new()))
-                        .1
-                        .push((rowid, status.clone()));
-                }
-            } else {
-                retained_components.insert(component_id);
-            }
-        }
+        let ObservationPlan {
+            records: observation_records,
+            folded: expired_observations,
+            redacted: redacted_observation_ids,
+        } = plan_observation_retention(
+            observation_rows,
+            &policies,
+            now,
+            &mut cursor.retained_components,
+        );
+        records.extend(observation_records);
 
-        cursor.retained_components = retained_components;
         // Content events carry no namespace or class: only the dataset-wide
         // policy applies.
         let content_cutoff = effective_policy(&policies, CONTENT_EVENTS_DATASET, "", "")
@@ -3533,17 +3653,18 @@ impl SekaiDb {
                 .optional()
                 .map_err(|e| e.to_string())?
                 .unwrap_or((0, 0, 0));
-            let succeeded = rows.iter().filter(|(_, status)| status == "done").count() as i32;
-            let trailing_failures = rows
+            let statuses = rows
                 .iter()
-                .rev()
-                .take_while(|(_, status)| status != "done")
-                .count() as i32;
-            let consecutive_failures = if trailing_failures == rows.len() as i32 {
-                baseline.2 + trailing_failures
-            } else {
-                trailing_failures
-            };
+                .map(|(_, status)| status.clone())
+                .collect::<Vec<_>>();
+            let (task_total, task_succeeded, consecutive_failures) = fold_observation_baseline(
+                (
+                    i64::from(baseline.0),
+                    i64::from(baseline.1),
+                    i64::from(baseline.2),
+                ),
+                &statuses,
+            );
             tx.execute(
                 "INSERT INTO sekai_task_observation_baselines
                  (component_id,namespace,task_total,task_succeeded,consecutive_failures,created)
@@ -3554,8 +3675,8 @@ impl SekaiDb {
                 params![
                     component_id,
                     namespace,
-                    baseline.0 + rows.len() as i32,
-                    baseline.1 + succeeded,
+                    task_total,
+                    task_succeeded,
                     consecutive_failures,
                     now / 1000
                 ],
@@ -3749,17 +3870,18 @@ impl SekaiDb {
                 .optional()
                 .map_err(|e| e.to_string())?
                 .unwrap_or((0, 0, 0));
-            let succeeded = rows.iter().filter(|(_, status)| status == "done").count() as i32;
-            let trailing_failures = rows
+            let statuses = rows
                 .iter()
-                .rev()
-                .take_while(|(_, status)| status != "done")
-                .count() as i32;
-            let consecutive_failures = if trailing_failures == rows.len() as i32 {
-                baseline.2 + trailing_failures
-            } else {
-                trailing_failures
-            };
+                .map(|(_, status)| status.clone())
+                .collect::<Vec<_>>();
+            let (task_total, task_succeeded, consecutive_failures) = fold_observation_baseline(
+                (
+                    i64::from(baseline.0),
+                    i64::from(baseline.1),
+                    i64::from(baseline.2),
+                ),
+                &statuses,
+            );
             tx.execute(
                 "INSERT INTO sekai_task_observation_baselines
                  (component_id, namespace, task_total, task_succeeded, consecutive_failures, created)
@@ -3773,8 +3895,8 @@ impl SekaiDb {
                 params![
                     component_id,
                     namespace,
-                    baseline.0 + rows.len() as i32,
-                    baseline.1 + succeeded,
+                    task_total,
+                    task_succeeded,
                     consecutive_failures,
                     now / 1000
                 ],
@@ -3806,21 +3928,7 @@ fn erase_expired_llm_call_versions(
     crate::sekai::dataset::erase_matching_dataset_version_rows_tx(
         tx,
         LLM_CALLS_DATASET,
-        &|row: &std::collections::HashMap<String, String>| {
-            let namespace = row.get("project").map(String::as_str).unwrap_or_default();
-            let data_class = row
-                .get("data_class")
-                .map(String::as_str)
-                .unwrap_or_default();
-            let timestamp = row
-                .get("timestamp_ms")
-                .and_then(|value| value.parse::<i64>().ok());
-            matches!(
-                (timestamp, effective_policy(policies, LLM_CALLS_DATASET, namespace, data_class)),
-                (Some(timestamp), Some(policy))
-                    if timestamp < now - i64::from(policy.retention_days) * DAY_MS
-            )
-        },
+        &|row: &std::collections::HashMap<String, String>| llm_call_expired(row, policies, now),
     )
 }
 
