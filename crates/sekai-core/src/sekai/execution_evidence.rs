@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn overdue_redemption_alerts_without_promoting_success() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
 
         let redemption = Redemption {
             version: "external-action.redemption/v1".into(),
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn overdue_redemptions_alert_in_one_reconcile_batch() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
 
         for (n, redemption_id) in [("1", "redemption-1"), ("2", "redemption-2")] {
             let redemption = Redemption {
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn admitted_funnel_reports_advance_without_collapsing_terminal_state() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         db.create_object(&Object {
             id: "action-1".into(),
             kind: "action".into(),

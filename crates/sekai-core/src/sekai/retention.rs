@@ -6079,7 +6079,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_removes_saved_filters_and_budget_events() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         db.create_object(&crate::domain::Object {
             id: "agent-object".into(),
             kind: "agent".into(),
@@ -6186,7 +6186,7 @@ mod tests {
 
     #[test]
     fn subject_erasure_spans_stores_and_preserves_verifiable_tombstones() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         for (id, external_id) in [
             ("agent-object", "agent:erase-agent"),
             ("keep-object", "agent:keep-agent"),

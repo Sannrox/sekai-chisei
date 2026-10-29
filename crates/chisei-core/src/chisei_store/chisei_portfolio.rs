@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn damped_route_matches_shared_contract() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         assert_route_contract(|namespace, task_class, proposed_model, now_ms, force| {
             db.portfolio_damped_route(
                 namespace,
@@ -342,7 +342,7 @@ mod tests {
             ).unwrap();
         }
 
-        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let db = crate::chisei_store::open_sekai_with_chisei_schema(path.to_str().unwrap());
         let points = db.portfolio_points("acme", "primary").unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn persistence_boundary_canonicalizes_an_empty_variant() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         db.portfolio_record_observation(&Observation {
             namespace: "acme".into(),
             task_class: "primary".into(),

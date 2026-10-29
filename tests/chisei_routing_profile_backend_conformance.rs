@@ -3,7 +3,7 @@
 
 use sekai_chisei::chisei::routing_profiles::HostedRoutingProfile;
 use sekai_chisei::chisei_store::chisei_routing_profile::ChiseiRoutingProfileBackend;
-use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::db::postgres::PostgresDb;
 
 fn profile(namespace: &str, name: &str, origin: &str) -> HostedRoutingProfile {
     HostedRoutingProfile {
@@ -86,17 +86,21 @@ fn exercise(db: &dyn ChiseiRoutingProfileBackend, prefix: &str) {
 
 #[test]
 fn sqlite_routing_profile_backend_conformance() {
-    exercise(&SekaiDb::new(":memory:").unwrap(), "sqlite");
+    exercise(
+        &sekai_chisei::chisei_store::memory_sekai_with_chisei_schema(),
+        "sqlite",
+    );
 }
 
 fn postgres() -> PostgresDb {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+    let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
         PostgresDb::connect_with_ca_certificate(&url, 4, &std::fs::read(path).unwrap()).unwrap()
     } else {
         PostgresDb::connect(&url, 4).unwrap()
-    }
+    };
+    sekai_chisei::chisei_store::postgres_with_chisei_schema(db)
 }
 
 #[test]

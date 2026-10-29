@@ -188,6 +188,7 @@ mod tests {
     fn measured_request_is_recorded_once() {
         let sqlite = SekaiDb::new(":memory:").unwrap();
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(sqlite));
+        crate::chisei_store::apply_chisei_schema(&db);
         let first = record_transform_usage(&db, "tenant-a", &run("run-1"), "local", 20).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].unit, UsageUnit::Requests);

@@ -9,7 +9,9 @@
 
 use sekai_chisei::chisei::eval::{EvalStore, Suite};
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
-use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
+use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
+
+use crate::replica_safety_harness::open_replica_pair;
 use sekai_chisei::sekai::coordination::{
     ADMISSION_POLICY_FIFO, ContentionScope, ReconcileFilter, WORK_UNIT_STATUS_PENDING,
     WORK_UNIT_STATUS_STALE, WorkUnit,
@@ -36,7 +38,7 @@ fn inventory_covers_parent_authoritative_surfaces_with_evidence() {
 
 #[test]
 fn budget_cannot_overspend_under_two_replicas() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("closeout", METRIC_TOKENS, 10, "daily")
         .unwrap();
@@ -52,7 +54,7 @@ fn budget_cannot_overspend_under_two_replicas() {
 
 #[test]
 fn lease_and_admission_converge_and_stale_work_recovers() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
 
     let leases = pair.race_results(2, |i, db| {
         let owner = format!("w{i}");
@@ -134,7 +136,7 @@ fn lease_and_admission_converge_and_stale_work_recovers() {
 
 #[test]
 fn credential_reload_and_eval_share_across_replicas() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     let secret = "closeout-secret";
     let hash = hash_gateway_key(secret);
     pair.a

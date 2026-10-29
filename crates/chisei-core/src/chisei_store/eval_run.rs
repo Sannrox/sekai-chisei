@@ -920,7 +920,7 @@ mod tests {
     #[test]
     fn a_run_is_bound_to_an_artifact_only_when_created() {
         use crate::chisei::eval_run::tests::spec;
-        let db = sekai_core::db::runtime_db::RuntimeDb::memory();
+        let db = crate::chisei_store::ChiseiStore::memory().runtime_arc();
         let bound = EvalRunSpec {
             run_id: "bound".into(),
             ..spec(1, 1_000)
@@ -942,7 +942,7 @@ mod tests {
             run_id: "unbound".into(),
             ..spec(1, 1_000)
         };
-        crate::chisei::eval_run::EvalRunStore::put_dataset_run(&db, &unbound, 3).unwrap();
+        crate::chisei::eval_run::EvalRunStore::put_dataset_run(db.as_ref(), &unbound, 3).unwrap();
         assert_eq!(
             db.put_bound_dataset_run(&unbound, &digest("ab"), 4)
                 .unwrap()
@@ -1069,7 +1069,8 @@ mod tests {
 
     #[test]
     fn sqlite_eval_runs_keep_the_first_spec_and_result() {
-        contract(&RuntimeDb::memory(), "acme");
+        let db = crate::chisei_store::ChiseiStore::memory().runtime_arc();
+        contract(db.as_ref(), "acme");
     }
 
     #[test]
@@ -1085,10 +1086,13 @@ mod tests {
             ),
             Err(_) => sekai_core::db::postgres::PostgresDb::connect(&url, 4),
         };
-        let db = RuntimeDb::Postgres(Arc::new(db.unwrap()));
+        let db = crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(
+            RuntimeDb::Postgres(Arc::new(db.unwrap())),
+        ))
+        .runtime_arc();
         // A namespace of its own, so concurrent runs on one database do not
         // share a run.
         let namespace = format!("eval-run-{}-{}", std::process::id(), uuid::Uuid::new_v4());
-        contract(&db, &namespace);
+        contract(db.as_ref(), &namespace);
     }
 }

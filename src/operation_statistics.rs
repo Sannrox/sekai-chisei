@@ -869,6 +869,12 @@ mod tests {
         }
     }
 
+    fn memory_runtime() -> RuntimeDb {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        crate::chisei_store::apply_chisei_schema(&db);
+        db
+    }
+
     fn receipt(
         operation_id: &str,
         namespace: &str,
@@ -897,7 +903,7 @@ mod tests {
 
     #[test]
     fn reconciles_attempts_cost_outcomes_and_learning_without_content() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         let first_id = "attempt-1";
         let mut first_context = event(first_id, 3, 130, ReceiptEventKind::ContextGoverned, &[]);
         first_context.references = vec![GovernedReference {
@@ -1069,7 +1075,7 @@ mod tests {
 
     #[test]
     fn attributes_priced_spend_to_outcome_classes_and_capabilities() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         let mut success = receipt(
             "success-1",
             "alpha",
@@ -1208,7 +1214,7 @@ mod tests {
 
     #[test]
     fn paginates_receipts_and_applies_inclusive_exclusive_event_bounds() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         for index in 0..129 {
             let operation_id = format!("op-{index:03}");
             let timestamp = 1_000 + index;
@@ -1250,7 +1256,7 @@ mod tests {
 
     #[test]
     fn waiting_time_sums_repeated_cycles_and_excludes_resolved_pre_window_waits() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         let operation_id = "waiting";
         db.put_operation_receipt(&receipt(
             operation_id,
@@ -1311,7 +1317,7 @@ mod tests {
 
     #[test]
     fn classifies_terminal_parked_unverified_and_unknown_operations() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         for (operation_id, kind, status) in [
             (
                 "dispatch-failure",
@@ -1371,7 +1377,7 @@ mod tests {
 
     #[test]
     fn learning_admissions_include_only_current_active_memories_in_window() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         for (id, state, promoted_at) in [
             ("active", "active", 100),
             ("rejected", "rejected", 110),
@@ -1403,7 +1409,7 @@ mod tests {
 
     #[test]
     fn reports_bounded_epistemic_usage_and_explicit_accounting() {
-        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let db = memory_runtime();
         db.put_operation_receipt(&receipt(
             "epistemic-report",
             "alpha",

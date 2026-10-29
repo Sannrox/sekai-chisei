@@ -3,7 +3,9 @@
 //! Uses the two-replica SQLite harness. Pass criteria are durable outcomes only.
 
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
-use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
+use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
+
+use crate::replica_safety_harness::open_replica_pair;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,7 +14,7 @@ fn concurrent_replicas_cannot_overspend_shared_limit() {
     let inventory = ReplicaSafetyInventory::load().unwrap();
     inventory.require_authoritative("chisei.budget").unwrap();
 
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("ns", METRIC_TOKENS, 100, "daily")
         .unwrap();
@@ -35,7 +37,7 @@ fn concurrent_replicas_cannot_overspend_shared_limit() {
 
 #[test]
 fn idempotent_reserve_converges_across_replicas() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("global", METRIC_TOKENS, 50, "daily")
         .unwrap();
@@ -65,7 +67,7 @@ fn idempotent_reserve_converges_across_replicas() {
 
 #[test]
 fn idempotent_record_does_not_double_spend_across_replicas() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("agent", METRIC_TOKENS, 1_000, "daily")
         .unwrap();
@@ -99,7 +101,7 @@ fn idempotent_record_does_not_double_spend_across_replicas() {
 
 #[test]
 fn conflicting_idempotency_payload_is_rejected_not_double_spent() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("global", METRIC_TOKENS, 100, "daily")
         .unwrap();
@@ -127,7 +129,7 @@ fn conflicting_idempotency_payload_is_rejected_not_double_spent() {
 
 #[test]
 fn limit_written_on_one_replica_is_enforced_on_the_other() {
-    let pair = TwoReplicaSqlite::open().unwrap();
+    let pair = open_replica_pair();
     pair.a
         .budget_set_limit("shared", METRIC_TOKENS, 5, "daily")
         .unwrap();

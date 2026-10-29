@@ -234,80 +234,6 @@ impl SekaiDb {
         Ok(limits)
     }
 
-    pub fn migrate_budget(&self) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
-                scope_id TEXT NOT NULL,
-                metric TEXT NOT NULL DEFAULT 'tokens',
-                parent_scope_id TEXT NOT NULL DEFAULT '',
-                max_amount INTEGER NOT NULL,
-                period_type TEXT NOT NULL,
-                home_site_id TEXT NOT NULL DEFAULT '',
-                pool_id TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (scope_id, metric)
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_usage (
-                scope_id TEXT NOT NULL,
-                metric TEXT NOT NULL DEFAULT 'tokens',
-                period_start INTEGER NOT NULL,
-                amount_used INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (scope_id, metric, period_start)
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_usage_events (
-                idempotency_key TEXT PRIMARY KEY,
-                scope_id TEXT NOT NULL,
-                metric TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_attributions (
-                source_scope_id TEXT NOT NULL,
-                applied_scope_id TEXT NOT NULL,
-                metric TEXT NOT NULL,
-                period_start INTEGER NOT NULL,
-                amount_used INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (source_scope_id, applied_scope_id, metric, period_start)
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_work_unit_defaults (
-                scope_id TEXT NOT NULL,
-                metric TEXT NOT NULL,
-                max_amount INTEGER NOT NULL,
-                period_type TEXT NOT NULL,
-                home_site_id TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (scope_id, metric)
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_pools (
-                pool_id TEXT NOT NULL,
-                metric TEXT NOT NULL,
-                max_amount INTEGER NOT NULL,
-                period_type TEXT NOT NULL DEFAULT 'daily',
-                PRIMARY KEY (pool_id, metric)
-            );
-            CREATE TABLE IF NOT EXISTS chisei_budget_transfers (
-                transfer_id TEXT PRIMARY KEY,
-                metric TEXT NOT NULL,
-                pool_id TEXT NOT NULL DEFAULT '',
-                from_scope_id TEXT NOT NULL,
-                to_scope_id TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                actor TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );",
-        )
-        .map_err(|e| e.to_string())?;
-        // Forward-compatible columns for databases created before #294.
-        for ddl in [
-            "ALTER TABLE chisei_budget_limits ADD COLUMN home_site_id TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE chisei_budget_limits ADD COLUMN pool_id TEXT NOT NULL DEFAULT ''",
-        ] {
-            let _ = conn.execute(ddl, []);
-        }
-        Ok(())
-    }
-
     pub fn budget_set_limit(
         &self,
         scope_id: &str,
@@ -1540,7 +1466,9 @@ mod tests {
     #[test]
     fn concurrent_reservations_do_not_exceed_shared_limit() {
         let path = std::env::temp_dir().join(format!("sekai-budget-{}.db", uuid::Uuid::new_v4()));
-        let db = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        let db = Arc::new(SekaiDb::open_for_chisei_sql_functions(
+            path.to_str().unwrap(),
+        ));
         db.budget_set_limit("global", METRIC_TOKENS, 10, "daily")
             .unwrap();
         let barrier = Arc::new(Barrier::new(2));

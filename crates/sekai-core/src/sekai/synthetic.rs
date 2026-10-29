@@ -1551,7 +1551,7 @@ mod tests {
         )
         .unwrap();
         let _guard = install_test_signer(keys.clone());
-        let db = RuntimeDb::memory();
+        let db = RuntimeDb::memory_for_chisei_sql_functions();
         let plan = generate(&SupplyChain, &spec(SizePreset::Demo)).unwrap();
         apply(&db, &plan).unwrap();
         for action in &plan.actions {

@@ -16,7 +16,6 @@ use crate::db::sekai::PrincipalCredential;
 
 const MIGRATION_LOCK_ID: i64 = 0x5345_4b41_4948_4101;
 const CONTROL_PLANE_SCHEMA: &str = include_str!("postgres/0001_control_plane.sql");
-const CONTROL_PLANE_CHISEI_SCHEMA: &str = include_str!("postgres/0001_control_plane_chisei.sql");
 const OPERATION_RECEIPTS_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS chisei_operation_receipts (
     operation_id TEXT PRIMARY KEY,
@@ -37,10 +36,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_chisei_operation_receipts_lookup
     ON chisei_operation_receipts(caller_scope, lookup_request_id)
     WHERE lookup_request_id IS NOT NULL AND alias_retired = 0;
 ";
-const SAMPLE_LEASE_SCHEMA: &str = include_str!("postgres/0002_sample_leases.sql");
 const UNIQUE_GRANT_SCHEMA: &str = include_str!("postgres/0003_unique_grants.sql");
-const PORTFOLIO_PROMPT_VARIANT_SCHEMA: &str =
-    include_str!("postgres/0004_portfolio_prompt_variants.sql");
 const TENANT_SCHEMA: &str = include_str!("postgres/0005_tenants.sql");
 const NAMESPACE_OWNERSHIP_SCHEMA: &str = include_str!("postgres/0006_namespace_ownership.sql");
 const TENANT_MEMBERSHIP_SCHEMA: &str = include_str!("postgres/0007_tenant_memberships.sql");
@@ -54,9 +50,6 @@ const RETENTION_DEDUPLICATION_PARITY_SCHEMA: &str =
 const ACTION_GOVERNANCE_PARITY_SCHEMA: &str =
     include_str!("postgres/0014_action_governance_parity.sql");
 const TEAM_NAMESPACE_PARITY_SCHEMA: &str = include_str!("postgres/0016_team_namespace_parity.sql");
-const CHISEI_EXECUTION_PARITY_SCHEMA: &str =
-    include_str!("postgres/0017_chisei_execution_parity.sql");
-const BUDGET_TOPOLOGY_SCHEMA: &str = include_str!("postgres/0018_budget_topology.sql");
 const LEASE_SITE_ID_SCHEMA: &str = include_str!("postgres/0019_lease_site_id.sql");
 const GOVERNED_ACTION_TYPES_SCHEMA: &str = include_str!("postgres/0020_governed_action_types.sql");
 const GOVERNED_ACTION_INSTANCES_SCHEMA: &str =
@@ -64,11 +57,6 @@ const GOVERNED_ACTION_INSTANCES_SCHEMA: &str =
 const ACTION_EFFECTS_SCHEMA: &str = include_str!("postgres/0022_action_effects.sql");
 const PARKED_WORK_CONTINUATION_SCHEMA: &str =
     include_str!("postgres/0023_parked_work_continuation.sql");
-const EVALUATION_PLANS_SCHEMA: &str = include_str!("postgres/0024_evaluation_plans.sql");
-const EVALUATION_MANIFESTS_SCHEMA: &str = include_str!("postgres/0025_evaluation_manifests.sql");
-const EVALUATION_EXECUTIONS_SCHEMA: &str = include_str!("postgres/0026_evaluation_executions.sql");
-const GOVERNED_SUBJECT_PROVENANCE_SCHEMA: &str =
-    include_str!("postgres/0027_governed_subject_provenance.sql");
 const REMOVE_LEGACY_ACTIONS_SCHEMA: &str = include_str!("postgres/0028_remove_legacy_actions.sql");
 const OBJECT_SYNC_SCHEMA: &str = include_str!("postgres/0029_object_sync.sql");
 const SOURCE_CHANGE_FEED_SCHEMA: &str = include_str!("postgres/0030_source_change_feed.sql");
@@ -92,12 +80,8 @@ const OBJECT_TYPE_INDEX_JOIN_VALUE_SCHEMA: &str =
     include_str!("postgres/0044_object_type_index_join_value.sql");
 const OBJECT_TYPE_INDEX_JOIN_GENERATION_SCHEMA: &str =
     include_str!("postgres/0045_object_type_index_join_generation.sql");
-const CHISEI_OPERATION_RESERVATIONS_SCHEMA: &str =
-    include_str!("postgres/0046_chisei_operation_reservations.sql");
 const STORE_CUTOVER_SCHEMA: &str = include_str!("postgres/0047_store_cutover.sql");
 const STORE_CUTOVER_PAIRING_SCHEMA: &str = include_str!("postgres/0048_store_cutover_pairing.sql");
-const CHISEI_ROUTING_PROFILES_SCHEMA: &str =
-    include_str!("postgres/0049_chisei_routing_profiles.sql");
 const GOVERNED_TRANSFORMS_SCHEMA: &str = include_str!("postgres/0050_governed_transforms.sql");
 const OBSERVATION_EXTERNAL_ID_SCHEMA: &str =
     include_str!("postgres/0051_observation_external_id.sql");
@@ -116,18 +100,11 @@ const NAMESPACE_OBJECT_GENERATION_SCHEMA: &str =
     include_str!("postgres/0059_namespace_object_generation.sql");
 const PARTITIONED_TRANSFORM_IO_SCHEMA: &str =
     include_str!("postgres/0060_partitioned_transform_io.sql");
-const CHISEI_MODEL_REVIEW_SCHEMA: &str = include_str!("postgres/0061_chisei_model_review.sql");
-const ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA: &str =
-    include_str!("postgres/0062_routing_profile_artifact_digest.sql");
-const CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA: &str =
-    include_str!("postgres/0063_chisei_model_release_evidence.sql");
 const AGENT_DEFINITION_CERTIFICATION_SCHEMA: &str =
     include_str!("postgres/0064_agent_definition_certification.sql");
 const DEFINITION_PROPOSAL_MERGED_HISTORY_SCHEMA: &str =
     include_str!("postgres/0065_definition_proposal_merged_history.sql");
 const SERVICE_PRINCIPALS_SCHEMA: &str = include_str!("postgres/0066_service_principals.sql");
-const CHISEI_GUNSHI_ALLOCATION_STATE_SCHEMA: &str =
-    include_str!("postgres/0067_chisei_gunshi_allocation_state.sql");
 const FEDERATION_NETWORK_AND_PROFILE_SCHEMA: &str =
     include_str!("postgres/0068_federation_network_and_profile.sql");
 const FEDERATION_SNAPSHOTS_AND_PROVENANCE_SCHEMA: &str =
@@ -140,12 +117,10 @@ const DATASET_VERSIONS_SCHEMA: &str = include_str!("postgres/0073_dataset_versio
 const TRANSFORM_QUOTA_HOLD_SCHEMA: &str = include_str!("postgres/0074_transform_quota_hold.sql");
 const TRANSFORM_WORK_TENANT_SCHEMA: &str = include_str!("postgres/0075_transform_work_tenant.sql");
 const TRANSFORM_QUOTA_OWNER_SCHEMA: &str = include_str!("postgres/0076_transform_quota_owner.sql");
-const CHISEI_USAGE_EVENTS_SCHEMA: &str = include_str!("postgres/0077_chisei_usage_events.sql");
 const TRANSFORM_USAGE_PENDING_SCHEMA: &str =
     include_str!("postgres/0078_transform_usage_pending.sql");
 const DATASET_HEALTH_CHECKS_SCHEMA: &str = include_str!("postgres/0079_dataset_health_checks.sql");
 const SEARCH_INDEX_SCHEMA: &str = include_str!("postgres/0080_search_index.sql");
-const RECEIPT_CHAIN_SCHEMA: &str = include_str!("postgres/0081_receipt_chain.sql");
 const GRANT_TERMS_SCHEMA: &str = include_str!("postgres/0082_grant_terms.sql");
 const WRITE_FREEZE_SCHEMA: &str = include_str!("postgres/0083_write_freeze.sql");
 const DECISION_MEMORY_SCHEMA: &str = include_str!("postgres/0084_decision_memory.sql");
@@ -156,19 +131,15 @@ const AGENT_CERTIFICATION_SCORE_SCHEMA: &str =
     include_str!("postgres/0087_agent_certification_score.sql");
 const DATASET_BRANCHES_SCHEMA: &str = include_str!("postgres/0088_dataset_branches.sql");
 const TRANSFORM_REPLAYS_SCHEMA: &str = include_str!("postgres/0089_transform_replays.sql");
-const CHISEI_POLICY_SHADOW_SCHEMA: &str = include_str!("postgres/0090_chisei_policy_shadow.sql");
 const FENCE_BINDINGS_SCHEMA: &str = include_str!("postgres/0091_fence_bindings.sql");
 const MEDIA_UPLOADS_SCHEMA: &str = include_str!("postgres/0092_media_uploads.sql");
 const OBJECT_CHANGE_OPERATION_SCHEMA: &str =
     include_str!("postgres/0093_object_change_operation.sql");
 const SYNC_SCOPES_SCHEMA: &str = include_str!("postgres/0094_sync_scopes.sql");
 const EMBEDDING_SPECS_SCHEMA: &str = include_str!("postgres/0095_embedding_specs.sql");
-const DATASET_RUNS_SCHEMA: &str = include_str!("postgres/0096_chisei_dataset_runs.sql");
 const SYNC_MEMBER_PROPERTIES_SCHEMA: &str =
     include_str!("postgres/0097_sync_member_properties.sql");
 const OBJECT_CHANGE_WRITER_SCHEMA: &str = include_str!("postgres/0098_object_change_writer.sql");
-const DATASET_RUN_ARTIFACTS_SCHEMA: &str =
-    include_str!("postgres/0099_chisei_dataset_run_artifacts.sql");
 const ACTION_PLANS_SCHEMA: &str = include_str!("postgres/0100_sekai_action_plans.sql");
 const DEFINITION_BUNDLE_APPLIES_SCHEMA: &str =
     include_str!("postgres/0101_definition_bundle_applies.sql");
@@ -204,12 +175,8 @@ const TRANSFORM_RUN_OUTPUT_VERSION_SCHEMA: &str =
     include_str!("postgres/0119_transform_run_output_version.sql");
 const TRANSFORM_RUNTIME_LABELS_SCHEMA: &str =
     include_str!("postgres/0122_transform_runtime_labels.sql");
-const CHISEI_RESERVATION_CHARGE_KEY_SCHEMA: &str =
-    include_str!("postgres/0123_chisei_reservation_charge_key.sql");
 const SECURITY_PACKAGE_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0124_security_package_identity.sql");
-const BUDGET_WORK_UNIT_DEFAULTS_SCHEMA: &str =
-    include_str!("postgres/0125_budget_work_unit_defaults.sql");
 const SECURITY_DISPOSITION_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0126_security_disposition_identity.sql");
 const FEDERATED_ALLOWANCES_SCHEMA: &str = include_str!("postgres/0127_federated_allowances.sql");
@@ -262,7 +229,7 @@ const fn mig(
 
 impl Migration {
     fn statements(self, plane: SchemaPlane) -> Vec<&'static str> {
-        match (self.owner, self.extra_sql, plane) {
+        let statements = match (self.owner, self.extra_sql, plane) {
             (MigrationOwner::Sekai, _, SchemaPlane::Chisei) => Vec::new(),
             (MigrationOwner::Chisei, _, SchemaPlane::Sekai) => Vec::new(),
             (MigrationOwner::Both, Some(extra), SchemaPlane::Shared) => {
@@ -271,8 +238,22 @@ impl Migration {
             (MigrationOwner::Both, Some(extra), SchemaPlane::Chisei) => vec![extra],
             (MigrationOwner::Both, Some(_), SchemaPlane::Sekai) => vec![self.sql],
             _ => vec![self.sql],
-        }
+        };
+        statements
+            .into_iter()
+            .filter(|sql| !sql.trim().is_empty())
+            .collect()
     }
+}
+
+/// Owner-specific SQL the other plane's persist crate applies after open.
+/// Version numbers and names must match the history this crate records.
+pub struct PlaneSql {
+    pub version: i64,
+    pub name: &'static str,
+    pub sql: &'static str,
+    /// Apply `sql` even when `version` is already recorded if this relation is absent.
+    pub catch_up_relation: Option<&'static str>,
 }
 
 const MIGRATIONS: &[Migration] = &[
@@ -280,27 +261,17 @@ const MIGRATIONS: &[Migration] = &[
         version: 1,
         name: "control_plane",
         sql: CONTROL_PLANE_SCHEMA,
-        extra_sql: Some(CONTROL_PLANE_CHISEI_SCHEMA),
+        extra_sql: Some(""),
         owner: MigrationOwner::Both,
     },
-    mig(
-        2,
-        "sample_leases",
-        SAMPLE_LEASE_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(2, "sample_leases", "", MigrationOwner::Chisei),
     mig(
         3,
         "unique_grants",
         UNIQUE_GRANT_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        4,
-        "portfolio_prompt_variants",
-        PORTFOLIO_PROMPT_VARIANT_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(4, "portfolio_prompt_variants", "", MigrationOwner::Chisei),
     mig(5, "tenants", TENANT_SCHEMA, MigrationOwner::Sekai),
     mig(
         6,
@@ -362,18 +333,8 @@ const MIGRATIONS: &[Migration] = &[
         TEAM_NAMESPACE_PARITY_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        16,
-        "chisei_execution_parity",
-        CHISEI_EXECUTION_PARITY_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
-    mig(
-        17,
-        "budget_topology",
-        BUDGET_TOPOLOGY_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(16, "chisei_execution_parity", "", MigrationOwner::Chisei),
+    mig(17, "budget_topology", "", MigrationOwner::Chisei),
     mig(
         18,
         "lease_site_id",
@@ -404,28 +365,13 @@ const MIGRATIONS: &[Migration] = &[
         PARKED_WORK_CONTINUATION_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        23,
-        "evaluation_plans",
-        EVALUATION_PLANS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
-    mig(
-        24,
-        "evaluation_manifests",
-        EVALUATION_MANIFESTS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
-    mig(
-        25,
-        "evaluation_executions",
-        EVALUATION_EXECUTIONS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(23, "evaluation_plans", "", MigrationOwner::Chisei),
+    mig(24, "evaluation_manifests", "", MigrationOwner::Chisei),
+    mig(25, "evaluation_executions", "", MigrationOwner::Chisei),
     mig(
         26,
         "governed_subject_provenance",
-        GOVERNED_SUBJECT_PROVENANCE_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -534,7 +480,7 @@ const MIGRATIONS: &[Migration] = &[
     mig(
         45,
         "chisei_operation_reservations",
-        CHISEI_OPERATION_RESERVATIONS_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -550,12 +496,7 @@ const MIGRATIONS: &[Migration] = &[
         MigrationOwner::Both,
     ),
     // Versions run one behind the file prefixes: `0049_*.sql` is version 48.
-    mig(
-        48,
-        "chisei_routing_profiles",
-        CHISEI_ROUTING_PROFILES_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(48, "chisei_routing_profiles", "", MigrationOwner::Chisei),
     mig(
         49,
         "governed_transforms",
@@ -623,16 +564,11 @@ const MIGRATIONS: &[Migration] = &[
         PARTITIONED_TRANSFORM_IO_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        60,
-        "chisei_model_review",
-        CHISEI_MODEL_REVIEW_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(60, "chisei_model_review", "", MigrationOwner::Chisei),
     mig(
         61,
         "routing_profile_artifact_digest",
-        ROUTING_PROFILE_ARTIFACT_DIGEST_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     // #1499 shipped version 61 on main. Evidence is 62 so those installs
@@ -640,7 +576,7 @@ const MIGRATIONS: &[Migration] = &[
     mig(
         62,
         "chisei_model_release_evidence",
-        CHISEI_MODEL_RELEASE_EVIDENCE_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -664,7 +600,7 @@ const MIGRATIONS: &[Migration] = &[
     mig(
         66,
         "chisei_gunshi_allocation_state",
-        CHISEI_GUNSHI_ALLOCATION_STATE_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -721,12 +657,7 @@ const MIGRATIONS: &[Migration] = &[
         TRANSFORM_QUOTA_OWNER_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        76,
-        "chisei_usage_events",
-        CHISEI_USAGE_EVENTS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(76, "chisei_usage_events", "", MigrationOwner::Chisei),
     mig(
         77,
         "transform_usage_pending",
@@ -745,12 +676,7 @@ const MIGRATIONS: &[Migration] = &[
         SEARCH_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        80,
-        "receipt_chain",
-        RECEIPT_CHAIN_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(80, "receipt_chain", "", MigrationOwner::Chisei),
     mig(81, "grant_terms", GRANT_TERMS_SCHEMA, MigrationOwner::Sekai),
     mig(
         82,
@@ -794,12 +720,7 @@ const MIGRATIONS: &[Migration] = &[
         TRANSFORM_REPLAYS_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        89,
-        "chisei_policy_shadow",
-        CHISEI_POLICY_SHADOW_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(89, "chisei_policy_shadow", "", MigrationOwner::Chisei),
     mig(
         90,
         "fence_bindings",
@@ -825,12 +746,7 @@ const MIGRATIONS: &[Migration] = &[
         EMBEDDING_SPECS_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        95,
-        "chisei_dataset_runs",
-        DATASET_RUNS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(95, "chisei_dataset_runs", "", MigrationOwner::Chisei),
     mig(
         96,
         "sync_member_properties",
@@ -846,7 +762,7 @@ const MIGRATIONS: &[Migration] = &[
     mig(
         98,
         "chisei_dataset_run_artifacts",
-        DATASET_RUN_ARTIFACTS_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -990,7 +906,7 @@ const MIGRATIONS: &[Migration] = &[
     mig(
         122,
         "chisei_reservation_charge_key",
-        CHISEI_RESERVATION_CHARGE_KEY_SCHEMA,
+        "",
         MigrationOwner::Chisei,
     ),
     mig(
@@ -999,12 +915,7 @@ const MIGRATIONS: &[Migration] = &[
         SECURITY_PACKAGE_IDENTITY_SCHEMA,
         MigrationOwner::Sekai,
     ),
-    mig(
-        124,
-        "budget_work_unit_defaults",
-        BUDGET_WORK_UNIT_DEFAULTS_SCHEMA,
-        MigrationOwner::Chisei,
-    ),
+    mig(124, "budget_work_unit_defaults", "", MigrationOwner::Chisei),
     mig(
         125,
         "security_disposition_identity",
@@ -1169,6 +1080,7 @@ pub struct PostgresDb {
     pool: Pool<Manager>,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
     schema_plane: SchemaPlane,
+    chisei_schema: std::sync::OnceLock<()>,
     pub search_maintenance: Mutex<()>,
     /// Identity extension an enterprise assembly injects (#1613), as on
     /// SQLite; `None` on the community runtime.
@@ -1274,6 +1186,7 @@ impl PostgresDb {
             pool,
             plane: std::sync::OnceLock::new(),
             schema_plane,
+            chisei_schema: std::sync::OnceLock::new(),
             search_maintenance: Mutex::new(()),
             enterprise_extension: None,
         };
@@ -1577,6 +1490,119 @@ impl PostgresDb {
         self.migrate_with(MIGRATIONS)
     }
 
+    /// Apply SQL owned by the other plane. History names must match this crate.
+    /// Already-recorded versions are skipped unless `catch_up_relation` is absent.
+    pub fn apply_plane_sql(&self, migrations: &[PlaneSql]) -> Result<(), String> {
+        if matches!(self.schema_plane, SchemaPlane::Sekai) {
+            return Ok(());
+        }
+        if self.chisei_schema.get().is_some() {
+            return Ok(());
+        }
+        let known: HashMap<i64, &Migration> = MIGRATIONS
+            .iter()
+            .map(|migration| (migration.version, migration))
+            .collect();
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| format!("begin PostgreSQL plane SQL: {error}"))?;
+        transaction
+            .query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK_ID])
+            .map_err(|error| format!("lock PostgreSQL migrations: {error}"))?;
+        transaction
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS sekai_schema_migrations (
+                    version BIGINT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at BIGINT NOT NULL
+                );",
+            )
+            .map_err(|error| format!("initialize PostgreSQL migrations: {error}"))?;
+        let rows = transaction
+            .query(
+                "SELECT version, name FROM sekai_schema_migrations ORDER BY version",
+                &[],
+            )
+            .map_err(|error| format!("read PostgreSQL migration state: {error}"))?;
+        let mut applied = HashMap::new();
+        for row in &rows {
+            let version: i64 = row.get(0);
+            let name: String = row.get(1);
+            applied.insert(version, name);
+        }
+        for migration in migrations {
+            if migration.sql.trim().is_empty() {
+                continue;
+            }
+            match known.get(&migration.version) {
+                None => {
+                    return Err(format!(
+                        "PostgreSQL plane SQL version {} ({}) is not in the supported history",
+                        migration.version, migration.name
+                    ));
+                }
+                Some(expected) if expected.name != migration.name => {
+                    return Err(format!(
+                        "incompatible PostgreSQL plane SQL: version {} ({}) does not match history name {}",
+                        migration.version, migration.name, expected.name
+                    ));
+                }
+                Some(_) => {}
+            }
+            let already = applied.get(&migration.version);
+            if let Some(name) = already {
+                if name != migration.name {
+                    return Err(format!(
+                        "incompatible PostgreSQL migration history: found version {} ({name}), expected version {} ({})",
+                        migration.version, migration.version, migration.name
+                    ));
+                }
+                let catch_up = match migration.catch_up_relation {
+                    Some(relation) => !postgres_relation_exists(&mut transaction, relation)?,
+                    None => false,
+                };
+                if !catch_up {
+                    continue;
+                }
+            }
+            tracing::info!(
+                version = migration.version,
+                name = migration.name,
+                "applying PostgreSQL plane SQL"
+            );
+            transaction.batch_execute(migration.sql).map_err(|error| {
+                format!(
+                    "apply PostgreSQL plane SQL {} ({}): {error}",
+                    migration.version, migration.name
+                )
+            })?;
+            if already.is_none() {
+                transaction
+                    .execute(
+                        "INSERT INTO sekai_schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                        &[
+                            &migration.version,
+                            &migration.name,
+                            &chrono::Utc::now().timestamp_millis(),
+                        ],
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "record PostgreSQL plane SQL {} ({}): {error}",
+                            migration.version, migration.name
+                        )
+                    })?;
+                applied.insert(migration.version, migration.name.to_owned());
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("commit PostgreSQL plane SQL: {error}"))?;
+        let _ = self.chisei_schema.set(());
+        Ok(())
+    }
+
     fn migrate_with(&self, migrations: &[Migration]) -> Result<(), String> {
         let plane = self.schema_plane;
         let mut connection = self.connection()?;
@@ -1681,31 +1707,23 @@ impl PostgresDb {
 }
 
 /// A plane-scoped open records a Both version after applying only its half.
-/// Shared (relocate source) and the other plane still need the missing half
-/// before later owner-specific versions can run.
+/// Shared (relocate source) still needs the Sekai half. Chisei extra SQL is
+/// applied by Chisei persist, not compiled into this crate.
 fn catch_up_split_bootstrap(
     transaction: &mut postgres::Transaction<'_>,
     migration: &Migration,
     plane: SchemaPlane,
 ) -> Result<(), String> {
-    let Some(extra) = migration.extra_sql else {
-        return Ok(());
-    };
     if !matches!(migration.owner, MigrationOwner::Both) {
         return Ok(());
     }
-    if plane.includes_sekai() && !postgres_relation_exists(transaction, "sekai_objects")? {
+    if plane.includes_sekai()
+        && !migration.sql.trim().is_empty()
+        && !postgres_relation_exists(transaction, "sekai_objects")?
+    {
         transaction.batch_execute(migration.sql).map_err(|error| {
             format!(
                 "catch up PostgreSQL Sekai bootstrap {} ({}): {error}",
-                migration.version, migration.name
-            )
-        })?;
-    }
-    if plane.includes_chisei() && !postgres_relation_exists(transaction, "chisei_eval_suites")? {
-        transaction.batch_execute(extra).map_err(|error| {
-            format!(
-                "catch up PostgreSQL Chisei bootstrap {} ({}): {error}",
                 migration.version, migration.name
             )
         })?;
@@ -1983,23 +2001,7 @@ mod tests {
             CONTROL_PLANE_SCHEMA.contains("CREATE TABLE IF NOT EXISTS chisei_operation_receipts"),
             "Sekai-plane v1 must create the per-store receipt table"
         );
-        for table in [
-            "sekai_decisions",
-            "sekai_ledger_anchors",
-            "chisei_eval_suites",
-            "chisei_eval_runs",
-            "chisei_eval_iterations",
-            "chisei_budget_limits",
-            "chisei_budget_usage",
-        ] {
-            assert!(
-                CONTROL_PLANE_CHISEI_SCHEMA
-                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
-                "missing PostgreSQL Chisei control-plane table {table}"
-            );
-        }
         assert!(!CONTROL_PLANE_SCHEMA.contains("chisei_budget_limits"));
-        assert!(!CONTROL_PLANE_CHISEI_SCHEMA.contains("sekai_objects"));
         assert!(REMOVE_LEGACY_ACTIONS_SCHEMA.contains("DROP TABLE IF EXISTS sekai_action_types"));
         assert!(
             REMOVE_LEGACY_ACTIONS_SCHEMA.contains("DROP TABLE IF EXISTS sekai_action_approvals")
@@ -2112,10 +2114,6 @@ mod tests {
             "missing PostgreSQL transform quota owner table"
         );
         assert!(
-            CHISEI_USAGE_EVENTS_SCHEMA.contains("CREATE TABLE IF NOT EXISTS chisei_usage_events"),
-            "missing PostgreSQL usage ledger table"
-        );
-        assert!(
             TRANSFORM_USAGE_PENDING_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_transform_usage_pending"),
             "missing PostgreSQL transform usage pending table"
@@ -2158,9 +2156,6 @@ mod tests {
         assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("CREATE TABLE sekai_source_sync_generations"));
         assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("ADD COLUMN sync_generation BIGINT"));
         assert!(SOURCE_CHANGE_FEED_SCHEMA.contains("ADD COLUMN source_sequence BIGINT"));
-        assert!(SAMPLE_LEASE_SCHEMA.contains("lease_expires_at"));
-        assert!(SAMPLE_LEASE_SCHEMA.contains("IF NOT EXISTS"));
-        assert!(PORTFOLIO_PROMPT_VARIANT_SCHEMA.contains("DEFAULT 'legacy@1'"));
         assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenants"));
         assert!(TENANT_SCHEMA.contains("CREATE TABLE IF NOT EXISTS sekai_tenant_requests"));
         assert!(
@@ -2172,10 +2167,6 @@ mod tests {
         assert!(
             TENANT_MEMBERSHIP_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_tenant_memberships")
-        );
-        assert!(
-            PORTFOLIO_PROMPT_VARIANT_SCHEMA
-                .contains("ADD PRIMARY KEY (namespace, task_class, model, prompt_variant)")
         );
         for table in [
             "sekai_action_policies",
@@ -2198,41 +2189,6 @@ mod tests {
         for excluded in ["tenant", "oauth", "oidc", "chisei", "gateway"] {
             assert!(!TEAM_NAMESPACE_PARITY_SCHEMA.contains(excluded));
         }
-        for table in [
-            "chisei_operation_receipts",
-            "chisei_gateway_request_aliases",
-            "chisei_budget_usage_events",
-            "chisei_budget_attributions",
-            "chisei_kioku_memories",
-            "chisei_external_action_authorizations",
-            "chisei_external_action_permits",
-        ] {
-            assert!(
-                CHISEI_EXECUTION_PARITY_SCHEMA
-                    .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
-                "missing PostgreSQL table {table}"
-            );
-        }
-        for excluded in ["tenant", "oauth", "oidc"] {
-            assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains(excluded));
-        }
-        assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("AUTOINCREMENT"));
-        assert!(!CHISEI_EXECUTION_PARITY_SCHEMA.contains("INSERT OR"));
-        assert!(
-            CHISEI_OPERATION_RESERVATIONS_SCHEMA
-                .contains("CREATE TABLE IF NOT EXISTS chisei_operation_reservations")
-        );
-        for table in ["chisei_budget_pools", "chisei_budget_transfers"] {
-            assert!(
-                BUDGET_TOPOLOGY_SCHEMA.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")),
-                "missing PostgreSQL table {table}"
-            );
-        }
-        assert!(BUDGET_TOPOLOGY_SCHEMA.contains("home_site_id"));
-        assert!(BUDGET_TOPOLOGY_SCHEMA.contains("pool_id"));
-        for excluded in ["tenant", "oauth", "oidc"] {
-            assert!(!BUDGET_TOPOLOGY_SCHEMA.contains(excluded));
-        }
     }
 
     #[test]
@@ -2240,8 +2196,20 @@ mod tests {
         for (index, migration) in MIGRATIONS.iter().enumerate() {
             assert_eq!(migration.version, index as i64 + 1);
             assert!(!migration.name.is_empty());
-            assert!(!migration.sql.trim().is_empty());
+            if matches!(migration.owner, MigrationOwner::Chisei) {
+                assert!(migration.sql.is_empty());
+            } else {
+                assert!(!migration.sql.trim().is_empty());
+            }
         }
+    }
+
+    fn shared_history() -> Vec<(i64, String)> {
+        MIGRATIONS
+            .iter()
+            .filter(|migration| !migration.statements(SchemaPlane::Shared).is_empty())
+            .map(|migration| (migration.version, migration.name.to_owned()))
+            .collect()
     }
 
     #[test]
@@ -2256,11 +2224,7 @@ mod tests {
         db.migrate().unwrap();
         db.migrate().unwrap();
 
-        let expected: Vec<_> = MIGRATIONS
-            .iter()
-            .map(|migration| (migration.version, migration.name.to_owned()))
-            .collect();
-        assert_eq!(migration_rows(&db), expected);
+        assert_eq!(migration_rows(&db), shared_history());
     }
 
     #[test]
@@ -2299,7 +2263,7 @@ mod tests {
                 .unwrap()
                 .get(0);
             assert_eq!(preserved, marker);
-            assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+            assert_eq!(migration_rows(&db), shared_history());
         }
     }
 
@@ -2543,19 +2507,21 @@ mod tests {
         let db = scratch.connect_for_plane(SchemaPlane::Chisei).unwrap();
         let tables = postgres_user_tables(&db);
         assert!(
-            tables.iter().any(|table| table == "sekai_decisions"),
-            "{tables:?}"
-        );
-        assert!(
-            tables.iter().any(|table| table == "chisei_budget_limits"),
-            "{tables:?}"
-        );
-        assert!(
-            tables.iter().any(|table| table == "chisei_usage_events"),
+            tables
+                .iter()
+                .any(|table| table == "chisei_operation_receipts"),
             "{tables:?}"
         );
         assert!(
             !tables.iter().any(|table| table == "sekai_objects"),
+            "{tables:?}"
+        );
+        assert!(
+            !tables.iter().any(|table| table == "chisei_budget_limits"),
+            "{tables:?}"
+        );
+        assert!(
+            !tables.iter().any(|table| table == "chisei_usage_events"),
             "{tables:?}"
         );
     }
@@ -2666,17 +2632,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
-    fn sekai_plane_postgres_then_shared_applies_chisei_bootstrap() {
+    fn sekai_plane_postgres_then_shared_omits_chisei_families() {
         let scratch = ScratchDatabase::create();
         drop(scratch.connect_for_plane(SchemaPlane::Sekai).unwrap());
         let db = scratch.connect();
         let tables = postgres_user_tables(&db);
         assert!(
-            tables.iter().any(|table| table == "chisei_eval_suites"),
+            !tables.iter().any(|table| table == "chisei_eval_suites"),
             "{tables:?}"
         );
         assert!(
-            tables.iter().any(|table| table == "chisei_budget_limits"),
+            !tables.iter().any(|table| table == "chisei_budget_limits"),
             "{tables:?}"
         );
     }
@@ -2688,10 +2654,14 @@ mod tests {
         let db = scratch.connect();
         db.connection()
             .unwrap()
-            .execute(
-                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
-                 VALUES ('user:missed', 1, 'daily')",
-                &[],
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
+                    scope_id TEXT NOT NULL,
+                    max_amount BIGINT NOT NULL,
+                    period_type TEXT NOT NULL
+                 );
+                 INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:missed', 1, 'daily');",
             )
             .unwrap();
         drop(db);
@@ -2707,7 +2677,12 @@ mod tests {
         db.connection()
             .unwrap()
             .batch_execute(
-                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
+                    scope_id TEXT NOT NULL,
+                    max_amount BIGINT NOT NULL,
+                    period_type TEXT NOT NULL
+                 );
+                 INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
                  VALUES ('user:leftover', 1, 'daily');
                  INSERT INTO sekai_store_cutover (id, generation, fence_raised, raised_at_ms)
                  VALUES (1, 1, 1, 0);",
@@ -2715,6 +2690,34 @@ mod tests {
             .unwrap();
         drop(db);
         scratch.connect_for_plane(SchemaPlane::Sekai).unwrap();
+    }
+
+    #[test]
+    fn store_cutover_migrations_apply_on_every_plane() {
+        for name in ["store_cutover", "store_cutover_pairing"] {
+            let migration = MIGRATIONS
+                .iter()
+                .copied()
+                .find(|migration| migration.name == name)
+                .unwrap_or_else(|| panic!("{name}"));
+            assert!(matches!(migration.owner, MigrationOwner::Both));
+            assert!(!migration.statements(SchemaPlane::Sekai).is_empty());
+            assert!(!migration.statements(SchemaPlane::Chisei).is_empty());
+            assert!(!migration.statements(SchemaPlane::Shared).is_empty());
+        }
+    }
+
+    #[test]
+    fn control_plane_chisei_half_is_applied_by_chisei_persist() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "control_plane")
+            .expect("control_plane");
+        assert!(matches!(migration.owner, MigrationOwner::Both));
+        assert!(!migration.statements(SchemaPlane::Sekai).is_empty());
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+        assert!(!migration.statements(SchemaPlane::Shared).is_empty());
     }
 
     #[test]
@@ -2726,14 +2729,8 @@ mod tests {
             .expect("chisei_usage_events");
         assert!(matches!(migration.owner, MigrationOwner::Chisei));
         assert!(migration.statements(SchemaPlane::Sekai).is_empty());
-        assert_eq!(
-            migration.statements(SchemaPlane::Chisei),
-            vec![CHISEI_USAGE_EVENTS_SCHEMA]
-        );
-        assert_eq!(
-            migration.statements(SchemaPlane::Shared),
-            vec![CHISEI_USAGE_EVENTS_SCHEMA]
-        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+        assert!(migration.statements(SchemaPlane::Shared).is_empty());
     }
 
     #[test]
@@ -2763,12 +2760,9 @@ mod tests {
             .find(|migration| migration.name == "sample_leases")
             .expect("sample_leases");
         assert!(matches!(migration.owner, MigrationOwner::Chisei));
-        assert!(SAMPLE_LEASE_SCHEMA.contains("chisei_sample_observations"));
         assert!(migration.statements(SchemaPlane::Sekai).is_empty());
-        assert_eq!(
-            migration.statements(SchemaPlane::Chisei),
-            vec![SAMPLE_LEASE_SCHEMA]
-        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+        assert!(migration.statements(SchemaPlane::Shared).is_empty());
     }
 
     #[test]

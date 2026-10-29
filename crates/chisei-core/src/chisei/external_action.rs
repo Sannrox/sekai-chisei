@@ -696,7 +696,7 @@ mod tests {
 
     #[test]
     fn authorization_storage_round_trips() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let request = fixture();
         let record = AuthorizationRecord {
             request: request.clone(),
@@ -740,7 +740,7 @@ mod tests {
 
     #[test]
     fn authorization_claims_and_terminal_transitions_are_atomic() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let request = fixture();
         let digest = request.canonical_digest().unwrap();
         assert_eq!(

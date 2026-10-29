@@ -350,14 +350,19 @@ mod tests {
         let database_url = std::env::var(TEST_DATABASE_URL_ENV).unwrap_or_else(|_| {
             panic!("{TEST_DATABASE_URL_ENV} must point to an isolated PostgreSQL test database")
         });
-        if let Ok(ca_certificate_path) = std::env::var(TEST_CA_CERT_ENV) {
+        let db = if let Ok(ca_certificate_path) = std::env::var(TEST_CA_CERT_ENV) {
             let ca_certificate = std::fs::read(&ca_certificate_path).unwrap_or_else(|error| {
                 panic!("read PostgreSQL test CA certificate {ca_certificate_path}: {error}")
             });
             PostgresDb::connect_with_ca_certificate(&database_url, 4, &ca_certificate).unwrap()
         } else {
             PostgresDb::connect(&database_url, 4).unwrap()
-        }
+        };
+        let db = std::sync::Arc::new(db);
+        crate::chisei_store::ChiseiStore::from_shared_runtime(std::sync::Arc::new(
+            sekai_core::db::runtime_db::RuntimeDb::Postgres(db.clone()),
+        ));
+        std::sync::Arc::try_unwrap(db).expect("ChiseiStore dropped its PostgreSQL handle")
     }
 
     #[test]

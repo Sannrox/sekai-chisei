@@ -2237,6 +2237,12 @@ impl RuntimeDb {
         Self::Sqlite(Arc::new(SekaiDb::new(":memory:").expect("memory sqlite")))
     }
 
+    /// In-memory SQLite plus tables for Chisei SQL functions still in this crate.
+    #[cfg(test)]
+    pub fn memory_for_chisei_sql_functions() -> Self {
+        Self::Sqlite(Arc::new(SekaiDb::memory_for_chisei_sql_functions()))
+    }
+
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Sqlite(_) => "sqlite",

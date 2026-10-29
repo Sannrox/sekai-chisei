@@ -11,6 +11,7 @@ fn service() -> SekaiServiceImpl {
     let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").unwrap(),
     )));
+    crate::chisei_store::apply_chisei_schema(&db);
     SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
 }
 

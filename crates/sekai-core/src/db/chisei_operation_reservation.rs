@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn sqlite_release_applies_once() {
-        release_applies_once(&RuntimeDb::memory(), "op-once");
+        release_applies_once(&RuntimeDb::memory_for_chisei_sql_functions(), "op-once");
     }
 
     #[test]

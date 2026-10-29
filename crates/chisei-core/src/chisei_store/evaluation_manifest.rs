@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn manifest_and_request_replay_are_immutable() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
         let manifest = manifest();
         let stored = db
             .put_evaluation_manifest(&manifest, "resolve-1", "request-digest")

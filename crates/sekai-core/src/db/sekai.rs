@@ -64,6 +64,8 @@ pub struct SekaiDb {
     persistent: bool,
     memory_pool_id: u64,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
+    schema_plane: crate::db::schema_plane::SchemaPlane,
+    chisei_schema: std::sync::OnceLock<()>,
     pub search_maintenance: Mutex<()>,
 }
 
@@ -211,10 +213,24 @@ impl SekaiDb {
             persistent,
             memory_pool_id,
             plane: std::sync::OnceLock::new(),
+            schema_plane,
+            chisei_schema: std::sync::OnceLock::new(),
             search_maintenance: Mutex::new(()),
         };
         db.migrate_for_plane(schema_plane)?;
         Ok(db)
+    }
+
+    pub fn schema_plane(&self) -> crate::db::schema_plane::SchemaPlane {
+        self.schema_plane
+    }
+
+    pub fn chisei_schema_applied(&self) -> bool {
+        self.chisei_schema.get().is_some()
+    }
+
+    pub fn mark_chisei_schema_applied(&self) {
+        let _ = self.chisei_schema.set(());
     }
 
     pub fn pool_max_size(&self) -> u32 {
@@ -334,9 +350,6 @@ impl SekaiDb {
         if plane.includes_sekai() {
             self.migrate_sekai_families()?;
         }
-        if plane.includes_chisei() {
-            self.migrate_chisei_families()?;
-        }
         crate::db::schema_plane::reject_populated_foreign_sqlite(self, plane)
     }
 
@@ -383,29 +396,6 @@ impl SekaiDb {
         self.migrate_agent_wake_cursors()?;
         self.migrate_ontology_health_trends()?;
         self.migrate_catalog_criticality_outbox()?;
-        Ok(())
-    }
-
-    fn migrate_chisei_families(&self) -> Result<(), String> {
-        self.migrate_chisei()?;
-        self.migrate_receipt_chain()?;
-        self.migrate_evaluation_plans()?;
-        self.migrate_evaluation_manifests()?;
-        self.migrate_evaluation_executions()?;
-        self.migrate_learning_changes()?;
-        self.migrate_data_quality_rules()?;
-        self.migrate_governed_subject_provenance()?;
-        self.migrate_kioku()?;
-        self.migrate_budget()?;
-        self.migrate_portfolio()?;
-        self.migrate_routing_profiles()?;
-        self.migrate_model_review()?;
-        self.migrate_policy_shadow()?;
-        self.migrate_eval_runs()?;
-        self.migrate_model_release_evidence()?;
-        self.migrate_usage_ledger()?;
-        self.ensure_external_permit_tables()?;
-        self.ensure_external_action_tables()?;
         Ok(())
     }
 
@@ -2657,12 +2647,6 @@ mod tests {
         assert!(work_unit_columns.contains(&"idempotency_key".to_string()));
         assert!(work_unit_columns.contains(&"updated_at".to_string()));
 
-        let iteration_columns = table_columns(&db, "chisei_eval_iterations");
-        assert!(iteration_columns.contains(&"namespace".to_string()));
-
-        let observation_columns = table_columns(&db, "chisei_sample_observations");
-        assert!(observation_columns.contains(&"attempts".to_string()));
-
         let task_observation_columns = table_columns(&db, "sekai_task_observations");
         assert!(task_observation_columns.contains(&"component_id".to_string()));
 
@@ -3697,8 +3681,15 @@ mod tests {
         .unwrap();
         let tables = user_tables(&db);
         assert!(tables.iter().any(|table| table == "sekai_decisions"));
-        assert!(tables.iter().any(|table| table == "chisei_budget_limits"));
-        assert!(tables.iter().any(|table| table == "chisei_usage_events"));
+        assert!(
+            tables
+                .iter()
+                .any(|table| table == "chisei_operation_receipts")
+        );
+        assert!(
+            !tables.iter().any(|table| table == "chisei_budget_limits"),
+            "{tables:?}"
+        );
         assert!(
             !tables.iter().any(|table| table == "sekai_objects"),
             "{tables:?}"
@@ -3918,10 +3909,19 @@ mod tests {
         let path = temp_db_path("dual-populated");
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
         db.conn()
-            .execute(
-                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
-                 VALUES ('user:missed', 1, 'daily')",
-                [],
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
+                    scope_id TEXT NOT NULL,
+                    metric TEXT NOT NULL DEFAULT 'tokens',
+                    parent_scope_id TEXT NOT NULL DEFAULT '',
+                    max_amount INTEGER NOT NULL,
+                    period_type TEXT NOT NULL,
+                    home_site_id TEXT NOT NULL DEFAULT '',
+                    pool_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, metric)
+                 );
+                 INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                 VALUES ('user:missed', 1, 'daily');",
             )
             .unwrap();
         drop(db);
@@ -3941,7 +3941,17 @@ mod tests {
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
         db.conn()
             .execute_batch(
-                "INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
+                "CREATE TABLE IF NOT EXISTS chisei_budget_limits (
+                    scope_id TEXT NOT NULL,
+                    metric TEXT NOT NULL DEFAULT 'tokens',
+                    parent_scope_id TEXT NOT NULL DEFAULT '',
+                    max_amount INTEGER NOT NULL,
+                    period_type TEXT NOT NULL,
+                    home_site_id TEXT NOT NULL DEFAULT '',
+                    pool_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (scope_id, metric)
+                 );
+                 INSERT INTO chisei_budget_limits (scope_id, max_amount, period_type)
                  VALUES ('user:leftover', 1, 'daily');
                  CREATE TABLE IF NOT EXISTS sekai_store_cutover (
                     id INTEGER PRIMARY KEY CHECK (id = 1),

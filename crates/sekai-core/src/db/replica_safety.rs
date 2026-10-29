@@ -263,6 +263,12 @@ mod tests {
         inventory.require_authoritative("chisei.budget").unwrap();
 
         let pair = TwoReplicaSqlite::open().expect("open shared sqlite");
+        match pair.a.as_ref() {
+            crate::db::runtime_db::RuntimeDb::Sqlite(db) => {
+                db.apply_chisei_sql_function_tables_for_tests().unwrap()
+            }
+            crate::db::runtime_db::RuntimeDb::Postgres(_) => panic!("sqlite pair"),
+        }
         pair.a
             .budget_set_limit("global", METRIC_TOKENS, 10, "daily")
             .unwrap();

@@ -27,6 +27,14 @@ use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::runtime_backend::{BackendIdentity, RuntimeBackend, RuntimeBackendConfig};
 
+fn initialize_chisei_dest(config: RuntimeBackendConfig) -> Result<RuntimeBackend, String> {
+    let backend = RuntimeBackend::initialize(
+        config.with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+    )?;
+    crate::chisei_store::try_apply_chisei_schema(backend.database().as_ref())?;
+    Ok(backend)
+}
+
 const CUTOVER_TABLE: &str = "sekai_store_cutover";
 const JOURNAL_TABLE: &str = "chisei_relocate_families";
 /// Single-row gate on the source that capture triggers read on every Chisei
@@ -269,17 +277,14 @@ pub fn relocate_sqlite(source: &str, sekai: &str, chisei: &str) -> Result<Reloca
         16,
         None,
     )?)?;
-    RuntimeBackend::initialize(
-        RuntimeBackendConfig::from_sources(
-            BackendIdentity::Sqlite,
-            Some(chisei),
-            chisei,
-            None,
-            16,
-            None,
-        )?
-        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
-    )?;
+    initialize_chisei_dest(RuntimeBackendConfig::from_sources(
+        BackendIdentity::Sqlite,
+        Some(chisei),
+        chisei,
+        None,
+        16,
+        None,
+    )?)?;
 
     relocate_sqlite_online(source, sekai, chisei, || Ok(()))
 }
@@ -503,17 +508,14 @@ pub fn relocate_postgres(
         16,
         ca.as_deref(),
     )?)?;
-    RuntimeBackend::initialize(
-        RuntimeBackendConfig::from_sources(
-            BackendIdentity::Postgres,
-            None,
-            "unused.db",
-            Some(chisei),
-            16,
-            ca.as_deref(),
-        )?
-        .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
-    )?;
+    initialize_chisei_dest(RuntimeBackendConfig::from_sources(
+        BackendIdentity::Postgres,
+        None,
+        "unused.db",
+        Some(chisei),
+        16,
+        ca.as_deref(),
+    )?)?;
 
     relocate_postgres_online(source, sekai, chisei, || Ok(()))
 }
@@ -530,6 +532,7 @@ fn relocate_postgres_online(
     let source_db = connect_postgres(source)?;
     let chisei_db =
         connect_postgres_for_plane(chisei, crate::db::schema_plane::SchemaPlane::Chisei)?;
+    crate::chisei_store::apply_chisei_postgres_schema(&chisei_db)?;
     let captured = install_postgres_change_capture(&source_db)?;
     let snapshot_dir = relocate_postgres_snapshot_dir(chisei);
     snapshot_postgres(&source_db, &snapshot_dir, None)?;
@@ -2421,8 +2424,10 @@ mod tests {
         assert!(!Path::new(&relocate_snapshot_path(chisei_s)).exists());
     }
 
+    /// Historical combined source: Shared infrastructure plus the Chisei
+    /// family tables relocate copies and fences.
     fn init_sqlite(path: &str) {
-        RuntimeBackend::initialize(
+        let backend = RuntimeBackend::initialize(
             RuntimeBackendConfig::from_sources(
                 BackendIdentity::Sqlite,
                 Some(path),
@@ -2434,10 +2439,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        crate::chisei_store::apply_chisei_schema(backend.database().as_ref());
     }
 
     fn init_chisei(path: &str) {
-        RuntimeBackend::initialize(
+        initialize_chisei_dest(
             RuntimeBackendConfig::from_sources(
                 BackendIdentity::Sqlite,
                 Some(path),
@@ -2446,8 +2452,7 @@ mod tests {
                 16,
                 None,
             )
-            .unwrap()
-            .with_schema_plane(crate::db::schema_plane::SchemaPlane::Chisei),
+            .unwrap(),
         )
         .unwrap();
     }

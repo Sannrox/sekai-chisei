@@ -5,24 +5,6 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sekai_types::governed_subject_provenance::ExportRecord;
 
 impl SekaiDb {
-    pub fn migrate_governed_subject_provenance(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_governed_subject_provenance_exports (
-                    actor TEXT NOT NULL,
-                    export_id TEXT NOT NULL,
-                    binding_digest TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    record_json TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(actor, export_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_chisei_governed_subject_provenance_namespace
-                    ON chisei_governed_subject_provenance_exports(namespace, created_at_ms);",
-            )
-            .map_err(|error| error.to_string())
-    }
-
     pub fn put_governed_subject_provenance_export(
         &self,
         actor: &str,
@@ -148,7 +130,7 @@ mod tests {
 
     #[test]
     fn export_is_append_only_replay_or_conflict() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let first = record('a');
         assert_eq!(
             db.put_governed_subject_provenance_export("root", "export-1", &first)

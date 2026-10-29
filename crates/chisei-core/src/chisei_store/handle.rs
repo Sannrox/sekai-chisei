@@ -10,6 +10,25 @@ use std::sync::Arc;
 use sekai_core::db::runtime_db::RuntimeDb;
 use sekai_core::db::store::SekaiStore;
 
+use super::ChiseiSqliteSchema;
+use super::postgres_migrations;
+
+/// Apply Chisei family DDL to an already-open runtime. `ChiseiStore` open
+/// calls this; relocate dest init and conformance helpers that still hold a
+/// bare `RuntimeDb` do too. PostgreSQL work runs off the Tokio runtime so
+/// request-path wraps (quota gate, console) do not panic.
+pub fn try_apply_chisei_schema(inner: &RuntimeDb) -> Result<(), String> {
+    match inner {
+        RuntimeDb::Sqlite(db) => db.migrate_chisei_families(),
+        RuntimeDb::Postgres(db) => postgres_migrations::apply_chisei_postgres_schema(db),
+    }
+}
+
+/// Apply Chisei family DDL, panicking when the dest cannot take schema.
+pub fn apply_chisei_schema(inner: &RuntimeDb) {
+    try_apply_chisei_schema(inner).expect("apply Chisei schema");
+}
+
 /// Chisei-owned decision state. Sekai constructors must not take this.
 ///
 /// Combined Split keeps Chisei families on `inner` and records
@@ -36,6 +55,7 @@ pub fn paired_memory() -> (SekaiStore, ChiseiStore) {
 
 impl ChiseiStore {
     pub fn from_shared_runtime(db: Arc<RuntimeDb>) -> Self {
+        apply_chisei_schema(&db);
         Self {
             inner: db.clone(),
             decisions: db,
@@ -44,6 +64,7 @@ impl ChiseiStore {
 
     /// Combined Split: Chisei families on `chisei`, decision-ledger rows on `sekai`.
     pub fn from_split_runtimes(chisei: Arc<RuntimeDb>, sekai: Arc<RuntimeDb>) -> Self {
+        apply_chisei_schema(&chisei);
         Self {
             inner: chisei,
             decisions: sekai,
@@ -129,6 +150,75 @@ mod tests {
     fn chisei_memory_does_not_require_naming_runtime_db_at_callers() {
         let store = ChiseiStore::memory();
         store.runtime().ping().expect("memory store pings");
+    }
+
+    #[test]
+    fn chisei_memory_applies_chisei_family_schema() {
+        let store = ChiseiStore::memory();
+        let RuntimeDb::Sqlite(db) = store.runtime() else {
+            panic!("memory store is sqlite");
+        };
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chisei_eval_suites'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sekai_memory_omits_chisei_family_schema() {
+        let store = SekaiStore::memory();
+        let RuntimeDb::Sqlite(db) = store.runtime() else {
+            panic!("memory store is sqlite");
+        };
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chisei_eval_suites'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn wrapping_the_same_runtime_applies_chisei_schema_once() {
+        let db = Arc::new(RuntimeDb::memory());
+        let first = ChiseiStore::from_shared_runtime(db.clone());
+        let RuntimeDb::Sqlite(inner) = first.runtime() else {
+            panic!("memory store is sqlite");
+        };
+        assert!(inner.chisei_schema_applied());
+        let _second = ChiseiStore::from_shared_runtime(db);
+    }
+
+    #[test]
+    fn wrapping_a_sekai_plane_sqlite_does_not_install_chisei_families() {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            sekai_core::db::sekai::SekaiDb::new_for_plane(
+                ":memory:",
+                sekai_core::db::schema_plane::SchemaPlane::Sekai,
+            )
+            .expect("sekai-plane sqlite"),
+        )));
+        let store = ChiseiStore::from_shared_runtime(db);
+        let RuntimeDb::Sqlite(inner) = store.runtime() else {
+            panic!("memory store is sqlite");
+        };
+        let count: i64 = inner
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chisei_eval_suites'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

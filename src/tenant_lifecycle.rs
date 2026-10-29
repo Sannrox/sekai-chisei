@@ -423,6 +423,9 @@ mod tests {
 
     fn controller() -> TenantLifecycleController {
         let db = Arc::new(SekaiDb::new(":memory:").unwrap());
+        crate::chisei_store::apply_chisei_schema(&crate::db::runtime_db::RuntimeDb::Sqlite(
+            db.clone(),
+        ));
         TenantLifecycleController::new(
             db,
             Arc::new(MemoryTenantProviderCredentialResolver::new()),

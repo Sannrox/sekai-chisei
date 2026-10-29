@@ -593,7 +593,9 @@ pub(crate) fn exercise_execution_recording(db: &RuntimeDb, prefix: &str) {
 fn sqlite_evidence_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();
     exercise_backend(&db, &db, &db, &db, "sqlite");
-    exercise_execution_recording(&RuntimeDb::memory(), "sqlite-exec");
+    let runtime = RuntimeDb::memory();
+    sekai_chisei::chisei_store::apply_chisei_schema(&runtime);
+    exercise_execution_recording(&runtime, "sqlite-exec");
 }
 
 fn postgres_test_database() -> PostgresDb {
@@ -615,7 +617,9 @@ fn postgres_evidence_conformance() {
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
     exercise_backend(&db, &db, &db, &db, &prefix);
     let exec_prefix = format!("pg-exec-{}", uuid::Uuid::new_v4().simple());
-    exercise_execution_recording(&RuntimeDb::Postgres(Arc::new(db)), &exec_prefix);
+    let runtime = RuntimeDb::Postgres(Arc::new(db));
+    sekai_chisei::chisei_store::apply_chisei_schema(&runtime);
+    exercise_execution_recording(&runtime, &exec_prefix);
 }
 
 #[test]

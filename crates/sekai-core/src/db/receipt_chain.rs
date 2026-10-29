@@ -75,48 +75,7 @@ pub fn kind_for_operation_receipt(receipt: &OperationReceipt) -> ReceiptKind {
     }
 }
 
-pub const SQLITE_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS chisei_receipt_chain (
-    namespace TEXT NOT NULL,
-    seq INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    receipt_id TEXT NOT NULL,
-    receipt_json TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL,
-    key_id TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_chisei_receipt_chain_receipt
-    ON chisei_receipt_chain(namespace, receipt_id);
-CREATE TABLE IF NOT EXISTS chisei_receipt_chain_checkpoints (
-    namespace TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    head_seq INTEGER NOT NULL,
-    head_hash TEXT NOT NULL,
-    entry_count INTEGER NOT NULL,
-    key_id TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, kind, head_seq)
-);
-CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
-    key_id TEXT PRIMARY KEY,
-    public_key_hex TEXT NOT NULL,
-    created_at_ms INTEGER NOT NULL,
-    retired_at_ms INTEGER
-);
-";
-
 impl SekaiDb {
-    pub fn migrate_receipt_chain(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(SQLITE_SCHEMA)
-            .map_err(|error| error.to_string())
-    }
-
     pub fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -841,7 +800,7 @@ mod tests {
 
     #[test]
     fn sqlite_export_verifies_action_agent_and_isolated_transform() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         db.put_operation_receipt(&sample_receipt(
@@ -866,7 +825,7 @@ mod tests {
 
     #[test]
     fn sqlite_transform_run_updates_append_a_revision() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         let mut run = isolated_run("run-iso");
@@ -886,7 +845,7 @@ mod tests {
 
     #[test]
     fn sqlite_transform_dispatch_status_appends_a_revision() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         let run = isolated_run("run-iso");
@@ -917,7 +876,7 @@ mod tests {
 
     #[test]
     fn sqlite_redaction_rewrites_chained_transform_partitions() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         let mut run = isolated_run("run-iso");
@@ -947,7 +906,7 @@ mod tests {
 
     #[test]
     fn sqlite_redaction_requires_a_signer_for_chained_bodies() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let mut run = isolated_run("run-iso");
         run.input_partitions = vec![TransformPartition {
@@ -982,7 +941,7 @@ mod tests {
 
     #[test]
     fn sqlite_redaction_after_rotation_needs_the_previous_public_key() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys_a = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let mut run = isolated_run("run-iso");
         run.input_partitions = vec![TransformPartition {
@@ -1032,7 +991,7 @@ mod tests {
 
     #[test]
     fn sqlite_redaction_refuses_to_resign_a_tampered_chain() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1089,7 +1048,7 @@ mod tests {
 
     #[test]
     fn sqlite_updated_receipt_appends_a_new_chain_entry() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1122,7 +1081,7 @@ mod tests {
 
     #[test]
     fn sqlite_lifecycle_updates_append_chain_entries() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1137,7 +1096,7 @@ mod tests {
 
     #[test]
     fn sqlite_refuses_to_extend_a_truncated_chain() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys);
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1155,7 +1114,7 @@ mod tests {
 
     #[test]
     fn sqlite_refuses_to_reset_a_chain_that_lost_its_latest() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys);
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1178,7 +1137,7 @@ mod tests {
 
     #[test]
     fn sqlite_refuses_a_latest_checkpoint_not_signed_by_the_operator() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys);
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))
@@ -1220,7 +1179,7 @@ mod tests {
 
     #[test]
     fn sqlite_rotated_signer_needs_the_previous_public_key() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let original = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let original_hex = original.current_public_key_hex();
         {
@@ -1253,7 +1212,7 @@ mod tests {
 
     #[test]
     fn sqlite_tamper_fails_at_exact_position() {
-        let db = SekaiDb::new(":memory:").unwrap();
+        let db = SekaiDb::memory_for_chisei_sql_functions();
         let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
         let _guard = install_test_signer(keys.clone());
         db.put_operation_receipt(&sample_receipt("op-1", ReceiptEventKind::ActionPerformed))

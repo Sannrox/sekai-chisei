@@ -188,18 +188,19 @@ fn exercise(db: &dyn ReceiptHarness, prefix: &str) {
 
 #[test]
 fn sqlite_chisei_execution_conformance() {
-    let db = SekaiDb::new(":memory:").unwrap();
+    let db = sekai_chisei::chisei_store::memory_sekai_with_chisei_schema();
     exercise(&db, "sqlite");
 }
 
 fn postgres() -> PostgresDb {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+    let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
         PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
     } else {
         PostgresDb::connect(&url, 8).unwrap()
-    }
+    };
+    sekai_chisei::chisei_store::postgres_with_chisei_schema(db)
 }
 
 #[test]

@@ -13,7 +13,6 @@ use sekai_chisei::chisei::external_permit::{
     HostContext, Issuance, Permit, REDEMPTION_MODE, SIGNATURE_ALGORITHM, issue,
 };
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::ext::*;
 use sekai_chisei::sekai::execution_evidence::{
     EXECUTION_EVIDENCE_SCHEMA, ExecutionEvidence, ExecutionLifecycleState, verify_for_executor,
@@ -496,7 +495,9 @@ fn verify_rejects_host_context_and_trust_binding_mismatches() {
 fn redeem_is_idempotent_across_retries() {
     // One-invocation permit: a double-consuming retry would exhaust the slot
     // and either diverge or block a same-key retry / free a second distinct key.
-    let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+    let db = RuntimeDb::Sqlite(Arc::new(
+        sekai_chisei::chisei_store::memory_sekai_with_chisei_schema(),
+    ));
     let record = authorization(10_000, 1);
     let (permit, key) = persist_and_issue(&db, &record);
     assert_eq!(permit.max_invocations, 1);
@@ -551,7 +552,9 @@ fn redeem_is_idempotent_across_retries() {
 
 #[test]
 fn redeem_after_revoke_fails() {
-    let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+    let db = RuntimeDb::Sqlite(Arc::new(
+        sekai_chisei::chisei_store::memory_sekai_with_chisei_schema(),
+    ));
     let record = authorization(10_000, 2);
     let (permit, key) = persist_and_issue(&db, &record);
     db.revoke_permit(
@@ -703,7 +706,9 @@ fn broken_harness_fails_every_negative_case() {
                 host_context(&permit, vec!["atomic_rename".into()])
             }
             "redeem_after_revoke_fails" => {
-                let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+                let db = RuntimeDb::Sqlite(Arc::new(
+                    sekai_chisei::chisei_store::memory_sekai_with_chisei_schema(),
+                ));
                 let record = authorization(10_000, 2);
                 let (permit, key) = persist_and_issue(&db, &record);
                 db.revoke_permit(

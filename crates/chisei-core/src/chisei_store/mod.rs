@@ -34,13 +34,29 @@ mod postgres_evaluation_plan;
 mod postgres_external_action;
 mod postgres_external_permit;
 mod postgres_kioku;
+mod postgres_migrations;
 mod postgres_model_release_evidence;
 mod postgres_model_review;
 mod postgres_portfolio;
 mod postgres_routing_profile;
 mod postgres_usage_ledger;
 pub mod runtime;
+mod sqlite_migrations;
+pub use handle::{apply_chisei_schema, try_apply_chisei_schema};
+pub use postgres_migrations::apply_chisei_postgres_schema;
 pub use runtime::ChiseiRuntimeDb;
+pub use sqlite_migrations::ChiseiSqliteSchema;
+#[doc(hidden)]
+pub use sqlite_migrations::{memory_sekai_with_chisei_schema, open_sekai_with_chisei_schema};
+
+/// Apply Chisei family SQL to an already-open PostgreSQL dest.
+#[doc(hidden)]
+pub fn postgres_with_chisei_schema(
+    db: sekai_core::db::postgres::PostgresDb,
+) -> sekai_core::db::postgres::PostgresDb {
+    apply_chisei_postgres_schema(&db).expect("apply Chisei PostgreSQL schema");
+    db
+}
 
 #[cfg(test)]
 pub use handle::paired_memory;

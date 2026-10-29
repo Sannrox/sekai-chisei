@@ -2811,7 +2811,6 @@ impl ChiseiRuntimeDb for RuntimeDb {
 mod evaluation_resolution_snapshot_tests {
     use super::ChiseiRuntimeDb;
     use sekai_core::db::runtime_db::RuntimeDb;
-    use sekai_core::db::sekai::SekaiDb;
     use sekai_core::domain::Object;
     use std::collections::HashMap;
     use std::sync::{Arc, mpsc};
@@ -2825,7 +2824,9 @@ mod evaluation_resolution_snapshot_tests {
             uuid::Uuid::new_v4().simple()
         ));
         let path_string = path.to_string_lossy().into_owned();
-        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(&path_string).unwrap()));
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::chisei_store::open_sekai_with_chisei_schema(&path_string),
+        ));
         let resolver_db = db.clone();
         let writer_db = db.clone();
         let (entered_tx, entered_rx) = mpsc::channel();
