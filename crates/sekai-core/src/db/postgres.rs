@@ -2299,7 +2299,7 @@ mod tests {
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
-        assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+        assert_eq!(migration_rows(&db), shared_history());
     }
 
     #[test]
@@ -2398,7 +2398,7 @@ mod tests {
         assert!(error.contains(&format!(
             "migration {failing_version} (deliberate_failure_fixture)"
         )));
-        assert_eq!(migration_rows(&db).len(), MIGRATIONS.len());
+        assert_eq!(migration_rows(&db), shared_history());
         let table: Option<String> = db
             .connection()
             .unwrap()
