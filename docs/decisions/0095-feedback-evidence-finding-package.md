@@ -73,6 +73,14 @@ evidence schema, and certify the package through existing admin surfaces.
 Fixture documents live under `tests/fixtures/feedback/`. Downstream issue
 delivery and tracker adapters remain later Issues.
 
+Issue #1231 adds a Combined-mode investigation worker that consumes
+`feedback.investigation.dispatch` through experimental object-change
+bindings (ADR 0090) and fenced ActionWork claims. Community SQLite is the
+reference store for those experimental surfaces; community PostgreSQL leaves
+action bindings unavailable. The worker writes investigation, hypothesis,
+and finding objects and does not publish to GitHub. The first binding pin
+does not backfill.
+
 ## Validation
 
 Crate tests install the fixtures into an in-memory runtime and cover portable

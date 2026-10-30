@@ -77,6 +77,10 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
         .unwrap();
     assert_eq!(stored.revision, 1);
     assert_eq!(cursor, ActionBindingCursor::default());
+    let listed = db.list_action_bindings(namespace).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].binding_id, "escalate-on-update");
+    assert!(db.list_action_bindings("missing-ns").unwrap().is_empty());
 
     for read_marker in [
         Some(ReadMarker::Absent),

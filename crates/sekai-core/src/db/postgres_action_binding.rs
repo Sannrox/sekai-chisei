@@ -120,4 +120,24 @@ impl PostgresDb {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    pub fn list_action_bindings(&self, namespace: &str) -> Result<Vec<ActionBinding>, String> {
+        let mut connection = self.connection()?;
+        let rows = connection
+            .query(
+                "SELECT body_json FROM sekai_action_bindings
+                 WHERE namespace = $1
+                 ORDER BY binding_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut bindings = Vec::new();
+        for row in rows {
+            let body: String = row.get(0);
+            let binding: ActionBinding = serde_json::from_str(&body)
+                .map_err(|error| format!("corrupt action binding: {error}"))?;
+            bindings.push(binding);
+        }
+        Ok(bindings)
+    }
 }
