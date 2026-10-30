@@ -1218,7 +1218,7 @@ fn map_object_set_error(error: ObjectSetError) -> Status {
 }
 
 impl SekaiServiceImpl {
-    /// Streams an object set as CSV or JSON Lines. The caller passes every
+    /// Streams an object set as CSV, JSON Lines, or Parquet. The caller passes every
     /// read check of EvaluateObjectSet and holds an active export grant on
     /// the namespace; rows and properties are what a read would return. The
     /// receipt is written before the first byte; an export that does not
@@ -1263,7 +1263,7 @@ impl SekaiServiceImpl {
             format: format.into(),
         };
         let format = ExportFormat::parse(&inner.format)
-            .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
+            .ok_or_else(|| Status::invalid_argument("format must be csv, jsonl, or parquet"))?;
         let encoder = RowEncoder::new(format, inner.properties.clone(), true)
             .map_err(Status::invalid_argument)?;
         let bound =
@@ -1355,8 +1355,8 @@ impl SekaiServiceImpl {
                             let encoded = sink
                                 .push(&object.id, &marking, object.properties.clone())
                                 .map_err(Status::invalid_argument)?;
-                            for row in encoded {
-                                if !writer.write(row, 1) {
+                            for part in encoded {
+                                if !writer.write(part.bytes, part.rows) {
                                     return Ok(false);
                                 }
                             }
@@ -1389,8 +1389,8 @@ impl SekaiServiceImpl {
                     return Ok(false);
                 }
                 let mut writer = writer.borrow_mut();
-                for row in sink.finish() {
-                    if !writer.write(row, 1) {
+                for part in sink.finish() {
+                    if !writer.write(part.bytes, part.rows) {
                         return Ok(false);
                     }
                 }

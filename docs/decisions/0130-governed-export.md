@@ -71,6 +71,9 @@ Rejected:
   than it sends. Its memory stays bounded.
 - On enterprise transport an export takes space write, not view.
 - A client that stops reading for longer than the lease loses the export.
+- Parquet (#1696) is an additive format written by `sekai-parquet-export`.
+  Cells are optional UTF-8; a withheld property is null. The Apache Parquet
+  library stays out of core.
 - Saved exports (#1628) run for their owner principal alone, with no tenant
   assertion and no purpose. They store their bytes as a Sekai artifact keyed
   by the run's receipt, readable only through delivery and kept for 7 days at

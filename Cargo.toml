@@ -25,6 +25,7 @@ members = [
     "crates/sekai-obs",
     "crates/sekai-types",
     "crates/sekai-ontology",
+    "crates/sekai-parquet-export",
     "crates/sekai-proto",
     "crates/chisei-provider",
     "crates/sekai-source-sdk",
@@ -131,6 +132,7 @@ rusqlite = { version = "0.40", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned revision.
 mikura-host = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
+sekai-parquet-export = { version = "1.0.0", path = "crates/sekai-parquet-export" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",

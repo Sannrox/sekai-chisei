@@ -428,7 +428,7 @@ impl SekaiServiceImpl {
             false,
         )?;
         let format = crate::sekai::data_export::ExportFormat::parse(&inner.format)
-            .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
+            .ok_or_else(|| Status::invalid_argument("format must be csv, jsonl, or parquet"))?;
         let actor = principals[0].clone();
         let admin =
             authorize_source_type_namespace_admin(self, &principals, &inner.namespace).is_ok();
@@ -678,12 +678,12 @@ pub(super) fn export_grantee(
 const DATASET_EXPORT_PAGE: usize = 1_000;
 
 impl SekaiServiceImpl {
-    /// Streams one dataset version as CSV or JSON Lines (#1695). The caller
-    /// needs read on the dataset, the full read policy of the object it is
-    /// bound to, and an export grant on that object's namespace. Columns the
-    /// bound object's property grants withhold are written empty (CSV) or
-    /// left out (JSON Lines); restricted columns are redacted as a read of
-    /// that object redacts restricted properties.
+    /// Streams one dataset version as CSV, JSON Lines, or Parquet (#1695).
+    /// The caller needs read on the dataset, the full read policy of the
+    /// object it is bound to, and an export grant on that object's namespace.
+    /// Columns the bound object's property grants withhold are written empty
+    /// (CSV), left out (JSON Lines), or null (Parquet); restricted columns
+    /// are redacted as a read of that object redacts restricted properties.
     pub(super) async fn export_dataset_version_rpc(
         &self,
         req: Request<ExportDatasetVersionRequest>,
@@ -713,7 +713,7 @@ impl SekaiServiceImpl {
         } = caller;
         let inner = request;
         let format = ExportFormat::parse(&inner.format)
-            .ok_or_else(|| Status::invalid_argument("format must be csv or jsonl"))?;
+            .ok_or_else(|| Status::invalid_argument("format must be csv, jsonl, or parquet"))?;
         let db = self.db.runtime().clone();
         let dataset = db
             .get_dataset(&inner.dataset_id)
@@ -893,8 +893,8 @@ impl SekaiServiceImpl {
                         let encoded = sink
                             .push("", &bound_marking, values)
                             .map_err(Status::invalid_argument)?;
-                        for row in encoded {
-                            if !writer.write(row, 1) {
+                        for part in encoded {
+                            if !writer.write(part.bytes, part.rows) {
                                 return Ok(false);
                             }
                         }
@@ -905,8 +905,8 @@ impl SekaiServiceImpl {
                 }
                 {
                     let mut writer = writer.borrow_mut();
-                    for row in sink.finish() {
-                        if !writer.write(row, 1) {
+                    for part in sink.finish() {
+                        if !writer.write(part.bytes, part.rows) {
                             return Ok(false);
                         }
                     }

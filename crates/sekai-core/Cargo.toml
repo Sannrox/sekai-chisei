@@ -34,6 +34,7 @@ same-file = "1"
 sekai-domain = { version = "1.1.0", path = "../sekai-domain" }
 sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
 sekai-ontology = { version = "1.0.0", path = "../sekai-ontology" }
+sekai-parquet-export = { version = "1.0.0", path = "../sekai-parquet-export" }
 sekai-source-sdk = { version = "1.3.0", path = "../sekai-source-sdk" }
 sekai-types = { version = "1.0.0", path = "../sekai-types" }
 serde = { version = "1", features = ["derive"] }

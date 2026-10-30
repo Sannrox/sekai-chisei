@@ -19,19 +19,21 @@ Revoking keeps the grant with `revoked_by`, `revoked_at_ms` and
 ## Export
 
 `ExportObjectSet` takes an object-set `descriptor`, the `properties` to
-export in column order, and a `format` (`csv` or `jsonl`). The caller needs
+export in column order, and a `format` (`csv`, `jsonl`, or `parquet`). The caller needs
 every read check of `EvaluateObjectSet` and an active export grant on the
 namespace (`PERMISSION_DENIED` `export_not_granted` otherwise). The response
 is a stream:
 
 1. the first message carries `receipt_id`;
 2. the next ones carry file bytes (`data`): for CSV, a header `id,<properties>`
-   and then one row per object; for JSON Lines, one object per line;
+   and then one row per object; for JSON Lines, one object per line; for
+   Parquet, a PLAIN optional-UTF8 file whose withheld properties are null;
 3. the last one sets `done`, `row_count` and `content_digest`
    (`sha256:<hex>` of every data byte in order).
 
 Rows are the objects a read returns, in the descriptor's order. A property
-the reader may not see is an empty cell, or an absent key. CSV fields with a
+the reader may not see is an empty cell, an absent key, or a null Parquet
+cell. CSV fields with a
 comma, quote, line break or surrounding whitespace are quoted. Values are
 written as stored, without spreadsheet formula escaping.
 
@@ -76,7 +78,8 @@ decision (`trace_export`).
 `ExportDatasetVersion` (#1695) takes `dataset_id`, `version_id`, the `columns`
 to export in order (empty: every column), and a `format`. It answers with the
 same stream and receipt as `ExportObjectSet`. CSV has a header of the
-columns, and neither format adds an id column. The caller needs:
+columns, and neither CSV nor JSON Lines adds an id column. Parquet columns
+are optional UTF-8. The caller needs:
 
 - read on the dataset;
 - the full read policy (marking, object security, purpose) of the object the
@@ -87,7 +90,7 @@ A dataset bound to no object has no namespace to grant on, so it is refused
 (`FAILED_PRECONDITION`). So is a dataset whose bound object type enforces
 cell (value-instance) grants, which name object values that dataset rows do
 not carry. Columns the bound object's property grants withhold
-are written empty, or left out. Restricted columns (by the dataset's column
+are written empty, left out, or null. Restricted columns (by the dataset's column
 classification or the bound object type's schema) read `[redacted]` unless
 the caller, and any actor it acts for, may read restricted properties of
 that object, as on a read of it. Rows are read in row order, a page at a

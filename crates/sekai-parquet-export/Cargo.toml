@@ -1,0 +1,13 @@
+[package]
+name = "sekai-parquet-export"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Write-only UTF-8 Parquet dialect for governed export."
+repository = "https://github.com/Sannrox/sekai-chisei"
+
+[dependencies]
+
+[dev-dependencies]
+parquet = { version = "56", default-features = false }
+bytes = "1"
