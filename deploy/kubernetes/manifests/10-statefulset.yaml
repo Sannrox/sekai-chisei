@@ -20,7 +20,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       initContainers:
         - name: data-owner
-          image: ghcr.io/sannrox/sekai-chisei:1.3.0
+          image: ghcr.io/sannrox/sekai-chisei:1.4.0
           command: ["chown", "-R", "sekai:sekai", "/data"]
           securityContext:
             runAsUser: 0
@@ -29,7 +29,7 @@ spec:
               mountPath: /data
       containers:
         - name: sekai-chisei
-          image: ghcr.io/sannrox/sekai-chisei:1.3.0
+          image: ghcr.io/sannrox/sekai-chisei:1.4.0
           ports:
             - name: grpc
               containerPort: 50051
