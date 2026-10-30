@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "Customer-managed key hierarchy and key-provider contract for stores."
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 rand = { version = "0.8", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
