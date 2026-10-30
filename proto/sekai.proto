@@ -691,17 +691,17 @@ message FederatedAggregateResponse {
   repeated FederatedAggregateExclusion excluded = 7;
   repeated FederatedAggregateNoise noise = 8;
 }
-// Streams an object set as CSV or JSON Lines under the caller's read policy.
+// Streams an object set as CSV, JSON Lines, or Parquet under the caller's read policy.
 message ExportObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;
   // Properties to export, in column order; the object id always comes first.
   repeated string properties = 2;
-  // csv | jsonl
+  // csv | jsonl | parquet
   string format = 3;
 }
 // The first message carries the receipt id, later ones the file bytes, and
 // the last one (`done`) the row count and the digest the receipt records.
-// Streams one dataset version as CSV or JSON Lines (#1695), under the same
+// Streams one dataset version as CSV, JSON Lines, or Parquet (#1695), under the same
 // export grant and receipt as ExportObjectSet; the response messages are
 // the same.
 message ExportDatasetVersionRequest {
@@ -709,7 +709,7 @@ message ExportDatasetVersionRequest {
   string version_id = 2;
   // Columns to export, in order; empty means every column of the dataset.
   repeated string columns = 3;
-  // csv | jsonl
+  // csv | jsonl | parquet
   string format = 4;
 }
 // A saved export (#1628): one source, run later for its owner alone. Set
@@ -826,7 +826,7 @@ message GetExportFingerprintPolicyResponse {
 message TraceExportRequest {
   string namespace = 1;
   bytes sample = 2;
-  // csv | jsonl
+  // csv | jsonl | parquet
   string format = 3;
 }
 message TraceExportMatch {

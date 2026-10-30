@@ -31881,6 +31881,49 @@ async fn an_export_needs_its_grant_and_streams_only_what_a_read_shows() {
     assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
 }
 
+#[tokio::test]
+async fn a_parquet_export_round_trips_and_matches_its_receipt_digest() {
+    use futures_util::StreamExt;
+    let svc = service();
+    let digest = export_fixture(&svc, 2, "hello").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "parquet fixture".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let mut request = export_request(&digest);
+    request.format = "parquet".into();
+    let chunks: Vec<ExportObjectSetChunk> = svc
+        .export_object_set(with_principal(request))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(Result::unwrap)
+        .collect()
+        .await;
+    let data: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.data.clone()).collect();
+    let table = sekai_parquet_export::decode(&data).unwrap();
+    assert_eq!(table.rows.len(), 2);
+    assert_eq!(table.rows[0].id, "t-00000");
+    assert_eq!(
+        table.rows[0].values.get("title").map(String::as_str),
+        Some("hello")
+    );
+    assert!(!table.rows[0].values.contains_key("secret"));
+    let done = chunks.last().unwrap();
+    assert!(done.done);
+    assert_eq!(done.row_count, 2);
+    assert_eq!(
+        done.content_digest,
+        format!("sha256:{:x}", sha2::Sha256::digest(&data))
+    );
+}
+
 /// #1968: operators export memory through ExportObjectSet. The namespace
 /// export grant is required, and items above the exporter's clearance
 /// are omitted.

@@ -2,8 +2,8 @@
 //!
 //! Data leaving the plane needs more than read. A namespace admin grants a
 //! principal export on a namespace, and every grant and revocation is an
-//! audit decision. An export streams an object set as CSV or JSON Lines
-//! under the caller's read policy, so hidden rows and properties never
+//! audit decision. An export streams an object set as CSV, JSON Lines, or
+//! Parquet under the caller's read policy, so hidden rows and properties never
 //! reach the file. Its receipt is written before the first byte and closed
 //! with the row count and the digest of every byte sent; a stream that ends
 //! early (a dropped client, an error) closes it as aborted.
@@ -355,6 +355,7 @@ pub fn record_refusal(
 pub enum ExportFormat {
     Csv,
     JsonLines,
+    Parquet,
 }
 
 impl ExportFormat {
@@ -362,25 +363,57 @@ impl ExportFormat {
         match value {
             "csv" => Some(Self::Csv),
             "jsonl" => Some(Self::JsonLines),
+            "parquet" => Some(Self::Parquet),
             _ => None,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Csv => "csv",
             Self::JsonLines => "jsonl",
+            Self::Parquet => "parquet",
         }
+    }
+}
+
+/// Bytes of an export file, with how many rows they represent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedPart {
+    pub bytes: Vec<u8>,
+    pub rows: u64,
+}
+
+impl AsRef<[u8]> for EncodedPart {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for EncodedPart {
+    fn borrow(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl IntoIterator for EncodedPart {
+    type Item = u8;
+    type IntoIter = std::vec::IntoIter<u8>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.bytes.into_iter()
     }
 }
 
 /// Encodes rows: the object id when exporting objects, then the selected
 /// columns in order. A value the reader may not see is absent from what it
-/// reads, so its cell is empty (CSV) or its key absent (JSON Lines).
+/// reads, so its cell is empty (CSV), its key absent (JSON Lines), or null
+/// (Parquet).
 pub struct RowEncoder {
     format: ExportFormat,
     columns: Vec<String>,
     id_column: bool,
+    parquet: Option<sekai_parquet_export::Encoder>,
 }
 
 fn csv_field(value: &str) -> String {
@@ -410,10 +443,13 @@ impl RowEncoder {
                 ));
             }
         }
+        let parquet = (format == ExportFormat::Parquet)
+            .then(|| sekai_parquet_export::Encoder::new(columns.clone(), id_column));
         Ok(Self {
             format,
             columns,
             id_column,
+            parquet,
         })
     }
 
@@ -443,6 +479,7 @@ impl RowEncoder {
                 line.into_bytes()
             }
             ExportFormat::JsonLines => Vec::new(),
+            ExportFormat::Parquet => sekai_parquet_export::Encoder::header(),
         }
     }
 
@@ -478,7 +515,38 @@ impl RowEncoder {
                 line.push(b'\n');
                 line
             }
+            ExportFormat::Parquet => Vec::new(),
         }
+    }
+
+    /// Encodes `id` and `values`. CSV and JSON Lines yield one row; Parquet
+    /// yields a row group when the group fills.
+    pub fn push(&mut self, id: &str, values: &HashMap<String, String>) -> Option<EncodedPart> {
+        match self.format {
+            ExportFormat::Csv | ExportFormat::JsonLines => Some(EncodedPart {
+                bytes: self.row(id, values),
+                rows: 1,
+            }),
+            ExportFormat::Parquet => {
+                self.parquet
+                    .as_mut()?
+                    .push(id, values)
+                    .map(|flush| EncodedPart {
+                        bytes: flush.bytes,
+                        rows: flush.rows,
+                    })
+            }
+        }
+    }
+
+    /// Remaining Parquet bytes (last group and footer). Empty for CSV and
+    /// JSON Lines.
+    pub fn finish(&mut self) -> Option<EncodedPart> {
+        let flush = self.parquet.as_mut()?.finish();
+        (!flush.bytes.is_empty()).then_some(EncodedPart {
+            bytes: flush.bytes,
+            rows: flush.rows,
+        })
     }
 }
 
@@ -869,6 +937,37 @@ mod tests {
             },
             b"{\"id\":\"t-1\",\"title\":\"x\"}\n"
         );
+    }
+
+    #[test]
+    fn parquet_round_trips_and_hashes_the_file() {
+        let mut encoder = RowEncoder::new(
+            ExportFormat::Parquet,
+            vec!["title".into(), "secret".into()],
+            true,
+        )
+        .unwrap();
+        let mut file = encoder.header();
+        let mut rows = 0u64;
+        if let Some(part) = encoder.push("t-1", &object("t-1", &[("title", "hello")]).properties) {
+            rows += part.rows;
+            file.extend(part.bytes);
+        }
+        if let Some(part) = encoder.finish() {
+            rows += part.rows;
+            file.extend(part.bytes);
+        }
+        assert_eq!(rows, 1);
+        let table = sekai_parquet_export::decode(&file).unwrap();
+        assert_eq!(table.rows[0].id, "t-1");
+        assert_eq!(
+            table.rows[0].values.get("title").map(String::as_str),
+            Some("hello")
+        );
+        assert!(!table.rows[0].values.contains_key("secret"));
+        let digest = format!("sha256:{:x}", Sha256::digest(&file));
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest.len(), 7 + 64);
     }
 
     /// Grant, retry, revoke and re-grant on either backend.

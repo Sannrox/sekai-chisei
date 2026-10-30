@@ -303,7 +303,7 @@ impl FingerprintSink {
         id: &str,
         marking: &str,
         mut values: HashMap<String, String>,
-    ) -> Result<Vec<Vec<u8>>, String> {
+    ) -> Result<Vec<crate::sekai::data_export::EncodedPart>, String> {
         values.retain(|name, _| self.encoder.columns().iter().any(|column| column == name));
         if let Some(plan) = &self.plan {
             apply_row(
@@ -320,23 +320,28 @@ impl FingerprintSink {
             }
             return Ok(Vec::new());
         }
-        Ok(vec![self.encoder.row(id, &values)])
+        Ok(self.encoder.push(id, &values).into_iter().collect())
     }
 
-    /// Encodes any buffered remainder.
-    pub fn finish(&mut self) -> Vec<Vec<u8>> {
-        if self.plan.is_none() || self.group.is_empty() {
-            return Vec::new();
+    /// Encodes any buffered remainder, then the format's trailer.
+    pub fn finish(&mut self) -> Vec<crate::sekai::data_export::EncodedPart> {
+        let mut out = if self.plan.is_none() || self.group.is_empty() {
+            Vec::new()
+        } else {
+            self.flush_group()
+        };
+        if let Some(part) = self.encoder.finish() {
+            out.push(part);
         }
-        self.flush_group()
+        out
     }
 
-    fn flush_group(&mut self) -> Vec<Vec<u8>> {
+    fn flush_group(&mut self) -> Vec<crate::sekai::data_export::EncodedPart> {
         permute_group(&self.export_id, self.group_index, &mut self.group);
         self.group_index += 1;
         let rows = std::mem::take(&mut self.group);
         rows.into_iter()
-            .map(|(id, values)| self.encoder.row(&id, &values))
+            .filter_map(|(id, values)| self.encoder.push(&id, &values))
             .collect()
     }
 }
@@ -526,11 +531,34 @@ struct SampleRow {
 }
 
 fn parse_sample(format: ExportFormat, sample: &[u8]) -> Result<Vec<SampleRow>, String> {
-    let text = std::str::from_utf8(sample).map_err(|_| "sample is not utf-8".to_string())?;
     match format {
-        ExportFormat::Csv => parse_csv(text),
-        ExportFormat::JsonLines => parse_jsonl(text),
+        ExportFormat::Csv => {
+            let text =
+                std::str::from_utf8(sample).map_err(|_| "sample is not utf-8".to_string())?;
+            parse_csv(text)
+        }
+        ExportFormat::JsonLines => {
+            let text =
+                std::str::from_utf8(sample).map_err(|_| "sample is not utf-8".to_string())?;
+            parse_jsonl(text)
+        }
+        ExportFormat::Parquet => parse_parquet(sample),
     }
+}
+
+fn parse_parquet(sample: &[u8]) -> Result<Vec<SampleRow>, String> {
+    let table = sekai_parquet_export::decode(sample).map_err(|error| error.to_string())?;
+    Ok(table
+        .rows
+        .into_iter()
+        .map(|row| {
+            let mut values = row.values;
+            if table.id_column && !row.id.is_empty() {
+                values.insert("id".into(), row.id.clone());
+            }
+            SampleRow { id: row.id, values }
+        })
+        .collect())
 }
 
 fn parse_csv(text: &str) -> Result<Vec<SampleRow>, String> {
@@ -701,10 +729,7 @@ fn binom_tail_half(hits: u64, cells: u64) -> f64 {
 }
 
 fn format_name(format: ExportFormat) -> &'static str {
-    match format {
-        ExportFormat::Csv => "csv",
-        ExportFormat::JsonLines => "jsonl",
-    }
+    format.as_str()
 }
 
 fn check_namespace(namespace: &str) -> Result<&str, String> {
