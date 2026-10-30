@@ -13,7 +13,35 @@ const CHISEI_PROTO: &str = include_str!("../proto/chisei.proto");
 const ONTOLOGY_CLI: &str = include_str!("../src/ontology_product_cli.rs");
 const SDK_TS: &str = include_str!("../sdk/typescript/client.ts");
 const SDK_PY: &str = include_str!("../sdk/python/sekai_client.py");
-const RUNTIME_DB: &str = include_str!("../crates/sekai-core/src/db/runtime_db.rs");
+const RUNTIME_DB: &str = concat!(
+    include_str!("../crates/sekai-core/src/db/runtime_db.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_objects.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_object_security.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_source_sync.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_transforms.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_actions.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_definitions.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_coordination.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_datasets.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_evidence.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_ontology.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_functions.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_federation.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_ezu_geo_feed.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_workflow.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_connector.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_warehouse.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_lakehouse.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_model_platform.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_autonomy.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_open_table.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_event_stream.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_documents.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_packages.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_images.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_retention.rs"),
+    include_str!("../crates/sekai-core/src/db/runtime_db_receipts.rs"),
+);
 
 fn rows() -> Vec<Vec<String>> {
     let start = DOC
