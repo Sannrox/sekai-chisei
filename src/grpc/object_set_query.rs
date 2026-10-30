@@ -152,6 +152,7 @@ impl SekaiServiceImpl {
             next_page_token,
             authority: false,
             aggregates: Vec::new(),
+            source: crate::sekai::object_set::EVALUATE_SOURCE_UNKNOWN.into(),
         }))
     }
 }
@@ -425,6 +426,7 @@ impl SekaiServiceImpl {
             next_page_token,
             authority: false,
             aggregates: Vec::new(),
+            source: crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
         }))
     }
 
@@ -930,6 +932,7 @@ impl SekaiServiceImpl {
                     count: row.count,
                 })
                 .collect(),
+            source: crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
         }))
     }
 }
@@ -1739,6 +1742,10 @@ mod tests {
             .into_inner();
         assert!(!first.authority);
         assert_eq!(
+            first.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_UNKNOWN
+        );
+        assert_eq!(
             first.contract_version,
             crate::sekai::object_set::CONTRACT_VERSION
         );
@@ -2032,6 +2039,10 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(page.total, 1);
+        assert_eq!(
+            page.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION
+        );
         assert_eq!(page.members[0].id, "Customer:c1");
         assert!(
             !page
@@ -2424,6 +2435,10 @@ mod tests {
         assert_eq!(page.aggregates[0].count, 1);
         assert!(page.members.is_empty());
         assert!(!page.authority);
+        assert_eq!(
+            page.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION
+        );
 
         grant_namespace(&svc, "sales", "service-a");
         grant_namespace(&svc, "sales", "human-a");
@@ -3248,6 +3263,10 @@ mod tests {
         assert_eq!(page.aggregates.len(), 1);
         assert_eq!(page.aggregates[0].value, 10.0);
         assert!(!page.authority);
+        assert_eq!(
+            page.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION
+        );
 
         svc.object_log_dual_read.enabled = false;
         let off = svc
