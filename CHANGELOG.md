@@ -6,6 +6,14 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 1.4.0
+
+Upgrade notes:
+
+- Community SQLite and PostgreSQL apply new schema on startup. Backup the store before the first 1.4.0 boot. This release carries migrations (`GATE:mig`).
+- Guest contexts are denied unless an installed identity extension admits them. Extensions must populate `home_tenant`, return `GuestGrant`, and implement `authorize_discovery` (`GATE:break`, #1432, #1433, #1435). Community installs without an extension keep existing credential behavior.
+- Optional `deny_unmarked` stays off. Enable with namespace property `deny_unmarked=true` or `SEKAI_DENY_UNMARKED=1` (#1430).
+- A binary or image rollback to 1.3.0 does not undo applied schema. Restore from backup.
 - Sync and devices: a device-bound credential must send the device's proof
   on `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas`, so a copied
   credential without the key is refused. A revoked device's wipe-only

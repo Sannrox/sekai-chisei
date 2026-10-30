@@ -48,7 +48,7 @@ development apply is limited to the built-in `local` environment.
 ```bash
 tenkaictl env cluster-config set local /path/to/kubeconfig
 tenkaictl publish deploy/kubernetes/tenkai.toml --allow-unsigned-development
-tenkaictl promote sekai-chisei@1.3.0 stable
+tenkaictl promote sekai-chisei@1.4.0 stable
 tenkaictl env subscribe local sekai-chisei=stable
 PLAN=$(tenkaictl plan --env local | sed -n 's/^plan id: //p')
 tenkaictl apply "$PLAN" \

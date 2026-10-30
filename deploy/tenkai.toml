@@ -10,14 +10,14 @@
 
 [product]
 name = "sekai-chisei"
-version = "1.3.0"
+version = "1.4.0"
 description = "sekai-chisei control plane (workload instance via Apple container)"
 
 [deploy]
 workdir = "."
 install = """
 set -e
-IMG=ghcr.io/sannrox/sekai-chisei:1.3.0
+IMG=ghcr.io/sannrox/sekai-chisei:1.4.0
 container image pull "$IMG" || container image inspect "$IMG" >/dev/null 2>&1
 container volume create sekai-chisei-prod-data >/dev/null 2>&1 || true
 container run --rm --user root -v sekai-chisei-prod-data:/data "$IMG" chown -R sekai /data
