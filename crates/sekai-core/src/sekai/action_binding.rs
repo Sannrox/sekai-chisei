@@ -318,6 +318,29 @@ impl SekaiDb {
         Ok(stored)
     }
 
+    pub fn list_action_bindings(&self, namespace: &str) -> Result<Vec<ActionBinding>, String> {
+        self.migrate_action_bindings()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT body_json FROM sekai_action_bindings
+                 WHERE namespace = ?1
+                 ORDER BY binding_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let mut bindings = Vec::new();
+        for body in rows {
+            let body = body.map_err(|error| error.to_string())?;
+            let binding: ActionBinding = serde_json::from_str(&body)
+                .map_err(|error| format!("corrupt action binding: {error}"))?;
+            bindings.push(binding);
+        }
+        Ok(bindings)
+    }
+
     pub fn get_action_binding(
         &self,
         namespace: &str,
@@ -575,6 +598,10 @@ mod tests {
             4,
         )
         .unwrap();
+        let listed = db.list_action_bindings("acme").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].binding_id, "escalate-on-update");
+        assert!(db.list_action_bindings("other").unwrap().is_empty());
         assert_eq!(
             db.get_action_binding("acme", "escalate-on-update")
                 .unwrap()

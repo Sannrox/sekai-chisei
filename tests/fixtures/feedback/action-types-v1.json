@@ -65,6 +65,22 @@
       }
     },
     {
+      "type_id": "feedback.investigation.dispatch",
+      "description": "Claimable investigation of a newly recorded observation.",
+      "object_kind": "",
+      "object_mutation": "",
+      "effect_kind": "runtime_dispatch",
+      "parameter_schema": {
+        "type": "object",
+        "properties": {
+          "observation_id": { "type": "string" },
+          "runtime": { "type": "string" }
+        },
+        "required": ["observation_id", "runtime"],
+        "additionalProperties": false
+      }
+    },
+    {
       "type_id": "feedback.hypothesis.record",
       "description": "Create one hypothesis. Hypotheses are not investigation results.",
       "object_kind": "feedback_hypothesis",

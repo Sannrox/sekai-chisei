@@ -45,6 +45,18 @@ compare-and-set, so instances running at once never move it backwards. Each
 pass also sweeps every disposition heading its chain for an expiry or a basis
 its exposure no longer has, so a change committed behind the feed position is
 still caught.
+Combined-mode instances also run a feedback investigation worker (#1231)
+every 15 seconds in every namespace holding the evidence and finding package.
+Enabled object-change bindings of kind `feedback_observation` and type
+`feedback.investigation.dispatch` admit one fenced ActionWork claim per new
+observation. The first pin does not backfill. The worker claims at most one
+investigation at a time, requests bounded analysis through `PlanExecution`
+and `ExecutePlanStream` with no agent tools, and writes investigation,
+hypothesis, and finding objects. Namespace model budgets apply; exhaustion
+records no finding. Inconclusive and malformed results stay `internal` and
+cannot dispatch a GitHub mutation. Those bindings and ActionWork claims are
+experimental: community SQLite is the reference store, and community
+PostgreSQL leaves action bindings unavailable (ADR 0090).
 Neither package
 ships live instances, and neither is a runtime grant.
 

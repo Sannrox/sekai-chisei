@@ -16,7 +16,9 @@ use crate::sekai::capability_package::{
 };
 use crate::sekai::evidence::{EvidenceIntent, EvidenceLifecycleState};
 use crate::sekai::evidence_store::{EvidenceSchemaDefinition, EvidenceSubmissionRecord};
-use crate::sekai::governed_action_type::{EFFECT_KIND_NOTIFY, GovernedActionType};
+use crate::sekai::governed_action_type::{
+    EFFECT_KIND_NOTIFY, EFFECT_KIND_RUNTIME_DISPATCH, GovernedActionType,
+};
 use crate::sekai::schema::{
     ObjectType, PropertyDef, PropertyType, default_property_classification,
 };
@@ -33,6 +35,7 @@ pub const KIND_VERIFICATION: &str = "feedback_verification";
 pub const ACTION_OBSERVATION: &str = "feedback.observation.record";
 pub const ACTION_FINDING: &str = "feedback.finding.record";
 pub const ACTION_INVESTIGATION: &str = "feedback.investigation.record";
+pub const ACTION_DISPATCH: &str = "feedback.investigation.dispatch";
 pub const ACTION_HYPOTHESIS: &str = "feedback.hypothesis.record";
 pub const ACTION_EXTERNAL_ISSUE: &str = "feedback.external_issue.record";
 pub const ACTION_VERIFICATION: &str = "feedback.verification.record";
@@ -102,6 +105,8 @@ struct ActionTypeFixture {
     description: String,
     object_kind: String,
     object_mutation: String,
+    #[serde(default)]
+    effect_kind: String,
     parameter_schema: serde_json::Value,
 }
 
@@ -187,6 +192,16 @@ fn register_action_types(
     for action in document.actions {
         let parameter_schema_json = serde_json::to_string(&action.parameter_schema)
             .map_err(|error| format!("feedback action parameter schema: {error}"))?;
+        let effect_kind = match action.effect_kind.trim() {
+            "" => EFFECT_KIND_NOTIFY,
+            EFFECT_KIND_RUNTIME_DISPATCH => EFFECT_KIND_RUNTIME_DISPATCH,
+            other => {
+                return Err(format!(
+                    "unknown feedback action effect kind {other} for {}",
+                    action.type_id
+                ));
+            }
+        };
         db.put_governed_action_type(
             GovernedActionType {
                 namespace: namespace.into(),
@@ -194,7 +209,7 @@ fn register_action_types(
                 version: PACKAGE_VERSION.into(),
                 description: action.description,
                 parameter_schema_json,
-                allowed_effect_kinds: vec![EFFECT_KIND_NOTIFY.into()],
+                allowed_effect_kinds: vec![effect_kind.into()],
                 object_kind: action.object_kind,
                 object_mutation: action.object_mutation,
                 enabled: true,
@@ -607,6 +622,14 @@ mod tests {
         verify_package(&runtime, ACTOR, NAMESPACE, CERTIFICATION_ID, &certified).unwrap();
         assert!(runtime.get_object_type(KIND_OBSERVATION).unwrap().is_some());
         assert!(runtime.get_object_type(KIND_HYPOTHESIS).unwrap().is_some());
+        let dispatch = runtime
+            .get_governed_action_type(NAMESPACE, ACTION_DISPATCH, PACKAGE_VERSION)
+            .unwrap()
+            .expect("dispatch action");
+        assert_eq!(
+            dispatch.allowed_effect_kinds,
+            [EFFECT_KIND_RUNTIME_DISPATCH]
+        );
         let verification = runtime
             .get_object_type(KIND_VERIFICATION)
             .unwrap()
