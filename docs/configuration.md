@@ -46,6 +46,12 @@ template.
 | `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
+| `SEKAI_FEEDBACK_GITHUB_OWNER` | unset | Combined-mode GitHub publisher (#1232): repository owner. Unset, the publisher idles. |
+| `SEKAI_FEEDBACK_GITHUB_REPO` | unset | Combined-mode GitHub publisher: repository name. Unset, the publisher idles. |
+| `SEKAI_FEEDBACK_GITHUB_TOKEN` | unset | Combined-mode GitHub publisher: bearer for Issues. Missing credentials stay visible and retryable and do not mutate. Treat as a secret. |
+| `SEKAI_FEEDBACK_GITHUB_RUN_AS` | `feedback-github` | Principal that authorizes and redeems the GitHub permit. |
+| `SEKAI_FEEDBACK_GITHUB_DAILY_CAP` | `5` | Maximum new GitHub issues created per UTC day. Excess qualifying findings stay queued. |
+| `SEKAI_FEEDBACK_GITHUB_API` | `https://api.github.com` | GitHub API origin used by the publisher. |
 | `SEKAI_EZU_URL` | unset | Ezu HTTP and Arrow Flight address for fence-binding event reads and geo-feed writes ([ezu-geo-feed.md](ezu-geo-feed.md)) |
 | `EZU_TOKEN` | unset | Community bearer for Ezu; enterprise resolves provider `ezu` per `run_as` tenant. The token decides the Ezu namespace |
 | `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Unset or empty parses as hop-projection. After the default switch, operators must `ReindexObjectType` for hop kinds. Pinning nested-loop does not bypass an unready generation. Both engines fail closed while hop-projection ready is false after a binding-generation bump. Switching engines requires `ReindexObjectType` |

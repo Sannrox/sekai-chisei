@@ -86,79 +86,9 @@ pub(super) async fn redeem_external_action_permit(
     req: Request<RedeemExternalActionPermitRequest>,
 ) -> Result<Response<RedeemExternalActionPermitResponse>, Status> {
     let actor = required_authenticated_actor(&req)?;
-    let input = req.into_inner();
-    if input.idempotency_key.trim().is_empty() || input.execution_id.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "idempotency_key and execution_id required",
-        ));
-    }
-    let value = external_permit_from_proto(
-        input
-            .permit
-            .ok_or_else(|| Status::invalid_argument("permit required"))?,
-    );
-    if actor != value.executor && !matches!(actor.as_str(), "root" | "local") {
-        return Err(Status::permission_denied(
-            "permit redemption requires the bound executor",
-        ));
-    }
-    if let Some(redemption) = service
-        .db
-        .replay_redemption(&value, &input.idempotency_key, &input.execution_id)
-        .map_err(Status::failed_precondition)?
-    {
-        return Ok(Response::new(RedeemExternalActionPermitResponse {
-            redemption: Some(ExternalActionRedemption {
-                version: redemption.version,
-                permit_id: redemption.permit_id,
-                redemption_id: redemption.redemption_id,
-                executor: redemption.executor,
-                redeemed_at_ms: redemption.redeemed_at_ms,
-                invocation_ordinal: redemption.invocation_ordinal,
-                evidence_due_at_ms: redemption.evidence_due_at_ms,
-                site_id: redemption.site_id,
-            }),
-        }));
-    }
-    let context = external_host_context(
-        input.executor,
-        input.requesting_harness,
-        input.canonical_arguments_digest,
-        input.target_selectors,
-        input.observed_preconditions,
-        input.host_capabilities,
-    );
-    let key = permit_signing_key(&service.config)?.verifying_key();
-    value
-        .verify_trust(&service.config.permit_issuer, &service.config.permit_key_id)
-        .map_err(Status::failed_precondition)?;
-    let redemption = service
-        .db
-        .redeem_or_reconcile_permit(
-            &value,
-            &context,
-            &key,
-            &input.idempotency_key,
-            &input.execution_id,
-            &service.config.site_id,
-            crate::chisei::external_permit::RedemptionTiming {
-                invoked_at_ms: input.invoked_at_ms,
-                reconciled_at_ms: chrono::Utc::now().timestamp_millis(),
-            },
-        )
-        .map_err(Status::failed_precondition)?;
-    Ok(Response::new(RedeemExternalActionPermitResponse {
-        redemption: Some(ExternalActionRedemption {
-            version: redemption.version,
-            permit_id: redemption.permit_id,
-            redemption_id: redemption.redemption_id,
-            executor: redemption.executor,
-            redeemed_at_ms: redemption.redeemed_at_ms,
-            invocation_ordinal: redemption.invocation_ordinal,
-            evidence_due_at_ms: redemption.evidence_due_at_ms,
-            site_id: redemption.site_id,
-        }),
-    }))
+    Ok(Response::new(
+        service.redeem_from_authenticated(actor, req.into_inner())?,
+    ))
 }
 pub(super) async fn set_external_action_policy(
     service: &ChiseiServiceImpl,

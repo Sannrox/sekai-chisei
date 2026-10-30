@@ -1,5 +1,6 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
+mod feedback_github;
 mod feedback_investigation;
 mod provider_execution;
 pub mod remote_sekai;
@@ -1733,6 +1734,7 @@ fn spawn_service_background_tasks(
             sekai_svc.clone(),
             chisei_svc.clone(),
         );
+        feedback_github::spawn_feedback_github(db.clone(), chisei_svc.clone());
     }
 }
 
