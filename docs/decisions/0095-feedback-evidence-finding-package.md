@@ -78,8 +78,16 @@ Issue #1231 adds a Combined-mode investigation worker that consumes
 bindings (ADR 0090) and fenced ActionWork claims. Community SQLite is the
 reference store for those experimental surfaces; community PostgreSQL leaves
 action bindings unavailable. The worker writes investigation, hypothesis,
-and finding objects and does not publish to GitHub. The first binding pin
-does not backfill.
+and finding objects. The first binding pin does not backfill.
+
+Issue #1232 adds a Combined-mode GitHub publisher for qualifying findings.
+It targets only the configured repository, authorizes and redeems an
+external-action permit, verifies the executor, and records host execution
+evidence plus a durable external-issue mapping and a public-safe marker.
+Lost create or update responses stay pending reconciliation and are never
+retried blindly. Publication strips private environment identifiers and
+private issue references. The default cap is five new issues per UTC day.
+Tracker adapters remain outside this package.
 
 ## Validation
 

@@ -2,7 +2,8 @@
 //!
 //! Polls plane-owned object-change bindings, claims one fenced dispatch, and
 //! records structured investigation objects. Analysis uses PlanExecution and
-//! ExecutePlanStream with no agent tools. GitHub publication is a later slice.
+//! ExecutePlanStream with no agent tools. Qualifying findings are published
+//! by the GitHub worker (#1232).
 
 use super::chisei_service::ChiseiServiceImpl;
 use super::pb::chisei::chisei_service_server::ChiseiService;

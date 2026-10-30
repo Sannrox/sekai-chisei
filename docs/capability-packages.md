@@ -54,9 +54,23 @@ investigation at a time, requests bounded analysis through `PlanExecution`
 and `ExecutePlanStream` with no agent tools, and writes investigation,
 hypothesis, and finding objects. Namespace model budgets apply; exhaustion
 records no finding. Inconclusive and malformed results stay `internal` and
-cannot dispatch a GitHub mutation. Those bindings and ActionWork claims are
-experimental: community SQLite is the reference store, and community
-PostgreSQL leaves action bindings unavailable (ADR 0090).
+cannot dispatch a GitHub mutation. Combined-mode instances also run a GitHub
+publisher (#1232) on the same 15-second interval. Qualifying findings create
+or update one issue on the configured repository after external-action
+authorization, executor verification, permit redemption, and execution
+evidence. Publication strips private environment identifiers and private
+repository or issue references. A durable mapping and public-safe marker
+connect each problem signature to its issue; later occurrences update managed
+content and leave maintainer text in place. Lost responses stay pending
+reconciliation and are never retried blindly. Denied, expired, revoked,
+mismatched, or missing permits, missing credentials, disabled issues, and
+rate limits stay visible and retryable. The default cap is five new issues
+per UTC day (`SEKAI_FEEDBACK_GITHUB_DAILY_CAP`). Owner and repository come
+from `SEKAI_FEEDBACK_GITHUB_OWNER` and `SEKAI_FEEDBACK_GITHUB_REPO`; the
+token is `SEKAI_FEEDBACK_GITHUB_TOKEN`. Those bindings and ActionWork claims
+are experimental: community SQLite is the reference store, and community
+PostgreSQL leaves action bindings unavailable (ADR 0090). The GitHub
+publisher does not use action bindings.
 Neither package
 ships live instances, and neither is a runtime grant.
 

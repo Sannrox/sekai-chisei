@@ -73,6 +73,9 @@ mod reported_operation_event_lifecycle;
 #[path = "chisei_service_support_auth.rs"]
 mod support_auth;
 use support_auth::*;
+pub(crate) use support_auth::{
+    external_permit_from_proto, external_permit_to_proto, permit_signing_key,
+};
 #[path = "chisei_service_support_policy.rs"]
 mod support_policy;
 use support_policy::*;

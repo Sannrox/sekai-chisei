@@ -76,6 +76,7 @@ pub mod federation_conflict;
 pub mod federation_network;
 pub mod federation_profile;
 pub mod federation_revocation;
+pub mod feedback_github;
 pub mod feedback_investigation;
 pub mod feedback_package;
 pub mod fence_binding;

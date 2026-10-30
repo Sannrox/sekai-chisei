@@ -273,13 +273,13 @@ pub(super) fn external_decision_to_proto(
         permit: None,
     }
 }
-pub(super) fn permit_signing_key(config: &Config) -> Result<ed25519_dalek::SigningKey, Status> {
+pub(crate) fn permit_signing_key(config: &Config) -> Result<ed25519_dalek::SigningKey, Status> {
     permit::signing_key_from_hex(config.permit_signing_key.as_deref().ok_or_else(|| {
         Status::failed_precondition("external-action permit signing is not configured")
     })?)
     .map_err(Status::failed_precondition)
 }
-pub(super) fn external_permit_to_proto(value: &permit::Permit) -> ExternalActionPermit {
+pub(crate) fn external_permit_to_proto(value: &permit::Permit) -> ExternalActionPermit {
     ExternalActionPermit {
         version: value.version.clone(),
         permit_id: value.permit_id.clone(),
@@ -330,7 +330,7 @@ pub(super) fn external_permit_to_proto(value: &permit::Permit) -> ExternalAction
         site_id: value.site_id.clone(),
     }
 }
-pub(super) fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
+pub(crate) fn external_permit_from_proto(value: ExternalActionPermit) -> permit::Permit {
     permit::Permit {
         version: value.version,
         permit_id: value.permit_id,

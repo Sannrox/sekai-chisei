@@ -3,8 +3,8 @@
 //! A plane-owned Action binding admits one `feedback.investigation.dispatch`
 //! per new observation. The worker claims that work, gathers authorized
 //! evidence, and records structured investigation, hypothesis, and finding
-//! objects. GitHub publication is a later slice: internal and malformed
-//! results never set the qualifying classification.
+//! objects. Internal and malformed results never set the qualifying
+//! classification that GitHub publication (#1232) consumes.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
