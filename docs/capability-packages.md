@@ -71,6 +71,17 @@ token is `SEKAI_FEEDBACK_GITHUB_TOKEN`. Those bindings and ActionWork claims
 are experimental: community SQLite is the reference store, and community
 PostgreSQL leaves action bindings unavailable (ADR 0090). The GitHub
 publisher does not use action bindings.
+Combined-mode instances also run a feedback quality worker (#1233) on the
+same 15-second interval. Later observations of the same problem class are
+matched to published findings. Comparable success, absent telemetry, expected
+waits, and unrelated workloads stay distinct; recovery and verified
+reproduction are recorded only from measured signals. Quality records
+(`useful`, `duplicate`, `false_positive`, `recurring`, `improved`) live on
+verification objects. Issue closure, learning activation, and detector-policy
+changes stay maintainer-controlled. Promotion into a `feedback-quality-` eval
+suite is explicit (`SEKAI_FEEDBACK_QUALITY_PROMOTE=1` or the Chisei
+`promote_quality_to_eval` path) and is not Gunshi operator-feedback
+promotion.
 Neither package
 ships live instances, and neither is a runtime grant.
 

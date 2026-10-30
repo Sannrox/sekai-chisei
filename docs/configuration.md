@@ -52,6 +52,8 @@ template.
 | `SEKAI_FEEDBACK_GITHUB_RUN_AS` | `feedback-github` | Principal that authorizes and redeems the GitHub permit. |
 | `SEKAI_FEEDBACK_GITHUB_DAILY_CAP` | `5` | Maximum new GitHub issues created per UTC day. Excess qualifying findings stay queued. |
 | `SEKAI_FEEDBACK_GITHUB_API` | `https://api.github.com` | GitHub API origin used by the publisher. |
+| `SEKAI_FEEDBACK_QUALITY_RUN_AS` | `feedback-quality` | Principal that records verification and issue quality (#1233). |
+| `SEKAI_FEEDBACK_QUALITY_PROMOTE` | unset | Set `1` to promote quality records into a `feedback-quality-` eval suite. Unset, records stay inspectable without silent promotion. |
 | `SEKAI_EZU_URL` | unset | Ezu HTTP and Arrow Flight address for fence-binding event reads and geo-feed writes ([ezu-geo-feed.md](ezu-geo-feed.md)) |
 | `EZU_TOKEN` | unset | Community bearer for Ezu; enterprise resolves provider `ezu` per `run_as` tenant. The token decides the Ezu namespace |
 | `SEKAI_OBJECT_INDEX_ENGINE` | `hop-projection` | Object-set hop engine (`hop-projection` default, or `nested-loop` as an explicit debug scan). Unset or empty parses as hop-projection. After the default switch, operators must `ReindexObjectType` for hop kinds. Pinning nested-loop does not bypass an unready generation. Both engines fail closed while hop-projection ready is false after a binding-generation bump. Switching engines requires `ReindexObjectType` |
