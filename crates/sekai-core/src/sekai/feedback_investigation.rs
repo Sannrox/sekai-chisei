@@ -626,7 +626,7 @@ fn write_records(
             "name": cluster.signature,
             "observation_id": cluster.trigger_id,
             "outcome": outcome.to_string(),
-            "measured": false,
+            "measured": analysis.independently_verified_reproduction,
         }),
         &format!("feedback:inv:{key}"),
         now_ms,
@@ -1288,7 +1288,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             investigation.properties.get("measured").map(String::as_str),
-            Some("false")
+            Some("true")
         );
         assert_eq!(
             runtime

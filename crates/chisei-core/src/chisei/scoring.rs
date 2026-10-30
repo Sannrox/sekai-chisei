@@ -28,6 +28,7 @@ use tracing::{error, info, warn};
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::decision_ledger::{Decision, DecisionFilter};
 use crate::chisei::eval::{self, EvalStore};
+use crate::chisei::feedback_quality_eval::is_generated_quality_case;
 use crate::chisei::gunshi_feedback_eval::{is_feedback_suite_id, is_generated_feedback_case};
 use crate::chisei_store::{
     ChiseiDecisionStore, ChiseiEvalStore, ChiseiObservationStore, ChiseiStore,
@@ -702,7 +703,9 @@ impl ScoringJob {
                 continue;
             }
             for case in suite.cases.iter().filter(|c| c.namespace == namespace) {
-                if is_feedback_suite_id(&suite.id) && is_generated_feedback_case(case) {
+                if is_feedback_suite_id(&suite.id)
+                    && (is_generated_feedback_case(case) || is_generated_quality_case(case))
+                {
                     continue;
                 }
                 assertions.extend(case.assertions.iter().cloned());

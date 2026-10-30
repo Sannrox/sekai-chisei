@@ -156,7 +156,37 @@
           "name": "result",
           "type": "string",
           "required": true,
-          "description": "Verification result."
+          "description": "Verification result: confirmed, refuted, or inconclusive. Missing signals never confirm."
+        },
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": false,
+          "description": "Finding whose quality this verification inspects."
+        },
+        {
+          "name": "match_class",
+          "type": "string",
+          "required": false,
+          "description": "How later observations compared to the original finding."
+        },
+        {
+          "name": "quality",
+          "type": "string",
+          "required": false,
+          "description": "Issue quality: useful, duplicate, false_positive, recurring, or improved."
+        },
+        {
+          "name": "tenkai_versions",
+          "type": "string",
+          "required": false,
+          "description": "Tenkai versions retained from comparable observations."
+        },
+        {
+          "name": "evidence_coverage",
+          "type": "string",
+          "required": false,
+          "description": "Whether later evidence covered comparable operations, waits, or was absent."
         }
       ]
     }
@@ -210,6 +240,12 @@
       "subject": "VerificationRecord",
       "source": "https://github.com/Sannrox/sekai-chisei/discussions/1281",
       "locator": "Verification Action subject_kind admits investigation results only",
+      "confidence": 1.0
+    },
+    {
+      "subject": "VerificationRecord",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1233",
+      "locator": "Quality and match-class records stay on verification objects; missing signals never confirm",
       "confidence": 1.0
     },
     {

@@ -132,8 +132,13 @@
           },
           "result": {
             "type": "string",
-            "enum": ["confirmed", "refuted"]
-          }
+            "enum": ["confirmed", "refuted", "inconclusive"]
+          },
+          "finding_id": { "type": "string" },
+          "match_class": { "type": "string" },
+          "quality": { "type": "string" },
+          "tenkai_versions": { "type": "string" },
+          "evidence_coverage": { "type": "string" }
         },
         "required": ["object_id", "subject_id", "subject_kind", "result"],
         "additionalProperties": false

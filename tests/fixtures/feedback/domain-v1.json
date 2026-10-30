@@ -168,7 +168,37 @@
           "name": "result",
           "type": "string",
           "required": true,
-          "description": "Verification result."
+          "description": "Verification result: confirmed, refuted, or inconclusive. Missing signals never confirm."
+        },
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": false,
+          "description": "Finding whose quality this verification inspects."
+        },
+        {
+          "name": "match_class",
+          "type": "string",
+          "required": false,
+          "description": "How later observations compared: comparable_success, absent_telemetry, expected_wait, unrelated_workload, recurrence, recovery, or verified_reproduction."
+        },
+        {
+          "name": "quality",
+          "type": "string",
+          "required": false,
+          "description": "Issue quality: useful, duplicate, false_positive, recurring, or improved."
+        },
+        {
+          "name": "tenkai_versions",
+          "type": "string",
+          "required": false,
+          "description": "Tenkai versions retained from comparable observations."
+        },
+        {
+          "name": "evidence_coverage",
+          "type": "string",
+          "required": false,
+          "description": "Whether later evidence covered comparable operations, waits, or was absent."
         }
       ]
     }

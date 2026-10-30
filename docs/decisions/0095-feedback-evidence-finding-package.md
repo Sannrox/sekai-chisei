@@ -89,6 +89,16 @@ retried blindly. Publication strips private environment identifiers and
 private issue references. The default cap is five new issues per UTC day.
 Tracker adapters remain outside this package.
 
+Issue #1233 adds a Combined-mode quality worker that matches later
+observations to the same problem class, retains Tenkai versions from
+comparable operations, and writes verification records with result
+`confirmed`, `refuted`, or `inconclusive`. Missing telemetry never confirms.
+Quality (`useful`, `duplicate`, `false_positive`, `recurring`, `improved`)
+is inspectable on those records. Promotion into a `feedback-quality-` eval
+suite is maintainer-controlled and is not Gunshi operator-feedback
+promotion. The worker never closes tracker issues, never activates learning,
+and never changes detector policy.
+
 ## Validation
 
 Crate tests install the fixtures into an in-memory runtime and cover portable
