@@ -31,6 +31,14 @@ fn operator_page_documents_non_authority() {
         OPERATOR.contains("EvaluateObjectSetResponse.authority"),
         "operator page must keep the descriptor from granting authority"
     );
+    assert!(
+        OPERATOR.contains("EvaluateObjectSetResponse.source"),
+        "operator page must name the evaluate serving source"
+    );
+    assert!(
+        OPERATOR.contains("sql_projection") && OPERATOR.contains("object_log"),
+        "operator page must name sql_projection and object_log"
+    );
 }
 
 #[test]

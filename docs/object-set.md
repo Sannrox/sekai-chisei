@@ -33,6 +33,10 @@ stale; regenerate the descriptor against the new revision. See
 The descriptor, a returned page, a continuation token, and any client-cached
 set grant no write, sync, or Action power. Subsequent reads recheck live
 authorization. `EvaluateObjectSetResponse.authority` is always false.
+`EvaluateObjectSetResponse.source` names how this page was produced:
+`sql_projection` (the `object_type_index*` serving index), `object_log`,
+or `unknown` when this replica cannot say. The field is additive; clients
+that do not know it ignore it. Do not open an object-log file to guess.
 
 ## Revision fence
 

@@ -13,6 +13,12 @@ use std::collections::BTreeMap;
 
 pub const CONTRACT_VERSION: &str = "sekai.object-set/v1";
 pub const CONTRACT_VERSION_V2: &str = "sekai.object-set/v2";
+/// `EvaluateObjectSetResponse.source` when the page came from `object_type_index*` (#2051).
+pub const EVALUATE_SOURCE_SQL_PROJECTION: &str = "sql_projection";
+/// `EvaluateObjectSetResponse.source` when the page came from the object log (#2051).
+pub const EVALUATE_SOURCE_OBJECT_LOG: &str = "object_log";
+/// `EvaluateObjectSetResponse.source` when this replica cannot name a source (#2051).
+pub const EVALUATE_SOURCE_UNKNOWN: &str = "unknown";
 pub const MAX_PROPERTY_FILTERS: usize = 4;
 pub const MAX_EVALUATE_LIMIT: i32 = domain::MAX_LIST_LIMIT;
 pub const DEFAULT_EVALUATE_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;

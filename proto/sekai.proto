@@ -1556,6 +1556,10 @@ message EvaluateObjectSetResponse {
   string next_page_token = 6;
   bool authority = 7;
   repeated ObjectSetAggregateRow aggregates = 8;
+  // Serving source of this page: sql_projection, object_log, or unknown
+  // when the replica cannot say. Additive; old clients ignore it. A page
+  // is still not a permit (#2051).
+  string source = 9;
 }
 message ObjectChangeSubscriptionScope {
   string namespace = 1;

@@ -38,6 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[serde(default)]",
         )
         .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
+        .field_attribute(
+            "sekai.EvaluateObjectSetResponse.source",
+            "#[serde(default)]",
+        )
         .compile_protos(
             &[
                 format!("{proto_root}/sekai.proto"),
