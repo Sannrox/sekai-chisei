@@ -49,6 +49,11 @@
 //!   fixed one. Running the probe stays with its suite; the binding records
 //!   the results.
 //!
+//! - A remediation (#1669) is a typed plan on an exposure: an optional patch,
+//!   catalogue mitigations, and an optional rollout. Each mitigation is a
+//!   separate reversible Action, applied only after the plan is decided. A
+//!   `fixed` disposition proposes lifting every active mitigation.
+//!
 //! Identities are stamped into `external_id` and enforced at commit by a
 //! partial unique index on `(namespace, external_id)` for these kinds; the
 //! plan-time checks here only give a precise error.
@@ -73,17 +78,19 @@ pub const PACKAGE_ID: &str = "pkg:security.finding-exposure/v1";
 /// review queue) needs a new version; installing again then registers it next
 /// to the previous one, which stays for instances and clients that use it.
 /// Version 2: `finding_class` (#1990) and the disposition review queue
-/// (#1991). `action_types_are_versioned` pins the bodies.
-pub const PACKAGE_VERSION: &str = "2";
+/// (#1991). Version 3: remediations and mitigating controls (#1669).
+/// `action_types_are_versioned` pins the bodies.
+pub const PACKAGE_VERSION: &str = "3";
 /// Earlier registered versions, newest first.
-const PREVIOUS_PACKAGE_VERSIONS: &[&str] = &["1"];
+const PREVIOUS_PACKAGE_VERSIONS: &[&str] = &["2", "1"];
 /// The current certification. A change to the certified members certifies
 /// the package again under a new id that succeeds the previous one where a
 /// namespace holds it; v1.3 adds the recorder and finding class (#1990),
-/// v1.4 regression probes (#1989).
-pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.4";
+/// v1.4 regression probes (#1989), v1.5 remediations (#1669).
+pub const CERTIFICATION_ID: &str = "cert:security.finding-exposure/v1.5";
 /// Certifications this one succeeds, newest first.
 const PREVIOUS_CERTIFICATION_IDS: &[&str] = &[
+    "cert:security.finding-exposure/v1.4",
     "cert:security.finding-exposure/v1.3",
     "cert:security.finding-exposure/v1.2",
     "cert:security.finding-exposure/v1.1",
@@ -105,6 +112,8 @@ pub fn is_package_kind(kind: &str) -> bool {
         KIND_EXPOSURE,
         KIND_DISPOSITION,
         KIND_PROBE,
+        crate::sekai::security_remediation::KIND_REMEDIATION,
+        crate::sekai::security_remediation::KIND_MITIGATION,
     ]
     .contains(&kind)
 }
@@ -289,6 +298,11 @@ fn register_action_types(
         {
             crate::sekai::review_queue::ReviewQueueSpec {
                 queue_id: DISPOSITION_REVIEW_QUEUE.into(),
+                ..Default::default()
+            }
+        } else if crate::sekai::security_remediation::is_remediation_action(&action.type_id) {
+            crate::sekai::review_queue::ReviewQueueSpec {
+                queue_id: crate::sekai::security_remediation::REMEDIATION_REVIEW_QUEUE.into(),
                 ..Default::default()
             }
         } else {
@@ -490,6 +504,9 @@ pub fn validate_object_write(
             }
             validate_probe(db, object)?
         }
+        kind if crate::sekai::security_remediation::is_remediation_kind(kind) => {
+            crate::sekai::security_remediation::validate_object_write(db, object)?
+        }
         _ => return Ok(()),
     };
     if !object.external_id.is_empty() && object.external_id != identity {
@@ -563,6 +580,9 @@ pub fn references(
     db: &RuntimeDb,
     object: &Object,
 ) -> Result<Vec<crate::sekai::action_instance::PlanReference>, String> {
+    if crate::sekai::security_remediation::is_remediation_kind(&object.kind) {
+        return crate::sekai::security_remediation::references(db, object);
+    }
     use crate::sekai::action_instance::PlanReference;
     let mut references = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -667,6 +687,13 @@ fn duplicate_message(object: &Object, existing: &Object) -> String {
             "that disposition already has regression probe {}",
             existing.id
         ),
+        crate::sekai::security_remediation::KIND_REMEDIATION => format!(
+            "a remediation with this plan already exists as {}",
+            existing.id
+        ),
+        crate::sekai::security_remediation::KIND_MITIGATION => {
+            format!("that control is already applied as {}", existing.id)
+        }
         _ => format!(
             "an exposure for this finding and target already exists as {}",
             existing.id
@@ -1743,6 +1770,8 @@ mod tests {
             "FindingOccurrence",
             "SecurityHypothesis",
             "Exposure",
+            "Remediation",
+            "Mitigation",
         ] {
             assert!(
                 exported
@@ -2233,7 +2262,13 @@ mod tests {
             updated: 1,
         };
         // Real identities carry a kind prefix, so kinds never collide.
-        for kind in [KIND_FINDING, KIND_OCCURRENCE, KIND_EXPOSURE] {
+        for kind in [
+            KIND_FINDING,
+            KIND_OCCURRENCE,
+            KIND_EXPOSURE,
+            crate::sekai::security_remediation::KIND_REMEDIATION,
+            crate::sekai::security_remediation::KIND_MITIGATION,
+        ] {
             let identity = format!("{kind}:id-1");
             runtime
                 .create_object_with_audit(&object(&format!("{kind}-1"), kind, &identity), ACTOR)
@@ -3121,7 +3156,7 @@ mod tests {
     }
 
     const PINNED_ACTION_BODIES: &str =
-        "sha256:e3a6dbbb2600175194fea02a1430575b97df1e2c89f73b212f00e2511c53f9b7";
+        "sha256:85697b3db4777ce9ce8a37cd39525bd058a1425a3a06b610116ffa2d6e533437";
 
     /// A namespace installed by the previous release, whose types differ at
     /// version 1, installs again: the new version registers next to the old

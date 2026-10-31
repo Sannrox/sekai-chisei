@@ -328,6 +328,110 @@
           "description": "The probe's result on the fixed revision; it must pass."
         }
       ]
+    },
+    {
+      "name": "Remediation",
+      "description": "A typed plan on an exposure: an optional patch, mitigating controls from a fixed catalogue, and an optional rollout. Applying each control is a separate Action.",
+      "mapped_kind": "security_remediation",
+      "properties": [
+        {
+          "name": "exposure_id",
+          "type": "string",
+          "required": true,
+          "description": "The exposure this plan remediates."
+        },
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": false,
+          "description": "The finding the exposure records. Stamped at write."
+        },
+        {
+          "name": "controls",
+          "type": "string",
+          "required": true,
+          "description": "Comma-separated catalogue entries kind:target: freeze, marking_raise, gateway_tool_disable, outbound_deny."
+        },
+        {
+          "name": "patch_ref",
+          "type": "string",
+          "required": false,
+          "description": "Change request id for the patch. Writing the patch is not this Action."
+        },
+        {
+          "name": "rollout_ref",
+          "type": "string",
+          "required": false,
+          "description": "Delivery plan or recall proposal id. Deploying is not this Action."
+        },
+        {
+          "name": "two_person",
+          "type": "string",
+          "required": false,
+          "description": "When true, propose, apply and lift park for a second principal."
+        },
+        {
+          "name": "asset_criticality",
+          "type": "string",
+          "required": false,
+          "description": "low, medium, high or critical. High and critical park for a human."
+        }
+      ]
+    },
+    {
+      "name": "Mitigation",
+      "description": "One reversible mitigating control from a remediation plan. Applied and lifted by their own Actions after the plan is decided.",
+      "mapped_kind": "security_mitigation",
+      "properties": [
+        {
+          "name": "remediation_id",
+          "type": "string",
+          "required": true,
+          "description": "The decided remediation this control belongs to."
+        },
+        {
+          "name": "exposure_id",
+          "type": "string",
+          "required": false,
+          "description": "The exposure. Stamped at write."
+        },
+        {
+          "name": "finding_id",
+          "type": "string",
+          "required": false,
+          "description": "The finding. Stamped at write."
+        },
+        {
+          "name": "control",
+          "type": "string",
+          "required": true,
+          "description": "freeze, marking_raise, gateway_tool_disable, or outbound_deny."
+        },
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Action type, marking, tool id, or outbound destination, matching the plan."
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "required": true,
+          "description": "applied, lift_proposed, or lifted."
+        },
+        {
+          "name": "gateway_audit",
+          "type": "string",
+          "required": false,
+          "description": "pending after a decided gateway apply, until the gateway records its audit."
+        },
+        {
+          "name": "marking_audit",
+          "type": "string",
+          "required": false,
+          "description": "pending after a decided marking raise, until the lattice records the raise."
+        }
+      ]
     }
   ],
   "relations": [
@@ -366,6 +470,18 @@
       "description": "A regression probe proves a fixed disposition.",
       "domain": "RegressionProbe",
       "range": "Disposition"
+    },
+    {
+      "name": "remediates",
+      "description": "A remediation plan decides how an exposure is contained and fixed.",
+      "domain": "Remediation",
+      "range": "Exposure"
+    },
+    {
+      "name": "mitigates",
+      "description": "A mitigation applies one catalogue control from a remediation plan.",
+      "domain": "Mitigation",
+      "range": "Remediation"
     }
   ],
   "provenance": [
@@ -403,6 +519,18 @@
       "subject": "Disposition",
       "source": "https://github.com/Sannrox/sekai-chisei/issues/1925",
       "locator": "A disposition returns to needs-review when its validity basis changes or it expires",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Remediation",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1669",
+      "locator": "A typed remediation plan on an exposure, with patch, catalogue mitigations, and rollout references",
+      "confidence": 1.0
+    },
+    {
+      "subject": "Mitigation",
+      "source": "https://github.com/Sannrox/sekai-chisei/issues/1669",
+      "locator": "Each mitigating control is a separate reversible Action applied only after the plan is decided",
       "confidence": 1.0
     }
   ]

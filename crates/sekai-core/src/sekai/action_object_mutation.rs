@@ -457,6 +457,8 @@ pub fn apply(
             "namespace:* identities are reserved for namespace boundaries".into(),
         ));
     }
+    crate::sekai::security_remediation::enable_applied_freeze(db, &object, now_ms)
+        .map_err(ActionObjectMutationError::FailedPrecondition)?;
     let object_id = object.id.clone();
     let object_kind = object.kind.clone();
     let object_external_id = object.external_id.clone();
@@ -466,39 +468,43 @@ pub fn apply(
     } else {
         ParkedGrantWrite::Update(object)
     };
-    let previous = match db
-        .apply_admission_object_write(
-            instance_id,
-            lease,
-            &write,
-            snapshot.as_deref(),
-            &references,
-            actor,
-            attribution,
-        )
-        .map_err(|error| {
-            if created && object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
-                ActionObjectMutationError::FailedPrecondition(format!(
-                    "observation external identity {object_external_id} already exists"
-                ))
-            } else if let Some(reference) =
-                error.strip_prefix(crate::sekai::action_instance::REFERENCE_CHANGED)
-            {
-                ActionObjectMutationError::FailedPrecondition(format!(
-                    "object {reference} changed since the Action was planned; submit again"
-                ))
-            } else if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
-                ActionObjectMutationError::FailedPrecondition(format!(
-                    "object {object_id} changed since the Action was planned; submit again"
-                ))
-            } else if error.ends_with("not found") {
-                ActionObjectMutationError::FailedPrecondition(format!(
-                    "object {object_id} not found"
-                ))
-            } else {
-                ActionObjectMutationError::Internal(error)
-            }
-        })? {
+    let persist = db.apply_admission_object_write(
+        instance_id,
+        lease,
+        &write,
+        snapshot.as_deref(),
+        &references,
+        actor,
+        attribution,
+    );
+    if !matches!(&persist, Ok(FencedAdmissionWrite::Applied(_))) {
+        let object = match &write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        };
+        crate::sekai::security_remediation::rollback_unapplied_freeze(db, object, now_ms)
+            .map_err(ActionObjectMutationError::FailedPrecondition)?;
+    }
+    let previous = match persist.map_err(|error| {
+        if created && object_kind == KIND_OBSERVATION && unique_constraint_failed(&error) {
+            ActionObjectMutationError::FailedPrecondition(format!(
+                "observation external identity {object_external_id} already exists"
+            ))
+        } else if let Some(reference) =
+            error.strip_prefix(crate::sekai::action_instance::REFERENCE_CHANGED)
+        {
+            ActionObjectMutationError::FailedPrecondition(format!(
+                "object {reference} changed since the Action was planned; submit again"
+            ))
+        } else if error == crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION {
+            ActionObjectMutationError::FailedPrecondition(format!(
+                "object {object_id} changed since the Action was planned; submit again"
+            ))
+        } else if error.ends_with("not found") {
+            ActionObjectMutationError::FailedPrecondition(format!("object {object_id} not found"))
+        } else {
+            ActionObjectMutationError::Internal(error)
+        }
+    })? {
         FencedAdmissionWrite::Applied(previous) => previous,
         FencedAdmissionWrite::FenceLost => {
             return Err(ActionObjectMutationError::FailedPrecondition(
@@ -570,6 +576,10 @@ pub fn grant_parked(
         object.updated = now_ms;
         (mutation, created, object)
     });
+    if let Some((_, _, object)) = prepared.as_ref() {
+        crate::sekai::security_remediation::enable_applied_freeze(db, object, now_ms)
+            .map_err(ActionObjectMutationError::FailedPrecondition)?;
+    }
     let write = prepared.as_ref().map(|(_, created, object)| {
         if *created {
             ParkedGrantWrite::Create(object.clone())
@@ -577,17 +587,32 @@ pub fn grant_parked(
             ParkedGrantWrite::Update(object.clone())
         }
     });
-    let outcome = db
-        .grant_parked_action_instance(
-            granted,
-            target_object_id,
-            parked_object_digest,
-            write.as_ref(),
-            &references,
-            actor,
-            claim,
-        )
-        .map_err(ActionObjectMutationError::Internal)?;
+    let outcome = match db.grant_parked_action_instance(
+        granted,
+        target_object_id,
+        parked_object_digest,
+        write.as_ref(),
+        &references,
+        actor,
+        claim,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if let Some((_, _, object)) = prepared.as_ref() {
+                crate::sekai::security_remediation::rollback_unapplied_freeze(db, object, now_ms)
+                    .map_err(ActionObjectMutationError::FailedPrecondition)?;
+            }
+            return Err(ActionObjectMutationError::Internal(error));
+        }
+    };
+    // NotParked is a lost CAS or a replay: this grant wrote nothing. If the
+    // object already exists, rollback_unapplied_freeze keeps that freeze.
+    if !matches!(&outcome, ParkedGrantOutcome::Granted { .. })
+        && let Some((_, _, object)) = prepared.as_ref()
+    {
+        crate::sekai::security_remediation::rollback_unapplied_freeze(db, object, now_ms)
+            .map_err(ActionObjectMutationError::FailedPrecondition)?;
+    }
     Ok(match outcome {
         ParkedGrantOutcome::NotParked => ParkedGrant::NotParked,
         ParkedGrantOutcome::Stale => ParkedGrant::Stale,
@@ -654,6 +679,7 @@ pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_m
     if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
         let _ = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms);
     }
+    crate::sekai::security_remediation::complete_object_write(db, object, actor, now_ms);
 }
 
 impl AppliedObjectMutation {
@@ -723,17 +749,18 @@ pub fn compensate(db: &RuntimeDb, applied: &AppliedObjectMutation, actor: &str) 
         {
             let _ = db.abort_unreceipted_object_create(&applied.object_id);
         }
-        return;
-    }
-    let Some(mut previous) = applied.previous.clone() else {
-        return;
-    };
-    if let Ok(Some(current)) = db.get_object(&applied.object_id)
+    } else if let Some(mut previous) = applied.previous.clone()
+        && let Ok(Some(current)) = db.get_object(&applied.object_id)
         && current.updated == applied.applied_updated
     {
         previous.updated = current.updated.saturating_add(1);
         let _ = db.update_object_with_audit(&previous, actor);
     }
+    let _ = crate::sekai::security_remediation::rollback_unapplied_freeze(
+        db,
+        &applied.object,
+        applied.applied_updated,
+    );
 }
 
 fn validate_object_schema(

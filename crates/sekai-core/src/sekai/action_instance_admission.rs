@@ -718,6 +718,34 @@ impl<'a> ActionInstanceAdmission<'a> {
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
+        // Remediation apply and lift always park. A proposal that is
+        // two-person, a production change, high criticality, or that
+        // touches marked data parks for a human; low-tier proposals
+        // auto-admit (#1669).
+        if status == STATUS_ADMITTED {
+            match crate::sekai::security_remediation::should_park(
+                self.db,
+                &namespace,
+                request.type_id.trim(),
+                &request.parameters_json,
+            ) {
+                Ok(true) => {
+                    status = STATUS_PARKED.into();
+                    policy_decision_text = "require_approval".into();
+                    if !budget_already_reserved {
+                        budget_decision = if self.budget.is_some() {
+                            "deferred".into()
+                        } else {
+                            budget_decision
+                        };
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(ActionInstanceAdmissionError::FailedPrecondition(error));
+                }
+            }
+        }
 
         // Policy above was decided now, at arrival. An offline base that the
         // object has moved past is then judged by the type's conflict rule.
@@ -1042,6 +1070,13 @@ impl<'a> ActionInstanceAdmission<'a> {
                 let _ = self
                     .db
                     .release_admission(&stored.instance_id, &lease, &undo, actor);
+                if let Some(applied) = applied_object.as_ref() {
+                    let _ = crate::sekai::security_remediation::rollback_unapplied_freeze(
+                        self.db,
+                        &applied.object,
+                        now,
+                    );
+                }
             }
             return Err(error);
         }
@@ -1959,6 +1994,12 @@ impl<'a> ActionInstanceAdmission<'a> {
         // same clearance as reading the instance (#1706).
         if !stored.marking.is_empty() {
             intent_attributes.insert(RECEIPT_MARKING_ATTRIBUTE.into(), stored.marking.clone());
+        }
+        if let Some(applied) = applied_object {
+            intent_attributes.extend(crate::sekai::security_remediation::receipt_chain(
+                &applied.object,
+                operation_id,
+            ));
         }
         // Offline provenance (#1580): when and on which device it was
         // prepared, under which lease, and any conflict it met.
