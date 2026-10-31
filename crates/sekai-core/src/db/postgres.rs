@@ -195,6 +195,8 @@ const SERVICE_PRINCIPAL_CAPABILITIES_SCHEMA: &str =
 const PARKED_AGENT_TURNS_SCHEMA: &str = include_str!("postgres/0137_parked_agent_turns.sql");
 const AGENT_TURN_INSTANCE_INDEX_SCHEMA: &str =
     include_str!("postgres/0138_agent_turn_instance_index.sql");
+const SECURITY_REMEDIATION_IDENTITY_SCHEMA: &str =
+    include_str!("postgres/0139_security_remediation_identity.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -992,6 +994,12 @@ const MIGRATIONS: &[Migration] = &[
         137,
         "agent_turn_instance_index",
         AGENT_TURN_INSTANCE_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        138,
+        "security_remediation_identity",
+        SECURITY_REMEDIATION_IDENTITY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

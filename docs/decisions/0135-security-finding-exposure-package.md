@@ -144,6 +144,25 @@ written through governed Actions, and no domain-specific core RPC.
     at, so a reopen parked before a reinstall still replays. A test pins the version's bodies so a change cannot land
     without a new version.
 
+12. **A remediation is a typed plan; each mitigation is its own Action** (#1669).
+    `security.remediation.propose` records an optional patch reference, zero
+    or more catalogue controls (`freeze`, `marking_raise`,
+    `gateway_tool_disable`, `outbound_deny`), and an optional rollout
+    reference. Applying a control is `security.mitigation.apply`; lifting it
+    is `security.mitigation.lift`. Both park for a human. A low-tier
+    proposal (no marked data, no rollout, not high or critical, not
+    two-person) auto-admits; the rest park in `security.remediations`. A
+    freeze is a `SCOPE_ACTION` write freeze and takes effect at the next
+    admission after the apply is decided; the lift clears it the same way.
+    Gateway tool-disable and outbound deny are recorded as decided
+    mitigations with `gateway_audit=pending` so the gateway applies only
+    after that decision. A marking raise is recorded with
+    `marking_audit=pending` so the lattice raise happens only after that
+    decision. A remediation that touches marked data needs the
+    matching grant. A `fixed` disposition proposes lifting every active
+    mitigation. The package registers these types at version 3. The
+    certification moves to `cert:security.finding-exposure/v1.5`.
+
 ## Alternatives considered
 
 - A findings store and domain RPC. Rejected for the same reason as ADR 0095: a

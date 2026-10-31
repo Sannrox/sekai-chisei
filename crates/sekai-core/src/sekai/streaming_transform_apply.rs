@@ -202,6 +202,13 @@ pub fn apply(
                 .into(),
         ));
     }
+    // Security package objects, including freeze mitigations, change only
+    // through SubmitActionInstance so apply and lift can park (ADR 0135).
+    if crate::sekai::security_package::is_package_kind(type_def.object_kind.trim()) {
+        return Err(StreamingApplyError::PermissionDenied(
+            "security package objects change only through their governed Actions".into(),
+        ));
+    }
     // This RPC has no envelope_id. Autonomous types require a live envelope on
     // SubmitActionInstance; refuse them here until that contract is on the wire.
     if type_def.type_id.starts_with("autonomous.") {
@@ -1378,6 +1385,37 @@ mod tests {
                 work.claim_generation,
                 &work.fencing_token,
                 "c-auto",
+                50,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn security_package_kind_is_refused() {
+        let (db, work) = setup();
+        let mut package = create_type();
+        package.type_id = crate::sekai::security_remediation::ACTION_MITIGATION_APPLY.into();
+        package.object_kind = crate::sekai::security_remediation::KIND_MITIGATION.into();
+        db.put_governed_action_type(package, "alice", 6).unwrap();
+        let mut request = request(&work, "c-mitigation", vec![edit("m-stream", "1")]);
+        request.action_type_id = crate::sekai::security_remediation::ACTION_MITIGATION_APPLY.into();
+        let error = apply_unrestricted(&db, request, "alice", 50).unwrap_err();
+        assert!(matches!(
+            error,
+            StreamingApplyError::PermissionDenied(message)
+                if message.contains("security package")
+        ));
+        assert!(object_snapshot(&db).is_empty());
+        assert!(db.get_object("m-stream").unwrap().is_none());
+        assert!(
+            db.peek_streaming_transform_apply(
+                &work.run_id,
+                &work.claim_owner,
+                work.claim_generation,
+                &work.fencing_token,
+                "c-mitigation",
                 50,
             )
             .unwrap()

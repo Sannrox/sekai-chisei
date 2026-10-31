@@ -519,6 +519,165 @@
           "fixed_result"
         ]
       }
+    },
+    {
+      "type_id": "security.remediation.propose",
+      "description": "Propose a typed remediation on an exposure: optional patch, catalogue mitigations, and optional rollout. Applying each mitigation is a separate Action.",
+      "object_kind": "security_remediation",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "exposure_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "controls": {
+            "type": "string",
+            "minLength": 1
+          },
+          "patch_ref": {
+            "type": "string"
+          },
+          "rollout_ref": {
+            "type": "string"
+          },
+          "two_person": {
+            "type": "boolean"
+          },
+          "asset_criticality": {
+            "type": "string",
+            "enum": [
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "exposure_id",
+          "controls"
+        ]
+      }
+    },
+    {
+      "type_id": "security.mitigation.apply",
+      "description": "Apply one catalogue mitigation from a decided remediation. The gateway applies its part only after this Action is decided.",
+      "object_kind": "security_mitigation",
+      "object_mutation": "create",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "remediation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "control": {
+            "type": "string",
+            "enum": [
+              "freeze",
+              "marking_raise",
+              "gateway_tool_disable",
+              "outbound_deny"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "applied"
+            ]
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "remediation_id",
+          "control",
+          "target",
+          "state"
+        ]
+      }
+    },
+    {
+      "type_id": "security.mitigation.propose_lift",
+      "description": "Propose lifting an applied mitigation after the exposure is fixed.",
+      "object_kind": "security_mitigation",
+      "object_mutation": "update",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "lift_proposed"
+            ]
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "state"
+        ]
+      }
+    },
+    {
+      "type_id": "security.mitigation.lift",
+      "description": "Lift an applied mitigation. A freeze lifts at the next admission after this Action is decided.",
+      "object_kind": "security_mitigation",
+      "object_mutation": "update",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "object_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "lifted"
+            ]
+          },
+          "access_marking": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "state"
+        ]
+      }
     }
   ]
 }

@@ -45,6 +45,17 @@ compare-and-set, so instances running at once never move it backwards. Each
 pass also sweeps every disposition heading its chain for an expiry or a basis
 its exposure no longer has, so a change committed behind the feed position is
 still caught.
+A remediation (#1669) is a typed plan on an exposure: an optional patch
+reference, catalogue mitigations (scoped freeze, marking raise, gateway
+tool-disable, outbound deny), and an optional rollout reference. Applying
+each mitigation is a separate reversible Action, parked until decided. A
+low-tier proposal auto-admits; production changes, two-person plans, high
+criticality, and marked data park in `security.remediations`. A freeze takes
+effect at the next admission after approval. The gateway applies a
+tool-disable or outbound deny only after that Action is decided. A
+marking raise is recorded with `marking_audit=pending` until the lattice
+records it. A `fixed` disposition proposes lifting every active
+mitigation. The certification moves to `cert:security.finding-exposure/v1.5`.
 Combined-mode instances also run a feedback investigation worker (#1231)
 every 15 seconds in every namespace holding the evidence and finding package.
 Enabled object-change bindings of kind `feedback_observation` and type
