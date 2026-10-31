@@ -2,6 +2,8 @@
 # Print a Keep a Changelog section for the pull requests squash-merged to main
 # since the last v* tag. Release prep pastes it into CHANGELOG.md, edits it,
 # and commits it with the version bump; pull requests never edit CHANGELOG.md.
+# The v* workflow takes the GitHub Release body from that section via
+# scripts/changelog-notes.py.
 #
 #   bash scripts/changelog-draft.sh <version> [since-ref]
 #
