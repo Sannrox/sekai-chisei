@@ -78,7 +78,7 @@ Add focused tests for changes touching provider routing, LLM calls, authenticati
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: sync proto copies`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications. Pull requests do not edit `CHANGELOG.md`: the Conventional Commit title and the body carry the change note, with a `### Breaking` or `### Upgrade` heading and the `risk:breaking` or `risk:migration` label when needed; release prep drafts the section with `bash scripts/changelog-draft.sh <version>`. The CI `Proto breaking` job runs `buf breaking` (rules in `proto/buf.yaml`) against the last final `v*` tag; a reported break passes only with a `type!:` subject or `### Breaking`/`### Upgrade` heading plus the `risk:breaking` label. Do not put hostnames, FQDNs, home directories, absolute worktree paths, LAN or employer network names, or other private environment inventory on public Issues, Pull Requests, comments, or commit messages. Delivery and lane briefs on GitHub may list only claim branch, repo-relative worktree (for example `.worktrees/issue-N`), base SHA, and published SHA. `.agents/skills/` is tracked; do not treat it as gitignored.
+Recent history uses short imperative subjects, often Conventional Commit style: `fix(sekai): preserve reconcile filters`, `docs: clean up OSS-readiness language`, `chore: sync proto copies`. Keep commits narrow and describe the affected subsystem when useful. Pull requests should include a concise behavior summary, tests run, linked issue or context, and any configuration or security implications. Pull requests do not edit `CHANGELOG.md`: the Conventional Commit title and the body carry the change note, with a `### Breaking` or `### Upgrade` heading and the `risk:breaking` or `risk:migration` label when needed; release prep drafts the section with `bash scripts/changelog-draft.sh <version>`. Do not put hostnames, FQDNs, home directories, absolute worktree paths, LAN or employer network names, or other private environment inventory on public Issues, Pull Requests, comments, or commit messages. Delivery and lane briefs on GitHub may list only claim branch, repo-relative worktree (for example `.worktrees/issue-N`), base SHA, and published SHA. `.agents/skills/` is tracked; do not treat it as gitignored.
 
 ### Verified commits on GitHub
 
@@ -160,7 +160,7 @@ Rows beyond `## Testing Guidelines`:
 | Surface | Required evidence |
 | --- | --- |
 | gateway | deterministic `scripts/chisei_gateway_smoke.sh` |
-| protocol | generated build, service/client/example coverage, compatibility review |
+| protocol | generated build, service/client/example coverage, compatibility review; the CI `Proto breaking` job runs `buf breaking` (rules in `proto/buf.yaml`) against the last final `v*` tag, and a reported break passes only with a `type!:` subject or `### Breaking`/`### Upgrade` heading plus the `risk:breaking` label |
 | persistence | fresh and upgrade behavior; SQLite/PostgreSQL alignment where implemented, PostgreSQL through `scripts/postgres-conformance.sh` |
 | configuration | parsing/default tests, `.env.example`, configuration docs |
 | ADRs | `sh scripts/adr-index.sh --check` |

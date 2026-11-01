@@ -103,19 +103,6 @@ jobs:
       - run: bash scripts/validate-ontology-deps.sh
 
   # Not a required check: it runs beside Build & Test, not after it.
-  images:
-    name: Release images
-    needs: changes
-    if: needs.changes.outputs.images == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-      - run: bash build/release-images.sh
-      - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help
-
   # Proto compatibility against the last final v* tag (proto/buf.yaml sets the
   # rules). A reported break passes only when the pull request is marked
   # breaking (`type!:` subject or a Breaking/Upgrade heading, as
@@ -178,3 +165,16 @@ jobs:
           fi
           echo "::error::buf breaking found incompatible proto changes against ${tag}. Mark the pull request breaking (a 'type!:' title or a '### Breaking' heading) and add the risk:breaking label, or keep the change compatible."
           exit 1
+
+  images:
+    name: Release images
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - run: bash build/release-images.sh
+      - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help
