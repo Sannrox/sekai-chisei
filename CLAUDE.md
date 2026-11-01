@@ -160,7 +160,7 @@ Rows beyond `## Testing Guidelines`:
 | Surface | Required evidence |
 | --- | --- |
 | gateway | deterministic `scripts/chisei_gateway_smoke.sh` |
-| protocol | generated build, service/client/example coverage, compatibility review |
+| protocol | generated build, service/client/example coverage, compatibility review; the CI `Proto breaking` job runs `buf breaking` (rules in `proto/buf.yaml`) against the last final `v*` tag, and a reported break passes only with a `type!:` subject or `### Breaking`/`### Upgrade` heading plus the `risk:breaking` label |
 | persistence | fresh and upgrade behavior; SQLite/PostgreSQL alignment where implemented, PostgreSQL through `scripts/postgres-conformance.sh` |
 | configuration | parsing/default tests, `.env.example`, configuration docs |
 | ADRs | `sh scripts/adr-index.sh --check` |
