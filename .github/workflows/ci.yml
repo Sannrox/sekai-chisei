@@ -102,7 +102,6 @@ jobs:
         run: bash scripts/check-connector-template.sh
       - run: bash scripts/validate-ontology-deps.sh
 
-  # Not a required check: it runs beside Build & Test, not after it.
   # Proto compatibility against the last final v* tag (proto/buf.yaml sets the
   # rules). A reported break passes only when the pull request is marked
   # breaking (`type!:` subject or a Breaking/Upgrade heading, as
@@ -166,6 +165,7 @@ jobs:
           echo "::error::buf breaking found incompatible proto changes against ${tag}. Mark the pull request breaking (a 'type!:' title or a '### Breaking' heading) and add the risk:breaking label, or keep the change compatible."
           exit 1
 
+  # Not a required check: it runs beside Build & Test, not after it.
   images:
     name: Release images
     needs: changes
