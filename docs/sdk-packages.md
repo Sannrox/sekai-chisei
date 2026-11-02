@@ -88,6 +88,10 @@ is not a substitute for that verification. Public API breaks therefore require
 new library versions, even when the server version changes separately. Git
 revision pins remain off-matrix; the checker does not resolve revisions to tags.
 
+When changing `sekai-source-sdk`'s version, update the version header in
+`crates/sekai-source-sdk/public-api.txt` as well as its manifest and constraints.
+The public API test checks that header even when the API entries are unchanged.
+
 ## Upgrade cadence
 
 1. Wait for the GitHub release of a `v*` tag. It attaches `compatibility.json`.
