@@ -1,8 +1,9 @@
 //! Contract compatibility matrix projection (#873).
 //!
 //! The matrix is derived from shipped Cargo, proto, and SDK metadata. It does
-//! not invent compatibility. A consumer pin check is on-matrix only when it
-//! names the exact versions and proto revision in the matrix.
+//! not invent compatibility. A consumer pin check compares exact package
+//! versions. Protocol and artifact bytes are verified by `client_package`,
+//! not by this manifest and lockfile check.
 
 use crate::sekai::client_package;
 use serde::{Deserialize, Serialize};

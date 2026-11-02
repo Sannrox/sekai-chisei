@@ -10,6 +10,12 @@ pull request body, which becomes the squash commit; at release,
 
 Upgrade notes:
 
+- Rust library consumers must update `sekai-client` to 0.2.0 and
+  `sekai-types`, `sekai-core`, and `chisei-core` to 2.0.0. New required
+  registration fields, acknowledgement variants and moved store methods break
+  the previous library API. `sekai-source-sdk` advances to 1.4.0. Server and
+  protocol versions remain 1.4.0; these libraries have independent versions.
+
 - Community SQLite and PostgreSQL apply new schema on startup. Backup the store before the first 1.4.0 boot. This release carries migrations (`GATE:mig`).
 - Guest contexts are denied unless an installed identity extension admits them. Extensions must populate `home_tenant`, return `GuestGrant`, and implement `authorize_discovery` (`GATE:break`, #1432, #1433, #1435). Community installs without an extension keep existing credential behavior.
 - Optional `deny_unmarked` stays off. Enable with namespace property `deny_unmarked=true` or `SEKAI_DENY_UNMARKED=1` (#1430).
