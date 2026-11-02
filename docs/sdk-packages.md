@@ -81,6 +81,13 @@ git lockfile source, a mismatched lockfile, or a vendored TypeScript/Python
 source copy is off-matrix. The check names the expected on-matrix
 `sekai-client` / `sekai-proto` / proto revision.
 
+The pin check does not inspect installed package bytes or authenticate a
+protocol digest. Use `sdk-packages verify` above to compare protocol, source,
+and artifact digests with the recorded publication. Matching a matrix version
+is not a substitute for that verification. Public API breaks therefore require
+new library versions, even when the server version changes separately. Git
+revision pins remain off-matrix; the checker does not resolve revisions to tags.
+
 ## Upgrade cadence
 
 1. Wait for the GitHub release of a `v*` tag. It attaches `compatibility.json`.
