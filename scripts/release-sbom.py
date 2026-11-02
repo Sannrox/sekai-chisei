@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 ROOT_NAME = "sekai-chisei"
@@ -59,7 +60,7 @@ def bom_from_metadata(meta: dict) -> dict:
     if root_pkg is None:
         raise SystemExit(f"cargo metadata did not include package {ROOT_NAME}")
     root_purl = f"pkg:cargo/{ROOT_NAME}@{root_pkg['version']}"
-    return {
+    bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
@@ -74,6 +75,10 @@ def bom_from_metadata(meta: dict) -> dict:
         },
         "components": sorted(components, key=lambda item: item["bom-ref"]),
     }
+
+    document = json.dumps(bom, sort_keys=True, separators=(",", ":"))
+    bom["serialNumber"] = uuid.uuid5(uuid.NAMESPACE_URL, document).urn
+    return bom
 
 
 def self_test() -> None:
@@ -104,6 +109,12 @@ def self_test() -> None:
     assert bom["bomFormat"] == "CycloneDX"
     assert bom["metadata"]["component"]["version"] == "1.4.0"
     assert bom["metadata"]["component"]["type"] == "application"
+    serial = bom["serialNumber"]
+    assert uuid.UUID(serial.removeprefix("urn:uuid:")).version == 5
+    assert serial.startswith("urn:uuid:")
+    assert bom_from_metadata(meta)["serialNumber"] == serial
+    meta["packages"][1]["version"] = "0.2.1"
+    assert bom_from_metadata(meta)["serialNumber"] != serial
     by_name = {item["name"]: item for item in bom["components"]}
     assert by_name["libc"]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
     assert by_name["foo"]["licenses"] == [{"license": {"id": "MIT"}}]
