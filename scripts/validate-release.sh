@@ -106,6 +106,8 @@ grep -F "record-image-digest" "$workflow" >/dev/null || fail "${workflow} must r
 if grep -F 'dist/*' "$workflow" >/dev/null; then
   fail "${workflow} must upload explicit family artifacts, not dist/*"
 fi
+grep -F -- "--exclude '*-*' \"\${GIT_SHA}^\"" scripts/release-package.sh >/dev/null \
+  || fail "release-package.sh must take gate flags since the previous final tag in the release commit's history"
 if grep -E '(:latest|tag: latest)' build/release.sh build/release-images.sh >/dev/null; then
   fail "image scripts must not produce a latest image tag"
 fi
