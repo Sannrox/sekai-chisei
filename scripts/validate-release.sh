@@ -63,20 +63,26 @@ fi
 [[ "$(grep -c 'is already published; cut a new tag instead of re-running' "$workflow")" -ge 3 ]] \
   || fail "${workflow} must refuse a published release early, when drafting, and before publishing"
 # "Re-run failed jobs" reuses verify-tag's outputs, so every job that changes a
-# release or pushes an image refuses a published release itself.
-python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release in every job that uploads, publishes, or pushes"
+# release, pushes an image, or mints attestations starts by refusing a
+# published release, before its first mutation.
+python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release before every upload, publish, push, or attestation"
 import re, sys
 body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
-mutating = ("gh release upload", "gh release create", "gh release edit", "upload-rust-binary-action", "build/release.sh")
-missing = [
-    block.split(":", 1)[0].strip()
-    for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body)
-    if any(m in block for m in mutating)
-    and "is already published; cut a new tag instead of re-running" not in block
-]
-if missing:
-    sys.exit("unguarded jobs: " + ", ".join(missing))
+mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "upload-rust-binary-action", "build/release.sh", "actions/attest")
+guard = "- name: Refuse a published release"
+bad = []
+for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body):
+    hits = [block.index(m) for m in mutating if m in block]
+    if hits and not (guard in block and block.index(guard) < min(hits)):
+        bad.append(block.split(":", 1)[0].strip())
+if bad:
+    sys.exit("unguarded jobs: " + ", ".join(bad))
 PY_JOBS
+if grep -F '.isDraft 2>/dev/null || true)' "$workflow" >/dev/null; then
+  fail "${workflow} published-release guards must fail closed when the release lookup errors"
+fi
+[[ "$(grep -c 'elif \[\[ "$state" != \*"release not found"\* \]\]; then' "$workflow")" -eq "$(grep -c -- '- name: Refuse a published release' "$workflow")" ]] \
+  || fail "${workflow} every published-release guard must accept only a draft or release not found"
 grep -F 'gh release delete-asset "$TAG" "$name" --yes' "$workflow" >/dev/null \
   || fail "${workflow} must drop an earlier run's assets when it resumes a draft"
 grep -F "needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest]" "$workflow" >/dev/null \
