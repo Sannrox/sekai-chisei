@@ -262,6 +262,11 @@ jobs:
           draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || echo absent)"
           case "$draft" in
             true)
+              # Every dispatch rebuilds every asset; drop the earlier run's
+              # so a renamed or removed asset is not published.
+              gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+                gh release delete-asset "$TAG" "$name" --yes
+              done
               gh release upload "$TAG" "${assets[@]}" --clobber
               gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft "${kind[@]}"
               ;;
@@ -300,6 +305,18 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
           test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again here.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -392,6 +409,18 @@ jobs:
         env:
           SHA: ${{ needs.verify-tag.outputs.sha }}
         run: test "$(git rev-parse HEAD)" = "$SHA"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again here.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Generate compatibility matrix
@@ -430,6 +459,18 @@ jobs:
         env:
           SHA: ${{ needs.verify-tag.outputs.sha }}
         run: test "$(git rev-parse HEAD)" = "$SHA"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again here.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
       - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: sekai
@@ -465,6 +506,18 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
           test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again here.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
@@ -495,6 +548,18 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
           test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again here.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
       - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io

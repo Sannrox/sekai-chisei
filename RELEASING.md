@@ -76,9 +76,10 @@ Everything else (the release and image scripts, `CHANGELOG.md`, and the
 sources) comes from the tagged commit, so a bug there needs a new rc or patch
 version.
 
-A re-run resumes the draft release. It refuses a release that is already
-published, both before it builds and before it publishes; cut a new version
-instead. One run per tag executes at a time.
+A re-run resumes the draft release and replaces its assets. Every job that
+uploads, pushes an image, or publishes refuses a release that is already
+published, so neither a new run nor "Re-run failed jobs" on an old one can
+change it; cut a new version instead. One run per tag executes at a time.
 
 Pull requests and `workflow_dispatch` without a tag dry-run the family
 scripts on that ref. Dry runs never mint attestations, push images, or touch a
