@@ -23,31 +23,74 @@ The tag must equal the workspace version in the root `Cargo.toml`
 
 ## Tag
 
-Create an annotated, signed tag on the merged release commit:
+Create an annotated, signed tag on the merged release commit on `main`:
 
 ```text
 vX.Y.Z
 ```
 
-Pre-releases are `vX.Y.Z-rc.N` or `vX.Y.Z-beta.N`. Hotfixes are tagged on
-`release/vX.Y`, never on `main` ahead of a minor. A tag is never moved,
-deleted, or reused.
+A tag is never moved, deleted, or reused. The tagged commit must be on
+`main`; the workflow refuses any other commit.
 
-## After the tag
+## Release candidates
 
-The existing `v*` workflow in `.github/workflows/release.yml`:
+Cut `vX.Y.Z-rc.N` (or `vX.Y.Z-beta.N`) before the final tag:
 
-- verifies the annotated signed tag equals the workspace version
-- drafts then publishes a GitHub Release from the matching CHANGELOG section
-- uploads the existing `sekai` binary matrix and `compatibility.json`
-- builds and pushes the GHCR image by version only (no `latest` tag) and
-  prints the image digest
-- writes an SBOM, attests provenance, and attaches a family release manifest
-  (component, version, git SHA, digests, attestation URLs, gate flags)
+1. Land a version-bump pull request that sets the workspace version to
+   `X.Y.Z-rc.N` and adds a `## [X.Y.Z-rc.N]` section to `CHANGELOG.md`.
+   The final `vX.Y.Z` needs its own section; it never reuses the rc notes.
+2. Tag `vX.Y.Z-rc.N` on that commit.
+3. The release publishes as a GitHub pre-release and is never marked latest.
 
-Pull requests and `workflow_dispatch` on a non-tag ref dry-run the family
-scripts. Dry runs never mint attestations, push images, or create a GitHub
-Release.
+A failed release candidate costs only an rc number. A final tag on a commit
+whose workspace version is still `X.Y.Z-rc.N` is refused.
+
+## Start, retry, and dry-run
+
+A `v*` tag push runs `.github/workflows/release-dispatch.yml`. It only runs
+`gh workflow run release.yml --ref main -f tag=<tag>`, so the release always
+runs **main's** `release.yml`, never the copy at the tagged commit.
+
+`release.yml` refuses a tagged run that does not start from `main`. It then:
+
+- checks out the tag and fetches the annotated tag object
+- verifies the signed tag with main's `scripts/verify-release-tag.sh` and
+  main's allowed keys against the tagged commit's `Cargo.toml`
+- requires the tagged commit to be on `main`
+- builds, packages, tags images, and writes the manifest `git_sha` from that
+  commit, and creates the release with `gh release create <tag> --verify-tag`
+- drafts the GitHub Release from the matching CHANGELOG section, uploads the
+  `sekai` binary matrix and `compatibility.json`, pushes the GHCR image by
+  version only (no `latest` tag), records its digest, writes an SBOM, attests
+  provenance, and publishes only after every asset is attached
+
+To retry a failed release, fix the workflow on `main` and run it again for the
+same tag:
+
+```sh
+gh workflow run release.yml --ref main -f tag=vX.Y.Z
+```
+
+A retry picks up fixes to `release.yml` and to the tag verifier and keys.
+Everything else (the release and image scripts, `CHANGELOG.md`, and the
+sources) comes from the tagged commit, so a bug there needs a new rc or patch
+version.
+
+A re-run resumes the draft release and replaces its assets. Every job that
+uploads, pushes an image, or publishes refuses a release that is already
+published, so neither a new run nor "Re-run failed jobs" on an old one can
+change it; cut a new version instead. One run per tag executes at a time.
+
+Pull requests and `workflow_dispatch` without a tag dry-run the family
+scripts on that ref. Dry runs never mint attestations, push images, or touch a
+GitHub Release.
+
+## Provenance
+
+Attestations record the workflow that built the artifacts, which is main's
+`release.yml` at `refs/heads/main`, not the tag. The source is pinned by the
+signed tag and by the manifest `git_sha`, which is the tagged commit.
 
 Allowed tag-signing keys live in `security/release-tag-fingerprints` with
-the public key in `security/release-tag-key.asc`.
+the public key in `security/release-tag-key.asc`. A tagged run uses the copies
+on `main`.
