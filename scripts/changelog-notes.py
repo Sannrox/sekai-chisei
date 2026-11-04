@@ -72,6 +72,21 @@ def self_test() -> None:
     body = notes_for(unbracketed, "1.4.0")
     assert "GATE:mig" in body, body
     assert "Older notes" not in body, body
+    # A pre-release has its own section; the final never reuses it.
+    rc = (
+        "# Changelog\n\n"
+        "## [1.5.0-rc.1] - 2026-11-01\n\n"
+        "- candidate\n\n"
+        "## 1.4.0\n\n"
+        "Older notes.\n"
+    )
+    assert notes_for(rc, "1.5.0-rc.1") == "- candidate"
+    try:
+        notes_for(rc, "1.5.0")
+    except SystemExit as exc:
+        assert "no ## [1.5.0] or ## 1.5.0 section" in str(exc)
+    else:
+        raise SystemExit("expected a final release to need its own section")
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "CHANGELOG.md"
         path.write_text(sample)
