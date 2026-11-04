@@ -108,6 +108,12 @@ if grep -F 'dist/*' "$workflow" >/dev/null; then
 fi
 grep -F -- "--exclude '*-*' \"\${GIT_SHA}^\"" scripts/release-package.sh >/dev/null \
   || fail "release-package.sh must take gate flags since the previous final tag in the release commit's history"
+grep -F 'range="${prev}..${GIT_SHA}"' scripts/release-package.sh >/dev/null \
+  && grep -F 'in_range[$1] { print $2 }' scripts/release-package.sh >/dev/null \
+  && grep -F '<(git rev-list "$range")' scripts/release-package.sh >/dev/null \
+  || fail "release-package.sh must count gate flags only for pull requests merged into the release commit's range"
+grep -F -- "--match 'v*' --exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
+  || fail "changelog-draft.sh must start from the last final tag, never an rc or beta tag"
 if grep -E '(:latest|tag: latest)' build/release.sh build/release-images.sh >/dev/null; then
   fail "image scripts must not produce a latest image tag"
 fi

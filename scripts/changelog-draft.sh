@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Print a Keep a Changelog section for the pull requests squash-merged to main
-# since the last v* tag. Release prep pastes it into CHANGELOG.md, edits it,
+# since the last final v* tag (rc and beta tags never start it). Release prep pastes it into CHANGELOG.md, edits it,
 # and commits it with the version bump; pull requests never edit CHANGELOG.md.
 # The v* workflow takes the GitHub Release body from that section via
 # scripts/changelog-notes.py.
@@ -25,7 +25,7 @@ ROOT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "${ROOT_PATH}"
 
 git fetch --quiet --tags origin main
-since="${2:-$(git describe --tags --abbrev=0 --match 'v*' origin/main)}"
+since="${2:-$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' origin/main)}"
 since_date="$(git log -1 --format=%cI "${since}")"
 
 # labeled <label> prints the numbers of PRs with that label merged since the tag.
