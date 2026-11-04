@@ -114,6 +114,8 @@ grep -F 'range="${prev}..${GIT_SHA}"' scripts/release-package.sh >/dev/null \
   || fail "release-package.sh must count gate flags only for pull requests merged into the release commit's range"
 grep -F '|| fail "could not list merged pull requests for gate flags"' scripts/release-package.sh >/dev/null \
   && grep -F '[[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail' scripts/release-package.sh >/dev/null \
+  && grep -F 'command -v gh >/dev/null 2>&1 || fail' scripts/release-package.sh >/dev/null \
+  && grep -F ')" || fail "could not read gate flags from the merged pull requests"' scripts/release-package.sh >/dev/null \
   || fail "release-package.sh must fail when the gate flag lookup fails or is truncated"
 grep -F -- "--match 'v*' --exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
   || fail "changelog-draft.sh must start from the last final tag, never an rc or beta tag"

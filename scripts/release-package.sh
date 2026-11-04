@@ -96,7 +96,8 @@ fi
 python3 "$ROOT_PATH/scripts/release-sbom.py" "${OUT}/sekai-chisei.cdx.json"
 
 LABEL_ARGS=()
-if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
+if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
+  command -v gh >/dev/null 2>&1 || fail "gh is required for gate flags; pass --skip-github for a dry run"
   # Gate flags cover exactly the pull requests merged into the release commit
   # since the nearest final tag before it: an rc tag never starts the range,
   # or a final release would drop gates first seen in its release candidates,
@@ -115,13 +116,14 @@ if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; the
     || fail "could not list merged pull requests for gate flags"
   [[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail "1000 or more merged pull requests match ${query}; gate flags would be incomplete"
   commits="$(git rev-list "$range")" || fail "could not list the commits in ${range}"
-  while IFS= read -r label; do
-    [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
-  done < <(
+  labels="$(
     jq -r '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' <<<"$prs" \
       | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(printf '%s\n' "$commits") - \
       | sort -u
-  )
+  )" || fail "could not read gate flags from the merged pull requests"
+  while IFS= read -r label; do
+    [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
+  done <<<"$labels"
 fi
 
 python3 "$ROOT_PATH/scripts/release-manifest.py" \
