@@ -97,8 +97,10 @@ python3 "$ROOT_PATH/scripts/release-sbom.py" "${OUT}/sekai-chisei.cdx.json"
 
 LABEL_ARGS=()
 if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
-  prev="$(git tag --list 'v*' --sort=-version:refname)"
-  prev="$(awk -v cur="$TAG" '$0 != cur { print; exit }' <<<"$prev")"
+  # Gate flags cover every pull request since the nearest final tag before the
+  # release commit, so a final release keeps gates first seen in its release
+  # candidates, and tags outside this commit's history never shorten the range.
+  prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "${GIT_SHA}^" 2>/dev/null || true)"
   search=()
   if [[ -n "$prev" ]]; then
     since="$(git log -1 --format=%cs "$prev" 2>/dev/null || true)"
