@@ -96,21 +96,34 @@ fi
 python3 "$ROOT_PATH/scripts/release-sbom.py" "${OUT}/sekai-chisei.cdx.json"
 
 LABEL_ARGS=()
-if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
-  # Gate flags cover every pull request since the nearest final tag before the
-  # release commit, so a final release keeps gates first seen in its release
-  # candidates, and tags outside this commit's history never shorten the range.
+if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
+  command -v gh >/dev/null 2>&1 || fail "gh is required for gate flags; pass --skip-github for a dry run"
+  # Gate flags cover exactly the pull requests merged into the release commit
+  # since the nearest final tag before it: an rc tag never starts the range,
+  # or a final release would drop gates first seen in its release candidates,
+  # and a pull request merged after the tagged commit never counts, even when a
+  # retry runs days later.
   prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "${GIT_SHA}^" 2>/dev/null || true)"
-  search=()
+  range="$GIT_SHA"
+  query="merged:<=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$GIT_SHA")"
   if [[ -n "$prev" ]]; then
-    since="$(git log -1 --format=%cs "$prev" 2>/dev/null || true)"
-    if [[ -n "$since" ]]; then
-      search+=(--search "merged:>=${since}")
-    fi
+    range="${prev}..${GIT_SHA}"
+    query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
   fi
+  # A lookup failure or a truncated search fails the release: an empty or
+  # partial list would publish a manifest without its gates.
+  prs="$(gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels)" \
+    || fail "could not list merged pull requests for gate flags"
+  [[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail "1000 or more merged pull requests match ${query}; gate flags would be incomplete"
+  commits="$(git rev-list "$range")" || fail "could not list the commits in ${range}"
+  labels="$(
+    jq -r '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' <<<"$prs" \
+      | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(printf '%s\n' "$commits") - \
+      | sort -u
+  )" || fail "could not read gate flags from the merged pull requests"
   while IFS= read -r label; do
     [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
-  done < <(gh pr list --state merged --limit 100 "${search[@]}" --json labels --jq '.[].labels[].name' 2>/dev/null || true)
+  done <<<"$labels"
 fi
 
 python3 "$ROOT_PATH/scripts/release-manifest.py" \
