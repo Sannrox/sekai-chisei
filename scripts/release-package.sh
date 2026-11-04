@@ -109,13 +109,18 @@ if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; the
     range="${prev}..${GIT_SHA}"
     query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
   fi
+  # A lookup failure or a truncated search fails the release: an empty or
+  # partial list would publish a manifest without its gates.
+  prs="$(gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels)" \
+    || fail "could not list merged pull requests for gate flags"
+  [[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail "1000 or more merged pull requests match ${query}; gate flags would be incomplete"
+  commits="$(git rev-list "$range")" || fail "could not list the commits in ${range}"
   while IFS= read -r label; do
     [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
   done < <(
-    gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels \
-      --jq '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' 2>/dev/null \
-      | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(git rev-list "$range") - \
-      | sort -u || true
+    jq -r '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' <<<"$prs" \
+      | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(printf '%s\n' "$commits") - \
+      | sort -u
   )
 fi
 
