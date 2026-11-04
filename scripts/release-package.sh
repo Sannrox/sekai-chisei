@@ -104,17 +104,20 @@ if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]]; then
   # and a pull request merged after the tagged commit never counts, even when a
   # retry runs days later.
   prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "${GIT_SHA}^" 2>/dev/null || true)"
+  # The date only narrows the search and the commit range decides. There is
+  # no upper date bound: GitHub can record a merge on a later day than its
+  # commit date, and that pull request would silently lose its gates.
   range="$GIT_SHA"
-  query="merged:<=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$GIT_SHA")"
+  query=""
   if [[ -n "$prev" ]]; then
     range="${prev}..${GIT_SHA}"
-    query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
+    query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev")"
   fi
   # A lookup failure or a truncated search fails the release: an empty or
   # partial list would publish a manifest without its gates.
   prs="$(gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels)" \
     || fail "could not list merged pull requests for gate flags"
-  [[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail "1000 or more merged pull requests match ${query}; gate flags would be incomplete"
+  [[ "$(jq length <<<"$prs")" -lt 1000 ]] || fail "1000 or more merged pull requests match \"${query}\"; gate flags would be incomplete"
   commits="$(git rev-list "$range")" || fail "could not list the commits in ${range}"
   labels="$(
     jq -r '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' <<<"$prs" \
