@@ -9,21 +9,33 @@ classified `experimental` (see [RPC maturity](rpc-maturity.md)) still needs
 `PERMISSION_DENIED` before anything is read or written. The space role then
 applies the RPC's read or write action.
 
-## Added in #2097
+## Dataset RPCs
 
 | RPC | Namespace from | Space action |
 | --- | --- | --- |
-| `QueryRows` | the dataset's binding object | read |
+| `QueryRows` (#2097) | the dataset's binding object | read |
+| `ListDatasetVersions`, `GetDatasetVersion` | the dataset's binding object | read |
+| `RollbackDataset` | the dataset's binding object | write |
+| `ListDatasetHealthChecks`, `ListDatasetHealthResults`, `ListDatasetAlerts` | the dataset's binding object | read |
+| `PutDatasetHealthCheck`, `RunDatasetHealthChecks` | the dataset's binding object | write |
 
-A dataset with no binding object, or whose binding object is gone, has no
-namespace and is refused with `PERMISSION_DENIED`. The binding object must
-also be visible to the caller (markings and object security policy), and when
-that policy enforces property grants the rows are held to the readable
-columns: a projection or filter naming another column is refused, and an
-unprojected query returns only the readable ones. Guests stay refused; a host
-grant does not admit them. `enterprise_query_rows_requires_namespace_read_for_the_tenant`
-drives the real interceptor and the handler, and
-`enterprise_query_rows_honours_property_grants` covers the columns.
+These handlers make one decision (`authorize_dataset`). A dataset with no
+binding object, or whose binding object is gone, has no namespace and is
+refused with `PERMISSION_DENIED`. The binding object must also be visible to
+the caller (markings and object security policy). Guests stay refused; a host
+grant does not admit them. The dataset branch RPCs authorize a bound
+dataset's namespace in `branch_caller`, and governed transforms check their
+inputs' binding objects for visibility.
+
+When the binding object's policy enforces property grants, rows are held to
+the readable columns for every caller, tenant or not: a `QueryRows`
+projection or filter naming another column is refused, an unprojected query
+returns only the readable ones, and version snapshots and the rows a rollback
+returns drop the others. A policy that grants no column refuses the read.
+`enterprise_query_rows_requires_namespace_read_for_the_tenant` and
+`enterprise_dataset_reads_refuse_another_tenants_dataset` drive the real
+interceptor and the handlers, and `dataset_row_reads_honour_property_grants`
+covers the columns.
 
 ## Added in #1777
 

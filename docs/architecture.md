@@ -306,9 +306,10 @@ runtime.
 
 The current injection seam admits enterprise credentials only to the
 namespace-aware object, link, lease, traversal, object-change, offline
-sync (#1836), and dataset row read (`QueryRows`, #2097) RPCs that invoke the
-authorization hook. `QueryRows` authorizes Read on the namespace of the
-dataset's binding object and refuses unbound datasets and guests. Other Sekai
+sync (#1836), and dataset (`QueryRows`, #2097, versions, rollback, health,
+branches) RPCs that invoke the authorization hook. The row, version, rollback
+and health RPCs authorize the namespace of the dataset's binding object and
+refuse unbound datasets and guests. Other Sekai
 and all Chisei RPCs fail closed for enterprise-scoped credentials. Action execution and approval resumption also
 remain unavailable until an enterprise composition can persist and re-derive
 the authenticated approval identity.

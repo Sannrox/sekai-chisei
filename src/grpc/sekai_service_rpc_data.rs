@@ -321,10 +321,10 @@ pub(super) async fn query_rows(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
@@ -335,16 +335,8 @@ pub(super) async fn query_rows(
         limit: query.limit,
         offset: query.offset,
     };
-    // A tenant context exists for every enterprise caller (request_tenant_context
-    // refuses one without it); tenant-free callers keep the checks above.
-    if let Some(context) = tenant_context
-        .as_ref()
-        .filter(|context| context.tenant.is_some())
-    {
-        let readable = authorize_tenant_dataset_rows(service, &principals, context, &dataset)?;
-        if let Some(readable) = readable {
-            restrict_row_query(&mut row_query, readable)?;
-        }
+    if let Some(readable) = readable_columns(service, &dataset)? {
+        restrict_row_query(&mut row_query, readable)?;
     }
     let rows = service
         .db
@@ -356,43 +348,76 @@ pub(super) async fn query_rows(
     }))
 }
 
-/// Tenant read of a dataset's rows (#2097). The namespace is the binding
-/// object's, and the installed extension must grant Read on it; a dataset
-/// with no live binding object has no namespace and is refused. Guests are
-/// refused here as well as at the interceptor. Returns the readable columns
-/// when the binding object's policy enforces property grants.
-fn authorize_tenant_dataset_rows(
+/// The access decision of the dataset RPCs admitted for tenant credentials
+/// (`QueryRows`, versions, rollback, health checks and alerts). Every caller
+/// passes the principal checks of [`check_dataset_access`]. A tenant caller
+/// must also hold Read, or Write when `write`, on the namespace of the
+/// dataset's binding object, and see that object; a dataset with no live
+/// binding object has no namespace and is refused, as are guests, here as
+/// well as at the interceptor. Tenant-free callers keep the principal checks.
+fn authorize_dataset(
     service: &SekaiServiceImpl,
     principals: &[String],
-    context: &crate::enterprise::AuthenticatedContext,
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
     dataset: &dataset::Dataset,
-) -> Result<Option<Vec<String>>, Status> {
+    write: bool,
+) -> Result<(), Status> {
+    let db = service.db.runtime();
+    check_dataset_access(db, &service.security, principals, dataset, write)?;
+    // request_tenant_context refuses an enterprise caller without a tenant.
+    let Some(context) = tenant_context.filter(|context| context.tenant.is_some()) else {
+        return Ok(());
+    };
     if context.guest_home_tenant().is_some() {
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
-    let db = service.db.runtime();
     let object = match dataset.object_id.as_str() {
         "" => None,
         id => db.get_object(id).map_err(Status::internal)?,
     }
     .ok_or_else(|| Status::permission_denied("dataset has no namespace binding"))?;
-    enforce_namespace_tenant_context(db, Some(context), &object.namespace, false)?;
+    enforce_namespace_tenant_context(db, Some(context), &object.namespace, write)?;
     if !object_is_visible(db, &service.security, &object, principals, Some(context)) {
         return Err(Status::permission_denied("access denied"));
     }
-    preview_column_allowlist(service, dataset)
+    Ok(())
 }
 
-/// Holds a row query to `readable` columns: projections and filters naming
-/// another column are refused, and an unprojected query is projected to them.
+/// The columns any caller may read of a dataset's rows: `None` for all of
+/// them, or those the binding object's policy grants when it enforces
+/// property grants. No readable column is a refusal, since an empty
+/// projection would read every column.
+fn readable_columns(
+    service: &SekaiServiceImpl,
+    dataset: &dataset::Dataset,
+) -> Result<Option<Vec<String>>, Status> {
+    match preview_column_allowlist(service, dataset)? {
+        Some(readable) if readable.is_empty() => {
+            Err(Status::permission_denied("column access denied"))
+        }
+        readable => Ok(readable),
+    }
+}
+
+/// Drops the columns of snapshot rows outside `readable` (see [`readable_columns`]).
+fn hold_rows_to(rows: &mut [HashMap<String, String>], readable: Option<&[String]>) {
+    if let Some(readable) = readable {
+        for row in rows {
+            row.retain(|column, _| readable.contains(column));
+        }
+    }
+}
+
+/// Holds a row query to `readable` columns (never empty, see
+/// [`readable_columns`]): projections and filters naming another column are
+/// refused, and an unprojected query is projected to them.
 fn restrict_row_query(query: &mut dataset::RowQuery, readable: Vec<String>) -> Result<(), Status> {
     let denied = query
         .columns
         .iter()
         .chain(query.filters.iter().map(|filter| &filter.column))
         .any(|column| !readable.contains(column));
-    // An empty projection reads every column, so no readable column is a refusal.
-    if denied || readable.is_empty() {
+    if denied {
         return Err(Status::permission_denied("column access denied"));
     }
     if query.columns.is_empty() {
@@ -406,6 +431,7 @@ pub(super) async fn list_dataset_versions(
 ) -> Result<Response<ListDatasetVersionsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -413,10 +439,10 @@ pub(super) async fn list_dataset_versions(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
@@ -449,6 +475,7 @@ pub(super) async fn get_dataset_version(
 ) -> Result<Response<GetDatasetVersionResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -456,18 +483,20 @@ pub(super) async fn get_dataset_version(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
-    let (version, rows) = service
+    let readable = readable_columns(service, &dataset)?;
+    let (version, mut rows) = service
         .db
         .runtime()
         .load_dataset_version(&inner.dataset_id, &inner.version_id, inner.as_of_ms)
         .map_err(map_dataset_version_error)?;
+    hold_rows_to(&mut rows, readable.as_deref());
     let version_retention_count = service
         .db
         .runtime()
@@ -493,13 +522,15 @@ pub(super) async fn rollback_dataset(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         true,
     )?;
+    // Decided before the rollback writes, so a refusal changes nothing.
+    let readable = readable_columns(service, &dataset)?;
     let actor = principals
         .first()
         .cloned()
@@ -534,11 +565,12 @@ pub(super) async fn rollback_dataset(
             tenant,
         })
         .map_err(map_dataset_version_error)?;
-    let rows = service
+    let mut rows = service
         .db
         .runtime()
         .query_dataset_version_rows(&inner.dataset_id, &version.version_id, 0)
         .map_err(map_dataset_version_error)?;
+    hold_rows_to(&mut rows, readable.as_deref());
     Ok(Response::new(RollbackDatasetResponse {
         version: Some(to_proto_dataset_version(&version)),
         rows: rows.into_iter().map(|values| Row { values }).collect(),
@@ -551,6 +583,7 @@ pub(super) async fn put_dataset_health_check(
 ) -> Result<Response<PutDatasetHealthCheckResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let check = inner
         .check
@@ -561,10 +594,10 @@ pub(super) async fn put_dataset_health_check(
         .get_dataset(&check.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         true,
     )?;
@@ -593,6 +626,7 @@ pub(super) async fn list_dataset_health_checks(
 ) -> Result<Response<ListDatasetHealthChecksResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -600,10 +634,10 @@ pub(super) async fn list_dataset_health_checks(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
@@ -623,6 +657,7 @@ pub(super) async fn list_dataset_health_results(
 ) -> Result<Response<ListDatasetHealthResultsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -630,10 +665,10 @@ pub(super) async fn list_dataset_health_results(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
@@ -660,6 +695,7 @@ pub(super) async fn run_dataset_health_checks(
 ) -> Result<Response<RunDatasetHealthChecksResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -667,10 +703,10 @@ pub(super) async fn run_dataset_health_checks(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         true,
     )?;
@@ -695,6 +731,7 @@ pub(super) async fn list_dataset_alerts(
 ) -> Result<Response<ListDatasetAlertsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -702,10 +739,10 @@ pub(super) async fn list_dataset_alerts(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         false,
     )?;
