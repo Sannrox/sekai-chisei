@@ -150,11 +150,15 @@ for component in bom["components"]:
 ' "${tmp}/dist/sekai-chisei.cdx.json"
 [[ ! -f "${tmp}/dist/published" ]] || fail "dry-run must not publish"
 
+# A tag dry-run for the workspace version takes its notes from that
+# version's CHANGELOG section, so the version bump must add one.
 notes_out="${tmp}/notes"
 mkdir -p "$notes_out"
-bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag v1.4.0 --git-sha "$(git rev-parse HEAD)"
+workspace_version="$(python3 -c 'import re, sys; print(re.search(r"(?ms)^\[package\][^\[]*?^version\s*=\s*\"([^\"]+)\"", open(sys.argv[1]).read()).group(1))' Cargo.toml)"
+bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag "v${workspace_version}" --git-sha "$(git rev-parse HEAD)"
 [[ -s "${notes_out}/RELEASE_NOTES.md" ]] || fail "tag dry-run did not write CHANGELOG notes"
-grep -F "GATE:mig" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing expected 1.4.0 body"
+python3 scripts/changelog-notes.py "$workspace_version" | cmp -s - "${notes_out}/RELEASE_NOTES.md" \
+  || fail "CHANGELOG notes do not match the ${workspace_version} section"
 grep -F "RELEASE_NOTES.md" "${notes_out}/SHA256SUMS" >/dev/null && fail "SHA256SUMS must not list RELEASE_NOTES.md"
 grep -F "sekai-chisei-release.json" "${notes_out}/SHA256SUMS" >/dev/null || fail "SHA256SUMS must cover the family manifest"
 bash scripts/release-package.sh --out "$notes_out" --checksums-only >/dev/null

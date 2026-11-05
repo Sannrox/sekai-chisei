@@ -6,6 +6,30 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 1.5.0
+
+Upgrade notes:
+
+- When a dataset's binding object has an object security policy that enforces property grants, `QueryRows`, `GetDatasetVersion` and `RollbackDataset` return only the readable columns to every caller, tenant-free callers included. A policy that grants no column refuses the read (#2099).
+- Tenant callers are refused the dataset version, rollback, and health RPCs on unbound datasets. `RollbackDataset`, `PutDatasetHealthCheck` and `RunDatasetHealthChecks` need Write on the binding object's namespace (#2099).
+- No store schema migration. A binary or image rollback to 1.4.0 restores the previous behavior.
+
+### Added
+
+- Enterprise-scoped credentials can call `QueryRows`. The handler authorizes Read on the namespace of the dataset's binding object, requires the binding object to be visible, and refuses unbound datasets and guests (#2098).
+
+### Changed
+
+- Releases run from main's `release.yml` for a signed `v*` tag, which `release-dispatch.yml` starts on the tag push. `vX.Y.Z-rc.N` and `-beta.N` tags publish as pre-releases that are never latest. A retry for the same tag resumes the draft release, and a published release is refused (#2091).
+
+### Fixed
+
+- The release workflow takes gate flags only from pull requests merged since the previous final tag, and the package job can read them (#2092, #2093, #2094).
+
+### Security
+
+- Enforce namespace authorization and binding-object visibility for the dataset version, rollback, and health RPCs, and apply property-grant column limits to every dataset row read (#2099).
+
 ## 1.4.0
 
 Upgrade notes:
