@@ -936,6 +936,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
             | "ListDatasets"
+            // Row reads (#2097): the handler authorizes Read on the binding
+            // object's namespace and refuses unbound datasets and guests.
+            | "QueryRows"
             | "ListDatasetVersions"
             | "GetDatasetVersion"
             | "RollbackDataset"
@@ -2496,6 +2499,7 @@ mod tests {
             (SpaceRole::Discoverer, "GetObject", false),
             (SpaceRole::Discoverer, "ListSiteAgentInstanceTurns", false),
             (SpaceRole::Discoverer, "QueryRows", false),
+            (SpaceRole::Viewer, "QueryRows", true),
             (SpaceRole::Discoverer, "EvaluateObjectSet", false),
             (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),

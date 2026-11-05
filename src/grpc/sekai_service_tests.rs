@@ -6506,6 +6506,334 @@ async fn query_rows_reports_corrupt_storage_as_internal() {
     assert!(error.message().contains("corrupt dataset row"));
 }
 
+/// #2097: `QueryRows` through the real assertion interceptor, then the
+/// handler. Admission alone reads nothing: the handler authorizes Read on the
+/// dataset's namespace for the caller's tenant.
+#[tokio::test]
+async fn enterprise_query_rows_requires_namespace_read_for_the_tenant() {
+    use crate::enterprise::{
+        AuthenticatedContext, AuthenticatedPrincipal, EnterpriseExtension, ExtensionError,
+        GuestGrant, NamespaceAction, SpaceRole, TenantContext,
+    };
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tonic::service::Interceptor;
+
+    /// `tenant-test` may read `readable` and only discover `discoverable`.
+    /// Bearer `guest-token` is a guest holding a host grant on `readable`.
+    struct RowReadExtension;
+    impl EnterpriseExtension for RowReadExtension {
+        fn authenticate_bearer(&self, _: &str) -> Result<AuthenticatedPrincipal, ExtensionError> {
+            Err(ExtensionError::CredentialNotFound)
+        }
+        fn authenticate_context(
+            &self,
+            token: &str,
+        ) -> Result<AuthenticatedContext, ExtensionError> {
+            (token == "guest-token")
+                .then(|| AuthenticatedContext {
+                    expires_at: i64::MAX,
+                    issuer: "https://issuer.test".into(),
+                    resource: "https://sekai.test".into(),
+                    ..guest_context()
+                })
+                .ok_or(ExtensionError::CredentialNotFound)
+        }
+        fn tenant_context(
+            &self,
+            _: &AuthenticatedPrincipal,
+        ) -> Result<TenantContext, ExtensionError> {
+            Err(ExtensionError::Unauthenticated)
+        }
+        fn authorize_namespace(
+            &self,
+            context: &TenantContext,
+            namespace: &str,
+            action: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            let granted = context.tenant_id == "tenant-test"
+                && (namespace == "readable"
+                    || (namespace == "discoverable" && action == NamespaceAction::Discover));
+            granted
+                .then_some(())
+                .ok_or(ExtensionError::PermissionDenied)
+        }
+        fn authorize_unscoped_namespace(
+            &self,
+            _: &AuthenticatedPrincipal,
+            _: &str,
+            _: NamespaceAction,
+        ) -> Result<(), ExtensionError> {
+            Err(ExtensionError::PermissionDenied)
+        }
+        fn authorize_guest_namespace(
+            &self,
+            _: &AuthenticatedContext,
+            namespace: &str,
+            _: NamespaceAction,
+        ) -> Result<GuestGrant, ExtensionError> {
+            (namespace == "readable")
+                .then(|| GuestGrant {
+                    role: SpaceRole::Viewer,
+                    marking_ceiling: "restricted".into(),
+                })
+                .ok_or(ExtensionError::PermissionDenied)
+        }
+    }
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(RowReadExtension)))
+            .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    for (dataset_id, namespace) in [
+        ("rows-readable", Some("readable")),
+        ("rows-discoverable", Some("discoverable")),
+        ("rows-unbound", None),
+    ] {
+        let object_id = namespace.map_or(String::new(), |namespace| {
+            let id = format!("{dataset_id}-object");
+            seed_lineage_object(&svc, &id, namespace);
+            id
+        });
+        let runtime = svc.db.runtime();
+        runtime
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: Vec::new(),
+                object_id,
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        runtime
+            .append_rows(
+                dataset_id,
+                &[HashMap::from([("v".into(), dataset_id.into())])],
+            )
+            .unwrap();
+    }
+
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    let assertion = |tenant: Option<&str>| {
+        authority
+            .sign(&IdentityAssertion {
+                contract_version: IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: tenant.map(Into::into),
+                scopes: vec!["sekai.read".into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    };
+    let mut query = |token: &str, dataset_id: &str| {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "QueryRows"));
+        let (metadata, extensions, ()) = interceptor.call(req)?.into_parts();
+        let request = Request::from_parts(
+            metadata,
+            extensions,
+            QueryRowsRequest {
+                dataset_id: dataset_id.into(),
+                query: None,
+            },
+        );
+        Ok::<_, Status>(request)
+    };
+    let code = |request: Result<Request<QueryRowsRequest>, Status>| async {
+        match request {
+            Ok(request) => svc
+                .query_rows(request)
+                .await
+                .err()
+                .map(|status| status.code()),
+            Err(status) => Some(status.code()),
+        }
+    };
+
+    let own = query(&assertion(Some("tenant-test")), "rows-readable").unwrap();
+    let rows = svc.query_rows(own).await.unwrap().into_inner().rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values["v"], "rows-readable");
+
+    let denied = tonic::Code::PermissionDenied;
+    for (case, request, expected) in [
+        (
+            "discover is not read",
+            query(&assertion(Some("tenant-test")), "rows-discoverable"),
+            denied,
+        ),
+        (
+            "unbound dataset has no namespace",
+            query(&assertion(Some("tenant-test")), "rows-unbound"),
+            denied,
+        ),
+        (
+            "another tenant",
+            query(&assertion(Some("tenant-other")), "rows-readable"),
+            denied,
+        ),
+        (
+            "guest with a host grant",
+            query("guest-token", "rows-readable"),
+            denied,
+        ),
+        (
+            "no tenant context",
+            query(&assertion(None), "rows-readable"),
+            tonic::Code::Unauthenticated,
+        ),
+    ] {
+        assert_eq!(code(request).await, Some(expected), "{case}");
+    }
+
+    // The handler decides on its own, whatever reaches it.
+    let direct = |context: Option<AuthenticatedContext>| {
+        let mut req = with_named_principal(
+            QueryRowsRequest {
+                dataset_id: "rows-readable".into(),
+                query: None,
+            },
+            "subject-a",
+        );
+        if let Some(context) = context {
+            req.extensions_mut().insert(context);
+        }
+        req
+    };
+    for (case, request, expected) in [
+        ("guest", direct(Some(guest_context())), denied),
+        (
+            "tenantless context",
+            direct(Some(AuthenticatedContext {
+                tenant: None,
+                ..test_tenant_context()
+            })),
+            tonic::Code::Unauthenticated,
+        ),
+        ("no context", direct(None), tonic::Code::Unauthenticated),
+    ] {
+        assert_eq!(code(Ok(request)).await, Some(expected), "{case}");
+    }
+}
+
+/// #2097: a tenant read of rows is held to the binding object's readable
+/// columns when its policy enforces property grants.
+#[tokio::test]
+async fn enterprise_query_rows_honours_property_grants() {
+    use std::collections::BTreeMap;
+
+    let svc = enterprise_service();
+    let runtime = svc.db.runtime();
+    seed_lineage_object(&svc, "graded-object", "allowed");
+    runtime
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "graded".into(),
+            name: "graded".into(),
+            columns: ["id", "note"]
+                .map(|name| crate::sekai::dataset::ColumnDef {
+                    name: name.into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                })
+                .into(),
+            object_id: "graded-object".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    runtime
+        .append_rows(
+            "graded",
+            &[HashMap::from([
+                ("id".into(), "1".into()),
+                ("note".into(), "hidden".into()),
+                ("undeclared".into(), "hidden".into()),
+            ])],
+        )
+        .unwrap();
+    let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+        contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+        namespace: "allowed".into(),
+        kind: "widget".into(),
+        rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+        }],
+        property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+            property: "id".into(),
+            access: crate::sekai::object_security::PropertyGrantAccess::Read,
+        }]),
+        value_instance_grants: None,
+        required_purpose: None,
+    };
+    let revision = runtime
+        .put_object_security_policy(&policy, "root", "put-graded", 1)
+        .unwrap();
+    runtime
+        .activate_object_security_policies(
+            "allowed",
+            &BTreeMap::from([("widget".into(), revision.revision_digest)]),
+            "root",
+            "activate-graded",
+            2,
+        )
+        .unwrap();
+    let query = |columns: &[&str], filter: Option<&str>| {
+        svc.query_rows(with_tenant_context(QueryRowsRequest {
+            dataset_id: "graded".into(),
+            query: Some(RowQuery {
+                columns: columns.iter().map(|column| column.to_string()).collect(),
+                filters: filter
+                    .map(|column| RowFilter {
+                        column: column.into(),
+                        op: "eq".into(),
+                        value: "hidden".into(),
+                    })
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+        }))
+    };
+
+    let rows = query(&[], None).await.unwrap().into_inner().rows;
+    assert_eq!(
+        rows[0].values,
+        HashMap::from([("id".to_string(), "1".to_string())])
+    );
+    for (columns, filter) in [(&["note"][..], None), (&[][..], Some("note"))] {
+        assert_eq!(
+            query(columns, filter).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied,
+            "{columns:?} {filter:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
     let svc = service();
