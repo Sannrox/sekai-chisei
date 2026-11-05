@@ -936,8 +936,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
             | "ListDatasets"
-            // Row reads (#2097): the handler authorizes Read on the binding
-            // object's namespace and refuses unbound datasets and guests.
+            // Dataset rows, versions, rollback and health (#2097): each
+            // handler authorizes the binding object's namespace
+            // (`authorize_dataset`) and refuses unbound datasets and guests.
+            // Branch handlers authorize a bound dataset in `branch_caller`.
             | "QueryRows"
             | "ListDatasetVersions"
             | "GetDatasetVersion"
