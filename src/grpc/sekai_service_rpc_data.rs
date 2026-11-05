@@ -313,6 +313,7 @@ pub(super) async fn query_rows(
 ) -> Result<Response<QueryRowsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -328,22 +329,76 @@ pub(super) async fn query_rows(
         false,
     )?;
     let query = inner.query.unwrap_or_default();
+    let mut row_query = dataset::RowQuery {
+        filters: from_proto_row_filters(&query.filters),
+        columns: query.columns,
+        limit: query.limit,
+        offset: query.offset,
+    };
+    // A tenant context exists for every enterprise caller (request_tenant_context
+    // refuses one without it); tenant-free callers keep the checks above.
+    if let Some(context) = tenant_context
+        .as_ref()
+        .filter(|context| context.tenant.is_some())
+    {
+        let readable = authorize_tenant_dataset_rows(service, &principals, context, &dataset)?;
+        if let Some(readable) = readable {
+            restrict_row_query(&mut row_query, readable)?;
+        }
+    }
     let rows = service
         .db
         .runtime()
-        .query_rows(
-            &inner.dataset_id,
-            &dataset::RowQuery {
-                filters: from_proto_row_filters(&query.filters),
-                columns: query.columns,
-                limit: query.limit,
-                offset: query.offset,
-            },
-        )
+        .query_rows(&inner.dataset_id, &row_query)
         .map_err(Status::internal)?;
     Ok(Response::new(QueryRowsResponse {
         rows: rows.into_iter().map(|values| Row { values }).collect(),
     }))
+}
+
+/// Tenant read of a dataset's rows (#2097). The namespace is the binding
+/// object's, and the installed extension must grant Read on it; a dataset
+/// with no live binding object has no namespace and is refused. Guests are
+/// refused here as well as at the interceptor. Returns the readable columns
+/// when the binding object's policy enforces property grants.
+fn authorize_tenant_dataset_rows(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: &crate::enterprise::AuthenticatedContext,
+    dataset: &dataset::Dataset,
+) -> Result<Option<Vec<String>>, Status> {
+    if context.guest_home_tenant().is_some() {
+        return Err(Status::permission_denied("enterprise authorization denied"));
+    }
+    let db = service.db.runtime();
+    let object = match dataset.object_id.as_str() {
+        "" => None,
+        id => db.get_object(id).map_err(Status::internal)?,
+    }
+    .ok_or_else(|| Status::permission_denied("dataset has no namespace binding"))?;
+    enforce_namespace_tenant_context(db, Some(context), &object.namespace, false)?;
+    if !object_is_visible(db, &service.security, &object, principals, Some(context)) {
+        return Err(Status::permission_denied("access denied"));
+    }
+    preview_column_allowlist(service, dataset)
+}
+
+/// Holds a row query to `readable` columns: projections and filters naming
+/// another column are refused, and an unprojected query is projected to them.
+fn restrict_row_query(query: &mut dataset::RowQuery, readable: Vec<String>) -> Result<(), Status> {
+    let denied = query
+        .columns
+        .iter()
+        .chain(query.filters.iter().map(|filter| &filter.column))
+        .any(|column| !readable.contains(column));
+    // An empty projection reads every column, so no readable column is a refusal.
+    if denied || readable.is_empty() {
+        return Err(Status::permission_denied("column access denied"));
+    }
+    if query.columns.is_empty() {
+        query.columns = readable;
+    }
+    Ok(())
 }
 pub(super) async fn list_dataset_versions(
     service: &SekaiServiceImpl,

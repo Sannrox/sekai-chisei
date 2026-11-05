@@ -9,6 +9,22 @@ classified `experimental` (see [RPC maturity](rpc-maturity.md)) still needs
 `PERMISSION_DENIED` before anything is read or written. The space role then
 applies the RPC's read or write action.
 
+## Added in #2097
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `QueryRows` | the dataset's binding object | read |
+
+A dataset with no binding object, or whose binding object is gone, has no
+namespace and is refused with `PERMISSION_DENIED`. The binding object must
+also be visible to the caller (markings and object security policy), and when
+that policy enforces property grants the rows are held to the readable
+columns: a projection or filter naming another column is refused, and an
+unprojected query returns only the readable ones. Guests stay refused; a host
+grant does not admit them. `enterprise_query_rows_requires_namespace_read_for_the_tenant`
+drives the real interceptor and the handler, and
+`enterprise_query_rows_honours_property_grants` covers the columns.
+
 ## Added in #1777
 
 | RPC | Namespace from | Space action |
