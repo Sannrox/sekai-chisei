@@ -1184,6 +1184,20 @@ fn exercise_audit_retention(db: &RuntimeDb, sql: &Sql<'_>) {
     assert_eq!(run.audit_archived, 3, "two decisions and one attestation");
     assert_eq!((sql.strings)("SELECT id FROM sekai_decisions"), ["d-new"]);
     assert_eq!(sql.count("SELECT id FROM sekai_attestations"), 0);
+    assert!(db.get_attestation("a-old").unwrap().is_none());
+    let archived = db
+        .get_archived_record("audit.attestations", "a-old")
+        .unwrap()
+        .expect("archived attestation");
+    assert!(archived.hash_ok());
+    assert!(
+        db.get_archived_record("audit.attestations", "never-existed")
+            .unwrap()
+            .is_none()
+    );
+    let markers = db.retention_list_markers().unwrap();
+    assert_eq!(markers.earliest_retained_seq, 3);
+    assert_eq!(markers.retained_from_ms, 2 * day);
     let after = db.verify_ledger().unwrap();
     assert!(after.ok, "{}", after.error);
     assert_eq!(
