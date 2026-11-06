@@ -107,6 +107,6 @@ digests, so they continue to identify the original versions after
 supersession.
 
 The runnable
-[`governed_fact_profile`](../examples/governed_fact_profile.rs) example seeds
+[`governed_fact_profile`](../crates/sekai-core/examples/governed_fact_profile.rs) example seeds
 API-compatibility and data-migration-safety facts through the same profile
 without adding either domain to the core vocabulary.

@@ -1,10 +1,10 @@
 //! Measure the #876 object-index envelope. Not the product indexer.
 //!
 //! ```text
-//! cargo run --release --example object_index_envelope -- --objects 10000000
+//! cargo run -p sekai-core --release --example object_index_envelope -- --objects 10000000
 //! ```
 
-use sekai_chisei::sekai::object_index_envelope::{
+use sekai_core::sekai::object_index_envelope::{
     EnvelopeScale, create_schema, materialize_two_hop_projection, measure, open_spike_db,
     source_matches_projection, two_hop_customer_count, two_hop_hash_join, two_hop_nested_loop,
     two_hop_projection_count,
@@ -77,11 +77,11 @@ fn main() -> ExitCode {
         };
     }
 
-    if let Err(error) = sekai_chisei::sekai::object_index_envelope::load_source(&mut conn, scale) {
+    if let Err(error) = sekai_core::sekai::object_index_envelope::load_source(&mut conn, scale) {
         eprintln!("load: {error}");
         return ExitCode::from(1);
     }
-    if let Err(error) = sekai_chisei::sekai::object_index_envelope::materialize(&conn) {
+    if let Err(error) = sekai_core::sekai::object_index_envelope::materialize(&conn) {
         eprintln!("materialize: {error}");
         return ExitCode::from(1);
     }

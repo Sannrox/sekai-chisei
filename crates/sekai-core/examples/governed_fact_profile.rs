@@ -3,10 +3,10 @@
 //! Two software concerns use the same domain-neutral Sekai structures. The
 //! concern names and subject profiles belong to this adapter, not core Sekai.
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::domain::{KIND_EXTERNAL_EVIDENCE, Object};
-use sekai_chisei::sekai::governed_facts::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::db::sekai::SekaiDb;
+use sekai_core::domain::{KIND_EXTERNAL_EVIDENCE, Object};
+use sekai_core::sekai::governed_facts::{
     FactApplicability, GovernedFactInput, GovernedFactType, PROFILE_CONTRACT_VERSION,
     VerificationContract, apply_profile, list_facts, put_fact, resolve_invariant_set,
 };

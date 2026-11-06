@@ -1,10 +1,10 @@
-#[path = "../adapters/lakehouse_events.rs"]
+#[path = "../../../adapters/lakehouse_events.rs"]
 mod lakehouse_events;
-#[path = "../adapters/lakehouse_metrics.rs"]
+#[path = "../../../adapters/lakehouse_metrics.rs"]
 mod lakehouse_metrics;
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::lakehouse_snapshot::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::sekai::lakehouse_snapshot::{
     LAKEHOUSE_UNAVAILABLE, OUTCOME_EXPORTED, OUTCOME_REPLAYED, PROFILE_EVENTS, PROFILE_METRICS,
     STATUS_REVOKED, delete_partitions, redact_columns, register_snapshot, reimport_snapshot,
     revoke_snapshot, upgrade_schema,
@@ -14,14 +14,16 @@ fn adapter_lifecycle(adapter_id: &str) {
     let db = RuntimeDb::memory();
     let snapshot = if adapter_id == PROFILE_EVENTS {
         lakehouse_events::translate_snapshot(
-            &lakehouse_events::parse(include_bytes!("../adapters/fixtures/lakehouse_events.json"))
-                .unwrap(),
+            &lakehouse_events::parse(include_bytes!(
+                "../../../adapters/fixtures/lakehouse_events.json"
+            ))
+            .unwrap(),
         )
         .unwrap()
     } else {
         lakehouse_metrics::translate_snapshot(
             &lakehouse_metrics::parse(include_bytes!(
-                "../adapters/fixtures/lakehouse_metrics.json"
+                "../../../adapters/fixtures/lakehouse_metrics.json"
             ))
             .unwrap(),
         )
@@ -41,7 +43,7 @@ fn adapter_lifecycle(adapter_id: &str) {
     upgraded.schema_version = 2;
     upgraded
         .columns
-        .push(sekai_chisei::sekai::lakehouse_snapshot::LakehouseColumn {
+        .push(sekai_core::sekai::lakehouse_snapshot::LakehouseColumn {
             name: "note".into(),
             col_type: "string".into(),
             classification: "internal".into(),
@@ -95,9 +97,10 @@ fn two_adapter_fixtures_pass_partitions_upgrade_redaction_deletion_reimport_and_
 
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut events: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../adapters/fixtures/lakehouse_events.json"))
-            .unwrap();
+    let mut events: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../adapters/fixtures/lakehouse_events.json"
+    ))
+    .unwrap();
     events
         .as_object_mut()
         .unwrap()

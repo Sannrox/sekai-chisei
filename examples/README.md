@@ -41,23 +41,23 @@ cargo test --locked --test it game_reference
 
 ## analytical_transform
 
-[analytical_transform.rs](analytical_transform.rs) seeds two datasets that back
+[analytical_transform.rs](../crates/sekai-core/examples/analytical_transform.rs) seeds two datasets that back
 an object type, runs a join + aggregate analytical transform, and prints the
 run receipt (rows in/out, definition and input digests, lineage parent):
 
 ```bash
-cargo run --example analytical_transform
+cargo run -p sekai-core --example analytical_transform
 ```
 
 ## governed_fact_profile
 
-[governed_fact_profile.rs](governed_fact_profile.rs) shows an external software
+[governed_fact_profile.rs](../crates/sekai-core/examples/governed_fact_profile.rs) shows an external software
 adapter applying the fixed `sekai.governed-facts/v1` profile, then representing
 API compatibility and data-migration safety through the same domain-neutral
 requirement and invariant structures:
 
 ```bash
-cargo run --example governed_fact_profile
+cargo run -p sekai-core --example governed_fact_profile
 ```
 
 The example is local and deterministic. It makes no network or model calls and
@@ -65,7 +65,7 @@ adds no software-specific field to the core contract.
 
 ## demo_client
 
-[demo_client.rs](demo_client.rs) is an end-to-end client that walks through a
+[demo_client.rs](../crates/sekai-adapters/examples/demo_client.rs) is an end-to-end client that walks through a
 realistic "AI-assisted delivery" slice: it builds a small typed-object graph in
 `sekai`, then drives the `chisei` budget and decision pipeline. Every call is
 tolerant — a failing step is reported and the run continues — so it doubles as a
@@ -83,7 +83,7 @@ SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db c
 Run the demo in another:
 
 ```bash
-cargo run --example demo_client
+cargo run -p sekai-adapters --example demo_client
 ```
 
 ### What it does
@@ -125,14 +125,14 @@ finishes.
 
 ## delegation
 
-[delegation.rs](delegation.rs) sketches the privacy-preserving delegation chain:
+[delegation.rs](../crates/sekai-adapters/examples/delegation.rs) sketches the privacy-preserving delegation chain:
 local Ollama planning with private context, a frontier `template_only` rubric
 request, local private composition, and a leak-checked `template_only` polish
 pass. It prints the `PlanExecution` request sequence without making network or
 model calls:
 
 ```bash
-cargo run --example delegation
+cargo run -p sekai-adapters --example delegation
 ```
 
 ### Configuration
@@ -164,7 +164,7 @@ It sends caller identity via `x-principal` using `SEKAI_PRINCIPAL`.
 
 ## incident_response
 
-[incident_response.rs](incident_response.rs) shows a non-coding domain using
+[incident_response.rs](../crates/sekai-adapters/examples/incident_response.rs) shows a non-coding domain using
 only the core Sekai contract. A service incident is represented as a namespace,
 actor, operation, attempt, action, artifact, verification, and outcome connected
 by ordinary links. No incident-specific field, RPC, application scope, workflow
@@ -173,7 +173,7 @@ engine, or agent runtime is added to the control plane.
 The example builds and prints the graph locally without starting the server:
 
 ```bash
-cargo run --example incident_response
+cargo run -p sekai-adapters --example incident_response
 ```
 
 An integration can persist the same objects and links through `SekaiService`,

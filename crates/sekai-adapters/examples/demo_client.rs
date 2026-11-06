@@ -14,7 +14,7 @@
 //! Then the demo in another:
 //!
 //! ```bash
-//! cargo run --example demo_client
+//! cargo run -p sekai-adapters --example demo_client
 //! ```
 //!
 //! Honors the same env vars as the server: `GRPC_PORT` (default 50051),
@@ -30,14 +30,14 @@ use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status};
 
-use sekai_chisei::grpc::client::{GatewayClient, connect_sekai};
-use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use sekai_chisei::grpc::pb::chisei::{
+use sekai_admin_client::client::{GatewayClient, connect_sekai};
+use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
+use sekai_proto::chisei::{
     ChatMessage, ExecutePlanRequest, ExecutionInput, PlanExecutionRequest, RecordUsageRequest,
     SetBudgetLimitRequest,
 };
-use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use sekai_chisei::grpc::pb::sekai::{
+use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_proto::sekai::{
     CreateLinkRequest, CreateObjectRequest, GetLinkedObjectsRequest, GraphQuery, Link, ListFilter,
     ListObjectsRequest, Object, TraverseRequest,
 };

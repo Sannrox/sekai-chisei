@@ -56,7 +56,7 @@ strict event sequence, distinct same-second payloads are retained as separate,
 attributable observations instead of being forced into a false version order:
 
 ```sh
-cargo run --example evidence_github_check_webhook < check_run.json
+cargo run -p sekai-adapters --example evidence_github_check_webhook < check_run.json
 ```
 
 The health adapter uses evidence type `operations.health_snapshot` and schema
@@ -64,7 +64,7 @@ The health adapter uses evidence type `operations.health_snapshot` and schema
 `HEALTH_SOURCE_RECORD_ID`; `HEALTH_EVIDENCE_TTL_MS` defaults to five minutes:
 
 ```sh
-cargo run --example evidence_http_health_poll
+cargo run -p sekai-adapters --example evidence_http_health_poll
 ```
 
 The concept-catalog adapter uses evidence type `ontology.concept_catalog` and
@@ -73,7 +73,7 @@ admins call `ProposeOntologyDefinitions` (prefer `dry_run=true` first) and
 `ReviewOntologyDefinitionProposal`:
 
 ```sh
-cargo run --example evidence_ontology_concept_catalog \
+cargo run -p sekai-adapters --example evidence_ontology_concept_catalog \
   < adapters/fixtures/ontology_concept_catalog.service.json
 ```
 
@@ -83,14 +83,14 @@ The social adapters use evidence types `social.post_snapshot` /
 id the product already owns; do not point the funnel at raw network credentials:
 
 ```sh
-cargo run --example evidence_social_post_snapshot \
+cargo run -p sekai-adapters --example evidence_social_post_snapshot \
   < adapters/fixtures/social_post_snapshot.7d.json
-cargo run --example evidence_social_reply \
+cargo run -p sekai-adapters --example evidence_social_reply \
   < adapters/fixtures/social_reply.sample.json
 ```
 
 Conformance fixtures live in `adapters/fixtures/` and run without network access
-through `cargo test --test evidence_adapters`.
+through `cargo test -p sekai-adapters --test evidence_adapters`.
 
 ## GitHub object sync
 
@@ -267,11 +267,11 @@ remains metadata-only and bounded.
 an independent Responses SSE decoder against the complete canonical harness
 fixture corpus, then maps terminal runs into the same operation-receipt and
 external-evidence contracts as interactive harnesses. Its conformance suite runs
-with `cargo test --test batch_harness_conformance`. The runnable target reads a
+with `cargo test -p chisei-core --test batch_harness_conformance`. The runnable target reads a
 Responses SSE stream from standard input and emits the assembled terminal result:
 
 ```sh
-cargo run --example batch_responses_harness < response.sse
+cargo run -p chisei-core --example batch_responses_harness < response.sse
 ```
 
 Host executors reporting redeemed external actions use the same SDK and outbox.
@@ -310,7 +310,7 @@ columns, stale cursors, foreign tenants, and unknown versions fail
 closed. Offline conformance:
 
 ```sh
-cargo test --test warehouse_projection_adapters
+cargo test -p sekai-core --test warehouse_projection_adapters
 ```
 
 ## Warehouse table ingest profile
@@ -373,7 +373,7 @@ columns, foreign tenants, and unknown versions fail closed. Offline
 conformance:
 
 ```sh
-cargo test --test lakehouse_snapshot_adapters
+cargo test -p sekai-core --test lakehouse_snapshot_adapters
 ```
 
 ## Model-platform adapters
@@ -391,7 +391,7 @@ fields, foreign tenants, and unknown versions fail closed. Offline
 conformance:
 
 ```sh
-cargo test --test model_platform_adapters
+cargo test -p sekai-core --test model_platform_adapters
 ```
 
 ## Autonomy envelope adapters
@@ -409,5 +409,5 @@ fields, stale pins, foreign tenants, and unknown versions fail closed.
 Offline conformance:
 
 ```sh
-cargo test --test autonomous_envelope_adapters
+cargo test -p sekai-core --test autonomous_envelope_adapters
 ```

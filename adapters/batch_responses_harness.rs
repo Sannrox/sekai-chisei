@@ -1,9 +1,9 @@
 use crate::sdk::{ConformanceProfile, EvidenceDraft};
-use sekai_chisei::chisei::receipt::{
+use chisei_core::chisei::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
     ReceiptSurface, UncoveredSurface,
 };
-use sekai_chisei::grpc::pb::sekai::EvidenceCausality;
+use sekai_proto::sekai::EvidenceCausality;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};

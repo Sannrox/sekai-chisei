@@ -1,6 +1,6 @@
 //! Domain-neutral inventory warehouse adapter (#711).
 
-use sekai_chisei::sekai::warehouse_projection::{
+use sekai_core::sekai::warehouse_projection::{
     PROFILE_INVENTORY, PROFILE_VERSION, SECURITY_CONTRACT, WAREHOUSE_CONTRACT, WarehouseColumn,
     WarehouseCursor, WarehouseProjection, WarehouseRow, WarehouseSecurity,
 };

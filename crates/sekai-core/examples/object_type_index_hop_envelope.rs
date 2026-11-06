@@ -4,13 +4,13 @@
 //! throwaway candidate. Not a shipped engine pick.
 //!
 //! ```text
-//! cargo run --release --example object_type_index_hop_envelope -- --objects 100000
+//! cargo run -p sekai-core --release --example object_type_index_hop_envelope -- --objects 100000
 //! ```
 
-use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::sekai::dataset::{ColumnDef, Dataset, RowQuery};
-use sekai_chisei::sekai::object_index_envelope::EnvelopeScale;
-use sekai_chisei::sekai::object_type_index::{
+use sekai_core::db::sekai::SekaiDb;
+use sekai_core::sekai::dataset::{ColumnDef, Dataset, RowQuery};
+use sekai_core::sekai::object_index_envelope::EnvelopeScale;
+use sekai_core::sekai::object_type_index::{
     CONTRACT_VERSION, ObjectTypeDatasource, ObjectTypeIndexMember,
 };
 use std::collections::{HashMap, HashSet};

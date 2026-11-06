@@ -1,4 +1,4 @@
-use sekai_chisei::grpc::pb::chisei::{ChatMessage, ExecutionInput, PlanExecutionRequest};
+use sekai_proto::chisei::{ChatMessage, ExecutionInput, PlanExecutionRequest};
 
 fn main() {
     let local_plan = local_private_plan();

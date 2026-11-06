@@ -38,7 +38,7 @@ rebuildable projection.
 Two-hop shape: Customer → Order → Shipment. Hidden rows stay in source and
 projection and must not affect visible counts or sums.
 
-Harness: `cargo run --release --example object_index_envelope -- --objects 10000000`.
+Harness: `cargo run -p sekai-core --release --example object_index_envelope -- --objects 10000000`.
 Invariants at small scale: `sekai::object_index_envelope` unit tests.
 
 ## Targets from #876
