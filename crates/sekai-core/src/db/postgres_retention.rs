@@ -28,17 +28,7 @@ struct ArchiveRecord {
 
 impl PostgresDb {
     pub fn set_retention_policy(&self, policy: &RetentionPolicy) -> Result<(), String> {
-        if policy.dataset.trim().is_empty() {
-            return Err("dataset is required".into());
-        }
-        if !crate::sekai::retention::RETENTION_DATASETS.contains(&policy.dataset.as_str()) {
-            return Err(
-                "dataset must be audit, llm_calls, task_observations, or content_events".into(),
-            );
-        }
-        if policy.retention_days <= 0 {
-            return Err("retention_days must be positive".into());
-        }
+        crate::sekai::retention::validate_policy(policy)?;
         let mut connection = self.connection()?;
         connection
             .execute(
@@ -69,6 +59,27 @@ impl PostgresDb {
             )
             .map_err(err)
             .map(|rows| rows.into_iter().map(row_policy).collect())
+    }
+
+    pub fn delete_retention_policy(
+        &self,
+        dataset: &str,
+        namespace: &str,
+        data_class: &str,
+    ) -> Result<(), String> {
+        crate::sekai::retention::validate_policy_dataset(dataset)?;
+        let mut connection = self.connection()?;
+        let deleted = connection
+            .execute(
+                "DELETE FROM sekai_retention_policies
+                 WHERE dataset=$1 AND namespace=$2 AND data_class=$3",
+                &[&dataset, &namespace, &data_class],
+            )
+            .map_err(err)?;
+        if deleted == 0 {
+            return Err("retention policy not found".into());
+        }
+        Ok(())
     }
 
     pub fn erase_subject(

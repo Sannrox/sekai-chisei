@@ -1,19 +1,19 @@
-//! sekaictl admin retention commands (#1987).
+//! sekaictl admin retention commands (#1987, #2023).
 //!
-//! Status, dry-run and run share `RuntimeDb::archive_retained_records` and
-//! `retention_archive_status`. Both backends implement those methods, so this
+//! Status, dry-run, run, and policy list/set/delete share `RuntimeDb`
+//! retention methods. Both backends implement those methods, so this
 //! surface is not SQLite-only.
 
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::retention::{ArchiveRun, ArchiveStatus};
+use crate::sekai::retention::{ArchiveRun, ArchiveStatus, RetentionPolicy};
 use chrono::Utc;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin retention status\n  sekaictl admin retention dry-run\n  sekaictl admin retention run"
+    "sekaictl admin retention status\n  sekaictl admin retention dry-run\n  sekaictl admin retention run\n  sekaictl admin retention policy list\n  sekaictl admin retention policy set --dataset <audit|llm_calls|task_observations|content_events> --days <n> [--namespace <ns>] [--data-class <class>]\n  sekaictl admin retention policy delete --dataset <audit|llm_calls|task_observations|content_events> [--namespace <ns>] [--data-class <class>]"
 }
 
 pub fn run_retention_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -35,6 +35,42 @@ pub fn run_retention_command(args: Vec<String>) -> Result<(), BoxErr> {
                 .map_err(std::io::Error::other)?,
             )
         }),
+        Some("policy") => run_policy_command(&args[1..]),
+        _ => Err(std::io::Error::other(usage()).into()),
+    }
+}
+
+fn run_policy_command(args: &[String]) -> Result<(), BoxErr> {
+    match args.first().map(String::as_str) {
+        Some("list") if args.len() == 1 => {
+            with_layout(|layout| print_policies(layout.sekai_runtime().as_ref()))
+        }
+        Some("set") => {
+            let mut policy = parse_set(&args[1..]).map_err(std::io::Error::other)?;
+            with_layout(|layout| {
+                policy.updated = Utc::now().timestamp_millis();
+                mutate_admitted(layout, |db| db.set_retention_policy(&policy))?;
+                println!("{}", policy_json(&policy, policy.updated));
+                Ok(())
+            })
+        }
+        Some("delete") => {
+            let key = parse_delete(&args[1..]).map_err(std::io::Error::other)?;
+            with_layout(|layout| {
+                mutate_admitted(layout, |db| {
+                    db.delete_retention_policy(&key.dataset, &key.namespace, &key.data_class)
+                })?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "dataset": key.dataset,
+                        "namespace": key.namespace,
+                        "data_class": key.data_class,
+                    })
+                );
+                Ok(())
+            })
+        }
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -81,6 +117,98 @@ pub(crate) fn archive_admitted(
     })
 }
 
+/// Policy writes go through the same restore fence as `run`.
+fn mutate_admitted<T>(
+    stores: &CombinedStoreLayout,
+    work: impl FnOnce(&RuntimeDb) -> Result<T, String>,
+) -> Result<T, BoxErr> {
+    crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)
+        .and_then(|_| work(stores.sekai_runtime().as_ref()))
+        .map_err(std::io::Error::other)
+        .map_err(Into::into)
+}
+
+#[derive(Debug)]
+struct PolicyKey {
+    dataset: String,
+    namespace: String,
+    data_class: String,
+}
+
+fn parse_set(args: &[String]) -> Result<RetentionPolicy, String> {
+    let mut dataset = None;
+    let mut days = None;
+    let mut namespace = String::new();
+    let mut data_class = String::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--dataset" => dataset = Some(value.clone()),
+            "--days" => {
+                days = Some(
+                    value
+                        .parse::<i32>()
+                        .map_err(|_| format!("--days must be a positive integer: {value}"))?,
+                )
+            }
+            "--namespace" => namespace = value.clone(),
+            "--data-class" => data_class = value.clone(),
+            _ => {
+                return Err(format!(
+                    "unknown retention policy option {arg:?}\n{}",
+                    usage()
+                ));
+            }
+        }
+    }
+    let dataset = dataset.ok_or_else(|| "--dataset is required".to_string())?;
+    let retention_days = days.ok_or_else(|| "--days is required".to_string())?;
+    let policy = RetentionPolicy {
+        dataset,
+        namespace,
+        data_class,
+        retention_days,
+        updated: 0,
+    };
+    crate::sekai::retention::validate_policy(&policy)?;
+    Ok(policy)
+}
+
+fn parse_delete(args: &[String]) -> Result<PolicyKey, String> {
+    let mut dataset = None;
+    let mut namespace = String::new();
+    let mut data_class = String::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--dataset" => dataset = Some(value.clone()),
+            "--namespace" => namespace = value.clone(),
+            "--data-class" => data_class = value.clone(),
+            _ => {
+                return Err(format!(
+                    "unknown retention policy option {arg:?}\n{}",
+                    usage()
+                ));
+            }
+        }
+    }
+    let dataset = dataset.ok_or_else(|| "--dataset is required".to_string())?;
+    crate::sekai::retention::validate_policy_dataset(&dataset)?;
+    Ok(PolicyKey {
+        dataset,
+        namespace,
+        data_class,
+    })
+}
+
 fn run(db: &RuntimeDb, dry_run: bool) -> Result<ArchiveRun, BoxErr> {
     db.archive_retained_records(Utc::now().timestamp_millis(), dry_run)
         .map_err(std::io::Error::other)
@@ -91,7 +219,29 @@ fn print_status(db: &RuntimeDb) -> Result<(), BoxErr> {
     let status = db
         .retention_archive_status()
         .map_err(std::io::Error::other)?;
-    println!("{}", status_json(&status));
+    let policies = db
+        .list_retention_policies()
+        .map_err(std::io::Error::other)?;
+    println!(
+        "{}",
+        status_json(&status, &policies, Utc::now().timestamp_millis())
+    );
+    Ok(())
+}
+
+fn print_policies(db: &RuntimeDb) -> Result<(), BoxErr> {
+    let policies = db
+        .list_retention_policies()
+        .map_err(std::io::Error::other)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "policies": policies
+                .iter()
+                .map(|policy| policy_value(policy, Utc::now().timestamp_millis()))
+                .collect::<Vec<_>>(),
+        })
+    );
     Ok(())
 }
 
@@ -100,7 +250,7 @@ fn print_run(run: &ArchiveRun) -> Result<(), BoxErr> {
     Ok(())
 }
 
-fn status_json(status: &ArchiveStatus) -> String {
+fn status_json(status: &ArchiveStatus, policies: &[RetentionPolicy], now: i64) -> String {
     let datasets: Vec<serde_json::Value> = status
         .records
         .iter()
@@ -121,8 +271,27 @@ fn status_json(status: &ArchiveStatus) -> String {
         "batches": status.batches,
         "last_cutoff_ms": status.last_cutoff_ms,
         "datasets": datasets,
+        "policies": policies
+            .iter()
+            .map(|policy| policy_value(policy, now))
+            .collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+fn policy_json(policy: &RetentionPolicy, now: i64) -> String {
+    policy_value(policy, now).to_string()
+}
+
+fn policy_value(policy: &RetentionPolicy, now: i64) -> serde_json::Value {
+    serde_json::json!({
+        "dataset": policy.dataset,
+        "namespace": policy.namespace,
+        "data_class": policy.data_class,
+        "retention_days": policy.retention_days,
+        "updated": policy.updated,
+        "cutoff_ms": policy.cutoff_ms(now),
+    })
 }
 
 fn run_json(run: &ArchiveRun) -> String {
@@ -145,7 +314,6 @@ mod tests {
     use crate::db::sekai::SekaiDb;
     use crate::runtime_backend::{BackendIdentity, RuntimeBackend};
     use crate::sekai::deduplication::{ContentReferenceRequest, ContentScope};
-    use crate::sekai::retention::RetentionPolicy;
     use std::sync::Arc;
 
     const DAY_MS: i64 = 86_400_000;
@@ -213,9 +381,12 @@ mod tests {
         assert!(!run.dry_run);
         assert!(run.content_events_archived > 0, "{run:?}");
         let status = db.retention_archive_status().unwrap();
-        let json = status_json(&status);
+        let policies = db.list_retention_policies().unwrap();
+        let json = status_json(&status, &policies, 2 * DAY_MS);
         assert!(json.contains("content_events"), "{json}");
         assert!(json.contains("last_archived_at_ms"), "{json}");
+        assert!(json.contains("\"retention_days\":1"), "{json}");
+        assert!(json.contains(&format!("\"cutoff_ms\":{DAY_MS}")), "{json}");
         assert!(
             status
                 .last_archived_at_ms
@@ -226,10 +397,66 @@ mod tests {
     }
 
     #[test]
-    fn usage_names_status_dry_run_and_run() {
+    fn usage_names_status_dry_run_run_and_policy() {
         assert!(usage().contains("sekaictl admin retention status"));
         assert!(usage().contains("dry-run"));
         assert!(usage().contains(" run"));
+        assert!(usage().contains("policy list"));
+        assert!(usage().contains("policy set"));
+        assert!(usage().contains("policy delete"));
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_set_and_delete_use_dataset_vocabulary() {
+        let policy = parse_set(&args(&[
+            "--dataset",
+            "audit",
+            "--days",
+            "365",
+            "--namespace",
+            "ops",
+            "--data-class",
+            "restricted",
+        ]))
+        .unwrap();
+        assert_eq!(policy.dataset, "audit");
+        assert_eq!(policy.retention_days, 365);
+        assert_eq!(policy.namespace, "ops");
+        assert_eq!(policy.data_class, "restricted");
+        assert_eq!(policy.cutoff_ms(365 * DAY_MS), 0);
+        let err = parse_set(&args(&["--dataset", "audit", "--days", "0"])).unwrap_err();
+        assert!(err.contains("retention_days must be positive"), "{err}");
+        let err = parse_set(&args(&["--dataset", "objects", "--days", "1"])).unwrap_err();
+        assert!(err.contains("dataset must be"), "{err}");
+        let err = parse_set(&args(&["--dataset", "audit"])).unwrap_err();
+        assert!(err.contains("--days is required"), "{err}");
+        let key = parse_delete(&args(&["--dataset", "llm_calls"])).unwrap();
+        assert_eq!(key.dataset, "llm_calls");
+        assert!(key.namespace.is_empty());
+        assert!(
+            parse_delete(&args(&["--dataset", "nope"]))
+                .unwrap_err()
+                .contains("dataset must be")
+        );
+    }
+
+    #[test]
+    fn policy_json_names_cutoff() {
+        let policy = RetentionPolicy {
+            dataset: "audit".into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 9,
+        };
+        let json = policy_json(&policy, 2 * DAY_MS);
+        assert!(json.contains("\"dataset\":\"audit\""), "{json}");
+        assert!(json.contains(&format!("\"cutoff_ms\":{DAY_MS}")), "{json}");
+        assert!(json.contains("\"updated\":9"), "{json}");
     }
 
     #[test]
@@ -256,6 +483,49 @@ mod tests {
         let dry = archive_admitted(&db, &layout, 2 * DAY_MS, true).unwrap();
         assert!(dry.dry_run);
         assert_eq!(db.retention_archive_status().unwrap(), before);
+        let policy = RetentionPolicy {
+            dataset: "audit".into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        };
+        let err = mutate_admitted(&layout, |db| db.set_retention_policy(&policy)).unwrap_err();
+        assert!(err.to_string().contains("restamp"), "{err}");
+        assert!(db.list_retention_policies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn admitted_layout_sets_and_deletes_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekai.db");
+        let backend =
+            RuntimeBackend::from_sqlite_with_enterprise_extension(path.to_str().unwrap(), None)
+                .unwrap();
+        let layout = CombinedStoreLayout::from_backend(backend);
+        let policy = RetentionPolicy {
+            dataset: "audit".into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 7,
+            updated: 1,
+        };
+        mutate_admitted(&layout, |db| db.set_retention_policy(&policy)).unwrap();
+        assert_eq!(
+            layout.sekai_runtime().list_retention_policies().unwrap(),
+            vec![policy.clone()]
+        );
+        mutate_admitted(&layout, |db| {
+            db.delete_retention_policy(&policy.dataset, &policy.namespace, &policy.data_class)
+        })
+        .unwrap();
+        assert!(
+            layout
+                .sekai_runtime()
+                .list_retention_policies()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

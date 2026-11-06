@@ -135,12 +135,15 @@ usage recovery, and durable receipt, usage, and refusal recovery. Test
 restore procedures, not only backup creation.
 
 Retention is opt-in. A fresh store on either backend has no policies, so the
-minute tick archives nothing until an operator sets one. Existing SQLite stores
+minute tick archives nothing until an operator sets one with
+`sekaictl admin retention policy set`. Existing SQLite stores
 that already contain the former global defaults (`audit` 365 days, `llm_calls`
-90 days, `task_observations` 90 days) keep them; delete those rows if they were
-never intended. When a policy is set, retention archives into tables in the
+90 days, `task_observations` 90 days) keep them; delete those rows with
+`sekaictl admin retention policy delete` if they were never intended. When a
+policy is set, retention archives into tables in the
 operational database ([ADR 0141](decisions/0141-retention-archives-in-database.md)),
 so the archive is backed up and replicated with it; size storage for it.
+Exporting and pruning archive rows is follow-up, not this command surface.
 `archive_retained_records` moves bounded batches (500 records per dataset per
 transaction) until nothing is left, so an interrupted run resumes; its dry run
 reports the counts without writing. Archived records are keyed by a SHA-256 of
@@ -159,8 +162,10 @@ Every Sekai plane instance runs a retention tick (ADR 0129): it calls
 `archive_retained_records` on a one-minute interval. With no policy it writes
 nothing. Replicas do not elect a scheduler; an interrupted run resumes, and two
 ticks archive each record once.
-`sekaictl admin retention status` reports per-dataset counts and the last
-archive time; `dry-run` reports the counts without writing; `run` performs them.
+`sekaictl admin retention status` reports the effective policies and their
+cutoffs, per-dataset archive counts, and the last archive time;
+`policy list` prints the same policies; `policy set` and `policy delete`
+write them; `dry-run` reports the counts without writing; `run` performs them.
 The same commands work on SQLite and PostgreSQL. On PostgreSQL decisions,
 attestations, object changes, LLM calls, task observations and content
 events are covered (migration 0135 adds the observation `data_class` and
