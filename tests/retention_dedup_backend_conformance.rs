@@ -297,6 +297,27 @@ fn exercise_backend(
     exercise_subject_erasure(dedup, retention, prefix);
 }
 
+fn assert_fresh_store_has_no_retention_policies(db: &dyn RetentionPolicyBackend) {
+    assert_eq!(
+        db.list_retention_policies().unwrap(),
+        Vec::<RetentionPolicy>::new()
+    );
+}
+
+#[test]
+fn sqlite_fresh_store_has_no_retention_policies() {
+    let db = SekaiDb::new(":memory:").unwrap();
+    assert_fresh_store_has_no_retention_policies(&db);
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_fresh_store_has_no_retention_policies() {
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
+    let db = scratch.connect(8);
+    assert_fresh_store_has_no_retention_policies(&db);
+}
+
 #[test]
 fn sqlite_retention_deduplication_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();

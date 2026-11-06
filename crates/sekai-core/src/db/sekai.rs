@@ -2530,6 +2530,18 @@ mod tests {
         ))
     }
 
+    fn insert_historical_retention_seeds(db: &SekaiDb) {
+        db.conn()
+            .execute_batch(
+                "INSERT INTO sekai_retention_policies
+                 (dataset, namespace, data_class, retention_days, updated)
+                 VALUES ('audit', '', '', 365, 1),
+                        ('llm_calls', '', '', 90, 1),
+                        ('task_observations', '', '', 90, 1);",
+            )
+            .unwrap();
+    }
+
     fn table_columns(db: &SekaiDb, table: &str) -> Vec<String> {
         let conn = db.conn();
         let mut stmt = conn
@@ -3772,7 +3784,7 @@ mod tests {
         let path = temp_db_path("dual-empty");
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
         drop(db);
-        // Shared migrate seeds Sekai retention policies. Chisei families stay
+        // Shared migrate creates empty Sekai tables. Chisei families stay
         // empty, so a Sekai-only open of that dual file is the empty-foreign case.
         SekaiDb::new_for_plane(
             path.to_str().unwrap(),
@@ -3786,9 +3798,10 @@ mod tests {
     fn dual_schema_file_opens_as_chisei_when_only_retention_seeds_exist() {
         let path = temp_db_path("dual-chisei-seeds");
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        insert_historical_retention_seeds(&db);
         drop(db);
         // Pre-split Chisei dests ran Shared migrate and still carry the three
-        // default retention rows. Those are not operator data.
+        // former default retention rows. Those are not operator data.
         SekaiDb::new_for_plane(
             path.to_str().unwrap(),
             crate::db::schema_plane::SchemaPlane::Chisei,
@@ -3824,6 +3837,7 @@ mod tests {
     fn dual_schema_file_refuses_as_chisei_when_retention_days_were_changed() {
         let path = temp_db_path("dual-chisei-retention-days");
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        insert_historical_retention_seeds(&db);
         db.conn()
             .execute(
                 "UPDATE sekai_retention_policies SET retention_days = 30 WHERE dataset = 'audit'",
