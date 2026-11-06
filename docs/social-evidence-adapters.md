@@ -95,17 +95,17 @@ export EVIDENCE_TARGET_EXTERNAL_ID=publication:example-1
 export EVIDENCE_TARGET_KIND=hibiki.publication
 export EVIDENCE_CLASSIFICATION=public
 
-cargo run --example evidence_social_post_snapshot \
+cargo run -p sekai-adapters --example evidence_social_post_snapshot \
   < adapters/fixtures/social_post_snapshot.7d.json
 
-cargo run --example evidence_social_reply \
+cargo run -p sekai-adapters --example evidence_social_reply \
   < adapters/fixtures/social_reply.sample.json
 ```
 
 Conformance (no network):
 
 ```sh
-cargo test --test evidence_adapters
+cargo test -p sekai-adapters --test evidence_adapters
 ```
 
 ## Non-goals

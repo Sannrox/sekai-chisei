@@ -24,7 +24,7 @@ engine pick and does not retire SQLite.
 
 ## macOS local server (Homebrew PostgreSQL 17.10)
 
-`cargo run --release --example embedded_postgres_envelope`
+`cargo run -p sekai-adapters --release --example embedded_postgres_envelope`
 
 `initdb` + `pg_ctl` against a temp data directory. TCP is off;
 `unix_socket_directories` is a mode-0700 directory owned by the measuring

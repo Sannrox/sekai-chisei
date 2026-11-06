@@ -3,11 +3,11 @@
 //! Seeds customer and order datasets that back an object type, runs a SQL
 //! transform, and prints the run receipt.
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::db::sekai::SekaiDb;
-use sekai_chisei::domain::Object;
-use sekai_chisei::sekai::dataset::{ColumnDef, Dataset};
-use sekai_chisei::sekai::governed_transform::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::db::sekai::SekaiDb;
+use sekai_core::domain::Object;
+use sekai_core::sekai::dataset::{ColumnDef, Dataset};
+use sekai_core::sekai::governed_transform::{
     AnalyticalSpec, CONTRACT_VERSION, GovernedTransform, TransformInput,
 };
 use std::collections::HashMap;

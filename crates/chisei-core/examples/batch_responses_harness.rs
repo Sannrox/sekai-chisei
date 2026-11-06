@@ -1,10 +1,8 @@
 #[allow(dead_code)]
-#[path = "../adapters/batch_responses_harness.rs"]
+#[path = "../../../adapters/batch_responses_harness.rs"]
 mod batch_responses_harness;
-#[allow(dead_code)]
-#[path = "../adapters/sdk.rs"]
-mod sdk;
 
+use sekai_adapters::sdk;
 use std::io::Read;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

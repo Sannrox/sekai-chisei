@@ -1,9 +1,5 @@
-#[path = "../adapters/http_health_poll.rs"]
-mod http_health_poll;
-#[path = "../adapters/sdk.rs"]
-mod sdk;
-
 use reqwest::header::ETAG;
+use sekai_adapters::{http_health_poll, sdk};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

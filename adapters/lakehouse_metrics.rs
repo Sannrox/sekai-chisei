@@ -1,6 +1,6 @@
 //! Domain-neutral metrics lakehouse adapter (#712).
 
-use sekai_chisei::sekai::lakehouse_snapshot::{
+use sekai_core::sekai::lakehouse_snapshot::{
     LAKEHOUSE_CONTRACT, LakehouseColumn, LakehousePartition, LakehouseRow, LakehouseSecurity,
     LakehouseSnapshot, PROFILE_METRICS, PROFILE_VERSION, SECURITY_CONTRACT,
 };

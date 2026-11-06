@@ -1,18 +1,8 @@
-#[path = "../adapters/github_check_webhook.rs"]
-mod github_check_webhook;
-#[path = "../adapters/http_health_poll.rs"]
-mod http_health_poll;
-#[path = "../adapters/ontology_concept_catalog.rs"]
-mod ontology_concept_catalog;
-#[allow(dead_code)]
-#[path = "../adapters/sdk.rs"]
-mod sdk;
-#[path = "../adapters/social_post_snapshot.rs"]
-mod social_post_snapshot;
-#[path = "../adapters/social_reply.rs"]
-mod social_reply;
-
 use sdk::AdapterConfig;
+use sekai_adapters::{
+    github_check_webhook, http_health_poll, ontology_concept_catalog, sdk, social_post_snapshot,
+    social_reply,
+};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -38,7 +28,7 @@ fn outbox(name: &str) -> PathBuf {
 
 #[test]
 fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
-    let input = include_bytes!("../adapters/fixtures/github_check_run.completed.json");
+    let input = include_bytes!("../../../adapters/fixtures/github_check_run.completed.json");
     let draft = github_check_webhook::translate(github_check_webhook::parse(input).unwrap())
         .expect("translate webhook");
     assert_eq!(draft.source_type, "github_check_run");
@@ -67,7 +57,7 @@ fn github_webhook_fixture_conforms_to_the_canonical_envelope() {
 
 #[test]
 fn github_same_second_updates_keep_distinct_source_identity() {
-    let input = include_bytes!("../adapters/fixtures/github_check_run.completed.json");
+    let input = include_bytes!("../../../adapters/fixtures/github_check_run.completed.json");
     let first = github_check_webhook::translate(github_check_webhook::parse(input).unwrap())
         .expect("translate webhook");
     let mut changed: serde_json::Value = serde_json::from_slice(input).unwrap();
@@ -83,7 +73,7 @@ fn github_same_second_updates_keep_distinct_source_identity() {
 
 #[test]
 fn health_poll_fixture_conforms_with_bounded_freshness() {
-    let input = include_bytes!("../adapters/fixtures/http_health.degraded.json");
+    let input = include_bytes!("../../../adapters/fixtures/http_health.degraded.json");
     let draft = http_health_poll::translate(
         http_health_poll::parse(input).unwrap(),
         "payments-health",
@@ -138,7 +128,7 @@ fn health_poll_fixture_conforms_with_bounded_freshness() {
 fn outbox_rejects_symlink_entries_without_changing_the_target() {
     use std::os::unix::fs::symlink;
 
-    let input = include_bytes!("../adapters/fixtures/http_health.degraded.json");
+    let input = include_bytes!("../../../adapters/fixtures/http_health.degraded.json");
     let draft = http_health_poll::translate(
         http_health_poll::parse(input).unwrap(),
         "payments-health",
@@ -181,7 +171,7 @@ fn outbox_rejects_symlink_entries_without_changing_the_target() {
 
 #[test]
 fn ontology_concept_catalog_fixture_conforms_to_the_canonical_envelope() {
-    let input = include_bytes!("../adapters/fixtures/ontology_concept_catalog.service.json");
+    let input = include_bytes!("../../../adapters/fixtures/ontology_concept_catalog.service.json");
     let draft =
         ontology_concept_catalog::translate(ontology_concept_catalog::parse(input).unwrap())
             .expect("translate concept catalog");
@@ -209,7 +199,7 @@ fn ontology_concept_catalog_fixture_conforms_to_the_canonical_envelope() {
 
 #[test]
 fn social_post_snapshot_fixture_conforms_to_the_canonical_envelope() {
-    let input = include_bytes!("../adapters/fixtures/social_post_snapshot.7d.json");
+    let input = include_bytes!("../../../adapters/fixtures/social_post_snapshot.7d.json");
     let draft = social_post_snapshot::translate(social_post_snapshot::parse(input).unwrap())
         .expect("translate social post snapshot");
     assert_eq!(draft.source_type, "social_observation_document");
@@ -241,7 +231,7 @@ fn social_post_snapshot_fixture_conforms_to_the_canonical_envelope() {
 
 #[test]
 fn social_reply_fixture_conforms_to_the_canonical_envelope() {
-    let input = include_bytes!("../adapters/fixtures/social_reply.sample.json");
+    let input = include_bytes!("../../../adapters/fixtures/social_reply.sample.json");
     let draft = social_reply::translate(social_reply::parse(input).unwrap())
         .expect("translate social reply");
     assert_eq!(draft.source_type, "social_observation_document");
@@ -265,7 +255,7 @@ fn social_reply_fixture_conforms_to_the_canonical_envelope() {
 #[test]
 fn social_adapters_reject_generated_digests_and_invalid_windows() {
     let mut snapshot: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../adapters/fixtures/social_post_snapshot.7d.json"
+        "../../../adapters/fixtures/social_post_snapshot.7d.json"
     ))
     .unwrap();
     snapshot["source_system"] = serde_json::json!("birdclaw_digest");
@@ -288,7 +278,7 @@ fn social_adapters_reject_generated_digests_and_invalid_windows() {
     );
 
     let mut reply: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../adapters/fixtures/social_reply.sample.json"
+        "../../../adapters/fixtures/social_reply.sample.json"
     ))
     .unwrap();
     reply["text"] = serde_json::json!("");
@@ -312,7 +302,7 @@ fn adapters_reject_malformed_source_inputs_before_submission() {
 
 #[test]
 fn conformance_profiles_reject_adapter_contract_drift() {
-    let input = include_bytes!("../adapters/fixtures/http_health.degraded.json");
+    let input = include_bytes!("../../../adapters/fixtures/http_health.degraded.json");
     let mut draft = http_health_poll::translate(
         http_health_poll::parse(input).unwrap(),
         "payments-health",

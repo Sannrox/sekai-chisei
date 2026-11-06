@@ -1,10 +1,10 @@
-#[path = "../adapters/warehouse_inventory.rs"]
+#[path = "../../../adapters/warehouse_inventory.rs"]
 mod warehouse_inventory;
-#[path = "../adapters/warehouse_orders.rs"]
+#[path = "../../../adapters/warehouse_orders.rs"]
 mod warehouse_orders;
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::warehouse_projection::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::sekai::warehouse_projection::{
     MODE_INCREMENTAL, MODE_SNAPSHOT, OUTCOME_EXPORTED, OUTCOME_REPLAYED, PROFILE_INVENTORY,
     PROFILE_ORDERS, STATUS_REVOKED, WAREHOUSE_UNAVAILABLE, WarehousePage, WarehouseRow,
     export_page, page_digest_for, register_projection, revoke_projection,
@@ -29,13 +29,14 @@ fn snapshot_page(projection_id: &str, rows: Vec<WarehouseRow>) -> WarehousePage 
 fn adapter_lifecycle(adapter_id: &str, projection_id: &str, rows: Vec<WarehouseRow>) {
     let db = RuntimeDb::memory();
     let projection = if adapter_id == PROFILE_ORDERS {
-        let document =
-            warehouse_orders::parse(include_bytes!("../adapters/fixtures/warehouse_orders.json"))
-                .unwrap();
+        let document = warehouse_orders::parse(include_bytes!(
+            "../../../adapters/fixtures/warehouse_orders.json"
+        ))
+        .unwrap();
         warehouse_orders::translate_projection(&document).unwrap()
     } else {
         let document = warehouse_inventory::parse(include_bytes!(
-            "../adapters/fixtures/warehouse_inventory.json"
+            "../../../adapters/fixtures/warehouse_inventory.json"
         ))
         .unwrap();
         warehouse_inventory::translate_projection(&document).unwrap()
@@ -82,14 +83,16 @@ fn adapter_lifecycle(adapter_id: &str, projection_id: &str, rows: Vec<WarehouseR
 #[test]
 fn two_adapter_fixtures_pass_snapshot_incremental_replay_revocation_and_scope() {
     let orders = warehouse_orders::translate_rows(
-        &warehouse_orders::parse(include_bytes!("../adapters/fixtures/warehouse_orders.json"))
-            .unwrap(),
+        &warehouse_orders::parse(include_bytes!(
+            "../../../adapters/fixtures/warehouse_orders.json"
+        ))
+        .unwrap(),
     )
     .unwrap();
     adapter_lifecycle(PROFILE_ORDERS, "wh:orders", orders);
     let inventory = warehouse_inventory::translate_rows(
         &warehouse_inventory::parse(include_bytes!(
-            "../adapters/fixtures/warehouse_inventory.json"
+            "../../../adapters/fixtures/warehouse_inventory.json"
         ))
         .unwrap(),
     )
@@ -99,9 +102,10 @@ fn two_adapter_fixtures_pass_snapshot_incremental_replay_revocation_and_scope() 
 
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut orders: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../adapters/fixtures/warehouse_orders.json"))
-            .unwrap();
+    let mut orders: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../adapters/fixtures/warehouse_orders.json"
+    ))
+    .unwrap();
     orders
         .as_object_mut()
         .unwrap()

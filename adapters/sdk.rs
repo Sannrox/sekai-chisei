@@ -1,8 +1,8 @@
 use chrono::DateTime;
 use prost::Message;
-use sekai_chisei::grpc::client::connect_sekai;
-use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use sekai_chisei::grpc::pb::sekai::{
+use sekai_admin_client::client::connect_sekai;
+use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_proto::sekai::{
     EvidenceCausality, EvidenceEnvelope, EvidenceRelationship, EvidenceSubmissionResult,
     SubmitEvidenceRequest,
 };

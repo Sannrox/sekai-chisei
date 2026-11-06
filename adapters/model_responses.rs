@@ -1,6 +1,6 @@
 //! Domain-neutral Responses model-platform adapter (#713).
 
-use sekai_chisei::sekai::model_platform::{
+use sekai_core::sekai::model_platform::{
     EVIDENCE_CONTRACT, MODEL_PLATFORM_CONTRACT, ModelCapabilityFixture, ModelFallbackFixture,
     ModelPlatformCertification, ModelProtocolFixtures, ModelReceiptFixture, ModelStreamingFixture,
     ModelUsageFixture, PROFILE_RESPONSES, PROFILE_VERSION,

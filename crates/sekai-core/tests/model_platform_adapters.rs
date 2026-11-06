@@ -1,10 +1,10 @@
-#[path = "../adapters/model_messages.rs"]
+#[path = "../../../adapters/model_messages.rs"]
 mod model_messages;
-#[path = "../adapters/model_responses.rs"]
+#[path = "../../../adapters/model_responses.rs"]
 mod model_responses;
 
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::model_platform::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::sekai::model_platform::{
     MODEL_UNAVAILABLE, PROFILE_MESSAGES, PROFILE_RESPONSES, STATUS_REVOKED, certify_model_platform,
     revoke_model_platform, verify_model_platform,
 };
@@ -13,14 +13,18 @@ fn adapter_lifecycle(adapter_id: &str) {
     let db = RuntimeDb::memory();
     let certification = if adapter_id == PROFILE_RESPONSES {
         model_responses::translate_certification(
-            &model_responses::parse(include_bytes!("../adapters/fixtures/model_responses.json"))
-                .unwrap(),
+            &model_responses::parse(include_bytes!(
+                "../../../adapters/fixtures/model_responses.json"
+            ))
+            .unwrap(),
         )
         .unwrap()
     } else {
         model_messages::translate_certification(
-            &model_messages::parse(include_bytes!("../adapters/fixtures/model_messages.json"))
-                .unwrap(),
+            &model_messages::parse(include_bytes!(
+                "../../../adapters/fixtures/model_messages.json"
+            ))
+            .unwrap(),
         )
         .unwrap()
     };
@@ -90,9 +94,10 @@ fn two_adapters_pass_deterministic_protocol_fixtures() {
 
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut responses: serde_json::Value =
-        serde_json::from_slice(include_bytes!("../adapters/fixtures/model_responses.json"))
-            .unwrap();
+    let mut responses: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../adapters/fixtures/model_responses.json"
+    ))
+    .unwrap();
     responses
         .as_object_mut()
         .unwrap()

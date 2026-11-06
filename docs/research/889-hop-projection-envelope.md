@@ -28,11 +28,11 @@ evaluator clones every matching path before aggregating; that work already
 misses at 10⁵. 10⁷ nested-loop is not runnable
 (O(|customers|·|orders|) then O(|paths|·|shipments|)).
 
-Harness: `cargo run --release --example object_type_index_hop_envelope -- --objects 100000`.
+Harness: `cargo run -p sekai-core --release --example object_type_index_hop_envelope -- --objects 100000`.
 
 ## #876 fixture at 10⁷ (throwaway membership tables)
 
-`cargo run --release --example object_index_envelope -- --objects 10000000 --plan compare`
+`cargo run -p sekai-core --release --example object_index_envelope -- --objects 10000000 --plan compare`
 
 | Plan | p95 two-hop | Count | vs 500 ms |
 | --- | ---: | ---: | --- |

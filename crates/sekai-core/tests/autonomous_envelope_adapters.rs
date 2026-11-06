@@ -1,11 +1,11 @@
-#[path = "../adapters/autonomy_evaluate.rs"]
+#[path = "../../../adapters/autonomy_evaluate.rs"]
 mod autonomy_evaluate;
-#[path = "../adapters/autonomy_simulate.rs"]
+#[path = "../../../adapters/autonomy_simulate.rs"]
 mod autonomy_simulate;
 
 use ed25519_dalek::Signer;
-use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::autonomous_envelope::{
+use sekai_core::db::runtime_db::RuntimeDb;
+use sekai_core::sekai::autonomous_envelope::{
     AUTONOMY_UNAVAILABLE, AutonomousEnvelope, PROFILE_EVALUATE, PROFILE_SIMULATE,
     RECEIPT_INVALIDATED, STATUS_LEASE_LOST, STATUS_ROLLED_BACK, STATUS_STOPPED, admit_envelope,
     envelope_digest_for, invalidate_receipt, note_lease_loss, rollback_envelope, stop_envelope,
@@ -34,7 +34,7 @@ fn adapter_lifecycle(adapter_id: &str) {
     let mut envelope = if adapter_id == PROFILE_SIMULATE {
         autonomy_simulate::translate_envelope(
             &autonomy_simulate::parse(include_bytes!(
-                "../adapters/fixtures/autonomy_simulate.json"
+                "../../../adapters/fixtures/autonomy_simulate.json"
             ))
             .unwrap(),
         )
@@ -42,7 +42,7 @@ fn adapter_lifecycle(adapter_id: &str) {
     } else {
         autonomy_evaluate::translate_envelope(
             &autonomy_evaluate::parse(include_bytes!(
-                "../adapters/fixtures/autonomy_evaluate.json"
+                "../../../adapters/fixtures/autonomy_evaluate.json"
             ))
             .unwrap(),
         )
@@ -82,7 +82,7 @@ fn lease_loss_and_receipt_invalidation_fail_closed() {
     let db = RuntimeDb::memory();
     let mut envelope = autonomy_simulate::translate_envelope(
         &autonomy_simulate::parse(include_bytes!(
-            "../adapters/fixtures/autonomy_simulate.json"
+            "../../../adapters/fixtures/autonomy_simulate.json"
         ))
         .unwrap(),
     )
@@ -115,7 +115,7 @@ fn lease_loss_and_receipt_invalidation_fail_closed() {
 #[test]
 fn hidden_fields_fail_closed() {
     let mut document: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../adapters/fixtures/autonomy_simulate.json"
+        "../../../adapters/fixtures/autonomy_simulate.json"
     ))
     .unwrap();
     document

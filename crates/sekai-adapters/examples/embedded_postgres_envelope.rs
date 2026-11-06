@@ -5,7 +5,7 @@
 //! `postgres:17-alpine` when `docker` is available. Not a runtime engine pick.
 //!
 //! ```text
-//! cargo run --release --example embedded_postgres_envelope
+//! cargo run -p sekai-adapters --release --example embedded_postgres_envelope
 //! ```
 
 use std::fs;

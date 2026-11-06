@@ -1,9 +1,4 @@
-#[path = "../adapters/ontology_concept_catalog.rs"]
-mod ontology_concept_catalog;
-#[allow(dead_code)]
-#[path = "../adapters/sdk.rs"]
-mod sdk;
-
+use sekai_adapters::{ontology_concept_catalog, sdk};
 use std::io::Read;
 
 #[tokio::main]

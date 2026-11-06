@@ -179,7 +179,7 @@ A scaler reads them as follows:
 The analytical profile runs SQL in a private in-memory SQLite connection
 (bundled rusqlite). Default bounds: 64 MiB and 5 seconds. Over-budget runs
 fail with `transform_budget_time` or `transform_budget_memory` and leave the
-previous output readable. Example: `cargo run --example analytical_transform`.
+previous output readable. Example: `cargo run -p sekai-core --example analytical_transform`.
 
 ## Shadow runs
 

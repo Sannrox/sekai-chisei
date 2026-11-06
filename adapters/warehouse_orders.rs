@@ -1,6 +1,6 @@
 //! Domain-neutral orders warehouse adapter (#711).
 
-use sekai_chisei::sekai::warehouse_projection::{
+use sekai_core::sekai::warehouse_projection::{
     PROFILE_ORDERS, PROFILE_VERSION, SECURITY_CONTRACT, WAREHOUSE_CONTRACT, WarehouseColumn,
     WarehouseCursor, WarehouseProjection, WarehouseRow, WarehouseSecurity,
 };

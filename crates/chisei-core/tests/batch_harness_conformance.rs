@@ -1,37 +1,35 @@
-#[path = "../adapters/batch_responses_harness.rs"]
+#[path = "../../../adapters/batch_responses_harness.rs"]
 mod batch_responses_harness;
-#[allow(dead_code)]
-#[path = "../adapters/sdk.rs"]
-mod sdk;
 
 use batch_responses_harness as batch;
+use sekai_adapters::sdk;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const FIXTURES: [(&str, &[u8]); 6] = [
     (
         "cancelled.sse",
-        include_bytes!("fixtures/responses/cancelled.sse"),
+        include_bytes!("../../../tests/fixtures/responses/cancelled.sse"),
     ),
     (
         "failed-partial.sse",
-        include_bytes!("fixtures/responses/failed-partial.sse"),
+        include_bytes!("../../../tests/fixtures/responses/failed-partial.sse"),
     ),
     (
         "fragmented-and-unknown.sse",
-        include_bytes!("fixtures/responses/fragmented-and-unknown.sse"),
+        include_bytes!("../../../tests/fixtures/responses/fragmented-and-unknown.sse"),
     ),
     (
         "incomplete.sse",
-        include_bytes!("fixtures/responses/incomplete.sse"),
+        include_bytes!("../../../tests/fixtures/responses/incomplete.sse"),
     ),
     (
         "interrupted.sse",
-        include_bytes!("fixtures/responses/interrupted.sse"),
+        include_bytes!("../../../tests/fixtures/responses/interrupted.sse"),
     ),
     (
         "multiple-tools.sse",
-        include_bytes!("fixtures/responses/multiple-tools.sse"),
+        include_bytes!("../../../tests/fixtures/responses/multiple-tools.sse"),
     ),
 ];
 
@@ -43,8 +41,10 @@ struct Manifest {
 
 #[test]
 fn headless_batch_harness_passes_the_canonical_corpus() {
-    let manifest: Manifest =
-        serde_json::from_slice(include_bytes!("fixtures/responses/manifest.json")).unwrap();
+    let manifest: Manifest = serde_json::from_slice(include_bytes!(
+        "../../../tests/fixtures/responses/manifest.json"
+    ))
+    .unwrap();
     assert_eq!(manifest.profile, batch::HARNESS_PROFILE);
     assert_eq!(manifest.fixtures.len(), FIXTURES.len());
     for (name, bytes) in FIXTURES {
@@ -55,8 +55,10 @@ fn headless_batch_harness_passes_the_canonical_corpus() {
         let result = batch::run_fixture(bytes).unwrap_or_else(|error| panic!("{name}: {error}"));
         assert!(result.terminal.starts_with("response.") || result.terminal.starts_with("chisei."));
     }
-    let tools =
-        batch::run_fixture(include_bytes!("fixtures/responses/multiple-tools.sse")).unwrap();
+    let tools = batch::run_fixture(include_bytes!(
+        "../../../tests/fixtures/responses/multiple-tools.sse"
+    ))
+    .unwrap();
     assert_eq!(tools.tool_calls.len(), 2);
     let first = &tools.tool_calls[&0];
     assert_eq!(first.item_id, "item_a");
@@ -65,7 +67,7 @@ fn headless_batch_harness_passes_the_canonical_corpus() {
     assert_eq!(first.output_index, 0);
     assert_eq!(first.arguments, r#"{"city":"Berlin"}"#);
     let forward = batch::run_fixture(include_bytes!(
-        "fixtures/responses/fragmented-and-unknown.sse"
+        "../../../tests/fixtures/responses/fragmented-and-unknown.sse"
     ))
     .unwrap();
     assert_eq!(forward.unknown_events, 1);
@@ -73,8 +75,10 @@ fn headless_batch_harness_passes_the_canonical_corpus() {
 
 #[test]
 fn batch_outcome_uses_shared_receipt_and_evidence_contracts() {
-    let result =
-        batch::run_fixture(include_bytes!("fixtures/responses/multiple-tools.sse")).unwrap();
+    let result = batch::run_fixture(include_bytes!(
+        "../../../tests/fixtures/responses/multiple-tools.sse"
+    ))
+    .unwrap();
     let receipt = batch::operation_receipt(
         &result,
         batch::BatchReceiptContext {
@@ -98,7 +102,7 @@ fn batch_outcome_uses_shared_receipt_and_evidence_contracts() {
         .events
         .iter()
         .find(|event| {
-            event.kind == sekai_chisei::chisei::receipt::ReceiptEventKind::VerificationRecorded
+            event.kind == chisei_core::chisei::receipt::ReceiptEventKind::VerificationRecorded
         })
         .unwrap();
     assert_eq!(verification.timestamp_ms, 200);
@@ -260,7 +264,10 @@ fn batch_harness_binds_response_identity_and_assembles_canonical_text_order() {
 
 #[test]
 fn ambiguous_terminals_do_not_become_verification_results() {
-    let result = batch::run_fixture(include_bytes!("fixtures/responses/interrupted.sse")).unwrap();
+    let result = batch::run_fixture(include_bytes!(
+        "../../../tests/fixtures/responses/interrupted.sse"
+    ))
+    .unwrap();
     assert!(batch::evidence(&result, "operation-interrupted", false, 200).is_err());
 
     let receipt = batch::operation_receipt(

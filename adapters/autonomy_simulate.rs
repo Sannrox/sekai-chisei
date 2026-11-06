@@ -1,6 +1,6 @@
 //! Domain-neutral simulation autonomy adapter (#715).
 
-use sekai_chisei::sekai::autonomous_envelope::{
+use sekai_core::sekai::autonomous_envelope::{
     AutonomousEnvelope, AutonomousPins, ENVELOPE_CONTRACT, PROFILE_SIMULATE, PROFILE_VERSION,
 };
 use serde::Deserialize;

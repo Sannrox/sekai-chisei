@@ -16,6 +16,7 @@ autotests = false
 members = [
     "crates/chisei-core",
     "crates/chisei-gateway",
+    "crates/sekai-adapters",
     "crates/sekai-admin-client",
     "crates/sekai-connector-template",
     "crates/sekai-client",
@@ -160,14 +161,6 @@ name = "it"
 path = "tests/it.rs"
 
 [[test]]
-name = "autonomous_envelope_adapters"
-path = "tests/autonomous_envelope_adapters.rs"
-
-[[test]]
-name = "batch_harness_conformance"
-path = "tests/batch_harness_conformance.rs"
-
-[[test]]
 name = "chisei_runtime_db_ratchet"
 path = "tests/chisei_runtime_db_ratchet.rs"
 
@@ -180,20 +173,8 @@ name = "epistemic_replication_example"
 path = "tests/epistemic_replication_example.rs"
 
 [[test]]
-name = "evidence_adapters"
-path = "tests/evidence_adapters.rs"
-
-[[test]]
 name = "gateway_cache_signals"
 path = "tests/gateway_cache_signals.rs"
-
-[[test]]
-name = "lakehouse_snapshot_adapters"
-path = "tests/lakehouse_snapshot_adapters.rs"
-
-[[test]]
-name = "model_platform_adapters"
-path = "tests/model_platform_adapters.rs"
 
 [[test]]
 name = "object_sync_adapters"
@@ -206,10 +187,6 @@ path = "tests/sekai_chisei_import_ratchet.rs"
 [[test]]
 name = "source_writeback_example"
 path = "tests/source_writeback_example.rs"
-
-[[test]]
-name = "warehouse_projection_adapters"
-path = "tests/warehouse_projection_adapters.rs"
 
 [[test]]
 name = "warehouse_table_ingest"

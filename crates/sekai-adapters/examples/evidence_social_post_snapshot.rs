@@ -1,8 +1,4 @@
-#[path = "../adapters/github_check_webhook.rs"]
-mod github_check_webhook;
-#[path = "../adapters/sdk.rs"]
-mod sdk;
-
+use sekai_adapters::{sdk, social_post_snapshot};
 use std::io::Read;
 
 #[tokio::main]
@@ -10,7 +6,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let config = sdk::AdapterConfig::from_env()?;
-    let draft = github_check_webhook::translate(github_check_webhook::parse(&input)?)?;
+    let draft = social_post_snapshot::translate(social_post_snapshot::parse(&input)?)?;
     let (envelope, outbox) =
         sdk::prepare_delivery(&config, draft, chrono::Utc::now().timestamp_millis())?;
     let result = sdk::submit(&config, envelope).await?;

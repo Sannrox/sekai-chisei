@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sekai_chisei::grpc::pb::sekai::{Link, Object};
+use sekai_proto::sekai::{Link, Object};
 
 fn main() {
     let (objects, links) = incident_response_graph();
