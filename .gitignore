@@ -17,7 +17,8 @@
 !.agents/skills/verify-change/
 !.agents/skills/technical-documentation/
 !.agents/skills/refactor-docs/
-.claude/
+.claude/*
+!.claude/skills
 data/*.db
 data/*.db-*
 data/*.sqlite
