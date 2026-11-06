@@ -71,6 +71,13 @@ pub struct RetentionPolicy {
     pub updated: i64,
 }
 
+impl RetentionPolicy {
+    /// Unix milliseconds before which this policy archives matching records.
+    pub fn cutoff_ms(&self, now: i64) -> i64 {
+        now - i64::from(self.retention_days) * DAY_MS
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionRun {
     pub audit_deleted: i32,
@@ -1359,14 +1366,23 @@ pub(crate) fn plan_audit_prefix(
     (prefix_end, !more)
 }
 
-fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
-    if !RETENTION_DATASETS.contains(&policy.dataset.as_str()) {
+/// Dataset names a retention policy may use, and a positive day count.
+pub fn validate_policy(policy: &RetentionPolicy) -> Result<(), String> {
+    validate_policy_dataset(&policy.dataset)?;
+    if policy.retention_days <= 0 {
+        return Err("retention_days must be positive".into());
+    }
+    Ok(())
+}
+
+pub fn validate_policy_dataset(dataset: &str) -> Result<(), String> {
+    if dataset.trim().is_empty() {
+        return Err("dataset is required".into());
+    }
+    if !RETENTION_DATASETS.contains(&dataset) {
         return Err(
             "dataset must be audit, llm_calls, task_observations, or content_events".into(),
         );
-    }
-    if policy.retention_days <= 0 {
-        return Err("retention_days must be positive".into());
     }
     Ok(())
 }
@@ -1604,6 +1620,27 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_retention_policy(
+        &self,
+        dataset: &str,
+        namespace: &str,
+        data_class: &str,
+    ) -> Result<(), String> {
+        validate_policy_dataset(dataset)?;
+        let conn = self.conn();
+        let deleted = conn
+            .execute(
+                "DELETE FROM sekai_retention_policies
+                 WHERE dataset = ?1 AND namespace = ?2 AND data_class = ?3",
+                params![dataset, namespace, data_class],
+            )
+            .map_err(|e| e.to_string())?;
+        if deleted == 0 {
+            return Err("retention policy not found".into());
+        }
+        Ok(())
     }
 
     pub fn erase_subject(
@@ -4359,9 +4396,18 @@ mod tests {
         };
         db.set_retention_policy(&policy).unwrap();
         assert_eq!(db.list_retention_policies().unwrap(), vec![policy.clone()]);
-        let mut invalid = policy;
+        assert_eq!(policy.cutoff_ms(365 * DAY_MS), 0);
+        let mut invalid = policy.clone();
         invalid.retention_days = 0;
         assert!(db.set_retention_policy(&invalid).is_err());
+        db.delete_retention_policy(&policy.dataset, &policy.namespace, &policy.data_class)
+            .unwrap();
+        assert!(db.list_retention_policies().unwrap().is_empty());
+        assert_eq!(
+            db.delete_retention_policy(&policy.dataset, &policy.namespace, &policy.data_class)
+                .unwrap_err(),
+            "retention policy not found"
+        );
     }
 
     #[test]

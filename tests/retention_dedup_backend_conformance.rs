@@ -231,9 +231,16 @@ fn exercise_policies(db: &dyn RetentionPolicyBackend, prefix: &str) {
     };
     db.set_retention_policy(&policy).unwrap();
     assert!(db.list_retention_policies().unwrap().contains(&policy));
-    let mut invalid = policy;
+    let mut invalid = policy.clone();
     invalid.retention_days = 0;
     assert!(db.set_retention_policy(&invalid).is_err());
+    db.delete_retention_policy(&policy.dataset, &policy.namespace, &policy.data_class)
+        .unwrap();
+    assert!(!db.list_retention_policies().unwrap().contains(&policy));
+    assert!(
+        db.delete_retention_policy(&policy.dataset, &policy.namespace, &policy.data_class)
+            .is_err()
+    );
 }
 
 fn exercise_subject_erasure(

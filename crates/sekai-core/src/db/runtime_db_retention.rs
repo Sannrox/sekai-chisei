@@ -20,6 +20,20 @@ impl RuntimeDb {
         }
     }
 
+    pub fn delete_retention_policy(
+        &self,
+        dataset: &str,
+        namespace: &str,
+        data_class: &str,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.delete_retention_policy(dataset, namespace, data_class),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_retention_policy(dataset, namespace, data_class)
+            }),
+        }
+    }
+
     pub fn erase_subject(
         &self,
         request: &SubjectErasureRequest,

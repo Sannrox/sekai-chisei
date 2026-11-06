@@ -9,6 +9,17 @@ use crate::sekai::retention::{
 pub trait RetentionPolicyBackend: Send + Sync {
     fn set_retention_policy(&self, policy: &RetentionPolicy) -> Result<(), String>;
     fn list_retention_policies(&self) -> Result<Vec<RetentionPolicy>, String>;
+    /// Default fails closed so adding this method is not a breaking trait change.
+    fn delete_retention_policy(
+        &self,
+        dataset: &str,
+        namespace: &str,
+        data_class: &str,
+    ) -> Result<(), String> {
+        Err(format!(
+            "delete_retention_policy is unimplemented for {dataset}/{namespace}/{data_class}"
+        ))
+    }
     fn erase_subject(
         &self,
         request: &SubjectErasureRequest,
@@ -26,6 +37,14 @@ macro_rules! forward {
         }
         fn list_retention_policies(&self) -> Result<Vec<RetentionPolicy>, String> {
             <$target>::list_retention_policies(self)
+        }
+        fn delete_retention_policy(
+            &self,
+            dataset: &str,
+            namespace: &str,
+            data_class: &str,
+        ) -> Result<(), String> {
+            <$target>::delete_retention_policy(self, dataset, namespace, data_class)
         }
         fn erase_subject(
             &self,

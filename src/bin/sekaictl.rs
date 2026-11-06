@@ -795,7 +795,10 @@ fn print_admin_usage() {
          Retention:\n\
            sekaictl admin retention status\n\
            sekaictl admin retention dry-run\n\
-           sekaictl admin retention run"
+           sekaictl admin retention run\n\
+           sekaictl admin retention policy list\n\
+           sekaictl admin retention policy set --dataset <name> --days <n>\n\
+           sekaictl admin retention policy delete --dataset <name>"
     );
 }
 

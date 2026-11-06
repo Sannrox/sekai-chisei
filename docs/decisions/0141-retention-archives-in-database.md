@@ -8,7 +8,7 @@
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0129](0129-scheduling-ownership.md),
-  [ADR 0130](0130-governed-export.md)
+  [ADR 0130](0130-governed-export.md), #2023
 
 ## Context
 
@@ -44,7 +44,8 @@ own.
    - a plane-owned retention tick under ADR 0129. Every replica may run it;
      a run is idempotent per dataset and cutoff, so no scheduler is elected
      and a run interrupted mid-way is safe to repeat;
-   - `sekaictl admin retention` for status, dry run and run-now.
+   - `sekaictl admin retention` for status, dry run, run-now, and policy
+     list, set and delete.
 
 ## Alternatives considered
 
@@ -67,13 +68,15 @@ own.
   ledger verification, and object changes, or records object changes as
   SQLite-only with a reason.
 - Archived data grows the operational database; operators size storage for
-  it or export and prune it through the governed export.
+  it. Exporting and pruning archive rows through the governed export
+  (ADR 0130) is follow-up; this surface does not delete archive rows.
 - `admin.retention` leaves the SQLite-only surface list once both backends
   pass the shared conformance suite.
 
 Follow-up work is tracked under #1788: shared archive tables and the entry
 point, PostgreSQL datasets, PostgreSQL ledger verification, PostgreSQL
-object changes, and the tick with `sekaictl admin retention`.
+object changes, and the tick with `sekaictl admin retention`. Exporting and
+pruning `sekai_archive_*` through the governed export remains follow-up.
 
 ## Validation
 
