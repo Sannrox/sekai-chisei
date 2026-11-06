@@ -9,9 +9,9 @@
 //! (Combined Split writes admission receipts onto the Sekai dest). Existing
 //! foreign-plane tables stay; populated ones refuse unless a relocate writer
 //! fence is already raised, so a missed relocation cannot hide. Known
-//! migration-seeded and historical Chisei-plane startup rows (default
-//! retention policies, `object_query_cursor_hmac`, `chisei-gateway`
-//! credentials) do not count as missed relocation.
+//! historical Chisei-plane startup rows (the former default retention
+//! policies, `object_query_cursor_hmac`, `chisei-gateway` credentials) do
+//! not count as missed relocation.
 
 use rusqlite::OptionalExtension;
 
@@ -198,10 +198,10 @@ pub fn reject_populated_foreign_postgres(
     Ok(())
 }
 
-/// Shared migrate used to insert these three global defaults into every dest,
-/// including Combined Split Chisei files. They are not operator data. A
-/// namespaced, day-changed, or otherwise custom policy still counts as
-/// missed relocation.
+/// Historical Shared migrate inserted these three global defaults into every
+/// dest, including Combined Split Chisei files. They are not operator data.
+/// New opens no longer seed them. A namespaced, day-changed, or otherwise
+/// custom policy still counts as missed relocation.
 const MIGRATION_SEEDED_RETENTION_POLICIES: [(&str, i64); 3] =
     [("audit", 365), ("llm_calls", 90), ("task_observations", 90)];
 
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn retention_seed_datasets_match_migrate_retention() {
+    fn historical_retention_seed_datasets_match_classifier() {
         assert_eq!(
             MIGRATION_SEEDED_RETENTION_POLICIES,
             [

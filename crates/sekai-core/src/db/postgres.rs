@@ -2544,6 +2544,14 @@ mod tests {
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn fresh_postgres_store_has_no_retention_policies() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        assert!(db.list_retention_policies().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
     fn dual_schema_postgres_opens_as_chisei_when_only_retention_seeds_exist() {
         let scratch = ScratchDatabase::create();
         let db = scratch.connect();

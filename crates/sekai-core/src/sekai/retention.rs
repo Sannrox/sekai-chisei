@@ -1557,20 +1557,8 @@ impl SekaiDb {
                 FOREIGN KEY(dataset,source_key) REFERENCES sekai_archive_records(dataset,source_key));",
         )
         .map_err(|e| e.to_string())?;
-        let now = chrono::Utc::now().timestamp_millis();
-        for (dataset, days) in [
-            (AUDIT_DATASET, 365),
-            (LLM_CALLS_DATASET, 90),
-            (TASK_OBSERVATIONS_DATASET, 90),
-        ] {
-            conn.execute(
-                "INSERT OR IGNORE INTO sekai_retention_policies
-                 (dataset, namespace, data_class, retention_days, updated)
-                 VALUES (?1, '', '', ?2, ?3)",
-                params![dataset, days, now],
-            )
-            .map_err(|e| e.to_string())?;
-        }
+        // No default policies. Both backends stay empty until an operator
+        // sets one; the minute tick then archives nothing (#2022).
         Ok(())
     }
 
@@ -4359,18 +4347,59 @@ mod tests {
     }
 
     #[test]
-    fn installs_bounded_defaults_and_validates_overrides() {
+    fn fresh_store_has_no_retention_policies_and_validates_overrides() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        assert!(db.list_retention_policies().unwrap().is_empty());
+        let policy = RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 365,
+            updated: 1,
+        };
+        db.set_retention_policy(&policy).unwrap();
+        assert_eq!(db.list_retention_policies().unwrap(), vec![policy.clone()]);
+        let mut invalid = policy;
+        invalid.retention_days = 0;
+        assert!(db.set_retention_policy(&invalid).is_err());
+    }
+
+    #[test]
+    fn archive_with_no_policies_moves_nothing() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let run = db.archive_retained_records(100 * DAY_MS, false).unwrap();
+        assert_eq!(run, ArchiveRun::default());
+    }
+
+    #[test]
+    fn previously_inserted_global_defaults_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-retention-upgrade-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        {
+            let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+            assert!(db.list_retention_policies().unwrap().is_empty());
+            db.conn()
+                .execute_batch(
+                    "INSERT INTO sekai_retention_policies
+                     (dataset, namespace, data_class, retention_days, updated)
+                     VALUES ('audit', '', '', 365, 1),
+                            ('llm_calls', '', '', 90, 1),
+                            ('task_observations', '', '', 90, 1);",
+                )
+                .unwrap();
+        }
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
         let policies = db.list_retention_policies().unwrap();
         assert_eq!(policies.len(), 3);
         assert!(
             policies
                 .iter()
-                .any(|p| p.dataset == AUDIT_DATASET && p.retention_days == 365)
+                .any(|policy| policy.dataset == AUDIT_DATASET && policy.retention_days == 365)
         );
-        let mut invalid = policies[0].clone();
-        invalid.retention_days = 0;
-        assert!(db.set_retention_policy(&invalid).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -5820,6 +5849,14 @@ mod tests {
             &[HashMap::from([("timestamp_ms".into(), "1".into())])],
         )
         .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
         db.archive_retained_records(100 * DAY_MS, false).unwrap();
         db.as_sqlite()
             .expect("sqlite")
@@ -5848,6 +5885,14 @@ mod tests {
             LLM_CALLS_DATASET,
             &[HashMap::from([("timestamp_ms".into(), "1".into())])],
         )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
         .unwrap();
         db.archive_retained_records(100 * DAY_MS, false).unwrap();
         db.as_sqlite()

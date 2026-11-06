@@ -134,8 +134,12 @@ Also preserve state files configured for provider registry lifecycle, gateway
 usage recovery, and durable receipt, usage, and refusal recovery. Test
 restore procedures, not only backup creation.
 
-Audit history is not purged automatically. Retention archives into tables in
-the operational database ([ADR 0141](decisions/0141-retention-archives-in-database.md)),
+Retention is opt-in. A fresh store on either backend has no policies, so the
+minute tick archives nothing until an operator sets one. Existing SQLite stores
+that already contain the former global defaults (`audit` 365 days, `llm_calls`
+90 days, `task_observations` 90 days) keep them; delete those rows if they were
+never intended. When a policy is set, retention archives into tables in the
+operational database ([ADR 0141](decisions/0141-retention-archives-in-database.md)),
 so the archive is backed up and replicated with it; size storage for it.
 `archive_retained_records` moves bounded batches (500 records per dataset per
 transaction) until nothing is left, so an interrupted run resumes; its dry run
@@ -147,12 +151,14 @@ key it with. Subject erasure reaches archived records by each dataset's
 hot-table rule, related objects and content references included: archived
 LLM calls and task observations the hot rule would delete are removed,
 object changes and content events are rewritten as in the hot tables, and
-attestations of an erased decision are removed. Content events are archived only once a `content_events`
-policy is set. Archive files written by earlier releases are kept as they
+attestations of an erased decision are removed. Audit history, LLM calls, task
+observations and content events are archived only once the matching policy is
+set. Archive files written by earlier releases are kept as they
 are and verify with `SekaiDb::verify_archive`; nothing is imported from them.
 Every Sekai plane instance runs a retention tick (ADR 0129): it calls
-`archive_retained_records` on a one-minute interval. Replicas do not elect a
-scheduler; an interrupted run resumes, and two ticks archive each record once.
+`archive_retained_records` on a one-minute interval. With no policy it writes
+nothing. Replicas do not elect a scheduler; an interrupted run resumes, and two
+ticks archive each record once.
 `sekaictl admin retention status` reports per-dataset counts and the last
 archive time; `dry-run` reports the counts without writing; `run` performs them.
 The same commands work on SQLite and PostgreSQL. On PostgreSQL decisions,
