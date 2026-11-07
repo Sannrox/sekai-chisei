@@ -1123,6 +1123,13 @@ impl tonic::service::Interceptor for LocalInterceptor {
     }
 }
 
+/// rustls 0.23 cannot auto-select a CryptoProvider when both `ring` (tonic
+/// `tls-ring`) and `aws-lc-rs` (reqwest `rustls-tls`) are linked. Install ring
+/// before `ServerTlsConfig` so gRPC TLS boot does not panic.
+fn install_rustls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, String)>, String> {
     let cert = config
         .tls_cert
@@ -1495,6 +1502,7 @@ where
 
     let mut server = Server::builder().layer(MetricsLayer);
     if let Some((cert, key)) = maybe_tls {
+        install_rustls_crypto_provider();
         let identity = Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
         server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
     }
@@ -3326,6 +3334,19 @@ mod tests {
         assert_eq!(credential.principal, "chisei-gateway");
 
         std::fs::remove_file(token_path).unwrap();
+    }
+
+    #[test]
+    fn tls_identity_config_does_not_panic_when_both_rustls_backends_are_linked() {
+        install_rustls_crypto_provider();
+        const CERT: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.pem");
+        const KEY: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.key");
+        let identity = Identity::from_pem(CERT, KEY);
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .expect("rustls CryptoProvider must be installed before ServerTlsConfig");
     }
 
     #[test]
