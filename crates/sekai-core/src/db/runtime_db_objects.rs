@@ -5,6 +5,8 @@ use super::*;
 
 impl RuntimeDb {
     pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
+        #[cfg(any(test, feature = "gateway-test-support"))]
+        source_batch_auth_counters::OBJECT_LOOKUPS.with(|c| c.set(c.get() + 1));
         match self {
             Self::Sqlite(db) => db.get_object(id),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.get_object(id)),

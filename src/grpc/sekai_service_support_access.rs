@@ -708,6 +708,12 @@ pub(super) fn evaluate_active_object_policy(
         _ => Some(false),
     })
 }
+#[derive(Clone, Copy)]
+pub(super) enum PolicyCache<'a> {
+    Fetch,
+    Resolved(Option<&'a crate::sekai::object_security::ObjectSecurityPolicy>),
+}
+
 pub(super) fn object_passes_security_policy(
     db: &RuntimeDb,
     object: &domain::Object,
@@ -715,6 +721,26 @@ pub(super) fn object_passes_security_policy(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+) -> Result<bool, Status> {
+    object_passes_security_policy_cached(
+        db,
+        object,
+        principals,
+        tenant_context,
+        operation,
+        purpose,
+        PolicyCache::Fetch,
+    )
+}
+
+fn object_passes_security_policy_cached(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    policy: PolicyCache<'_>,
 ) -> Result<bool, Status> {
     if is_reserved_governance_kind(&object.kind) {
         if let Some(actor) = tenant_context.and_then(|context| context.act.as_ref())
@@ -724,10 +750,49 @@ pub(super) fn object_passes_security_policy(
         }
         return object_passes_marking(db, object, principals);
     }
-    Ok(
-        decide_object_access(db, object, principals, tenant_context, operation, purpose)?.outcome
-            == crate::sekai::policy_decision::PolicyOutcome::Allow,
-    )
+    Ok(decide_object_access_cached(
+        db,
+        object,
+        principals,
+        tenant_context,
+        operation,
+        purpose,
+        policy,
+    )?
+    .outcome
+        == crate::sekai::policy_decision::PolicyOutcome::Allow)
+}
+
+/// Visibility after [`dataset_binding_after_access`] already passed team and
+/// ACL on this object. Skips those repeats; still applies tenant
+/// collaboration, markings, and object security.
+pub(super) fn dataset_object_visible_after_access(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    policy: PolicyCache<'_>,
+) -> bool {
+    !is_reserved_governance_kind(&object.kind)
+        && enforce_collaboration_namespace(db, tenant_context, &object.namespace, false).is_ok()
+        && collaboration_object_permitted(
+            db,
+            tenant_context,
+            object,
+            crate::enterprise::NamespaceAction::Read,
+        )
+        .unwrap_or(false)
+        && object_passes_marking(db, object, principals).unwrap_or(false)
+        && object_passes_security_policy_cached(
+            db,
+            object,
+            principals,
+            tenant_context,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            None,
+            policy,
+        )
+        .unwrap_or(false)
 }
 /// Refuse a write into `namespace` while a write freeze covers it, the acting
 /// principal, its delegator, or the acting or owning tenant.
@@ -819,24 +884,52 @@ pub(super) fn decide_object_access(
     operation: crate::sekai::object_security::ObjectSecurityOperation,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<crate::sekai::policy_decision::PolicyDecision, Status> {
-    let policy = match db.active_object_policy(&object.namespace, &object.kind) {
-        Ok(policy) => policy,
-        Err(error) if error.starts_with("object_security_denied") => {
-            return Ok(crate::sekai::policy_decision::PolicyDecision {
-                contract_version: crate::sekai::policy_decision::POLICY_DECISION_CONTRACT.into(),
-                namespace: object.namespace.clone(),
-                object_kind: object.kind.clone(),
-                object_id: object.id.clone(),
-                operation: operation.as_str().into(),
-                principal: principals.first().cloned().unwrap_or_default(),
-                principal_digest: String::new(),
-                activation_digest: String::new(),
-                policy_revision_digest: String::new(),
-                outcome: crate::sekai::policy_decision::PolicyOutcome::Deny,
-                denied_by: Some(crate::sekai::policy_decision::PolicyLayer::ObjectRow),
-            });
+    decide_object_access_cached(
+        db,
+        object,
+        principals,
+        tenant_context,
+        operation,
+        purpose,
+        PolicyCache::Fetch,
+    )
+}
+
+fn decide_object_access_cached(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    policy: PolicyCache<'_>,
+) -> Result<crate::sekai::policy_decision::PolicyDecision, Status> {
+    let fetched_policy;
+    let policy = match policy {
+        PolicyCache::Resolved(policy) => policy,
+        PolicyCache::Fetch => {
+            fetched_policy = match db.active_object_policy(&object.namespace, &object.kind) {
+                Ok(policy) => policy,
+                Err(error) if error.starts_with("object_security_denied") => {
+                    return Ok(crate::sekai::policy_decision::PolicyDecision {
+                        contract_version: crate::sekai::policy_decision::POLICY_DECISION_CONTRACT
+                            .into(),
+                        namespace: object.namespace.clone(),
+                        object_kind: object.kind.clone(),
+                        object_id: object.id.clone(),
+                        operation: operation.as_str().into(),
+                        principal: principals.first().cloned().unwrap_or_default(),
+                        principal_digest: String::new(),
+                        activation_digest: String::new(),
+                        policy_revision_digest: String::new(),
+                        outcome: crate::sekai::policy_decision::PolicyOutcome::Deny,
+                        denied_by: Some(crate::sekai::policy_decision::PolicyLayer::ObjectRow),
+                    });
+                }
+                Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+            };
+            fetched_policy.as_ref()
         }
-        Err(_) => return Err(Status::unavailable("object authorization unavailable")),
     };
     let lattice = load_classification_lattice(db, &object.namespace)?;
     let authority = resolve_principal_authority(db, principals)?;
@@ -852,9 +945,7 @@ pub(super) fn decide_object_access(
         None => "legacy".into(),
     };
     let purpose_authorization = match (
-        policy
-            .as_ref()
-            .and_then(|policy| policy.required_purpose.as_deref()),
+        policy.and_then(|policy| policy.required_purpose.as_deref()),
         purpose,
     ) {
         (Some(_), Some(presented))
@@ -887,7 +978,7 @@ pub(super) fn decide_object_access(
             context: &context,
             authority: &authority,
             lattice: lattice.as_ref(),
-            policy: policy.as_ref(),
+            policy,
             activation_digest: &activation_digest,
             purpose,
             purpose_authorization: purpose_authorization.as_ref(),
@@ -1665,13 +1756,24 @@ pub(super) fn check_dataset_access(
     dataset: &dataset::Dataset,
     write: bool,
 ) -> Result<(), Status> {
+    dataset_binding_after_access(db, security, principals, dataset, write).map(|_| ())
+}
+
+/// Loads the dataset binding once and applies team/ACL. `None` is unbound.
+pub(super) fn dataset_binding_after_access(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    dataset: &dataset::Dataset,
+    write: bool,
+) -> Result<Option<domain::Object>, Status> {
     if dataset.object_id.is_empty() {
         if is_managed_team_principal(db, principals)? {
             return Err(Status::permission_denied(
                 "team principals cannot access unbound global datasets",
             ));
         }
-        return Ok(());
+        return Ok(None);
     }
     let object = match db
         .get_object(&dataset.object_id)
@@ -1685,7 +1787,8 @@ pub(super) fn check_dataset_access(
         }
     };
     check_team_namespace(db, principals, &object.namespace, write)?;
-    check_object_acl(db, security, &object, principals, write)
+    check_object_acl(db, security, &object, principals, write)?;
+    Ok(Some(object))
 }
 
 /// The object ACL check. A scratch output (ADR 0138) is checked against its

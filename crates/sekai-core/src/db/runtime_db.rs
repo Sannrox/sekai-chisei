@@ -17,6 +17,7 @@ pub mod source_batch_auth_counters {
     thread_local! {
         pub static LOOKUP_QUERIES: Cell<usize> = const { Cell::new(0) };
         pub static POLICY_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+        pub static OBJECT_LOOKUPS: Cell<usize> = const { Cell::new(0) };
     }
 }
 

@@ -314,7 +314,7 @@ pub(super) async fn query_rows(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    authorize_dataset(
+    let access = authorize_dataset_access(
         service,
         &principals,
         tenant_context.as_ref(),
@@ -328,7 +328,7 @@ pub(super) async fn query_rows(
         limit: query.limit,
         offset: query.offset,
     };
-    if let Some(readable) = readable_columns(service, &dataset)? {
+    if let Some(readable) = readable_columns(service, &dataset, &access)? {
         restrict_row_query(&mut row_query, readable)?;
     }
     let rows = service
@@ -339,6 +339,13 @@ pub(super) async fn query_rows(
     Ok(Response::new(QueryRowsResponse {
         rows: rows.into_iter().map(|values| Row { values }).collect(),
     }))
+}
+
+/// Binding and policy resolved while authorizing a dataset RPC.
+struct DatasetAuthorization {
+    binding: Option<domain::Object>,
+    policy: Option<crate::sekai::object_security::ObjectSecurityPolicy>,
+    policy_resolved: bool,
 }
 
 /// The access decision of the dataset RPCs admitted for tenant credentials
@@ -357,25 +364,51 @@ fn authorize_dataset(
     dataset: &dataset::Dataset,
     write: bool,
 ) -> Result<(), Status> {
+    authorize_dataset_access(service, principals, tenant_context, dataset, write).map(|_| ())
+}
+
+fn authorize_dataset_access(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset: &dataset::Dataset,
+    write: bool,
+) -> Result<DatasetAuthorization, Status> {
     let db = service.db.runtime();
-    check_dataset_access(db, &service.security, principals, dataset, write)?;
+    let binding = dataset_binding_after_access(db, &service.security, principals, dataset, write)?;
     // request_tenant_context refuses an enterprise caller without a tenant.
     let Some(context) = tenant_context.filter(|context| context.tenant.is_some()) else {
-        return Ok(());
+        return Ok(DatasetAuthorization {
+            binding,
+            policy: None,
+            policy_resolved: false,
+        });
     };
     if context.guest_home_tenant().is_some() {
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
-    let object = match dataset.object_id.as_str() {
-        "" => None,
-        id => db.get_object(id).map_err(Status::internal)?,
-    }
-    .ok_or_else(|| Status::permission_denied("dataset has no namespace binding"))?;
+    let object = binding
+        .as_ref()
+        .ok_or_else(|| Status::permission_denied("dataset has no namespace binding"))?;
     enforce_namespace_tenant_context(db, Some(context), &object.namespace, write)?;
-    if !object_is_visible(db, &service.security, &object, principals, Some(context)) {
+    let policy = match db.active_object_policy(&object.namespace, &object.kind) {
+        Ok(policy) => policy,
+        Err(_) => return Err(Status::permission_denied("access denied")),
+    };
+    if !dataset_object_visible_after_access(
+        db,
+        object,
+        principals,
+        Some(context),
+        PolicyCache::Resolved(policy.as_ref()),
+    ) {
         return Err(Status::permission_denied("access denied"));
     }
-    Ok(())
+    Ok(DatasetAuthorization {
+        binding,
+        policy,
+        policy_resolved: true,
+    })
 }
 
 /// The columns any caller may read of a dataset's rows: `None` for all of
@@ -385,8 +418,9 @@ fn authorize_dataset(
 fn readable_columns(
     service: &SekaiServiceImpl,
     dataset: &dataset::Dataset,
+    access: &DatasetAuthorization,
 ) -> Result<Option<Vec<String>>, Status> {
-    match preview_column_allowlist(service, dataset)? {
+    match preview_column_allowlist_for(service, dataset, access)? {
         Some(readable) if readable.is_empty() => {
             Err(Status::permission_denied("column access denied"))
         }
@@ -478,14 +512,14 @@ pub(super) async fn get_dataset_version(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    authorize_dataset(
+    let access = authorize_dataset_access(
         service,
         &principals,
         tenant_context.as_ref(),
         &dataset,
         false,
     )?;
-    let readable = readable_columns(service, &dataset)?;
+    let readable = readable_columns(service, &dataset, &access)?;
     let (version, mut rows) = service
         .db
         .runtime()
@@ -517,7 +551,7 @@ pub(super) async fn rollback_dataset(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    authorize_dataset(
+    let access = authorize_dataset_access(
         service,
         &principals,
         tenant_context.as_ref(),
@@ -525,7 +559,7 @@ pub(super) async fn rollback_dataset(
         true,
     )?;
     // Decided before the rollback writes, so a refusal changes nothing.
-    let readable = readable_columns(service, &dataset)?;
+    let readable = readable_columns(service, &dataset, &access)?;
     let actor = principals
         .first()
         .cloned()
@@ -2567,8 +2601,9 @@ fn authorize_preview_inputs(
             .get_dataset(&dataset_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("dataset not found"))?;
-        authorize_dataset(service, principals, tenant_context, &dataset, false)?;
-        if let Some(allowed) = preview_column_allowlist(service, &dataset)? {
+        let access =
+            authorize_dataset_access(service, principals, tenant_context, &dataset, false)?;
+        if let Some(allowed) = preview_column_allowlist_for(service, &dataset, &access)? {
             column_allowlists.insert(dataset_id, allowed);
         }
     }
@@ -4201,29 +4236,59 @@ pub(super) fn preview_column_allowlist(
     service: &SekaiServiceImpl,
     dataset: &crate::sekai::dataset::Dataset,
 ) -> Result<Option<Vec<String>>, Status> {
+    preview_column_allowlist_for(
+        service,
+        dataset,
+        &DatasetAuthorization {
+            binding: None,
+            policy: None,
+            policy_resolved: false,
+        },
+    )
+}
+
+fn preview_column_allowlist_for(
+    service: &SekaiServiceImpl,
+    dataset: &crate::sekai::dataset::Dataset,
+    access: &DatasetAuthorization,
+) -> Result<Option<Vec<String>>, Status> {
     if dataset.object_id.is_empty() {
         return Ok(None);
     }
-    let Some(object) = service
-        .db
-        .runtime()
-        .get_object(&dataset.object_id)
-        .map_err(Status::internal)?
-    else {
-        return Ok(None);
+    let fetched_object;
+    let object = match access.binding.as_ref() {
+        Some(object) => object,
+        None => {
+            fetched_object = match service
+                .db
+                .runtime()
+                .get_object(&dataset.object_id)
+                .map_err(Status::internal)?
+            {
+                Some(object) => object,
+                None => return Ok(None),
+            };
+            &fetched_object
+        }
     };
-    let Some(policy) = service
-        .db
-        .runtime()
-        .active_object_policy(&object.namespace, &object.kind)
-        .map_err(|error| {
-            if error.starts_with("object_security_denied") {
-                Status::permission_denied("access denied")
-            } else {
-                Status::unavailable("object authorization unavailable")
-            }
-        })?
-    else {
+    let fetched_policy;
+    let policy = if access.policy_resolved {
+        access.policy.as_ref()
+    } else {
+        fetched_policy = service
+            .db
+            .runtime()
+            .active_object_policy(&object.namespace, &object.kind)
+            .map_err(|error| {
+                if error.starts_with("object_security_denied") {
+                    Status::permission_denied("access denied")
+                } else {
+                    Status::unavailable("object authorization unavailable")
+                }
+            })?;
+        fetched_policy.as_ref()
+    };
+    let Some(policy) = policy else {
         return Ok(None);
     };
     if !policy.property_grants_enforced() {
