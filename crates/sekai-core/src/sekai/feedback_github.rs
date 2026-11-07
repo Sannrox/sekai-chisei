@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::{ListFilter, Object};
+use crate::domain::Object;
 use crate::sekai::action_describe_preview::object_revision;
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
@@ -27,7 +27,9 @@ use crate::sekai::evidence_store::{
 use crate::sekai::execution_evidence::{
     EXECUTION_EVIDENCE_SCHEMA, EXECUTION_EVIDENCE_TYPE, ExecutionEvidence, ExecutionLifecycleState,
 };
-use crate::sekai::feedback_investigation::github_dispatch_permitted;
+use crate::sekai::feedback_investigation::{
+    eq_property, github_dispatch_permitted, list_feedback_objects,
+};
 use crate::sekai::feedback_package::{
     ACTION_EXTERNAL_ISSUE, KIND_EXTERNAL_ISSUE, KIND_FINDING, KIND_HYPOTHESIS,
     KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, PACKAGE_VERSION,
@@ -429,13 +431,7 @@ pub fn new_issues_today(issues: &[GitHubIssue], marker_prefix: &str, now_ms: i64
 
 /// Findings that may still need a create or an update, newest first per signature.
 pub fn qualifying_findings(db: &RuntimeDb, namespace: &str) -> Result<Vec<Object>, PublishError> {
-    let listed = db
-        .list_objects(&ListFilter {
-            kind: Some(KIND_FINDING.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
+    let listed = list_feedback_objects(db, namespace, KIND_FINDING, Vec::new())
         .map_err(PublishError::Internal)?;
     let mut by_signature: BTreeMap<String, Object> = BTreeMap::new();
     for finding in listed {
@@ -1136,17 +1132,30 @@ fn related_object(
     kind: &str,
     observation_id: &str,
 ) -> Result<Option<Object>, PublishError> {
-    let listed = db
-        .list_objects(&ListFilter {
-            kind: Some(kind.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
-        .map_err(PublishError::Internal)?;
-    Ok(listed.into_iter().find(|object| {
-        object.properties.get("observation_id").map(String::as_str) == Some(observation_id)
-    }))
+    let listed = list_feedback_objects(
+        db,
+        namespace,
+        kind,
+        vec![eq_property("observation_id", observation_id)],
+    )
+    .map_err(PublishError::Internal)?;
+    let mut fallback = None;
+    for object in listed {
+        if object.properties.get("observation_id").map(String::as_str) != Some(observation_id) {
+            continue;
+        }
+        let parses_analysis = object
+            .properties
+            .get("outcome")
+            .is_some_and(|raw| serde_json::from_str::<serde_json::Value>(raw).is_ok());
+        if parses_analysis {
+            return Ok(Some(object));
+        }
+        if fallback.is_none() {
+            fallback = Some(object);
+        }
+    }
+    Ok(fallback)
 }
 
 fn hypothesis_statements(
@@ -1154,14 +1163,13 @@ fn hypothesis_statements(
     namespace: &str,
     observation_id: &str,
 ) -> Result<Vec<String>, PublishError> {
-    let listed = db
-        .list_objects(&ListFilter {
-            kind: Some(KIND_HYPOTHESIS.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
-        .map_err(PublishError::Internal)?;
+    let listed = list_feedback_objects(
+        db,
+        namespace,
+        KIND_HYPOTHESIS,
+        vec![eq_property("observation_id", observation_id)],
+    )
+    .map_err(PublishError::Internal)?;
     Ok(listed
         .into_iter()
         .filter(|object| {
@@ -1859,6 +1867,32 @@ mod tests {
             mapping.properties.get("remote_id").map(String::as_str),
             Some("github:tenkai-org/tenkai#1")
         );
+    }
+
+    #[test]
+    fn draft_uses_analysis_when_a_newer_quality_stub_exists() {
+        let runtime = db();
+        let finding = qualifying_cluster(&runtime, "q", "api:timeout", "apply cannot finish", "");
+        let observation_id = finding.properties.get("observation_id").cloned().unwrap();
+        runtime
+            .create_object(&Object {
+                id: "fb-inv-quality-stub".into(),
+                kind: KIND_INVESTIGATION_RESULT.into(),
+                name: "quality".into(),
+                namespace: NAMESPACE.into(),
+                external_id: "fb-inv-quality-stub".into(),
+                properties: std::collections::HashMap::from([
+                    ("observation_id".into(), observation_id),
+                    ("outcome".into(), "quality-evaluation".into()),
+                    ("measured".into(), "true".into()),
+                ]),
+                created: 99_000,
+                updated: 99_000,
+            })
+            .unwrap();
+        let draft = draft_from_finding(&runtime, &finding, &target()).unwrap();
+        assert!(draft.managed_body.contains("apply cannot finish"));
+        assert!(draft.managed_body.contains("replay the same plan"));
     }
 
     #[test]

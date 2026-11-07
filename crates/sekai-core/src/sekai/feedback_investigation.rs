@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::{ListFilter, Object};
+use crate::domain::{ListFilter, Object, PropertyFilter};
 use crate::sekai::action_binding::ActionBinding;
 use crate::sekai::action_effect::{
     ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, EFFECT_STATUS_CLAIMED,
@@ -431,6 +431,30 @@ pub fn ack_investigation(
         .map_err(|error| InvestigateError::Internal(format!("{error:?}")))
 }
 
+pub(crate) fn eq_property(key: &str, value: &str) -> PropertyFilter {
+    PropertyFilter {
+        key: key.into(),
+        op: "eq".into(),
+        value: value.into(),
+    }
+}
+
+/// List every matching object in the namespace. Feedback recurrence, verify,
+/// and publish page past the public list cap so late ids stay visible.
+pub(crate) fn list_feedback_objects(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+    property_filters: Vec<PropertyFilter>,
+) -> Result<Vec<Object>, String> {
+    db.list_all_objects(&ListFilter {
+        kind: Some(kind.into()),
+        namespace: Some(namespace.into()),
+        property_filters,
+        ..ListFilter::default()
+    })
+}
+
 pub fn gather_cluster(
     db: &RuntimeDb,
     namespace: &str,
@@ -454,14 +478,13 @@ pub fn gather_cluster(
     let trigger = observation_view(&visible).ok_or_else(|| {
         InvestigateError::Internal("observation signature is hidden or missing".into())
     })?;
-    let listed = db
-        .list_objects(&ListFilter {
-            kind: Some(KIND_OBSERVATION.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
-        .map_err(InvestigateError::Internal)?;
+    let listed = list_feedback_objects(
+        db,
+        namespace,
+        KIND_OBSERVATION,
+        vec![eq_property("problem_signature", &trigger.problem_signature)],
+    )
+    .map_err(InvestigateError::Internal)?;
     let mut views = Vec::new();
     for object in listed {
         let projected = db
@@ -489,14 +512,13 @@ fn namespace_has_measured_reproduction(
     namespace: &str,
     signature: &str,
 ) -> Result<bool, InvestigateError> {
-    let results = db
-        .list_objects(&ListFilter {
-            kind: Some(KIND_INVESTIGATION_RESULT.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
-        .map_err(InvestigateError::Internal)?;
+    let results = list_feedback_objects(
+        db,
+        namespace,
+        KIND_INVESTIGATION_RESULT,
+        vec![eq_property("measured", "true")],
+    )
+    .map_err(InvestigateError::Internal)?;
     for object in results {
         if object.properties.get("measured").map(String::as_str) != Some("true") {
             continue;
@@ -1206,6 +1228,55 @@ mod tests {
             false,
         );
         assert_eq!(cluster.distinct_operations, ["op-1", "op-3"]);
+    }
+
+    fn seed_observation(
+        runtime: &RuntimeDb,
+        id: &str,
+        signature: &str,
+        occurrence: &str,
+        created_ms: i64,
+    ) {
+        runtime
+            .create_object(&Object {
+                id: id.into(),
+                kind: KIND_OBSERVATION.into(),
+                name: signature.into(),
+                namespace: NAMESPACE.into(),
+                external_id: id.into(),
+                properties: HashMap::from([
+                    ("problem_signature".into(), signature.into()),
+                    ("occurrence_ids".into(), occurrence.into()),
+                    ("classification".into(), "defect".into()),
+                    ("disposition".into(), "open".into()),
+                ]),
+                created: created_ms,
+                updated: created_ms,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn gather_cluster_sees_matching_observations_past_the_id_page() {
+        let runtime = db();
+        for index in 0..300 {
+            seed_observation(
+                &runtime,
+                &format!("a-{index:04}"),
+                "other:unrelated",
+                &format!("other-{index}"),
+                1_000,
+            );
+        }
+        seed_observation(&runtime, "z-1", "deploy:timeout", "deploy-op-1", 2_000);
+        seed_observation(&runtime, "z-2", "deploy:timeout", "deploy-op-2", 3_000);
+        seed_observation(&runtime, "z-3", "deploy:timeout", "deploy-op-3", 4_000);
+        let cluster = gather_cluster(&runtime, NAMESPACE, "z-3", 10_000).unwrap();
+        assert_eq!(cluster.distinct_operations.len(), 3);
+        assert_eq!(
+            cluster.distinct_operations,
+            ["deploy-op-1", "deploy-op-2", "deploy-op-3"]
+        );
     }
 
     #[test]

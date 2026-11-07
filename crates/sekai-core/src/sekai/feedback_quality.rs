@@ -11,12 +11,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::{ListFilter, Object};
+use crate::domain::Object;
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionRequest,
 };
 use crate::sekai::feedback_investigation::{
-    ObservationView, observation_view, parse_occurrence_ids, precludes_tenkai_defect,
+    ObservationView, list_feedback_objects, observation_view, parse_occurrence_ids,
+    precludes_tenkai_defect,
 };
 use crate::sekai::feedback_package::{
     ACTION_INVESTIGATION, ACTION_VERIFICATION, KIND_FINDING, KIND_INVESTIGATION_RESULT,
@@ -422,13 +423,7 @@ fn list_projected(
     namespace: &str,
     kind: &str,
 ) -> Result<Vec<Object>, QualityError> {
-    let listed = db
-        .list_objects(&ListFilter {
-            kind: Some(kind.into()),
-            namespace: Some(namespace.into()),
-            limit: 256,
-            ..ListFilter::default()
-        })
+    let listed = list_feedback_objects(db, namespace, kind, Vec::new())
         .map_err(|error| QualityError::Internal(error.to_string()))?;
     let mut out = Vec::new();
     for object in listed {
@@ -797,6 +792,7 @@ pub fn occurrence_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ListFilter;
     use crate::sekai::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
         EvidenceTarget, SchemaCompatibility,
