@@ -181,6 +181,18 @@ impl AgentTurn {
         self.status == CLAIMED && self.claim_expires_at_ms > now_ms
     }
 
+    /// The person this turn acts for, if a human requester admitted it.
+    /// Scheduled and change-driven turns have none.
+    pub fn requester(&self) -> Option<&str> {
+        match self.cause {
+            Cause::Manual => {
+                let actor = self.admitted_by.trim();
+                (!actor.is_empty()).then_some(actor)
+            }
+            Cause::Schedule | Cause::ObjectChange => None,
+        }
+    }
+
     fn claimable(&self, now_ms: i64) -> bool {
         self.due_at_ms <= now_ms
             && match self.status.as_str() {

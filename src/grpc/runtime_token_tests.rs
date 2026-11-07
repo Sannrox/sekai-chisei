@@ -236,6 +236,7 @@ fn forged(plane: &Plane, claimed: &crate::grpc::pb::sekai::ActionEffect) -> Runt
         audience: plane.authority.audience.clone(),
         subject: WORKER.into(),
         act: None,
+        worker: None,
         space: None,
         space_role: None,
         tenant_id: "tenant-a".into(),
@@ -380,8 +381,14 @@ fn token_admits_only_calls_for_its_claim() {
 }
 
 /// A site agent instance `line-<suffix>` in `ns-<suffix>`, acting as
-/// `agent:line-<suffix>`, with one pending manual turn.
+/// `agent:line-<suffix>`, with one pending manual turn admitted by `root`.
 fn seed_turn(plane: &Plane, suffix: &str) -> String {
+    seed_turn_admitted_by(plane, suffix, "root")
+}
+
+/// A site agent instance `line-<suffix>` in `ns-<suffix>`, acting as
+/// `agent:line-<suffix>`, with one pending manual turn admitted by `actor`.
+fn seed_turn_admitted_by(plane: &Plane, suffix: &str, actor: &str) -> String {
     let db = plane.service.db.runtime();
     // The instance's principal acts in its namespace, as its Actions do.
     db.ensure_team_namespace(
@@ -414,7 +421,7 @@ fn seed_turn(plane: &Plane, suffix: &str) -> String {
             cause_ref: format!("wake-{suffix}"),
             due_at_ms: 1,
         },
-        "root",
+        actor,
         1,
     )
     .unwrap()
@@ -477,11 +484,20 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
     )
     .unwrap();
     assert_eq!(claims.subject, "agent:line-a");
-    assert_eq!(claims.act.as_deref(), Some(TURN_WORKER));
+    assert_eq!(claims.act.as_deref(), Some("root"));
+    assert_eq!(claims.worker.as_deref(), Some(TURN_WORKER));
     assert_eq!(
         (claims.turn_id.as_str(), claims.effect_id.as_str()),
         (turn_id.as_str(), "")
     );
+    let context = authenticate(&plane, &claimed.runtime_token, "ListSiteAgentWorkingMemory")
+        .unwrap()
+        .extensions()
+        .get::<AuthenticatedContext>()
+        .cloned()
+        .unwrap();
+    assert_eq!(context.principal.subject, "agent:line-a");
+    assert_eq!(context.act.as_deref(), Some("root"));
 
     // Admitted only for the turn's follow-up calls, its submissions, and
     // the dual-principal read of its instance's live working memory.
@@ -510,7 +526,7 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
         );
     }
 
-    // A heartbeat renews it as the same principal and worker.
+    // A heartbeat renews it as the same principal, requester and worker.
     let renewed = plane
         .service
         .heartbeat_agent_turn_claim(with_token(
@@ -537,11 +553,145 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
     assert_eq!(
         (
             renewed_claims.subject.as_str(),
-            renewed_claims.act.as_deref()
+            renewed_claims.act.as_deref(),
+            renewed_claims.worker.as_deref()
         ),
-        ("agent:line-a", Some(TURN_WORKER))
+        ("agent:line-a", Some("root"), Some(TURN_WORKER))
     );
     assert_ne!(renewed_claims.jti, claims.jti);
+}
+
+#[tokio::test]
+async fn a_scheduled_turn_token_has_no_requester() {
+    let plane = plane();
+    let db = plane.service.db.runtime();
+    db.ensure_team_namespace("ns-a", "agent:line-a", Role::Admin, "root")
+        .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "line-a".into(),
+        kind: crate::sekai::site_agent_instance::KIND.into(),
+        name: "line-a".into(),
+        namespace: "ns-a".into(),
+        external_id: String::new(),
+        properties: HashMap::from([
+            ("principal_id".to_string(), "agent:line-a".into()),
+            ("frozen".to_string(), "false".to_string()),
+        ]),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    let turn_id = crate::sekai::agent_turn::admit(
+        db,
+        crate::sekai::agent_turn::Wake {
+            namespace: "ns-a".into(),
+            instance_id: "line-a".into(),
+            cause: crate::sekai::agent_turn::Cause::Schedule,
+            cause_ref: "schedule:60000@1".into(),
+            due_at_ms: 1,
+        },
+        "scheduler",
+        1,
+    )
+    .unwrap()
+    .turn_id;
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let claims = RuntimeTokenClaims::verify(
+        &plane.authority,
+        &claimed.runtime_token,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    assert_eq!(claims.subject, "agent:line-a");
+    assert_eq!(claims.act, None);
+    assert_eq!(claims.worker.as_deref(), Some(TURN_WORKER));
+    let context = authenticate(&plane, &claimed.runtime_token, "ListSiteAgentWorkingMemory")
+        .unwrap()
+        .extensions()
+        .get::<AuthenticatedContext>()
+        .cloned()
+        .unwrap();
+    assert_eq!(context.act, None);
+    assert_eq!(context.principal.subject, "agent:line-a");
+}
+
+/// On the turn-token path, dual-principal working-memory reads use the
+/// admitted requester, never the claiming worker. A credential-admin
+/// worker must not make the requester check a no-op.
+#[tokio::test]
+async fn a_turn_token_working_memory_read_uses_the_admitted_requester() {
+    use crate::sekai::security::Grant;
+    use crate::sekai::site_agent_memory as memory;
+
+    let plane = plane();
+    let turn_id = seed_turn_admitted_by(&plane, "a", "alice");
+    let db = plane.service.db.runtime();
+    memory::install(db, "ns-a", "root", 1).unwrap();
+    let (_, alice_grants) = db
+        .ensure_team_namespace("ns-a", "alice", Role::Editor, "root")
+        .unwrap();
+    for grant in &alice_grants {
+        plane.service.security.add_grant(grant);
+    }
+    let note = |id: &str| crate::domain::Object {
+        id: id.into(),
+        kind: memory::KIND.into(),
+        name: id.into(),
+        namespace: "ns-a".into(),
+        external_id: String::new(),
+        properties: HashMap::from([
+            (memory::INSTANCE_PROPERTY.into(), "line-a".into()),
+            (memory::CONTENT_PROPERTY.into(), id.into()),
+        ]),
+        created: 1,
+        updated: 1,
+    };
+    db.create_object(&note("note-open")).unwrap();
+    db.create_object(&note("note-mine")).unwrap();
+    let mine = Grant {
+        id: "grant-note-mine".into(),
+        object_id: "note-mine".into(),
+        principal: "agent:line-a".into(),
+        role: Role::Viewer,
+        created: 0,
+        ..Default::default()
+    };
+    db.create_grant(&mine).unwrap();
+    plane.service.security.add_grant(&mine);
+
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let claims = RuntimeTokenClaims::verify(
+        &plane.authority,
+        &claimed.runtime_token,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    assert_eq!(claims.act.as_deref(), Some("alice"));
+    assert_eq!(claims.worker.as_deref(), Some(TURN_WORKER));
+
+    let listed = plane
+        .service
+        .list_site_agent_working_memory(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "ListSiteAgentWorkingMemory",
+            crate::grpc::pb::sekai::ListSiteAgentWorkingMemoryRequest {
+                namespace: "ns-a".into(),
+                instance_id: "line-a".into(),
+                turn_id,
+                limit: 0,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut ids = listed
+        .items
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, ["note-open"]);
 }
 
 #[tokio::test]

@@ -1,7 +1,8 @@
 //! Agent-turn RPCs (ADR 0137, #1950). A manual wake needs administration of
 //! the instance's namespace; workers list, claim, heartbeat and acknowledge
 //! as credential admin or as a service principal registered as a turn
-//! worker, and a claim's runtime token acts for its turn (ADR 0142).
+//! worker, and a claim's runtime token acts for its turn (ADR 0142,
+//! ADR 0143).
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
@@ -291,6 +292,7 @@ impl SekaiServiceImpl {
             namespace: &turn.namespace,
             turn_id: &turn.turn_id,
             principal: &turn.principal_id,
+            requester: turn.requester(),
             runtime_id: &turn.claim_owner,
             claim_generation,
             claim_expires_at_ms: turn.claim_expires_at_ms,
@@ -302,9 +304,9 @@ impl SekaiServiceImpl {
         Ok((token, claims.expires_at_ms))
     }
 
-    /// A turn token renewed on heartbeat: the same turn, principal and
-    /// actor, expiring with the renewed claim and never after the authority
-    /// it was first minted with.
+    /// A turn token renewed on heartbeat: the same turn, principal,
+    /// requester and worker, expiring with the renewed claim and never
+    /// after the authority it was first minted with.
     fn refresh_turn_token(
         &self,
         claims: &RuntimeTokenClaims,
@@ -478,7 +480,7 @@ impl SekaiServiceImpl {
         )
         .map_err(turn_status)?;
         // A heartbeat with a turn token refreshes it as the token's own
-        // claim: its worker stays its actor (ADR 0142).
+        // claim: the same principal, requester and worker (ADR 0143).
         let (runtime_token, runtime_token_expires_at_ms) =
             match req.extensions().get::<RuntimeTokenClaims>() {
                 Some(claims) => self.refresh_turn_token(claims, &turn, now)?,

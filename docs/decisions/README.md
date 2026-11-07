@@ -168,4 +168,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0140: Object-set inputs for governed transforms](0140-object-set-transform-inputs.md)
 - [ADR 0141: Retention archives into database tables on both backends](0141-retention-archives-in-database.md)
 - [ADR 0142: Agent-turn workers carry the turn's authority, not their own](0142-agent-turn-worker-authority.md)
+- [ADR 0143: Runtime-token `act` is the delegating requester](0143-runtime-token-act-is-the-requester.md)
 <!-- adr-index:end -->

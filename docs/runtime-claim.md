@@ -98,13 +98,15 @@ tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
 using their own credential. Claim RPCs are now available to tenant-scoped
 credentials under the same namespace and tenant checks as other Action RPCs.
 
-Agent-turn claims mint the same kind of token (ADR 0142, #2005).
+Agent-turn claims mint the same kind of token (ADR 0142, ADR 0143, #2005).
 `ClaimAgentTurn` and `HeartbeatAgentTurnClaim` return `runtime_token` and
 `runtime_token_expires_at_ms` bound to the turn's namespace, turn, runtime and
 claim generation. `sekai-client` maps a claim onto `ClaimedAgentTurn` so the
 token and continuation are not dropped. DiscoverCapabilities advertises
-`sekai.agent_turn.runtime_token` and `sekai.agent_turn.parked`. The token acts as the instance's `principal_id`, with the
-claiming worker as its `act`, so both need access to the namespace. It
+`sekai.agent_turn.runtime_token` and `sekai.agent_turn.parked`. The token acts as the instance's `principal_id`. `act` is the person the
+turn acts for when a human requester admitted it, and is absent on scheduled
+and change-driven turns; the claiming worker is a distinct `worker` claim.
+Follow-up checks that bind agent and requester use `act`, never the worker. It
 authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn` and
 `SubmitActionInstance`, and only while the turn is claimed at that generation
 and its lease holds. A submission with it must name the turn's namespace and is
@@ -112,7 +114,7 @@ refused while the instance is frozen. Its admission records the turn and
 generation, and commits only while the turn is still claimed at that
 generation: a submission still in flight when another worker reclaims the
 turn is denied with a receipt instead of writing. A heartbeat made with the token renews
-it for the same principal and worker. The agent-turn worker RPCs are available
+it for the same principal, requester and worker. The agent-turn worker RPCs are available
 to tenant-scoped credentials under the same checks.
 
 Turn workers authenticate as credential admin (`root`, `local`) or as a

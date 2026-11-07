@@ -1,10 +1,12 @@
 //! Short-lived runtime tokens for claimed Action work (#1507, ADR 0099) and
-//! claimed agent turns (#2005, ADR 0142).
+//! claimed agent turns (#2005, ADR 0142, ADR 0143).
 //!
 //! A granted claim returns one token bound to the claiming principal, the
 //! runtime, the tenant and namespace of the work, the effect and the claim
 //! generation. A turn's token is bound to the turn instead, and acts as the
-//! turn's instance principal with the claiming worker as its actor. It expires no later than the claim, and the authentication
+//! turn's instance principal. `act` is the person the turn acts for, when a
+//! human requester admitted it; the claiming worker is a distinct `worker`
+//! claim. It expires no later than the claim, and the authentication
 //! boundary admits it only for the follow-up calls on that claim. It is sealed
 //! with the configured identity-assertion key under its own prefix and
 //! version, so it never verifies as an identity assertion or the reverse.
@@ -49,9 +51,15 @@ pub struct RuntimeTokenClaims {
     pub audience: String,
     /// Principal that claimed the work; follow-up calls act as it.
     pub subject: String,
-    /// Delegating actor of the claiming context, kept so it still narrows.
+    /// Delegating user the token acts for (ADR 0139, ADR 0143). On a turn
+    /// token this is the human requester who admitted the turn, absent for
+    /// scheduled and change-driven turns. Never the claiming worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<String>,
+    /// Claiming worker of a turn token (ADR 0143). Absent on Action-work
+    /// tokens, and from their encoding, so those tokens verify as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +92,8 @@ pub struct TurnBinding<'a> {
     pub turn_id: &'a str,
     /// The instance's principal, whom the token acts as.
     pub principal: &'a str,
+    /// Person the turn acts for; absent on scheduled and change-driven turns.
+    pub requester: Option<&'a str>,
     pub runtime_id: &'a str,
     pub claim_generation: u64,
     pub claim_expires_at_ms: i64,
@@ -119,6 +129,7 @@ impl RuntimeTokenClaims {
             audience: authority.audience.clone(),
             subject: context.principal.subject.clone(),
             act: context.act.clone(),
+            worker: None,
             space: context.space.clone(),
             space_role: context.space_role,
             tenant_id: tenant.tenant_id.clone(),
@@ -137,10 +148,11 @@ impl RuntimeTokenClaims {
         })
     }
 
-    /// Claims for an agent turn claimed by `context` (ADR 0142): the token
-    /// acts as the turn's instance principal, with the claiming worker as its
-    /// actor, under the worker's tenant. `None` where [`Self::for_claim`]
-    /// would mint none.
+    /// Claims for an agent turn claimed by `context` (ADR 0142, ADR 0143):
+    /// the token acts as the turn's instance principal, with `act` the
+    /// person the turn acts for when a human requester admitted it, and
+    /// `worker` the claiming worker, under the worker's tenant. `None`
+    /// where [`Self::for_claim`] would mint none.
     pub fn for_turn(
         authority: &AssertionAuthority,
         context: &AuthenticatedContext,
@@ -162,7 +174,17 @@ impl RuntimeTokenClaims {
         if turn.principal.trim().is_empty() || turn.turn_id.trim().is_empty() {
             return None;
         }
-        claims.act = Some(context.principal.subject.clone());
+        let worker = context.principal.subject.trim();
+        if worker.is_empty() {
+            return None;
+        }
+        // The worker's own `act` is not the person the turn acts for.
+        claims.act = turn
+            .requester
+            .map(str::trim)
+            .filter(|requester| !requester.is_empty())
+            .map(str::to_string);
+        claims.worker = Some(worker.to_string());
         claims.subject = turn.principal.into();
         claims.turn_id = turn.turn_id.into();
         // The worker's registration scopes the worker, not the principal.
@@ -262,8 +284,8 @@ impl RuntimeTokenClaims {
             && self.claim_generation == claim_generation
     }
 
-    /// The authenticated context follow-up calls run under: the claiming
-    /// principal, narrowed to the token's tenant, space and actor.
+    /// The authenticated context follow-up calls run under: the token's
+    /// subject, narrowed to the token's tenant, space and delegating user.
     pub fn authenticated_context(&self) -> AuthenticatedContext {
         AuthenticatedContext {
             contract_version: IDENTITY_EXTENSION_VERSION,
@@ -406,5 +428,65 @@ mod tests {
         assert!(!claims.covers("ns-a", "effect-b", "runner-a", 3));
         assert!(!claims.covers("ns-a", "effect-a", "runner-b", 3));
         assert!(!claims.covers("ns-a", "effect-a", "runner-a", 4));
+    }
+
+    fn turn_binding(requester: Option<&'static str>) -> TurnBinding<'static> {
+        TurnBinding {
+            namespace: "ns-a",
+            turn_id: "turn-a",
+            principal: "agent:line-a",
+            requester,
+            runtime_id: "runner-a",
+            claim_generation: 3,
+            claim_expires_at_ms: 5_000,
+        }
+    }
+
+    #[test]
+    fn a_turn_token_keeps_act_as_the_requester_and_names_the_worker_apart() {
+        let authority = authority();
+        let mut claiming = context(Some("t"));
+        claiming.act = Some("mallory".into());
+        let with_requester =
+            RuntimeTokenClaims::for_turn(&authority, &claiming, turn_binding(Some("alice")), 0)
+                .unwrap();
+        assert_eq!(with_requester.subject, "agent:line-a");
+        assert_eq!(with_requester.act.as_deref(), Some("alice"));
+        assert_eq!(with_requester.worker.as_deref(), Some("worker"));
+        assert_eq!(
+            with_requester.authenticated_context().act.as_deref(),
+            Some("alice")
+        );
+        let scheduled =
+            RuntimeTokenClaims::for_turn(&authority, &claiming, turn_binding(None), 0).unwrap();
+        assert_eq!(scheduled.act, None);
+        assert_eq!(scheduled.worker.as_deref(), Some("worker"));
+        assert_eq!(scheduled.authenticated_context().act, None);
+        assert_eq!(
+            scheduled.authenticated_context().principal.subject,
+            "agent:line-a"
+        );
+
+        let encoded = serde_json::to_value(&with_requester).unwrap();
+        assert_eq!(encoded["act"], "alice");
+        assert_eq!(encoded["worker"], "worker");
+        let action =
+            RuntimeTokenClaims::for_claim(&authority, &claiming, binding(5_000), 0).unwrap();
+        let action_encoded = serde_json::to_value(&action).unwrap();
+        assert!(action_encoded.get("worker").is_none());
+        assert_eq!(action_encoded["act"], "mallory");
+    }
+
+    #[test]
+    fn a_token_without_worker_still_verifies() {
+        let authority = authority();
+        let mut claims =
+            RuntimeTokenClaims::for_claim(&authority, &context(Some("t")), binding(5_000), 0)
+                .unwrap();
+        claims.worker = None;
+        let token = claims.sign(&authority).unwrap();
+        let verified = RuntimeTokenClaims::verify(&authority, &token, 0).unwrap();
+        assert_eq!(verified.worker, None);
+        assert_eq!(verified.act, None);
     }
 }
