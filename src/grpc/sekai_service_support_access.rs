@@ -556,7 +556,7 @@ fn namespace_object(db: &RuntimeDb, namespace: &str) -> Result<Option<domain::Ob
         .map_err(Status::internal)
 }
 
-fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Result<bool, Status> {
+pub(super) fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Result<bool, Status> {
     Ok(markings::deny_unmarked_enabled(
         markings::env_deny_unmarked(),
         markings::namespace_deny_unmarked(namespace_object(db, namespace)?.as_ref()),

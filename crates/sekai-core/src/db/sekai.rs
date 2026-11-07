@@ -937,6 +937,46 @@ impl SekaiDb {
         ).optional().map_err(|e| e.to_string())
     }
 
+    /// Keyed object load (`id IN (...)`) without ACL or row-policy SQL filters.
+    pub fn list_objects_by_ids(&self, ids: &[String]) -> Result<Vec<Object>, String> {
+        const MAX_IDS_PER_QUERY: usize = 500;
+        let mut ids = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut objects = Vec::with_capacity(ids.len());
+        let conn = self.conn();
+        for batch in ids.chunks(MAX_IDS_PER_QUERY) {
+            let placeholders = (1..=batch.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects WHERE id IN ({placeholders})"
+            );
+            let params = batch
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>();
+            let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params.as_slice(), row_to_object)
+                .map_err(|error| error.to_string())?;
+            objects.extend(
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(objects)
+    }
+
     pub fn get_object_with_policy_context(
         &self,
         id: &str,

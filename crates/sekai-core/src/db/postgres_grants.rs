@@ -106,6 +106,28 @@ impl PostgresDb {
         )
     }
 
+    /// Keyed grant load (`object_id = ANY($1)`) for a page of members.
+    pub fn list_grants_for_object_ids(&self, object_ids: &[String]) -> Result<Vec<Grant>, String> {
+        let mut object_ids = object_ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        object_ids.sort_unstable();
+        object_ids.dedup();
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.query_grants(
+            &format!(
+                "SELECT {GRANT_COLUMNS}
+                 FROM sekai_grants WHERE object_id = ANY($1)
+                 ORDER BY object_id, created, id"
+            ),
+            &[&object_ids],
+        )
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         self.query_grants(
             &format!("SELECT {GRANT_COLUMNS} FROM sekai_grants ORDER BY object_id, principal"),

@@ -32,7 +32,26 @@ const MAX_DIMENSIONS: usize = 8;
 const MAX_MEASURES: usize = 8;
 /// Rows one namespace may scan for one query.
 const MAX_ROWS_PER_NAMESPACE: i32 = 100_000;
+/// Member-keyed object and grant lookups are batched at the index page size.
+const FEDERATION_AUTH_PAGE: usize = 256;
 const FILTER_OPERATORS: &[&str] = &["eq", "gt", "gte", "lt", "lte"];
+
+/// Namespace-invariant object-access residual for one federation scan.
+struct FederationDecider {
+    /// `None` is an invalid active policy: every member is omitted.
+    compiled: Option<crate::sekai::policy_decision::CompiledObjectAccess>,
+    deny_unmarked: bool,
+    trusted: bool,
+}
+
+struct FederationMemberAuth<'a> {
+    decider: &'a FederationDecider,
+    principal: &'a [String],
+    schema: &'a schema::SchemaRegistry,
+    explicit_grants: &'a std::collections::HashSet<String>,
+    namespace: &'a str,
+    kind: &'a str,
+}
 
 /// Uniform values in the open interval (0, 1) from the operating system's
 /// generator: 53 uniform bits, offset by half a step so neither end is hit.
@@ -52,6 +71,54 @@ fn federation_principal(allowance_digest: &str) -> String {
     format!("federation:{allowance_digest}")
 }
 
+fn federation_snapshot(
+    member: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+    indexed_at_ms: i64,
+) -> domain::Object {
+    domain::Object {
+        id: member.object_id.clone(),
+        kind: member.kind.clone(),
+        name: member.source_key.clone(),
+        namespace: member.namespace.clone(),
+        external_id: member.source_key.clone(),
+        properties: member.properties.clone().into_iter().collect(),
+        created: indexed_at_ms,
+        updated: indexed_at_ms,
+    }
+}
+
+fn federation_policy_allows(decider: &FederationDecider, object: &domain::Object) -> bool {
+    let Some(compiled) = &decider.compiled else {
+        return false;
+    };
+    let decision = compiled.decide(object);
+    !matches!(
+        (decision.outcome, decision.denied_by),
+        (
+            crate::sekai::policy_decision::PolicyOutcome::Deny,
+            Some(layer)
+        ) if layer != crate::sekai::policy_decision::PolicyLayer::Marking
+    )
+}
+
+fn federation_marking_allows(
+    decider: &FederationDecider,
+    object: &domain::Object,
+    explicit_grants: &std::collections::HashSet<String>,
+) -> bool {
+    if crate::sekai::markings::object_marking_token(object).is_none() {
+        return crate::sekai::markings::unmarked_access_decision(
+            decider.deny_unmarked,
+            decider.trusted,
+            explicit_grants.contains(&object.id),
+        ) != crate::sekai::markings::MarkingDecision::Deny;
+    }
+    let Some(compiled) = &decider.compiled else {
+        return false;
+    };
+    compiled.decide(object).denied_by != Some(crate::sekai::policy_decision::PolicyLayer::Marking)
+}
+
 fn exclusion_name(reason: ExclusionReason) -> &'static str {
     match reason {
         ExclusionReason::NoAllowance => "no_allowance",
@@ -66,6 +133,7 @@ fn exclusion_name(reason: ExclusionReason) -> &'static str {
 }
 
 /// The request as the rules see it, with the filters to evaluate.
+#[derive(Clone)]
 struct ParsedQuery {
     query: Query,
     namespaces: Vec<String>,
@@ -295,7 +363,12 @@ impl SekaiServiceImpl {
             }
         }
 
-        let evaluated = self.evaluate_partials(&parsed, &covered);
+        let svc = self.clone();
+        let parsed_scan = parsed.clone();
+        let covered_scan = covered.clone();
+        let evaluated = self
+            .spawn_db(move || svc.evaluate_partials(&parsed_scan, &covered_scan))
+            .await;
         let partials = match evaluated {
             Ok((partials, changed)) => {
                 excluded.extend(changed);
@@ -587,11 +660,15 @@ impl SekaiServiceImpl {
         // Members are read whole, as the constrained object-set path reads
         // them: markings and row-policy inputs are often properties outside
         // the query, and authorization must see them. Rows take only the
-        // query's properties afterwards.
+        // query's properties afterwards. Authorization that depends only on
+        // (namespace, kind, principal) is compiled once; live objects and
+        // explicit grants are loaded per page.
+        let decider = self.compile_federation_decider(namespace, kind, &principal)?;
         let members =
-            self.scan_index_layer(namespace, kind, query, None, &mut meter, |member| {
-                self.federation_visible(
-                    member,
+            self.scan_index_layer_pages(namespace, kind, query, None, &mut meter, |page| {
+                self.federation_visible_page(
+                    page,
+                    &decider,
                     &principal,
                     (namespace, kind),
                     &schema,
@@ -622,6 +699,65 @@ impl SekaiServiceImpl {
         Ok(Some(rows_from_members(&parsed.query, members)))
     }
 
+    fn compile_federation_decider(
+        &self,
+        namespace: &str,
+        kind: &str,
+        principal: &[String],
+    ) -> Result<FederationDecider, Status> {
+        let runtime = self.db.runtime();
+        let policy = match runtime.active_object_policy(namespace, kind) {
+            Ok(policy) => policy,
+            Err(error) if error.starts_with("object_security_denied") => {
+                return Ok(FederationDecider {
+                    compiled: None,
+                    deny_unmarked: deny_unmarked_for_namespace(runtime, namespace)?,
+                    trusted: principal
+                        .iter()
+                        .any(|name| crate::sekai::markings::is_trusted_service_principal(name)),
+                });
+            }
+            Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+        };
+        let lattice = load_classification_lattice(runtime, namespace)?;
+        let authority = resolve_principal_authority(runtime, principal)?;
+        let context = principal_policy_context_from(principal, None);
+        let activation = runtime
+            .get_object_security_activation(namespace)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        let activation_digest = match activation.as_ref() {
+            Some(activation) => {
+                crate::sekai::object_security::object_security_activation_digest(activation)
+                    .unwrap_or_else(|_| "legacy".into())
+            }
+            None => "legacy".into(),
+        };
+        let compiled = crate::sekai::policy_decision::compile_object_access(
+            crate::sekai::policy_decision::PolicyCompileRequest {
+                namespace,
+                kind,
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                context: &context,
+                authority: &authority,
+                lattice: lattice.as_ref(),
+                policy: policy.as_ref(),
+                activation_digest: &activation_digest,
+                purpose: None,
+                purpose_authorization: None,
+                now_ms: now_millis(),
+                namespace_granted: true,
+            },
+        )
+        .map_err(Status::internal)?;
+        Ok(FederationDecider {
+            compiled: Some(compiled),
+            deny_unmarked: deny_unmarked_for_namespace(runtime, namespace)?,
+            trusted: principal
+                .iter()
+                .any(|name| crate::sekai::markings::is_trusted_service_principal(name)),
+        })
+    }
+
     /// The index member's snapshot, cell-projected, when the federation
     /// principal may read it. The snapshot is what enters the aggregate,
     /// so it is what is authorized: it must be of this namespace and type,
@@ -631,35 +767,109 @@ impl SekaiServiceImpl {
     /// stands in for namespace read; the object's ACL, row policy and
     /// markings decide as for any principal. A denial leaves the record
     /// out; an authorization outage fails.
-    fn federation_visible(
+    fn federation_visible_page(
         &self,
-        member: &crate::sekai::object_type_index::ObjectTypeIndexMember,
+        page: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
+        decider: &FederationDecider,
         principal: &[String],
         scope: (&str, &str),
         schema: &schema::SchemaRegistry,
         indexed_at_ms: i64,
-    ) -> Result<Option<domain::Object>, Status> {
+    ) -> Result<Vec<Option<domain::Object>>, Status> {
+        let mut visible = Vec::with_capacity(page.len());
+        for chunk in page.chunks(FEDERATION_AUTH_PAGE) {
+            visible.extend(self.federation_visible_chunk(
+                chunk,
+                decider,
+                principal,
+                scope,
+                schema,
+                indexed_at_ms,
+            )?);
+        }
+        Ok(visible)
+    }
+
+    fn federation_visible_chunk(
+        &self,
+        chunk: &[crate::sekai::object_type_index::ObjectTypeIndexMember],
+        decider: &FederationDecider,
+        principal: &[String],
+        scope: (&str, &str),
+        schema: &schema::SchemaRegistry,
+        indexed_at_ms: i64,
+    ) -> Result<Vec<Option<domain::Object>>, Status> {
         let (namespace, kind) = scope;
-        let snapshot = domain::Object {
-            id: member.object_id.clone(),
-            kind: member.kind.clone(),
-            name: member.source_key.clone(),
-            namespace: member.namespace.clone(),
-            external_id: member.source_key.clone(),
-            properties: member.properties.clone().into_iter().collect(),
-            created: indexed_at_ms,
-            updated: indexed_at_ms,
-        };
         let in_scope =
             |object: &domain::Object| object.namespace == namespace && object.kind == kind;
+        let snapshots = chunk
+            .iter()
+            .map(|member| federation_snapshot(member, indexed_at_ms))
+            .collect::<Vec<_>>();
+        let candidate_ids = snapshots
+            .iter()
+            .filter(|snapshot| in_scope(snapshot) && !is_reserved_governance_kind(&snapshot.kind))
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<Vec<_>>();
+        let live_by_id = self
+            .db
+            .runtime()
+            .list_objects_by_ids(&candidate_ids)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(|object| (object.id.clone(), object))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut grant_ids = Vec::new();
+        if decider.deny_unmarked {
+            for snapshot in &snapshots {
+                if crate::sekai::markings::object_marking_token(snapshot).is_none() {
+                    grant_ids.push(snapshot.id.clone());
+                }
+                if let Some(live) = live_by_id.get(&snapshot.id)
+                    && crate::sekai::markings::object_marking_token(live).is_none()
+                {
+                    grant_ids.push(live.id.clone());
+                }
+            }
+        }
+        let explicit_grants = self
+            .db
+            .runtime()
+            .list_grants_for_object_ids(&grant_ids)
+            .map_err(Status::internal)?
+            .into_iter()
+            .filter(|grant| principal.contains(&grant.principal))
+            .map(|grant| grant.object_id)
+            .collect::<std::collections::HashSet<_>>();
+        let auth = FederationMemberAuth {
+            decider,
+            principal,
+            schema,
+            explicit_grants: &explicit_grants,
+            namespace,
+            kind,
+        };
+        snapshots
+            .into_iter()
+            .map(|snapshot| {
+                let live = live_by_id.get(&snapshot.id).cloned();
+                self.federation_visible_member(snapshot, live, &auth)
+            })
+            .collect()
+    }
+
+    fn federation_visible_member(
+        &self,
+        snapshot: domain::Object,
+        live: Option<domain::Object>,
+        auth: &FederationMemberAuth<'_>,
+    ) -> Result<Option<domain::Object>, Status> {
+        let in_scope = |object: &domain::Object| {
+            object.namespace == auth.namespace && object.kind == auth.kind
+        };
         if !in_scope(&snapshot) || is_reserved_governance_kind(&snapshot.kind) {
             return Ok(None);
         }
-        let live = self
-            .db
-            .runtime()
-            .get_object(&member.object_id)
-            .map_err(Status::internal)?;
         if live.as_ref().is_some_and(|live| !in_scope(live)) {
             return Ok(None);
         }
@@ -673,7 +883,7 @@ impl SekaiServiceImpl {
             self.db.runtime(),
             &self.security,
             &snapshot.id,
-            principal,
+            auth.principal,
             None,
             crate::sekai::object_security::ObjectSecurityOperation::Read,
         ) {
@@ -682,44 +892,26 @@ impl SekaiServiceImpl {
             Err(status) => return Err(status),
         }
         for object in std::iter::once(&snapshot).chain(live.as_ref()) {
-            match evaluate_active_object_policy(
-                self.db.runtime(),
-                object,
-                principal,
-                None,
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                None,
-            ) {
-                Ok(Some(false)) => return Ok(None),
-                Ok(_) => {}
-                Err(status) if hidden(&status) => return Ok(None),
-                Err(status) => return Err(status),
+            if !federation_policy_allows(auth.decider, object) {
+                return Ok(None);
             }
-            match enforce_object_marking_access(
-                self.db.runtime(),
-                object,
-                principal,
-                "federated_aggregate",
-            ) {
-                Ok(_) => {}
-                Err(status) if hidden(&status) => return Ok(None),
-                Err(status) => return Err(status),
+            if !federation_marking_allows(auth.decider, object, auth.explicit_grants) {
+                return Ok(None);
             }
         }
         // Property and value-instance (cell) grants on the snapshot's own
         // values, as every read projects them: a hidden cell is absent, so
         // the record drops out of any group or measure that needs it.
         // Restricted properties are redacted as on every read.
-        let projected = self
-            .db
-            .runtime()
-            .project_object_property_grants(snapshot)
-            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        let mut projected = snapshot;
+        if let Some(compiled) = &auth.decider.compiled {
+            compiled.project(&mut projected);
+        }
         Ok(Some(redact_restricted_properties(
             projected,
-            schema,
+            auth.schema,
             &self.security,
-            principal,
+            auth.principal,
         )))
     }
 
@@ -1480,20 +1672,18 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
-    type ScanHook = Box<dyn Fn(&SekaiServiceImpl, &str)>;
+    type ScanHook = Box<dyn Fn(&SekaiServiceImpl, &str) + Send + Sync>;
 
-    thread_local! {
-        /// Run after a namespace's index scan, before its status is read again.
-        static AFTER_SCAN: std::cell::RefCell<Option<ScanHook>> =
-            const { std::cell::RefCell::new(None) };
-    }
+    /// Run after a namespace's index scan, before its status is read again.
+    /// Global so the hook still fires when the scan runs on the blocking pool.
+    static AFTER_SCAN: std::sync::Mutex<Option<ScanHook>> = std::sync::Mutex::new(None);
 
     pub(super) fn after_scan(svc: &SekaiServiceImpl, namespace: &str) {
-        AFTER_SCAN.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook(svc, namespace);
-            }
-        });
+        if let Ok(hook) = AFTER_SCAN.lock()
+            && let Some(hook) = hook.as_ref()
+        {
+            hook(svc, namespace);
+        }
     }
 
     /// A member read twice counts once, so it cannot lift a one-record
@@ -1535,8 +1725,12 @@ mod tests {
     #[tokio::test]
     async fn an_index_change_during_the_scan_excludes_the_namespace() {
         let svc = federation();
-        AFTER_SCAN.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(|svc: &SekaiServiceImpl, namespace: &str| {
+        let expected = std::sync::Arc::as_ptr(&svc.db.runtime_arc()) as usize;
+        *AFTER_SCAN.lock().unwrap() =
+            Some(Box::new(move |svc: &SekaiServiceImpl, namespace: &str| {
+                if std::sync::Arc::as_ptr(&svc.db.runtime_arc()) as usize != expected {
+                    return;
+                }
                 if namespace == "north" {
                     svc.db
                         .runtime()
@@ -1549,14 +1743,13 @@ mod tests {
                         .unwrap();
                 }
             }));
-        });
         let response = svc
             .federated_aggregate(as_principal(
                 request(&["north", "south"], vec![measure("count", "")]),
                 "analyst",
             ))
             .await;
-        AFTER_SCAN.with(|hook| *hook.borrow_mut() = None);
+        *AFTER_SCAN.lock().unwrap() = None;
         let response = response.unwrap().into_inner();
         assert_eq!(response.contributors, ["south"]);
         assert_eq!(
@@ -1753,5 +1946,59 @@ mod tests {
             .into_inner();
         assert!(response.groups.is_empty());
         assert_eq!(response.excluded[0].reason, "requester");
+    }
+
+    /// #2030: policy compile and activation stay flat per namespace while
+    /// member-keyed live-object lookups grow with pages of members.
+    #[test]
+    fn federation_auth_store_work_stays_flat_as_members_grow() {
+        use crate::db::runtime_db::source_batch_auth_counters::{OBJECT_LOOKUPS, POLICY_LOOKUPS};
+
+        fn count_for(n: usize) -> (usize, usize) {
+            let svc = service();
+            grant_namespace(&svc, "buyer", "analyst");
+            let keys: Vec<String> = (0..n).map(|i| format!("k{i:03}")).collect();
+            let rows: Vec<(&str, &str, &str)> =
+                keys.iter().map(|key| (key.as_str(), "eu", "1")).collect();
+            seed_shipments(&svc, "north", &rows);
+            allow(&svc, "north", 2, None);
+            let digest =
+                crate::sekai::federated_allowance::current(svc.db.runtime(), "north", "Shipment")
+                    .unwrap()
+                    .unwrap()
+                    .allowance_digest;
+            let parsed = parse_request(request(&["north"], vec![measure("count", "")])).unwrap();
+            POLICY_LOOKUPS.with(|c| c.set(0));
+            OBJECT_LOOKUPS.with(|c| c.set(0));
+            let rows = svc
+                .federated_rows("north", &parsed, &digest)
+                .unwrap()
+                .expect("index ready");
+            assert_eq!(rows.len(), n);
+            (
+                POLICY_LOOKUPS.with(|c| c.get()),
+                OBJECT_LOOKUPS.with(|c| c.get()),
+            )
+        }
+
+        let (policies_small, objects_small) = count_for(4);
+        let (policies_large, objects_large) = count_for(300);
+        assert_eq!(
+            policies_small, policies_large,
+            "policy compiles stay flat per namespace"
+        );
+        assert!(
+            policies_small <= 2,
+            "one active policy load per namespace, got {policies_small}"
+        );
+        assert_eq!(objects_small, 1, "one live-object batch for a short page");
+        assert!(
+            objects_large > objects_small,
+            "member-keyed batches grow with pages"
+        );
+        assert!(
+            objects_large < 300,
+            "live objects are batched, not loaded per member"
+        );
     }
 }
