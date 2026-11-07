@@ -1082,6 +1082,12 @@ mod tests {
         db
     }
 
+    /// Entailment retrieval otherwise inherits a 100ms wall-clock budget and
+    /// drops derived candidates when the thread is preempted.
+    fn unexpired_start() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
     fn reasoning_ontology() -> OntologyRegistry {
         OntologyRegistry::from_parts(
             vec![
@@ -1153,17 +1159,24 @@ mod tests {
         assert_eq!(asserted.candidates.len(), 1);
 
         let ontology = reasoning_ontology();
-        let entailed = retrieve_with_ontology(
+        let started = unexpired_start();
+        let entailed = retrieve_with_ontology_started(
             &db,
             &RetrievalQuery {
                 reasoning_mode: ReasoningMode::Entailment,
                 ..query
             },
             Some(&ontology),
+            started,
             |_| true,
             |_| false,
         )
         .unwrap();
+        assert!(
+            !entailed.truncation_reasons.contains(&"time".into()),
+            "entailment query timed out: {:?}",
+            entailed.truncation_reasons
+        );
         let component = entailed
             .candidates
             .iter()
@@ -1179,7 +1192,7 @@ mod tests {
         );
         assert_eq!(component.explanation.ontology_revision, ontology.revision());
 
-        let equivalent = retrieve_with_ontology(
+        let equivalent = retrieve_with_ontology_started(
             &db,
             &RetrievalQuery {
                 roots: vec![RetrievalRoot::Object("root".into())],
@@ -1189,6 +1202,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&ontology),
+            started,
             |_| true,
             |_| false,
         )
@@ -1202,7 +1216,7 @@ mod tests {
                     .any(|step| step.rule == "equivalence")
         }));
 
-        let directly_mapped = retrieve_with_ontology(
+        let directly_mapped = retrieve_with_ontology_started(
             &db,
             &RetrievalQuery {
                 roots: vec![RetrievalRoot::Object("root".into())],
@@ -1212,20 +1226,30 @@ mod tests {
                 ..Default::default()
             },
             Some(&ontology),
+            started,
             |_| true,
             |_| false,
         )
         .unwrap();
-        assert!(directly_mapped.candidates.iter().any(|candidate| {
-            candidate.object.id == "a"
-                && candidate
-                    .explanation
-                    .steps
-                    .iter()
-                    .any(|step| step.rule == "mapping")
-        }));
+        assert!(
+            directly_mapped.candidates.iter().any(|candidate| {
+                candidate.object.id == "a"
+                    && candidate
+                        .explanation
+                        .steps
+                        .iter()
+                        .any(|step| step.rule == "mapping")
+            }),
+            "expected mapped candidate a, got ids {:?} truncations {:?}",
+            directly_mapped
+                .candidates
+                .iter()
+                .map(|candidate| candidate.object.id.as_str())
+                .collect::<Vec<_>>(),
+            directly_mapped.truncation_reasons
+        );
 
-        let proof_bounded = retrieve_with_ontology(
+        let proof_bounded = retrieve_with_ontology_started(
             &db,
             &RetrievalQuery {
                 roots: vec![RetrievalRoot::Object("root".into())],
@@ -1236,6 +1260,7 @@ mod tests {
                 ..Default::default()
             },
             Some(&ontology),
+            started,
             |_| true,
             |_| false,
         )
