@@ -22,7 +22,10 @@ The tag must equal the workspace version in the root `Cargo.toml`
    `deploy/kubernetes/tenkai.toml`; its pin follows the version.
    On mismatch, `sekaictl admin compatibility check-tenkai` prints the
    block to paste, and CI refuses the bump until it matches.
-4. Land the version-bump pull request. The workspace version, CHANGELOG
+4. Run `python3 scripts/check-semver.py release`. It compares library crates
+   to the previous final `v*` tag and fails when cargo-semver-checks requires
+   a new major but the crate version did not major.
+5. Land the version-bump pull request. The workspace version, CHANGELOG
    heading, and Tenkai products move together.
 
 ## Tag

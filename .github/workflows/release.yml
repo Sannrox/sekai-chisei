@@ -15,6 +15,7 @@ on:
       - "scripts/release-sbom.py"
       - "scripts/release-package.sh"
       - "scripts/validate-release.sh"
+      - "scripts/check-semver.py"
       - "scripts/changelog-draft.sh"
       - "security/release-tag-key.asc"
       - "security/release-tag-fingerprints"
@@ -57,6 +58,13 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SHA"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: bash scripts/validate-release.sh
+      - uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        if: needs.verify-tag.outputs.tag != ''
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: Public API vs last final tag
+        if: needs.verify-tag.outputs.tag != ''
+        run: python3 scripts/check-semver.py release
 
   # Resolves the release commit every later job checks out. A tagged run must
   # come from main: main's verify-release-tag.sh and allowed keys verify the
