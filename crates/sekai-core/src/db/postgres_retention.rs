@@ -509,7 +509,7 @@ fn archive_retained_batch_on(
         tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
             .map_err(err)?;
         let verification =
-            crate::db::postgres_decision::verify_ledger_in(&mut tx, Some(prefix_end))?;
+            crate::db::postgres_decision::verify_ledger_in_through(&mut tx, Some(prefix_end))?;
         if !verification.ok {
             return Err(format!(
                 "audit ledger verification failed before retention: {}",

@@ -12,7 +12,7 @@ impl PostgresDb {
             .read_only(true)
             .start()
             .map_err(|error| error.to_string())?;
-        let verification = verify_ledger_in(&mut tx, None)?;
+        let verification = verify_ledger_in(&mut tx)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(verification)
     }
@@ -178,7 +178,9 @@ pub fn chain_head(client: &mut impl postgres::GenericClient) -> Result<(i64, Str
 
 /// Cheap forged/incomplete probes. Retention runs these before skipping the
 /// hash walk so a NULL `seq` that sorts last cannot hide a broken ledger.
-pub fn ledger_chain_metadata_ok(client: &mut impl postgres::GenericClient) -> Result<(), String> {
+pub(crate) fn ledger_chain_metadata_ok(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), String> {
     let anchor_seq: i64 = client
         .query_opt(
             "SELECT seq FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
@@ -217,13 +219,19 @@ pub fn ledger_chain_metadata_ok(client: &mut impl postgres::GenericClient) -> Re
 /// Verify the decision ledger as SQLite's `verify_ledger` does, with the
 /// same report: no row at or below the latest purge anchor, complete chain
 /// metadata, then from the anchor (or genesis) contiguous sequence numbers,
-/// previous-hash links and every entry hash. `through_seq` limits the walk
-/// to that prefix (retention verifies only the expired rows it will
-/// archive). Lifecycle classification is derived from the hashed evidence
-/// on PostgreSQL, so it cannot differ. Run it in one snapshot (a
-/// repeatable-read transaction, or one holding the ledger lock) so
-/// concurrent writes cannot split the walk.
+/// previous-hash links and every entry hash. Lifecycle classification is
+/// derived from the hashed evidence on PostgreSQL, so it cannot differ.
+/// Run it in one snapshot (a repeatable-read transaction, or one holding the
+/// ledger lock) so concurrent writes cannot split the walk.
 pub fn verify_ledger_in(
+    client: &mut impl postgres::GenericClient,
+) -> Result<ledger::LedgerVerification, String> {
+    verify_ledger_in_through(client, None)
+}
+
+/// Same as [`verify_ledger_in`], with `through_seq` limiting the walk to
+/// that prefix (retention verifies only the expired rows it will archive).
+pub(crate) fn verify_ledger_in_through(
     client: &mut impl postgres::GenericClient,
     through_seq: Option<i64>,
 ) -> Result<ledger::LedgerVerification, String> {
