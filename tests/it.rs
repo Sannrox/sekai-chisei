@@ -79,6 +79,7 @@ mod governed_fact_backend_conformance;
 mod governed_image_adr;
 mod governed_image_backend_conformance;
 mod graph_backend_conformance;
+mod grpc_tls_boot;
 mod guarded_mutation_backend_conformance;
 mod host_executor_permit_conformance;
 mod hosted_provider_smoke;
