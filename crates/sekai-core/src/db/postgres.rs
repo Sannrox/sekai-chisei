@@ -199,6 +199,8 @@ const SECURITY_REMEDIATION_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0139_security_remediation_identity.sql");
 const RETENTION_PREDICATE_INDEXES_SCHEMA: &str =
     include_str!("postgres/0140_retention_predicate_indexes.sql");
+const AGENT_TURN_CLAIM_INDEX_SCHEMA: &str =
+    include_str!("postgres/0141_agent_turn_claim_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1008,6 +1010,12 @@ const MIGRATIONS: &[Migration] = &[
         139,
         "retention_predicate_indexes",
         RETENTION_PREDICATE_INDEXES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        140,
+        "agent_turn_claim_index",
+        AGENT_TURN_CLAIM_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2791,6 +2799,23 @@ mod tests {
         assert!(
             RETENTION_PREDICATE_INDEXES_SCHEMA
                 .contains("ON sekai_content_events (created_at_ms, id)")
+        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+    }
+
+    #[test]
+    fn agent_turn_claim_index_skips_finished_history() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "agent_turn_claim_index")
+            .expect("agent_turn_claim_index");
+        assert_eq!(migration.version, 140);
+        assert!(matches!(migration.owner, MigrationOwner::Sekai));
+        assert!(AGENT_TURN_CLAIM_INDEX_SCHEMA.contains("sekai_agent_turn_claim"));
+        assert!(
+            AGENT_TURN_CLAIM_INDEX_SCHEMA
+                .contains("WHERE status IN ('pending', 'claimed', 'parked')")
         );
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
     }

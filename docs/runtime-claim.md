@@ -99,7 +99,10 @@ using their own credential. Claim RPCs are now available to tenant-scoped
 credentials under the same namespace and tenant checks as other Action RPCs.
 
 Agent-turn claims mint the same kind of token (ADR 0142, ADR 0143, #2005).
-`ClaimAgentTurn` and `HeartbeatAgentTurnClaim` return `runtime_token` and
+An empty `ClaimAgentTurn.turn_id` claims the next due turn in the namespace
+(pending, expired claims, and decided parks when the claimer accepts
+continuation); PostgreSQL skips rows locked by other workers so a herd does
+not serialize on the oldest row. `ClaimAgentTurn` and `HeartbeatAgentTurnClaim` return `runtime_token` and
 `runtime_token_expires_at_ms` bound to the turn's namespace, turn, runtime and
 claim generation. `sekai-client` maps a claim onto `ClaimedAgentTurn` so the
 token and continuation are not dropped. DiscoverCapabilities advertises

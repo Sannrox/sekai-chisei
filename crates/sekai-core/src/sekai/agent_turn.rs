@@ -632,6 +632,51 @@ pub fn claim_accepting_continuation(
     Ok(claimed)
 }
 
+/// Claims the next due turn in `namespace`. PostgreSQL uses `SKIP LOCKED` so
+/// concurrent workers do not wait on the same oldest row. An empty queue is
+/// [`TurnError::NotFound`]. Parked resumes share the same oldest-due pick as
+/// pending and expired claims when `accepts_continuation` is set.
+pub fn claim_next(
+    db: &RuntimeDb,
+    namespace: &str,
+    runtime_id: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    accepts_continuation: bool,
+) -> Result<AgentTurn, TurnError> {
+    if runtime_id.trim().is_empty() {
+        return Err(TurnError::Invalid("runtime_id required".into()));
+    }
+    let mut frozen = Vec::new();
+    let claimed = match db {
+        RuntimeDb::Sqlite(store) => store.claim_next_agent_turn(
+            namespace,
+            runtime_id,
+            ttl_ms,
+            now_ms,
+            accepts_continuation,
+            &mut frozen,
+        )?,
+        RuntimeDb::Postgres(store) => off_runtime(|| {
+            store.claim_next_agent_turn(
+                namespace,
+                runtime_id,
+                ttl_ms,
+                now_ms,
+                accepts_continuation,
+                &mut frozen,
+            )
+        })?,
+    };
+    for turn in frozen {
+        if refuse(db, &turn, runtime_id, &turn.reason, now_ms).is_err() {
+            continue;
+        }
+        let _ = retire(db, &turn.turn_id, &turn.reason, now_ms);
+    }
+    claimed.ok_or(TurnError::NotFound)
+}
+
 /// Extends the live claim. A lapsed or superseded claim is stale.
 pub fn heartbeat(
     db: &RuntimeDb,
@@ -825,6 +870,9 @@ CREATE INDEX IF NOT EXISTS sekai_agent_turn_queue
     ON sekai_agent_turn (status, due_at_ms);
 CREATE INDEX IF NOT EXISTS sekai_agent_turn_instance
     ON sekai_agent_turn (namespace, instance_id, created_at_ms DESC, turn_id DESC);
+CREATE INDEX IF NOT EXISTS sekai_agent_turn_claim
+    ON sekai_agent_turn (namespace, due_at_ms, turn_id)
+    WHERE status IN ('pending', 'claimed', 'parked');
 ";
 
 const COLUMNS: &str = "turn_id, namespace, instance_id, principal_id, cause, cause_ref, due_at_ms,
@@ -943,6 +991,261 @@ fn persist(conn: &rusqlite::Connection, turn: &AgentTurn) -> Result<(), TurnErro
         ],
     )?;
     Ok(())
+}
+
+enum InstanceCheck {
+    Ready,
+    Frozen(String),
+    Gone,
+}
+
+fn instance_check_sqlite(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    instance_id: &str,
+) -> Result<InstanceCheck, TurnError> {
+    let frozen: Option<Option<String>> = conn
+        .query_row(
+            "SELECT json_extract(properties, '$.frozen') FROM sekai_objects
+             WHERE id = ?1 AND kind = ?2 AND namespace = ?3",
+            params![instance_id, site_agent_instance::KIND, namespace],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match frozen {
+        None => InstanceCheck::Gone,
+        Some(Some(value)) if value == "true" => {
+            InstanceCheck::Frozen(format!("site agent instance {instance_id} is frozen"))
+        }
+        Some(_) => InstanceCheck::Ready,
+    })
+}
+
+fn instance_check_pg(
+    client: &mut impl postgres::GenericClient,
+    namespace: &str,
+    instance_id: &str,
+) -> Result<InstanceCheck, TurnError> {
+    let kind = site_agent_instance::KIND;
+    let row = client.query_opt(
+        "SELECT properties::jsonb ->> 'frozen' FROM sekai_objects
+         WHERE id = $1 AND kind = $2 AND namespace = $3",
+        &[&instance_id, &kind, &namespace],
+    )?;
+    Ok(match row {
+        None => InstanceCheck::Gone,
+        Some(row) => {
+            let frozen: Option<String> = row.get(0);
+            if frozen.as_deref() == Some("true") {
+                InstanceCheck::Frozen(format!("site agent instance {instance_id} is frozen"))
+            } else {
+                InstanceCheck::Ready
+            }
+        }
+    })
+}
+
+fn retire_unclaimed(turn: &mut AgentTurn, reason: &str, now_ms: i64) {
+    turn.status = REFUSED.into();
+    turn.reason = reason.into();
+    turn.finished_at_ms = now_ms;
+    turn.claim_expires_at_ms = 0;
+}
+
+fn assign_claim(
+    turn: &mut AgentTurn,
+    runtime_id: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> Result<(), TurnError> {
+    if turn.status == CLAIMED {
+        turn.lease_expiries += 1;
+        if turn.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
+            turn.status = FAILED.into();
+            turn.reason = LEASE_EXHAUSTED.into();
+            turn.finished_at_ms = now_ms;
+            turn.claim_expires_at_ms = 0;
+            return Err(TurnError::NotClaimable);
+        }
+    }
+    turn.status = CLAIMED.into();
+    turn.claim_owner = runtime_id.into();
+    turn.claim_generation += 1;
+    turn.fencing_token = uuid::Uuid::new_v4().to_string();
+    turn.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+    Ok(())
+}
+
+fn persist_pg(
+    client: &mut impl postgres::GenericClient,
+    turn: &AgentTurn,
+) -> Result<(), TurnError> {
+    client.execute(
+        "UPDATE sekai_agent_turn SET status = $2, claim_owner = $3, claim_generation = $4,
+             fencing_token = $5, claim_expires_at_ms = $6, lease_expiries = $7,
+             finished_at_ms = $8, reason = $9, parked_action_id = $10, park_count = $11
+         WHERE turn_id = $1",
+        &[
+            &turn.turn_id,
+            &turn.status,
+            &turn.claim_owner,
+            &turn.claim_generation,
+            &turn.fencing_token,
+            &turn.claim_expires_at_ms,
+            &turn.lease_expiries,
+            &turn.finished_at_ms,
+            &turn.reason,
+            &turn.parked_action_id,
+            &turn.park_count,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Pending, expired claims, and (when `$3`/`?3`) parks whose Action left
+/// `parked` or is gone. `skipped` ids were locked in this transaction but
+/// are not yet decided, so the next pick must not see them again.
+fn claim_next_predicate(skipped: usize, postgres: bool) -> String {
+    let (ns, now, accepts) = if postgres {
+        ("$1", "$2", "$3")
+    } else {
+        ("?1", "?2", "?3")
+    };
+    let exclude = if skipped == 0 {
+        String::new()
+    } else {
+        let list = (0..skipped)
+            .map(|i| {
+                if postgres {
+                    format!("${}", 4 + i)
+                } else {
+                    format!("?{}", 4 + i)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" AND turn_id NOT IN ({list})")
+    };
+    format!(
+        "namespace = {ns} AND due_at_ms <= {now}
+           AND (status = '{PENDING}'
+                OR (status = '{CLAIMED}' AND claim_expires_at_ms <= {now})
+                OR ({accepts} AND status = '{PARKED}'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM sekai_action_instances a
+                      WHERE a.instance_id = sekai_agent_turn.parked_action_id
+                        AND a.status = '{PARKED}'
+                    ))){exclude}"
+    )
+}
+
+enum NextPick {
+    Take,
+    Persist,
+    Skip,
+}
+
+fn next_pick_after_lock(
+    turn: &mut AgentTurn,
+    runtime_id: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    instance: InstanceCheck,
+    parked_decided: bool,
+    frozen: &mut Vec<AgentTurn>,
+) -> Result<NextPick, TurnError> {
+    match instance {
+        InstanceCheck::Ready => {}
+        InstanceCheck::Gone => {
+            retire_unclaimed(turn, "site agent instance is gone", now_ms);
+            return Ok(NextPick::Persist);
+        }
+        InstanceCheck::Frozen(message) => {
+            // Leave the row claimable in this transaction. refuse() after
+            // commit records the decision first; a failed ledger write must
+            // not leave a REFUSED turn the pick will never see again.
+            let mut frozen_turn = turn.clone();
+            frozen_turn.reason = message;
+            frozen.push(frozen_turn);
+            return Ok(NextPick::Skip);
+        }
+    }
+    if turn.is_parked() && !parked_decided {
+        return Ok(NextPick::Skip);
+    }
+    match assign_claim(turn, runtime_id, ttl_ms, now_ms) {
+        Ok(()) => Ok(NextPick::Take),
+        Err(TurnError::NotClaimable) => Ok(NextPick::Persist),
+        Err(error) => Err(error),
+    }
+}
+
+fn parked_action_row_decided(
+    row: Option<(String, String)>,
+    receipt_json: impl FnOnce(&str) -> Result<Option<String>, TurnError>,
+) -> Result<bool, TurnError> {
+    let Some((status, operation_id)) = row else {
+        return Ok(true);
+    };
+    if status == crate::sekai::action_instance::STATUS_PARKED {
+        return Ok(false);
+    }
+    if status == crate::sekai::action_instance::STATUS_DENIED {
+        return Ok(true);
+    }
+    let Some(json) = receipt_json(&operation_id)? else {
+        return Ok(false);
+    };
+    let receipt: sekai_domain::receipt::OperationReceipt = serde_json::from_str(&json)
+        .map_err(|error| TurnError::Internal(format!("corrupt operation receipt: {error}")))?;
+    Ok(receipt
+        .events
+        .iter()
+        .any(|event| event.kind == sekai_domain::receipt::ReceiptEventKind::ApprovalDecided))
+}
+
+fn parked_action_decided_on_sqlite(
+    conn: &rusqlite::Connection,
+    action_id: &str,
+) -> Result<bool, TurnError> {
+    let row = conn
+        .query_row(
+            "SELECT status, operation_id FROM sekai_action_instances WHERE instance_id = ?1",
+            params![action_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    parked_action_row_decided(row, |operation_id| {
+        conn.query_row(
+            "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id = ?1",
+            params![operation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(TurnError::from)
+    })
+}
+
+fn parked_action_decided_on_pg(
+    client: &mut impl postgres::GenericClient,
+    action_id: &str,
+) -> Result<bool, TurnError> {
+    let row = client
+        .query_opt(
+            "SELECT status, operation_id FROM sekai_action_instances WHERE instance_id = $1",
+            &[&action_id],
+        )?
+        .map(|row| Ok::<_, TurnError>((row.try_get::<_, String>(0)?, row.try_get::<_, String>(1)?)))
+        .transpose()?;
+    parked_action_row_decided(row, |operation_id| {
+        Ok(client
+            .query_opt(
+                "SELECT receipt_json FROM chisei_operation_receipts WHERE operation_id = $1",
+                &[&operation_id],
+            )?
+            .map(|row| row.try_get::<_, String>(0))
+            .transpose()?)
+    })
 }
 
 impl SekaiDb {
@@ -1125,6 +1428,65 @@ impl SekaiDb {
         persist(&tx, &turn)?;
         tx.commit()?;
         Ok(turn)
+    }
+
+    fn claim_next_agent_turn(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+        accepts_continuation: bool,
+        frozen: &mut Vec<AgentTurn>,
+    ) -> Result<Option<AgentTurn>, TurnError> {
+        self.migrate_action_instances()?;
+        let mut conn = self.conn();
+        // IMMEDIATE serializes writers, so a second claim_next waits instead of
+        // colliding on the oldest row. SKIP LOCKED is PostgreSQL-only.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut skipped: Vec<String> = Vec::new();
+        let accepts = if accepts_continuation { 1i64 } else { 0 };
+        loop {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM sekai_agent_turn
+                 WHERE {}
+                 ORDER BY due_at_ms, turn_id
+                 LIMIT 1",
+                claim_next_predicate(skipped.len(), false)
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &now_ms, &accepts];
+            for id in &skipped {
+                params.push(id);
+            }
+            let row = tx.query_row(&sql, params.as_slice(), map_turn).optional()?;
+            let Some(mut turn) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let instance = instance_check_sqlite(&tx, namespace, &turn.instance_id)?;
+            let parked_decided = if turn.is_parked() {
+                parked_action_decided_on_sqlite(&tx, &turn.parked_action_id)?
+            } else {
+                true
+            };
+            match next_pick_after_lock(
+                &mut turn,
+                runtime_id,
+                ttl_ms,
+                now_ms,
+                instance,
+                parked_decided,
+                frozen,
+            )? {
+                NextPick::Take => {
+                    persist(&tx, &turn)?;
+                    tx.commit()?;
+                    return Ok(Some(turn));
+                }
+                NextPick::Persist => persist(&tx, &turn)?,
+                NextPick::Skip => skipped.push(turn.turn_id),
+            }
+        }
     }
 
     /// `(queued, claimable, oldest claimable due time)`; see [`pool_gauge`].
@@ -1396,6 +1758,64 @@ impl PostgresDb {
         )?;
         tx.commit()?;
         Ok(turn)
+    }
+
+    fn claim_next_agent_turn(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+        accepts_continuation: bool,
+        frozen: &mut Vec<AgentTurn>,
+    ) -> Result<Option<AgentTurn>, TurnError> {
+        let mut connection = self.connection()?;
+        let mut tx = connection.transaction()?;
+        let mut skipped: Vec<String> = Vec::new();
+        loop {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM sekai_agent_turn
+                 WHERE {}
+                 ORDER BY due_at_ms, turn_id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 1",
+                claim_next_predicate(skipped.len(), true)
+            );
+            let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                vec![&namespace, &now_ms, &accepts_continuation];
+            for id in &skipped {
+                params.push(id);
+            }
+            let row = tx.query_opt(&sql, params.as_slice())?;
+            let Some(row) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let mut turn = pg_turn(&row)?;
+            let instance = instance_check_pg(&mut tx, namespace, &turn.instance_id)?;
+            let parked_decided = if turn.is_parked() {
+                parked_action_decided_on_pg(&mut tx, &turn.parked_action_id)?
+            } else {
+                true
+            };
+            match next_pick_after_lock(
+                &mut turn,
+                runtime_id,
+                ttl_ms,
+                now_ms,
+                instance,
+                parked_decided,
+                frozen,
+            )? {
+                NextPick::Take => {
+                    persist_pg(&mut tx, &turn)?;
+                    tx.commit()?;
+                    return Ok(Some(turn));
+                }
+                NextPick::Persist => persist_pg(&mut tx, &turn)?,
+                NextPick::Skip => skipped.push(turn.turn_id),
+            }
+        }
     }
 
     fn agent_turn_depth(&self, now_ms: i64) -> Result<(u64, u64, Option<i64>), TurnError> {
@@ -2020,10 +2440,203 @@ mod tests {
         assert!(parse_page_token("nope").is_err());
     }
 
+    fn claim_next_contract(db: &RuntimeDb, ns: &str) {
+        let line = seed(db, ns, "next", false);
+        let first = admit(db, wake(ns, &line, Cause::Schedule, "100"), "plane", 1).unwrap();
+        let second = admit(db, wake(ns, &line, Cause::Manual, "req-1"), "plane", 1).unwrap();
+        let done = admit(db, wake(ns, &line, Cause::Manual, "req-done"), "plane", 1).unwrap();
+        let held = claim(db, ns, "finisher", &done.turn_id, 1_000, 100).unwrap();
+        acknowledge(
+            db,
+            &done.turn_id,
+            "finisher",
+            held.claim_generation,
+            &held.fencing_token,
+            Outcome::Completed,
+            "done",
+            150,
+        )
+        .unwrap();
+        assert_eq!(list_claimable(db, ns, 100, 10).unwrap().len(), 2);
+
+        let a = claim_next(db, ns, "w1", 1_000, 100, true).unwrap();
+        let b = claim_next(db, ns, "w2", 1_000, 100, true).unwrap();
+        let mut claimed = vec![a.turn_id.clone(), b.turn_id.clone()];
+        claimed.sort();
+        let mut expected = vec![first.turn_id.clone(), second.turn_id.clone()];
+        expected.sort();
+        assert_eq!(claimed, expected);
+        assert_ne!(a.turn_id, b.turn_id);
+        assert_eq!(
+            claim_next(db, ns, "w3", 1_000, 100, true).unwrap_err(),
+            TurnError::NotFound
+        );
+        for held in [&a, &b] {
+            acknowledge(
+                db,
+                &held.turn_id,
+                &held.claim_owner,
+                held.claim_generation,
+                &held.fencing_token,
+                Outcome::Completed,
+                "done",
+                150,
+            )
+            .unwrap();
+        }
+
+        let later = admit(db, wake(ns, &line, Cause::Manual, "req-2"), "plane", 1).unwrap();
+        let live = claim_next(db, ns, "w4", 1_000, 100, true).unwrap();
+        assert_eq!(live.turn_id, later.turn_id);
+        assert_eq!(
+            claim_next(db, ns, "w5", 1_000, 100, true).unwrap_err(),
+            TurnError::NotFound,
+            "a live claim is not taken"
+        );
+        let taken = claim_next(db, ns, "w6", 1_000, 1_200, true).unwrap();
+        assert_eq!(taken.turn_id, later.turn_id);
+        assert!(taken.claim_generation > live.claim_generation);
+    }
+
+    fn park_turn(db: &RuntimeDb, ns: &str, turn: &AgentTurn, tag: &str, at: i64) -> String {
+        let held = claim(db, ns, "runner-a", &turn.turn_id, 1_000, at).unwrap();
+        let action = parked_action(db, ns, &held, tag);
+        park(
+            db,
+            &turn.turn_id,
+            &held.claim_owner,
+            held.claim_generation,
+            &held.fencing_token,
+            &action,
+            "awaiting approval",
+            at,
+        )
+        .unwrap();
+        action
+    }
+
+    /// Decided parks share oldest-due with pending wakes; awaiting parks do
+    /// not starve them; a gone instance's park is retired so the next park
+    /// is taken; `accepts_continuation = false` skips parks.
+    fn claim_next_park_order_contract(db: &RuntimeDb, ns: &str) {
+        let await_line = seed(db, ns, "await", false);
+        let park_line = seed(db, ns, "park", false);
+        let wake_line = seed(db, ns, "wake", false);
+        let gone_line = seed(db, ns, "gone", false);
+        let later_park_line = seed(db, ns, "later-park", false);
+
+        let awaiting = admit(
+            db,
+            Wake {
+                due_at_ms: 50,
+                ..wake(ns, &await_line, Cause::Manual, "await")
+            },
+            "plane",
+            1,
+        )
+        .unwrap();
+        park_turn(db, ns, &awaiting, "await", 50);
+
+        let early_park = admit(
+            db,
+            Wake {
+                due_at_ms: 100,
+                ..wake(ns, &park_line, Cause::Manual, "early")
+            },
+            "plane",
+            1,
+        )
+        .unwrap();
+        let early_action = park_turn(db, ns, &early_park, "early", 100);
+        decide(db, &early_action, "admitted");
+
+        let pending = admit(
+            db,
+            Wake {
+                due_at_ms: 200,
+                ..wake(ns, &wake_line, Cause::Manual, "wake")
+            },
+            "plane",
+            1,
+        )
+        .unwrap();
+
+        let taken = claim_next(db, ns, "w1", 1_000, 300, true).unwrap();
+        assert_eq!(taken.turn_id, early_park.turn_id);
+        assert_eq!(taken.parked_action_id, early_action);
+        acknowledge(
+            db,
+            &taken.turn_id,
+            &taken.claim_owner,
+            taken.claim_generation,
+            &taken.fencing_token,
+            Outcome::Completed,
+            "done",
+            301,
+        )
+        .unwrap();
+
+        let skipped = claim_next(db, ns, "w2", 1_000, 300, false).unwrap();
+        assert_eq!(
+            skipped.turn_id, pending.turn_id,
+            "a claimer that refuses continuation takes the pending wake"
+        );
+        acknowledge(
+            db,
+            &skipped.turn_id,
+            &skipped.claim_owner,
+            skipped.claim_generation,
+            &skipped.fencing_token,
+            Outcome::Completed,
+            "done",
+            301,
+        )
+        .unwrap();
+
+        let gone_park = admit(
+            db,
+            Wake {
+                due_at_ms: 400,
+                ..wake(ns, &gone_line, Cause::Manual, "gone")
+            },
+            "plane",
+            1,
+        )
+        .unwrap();
+        let gone_action = park_turn(db, ns, &gone_park, "gone", 400);
+        decide(db, &gone_action, "admitted");
+        db.delete_object(&gone_line).unwrap();
+
+        let later_park = admit(
+            db,
+            Wake {
+                due_at_ms: 500,
+                ..wake(ns, &later_park_line, Cause::Manual, "later")
+            },
+            "plane",
+            1,
+        )
+        .unwrap();
+        let later_action = park_turn(db, ns, &later_park, "later", 500);
+        decide(db, &later_action, "admitted");
+
+        let drained = claim_next(db, ns, "w3", 1_000, 600, true).unwrap();
+        assert_eq!(
+            drained.turn_id, later_park.turn_id,
+            "a gone instance's park is retired so the next park is taken"
+        );
+        assert_eq!(
+            get(db, &gone_park.turn_id).unwrap().unwrap().status,
+            REFUSED
+        );
+    }
+
     #[test]
     fn sqlite_turns_follow_the_contract() {
         turn_contract(&RuntimeDb::memory(), "site");
         instance_history(&RuntimeDb::memory(), "site");
+        claim_next_contract(&RuntimeDb::memory(), "site");
+        claim_next_park_order_contract(&RuntimeDb::memory(), "site");
     }
 
     #[test]
@@ -2043,6 +2656,33 @@ mod tests {
         let ns = format!("turns-{}-{}", std::process::id(), uuid::Uuid::new_v4());
         turn_contract(&db, &ns);
         instance_history(&db, &ns);
+        claim_next_contract(&db, &ns);
+        let parks = format!("next-parks-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        claim_next_park_order_contract(&db, &parks);
+    }
+
+    #[test]
+    fn claim_next_retires_a_frozen_instance_and_takes_the_next_turn() {
+        let db = RuntimeDb::memory();
+        let frozen = seed(&db, "site", "frozen", false);
+        let open = seed(&db, "site", "open", false);
+        let blocked = admit(
+            &db,
+            wake("site", &frozen, Cause::Schedule, "100"),
+            "plane",
+            1,
+        )
+        .unwrap();
+        let ready = admit(&db, wake("site", &open, Cause::Manual, "req-1"), "plane", 1).unwrap();
+        freeze(&db, &frozen);
+        let claimed = claim_next(&db, "site", "worker", 1_000, 100, true).unwrap();
+        assert_eq!(claimed.turn_id, ready.turn_id);
+        assert_eq!(
+            claim_next(&db, "site", "worker", 1_000, 100, true).unwrap_err(),
+            TurnError::NotFound
+        );
+        assert_eq!(get(&db, &blocked.turn_id).unwrap().unwrap().status, REFUSED);
+        assert_eq!(refusals(&db, &frozen).len(), 1);
     }
 
     #[test]

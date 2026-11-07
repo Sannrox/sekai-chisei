@@ -181,9 +181,11 @@ impl RuntimeClaimError {
     }
 
     /// A targeted turn that is gone, held, finished, or refused because its
-    /// instance is frozen is contention, never fence loss or idle.
-    fn from_agent_turn_claim<T>(error: SdkError) -> Result<ClaimAttempt<T>, Self> {
+    /// instance is frozen is contention, never fence loss or idle. An empty
+    /// `turn_id` NotFound is an empty queue.
+    fn from_agent_turn_claim<T>(error: SdkError, turn_id: &str) -> Result<ClaimAttempt<T>, Self> {
         match error.code {
+            SdkErrorCode::NotFound if turn_id.trim().is_empty() => Ok(ClaimAttempt::Idle),
             SdkErrorCode::NotFound | SdkErrorCode::FailedPrecondition
                 if error.reason_code.is_none() =>
             {
@@ -720,6 +722,7 @@ impl<'a> RuntimeClaimClient<'a> {
         ttl: Duration,
     ) -> Result<ClaimAttempt<ClaimedAgentTurn>, RuntimeClaimError> {
         let namespace = self.namespace()?.to_string();
+        let turn_id = turn_id.into();
         match self
             .client
             .raw()
@@ -728,7 +731,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 ClaimAgentTurnRequest {
                     namespace,
                     runtime_id: runtime_id.into(),
-                    turn_id: turn_id.into(),
+                    turn_id: turn_id.clone(),
                     ttl_ms: duration_millis(ttl)?,
                     accepts_continuation: true,
                 },
@@ -738,21 +741,18 @@ impl<'a> RuntimeClaimClient<'a> {
         {
             Ok(response) => Ok(ClaimedAgentTurn::from_response(response)
                 .map_or(ClaimAttempt::Contended, ClaimAttempt::Claimed)),
-            Err(error) => RuntimeClaimError::from_agent_turn_claim(error),
+            Err(error) => RuntimeClaimError::from_agent_turn_claim(error, &turn_id),
         }
     }
 
-    /// List then claim the oldest due turn. An empty queue is idle.
+    /// Claims the next due turn. An empty queue is idle. The plane picks and
+    /// locks one row so concurrent workers do not collide on the oldest turn.
     pub async fn claim_next_agent_turn(
         &self,
         runtime_id: impl Into<String>,
         ttl: Duration,
     ) -> Result<ClaimAttempt<ClaimedAgentTurn>, RuntimeClaimError> {
-        let Some(candidate) = self.list_agent_turns(1).await?.into_iter().next() else {
-            return Ok(ClaimAttempt::Idle);
-        };
-        self.claim_agent_turn(runtime_id, candidate.turn_id, ttl)
-            .await
+        self.claim_agent_turn(runtime_id, "", ttl).await
     }
 
     pub async fn heartbeat_agent_turn(
@@ -1060,20 +1060,29 @@ mod tests {
     fn agent_turn_claim_refusals_are_contention() {
         for code in [SdkErrorCode::NotFound, SdkErrorCode::FailedPrecondition] {
             assert_eq!(
-                RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(code)),
+                RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(code), "turn-1"),
                 Ok(ClaimAttempt::Contended)
             );
         }
+        assert_eq!(
+            RuntimeClaimError::from_agent_turn_claim::<()>(
+                SdkError::new(SdkErrorCode::NotFound),
+                ""
+            ),
+            Ok(ClaimAttempt::Idle)
+        );
         assert!(matches!(
-            RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(
-                SdkErrorCode::Unavailable
-            )),
+            RuntimeClaimError::from_agent_turn_claim::<()>(
+                SdkError::new(SdkErrorCode::Unavailable),
+                "turn-1"
+            ),
             Err(RuntimeClaimError::Unavailable(_))
         ));
         assert!(matches!(
-            RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(
-                SdkErrorCode::InvalidArgument
-            )),
+            RuntimeClaimError::from_agent_turn_claim::<()>(
+                SdkError::new(SdkErrorCode::InvalidArgument),
+                "turn-1"
+            ),
             Err(RuntimeClaimError::Invalid(_))
         ));
     }
