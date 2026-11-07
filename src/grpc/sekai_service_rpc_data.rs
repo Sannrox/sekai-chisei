@@ -343,7 +343,8 @@ pub(super) async fn query_rows(
 
 /// The access decision of the dataset RPCs admitted for tenant credentials
 /// (`QueryRows`, versions, rollback, health, CreateDataset, AppendRows,
-/// UpdateDataset). Every caller passes the principal checks of
+/// UpdateDataset, and the branch RPCs via [`branch_caller`]). Every caller
+/// passes the principal checks of
 /// [`check_dataset_access`]. A tenant caller must also hold Read, or Write
 /// when `write`, on the namespace of the dataset's binding object, and see
 /// that object; a dataset with no live binding object has no namespace and
@@ -5221,30 +5222,7 @@ pub(super) fn branch_caller<T: 'static>(
         .get_dataset(dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    // The bound object's namespace must be one the authenticated context
-    // may read or write, whatever ACL grants the caller also holds.
-    if let Some(context) = context.as_ref()
-        && !dataset.object_id.is_empty()
-        && let Some(object) = service
-            .db
-            .runtime()
-            .get_object(&dataset.object_id)
-            .map_err(Status::internal)?
-    {
-        enforce_namespace_tenant_context(
-            service.db.runtime(),
-            Some(context),
-            &object.namespace,
-            write,
-        )?;
-    }
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
-        &principals,
-        &dataset,
-        write,
-    )?;
+    authorize_dataset(service, &principals, context.as_ref(), &dataset, write)?;
     let actor = principals
         .first()
         .cloned()

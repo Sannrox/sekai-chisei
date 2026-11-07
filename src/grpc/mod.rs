@@ -936,12 +936,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
             | "ListDatasets"
-            // Dataset rows, versions, rollback, health (#2097) and catalog
-            // writes (#2105): each handler authorizes the binding object's
-            // namespace (`authorize_dataset`) and refuses unbound datasets
-            // and guests. CreateDataset requires a live binding object in a
-            // writable namespace. Branch handlers authorize a bound dataset
-            // in `branch_caller`.
+            // Dataset rows, versions, rollback, health (#2097), catalog
+            // writes (#2105) and branches (#2104): each handler authorizes
+            // the binding object's namespace (`authorize_dataset`) and
+            // refuses unbound datasets and guests. CreateDataset requires a
+            // live binding object in a writable namespace. Branch handlers
+            // call `authorize_dataset` from `branch_caller`.
             | "QueryRows"
             | "CreateDataset"
             | "UpdateDataset"
