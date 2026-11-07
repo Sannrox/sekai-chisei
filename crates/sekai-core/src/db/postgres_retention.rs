@@ -1,9 +1,11 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::audit::Decision;
 use crate::sekai::retention::{
-    AUDIT_DATASET, CONTENT_EVENTS_DATASET, DAY_MS, LLM_CALLS_DATASET, ObservationPlan,
-    RETENTION_BATCH_SIZE, RETENTION_TOMBSTONE_CONTEXT, RetainedObservation, effective_policy,
-    fold_observation_baseline, llm_call_expired, plan_audit_prefix, plan_observation_retention,
+    AUDIT_DATASET, ArchivedRecord, CONTENT_EVENTS_DATASET, DAY_MS, LLM_CALLS_DATASET,
+    ObservationPlan, RETENTION_BATCH_SIZE, RETENTION_TOMBSTONE_CONTEXT, RetainedObservation,
+    RetentionListMarkers, effective_policy, fold_observation_baseline, llm_call_expired,
+    parse_archived_decision_link, plan_audit_prefix, plan_observation_retention,
+    retention_list_markers_from_anchor, verify_archived_decision_chain,
 };
 use crate::sekai::retention::{
     ArchiveErasureSubject, ArchivedErasure, CONTENT_EVENT_ERASED_REASON, erase_archived_record,
@@ -795,6 +797,22 @@ impl PostgresDb {
         let verification = verify_retention_archive_pg(&mut tx)?;
         tx.commit().map_err(err)?;
         Ok(verification)
+    }
+
+    /// The in-database archive row for `(dataset, natural_key)`, if any.
+    pub fn get_archived_record(
+        &self,
+        dataset: &str,
+        natural_key: &str,
+    ) -> Result<Option<ArchivedRecord>, String> {
+        let mut connection = self.connection()?;
+        get_archived_record_pg(&mut *connection, dataset, natural_key)
+    }
+
+    /// First hot seq and cutoff after the latest ledger archive/purge anchor.
+    pub fn retention_list_markers(&self) -> Result<RetentionListMarkers, String> {
+        let mut connection = self.connection()?;
+        retention_list_markers_pg(&mut *connection)
     }
 
     /// Batches and archived records per dataset in the in-database archive.
@@ -2116,7 +2134,80 @@ fn verify_retention_archive_pg(
             }
         }
     }
+    if let Err(error) = verify_archived_decision_chain_pg(client) {
+        verification.ok = false;
+        verification.error = error;
+    }
     Ok(verification)
+}
+
+fn get_archived_record_pg(
+    client: &mut impl GenericClient,
+    dataset: &str,
+    natural_key: &str,
+) -> Result<Option<ArchivedRecord>, String> {
+    if !postgres_relation_exists(client, "sekai_archive_records")? {
+        return Ok(None);
+    }
+    let source_key = crate::sekai::retention::archive_source_key(dataset, natural_key);
+    Ok(client
+        .query_opt(
+            "SELECT dataset,source_key,payload,payload_hash,archived_at_ms
+             FROM sekai_archive_records WHERE dataset=$1 AND source_key=$2",
+            &[&dataset, &source_key],
+        )
+        .map_err(err)?
+        .map(|row| ArchivedRecord {
+            dataset: row.get(0),
+            source_key: row.get(1),
+            payload: row.get(2),
+            payload_hash: row.get(3),
+            archived_at_ms: row.get(4),
+        }))
+}
+
+fn retention_list_markers_pg(
+    client: &mut impl GenericClient,
+) -> Result<RetentionListMarkers, String> {
+    Ok(client
+        .query_opt(
+            "SELECT seq, reason, created FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
+            &[],
+        )
+        .map_err(err)?
+        .map_or_else(RetentionListMarkers::default, |row| {
+            retention_list_markers_from_anchor(row.get(0), &row.get::<_, String>(1), row.get(2))
+        }))
+}
+
+fn verify_archived_decision_chain_pg(client: &mut impl GenericClient) -> Result<(), String> {
+    if !postgres_relation_exists(client, "sekai_archive_records")? {
+        return Ok(());
+    }
+    let rows = client
+        .query(
+            "SELECT payload FROM sekai_archive_records WHERE dataset='audit.decisions'",
+            &[],
+        )
+        .map_err(err)?;
+    let mut links = Vec::with_capacity(rows.len());
+    for row in rows {
+        let payload: String = row.get(0);
+        let Some(link) = parse_archived_decision_link(&payload) else {
+            return Err("archived decision payload is malformed".into());
+        };
+        links.push(link);
+    }
+    let anchors = client
+        .query(
+            "SELECT seq, entry_hash FROM sekai_ledger_anchors ORDER BY seq",
+            &[],
+        )
+        .map_err(err)?
+        .into_iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
+    verify_archived_decision_chain(links, &anchors)
 }
 
 fn verify_batch(client: &mut impl GenericClient, batch_id: &str) -> Result<(i64, i64), String> {

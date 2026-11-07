@@ -2617,9 +2617,19 @@ message EnsureTeamNamespaceResponse {
 message RecordDecisionRequest { Decision decision = 1; }
 message RecordDecisionResponse { Decision decision = 1; }
 message ListDecisionsRequest { string actor = 1; string action = 2; int64 after = 3; int32 limit = 4; string target_id = 5; }
-message ListDecisionsResponse { repeated Decision decisions = 1; }
+message ListDecisionsResponse {
+  repeated Decision decisions = 1;
+  // First seq still in the hot table after retention; 0 if nothing was archived.
+  int64 earliest_retained_seq = 2;
+  // Unix milliseconds from which hot records are retained; 0 if nothing was archived.
+  int64 retained_from_ms = 3;
+}
 message ListObjectChangesRequest { string object_id = 1; int32 limit = 2; int32 offset = 3; }
-message ListObjectChangesResponse { repeated ObjectChange changes = 1; }
+message ListObjectChangesResponse {
+  repeated ObjectChange changes = 1;
+  int64 earliest_retained_seq = 2;
+  int64 retained_from_ms = 3;
+}
 
 // Why one property value is what it is (#1452).
 message ExplainValueRequest {
@@ -2694,6 +2704,9 @@ message VerifyAttestationResponse {
   string replayed_decision = 5;
   bool decision_linked = 6;    // linked audit decision binds this attestation back
   string error = 7;
+  // Present in the in-database archive after retention, not the hot table.
+  bool archived = 8;
+  int64 archived_at_ms = 9;
 }
 // Closed object-security v1 predicate on an Action type (#883 / ADR 0077).
 message ActionSubmissionCriterion {

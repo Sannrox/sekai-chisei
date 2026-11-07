@@ -135,6 +135,118 @@ pub struct ArchiveVerification {
     pub error: String,
 }
 
+/// One in-database archive row, looked up by the natural key hashed as
+/// [`archive_source_key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedRecord {
+    pub dataset: String,
+    pub source_key: String,
+    pub payload: String,
+    pub payload_hash: String,
+    pub archived_at_ms: i64,
+}
+
+impl ArchivedRecord {
+    /// Stored payload hash matches a recomputation over the stored fields.
+    pub fn hash_ok(&self) -> bool {
+        archive_payload_hash(&self.dataset, &self.source_key, &self.payload) == self.payload_hash
+    }
+}
+
+/// Hot-table retained window after a ledger prefix was archived or purged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionListMarkers {
+    /// First seq still in the hot table; 0 when nothing was archived.
+    pub earliest_retained_seq: i64,
+    /// Unix milliseconds from which hot records are retained; 0 when nothing
+    /// was archived.
+    pub retained_from_ms: i64,
+}
+
+pub(crate) fn retention_list_markers_from_anchor(
+    seq: i64,
+    reason: &str,
+    created: i64,
+) -> RetentionListMarkers {
+    RetentionListMarkers {
+        earliest_retained_seq: seq.saturating_add(1),
+        retained_from_ms: trailing_unix_ms(reason).unwrap_or(created),
+    }
+}
+
+fn trailing_unix_ms(reason: &str) -> Option<i64> {
+    reason
+        .rsplit_once(char::is_whitespace)
+        .map(|(_, last)| last)
+        .or(Some(reason))
+        .and_then(|last| last.parse().ok())
+        .filter(|&ms| ms > 0)
+}
+
+/// Chain fields stored on an archived `audit.decisions` payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivedDecisionLink {
+    pub seq: i64,
+    pub prev_hash: String,
+    pub entry_hash: String,
+}
+
+pub(crate) fn parse_archived_decision_link(payload: &str) -> Option<ArchivedDecisionLink> {
+    let json: serde_json::Value = serde_json::from_str(payload).ok()?;
+    Some(ArchivedDecisionLink {
+        seq: json.get("seq")?.as_i64()?,
+        prev_hash: json.get("prev_hash")?.as_str()?.to_string(),
+        entry_hash: json.get("entry_hash")?.as_str()?.to_string(),
+    })
+}
+
+/// Walk archived `audit.decisions` as a contiguous chain that starts at
+/// genesis or resumes from a ledger anchor, and ends on an anchor.
+/// An empty set is valid. Tombstones keep these chain fields.
+pub(crate) fn verify_archived_decision_chain(
+    mut links: Vec<ArchivedDecisionLink>,
+    anchors: &[(i64, String)],
+) -> Result<(), String> {
+    if links.is_empty() {
+        return Ok(());
+    }
+    links.sort_by_key(|link| link.seq);
+    for pair in links.windows(2) {
+        let prev = &pair[0];
+        let next = &pair[1];
+        if next.seq != prev.seq + 1 {
+            return Err(format!(
+                "archived decision chain gap: expected {}, found {}",
+                prev.seq + 1,
+                next.seq
+            ));
+        }
+        if next.prev_hash != prev.entry_hash {
+            return Err(format!(
+                "archived decision chain prev_hash mismatch at seq {}",
+                next.seq
+            ));
+        }
+    }
+    let first = &links[0];
+    if first.seq == 1 {
+        if !first.prev_hash.is_empty() {
+            return Err("archived decision chain does not start at genesis".into());
+        }
+    } else {
+        let predecessor = first.seq - 1;
+        match anchors.iter().find(|(seq, _)| *seq == predecessor) {
+            Some((_, hash)) if hash == &first.prev_hash => {}
+            _ => return Err("archived decision chain does not resume from a ledger anchor".into()),
+        }
+    }
+    let last = &links[links.len() - 1];
+    match anchors.iter().find(|(seq, _)| *seq == last.seq) {
+        Some((_, hash)) if hash == &last.entry_hash => Ok(()),
+        _ => Err("archived decision chain does not end at a ledger anchor".into()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveRecord {
     pub(crate) dataset: &'static str,
@@ -174,7 +286,7 @@ pub(crate) fn archive_source_key(dataset: &str, natural_key: &str) -> String {
     )
 }
 
-fn archive_payload_hash(dataset: &str, source_key: &str, payload: &str) -> String {
+pub(crate) fn archive_payload_hash(dataset: &str, source_key: &str, payload: &str) -> String {
     sha256_hex(
         serde_json::to_string(&(dataset, source_key, payload))
             .unwrap_or_default()
@@ -3159,8 +3271,9 @@ impl SekaiDb {
     }
 
     /// Verify the in-database archive (ADR 0141): every record's hash, every
-    /// manifest reference, and every batch's content hash. An empty archive
-    /// verifies.
+    /// manifest reference, every batch's content hash, and the archived
+    /// `audit.decisions` chain ending at the latest `sekai_ledger_anchors`
+    /// row. An empty archive verifies.
     pub fn verify_retention_archive(&self) -> Result<ArchiveVerification, String> {
         let mut conn = self.conn();
         // One read transaction on one connection: every query sees the same
@@ -3212,6 +3325,59 @@ impl SekaiDb {
             last_cutoff_ms,
             last_archived_at_ms,
         })
+    }
+
+    /// The in-database archive row for `(dataset, natural_key)`, if any.
+    pub fn get_archived_record(
+        &self,
+        dataset: &str,
+        natural_key: &str,
+    ) -> Result<Option<ArchivedRecord>, String> {
+        let conn = self.conn();
+        if !sqlite_table_exists(&conn, "sekai_archive_records")? {
+            return Ok(None);
+        }
+        let source_key = archive_source_key(dataset, natural_key);
+        conn.query_row(
+            "SELECT dataset,source_key,payload,payload_hash,archived_at_ms
+             FROM sekai_archive_records WHERE dataset=?1 AND source_key=?2",
+            params![dataset, source_key],
+            |row| {
+                Ok(ArchivedRecord {
+                    dataset: row.get(0)?,
+                    source_key: row.get(1)?,
+                    payload: row.get(2)?,
+                    payload_hash: row.get(3)?,
+                    archived_at_ms: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| e.to_string())
+    }
+
+    /// First hot seq and cutoff after the latest ledger archive/purge anchor.
+    pub fn retention_list_markers(&self) -> Result<RetentionListMarkers, String> {
+        let conn = self.conn();
+        let anchor = conn
+            .query_row(
+                "SELECT seq, reason, created FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(
+            anchor.map_or_else(RetentionListMarkers::default, |(seq, reason, created)| {
+                retention_list_markers_from_anchor(seq, &reason, created)
+            }),
+        )
     }
 
     /// Move records outside their retention windows into the in-database
@@ -4311,7 +4477,46 @@ fn verify_archive_tables(
             return Ok(verification);
         }
     }
+    if prefix == "sekai_archive_"
+        && let Err(error) = verify_archived_decision_chain_in(conn, prefix)
+    {
+        verification.ok = false;
+        verification.error = error;
+    }
     Ok(verification)
+}
+
+fn verify_archived_decision_chain_in(conn: &Connection, prefix: &str) -> Result<(), String> {
+    let records = {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT payload FROM {prefix}records WHERE dataset='audit.decisions'"
+            ))
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    let mut links = Vec::with_capacity(records.len());
+    for payload in records {
+        let Some(link) = parse_archived_decision_link(&payload) else {
+            return Err("archived decision payload is malformed".into());
+        };
+        links.push(link);
+    }
+    let anchors = {
+        let mut stmt = conn
+            .prepare("SELECT seq, entry_hash FROM sekai_ledger_anchors ORDER BY seq")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+    verify_archived_decision_chain(links, &anchors)
 }
 
 #[cfg(test)]
@@ -5266,6 +5471,229 @@ mod tests {
         assert_eq!((decisions, attestations, leaked), (1, 0, 0));
         drop(conn);
         assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    #[test]
+    fn archived_decision_chain_walk_rejects_broken_links() {
+        let genesis = ArchivedDecisionLink {
+            seq: 1,
+            prev_hash: String::new(),
+            entry_hash: "h1".into(),
+        };
+        let second = ArchivedDecisionLink {
+            seq: 2,
+            prev_hash: "h1".into(),
+            entry_hash: "h2".into(),
+        };
+        let end = [(2, "h2".to_string())];
+        assert!(
+            verify_archived_decision_chain(vec![genesis.clone(), second.clone()], &end).is_ok()
+        );
+        assert!(verify_archived_decision_chain(Vec::new(), &[]).is_ok());
+        assert!(
+            verify_archived_decision_chain(vec![genesis.clone()], &[])
+                .unwrap_err()
+                .contains("does not end at a ledger anchor")
+        );
+        let resumed = ArchivedDecisionLink {
+            seq: 3,
+            prev_hash: "h2".into(),
+            entry_hash: "h3".into(),
+        };
+        assert!(
+            verify_archived_decision_chain(
+                vec![resumed.clone()],
+                &[(2, "h2".into()), (3, "h3".into())]
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_archived_decision_chain(vec![resumed], &[(3, "h3".into())])
+                .unwrap_err()
+                .contains("does not resume from a ledger anchor")
+        );
+        let gapped = ArchivedDecisionLink {
+            seq: 3,
+            prev_hash: "h1".into(),
+            entry_hash: "h3".into(),
+        };
+        assert!(
+            verify_archived_decision_chain(vec![genesis.clone(), gapped], &[(3, "h3".into())])
+                .unwrap_err()
+                .contains("gap")
+        );
+        let mismatched = ArchivedDecisionLink {
+            seq: 2,
+            prev_hash: "wrong".into(),
+            entry_hash: "h2".into(),
+        };
+        assert!(
+            verify_archived_decision_chain(vec![genesis, mismatched], &end)
+                .unwrap_err()
+                .contains("prev_hash mismatch")
+        );
+        assert_eq!(
+            retention_list_markers_from_anchor(4, "archived before 123", 9),
+            RetentionListMarkers {
+                earliest_retained_seq: 5,
+                retained_from_ms: 123,
+            }
+        );
+        assert_eq!(
+            retention_list_markers_from_anchor(4, "retention purge before 50", 9).retained_from_ms,
+            50
+        );
+        assert_eq!(
+            retention_list_markers_from_anchor(4, "operator note", 9).retained_from_ms,
+            9
+        );
+    }
+
+    #[test]
+    fn archived_attestation_is_looked_up_by_natural_key() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        for (id, timestamp) in [("d-old", 1), ("d-old-2", 2)] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp,
+                actor: "operator".into(),
+                action: "apply".into(),
+                reason: String::new(),
+                evidence: HashMap::new(),
+                target_id: "other".into(),
+                outcome: "ok".into(),
+            })
+            .unwrap();
+        }
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "INSERT INTO sekai_attestations
+                 (id,decision_id,policy_kind,policy_scope,policy_version,policy_snapshot,
+                  inputs,decision,content_hash,created)
+                 VALUES ('a-old','d-old','k','s','v','{}','{}','allow','h',1)",
+                [],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let now = 2 * DAY_MS;
+        db.archive_retained_records(now, false).unwrap();
+        assert!(db.get_attestation("a-old").unwrap().is_none());
+        assert!(
+            db.get_archived_record("audit.attestations", "missing")
+                .unwrap()
+                .is_none()
+        );
+        let archived = db
+            .get_archived_record("audit.attestations", "a-old")
+            .unwrap()
+            .expect("archived attestation");
+        assert!(archived.hash_ok());
+        assert_eq!(archived.archived_at_ms, now);
+        let markers = db.retention_list_markers().unwrap();
+        assert_eq!(markers.earliest_retained_seq, 3);
+        assert_eq!(markers.retained_from_ms, DAY_MS);
+        assert!(db.verify_retention_archive().unwrap().ok);
+    }
+
+    #[test]
+    fn verify_retention_archive_walks_archived_decision_chain() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        for (id, timestamp) in [("d-1", 1), ("d-2", 2)] {
+            db.record_decision(&Decision {
+                id: id.into(),
+                timestamp,
+                actor: "operator".into(),
+                action: "apply".into(),
+                reason: String::new(),
+                evidence: HashMap::new(),
+                target_id: "other".into(),
+                outcome: "ok".into(),
+            })
+            .unwrap();
+        }
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert!(db.verify_retention_archive().unwrap().ok);
+
+        let sqlite = db.as_sqlite().expect("sqlite");
+        let conn = sqlite.conn();
+        let (source_key, payload): (String, String) = conn
+            .query_row(
+                "SELECT source_key,payload FROM sekai_archive_records
+                 WHERE dataset='audit.decisions' AND json_extract(payload,'$.seq')=2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        json["prev_hash"] = serde_json::Value::String("tampered".into());
+        let tampered = json.to_string();
+        let hash = archive_payload_hash("audit.decisions", &source_key, &tampered);
+        conn.execute(
+            "UPDATE sekai_archive_records SET payload=?1, payload_hash=?2
+             WHERE dataset='audit.decisions' AND source_key=?3",
+            params![tampered, hash, source_key],
+        )
+        .unwrap();
+        let batches: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM sekai_archive_batches")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for batch_id in batches {
+            let hashes: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT r.payload_hash FROM sekai_archive_batch_records b
+                         JOIN sekai_archive_records r
+                           ON r.dataset=b.dataset AND r.source_key=b.source_key
+                         WHERE b.batch_id=?1 ORDER BY b.dataset,b.source_key",
+                    )
+                    .unwrap();
+                stmt.query_map(params![batch_id], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+            };
+            let content_hash = sha256_hex(
+                serde_json::to_string(&hashes)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            conn.execute(
+                "UPDATE sekai_archive_batches SET content_hash=?1, record_count=?2 WHERE id=?3",
+                params![content_hash, hashes.len() as i64, batch_id],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let verification = db.verify_retention_archive().unwrap();
+        assert!(!verification.ok, "{}", verification.error);
+        assert!(
+            verification.error.contains("prev_hash mismatch"),
+            "{}",
+            verification.error
+        );
     }
 
     /// The archive walker decides exactly as the hot path's predicates do

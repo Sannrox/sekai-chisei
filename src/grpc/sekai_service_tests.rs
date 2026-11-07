@@ -14093,6 +14093,109 @@ async fn list_attestations_paginates_over_visible_rows_only() {
 }
 
 #[tokio::test]
+async fn archived_attestation_reads_distinct_from_never_existed() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .record_decision(&crate::sekai::audit::Decision {
+            id: "d-old".into(),
+            timestamp: 1,
+            actor: "tester".into(),
+            action: "apply".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: "other".into(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+    let attestation = attestation::build_action_attestation(attestation::ActionAttestationInput {
+        decision_id: "d-old",
+        policy: &action_policy::ActionPolicy::allow_all("scope-a"),
+        action: "set_property",
+        actor: "tester",
+        risk: RiskClass::Write,
+        namespace: "default",
+        decision: action_policy::ActionDecision::Allow,
+        created: 1,
+    });
+    let attestation_id = attestation.id.clone();
+    svc.db.runtime().insert_attestation(&attestation).unwrap();
+    svc.db
+        .runtime()
+        .set_retention_policy(&crate::sekai::retention::RetentionPolicy {
+            dataset: crate::sekai::retention::AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+    const DAY_MS: i64 = 86_400_000;
+    let now = 2 * DAY_MS;
+    svc.db
+        .runtime()
+        .archive_retained_records(now, false)
+        .unwrap();
+
+    let archived = svc
+        .get_attestation(with_principal(GetAttestationRequest {
+            id: attestation_id.clone(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(archived.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(archived.message(), "archived");
+
+    let missing = svc
+        .get_attestation(with_principal(GetAttestationRequest {
+            id: "never-existed".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    let verified = svc
+        .verify_attestation(with_principal(VerifyAttestationRequest {
+            id: attestation_id,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(verified.found);
+    assert!(verified.archived);
+    assert!(verified.hash_ok);
+    assert!(!verified.ok);
+    assert!(!verified.replay_ok);
+    assert!(!verified.decision_linked);
+    assert_eq!(verified.archived_at_ms, now);
+
+    let never = svc
+        .verify_attestation(with_principal(VerifyAttestationRequest {
+            id: "never-existed".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!never.found);
+    assert!(!never.archived);
+
+    let listed = svc
+        .list_decisions(with_principal(ListDecisionsRequest {
+            actor: String::new(),
+            action: String::new(),
+            after: 0,
+            limit: 10,
+            target_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.decisions.is_empty());
+    assert_eq!(listed.earliest_retained_seq, 2);
+    assert_eq!(listed.retained_from_ms, DAY_MS);
+}
+
+#[tokio::test]
 async fn reserved_governance_objects_are_hidden_from_generic_crud() {
     let svc = service();
     svc.db

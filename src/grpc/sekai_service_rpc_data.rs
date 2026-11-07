@@ -1474,7 +1474,16 @@ pub(super) async fn list_decisions(
         outcome: decision.outcome,
     })
     .collect();
-    Ok(Response::new(ListDecisionsResponse { decisions }))
+    let markers = service
+        .db
+        .runtime()
+        .retention_list_markers()
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListDecisionsResponse {
+        decisions,
+        earliest_retained_seq: markers.earliest_retained_seq,
+        retained_from_ms: markers.retained_from_ms,
+    }))
 }
 /// Read access to a live object's change history: its namespace and
 /// collaboration scope, active read policy and marking. A denial reads as
@@ -1657,7 +1666,16 @@ pub(super) async fn list_object_changes(
         mapped
     })
     .collect();
-    Ok(Response::new(ListObjectChangesResponse { changes }))
+    let markers = service
+        .db
+        .runtime()
+        .retention_list_markers()
+        .map_err(Status::internal)?;
+    Ok(Response::new(ListObjectChangesResponse {
+        changes,
+        earliest_retained_seq: markers.earliest_retained_seq,
+        retained_from_ms: markers.retained_from_ms,
+    }))
 }
 pub(super) async fn get_attestation(
     service: &SekaiServiceImpl,
@@ -1669,12 +1687,28 @@ pub(super) async fn get_attestation(
     if id.trim().is_empty() {
         return Err(Status::invalid_argument("id required"));
     }
-    let attestation = service
+    let attestation = match service
         .db
         .runtime()
         .get_attestation(&id)
         .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("attestation not found"))?;
+    {
+        Some(attestation) => attestation,
+        None => {
+            // Receipts that cite an attestation id need to tell retention
+            // from a missing record. The archived payload is not returned.
+            if service
+                .db
+                .runtime()
+                .get_archived_record("audit.attestations", &id)
+                .map_err(Status::internal)?
+                .is_some()
+            {
+                return Err(Status::failed_precondition("archived"));
+            }
+            return Err(Status::not_found("attestation not found"));
+        }
+    };
     // Attestations embed the full policy snapshot; reading policy content
     // is admin-gated like get_action_policy / list_action_policies.
     check_action_admin(&service.security, &attestation.policy_scope, &principals)?;
@@ -1752,6 +1786,47 @@ pub(super) async fn verify_attestation(
         .map_err(Status::internal)?
     {
         check_action_admin(&service.security, &attestation.policy_scope, &principals)?;
+        let report = service
+            .db
+            .runtime()
+            .verify_attestation(&id)
+            .map_err(Status::internal)?;
+        return Ok(Response::new(VerifyAttestationResponse {
+            ok: report.ok,
+            found: report.found,
+            hash_ok: report.hash_ok,
+            replay_ok: report.replay_ok,
+            replayed_decision: report.replayed_decision,
+            decision_linked: report.decision_linked,
+            error: report.error,
+            archived: false,
+            archived_at_ms: 0,
+        }));
+    }
+    // Archived presence is the same distinction GetAttestation makes;
+    // hash_ok is the archive payload hash, not a policy snapshot.
+    if let Some(record) = service
+        .db
+        .runtime()
+        .get_archived_record("audit.attestations", &id)
+        .map_err(Status::internal)?
+    {
+        let hash_ok = record.hash_ok();
+        return Ok(Response::new(VerifyAttestationResponse {
+            ok: false,
+            found: true,
+            hash_ok,
+            replay_ok: false,
+            replayed_decision: String::new(),
+            decision_linked: false,
+            error: if hash_ok {
+                "archived".into()
+            } else {
+                "archived payload hash mismatch".into()
+            },
+            archived: true,
+            archived_at_ms: record.archived_at_ms,
+        }));
     }
     let report = service
         .db
@@ -1766,6 +1841,8 @@ pub(super) async fn verify_attestation(
         replayed_decision: report.replayed_decision,
         decision_linked: report.decision_linked,
         error: report.error,
+        archived: false,
+        archived_at_ms: 0,
     }))
 }
 pub(super) async fn create_credential(

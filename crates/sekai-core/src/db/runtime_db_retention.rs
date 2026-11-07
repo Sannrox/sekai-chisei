@@ -68,6 +68,28 @@ impl RuntimeDb {
         }
     }
 
+    /// The in-database archive row for `(dataset, natural_key)`, if any.
+    pub fn get_archived_record(
+        &self,
+        dataset: &str,
+        natural_key: &str,
+    ) -> Result<Option<ArchivedRecord>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_archived_record(dataset, natural_key),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_archived_record(dataset, natural_key))
+            }
+        }
+    }
+
+    /// First hot seq and cutoff after the latest ledger archive/purge anchor.
+    pub fn retention_list_markers(&self) -> Result<RetentionListMarkers, String> {
+        match self {
+            Self::Sqlite(db) => db.retention_list_markers(),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.retention_list_markers()),
+        }
+    }
+
     /// What the in-database retention archive holds.
     pub fn retention_archive_status(
         &self,
