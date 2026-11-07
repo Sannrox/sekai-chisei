@@ -233,7 +233,20 @@ pub fn quality_observation(object: &Object) -> Option<QualityObservation> {
     })
 }
 
+fn success_match(original: &QualityObservation) -> MatchClass {
+    if original.view.classification == "defect" {
+        MatchClass::Recovery
+    } else {
+        MatchClass::ComparableSuccess
+    }
+}
+
 /// Classify one later observation against the original finding's trigger.
+///
+/// Success (`ok` / `reconciled`) matches on `operation_class` so Tenkai
+/// signatures that embed the outcome reason (`api:none` after
+/// `api:product_failed`) can confirm recovery. Recurrence, reproduction, and
+/// waits still require an exact `problem_signature`.
 pub fn classify_observation(
     original: &QualityObservation,
     later: &QualityObservation,
@@ -241,26 +254,28 @@ pub fn classify_observation(
     if later.view.object_id == original.view.object_id {
         return MatchClass::UnrelatedWorkload;
     }
-    if later.view.problem_signature != original.view.problem_signature {
-        return MatchClass::UnrelatedWorkload;
+    let same_signature = later.view.problem_signature == original.view.problem_signature;
+    if !same_signature {
+        if operation_class(&later.view.problem_signature)
+            != operation_class(&original.view.problem_signature)
+        {
+            return MatchClass::UnrelatedWorkload;
+        }
+        return if matches!(later.view.classification.as_str(), "ok" | "reconciled") {
+            success_match(original)
+        } else {
+            MatchClass::UnrelatedWorkload
+        };
     }
     let classification = later.view.classification.as_str();
     if matches!(classification, "cancelled" | "blocked") || precludes_tenkai_defect(&later.view) {
         if matches!(classification, "ok" | "reconciled") {
-            return if original.view.classification == "defect" {
-                MatchClass::Recovery
-            } else {
-                MatchClass::ComparableSuccess
-            };
+            return success_match(original);
         }
         return MatchClass::ExpectedWait;
     }
     if matches!(classification, "ok" | "reconciled") {
-        return if original.view.classification == "defect" {
-            MatchClass::Recovery
-        } else {
-            MatchClass::ComparableSuccess
-        };
+        return success_match(original);
     }
     if classification == "reproduced" {
         return MatchClass::VerifiedReproduction;
@@ -1229,6 +1244,90 @@ mod tests {
             decide_quality(false, MatchClass::Recovery, &matches),
             IssueQuality::Improved
         );
+    }
+
+    fn quality_obs(
+        id: &str,
+        signature: &str,
+        classification: &str,
+        version: &str,
+    ) -> QualityObservation {
+        QualityObservation {
+            view: ObservationView {
+                object_id: id.into(),
+                created_ms: 1,
+                problem_signature: signature.into(),
+                occurrence_ids: vec![format!("{id}@{version}")],
+                classification: classification.into(),
+                disposition: "open".into(),
+                source_evidence: "ev".into(),
+            },
+            tenkai_version: version.into(),
+        }
+    }
+
+    #[test]
+    fn tenkai_success_matches_operation_class_not_reason() {
+        let original = quality_obs("o-fail", "api:product_failed", "defect", "0.5.0");
+        let recovered = quality_obs("o-ok", "api:none", "ok", "0.6.0");
+        let reconciled = quality_obs("o-rec", "api:none", "reconciled", "0.6.1");
+        let later_defect = quality_obs("o-other-fail", "api:timeout", "defect", "0.6.2");
+        let later_wait = quality_obs("o-wait", "api:blocked", "blocked", "0.6.3");
+        let other_product = quality_obs("o-deploy", "deploy:none", "ok", "0.9.0");
+        assert_eq!(operation_class("api:product_failed"), "api");
+        assert_eq!(operation_class("api:none"), "api");
+        assert_eq!(
+            classify_observation(&original, &recovered),
+            MatchClass::Recovery
+        );
+        assert_eq!(
+            classify_observation(&original, &reconciled),
+            MatchClass::Recovery
+        );
+        assert_eq!(
+            classify_observation(&original, &later_defect),
+            MatchClass::UnrelatedWorkload
+        );
+        assert_eq!(
+            classify_observation(&original, &later_wait),
+            MatchClass::UnrelatedWorkload
+        );
+        assert_eq!(
+            classify_observation(&original, &other_product),
+            MatchClass::UnrelatedWorkload
+        );
+        assert_eq!(
+            classify_observation(
+                &quality_obs("o-ok-orig", "api:none", "ok", "0.5.0"),
+                &recovered,
+            ),
+            MatchClass::ComparableSuccess
+        );
+    }
+
+    #[test]
+    fn tenkai_recovery_confirms_evaluate_namespace() {
+        let runtime = db();
+        let finding = seed_finding(&runtime, "tk", "api:product_failed", "0.5.0");
+        record_observation(
+            &runtime,
+            NAMESPACE,
+            "tk-ok",
+            "api:none",
+            "tk-op-ok@0.6.0",
+            "ok",
+            21_000,
+        );
+        let report = evaluate_namespace(&runtime, NAMESPACE, ACTOR, 30_000).unwrap();
+        let record = report
+            .records
+            .iter()
+            .find(|record| record.finding_id == finding.id)
+            .expect("tenkai recovery");
+        assert_eq!(record.match_class, MatchClass::Recovery);
+        assert_eq!(record.quality, IssueQuality::Improved);
+        assert_eq!(record.verification_result, RESULT_CONFIRMED);
+        assert!(record.tenkai_versions.contains(&"0.6.0".into()));
     }
 
     #[test]
