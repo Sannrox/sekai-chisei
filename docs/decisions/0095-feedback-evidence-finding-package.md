@@ -37,7 +37,9 @@ write paths and invent a second fact authority.
 4. Invalid, stale, conflicting, or unauthorized evidence is rejected by the
    existing evidence contract. The observation Action also requires
    `source_evidence` to name an unexpired accepted upsert submission in the
-   same namespace targeting an observation. SubmitEvidence may quarantine that
+   same namespace targeting `feedback_observation` or tenant-mode
+   `tenant_feedback_observation`. Both write a `feedback_observation` object;
+   tenant-mode scopes identity in `target_external_id`. SubmitEvidence may quarantine that
    submission with `projection_target_missing` until the observation exists;
    that recoverable state still authorizes the observation Action. The write
    stamps the observation `external_id` from that evidence target, retries

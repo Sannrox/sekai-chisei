@@ -117,7 +117,10 @@ impl SekaiDb {
             };
             return quarantine(tx, &submission, now_ms, code, summary);
         };
-        if target_kind != &envelope.target.object_kind {
+        if !crate::sekai::feedback_package::evidence_target_kind_matches_object(
+            &envelope.target.object_kind,
+            target_kind,
+        ) {
             return quarantine(
                 tx,
                 &submission,

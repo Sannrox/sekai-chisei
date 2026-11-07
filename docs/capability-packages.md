@@ -19,7 +19,10 @@ deploy, or authorize invocation. See
 Closed member kinds are `change_set`, `action_type`, `ontology`, and
 `evaluation`. The evidence and finding domain package
 (`pkg:feedback.evidence-finding/v1`, ADR 0095) certifies ontology, Action
-type, and evaluation members from `tests/fixtures/feedback/`. The security
+type, and evaluation members from `tests/fixtures/feedback/`. Observation
+evidence may target `feedback_observation` or tenant-mode
+`tenant_feedback_observation`; both write `feedback_observation` objects.
+The security
 finding and exposure package (`pkg:security.finding-exposure/v1`, ADR 0135)
 certifies the same member kinds from `tests/fixtures/security/`. Its
 dispositions (#1924) record a decision on an exposure (`accept-risk`,
