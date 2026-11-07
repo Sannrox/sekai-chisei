@@ -169,4 +169,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0141: Retention archives into database tables on both backends](0141-retention-archives-in-database.md)
 - [ADR 0142: Agent-turn workers carry the turn's authority, not their own](0142-agent-turn-worker-authority.md)
 - [ADR 0143: Runtime-token `act` is the delegating requester](0143-runtime-token-act-is-the-requester.md)
+- [ADR 0144: FederatedAggregate withholds the suppressed-group count from the caller](0144-federated-aggregate-withholds-suppressed-count.md)
 <!-- adr-index:end -->

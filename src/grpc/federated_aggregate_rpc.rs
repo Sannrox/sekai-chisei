@@ -1,4 +1,4 @@
-//! FederatedAggregate (ADR 0134, #1997).
+//! FederatedAggregate (ADR 0134, ADR 0144, #1997).
 //!
 //! The caller needs read on the requesting namespace, and nothing else: its
 //! identity never reaches a participating namespace. Each participating
@@ -330,7 +330,9 @@ impl SekaiServiceImpl {
             let outcome = match role {
                 ReceiptRole::Requester => ReceiptOutcome {
                     returned_groups: combined.groups.len() as u64,
-                    suppressed_groups: combined.suppressed_groups,
+                    // Exact suppression stays on participant receipts
+                    // (ADR 0144); the requester already sees the groups.
+                    suppressed_groups: 0,
                     excluded: combined.excluded.clone(),
                 },
                 ReceiptRole::Participant => {
@@ -373,7 +375,9 @@ impl SekaiServiceImpl {
                         .collect(),
                 })
                 .collect(),
-            suppressed_groups: combined.suppressed_groups,
+            // Withheld: an exact count distinguishes no matches from
+            // fewer-than-k matches (ADR 0144, #2027).
+            suppressed_groups: 0,
             min_group_size: combined.min_group_size,
             contributors: combined.contributors,
             excluded: combined
@@ -989,7 +993,7 @@ mod tests {
             .map(|value| (value.present, value.value))
             .collect();
         assert_eq!(values, [(true, 5.0), (true, 16.0), (true, 3.2)]);
-        assert_eq!(response.suppressed_groups, 2);
+        assert_eq!(response.suppressed_groups, 0);
         assert_eq!(response.min_group_size, 2);
         assert_eq!(response.contributors, ["north", "south"]);
         assert_eq!(response.excluded.len(), 1);
@@ -1007,7 +1011,7 @@ mod tests {
         }
 
         for (tenant, returned, suppressed) in [
-            ("buyer", 1, 2),
+            ("buyer", 1, 0),
             ("north", 1, 1),
             ("south", 1, 1),
             ("west", 0, 0),
@@ -1031,6 +1035,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(north.opened.allowance_digest.starts_with("sha256:"));
+    }
+
+    /// An empty result from no matching records and an empty result from
+    /// fewer-than-k matching records are indistinguishable on the response.
+    #[tokio::test]
+    async fn the_response_does_not_distinguish_no_matches_from_below_k() {
+        let svc = federation();
+        let filtered = |region: &str| {
+            let mut request = request(&["north"], vec![measure("count", "")]);
+            request.filters = vec![PropertyFilter {
+                key: "region".into(),
+                op: "eq".into(),
+                value: region.into(),
+            }];
+            request
+        };
+        let none = svc
+            .federated_aggregate(as_principal(filtered("xx"), "analyst"))
+            .await
+            .unwrap()
+            .into_inner();
+        let below_k = svc
+            .federated_aggregate(as_principal(filtered("us"), "analyst"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(none.groups.is_empty());
+        assert!(below_k.groups.is_empty());
+        assert_eq!(none.suppressed_groups, below_k.suppressed_groups);
+        assert_eq!(none.suppressed_groups, 0);
+        let none_receipt = federated_receipt::get(svc.db.runtime(), &none.query_id, "north")
+            .unwrap()
+            .unwrap()
+            .outcome
+            .unwrap();
+        let below_k_receipt = federated_receipt::get(svc.db.runtime(), &below_k.query_id, "north")
+            .unwrap()
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert_eq!(none_receipt.suppressed_groups, 0);
+        assert_eq!(below_k_receipt.suppressed_groups, 1);
+        let requester = federated_receipt::get(svc.db.runtime(), &below_k.query_id, "buyer")
+            .unwrap()
+            .unwrap()
+            .outcome
+            .unwrap();
+        assert_eq!(requester.suppressed_groups, 0);
     }
 
     /// min and max are refused before anything is read or recorded.

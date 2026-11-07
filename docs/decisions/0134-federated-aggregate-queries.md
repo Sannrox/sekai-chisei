@@ -4,7 +4,9 @@
 - Date: 2026-10-26
 - Owners: @Sannrox
 - Issue: #1464
-- Related: [ADR 0099](0099-shared-identity-and-tenancy.md), [ADR 0130](0130-governed-export.md), #878, #1434, #1435
+- Supersedes: none
+- Superseded by: [ADR 0144](0144-federated-aggregate-withholds-suppressed-count.md) for the caller-response suppressed-group count
+- Related: [ADR 0099](0099-shared-identity-and-tenancy.md), [ADR 0130](0130-governed-export.md), #878, #1434, #1435, #2027
 
 ## Context
 
