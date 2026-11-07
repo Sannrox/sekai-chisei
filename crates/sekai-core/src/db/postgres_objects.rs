@@ -101,6 +101,29 @@ impl PostgresDb {
             .transpose()
     }
 
+    /// Keyed object load (`id = ANY($1)`) without ACL or row-policy SQL filters.
+    pub fn list_objects_by_ids(&self, ids: &[String]) -> Result<Vec<Object>, String> {
+        let mut ids = ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.connection()?
+            .query(
+                &format!("SELECT {OBJECT_COLUMNS} FROM sekai_objects WHERE id = ANY($1)"),
+                &[&ids],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(row_to_object)
+            .collect()
+    }
+
     pub fn get_object_with_policy_context(
         &self,
         id: &str,

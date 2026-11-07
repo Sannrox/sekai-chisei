@@ -948,12 +948,31 @@ impl SekaiServiceImpl {
         &self,
         namespace: &str,
         kind: &str,
-        mut query: crate::sekai::dataset::RowQuery,
+        query: crate::sekai::dataset::RowQuery,
         needed: Option<&[String]>,
         meter: &mut crate::sekai::object_set::CostMeter,
         mut admit: impl FnMut(
             &crate::sekai::object_type_index::ObjectTypeIndexMember,
         ) -> Result<Option<domain::Object>, Status>,
+    ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, Status> {
+        self.scan_index_layer_pages(namespace, kind, query, needed, meter, |members| {
+            members.iter().map(&mut admit).collect()
+        })
+    }
+
+    /// [`scan_index_layer`] with one `admit_page` call per store page so a
+    /// reader can batch member-keyed lookups. `admit_page` returns one
+    /// optional object per member, in the same order.
+    pub(super) fn scan_index_layer_pages(
+        &self,
+        namespace: &str,
+        kind: &str,
+        mut query: crate::sekai::dataset::RowQuery,
+        needed: Option<&[String]>,
+        meter: &mut crate::sekai::object_set::CostMeter,
+        mut admit_page: impl FnMut(
+            &[crate::sekai::object_type_index::ObjectTypeIndexMember],
+        ) -> Result<Vec<Option<domain::Object>>, Status>,
     ) -> Result<Vec<crate::sekai::object_type_index::ObjectTypeIndexMember>, Status> {
         let batch = if query.limit > 0 {
             query.limit
@@ -973,8 +992,12 @@ impl SekaiServiceImpl {
                 .map_err(Status::internal)?;
             let scanned = members.len() as i32;
             meter.charge(scanned).map_err(map_object_set_error)?;
-            for mut member in members {
-                if let Some(object) = admit(&member)? {
+            let admitted = admit_page(&members)?;
+            if admitted.len() != members.len() {
+                return Err(Status::internal("index page admission length mismatch"));
+            }
+            for (mut member, object) in members.into_iter().zip(admitted) {
+                if let Some(object) = object {
                     member.properties = object.properties.into_iter().collect();
                     visible.push(member);
                 }
