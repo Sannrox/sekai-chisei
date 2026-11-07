@@ -19126,12 +19126,14 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
             .code(),
         tonic::Code::PermissionDenied
     );
+    // Create/edit/propose are stable; Get still needs the experimental gate.
+    assert!(crate::rpc_maturity::require_invokable("GetDefinitionBranch", false).is_err());
     for method in [
-        "GetDefinitionBranch",
         "CreateDefinitionBranch",
         "ApplyDefinitionBranchEdit",
+        "CreateDefinitionProposal",
     ] {
-        assert!(crate::rpc_maturity::require_invokable(method, false).is_err());
+        assert!(crate::rpc_maturity::require_invokable(method, false).is_ok());
     }
     stop.send(()).unwrap();
     server.await.unwrap();

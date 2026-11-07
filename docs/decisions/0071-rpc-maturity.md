@@ -97,3 +97,12 @@ the shrink-only SQLite-only list.
   stable RPC still needs a real backend plus a consumer or a required-sibling
   reason, and the table still fails by name on a missing, unknown, or
   duplicate RPC.
+- 2026-11-07, Issue [#2095](https://github.com/Sannrox/sekai-chisei/issues/2095):
+  `CreateDefinitionBranch`, `ApplyDefinitionBranchEdit`,
+  `CompareDefinitionRevisions`, `ReportDefinitionConsumerImpact`, and
+  `CreateDefinitionProposal` become `stable` because the MCP adapter
+  (`sekai.definitions.branch.create`, `.edit`, `.diff`, `.impact`,
+  `.proposal.create`), `tests/mcp_definition_branch.rs`, and
+  `examples/shikigami-definition-branch/` consume them on the default build.
+  Approve and merge stay `experimental` and off MCP. The HTTP/JSON projection
+  and generated stable SDKs pick the five up as unary stables.

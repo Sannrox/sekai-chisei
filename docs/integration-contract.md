@@ -48,7 +48,6 @@ Coverage:
 | ObjectType / schema | supported | Sekai | `SekaiService.CreateSchemaType` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
 | Ontology class | supported | Sekai | `SekaiService.CreateOntologyClass` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
 | Ontology relation | supported | Sekai | `SekaiService.CreateOntologyRelation` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
-| Definition branch edit | experimental | Sekai | `SekaiService.ApplyDefinitionBranchEdit` | [definition-branches.md](definition-branches.md) | `crates/sekai-core/src/sekai/definition_branch.rs` |
 | Object seed | supported | Sekai | `SekaiService.CreateObject` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
 | Link seed | supported | Sekai | `SekaiService.CreateLink` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
 | Plan execution | supported | Chisei | `ChiseiService.PlanExecution` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |

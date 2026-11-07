@@ -89,10 +89,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.RegisterSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
-| `SekaiService.CreateDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.CreateDefinitionBranch` | `sekai.definition-branch` | yes | mcp, example | `stable` |
 | `SekaiService.GetDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.ApplyDefinitionBranchEdit` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.CreateDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.ApplyDefinitionBranchEdit` | `sekai.definition-branch` | yes | mcp, example | `stable` |
+| `SekaiService.CreateDefinitionProposal` | `sekai.definition-branch` | yes | mcp, example | `stable` |
 | `SekaiService.GetDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ApproveDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.MergeDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
@@ -109,8 +109,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.ExportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionTree` | `sekai.definition-branch` | yes | cli | `experimental` |
-| `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
+| `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | mcp, example | `stable` |
+| `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | mcp, example | `stable` |
 | `SekaiService.GetOntologyLintReport` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RecordOntologyHealthSnapshot` | `sekai.ontology-definitions` | yes | none | `experimental` |

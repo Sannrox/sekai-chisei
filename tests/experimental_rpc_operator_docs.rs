@@ -215,10 +215,11 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
         "sekai.definitions.impact",
         "sekai.definitions.proposal.create",
     ];
-    // Tools whose backing RPC is experimental have their own catalog sections.
+    // Search stays experimental in its own catalog section. Definition-branch
+    // tools are stable and listed in both the allowlist and their own section.
     let search_tool = "sekai.search.query";
     for tool in &projected {
-        if definition_tools.contains(tool) || *tool == search_tool {
+        if *tool == search_tool {
             continue;
         }
         assert!(
@@ -245,8 +246,8 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
             "{tool} must stay on the shipped MCP allowlist"
         );
         assert!(
-            !capability_is_stable(tool),
-            "{tool} backing RPC must stay experimental"
+            capability_is_stable(tool),
+            "{tool} backing RPC must be stable"
         );
         assert!(
             definition.contains(tool),
@@ -258,10 +259,6 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
             "definition-branch catalog paragraph must list {rpc}"
         );
     }
-    assert!(
-        definition.contains("SEKAI_EXPERIMENTAL_RPCS"),
-        "definition-branch catalog paragraph must name SEKAI_EXPERIMENTAL_RPCS: {definition}"
-    );
     assert!(
         !definition.contains("sekai.definitions.proposal.approve")
             && !definition.contains("sekai.definitions.proposal.merge"),

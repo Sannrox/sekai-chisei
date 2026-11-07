@@ -431,9 +431,15 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 `sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
 `SubmitActionInstance`, `chisei.receipt.read` → `GetOperationReceipt`,
 `sekai.links.get` → `GetLinks`, `sekai.links.create` → `CreateLink`,
-`chisei.evaluation.resolve` → `ResolveEvaluationPlan`, and
-`chisei.evaluation.execute` → `ExecuteEvaluationManifest`. Link and evaluation
-tools are listed because their RPCs are `stable` (#1093, #1090). Evaluation
+`chisei.evaluation.resolve` → `ResolveEvaluationPlan`,
+`chisei.evaluation.execute` → `ExecuteEvaluationManifest`,
+`sekai.definitions.branch.create` → `CreateDefinitionBranch`,
+`sekai.definitions.branch.edit` → `ApplyDefinitionBranchEdit`,
+`sekai.definitions.diff` → `CompareDefinitionRevisions`,
+`sekai.definitions.impact` → `ReportDefinitionConsumerImpact`, and
+`sekai.definitions.proposal.create` → `CreateDefinitionProposal`. Link,
+evaluation, and definition-branch tools are listed because their RPCs are
+`stable` (#1093, #1090, #2095). Evaluation
 compare is a CLI projection over existing evidence with no wire RPC, so it has
 no tool. The evaluation tools bind `input.resolution.namespace` or
 `input.execution.namespace` to the session namespace and refuse a different
@@ -451,8 +457,8 @@ effects reconcile through `GetOperationReceipt`.
 
 ### Definition-branch tools
 
-`tools/list` also returns definition-branch tools whose backing RPCs stay
-`experimental` and remain gated by `SEKAI_EXPERIMENTAL_RPCS` (#1311):
+`tools/list` also returns definition-branch tools whose backing RPCs are
+`stable` (#2095):
 `sekai.definitions.branch.create` → `CreateDefinitionBranch`,
 `sekai.definitions.branch.edit` → `ApplyDefinitionBranchEdit`,
 `sekai.definitions.diff` → `CompareDefinitionRevisions`,

@@ -108,8 +108,8 @@
       "rpc": "CreateDefinitionBranch",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp, example",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -126,8 +126,8 @@
       "rpc": "ApplyDefinitionBranchEdit",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp, example",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -135,8 +135,8 @@
       "rpc": "CreateDefinitionProposal",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp, example",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -288,8 +288,8 @@
       "rpc": "CompareDefinitionRevisions",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp, example",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -297,8 +297,8 @@
       "rpc": "ReportDefinitionConsumerImpact",
       "storage_path": "sekai.definition-branch, sekai.graph",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp, example",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {

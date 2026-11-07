@@ -11,7 +11,12 @@ HTTP_PROJECTION_CONTRACT = "sekai.http-projection/v1"
 HTTP_UNARY_METHODS = (
     ("sekai.SekaiService", "ApplySourceBatch"),
     ("sekai.SekaiService", "GetSourceSyncState"),
+    ("sekai.SekaiService", "CreateDefinitionBranch"),
+    ("sekai.SekaiService", "ApplyDefinitionBranchEdit"),
+    ("sekai.SekaiService", "CreateDefinitionProposal"),
     ("sekai.SekaiService", "GetPublishedDefinitionRevision"),
+    ("sekai.SekaiService", "CompareDefinitionRevisions"),
+    ("sekai.SekaiService", "ReportDefinitionConsumerImpact"),
     ("sekai.SekaiService", "CreateObject"),
     ("sekai.SekaiService", "GetObject"),
     ("sekai.SekaiService", "UpdateObject"),

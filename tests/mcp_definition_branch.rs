@@ -1,4 +1,4 @@
-//! MCP definition-branch tools: agent drafts, human approves (#1311).
+//! MCP definition-branch tools: agent drafts, human approves (#1311, #2095).
 
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
 use sekai_chisei::grpc::pb::sekai::{
@@ -37,11 +37,23 @@ fn with_principal<T>(payload: T, principal: &str) -> Request<T> {
 
 #[tokio::test]
 async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
-    let surface = InProcessSurface::synthetic().await.unwrap();
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface.experimental_rpcs = false;
     assert!(
         !well_known_tools()
             .iter()
             .any(|tool| tool.contains("approve") || tool.contains("merge"))
+    );
+
+    let search = handle_message(
+        &surface,
+        call(0, "sekai.search.query", json!({"text": "Ticket"})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        search["result"]["structuredContent"]["code"], "failed_precondition",
+        "{search}"
     );
 
     let created = handle_message(

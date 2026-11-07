@@ -7,7 +7,22 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "GetSourceSyncState";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "CreateDefinitionBranch";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ApplyDefinitionBranchEdit";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "CreateDefinitionProposal";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "GetPublishedDefinitionRevision";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "CompareDefinitionRevisions";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ReportDefinitionConsumerImpact";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateObject";

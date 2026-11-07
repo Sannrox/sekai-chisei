@@ -50,7 +50,7 @@ async fn default_server_layer_rejects_experimental_rpc_paths() {
     });
     let mut svc = RpcMaturityLayer::default().layer(inner);
     let request = http::Request::builder()
-        .uri("/sekai.SekaiService/CreateDefinitionBranch")
+        .uri("/sekai.SekaiService/ApproveDefinitionProposal")
         .body(tonic::body::Body::default())
         .unwrap();
     let response = svc.ready().await.unwrap().call(request).await.unwrap();
