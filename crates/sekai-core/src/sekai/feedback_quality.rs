@@ -21,7 +21,7 @@ use crate::sekai::feedback_investigation::{
 };
 use crate::sekai::feedback_package::{
     ACTION_INVESTIGATION, ACTION_VERIFICATION, KIND_FINDING, KIND_INVESTIGATION_RESULT,
-    KIND_OBSERVATION, KIND_VERIFICATION, PACKAGE_VERSION,
+    KIND_OBSERVATION, KIND_VERIFICATION, OUTCOME_QUALITY_EVALUATION, PACKAGE_VERSION,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 
@@ -464,36 +464,6 @@ pub fn quality_investigation_id(namespace: &str, finding_id: &str) -> String {
     format!("fb-inv-quality-{}", quality_key(&[namespace, finding_id]))
 }
 
-fn measured_investigation_for_signature(
-    db: &RuntimeDb,
-    namespace: &str,
-    signature: &str,
-) -> Result<Option<Object>, QualityError> {
-    for object in list_projected(db, namespace, KIND_INVESTIGATION_RESULT)? {
-        if object.properties.get("measured").map(String::as_str) != Some("true") {
-            continue;
-        }
-        let Some(observation_id) = object.properties.get("observation_id") else {
-            continue;
-        };
-        let Some(observation) = db
-            .get_object(observation_id)
-            .map_err(|error| QualityError::Internal(error.to_string()))?
-        else {
-            continue;
-        };
-        if observation
-            .properties
-            .get("problem_signature")
-            .map(String::as_str)
-            == Some(signature)
-        {
-            return Ok(Some(object));
-        }
-    }
-    Ok(None)
-}
-
 fn admit(
     db: &RuntimeDb,
     actor: &str,
@@ -540,7 +510,7 @@ fn admit(
     }
 }
 
-fn ensure_measured_investigation(
+fn ensure_quality_investigation(
     db: &RuntimeDb,
     actor: &str,
     finding: &Object,
@@ -548,11 +518,14 @@ fn ensure_measured_investigation(
     signature: &str,
     now_ms: i64,
 ) -> Result<String, QualityError> {
-    if let Some(existing) = measured_investigation_for_signature(db, &finding.namespace, signature)?
-    {
-        return Ok(existing.id);
-    }
     let investigation_id = quality_investigation_id(&finding.namespace, &finding.id);
+    if db
+        .get_object(&investigation_id)
+        .map_err(|error| QualityError::Internal(error.to_string()))?
+        .is_some()
+    {
+        return Ok(investigation_id);
+    }
     admit(
         db,
         actor,
@@ -562,8 +535,8 @@ fn ensure_measured_investigation(
             "object_id": investigation_id,
             "name": signature,
             "observation_id": original.view.object_id,
-            "outcome": "quality-evaluation",
-            "measured": true,
+            "outcome": OUTCOME_QUALITY_EVALUATION,
+            "measured": false,
         }),
         &format!(
             "feedback:inv-quality:{}",
@@ -659,7 +632,7 @@ pub fn evaluate_finding(
     let quality = decide_quality(duplicate, match_class, &matches);
     let fingerprint = assessment_fingerprint(match_class, quality, &matches);
     let investigation_id =
-        ensure_measured_investigation(db, actor, finding, &original, &signature, now_ms)?;
+        ensure_quality_investigation(db, actor, finding, &original, &signature, now_ms)?;
     let record = QualityRecord {
         namespace: finding.namespace.clone(),
         finding_id: finding.id.clone(),
@@ -800,7 +773,8 @@ mod tests {
     use crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle;
     use crate::sekai::evidence_store::{EvidenceProducerCapability, canonical_content_digest};
     use crate::sekai::feedback_investigation::{
-        Attribution, InvestigationAnalysis, record_investigation,
+        Attribution, FilingDecision, InvestigationAnalysis, decide_filing, gather_cluster,
+        github_dispatch_permitted, record_investigation,
     };
     use crate::sekai::feedback_package::{
         ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, install,
@@ -1126,6 +1100,58 @@ mod tests {
 
         let again = evaluate_namespace(&runtime, NAMESPACE, ACTOR, 31_000).unwrap();
         assert_eq!(again.records.len(), report.records.len());
+    }
+
+    #[test]
+    fn quality_pass_does_not_qualify_later_observations() {
+        let runtime = db();
+        record_observation(
+            &runtime,
+            NAMESPACE,
+            "c-1",
+            "api:cancelled",
+            "c-op-1@0.5.0",
+            "cancelled",
+            1_000,
+        );
+        let cluster = gather_cluster(&runtime, NAMESPACE, "c-1", 10_000).unwrap();
+        let mut analysis = tenkai_analysis();
+        analysis.attribution = Attribution::Application;
+        let report = record_investigation(&runtime, &cluster, &analysis, ACTOR, 10_000).unwrap();
+        let finding = runtime.get_object(&report.finding_id).unwrap().unwrap();
+        assert!(!github_dispatch_permitted(&finding));
+
+        let evaluated = evaluate_namespace(&runtime, NAMESPACE, ACTOR, 20_000).unwrap();
+        let record = evaluated
+            .records
+            .iter()
+            .find(|item| item.finding_id == finding.id)
+            .expect("quality record");
+        let quality_inv = runtime
+            .get_object(&record.investigation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            quality_inv.properties.get("measured").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            quality_inv.properties.get("outcome").map(String::as_str),
+            Some(OUTCOME_QUALITY_EVALUATION)
+        );
+
+        record_observation(
+            &runtime,
+            NAMESPACE,
+            "c-2",
+            "api:cancelled",
+            "c-op-2@0.5.0",
+            "cancelled",
+            21_000,
+        );
+        let later = gather_cluster(&runtime, NAMESPACE, "c-2", 30_000).unwrap();
+        assert!(!later.has_measured_reproduction);
+        assert_eq!(decide_filing(&later, &analysis), FilingDecision::Internal);
     }
 
     #[test]

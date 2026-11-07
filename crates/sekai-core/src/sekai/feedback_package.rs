@@ -35,6 +35,8 @@ pub const KIND_INVESTIGATION_RESULT: &str = "feedback_investigation_result";
 pub const KIND_HYPOTHESIS: &str = "feedback_hypothesis";
 pub const KIND_EXTERNAL_ISSUE: &str = "feedback_external_issue";
 pub const KIND_VERIFICATION: &str = "feedback_verification";
+/// Outcome written by the quality pass. Not a measured reproduction.
+pub const OUTCOME_QUALITY_EVALUATION: &str = "quality-evaluation";
 pub const ACTION_OBSERVATION: &str = "feedback.observation.record";
 pub const ACTION_FINDING: &str = "feedback.finding.record";
 pub const ACTION_INVESTIGATION: &str = "feedback.investigation.record";
@@ -297,7 +299,8 @@ fn fixture_digest(bytes: &[u8]) -> String {
 
 /// Package write rules on top of ObjectType schema: observations require
 /// accepted source evidence with a unique namespace/external identity, and
-/// verification subjects must be measured investigation results.
+/// verification subjects must be measured investigation results or quality
+/// evaluation stubs.
 pub fn validate_object_write(
     db: &RuntimeDb,
     object: &mut Object,
@@ -421,7 +424,10 @@ fn validate_verification_subject(db: &RuntimeDb, object: &Object) -> Result<(), 
     if subject.kind != KIND_INVESTIGATION_RESULT {
         return Err("verification subject is not an investigation result".into());
     }
-    if subject.properties.get("measured").map(String::as_str) != Some("true") {
+    let measured = subject.properties.get("measured").map(String::as_str) == Some("true");
+    let quality_evaluation =
+        subject.properties.get("outcome").map(String::as_str) == Some(OUTCOME_QUALITY_EVALUATION);
+    if !measured && !quality_evaluation {
         return Err("verification subject is not a measured investigation result".into());
     }
     Ok(())
@@ -1254,6 +1260,39 @@ mod tests {
             ActionInstanceAdmissionError::FailedPrecondition(_)
         ));
         assert!(runtime.get_object("ver-unmeasured").unwrap().is_none());
+
+        let quality = serde_json::json!({
+            "object_id": "inv-quality",
+            "name": "quality",
+            "observation_id": "obs-1",
+            "outcome": OUTCOME_QUALITY_EVALUATION,
+            "measured": false
+        });
+        ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                admit_request(
+                    ACTION_INVESTIGATION,
+                    &quality.to_string(),
+                    "inv-quality",
+                    vec![],
+                ),
+                ACTOR,
+                3_400,
+            )
+            .unwrap();
+        ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                admit_request(
+                    ACTION_VERIFICATION,
+                    r#"{"object_id":"ver-quality","name":"check","subject_id":"inv-quality","subject_kind":"feedback_investigation_result","result":"inconclusive"}"#,
+                    "ver-quality",
+                    vec![],
+                ),
+                ACTOR,
+                3_500,
+            )
+            .unwrap();
+        assert!(runtime.get_object("ver-quality").unwrap().is_some());
 
         let investigation = serde_json::json!({
             "object_id": "inv-1",
