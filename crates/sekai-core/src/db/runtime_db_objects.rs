@@ -737,6 +737,23 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_live_site_agent_memory(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        after_id: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<Object>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.list_live_site_agent_memory(namespace, instance_id, after_id, limit)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_live_site_agent_memory(namespace, instance_id, after_id, limit)
+            }),
+        }
+    }
+
     pub fn list_interfaces(&self) -> Result<Vec<InterfaceDef>, String> {
         match self {
             Self::Sqlite(db) => db.list_interfaces(),

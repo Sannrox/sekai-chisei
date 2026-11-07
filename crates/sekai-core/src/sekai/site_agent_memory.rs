@@ -27,7 +27,7 @@
 //! reference store, as for site agent instances (ADR 0136).
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::domain::{ListFilter, Object, PropertyFilter};
+use crate::domain::Object;
 use crate::sekai::governed_action_type::{
     EFFECT_KIND_NOTIFY, GovernedActionType, OBJECT_MUTATION_CREATE, OBJECT_MUTATION_UPDATE,
 };
@@ -222,19 +222,42 @@ pub fn list_live_for_instance(
     namespace: &str,
     instance_id: &str,
 ) -> Result<Vec<Object>, String> {
-    let mut items = db.list_all_objects(&ListFilter {
-        kind: Some(KIND.into()),
-        namespace: Some(namespace.into()),
-        property_filters: vec![PropertyFilter {
-            key: INSTANCE_PROPERTY.into(),
-            op: "eq".into(),
-            value: instance_id.into(),
-        }],
-        ..Default::default()
-    })?;
-    items.retain(|object| !is_forgotten(object));
-    items.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut after = None;
+    let mut items = Vec::new();
+    loop {
+        let page = list_live_page(db, namespace, instance_id, after.as_deref(), 256)?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|object| object.id.clone());
+        items.extend(page);
+    }
     Ok(items)
+}
+
+/// One keyset page of live working memory, ordered by id, at most `limit`
+/// rows. Forgotten tombstones stay in the store and are excluded here.
+/// Visibility is applied by the caller (#2034).
+pub fn list_live_page(
+    db: &RuntimeDb,
+    namespace: &str,
+    instance_id: &str,
+    after_id: Option<&str>,
+    limit: i32,
+) -> Result<Vec<Object>, String> {
+    db.list_live_site_agent_memory(namespace, instance_id, after_id, limit)
+}
+
+/// Empty is the first page. Otherwise the previous response's last id.
+pub fn parse_page_token(token: &str) -> Result<Option<String>, String> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let id = token.trim();
+    if id.is_empty() || id.len() > 256 || id.contains('|') || id.chars().any(char::is_whitespace) {
+        return Err("invalid page token".into());
+    }
+    Ok(Some(id.to_string()))
 }
 
 /// Actions whose parameters may hold a memory item's note.
@@ -1123,6 +1146,80 @@ mod tests {
         assert_eq!(
             live.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
             ["note-live"]
+        );
+        let page = list_live_page(&db, NAMESPACE, "line-7", None, 1).unwrap();
+        assert_eq!(
+            page.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            ["note-live"]
+        );
+        assert!(
+            list_live_page(&db, NAMESPACE, "line-7", Some("note-live"), 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(parse_page_token("").unwrap(), None);
+        assert_eq!(
+            parse_page_token("note-live").unwrap().as_deref(),
+            Some("note-live")
+        );
+        assert!(parse_page_token("note live").is_err());
+    }
+
+    #[test]
+    fn list_live_page_is_a_keyset_of_one_instance() {
+        let db = setup();
+        for (id, instance) in [
+            ("note-a", "line-7"),
+            ("note-b", "line-7"),
+            ("note-c", "line-7"),
+            ("note-x", "other"),
+        ] {
+            db.create_object(&Object {
+                id: id.into(),
+                kind: KIND.into(),
+                name: id.into(),
+                namespace: NAMESPACE.into(),
+                external_id: String::new(),
+                properties: HashMap::from([
+                    (INSTANCE_PROPERTY.into(), instance.into()),
+                    (CONTENT_PROPERTY.into(), id.into()),
+                ]),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        }
+        db.create_object(&Object {
+            id: "note-gone".into(),
+            kind: KIND.into(),
+            name: "note-gone".into(),
+            namespace: NAMESPACE.into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (INSTANCE_PROPERTY.into(), "line-7".into()),
+                (CONTENT_PROPERTY.into(), String::new()),
+                (FORGOTTEN_PROPERTY.into(), "true".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let first = list_live_page(&db, NAMESPACE, "line-7", None, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["note-a", "note-b"]
+        );
+        let second =
+            list_live_page(&db, NAMESPACE, "line-7", Some(&first.last().unwrap().id), 2).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["note-c"]
         );
     }
 

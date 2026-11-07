@@ -393,6 +393,35 @@ impl PostgresDb {
         self.list_objects(&effective_filter)
     }
 
+    /// Live site-agent working memory of one instance, keyset by id.
+    /// Forgotten rows stay in the store and are excluded here (#2034).
+    pub fn list_live_site_agent_memory(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        after_id: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<Object>, String> {
+        if limit <= 0 {
+            return Err("limit must be positive".into());
+        }
+        let limit = i64::from(limit.min(MAX_LIST_LIMIT));
+        let after = after_id.map(str::to_owned);
+        self.query_objects(
+            &format!(
+                "SELECT {OBJECT_COLUMNS} FROM sekai_objects
+                 WHERE kind = 'site_agent_memory'
+                   AND namespace = $1
+                   AND sekai_jsonb_object(properties) ->> 'instance_id' = $2
+                   AND coalesce(sekai_jsonb_object(properties) ->> 'forgotten', '') <> 'true'
+                   AND ($3::text IS NULL OR id > $3)
+                 ORDER BY id
+                 LIMIT $4"
+            ),
+            &[&namespace, &instance_id, &after, &limit],
+        )
+    }
+
     pub fn list_objects_with_total_for_principals(
         &self,
         filter: &ListFilter,
