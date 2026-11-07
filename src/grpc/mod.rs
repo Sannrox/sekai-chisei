@@ -936,11 +936,16 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
             | "ListDatasets"
-            // Dataset rows, versions, rollback and health (#2097): each
-            // handler authorizes the binding object's namespace
-            // (`authorize_dataset`) and refuses unbound datasets and guests.
-            // Branch handlers authorize a bound dataset in `branch_caller`.
+            // Dataset rows, versions, rollback, health (#2097) and catalog
+            // writes (#2105): each handler authorizes the binding object's
+            // namespace (`authorize_dataset`) and refuses unbound datasets
+            // and guests. CreateDataset requires a live binding object in a
+            // writable namespace. Branch handlers authorize a bound dataset
+            // in `branch_caller`.
             | "QueryRows"
+            | "CreateDataset"
+            | "UpdateDataset"
+            | "AppendRows"
             | "ListDatasetVersions"
             | "GetDatasetVersion"
             | "RollbackDataset"
@@ -2537,6 +2542,10 @@ mod tests {
             NamespaceAction::Read
         );
         assert_eq!(rpc_namespace_action("QueryRows"), NamespaceAction::Read);
+        for method in ["CreateDataset", "UpdateDataset", "AppendRows"] {
+            assert_eq!(rpc_namespace_action(method), NamespaceAction::Write);
+            assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
+        }
         assert_eq!(
             rpc_namespace_action("EvaluateObjectSet"),
             NamespaceAction::Read
@@ -2564,6 +2573,12 @@ mod tests {
             (SpaceRole::Discoverer, "ListSiteAgentInstanceTurns", false),
             (SpaceRole::Discoverer, "QueryRows", false),
             (SpaceRole::Viewer, "QueryRows", true),
+            (SpaceRole::Viewer, "CreateDataset", false),
+            (SpaceRole::Viewer, "AppendRows", false),
+            (SpaceRole::Viewer, "UpdateDataset", false),
+            (SpaceRole::Editor, "CreateDataset", true),
+            (SpaceRole::Editor, "AppendRows", true),
+            (SpaceRole::Editor, "UpdateDataset", true),
             (SpaceRole::Discoverer, "EvaluateObjectSet", false),
             (SpaceRole::Discoverer, "CreateObject", false),
             (SpaceRole::Viewer, "CreateObject", false),
@@ -3030,6 +3045,9 @@ mod tests {
             "ExecutePlanStream",
             "ListSchemaTypes",
             "ListDatasets",
+            "CreateDataset",
+            "UpdateDataset",
+            "AppendRows",
             "DescribeObjectAction",
             "DiscoverCapabilities",
         ] {
