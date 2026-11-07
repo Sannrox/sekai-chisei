@@ -526,6 +526,7 @@ impl SekaiDb {
                 operation_id TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_changes_object ON sekai_object_changes(object_id);
+            CREATE INDEX IF NOT EXISTS idx_object_changes_timestamp ON sekai_object_changes(timestamp, id);
             CREATE INDEX IF NOT EXISTS idx_decisions_target ON sekai_decisions(target_id, timestamp);
             CREATE TABLE IF NOT EXISTS sekai_schema_migrations (
                 name TEXT PRIMARY KEY

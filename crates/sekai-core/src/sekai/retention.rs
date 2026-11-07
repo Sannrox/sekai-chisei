@@ -1632,6 +1632,10 @@ pub(crate) fn fold_observation_baseline(
     )
 }
 
+pub(crate) fn dataset_has_policy(policies: &[RetentionPolicy], dataset: &str) -> bool {
+    policies.iter().any(|policy| policy.dataset == dataset)
+}
+
 pub(crate) fn effective_policy<'a>(
     policies: &'a [RetentionPolicy],
     dataset: &str,
@@ -1683,6 +1687,11 @@ impl SekaiDb {
                 old_payload_hash TEXT NOT NULL, new_payload_hash TEXT NOT NULL,
                 subject_hash TEXT NOT NULL, redacted_at_ms INTEGER NOT NULL,
                 FOREIGN KEY(dataset,source_key) REFERENCES sekai_archive_records(dataset,source_key));",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_object_changes_timestamp
+             ON sekai_object_changes(timestamp, id);",
         )
         .map_err(|e| e.to_string())?;
         // No default policies. Both backends stay empty until an operator
@@ -3387,8 +3396,16 @@ impl SekaiDb {
     /// batches already committed and loses none in progress; a rerun resumes.
     /// Each batch takes the write lock up front, so concurrent runs
     /// interleave batches and never archive a record twice. A dry run counts
-    /// everything in one pass and rolls it back.
+    /// everything in one pass and rolls it back. With no policies the run
+    /// returns without taking the writer lock.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        let policies = self.list_retention_policies()?;
+        if policies.is_empty() {
+            return Ok(ArchiveRun {
+                dry_run,
+                ..ArchiveRun::default()
+            });
+        }
         // A dry run moves nothing, so it counts everything in one pass.
         if dry_run {
             return self.archive_retained_batch(
@@ -3407,15 +3424,17 @@ impl SekaiDb {
                 total.absorb(batch);
             }
         }
-        self.finish_retention_run(now, total.llm_calls_archived > 0)?;
+        if dataset_has_policy(&policies, LLM_CALLS_DATASET) {
+            self.finish_retention_run(now, total.llm_calls_archived > 0)?;
+        }
         Ok(total)
     }
 
-    /// After a run's last batch, on every run: drop calls past their policy
-    /// from the `llm_calls` versions, so a run that crashed before this step
-    /// is completed by the next one even when it has nothing new to archive
-    /// (one pass over the version rows; nothing matches once clean). Records
-    /// an `archive` version when this run archived calls.
+    /// After a run's last batch, when an `llm_calls` policy exists: drop
+    /// calls past their policy from the `llm_calls` versions, so a run that
+    /// crashed before this step is completed by the next one even when it has
+    /// nothing new to archive (one pass over the version rows; nothing matches
+    /// once clean). Records an `archive` version when this run archived calls.
     fn finish_retention_run(&self, now: i64, archived_calls: bool) -> Result<(), String> {
         let policies = self.list_retention_policies()?;
         let mut conn = self.conn();
@@ -3443,6 +3462,17 @@ impl SekaiDb {
         cursor: &mut RetentionCursor,
     ) -> Result<ArchiveRun, String> {
         let policies = self.list_retention_policies()?;
+        if policies.is_empty() {
+            cursor.audit_done = true;
+            cursor.object_changes_done = true;
+            cursor.content_events_done = true;
+            cursor.llm_done = true;
+            cursor.observations_done = true;
+            return Ok(ArchiveRun {
+                dry_run,
+                ..ArchiveRun::default()
+            });
+        }
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -3570,6 +3600,9 @@ impl SekaiDb {
 
         let llm_rows = if cursor.llm_done {
             Vec::new()
+        } else if !dataset_has_policy(&policies, LLM_CALLS_DATASET) {
+            cursor.llm_done = true;
+            Vec::new()
         } else {
             let mut stmt = tx
                 .prepare(
@@ -3606,6 +3639,9 @@ impl SekaiDb {
         }
 
         let observation_rows = if cursor.observations_done {
+            Vec::new()
+        } else if !dataset_has_policy(&policies, TASK_OBSERVATIONS_DATASET) {
+            cursor.observations_done = true;
             Vec::new()
         } else {
             let (component, timestamp, rowid) = cursor
@@ -3676,8 +3712,8 @@ impl SekaiDb {
             let mut stmt = tx
                 .prepare(
                     "SELECT id,event_kind,blob_id,reference_id,actor,reason,created_at_ms
-                     FROM sekai_content_events WHERE created_at_ms < ?1 ORDER BY id
-                     LIMIT ?2",
+                     FROM sekai_content_events WHERE created_at_ms < ?1
+                     ORDER BY created_at_ms,id LIMIT ?2",
                 )
                 .map_err(|e| e.to_string())?;
             let rows = stmt
@@ -4618,8 +4654,95 @@ mod tests {
     #[test]
     fn archive_with_no_policies_moves_nothing() {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([
+                ("timestamp_ms".into(), "1".into()),
+                ("project".into(), "ns".into()),
+            ])],
+        )
+        .unwrap();
+        {
+            let conn = db.as_sqlite().expect("sqlite").conn();
+            conn.execute(
+                "INSERT INTO sekai_task_observations
+                 (request_id,namespace,data_class,component_id,model,status,timestamp)
+                 VALUES ('r','ns','public','component','','done',1)",
+                [],
+            )
+            .unwrap();
+        }
         let run = db.archive_retained_records(100 * DAY_MS, false).unwrap();
         assert_eq!(run, ArchiveRun::default());
+        assert_eq!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.list_task_observations_for_component("component")
+                .unwrap()
+                .len(),
+            1
+        );
+        let conn = db.as_sqlite().expect("sqlite").conn();
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN
+                 ('idx_object_changes_timestamp','idx_content_events_created')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 2);
+    }
+
+    #[test]
+    fn archive_without_llm_policy_leaves_llm_calls() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([
+                ("timestamp_ms".into(), "1".into()),
+                ("project".into(), "ns".into()),
+            ])],
+        )
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 365,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(100 * DAY_MS, false).unwrap();
+        assert_eq!(run.llm_calls_archived, 0);
+        assert_eq!(
+            db.query_rows(LLM_CALLS_DATASET, &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

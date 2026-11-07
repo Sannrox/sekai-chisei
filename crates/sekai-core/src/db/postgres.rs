@@ -197,6 +197,8 @@ const AGENT_TURN_INSTANCE_INDEX_SCHEMA: &str =
     include_str!("postgres/0138_agent_turn_instance_index.sql");
 const SECURITY_REMEDIATION_IDENTITY_SCHEMA: &str =
     include_str!("postgres/0139_security_remediation_identity.sql");
+const RETENTION_PREDICATE_INDEXES_SCHEMA: &str =
+    include_str!("postgres/0140_retention_predicate_indexes.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1000,6 +1002,12 @@ const MIGRATIONS: &[Migration] = &[
         138,
         "security_remediation_identity",
         SECURITY_REMEDIATION_IDENTITY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        139,
+        "retention_predicate_indexes",
+        RETENTION_PREDICATE_INDEXES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2764,6 +2772,25 @@ mod tests {
         assert!(
             EXECUTION_EVIDENCE_STATE_SCHEMA
                 .contains("CREATE TABLE IF NOT EXISTS sekai_external_action_execution_alerts")
+        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+    }
+
+    #[test]
+    fn retention_predicate_indexes_cover_object_changes_and_content_events() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "retention_predicate_indexes")
+            .expect("retention_predicate_indexes");
+        assert_eq!(migration.version, 139);
+        assert!(matches!(migration.owner, MigrationOwner::Sekai));
+        assert!(
+            RETENTION_PREDICATE_INDEXES_SCHEMA.contains("ON sekai_object_changes (timestamp, id)")
+        );
+        assert!(
+            RETENTION_PREDICATE_INDEXES_SCHEMA
+                .contains("ON sekai_content_events (created_at_ms, id)")
         );
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
     }
