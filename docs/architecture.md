@@ -73,10 +73,11 @@ retaining obligation. Retention archives into `sekai_archive_*` tables in the sa
 both backends (ADR 0141): `RuntimeDb::archive_retained_records(now, dry_run)`
 moves records past their policy cutoff and removes or redacts them in one
 transaction. SQLite covers decisions, attestations, object changes, LLM calls,
-task observations and content events; PostgreSQL covers all six. Both
-backends archive decisions, attestations and object changes (the `audit`
-policy) only after `RuntimeDb::verify_ledger` passes, and refuse the run
-naming the failure otherwise; on PostgreSQL the check reads one snapshot. Batches on several PostgreSQL replicas take turns under a
+task observations and content events; PostgreSQL covers all six. Both backends archive expired audit decisions and their attestations only
+after that prefix verifies, and refuse the run naming the failure otherwise.
+Idle ticks with an audit policy and nothing expired skip the walk; object
+changes still follow the dataset-wide audit policy. On PostgreSQL the check
+holds the ledger lock and reads one snapshot through the prefix. Batches on several PostgreSQL replicas take turns under a
 transaction-scoped archive lock, so each record is archived once. A plane-owned
 tick on every Sekai instance calls that entry point on a one-minute interval
 (ADR 0129); `sekaictl admin retention status | dry-run | run | policy list | policy set | policy delete` uses it too.

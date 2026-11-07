@@ -321,10 +321,11 @@ impl PostgresDb {
     /// transaction and locks the rows it reads, so replicas running at once
     /// take turns batch by batch and archive every record once; a crash
     /// loses only the uncommitted batch, which a rerun redoes. A dry run
-    /// counts everything in one pass and rolls it back. Decisions, their
-    /// attestations and object changes (all under the `audit` policy) go
-    /// only after the ledger verifies, once per run under the ledger lock,
-    /// and the run refuses naming the failure otherwise.
+    /// counts everything in one pass and rolls it back. Expired audit
+    /// decisions and their attestations go only after that prefix verifies
+    /// under the ledger lock; idle ticks with nothing expired skip the
+    /// walk. Object changes follow the dataset-wide audit policy. The run
+    /// refuses naming a verification failure.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         self.archive_retained_records_locked(now, dry_run, false)
     }
@@ -457,45 +458,40 @@ fn archive_retained_batch_on(
     let audit_policy = policies
         .iter()
         .any(|policy| policy.dataset == AUDIT_DATASET);
-    if audit_policy && !cursor.audit_done {
-        // The ledger lock every decision writer takes, before the rows
-        // lock as in erasure: the ledger cannot move under this batch.
-        tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
-            .map_err(err)?;
-    }
     let full = |rows: usize| i64::try_from(rows).unwrap_or(i64::MAX) >= limit;
     let mut records = Vec::<ArchiveRecord>::new();
 
-    // Audit records go only after the ledger verifies, once per run, in
-    // this batch's transaction; a failure refuses the whole run.
-    if audit_policy && !cursor.ledger_verified {
-        let verification = crate::db::postgres_decision::verify_ledger_in(&mut tx)?;
-        if !verification.ok {
-            return Err(format!(
-                "audit ledger verification failed before retention: {}",
-                verification.error
-            ));
-        }
-        cursor.ledger_verified = true;
-    }
+    // Cheap forged/incomplete probes first, then plan the expired prefix
+    // before taking 25012 or hashing the chain. Idle ticks with an audit
+    // policy and nothing expired skip the lock and the walk.
     let mut audit_archived = 0;
     let mut prefix_end = None;
     if audit_policy && !cursor.audit_done {
+        crate::db::postgres_decision::ledger_chain_metadata_ok(&mut tx).map_err(|error| {
+            format!("audit ledger verification failed before retention: {error}")
+        })?;
         let rows = tx
             .query(
                 "SELECT seq,timestamp,evidence FROM sekai_decisions
-                     ORDER BY seq LIMIT $1",
+                     ORDER BY seq NULLS FIRST LIMIT $1",
                 &[&limit.saturating_add(1)],
             )
             .map_err(err)?
             .into_iter()
             .map(|row| {
+                let seq: Option<i64> = row.get(0);
+                let Some(seq) = seq else {
+                    return Err(
+                        "audit ledger verification failed before retention: audit ledger contains incomplete chain metadata"
+                            .into(),
+                    );
+                };
                 let evidence = serde_json::from_str(row.get(2)).unwrap_or_default();
                 let (namespace, data_class) =
                     crate::sekai::ledger::lifecycle_scope_from_evidence(&evidence);
-                (row.get(0), row.get(1), namespace, data_class)
+                Ok((seq, row.get(1), namespace, data_class))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         let (end, done) = plan_audit_prefix(
             rows,
             policies,
@@ -508,6 +504,18 @@ fn archive_retained_batch_on(
         cursor.audit_done = true;
     }
     if let Some(prefix_end) = prefix_end {
+        // The ledger lock every decision writer takes, then verify only
+        // the prefix this batch will archive.
+        tx.query_one("SELECT pg_advisory_xact_lock(25012)", &[])
+            .map_err(err)?;
+        let verification =
+            crate::db::postgres_decision::verify_ledger_in(&mut tx, Some(prefix_end))?;
+        if !verification.ok {
+            return Err(format!(
+                "audit ledger verification failed before retention: {}",
+                verification.error
+            ));
+        }
         for row in tx
             .query(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
@@ -678,9 +686,7 @@ fn archive_retained_batch_on(
     let observations_archived = observation_records.len();
     records.extend(observation_records.into_iter().map(ArchiveRecord::from));
 
-    // Object changes follow the dataset-wide audit policy, as on SQLite,
-    // so they pass the same ledger gate above: an `audit` policy means
-    // the ledger was verified in this run before anything moves.
+    // Object changes follow the dataset-wide audit policy, as on SQLite.
     // Archived rows leave the table, so each batch reads the oldest.
     let mut change_ids = Vec::new();
     if let (false, Some(policy)) = (
@@ -1034,7 +1040,6 @@ impl PostgresDb {
 /// last key read.
 #[derive(Debug, Default)]
 struct RetentionCursor {
-    ledger_verified: bool,
     audit_done: bool,
     llm_after: i64,
     llm_done: bool,

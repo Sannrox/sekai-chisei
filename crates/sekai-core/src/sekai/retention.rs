@@ -20,7 +20,6 @@ pub const RETENTION_BATCH_SIZE: usize = 500;
 /// (LLM calls, task observations) resume after the last key read.
 #[derive(Debug, Default)]
 struct RetentionCursor {
-    ledger_verified: bool,
     audit_done: bool,
     object_changes_done: bool,
     content_events_done: bool,
@@ -1282,7 +1281,47 @@ fn audit_contains_identifier(decision: &Decision, identifier: &str) -> bool {
         })
 }
 
-fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
+fn decisions_chain_metadata_ok(tx: &Transaction<'_>) -> Result<(), String> {
+    let anchor_seq: i64 = tx
+        .query_row(
+            "SELECT seq FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(0);
+    let forged: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sekai_decisions WHERE seq <= ?1)",
+            params![anchor_seq],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if forged {
+        return Err("audit ledger contains rows below its purge anchor".into());
+    }
+    let incomplete: bool = tx
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM sekai_decisions
+                WHERE seq IS NULL OR prev_hash IS NULL OR entry_hash IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if incomplete {
+        return Err("audit ledger contains incomplete chain metadata".into());
+    }
+    Ok(())
+}
+
+fn verify_decisions_in_transaction(
+    tx: &Transaction<'_>,
+    through_seq: Option<i64>,
+) -> Result<(), String> {
+    decisions_chain_metadata_ok(tx)?;
     let (anchor_seq, anchor_hash) = tx
         .query_row(
             "SELECT seq, entry_hash FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
@@ -1292,36 +1331,17 @@ fn verify_decisions_in_transaction(tx: &Transaction<'_>) -> Result<(), String> {
         .optional()
         .map_err(|e| e.to_string())?
         .unwrap_or((0, String::new()));
-    let forged: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM sekai_decisions WHERE seq <= ?1",
-            params![anchor_seq],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if forged > 0 {
-        return Err("audit ledger contains rows below its purge anchor".into());
-    }
-    let incomplete: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM sekai_decisions
-             WHERE seq IS NULL OR prev_hash IS NULL OR entry_hash IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if incomplete > 0 {
-        return Err("audit ledger contains incomplete chain metadata".into());
-    }
     let rows = {
         let mut stmt = tx
             .prepare(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
                         seq,prev_hash,entry_hash,namespace,data_class
-                 FROM sekai_decisions WHERE seq > ?1 ORDER BY seq",
+                 FROM sekai_decisions
+                 WHERE seq > ?1 AND (?2 IS NULL OR seq <= ?2)
+                 ORDER BY seq",
             )
             .map_err(|e| e.to_string())?;
-        stmt.query_map(params![anchor_seq], |row| {
+        stmt.query_map(params![anchor_seq, through_seq], |row| {
             let evidence_json: String = row.get(5)?;
             Ok((
                 Decision {
@@ -1440,7 +1460,7 @@ fn expired_audit_prefix(
             .map_err(|e| e.to_string())?;
         stmt.query_map(params![sql_limit(limit.saturating_add(1))], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
@@ -1450,6 +1470,14 @@ fn expired_audit_prefix(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?
     };
+    let rows = rows
+        .into_iter()
+        .map(|(seq, timestamp, namespace, data_class)| {
+            let seq =
+                seq.ok_or_else(|| "audit ledger contains incomplete chain metadata".to_string())?;
+            Ok((seq, timestamp, namespace, data_class))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(plan_audit_prefix(rows, policies, now, limit))
 }
 
@@ -1787,7 +1815,7 @@ impl SekaiDb {
         };
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        verify_decisions_in_transaction(&tx)?;
+        verify_decisions_in_transaction(&tx, None)?;
         let content_predicate = match request.subject_kind.as_str() {
             "work_unit" => "operation_id=?1 OR causal_identity=?1",
             "agent" | "user" => "actor=?1",
@@ -3220,7 +3248,7 @@ impl SekaiDb {
     ) -> Result<i32, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        verify_decisions_in_transaction(&tx)?;
+        verify_decisions_in_transaction(&tx, None)?;
         let (prefix_end, _) = expired_audit_prefix(&tx, policies, now, usize::MAX)?;
         let mut deleted = 0;
         if let Some(prefix_end) = prefix_end {
@@ -3396,8 +3424,11 @@ impl SekaiDb {
     /// batches already committed and loses none in progress; a rerun resumes.
     /// Each batch takes the write lock up front, so concurrent runs
     /// interleave batches and never archive a record twice. A dry run counts
-    /// everything in one pass and rolls it back. With no policies the run
-    /// returns without taking the writer lock.
+    /// everything in one pass and rolls it back. Expired audit decisions
+    /// and their attestations go only after that prefix verifies; idle
+    /// ticks with nothing expired skip the walk. Object changes follow the
+    /// dataset-wide audit policy. With no policies the run returns without
+    /// taking the writer lock.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         let policies = self.list_retention_policies()?;
         if policies.is_empty() {
@@ -3485,24 +3516,31 @@ impl SekaiDb {
                     && policy.data_class.is_empty()
             })
             .map(|policy| now - i64::from(policy.retention_days) * DAY_MS);
-        // The ledger is verified once per run, in its first batch.
-        if !cursor.ledger_verified
-            && policies
-                .iter()
-                .any(|policy| policy.dataset == AUDIT_DATASET)
-        {
-            verify_decisions_in_transaction(&tx).map_err(|error| {
-                format!("audit ledger verification failed before retention: {error}")
-            })?;
-        }
-        cursor.ledger_verified = true;
-        let prefix_end = if cursor.audit_done {
+        let audit_policy = policies
+            .iter()
+            .any(|policy| policy.dataset == AUDIT_DATASET);
+        let prefix_end = if cursor.audit_done || !audit_policy {
+            cursor.audit_done = true;
             None
         } else {
-            let (prefix_end, done) = expired_audit_prefix(&tx, &policies, now, limit)?;
+            decisions_chain_metadata_ok(&tx).map_err(|error| {
+                format!("audit ledger verification failed before retention: {error}")
+            })?;
+            let (prefix_end, done) =
+                expired_audit_prefix(&tx, &policies, now, limit).map_err(|error| {
+                    format!("audit ledger verification failed before retention: {error}")
+                })?;
             cursor.audit_done = done;
             prefix_end
         };
+        // Cheap forged/incomplete probes already ran when an audit policy
+        // exists. Idle ticks with nothing expired skip the chain walk. A
+        // prefix is verified only as far as this batch will archive.
+        if let Some(end) = prefix_end {
+            verify_decisions_in_transaction(&tx, Some(end)).map_err(|error| {
+                format!("audit ledger verification failed before retention: {error}")
+            })?;
+        }
 
         let mut records = Vec::<ArchiveRecord>::new();
         let mut object_change_ids = Vec::new();
@@ -6592,6 +6630,150 @@ mod tests {
         assert!(error.contains("audit ledger hash invalid"), "{error}");
         assert!(db.get_decision("tampered").unwrap().is_some());
         assert_eq!(db.retention_archive_status().unwrap().batches, 0);
+    }
+
+    #[test]
+    fn idle_audit_tick_archives_nothing_for_unexpired_rows() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.record_decision(&Decision {
+            id: "fresh".into(),
+            timestamp: 2 * DAY_MS,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.audit_archived, 0);
+        assert_eq!(run.batches, 0);
+        assert!(db.get_decision("fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn idle_audit_tick_skips_verify_when_nothing_expired() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.record_decision(&Decision {
+            id: "fresh".into(),
+            timestamp: 2 * DAY_MS,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "UPDATE sekai_decisions SET outcome='forged' WHERE id='fresh'",
+                [],
+            )
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.audit_archived, 0);
+        assert_eq!(run.batches, 0);
+        assert!(db.get_decision("fresh").unwrap().is_some());
+        assert!(!db.verify_ledger().unwrap().ok);
+    }
+
+    #[test]
+    fn idle_audit_tick_refuses_incomplete_seq() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.record_decision(&Decision {
+            id: "fresh".into(),
+            timestamp: 2 * DAY_MS,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute("UPDATE sekai_decisions SET seq=NULL WHERE id='fresh'", [])
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: AUDIT_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let error = db.archive_retained_records(2 * DAY_MS, false).unwrap_err();
+        assert!(error.contains("incomplete chain metadata"));
+        assert!(db.get_decision("fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn llm_calls_retention_skips_ledger_probes_without_audit_policy() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        db.create_dataset(&Dataset {
+            id: LLM_CALLS_DATASET.into(),
+            name: "calls".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            LLM_CALLS_DATASET,
+            &[HashMap::from([("timestamp_ms".into(), "1".into())])],
+        )
+        .unwrap();
+        db.record_decision(&Decision {
+            id: "fresh".into(),
+            timestamp: 2 * DAY_MS,
+            actor: "actor".into(),
+            action: "test".into(),
+            reason: String::new(),
+            evidence: HashMap::new(),
+            target_id: String::new(),
+            outcome: "ok".into(),
+        })
+        .unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute("UPDATE sekai_decisions SET seq=NULL WHERE id='fresh'", [])
+            .unwrap();
+        db.set_retention_policy(&RetentionPolicy {
+            dataset: LLM_CALLS_DATASET.into(),
+            namespace: String::new(),
+            data_class: String::new(),
+            retention_days: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let run = db.archive_retained_records(2 * DAY_MS, false).unwrap();
+        assert_eq!(run.llm_calls_archived, 1);
+        assert!(db.get_decision("fresh").unwrap().is_some());
+        assert!(!db.verify_ledger().unwrap().ok);
     }
 
     #[test]
