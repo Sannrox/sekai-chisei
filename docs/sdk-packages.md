@@ -74,7 +74,7 @@ commit a copy. `generate` reproduces it for any checkout.
 those contract versions, not Chisei's release version. `deploy/tenkai.toml` and
 `deploy/kubernetes/tenkai.toml` provide the same contracts in their v2
 compatibility profile; `check-tenkai` (in CI and at release) refuses products
-that disagree with the matrix. [RELEASING.md](../RELEASING.md#contract-versions)
+that disagree with `PROVIDED_CONTRACTS`. [RELEASING.md](../RELEASING.md#contract-versions)
 says which change moves which version.
 
 ```text

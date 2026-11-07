@@ -43,7 +43,7 @@ fn check_tenkai(root: PathBuf) -> Result<(), BoxErr> {
         eprintln!("{message}");
         return Err(std::io::Error::other("Tenkai products are stale").into());
     }
-    for (id, version) in &matrix.contracts {
+    for (id, version) in compatibility_matrix::PROVIDED_CONTRACTS {
         println!("{id} {version}");
     }
     Ok(())

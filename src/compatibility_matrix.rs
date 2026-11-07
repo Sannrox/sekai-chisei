@@ -22,8 +22,9 @@ const PROTO_FILES: &[&str] = &["sekai.proto", "chisei.proto"];
 
 const TRACKED_CRATES: &[&str] = &["sekai-client", "sekai-proto", "sekai-chisei"];
 
-/// RPC contracts Chisei provides to dependents, as `(id, version)`. The only
-/// source for these versions; RELEASING.md says which change moves which.
+/// RPC contracts Chisei provides to dependents, as `(id, version)`, sorted by
+/// id. The only source for these versions; RELEASING.md says which change
+/// moves which. `compatibility.json` lists the same map under `contracts`.
 pub const PROVIDED_CONTRACTS: &[(&str, &str)] = &[
     ("chisei.admin-rpc", "1.0.0"),
     ("chisei.enterprise-rpc", "1.0.0"),
@@ -41,10 +42,24 @@ pub struct CompatibilityMatrix {
     pub minimum_compatible_server: String,
     #[serde(default)]
     pub identity_assertion_contract: String,
-    /// Provided RPC contract versions by id; empty in matrices before #2114.
-    #[serde(default)]
-    pub contracts: BTreeMap<String, String>,
     pub packages: CompatibilityPackages,
+}
+
+/// On-disk `compatibility.json`. `contracts` is a JSON projection of
+/// [`PROVIDED_CONTRACTS`], not a field on [`CompatibilityMatrix`], so adding
+/// it is not a Rust struct-literal break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibilityMatrixFile {
+    contract_version: String,
+    server_version: String,
+    proto_revision: String,
+    minimum_compatible_server: String,
+    #[serde(default)]
+    identity_assertion_contract: String,
+    #[serde(default)]
+    contracts: BTreeMap<String, String>,
+    packages: CompatibilityPackages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,8 +131,16 @@ impl CompatibilityMatrix {
     }
 
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let matrix: Self = serde_json::from_str(raw)
+        let file: CompatibilityMatrixFile = serde_json::from_str(raw)
             .map_err(|error| format!("compatibility matrix is invalid: {error}"))?;
+        let matrix = Self {
+            contract_version: file.contract_version,
+            server_version: file.server_version,
+            proto_revision: file.proto_revision,
+            minimum_compatible_server: file.minimum_compatible_server,
+            identity_assertion_contract: file.identity_assertion_contract,
+            packages: file.packages,
+        };
         matrix.validate()?;
         Ok(matrix)
     }
@@ -137,7 +160,6 @@ impl CompatibilityMatrix {
             minimum_compatible_server: server_version.clone(),
             identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
                 .into(),
-            contracts: provided_contracts(),
             packages: CompatibilityPackages {
                 sekai_chisei: server_version,
                 sekai_proto,
@@ -152,7 +174,19 @@ impl CompatibilityMatrix {
     }
 
     pub fn to_pretty_json(&self) -> Result<String, String> {
-        let mut body = serde_json::to_string_pretty(self)
+        let file = CompatibilityMatrixFile {
+            contract_version: self.contract_version.clone(),
+            server_version: self.server_version.clone(),
+            proto_revision: self.proto_revision.clone(),
+            minimum_compatible_server: self.minimum_compatible_server.clone(),
+            identity_assertion_contract: self.identity_assertion_contract.clone(),
+            contracts: PROVIDED_CONTRACTS
+                .iter()
+                .map(|(id, version)| ((*id).to_string(), (*version).to_string()))
+                .collect(),
+            packages: self.packages.clone(),
+        };
+        let mut body = serde_json::to_string_pretty(&file)
             .map_err(|error| format!("compatibility matrix encode failed: {error}"))?;
         body.push('\n');
         Ok(body)
@@ -524,16 +558,9 @@ fn require_in_tree_package_pins(root: &Path, matrix: &CompatibilityMatrix) -> Re
     }
 }
 
-fn provided_contracts() -> BTreeMap<String, String> {
-    PROVIDED_CONTRACTS
-        .iter()
-        .map(|(id, version)| (id.to_string(), version.to_string()))
-        .collect()
-}
-
 /// The Tenkai compatibility profile (v2) a release's products declare: one
-/// component, pinned to a digest of the release version, providing the matrix
-/// contracts. The pin moves only with a version bump, so CI can hold every
+/// component, pinned to a digest of the release version, providing
+/// [`PROVIDED_CONTRACTS`]. The pin moves only with a version bump, so CI can hold every
 /// commit to it without each proto change rewriting the products.
 pub fn tenkai_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
     let pin = client_package::digest_bytes(
@@ -552,7 +579,7 @@ pub fn tenkai_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
          \n\
          [compatibility.components.sekai-chisei.provides]\n"
     );
-    for (id, version) in &matrix.contracts {
+    for (id, version) in PROVIDED_CONTRACTS {
         profile.push_str(&format!("\"{id}\" = \"{version}\"\n"));
     }
     Ok(profile)
@@ -1095,7 +1122,6 @@ mod tests {
             minimum_compatible_server: "1.0.1".into(),
             identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
                 .into(),
-            contracts: provided_contracts(),
             packages: CompatibilityPackages {
                 sekai_chisei: "1.0.1".into(),
                 sekai_proto: "1.0.1".into(),
@@ -1459,10 +1485,20 @@ mod tests {
 
     #[test]
     fn matrices_before_provided_contracts_still_parse() {
-        let matrix = CompatibilityMatrix::from_json(&format!(
+        CompatibilityMatrix::from_json(&format!(
             r#"{{"contract_version":"{MATRIX_CONTRACT}","server_version":"1","proto_revision":"sha256:x","minimum_compatible_server":"1","packages":{{"sekai-chisei":"1","sekai-proto":"1","sekai-client":"1","typescript":"1","python":"1"}}}}"#
         ))
         .unwrap();
-        assert!(matrix.contracts.is_empty());
+    }
+
+    #[test]
+    fn generated_json_lists_provided_contracts_without_a_new_struct_field() {
+        let json = sample_matrix().to_pretty_json().unwrap();
+        assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
+        assert!(
+            json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
+            "{json}"
+        );
+        CompatibilityMatrix::from_json(&json).unwrap();
     }
 }

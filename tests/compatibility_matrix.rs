@@ -16,19 +16,11 @@ fn workspace_matrix() -> CompatibilityMatrix {
 fn workspace_matrix_projects_the_contract_and_proto_revision() {
     let generated = workspace_matrix();
     assert_eq!(generated.contract_version, MATRIX_CONTRACT);
-    assert_eq!(
-        generated
-            .contracts
-            .get("chisei.admin-rpc")
-            .map(String::as_str),
-        Some("1.0.0")
-    );
-    assert_eq!(
-        generated
-            .contracts
-            .get("chisei.enterprise-rpc")
-            .map(String::as_str),
-        Some("1.0.0")
+    let json = generated.to_pretty_json().expect("encode");
+    assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
+    assert!(
+        json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
+        "{json}"
     );
     assert_eq!(
         generated.proto_revision,
@@ -137,7 +129,7 @@ fn generate_round_trips_the_workspace_matrix() {
 }
 
 #[test]
-fn tenkai_products_provide_the_matrix_contracts() {
+fn tenkai_products_provide_the_contracts() {
     // A version bump or contract bump fails here until `deploy/` is refreshed.
     check_tenkai_products(".", &workspace_matrix()).unwrap();
 }
