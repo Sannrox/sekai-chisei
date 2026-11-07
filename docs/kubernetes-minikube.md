@@ -45,9 +45,37 @@ rm tls.key
 Point Tenkai at a kubeconfig file, then publish the Kubernetes product. Unsigned
 development apply is limited to the built-in `local` environment.
 
+The product declares a compatibility profile that provides Chisei's RPC
+contracts to dependents ([contract versions](../RELEASING.md#contract-versions)).
+Tenkai plans it only with an observation of its component recorded within the
+last day. After publish, put the release digest, the pin from the profile at
+the end of `deploy/kubernetes/tenkai.toml`, and the observation time into
+`observation.json`:
+
+```json
+{
+  "version": 1,
+  "environment": "local",
+  "release_digest": "<published release digest>",
+  "observed_at_ms": 1790000000000,
+  "components": {
+    "sekai-chisei": {
+      "pin": { "kind": "digest", "value": "<pin value from tenkai.toml>" },
+      "provides": { "chisei.admin-rpc": "1.0.0", "chisei.enterprise-rpc": "1.0.0" }
+    }
+  },
+  "contracts": {},
+  "capabilities": [],
+  "schema_version": null,
+  "migration": "stable"
+}
+```
+
 ```bash
 tenkaictl env cluster-config set local /path/to/kubeconfig
 tenkaictl publish deploy/kubernetes/tenkai.toml --allow-unsigned-development
+tenkaictl env compatibility record local observation.json
+tenkaictl env compatibility check local sekai-chisei@1.5.0
 tenkaictl promote sekai-chisei@1.5.0 stable
 tenkaictl env subscribe local sekai-chisei=stable
 PLAN=$(tenkaictl plan --env local | sed -n 's/^plan id: //p')

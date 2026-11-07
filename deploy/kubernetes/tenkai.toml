@@ -24,3 +24,20 @@ uninstall = "true"
 # reminder if the executor env is forgotten.
 health = "echo 'set TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess for this product' >&2; exit 1"
 inputs = ["manifests"]
+
+# Contracts this release provides to dependents (Tenkai profile v2), as its
+# compatibility.json lists them. The pin is a digest of the release version.
+# A version or contract bump refreshes this block: `sekaictl admin
+# compatibility check-tenkai` prints it, and CI refuses a stale one.
+[compatibility]
+version = 2
+# Evidence binds one release digest; one day is Tenkai's maximum.
+max_evidence_age_ms = 86400000
+
+[compatibility.components.sekai-chisei.pin]
+kind = "digest"
+value = "sha256:cdc23a21b632cde361254bce301b52d52a840b959bce7dda8e312f375aa9b215"
+
+[compatibility.components.sekai-chisei.provides]
+"chisei.admin-rpc" = "1.0.0"
+"chisei.enterprise-rpc" = "1.0.0"

@@ -18,8 +18,12 @@ The tag must equal the workspace version in the root `Cargo.toml`
 1. Choose the target version. Do not invent one in a feature pull request.
 2. Draft notes with `scripts/changelog-draft.sh`. Pull requests never edit
    `CHANGELOG.md`; the release step writes the section from merged work.
-3. Land the version-bump pull request. The workspace version and CHANGELOG
-   heading move together.
+3. Refresh the compatibility profile at the end of `deploy/tenkai.toml` and
+   `deploy/kubernetes/tenkai.toml`; its pin follows the version.
+   On mismatch, `sekaictl admin compatibility check-tenkai` prints the
+   block to paste, and CI refuses the bump until it matches.
+4. Land the version-bump pull request. The workspace version, CHANGELOG
+   heading, and Tenkai products move together.
 
 ## Tag
 
@@ -31,6 +35,31 @@ vX.Y.Z
 
 A tag is never moved, deleted, or reused. The tagged commit must be on
 `main`; the workflow refuses any other commit.
+
+## Contract versions
+
+Tenkai dependents require Chisei's RPC contracts, not its release version.
+`PROVIDED_CONTRACTS` in `src/compatibility_matrix.rs` is the only source of
+their versions. Each release lists them under `contracts` in
+`compatibility.json`, and its Tenkai products provide them.
+
+| Contract | Surface |
+| --- | --- |
+| `chisei.enterprise-rpc` | RPCs a tenant-scoped identity assertion reaches (`enterprise_namespace_method` in `src/grpc/mod.rs`, listed in [tenant assertion RPCs](docs/tenant-assertion-rpcs.md)) and the assertion they accept |
+| `chisei.admin-rpc` | Every other public `SekaiService` and `ChiseiService` RPC |
+
+RPCs classified `experimental` or `remove` in
+[RPC maturity](docs/rpc-maturity.md) belong to neither contract. The pull
+request that changes a surface bumps its contract, in `PROVIDED_CONTRACTS`
+and in both Tenkai products:
+
+- **Major** for a break: an RPC, field, or enum value removed or renamed, a
+  changed meaning, a stricter request, or an RPC no longer admitted for tenant
+  assertions. The pull request also carries the `type!:` subject and the
+  `risk:breaking` label.
+- **Minor** for an addition: a new RPC, field, or enum value, or an RPC newly
+  admitted for tenant assertions.
+- **Patch** for a fix that keeps the surface.
 
 ## Release candidates
 
@@ -60,7 +89,8 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 - builds, packages, tags images, and writes the manifest `git_sha` from that
   commit, and creates the release with `gh release create <tag> --verify-tag`
 - drafts the GitHub Release from the matching CHANGELOG section, uploads the
-  `sekai` binary matrix and `compatibility.json`, pushes the GHCR image by
+  `sekai` binary matrix and `compatibility.json` once the Tenkai products
+  provide its contracts, pushes the GHCR image by
   version only (no `latest` tag), records its digest, writes an SBOM, attests
   provenance, and publishes only after every asset is attached
 

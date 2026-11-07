@@ -1,7 +1,8 @@
 //! Compatibility matrix projection and consumer pin check (#873).
 
 use sekai_chisei::compatibility_matrix::{
-    self, CompatibilityMatrix, MATRIX_CONTRACT, check_consumer, protocol_revision,
+    self, CompatibilityMatrix, MATRIX_CONTRACT, check_consumer, check_tenkai_products,
+    protocol_revision,
 };
 use std::fs;
 use std::path::Path;
@@ -15,6 +16,12 @@ fn workspace_matrix() -> CompatibilityMatrix {
 fn workspace_matrix_projects_the_contract_and_proto_revision() {
     let generated = workspace_matrix();
     assert_eq!(generated.contract_version, MATRIX_CONTRACT);
+    let json = generated.to_pretty_json().expect("encode");
+    assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
+    assert!(
+        json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
+        "{json}"
+    );
     assert_eq!(
         generated.proto_revision,
         protocol_revision(".").expect("proto revision")
@@ -119,4 +126,10 @@ fn generate_round_trips_the_workspace_matrix() {
     let out = root.path().join("compatibility.json");
     compatibility_matrix::write_matrix(&out, &matrix).unwrap();
     assert_eq!(CompatibilityMatrix::from_path(&out).unwrap(), matrix);
+}
+
+#[test]
+fn tenkai_products_provide_the_contracts() {
+    // A version bump or contract bump fails here until `deploy/` is refreshed.
+    check_tenkai_products(".", &workspace_matrix()).unwrap();
 }

@@ -484,6 +484,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Generate compatibility matrix
         run: cargo run --locked --bin sekaictl -- admin compatibility generate --out compatibility.json
+      # CI runs the same check; this one guards the tagged commit itself.
+      - name: Check Tenkai products
+        run: cargo run --locked --bin sekaictl -- admin compatibility check-tenkai
       - name: Upload compatibility.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

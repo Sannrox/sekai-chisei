@@ -3,10 +3,13 @@
 //! The matrix is derived from shipped Cargo, proto, and SDK metadata. It does
 //! not invent compatibility. A consumer pin check compares exact package
 //! versions. Protocol and artifact bytes are verified by `client_package`,
-//! not by this manifest and lockfile check.
+//! not by this manifest and lockfile check. It also lists the RPC contracts
+//! the Tenkai products in `deploy/` provide, and checks those products declare
+//! them.
 
 use crate::sekai::client_package;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +19,19 @@ pub const TYPESCRIPT_PACKAGE: &str = "@sannrox/sekai-chisei-sdk";
 pub const PYTHON_PACKAGE: &str = "sekai-chisei-sdk";
 
 const PROTO_FILES: &[&str] = &["sekai.proto", "chisei.proto"];
+
 const TRACKED_CRATES: &[&str] = &["sekai-client", "sekai-proto", "sekai-chisei"];
+
+/// RPC contracts Chisei provides to dependents, as `(id, version)`, sorted by
+/// id. The only source for these versions; RELEASING.md says which change
+/// moves which. `compatibility.json` lists the same map under `contracts`.
+pub const PROVIDED_CONTRACTS: &[(&str, &str)] = &[
+    ("chisei.admin-rpc", "1.0.0"),
+    ("chisei.enterprise-rpc", "1.0.0"),
+];
+
+/// Tenkai products that must declare [`PROVIDED_CONTRACTS`] at release.
+pub const TENKAI_PRODUCTS: &[&str] = &["deploy/tenkai.toml", "deploy/kubernetes/tenkai.toml"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +43,23 @@ pub struct CompatibilityMatrix {
     #[serde(default)]
     pub identity_assertion_contract: String,
     pub packages: CompatibilityPackages,
+}
+
+/// On-disk `compatibility.json`. `contracts` is a JSON projection of
+/// [`PROVIDED_CONTRACTS`], not a field on [`CompatibilityMatrix`], so adding
+/// it is not a Rust struct-literal break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibilityMatrixFile {
+    contract_version: String,
+    server_version: String,
+    proto_revision: String,
+    minimum_compatible_server: String,
+    #[serde(default)]
+    identity_assertion_contract: String,
+    #[serde(default)]
+    contracts: BTreeMap<String, String>,
+    packages: CompatibilityPackages,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +131,16 @@ impl CompatibilityMatrix {
     }
 
     pub fn from_json(raw: &str) -> Result<Self, String> {
-        let matrix: Self = serde_json::from_str(raw)
+        let file: CompatibilityMatrixFile = serde_json::from_str(raw)
             .map_err(|error| format!("compatibility matrix is invalid: {error}"))?;
+        let matrix = Self {
+            contract_version: file.contract_version,
+            server_version: file.server_version,
+            proto_revision: file.proto_revision,
+            minimum_compatible_server: file.minimum_compatible_server,
+            identity_assertion_contract: file.identity_assertion_contract,
+            packages: file.packages,
+        };
         matrix.validate()?;
         Ok(matrix)
     }
@@ -134,7 +174,19 @@ impl CompatibilityMatrix {
     }
 
     pub fn to_pretty_json(&self) -> Result<String, String> {
-        let mut body = serde_json::to_string_pretty(self)
+        let file = CompatibilityMatrixFile {
+            contract_version: self.contract_version.clone(),
+            server_version: self.server_version.clone(),
+            proto_revision: self.proto_revision.clone(),
+            minimum_compatible_server: self.minimum_compatible_server.clone(),
+            identity_assertion_contract: self.identity_assertion_contract.clone(),
+            contracts: PROVIDED_CONTRACTS
+                .iter()
+                .map(|(id, version)| ((*id).to_string(), (*version).to_string()))
+                .collect(),
+            packages: self.packages.clone(),
+        };
+        let mut body = serde_json::to_string_pretty(&file)
             .map_err(|error| format!("compatibility matrix encode failed: {error}"))?;
         body.push('\n');
         Ok(body)
@@ -504,6 +556,56 @@ fn require_in_tree_package_pins(root: &Path, matrix: &CompatibilityMatrix) -> Re
             matrix.expected_revision_label()
         )),
     }
+}
+
+/// The Tenkai compatibility profile (v2) a release's products declare: one
+/// component, pinned to a digest of the release version, providing
+/// [`PROVIDED_CONTRACTS`]. The pin moves only with a version bump, so CI can hold every
+/// commit to it without each proto change rewriting the products.
+pub fn tenkai_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
+    let pin = client_package::digest_bytes(
+        "tenkai-component",
+        &format!("sekai-chisei@{}", matrix.server_version),
+    )?;
+    let mut profile = format!(
+        "[compatibility]\n\
+         version = 2\n\
+         # Evidence binds one release digest; one day is Tenkai's maximum.\n\
+         max_evidence_age_ms = 86400000\n\
+         \n\
+         [compatibility.components.sekai-chisei.pin]\n\
+         kind = \"digest\"\n\
+         value = \"{pin}\"\n\
+         \n\
+         [compatibility.components.sekai-chisei.provides]\n"
+    );
+    for (id, version) in PROVIDED_CONTRACTS {
+        profile.push_str(&format!("\"{id}\" = \"{version}\"\n"));
+    }
+    Ok(profile)
+}
+
+/// Fails unless every product in [`TENKAI_PRODUCTS`] under `root` ends with
+/// [`tenkai_profile`]. The error carries the block to paste.
+pub fn check_tenkai_products(
+    root: impl AsRef<Path>,
+    matrix: &CompatibilityMatrix,
+) -> Result<(), String> {
+    let profile = tenkai_profile(matrix)?;
+    let stale: Vec<&str> = TENKAI_PRODUCTS
+        .iter()
+        .copied()
+        .filter(|product| {
+            !read_text(&root.as_ref().join(product)).is_ok_and(|body| body.ends_with(&profile))
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} must end with this compatibility profile:\n\n{profile}",
+        stale.join(" and ")
+    ))
 }
 
 pub fn protocol_revision(root: impl AsRef<Path>) -> Result<String, String> {
@@ -1039,6 +1141,48 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tenkai_products_match_the_release_profile() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let matrix = CompatibilityMatrix::from_workspace(&root).unwrap();
+        check_tenkai_products(&root, &matrix).unwrap();
+    }
+
+    #[test]
+    fn tenkai_products_must_end_with_the_release_profile() {
+        let matrix = sample_matrix();
+        let profile = tenkai_profile(&matrix).unwrap();
+        let mut next = matrix.clone();
+        next.server_version = "1.0.2".into();
+        assert_ne!(
+            tenkai_profile(&next).unwrap(),
+            profile,
+            "a version bump moves the pin"
+        );
+        assert!(
+            profile.contains("\"chisei.enterprise-rpc\" = \"1.0.0\""),
+            "{profile}"
+        );
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("deploy/kubernetes")).unwrap();
+        let product = format!("[product]\nname = \"sekai-chisei\"\n\n{profile}");
+        fs::write(root.path().join("deploy/tenkai.toml"), &product).unwrap();
+        fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), &product).unwrap();
+        check_tenkai_products(root.path(), &matrix).unwrap();
+
+        let stale = product.replace(
+            "\"chisei.admin-rpc\" = \"1.0.0\"",
+            "\"chisei.admin-rpc\" = \"0.9.0\"",
+        );
+        fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), stale).unwrap();
+        let error = check_tenkai_products(root.path(), &matrix).unwrap_err();
+        assert!(
+            error.starts_with("deploy/kubernetes/tenkai.toml must end with"),
+            "{error}"
+        );
+        assert!(error.ends_with(&profile), "{error}");
+    }
+
+    #[test]
     fn rust_version_pin_is_on_matrix() {
         let matrix = sample_matrix();
         let (_keep, consumer) = write_consumer(
@@ -1337,5 +1481,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, MATRIX_UNSUPPORTED);
+    }
+
+    #[test]
+    fn matrices_before_provided_contracts_still_parse() {
+        CompatibilityMatrix::from_json(&format!(
+            r#"{{"contract_version":"{MATRIX_CONTRACT}","server_version":"1","proto_revision":"sha256:x","minimum_compatible_server":"1","packages":{{"sekai-chisei":"1","sekai-proto":"1","sekai-client":"1","typescript":"1","python":"1"}}}}"#
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn generated_json_lists_provided_contracts_without_a_new_struct_field() {
+        let json = sample_matrix().to_pretty_json().unwrap();
+        assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
+        assert!(
+            json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
+            "{json}"
+        );
+        CompatibilityMatrix::from_json(&json).unwrap();
     }
 }

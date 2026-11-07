@@ -69,9 +69,18 @@ The file is not a second authority: the release workflow generates it from
 the tagged tree's Cargo, proto, and SDK metadata, and the repository does not
 commit a copy. `generate` reproduces it for any checkout.
 
+`contracts` lists the RPC contracts the release provides, by id and version
+(`chisei.enterprise-rpc`, `chisei.admin-rpc`). A Tenkai dependent requires
+those contract versions, not Chisei's release version. `deploy/tenkai.toml` and
+`deploy/kubernetes/tenkai.toml` provide the same contracts in their v2
+compatibility profile; `check-tenkai` (in CI and at release) refuses products
+that disagree with `PROVIDED_CONTRACTS`. [RELEASING.md](../RELEASING.md#contract-versions)
+says which change moves which version.
+
 ```text
 sekaictl admin compatibility generate --out compatibility.json
 sekaictl admin compatibility check --matrix compatibility.json --consumer ./crates/sekai-client
+sekaictl admin compatibility check-tenkai
 ```
 
 On-matrix means the consumer names those exact versions. Cargo `=` pins are
