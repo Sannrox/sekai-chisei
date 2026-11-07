@@ -1,0 +1,20 @@
+{
+  "contract_version": "example.definition-change-tracer/v1",
+  "object_type": {
+    "member_kind": "object_type",
+    "member_id": "Issue",
+    "definition": {
+      "name": "Issue",
+      "properties": ["title", "state"],
+      "lint_suppressions": [
+        {
+          "rule": "orphan_object_type",
+          "reason": "tracer fixture, no live consumer bindings"
+        }
+      ]
+    }
+  },
+  "link": {
+    "relation": "relates_to"
+  }
+}

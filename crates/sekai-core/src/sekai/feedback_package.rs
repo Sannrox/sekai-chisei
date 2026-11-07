@@ -27,6 +27,9 @@ pub const PACKAGE_ID: &str = "pkg:feedback.evidence-finding/v1";
 pub const PACKAGE_VERSION: &str = "1";
 pub const CERTIFICATION_ID: &str = "cert:feedback.evidence-finding/v1";
 pub const KIND_OBSERVATION: &str = "feedback_observation";
+/// Tenant-mode evidence target from tenkai 0.7.0. Objects stay
+/// [`KIND_OBSERVATION`]; only the evidence `target_kind` uses this token.
+pub const KIND_TENANT_OBSERVATION: &str = "tenant_feedback_observation";
 pub const KIND_FINDING: &str = "feedback_finding";
 pub const KIND_INVESTIGATION_RESULT: &str = "feedback_investigation_result";
 pub const KIND_HYPOTHESIS: &str = "feedback_hypothesis";
@@ -307,6 +310,16 @@ pub fn validate_object_write(
     }
 }
 
+pub(crate) fn is_observation_target_kind(kind: &str) -> bool {
+    kind == KIND_OBSERVATION || kind == KIND_TENANT_OBSERVATION
+}
+
+/// Tenant-mode evidence targets an observation object of [`KIND_OBSERVATION`].
+pub(crate) fn evidence_target_kind_matches_object(target_kind: &str, object_kind: &str) -> bool {
+    target_kind == object_kind
+        || (object_kind == KIND_OBSERVATION && is_observation_target_kind(target_kind))
+}
+
 fn validate_observation_evidence(
     db: &RuntimeDb,
     object: &mut Object,
@@ -326,7 +339,7 @@ fn validate_observation_evidence(
     if submission.namespace != object.namespace {
         return Err("source evidence is not in the observation namespace".into());
     }
-    if submission.target_kind != KIND_OBSERVATION {
+    if !is_observation_target_kind(&submission.target_kind) {
         return Err("source evidence does not target an observation".into());
     }
     // Plan-time check for a precise error. Commit uniqueness is the partial
@@ -482,7 +495,7 @@ mod tests {
             source_instances: vec!["feedback:checks".into()],
             namespaces: vec![NAMESPACE.into()],
             evidence_types: vec![EVIDENCE_TYPE.into()],
-            target_kinds: vec![KIND_OBSERVATION.into()],
+            target_kinds: vec![KIND_OBSERVATION.into(), KIND_TENANT_OBSERVATION.into()],
             classification_ceiling: crate::sekai::evidence::EvidenceClassification::Confidential,
             allowed_intents: vec![
                 EvidenceIntent::Upsert,
@@ -713,6 +726,99 @@ mod tests {
             stored.properties.get("disposition").map(String::as_str),
             Some("open")
         );
+    }
+
+    #[test]
+    fn tenant_mode_target_kind_records_the_same_observation_kind() {
+        let runtime = installed();
+        runtime
+            .upsert_evidence_producer(&producer(), 1_000)
+            .unwrap();
+        let mut envelope = observation_envelope();
+        envelope.target.object_kind = KIND_TENANT_OBSERVATION.into();
+        envelope.target.object_external_id = "tenant-a/obs-1".into();
+        envelope.idempotency_key = "delivery-tenant-1".into();
+        let admission = admit_source_evidence(&runtime, &envelope, 1_100);
+        assert!(admission.admitted);
+        let evidence_id = admission.submission.id.clone();
+        assert_eq!(admission.submission.target_kind, KIND_TENANT_OBSERVATION);
+        let parameters = serde_json::json!({
+            "object_id": "obs-tenant-1",
+            "name": "timeout",
+            "source_evidence": evidence_id,
+            "problem_signature": "sig:timeout",
+            "occurrence_ids": "occ-1",
+            "classification": "defect",
+            "disposition": "open"
+        });
+        ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                admit_request(
+                    ACTION_OBSERVATION,
+                    &parameters.to_string(),
+                    "obs-admit-tenant-1",
+                    vec![evidence_id.clone()],
+                ),
+                ACTOR,
+                2_000,
+            )
+            .unwrap();
+        let stored = runtime
+            .get_object("obs-tenant-1")
+            .unwrap()
+            .expect("observation");
+        assert_eq!(stored.kind, KIND_OBSERVATION);
+        assert_eq!(stored.external_id, "tenant-a/obs-1");
+        let projected = runtime
+            .get_evidence_submission(&evidence_id)
+            .unwrap()
+            .expect("projected evidence");
+        assert_eq!(projected.lifecycle_state, EvidenceLifecycleState::Available);
+    }
+
+    #[test]
+    fn observation_action_rejects_unrelated_evidence_target_kind() {
+        let runtime = installed();
+        let mut capability = producer();
+        capability.target_kinds.push(KIND_FINDING.into());
+        runtime
+            .upsert_evidence_producer(&capability, 1_000)
+            .unwrap();
+        let mut envelope = observation_envelope();
+        envelope.target.object_kind = KIND_FINDING.into();
+        envelope.idempotency_key = "delivery-wrong-kind".into();
+        let admission = admit_source_evidence(&runtime, &envelope, 1_100);
+        assert!(admission.admitted);
+        let evidence_id = admission.submission.id;
+        let parameters = serde_json::json!({
+            "object_id": "obs-wrong-kind",
+            "name": "timeout",
+            "source_evidence": evidence_id,
+            "problem_signature": "sig:timeout",
+            "occurrence_ids": "occ-1",
+            "classification": "defect",
+            "disposition": "open"
+        });
+        let error = ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                admit_request(
+                    ACTION_OBSERVATION,
+                    &parameters.to_string(),
+                    "obs-wrong-kind",
+                    vec![evidence_id],
+                ),
+                ACTOR,
+                2_000,
+            )
+            .unwrap_err();
+        let ActionInstanceAdmissionError::FailedPrecondition(message) = error else {
+            panic!("unexpected {error:?}");
+        };
+        assert!(
+            message.contains("does not target an observation"),
+            "{message}"
+        );
+        assert!(runtime.get_object("obs-wrong-kind").unwrap().is_none());
     }
 
     #[test]
