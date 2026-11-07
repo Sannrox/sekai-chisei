@@ -16,8 +16,8 @@ use crate::sekai::external_permit::HostContext;
 use crate::sekai::feedback_github::{
     DEFAULT_DAILY_CAP, EXTERNAL_ACTION_TYPE, GitHubError, GitHubIssue, GitHubIssues, GitHubTarget,
     HARNESS, HOST_CAPABILITY, PARAMETER_SCHEMA, POLL_INTERVAL_SECS, PermitError, PermitGate,
-    PermitProof, PublishError, PublishIntent, PublishOperation, RUNTIME_ID, publish_finding,
-    qualifying_findings,
+    PermitProof, PublishError, PublishIntent, PublishOperation, RUNTIME_ID, permit_deadline_ms,
+    permit_operation_id, publish_finding, qualifying_findings,
 };
 use crate::sekai::feedback_package::PACKAGE_ID;
 use serde_json::Value;
@@ -174,66 +174,86 @@ struct LivePermitGate<'a> {
 
 impl PermitGate for LivePermitGate<'_> {
     fn authorize_and_redeem(&self, intent: &PublishIntent) -> Result<PermitProof, PermitError> {
+        match self.authorize_once(intent, None) {
+            Ok(proof) => Ok(proof),
+            Err(status) if is_idempotency_conflict(&status) => {
+                let retry = uuid::Uuid::new_v4().simple().to_string();
+                self.authorize_once(intent, Some(&retry))
+                    .map_err(status_to_permit)
+            }
+            Err(status) => Err(status_to_permit(status)),
+        }
+    }
+}
+
+impl LivePermitGate<'_> {
+    fn authorize_once(
+        &self,
+        intent: &PublishIntent,
+        retry_suffix: Option<&str>,
+    ) -> Result<PermitProof, tonic::Status> {
         let resource = format!("github:{}", self.target.repository());
         let op = match intent.operation {
             PublishOperation::Create => "create",
-            PublishOperation::Update { number } => {
-                let _ = number;
-                "update"
-            }
+            PublishOperation::Update { .. } => "update",
         };
-        let operation_id = format!("feedback-gh-{}-{op}", intent.mapping_id);
-        let authorized = self
-            .chisei
-            .authorize_from_authenticated(
-                self.run_as.clone(),
-                AuthorizeExternalActionRequest {
-                    request: Some(ExternalActionRequest {
-                        version: "external-action.request/v1".into(),
-                        operation_id: operation_id.clone(),
-                        parent_operation_id: String::new(),
-                        attempt_id: format!("{operation_id}-attempt"),
-                        request_id: format!("{operation_id}-request"),
-                        actor: self.run_as.clone(),
-                        namespace: intent.draft.namespace.clone(),
-                        requesting_harness: HARNESS.into(),
-                        intended_executor: self.run_as.clone(),
-                        action_type: EXTERNAL_ACTION_TYPE.into(),
-                        parameter_schema: PARAMETER_SCHEMA.into(),
-                        canonical_arguments_digest: intent.arguments_digest.clone(),
-                        policy_summary: std::collections::HashMap::from([(
-                            "repository".into(),
-                            self.target.repository(),
-                        )]),
-                        target_selectors: vec![format!(
-                            "project:{}/{}",
-                            intent.draft.namespace, resource
-                        )],
-                        immutable_preconditions: std::collections::HashMap::from([(
-                            "repository".into(),
-                            self.target.repository(),
-                        )]),
-                        risk_class: "write".into(),
-                        expected_effects: vec![format!("issue_{op}")],
-                        requested_invocation_count: 1,
-                        deadline_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
-                        estimated_cost_micros: 0,
-                        estimated_volume: 1,
-                        affected_resource_count: 1,
-                        rollback_capability: "none".into(),
-                        required_host_capabilities: vec![HOST_CAPABILITY.into()],
-                        idempotency_key: format!("{operation_id}-auth"),
-                        policy_project: intent.draft.namespace.clone(),
-                    }),
-                    offline: false,
-                },
-            )
-            .map_err(status_to_permit)?;
-        let decision = authorized.decision.ok_or(PermitError::Missing)?;
-        if decision.decision != "permit" {
-            return Err(classify_decision(&decision.reason));
+        let mut operation_id = permit_operation_id(intent);
+        if let Some(suffix) = retry_suffix {
+            operation_id = format!("{operation_id}-r-{suffix}");
         }
-        let permit_proto = authorized.permit.ok_or(PermitError::Missing)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let authorized = self.chisei.authorize_from_authenticated(
+            self.run_as.clone(),
+            AuthorizeExternalActionRequest {
+                request: Some(ExternalActionRequest {
+                    version: "external-action.request/v1".into(),
+                    operation_id: operation_id.clone(),
+                    parent_operation_id: String::new(),
+                    attempt_id: format!("{operation_id}-attempt"),
+                    request_id: format!("{operation_id}-request"),
+                    actor: self.run_as.clone(),
+                    namespace: intent.draft.namespace.clone(),
+                    requesting_harness: HARNESS.into(),
+                    intended_executor: self.run_as.clone(),
+                    action_type: EXTERNAL_ACTION_TYPE.into(),
+                    parameter_schema: PARAMETER_SCHEMA.into(),
+                    canonical_arguments_digest: intent.arguments_digest.clone(),
+                    policy_summary: std::collections::HashMap::from([(
+                        "repository".into(),
+                        self.target.repository(),
+                    )]),
+                    target_selectors: vec![format!(
+                        "project:{}/{}",
+                        intent.draft.namespace, resource
+                    )],
+                    immutable_preconditions: std::collections::HashMap::from([(
+                        "repository".into(),
+                        self.target.repository(),
+                    )]),
+                    risk_class: "write".into(),
+                    expected_effects: vec![format!("issue_{op}")],
+                    requested_invocation_count: 1,
+                    deadline_ms: permit_deadline_ms(intent, now_ms),
+                    estimated_cost_micros: 0,
+                    estimated_volume: 1,
+                    affected_resource_count: 1,
+                    rollback_capability: "none".into(),
+                    required_host_capabilities: vec![HOST_CAPABILITY.into()],
+                    idempotency_key: format!("{operation_id}-auth"),
+                    policy_project: intent.draft.namespace.clone(),
+                }),
+                offline: false,
+            },
+        )?;
+        let decision = authorized
+            .decision
+            .ok_or_else(|| tonic::Status::failed_precondition("permit decision missing"))?;
+        if decision.decision != "permit" {
+            return Err(tonic::Status::permission_denied(decision.reason));
+        }
+        let permit_proto = authorized
+            .permit
+            .ok_or_else(|| tonic::Status::failed_precondition("permit missing"))?;
         let permit = external_permit_from_proto(permit_proto.clone());
         let host = HostContext {
             executor: self.run_as.clone(),
@@ -246,9 +266,7 @@ impl PermitGate for LivePermitGate<'_> {
             )]),
             host_capabilities: vec![HOST_CAPABILITY.into()],
         };
-        let key = permit_signing_key(&self.chisei.config)
-            .map_err(|_| PermitError::Missing)?
-            .verifying_key();
+        let key = permit_signing_key(&self.chisei.config)?.verifying_key();
         verify_for_executor(
             &permit,
             &key,
@@ -257,27 +275,26 @@ impl PermitGate for LivePermitGate<'_> {
             &host,
             chrono::Utc::now().timestamp_millis(),
         )
-        .map_err(|error| classify_decision(&error))?;
+        .map_err(tonic::Status::failed_precondition)?;
         let execution_id = format!("{operation_id}-exec");
-        let redeemed = self
-            .chisei
-            .redeem_from_authenticated(
-                self.run_as.clone(),
-                RedeemExternalActionPermitRequest {
-                    permit: Some(external_permit_to_proto(&permit)),
-                    executor: self.run_as.clone(),
-                    requesting_harness: HARNESS.into(),
-                    canonical_arguments_digest: host.canonical_arguments_digest,
-                    target_selectors: host.target_selectors,
-                    observed_preconditions: host.observed_preconditions.into_iter().collect(),
-                    host_capabilities: host.host_capabilities,
-                    idempotency_key: format!("{operation_id}-redeem"),
-                    execution_id: execution_id.clone(),
-                    invoked_at_ms: 0,
-                },
-            )
-            .map_err(status_to_permit)?;
-        let redemption = redeemed.redemption.ok_or(PermitError::Missing)?;
+        let redeemed = self.chisei.redeem_from_authenticated(
+            self.run_as.clone(),
+            RedeemExternalActionPermitRequest {
+                permit: Some(external_permit_to_proto(&permit)),
+                executor: self.run_as.clone(),
+                requesting_harness: HARNESS.into(),
+                canonical_arguments_digest: host.canonical_arguments_digest,
+                target_selectors: host.target_selectors,
+                observed_preconditions: host.observed_preconditions.into_iter().collect(),
+                host_capabilities: host.host_capabilities,
+                idempotency_key: format!("{operation_id}-redeem"),
+                execution_id: execution_id.clone(),
+                invoked_at_ms: 0,
+            },
+        )?;
+        let redemption = redeemed
+            .redemption
+            .ok_or_else(|| tonic::Status::failed_precondition("redemption missing"))?;
         Ok(PermitProof {
             permit_id: permit.permit_id,
             redemption_id: redemption.redemption_id,
@@ -303,7 +320,14 @@ fn classify_decision(reason: &str) -> PermitError {
     }
 }
 
+fn is_idempotency_conflict(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::AlreadyExists
+}
+
 fn status_to_permit(status: tonic::Status) -> PermitError {
+    if is_idempotency_conflict(&status) {
+        return PermitError::Denied(status.message().to_string());
+    }
     classify_decision(status.message())
 }
 
@@ -489,6 +513,16 @@ impl GitHubIssues for GitHubHttp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_exists_is_an_idempotency_conflict() {
+        assert!(is_idempotency_conflict(&tonic::Status::already_exists(
+            "idempotency key was reused with a different canonical request digest"
+        )));
+        assert!(!is_idempotency_conflict(&tonic::Status::permission_denied(
+            "policy"
+        )));
+    }
 
     #[test]
     fn github_status_maps_retryable_failures() {
