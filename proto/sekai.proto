@@ -682,8 +682,9 @@ message FederatedAggregateResponse {
   string query_id = 1;
   string query_digest = 2;
   repeated FederatedAggregateGroup groups = 3;
-  // Groups dropped inside namespaces and on the combined result; counted,
-  // never described.
+  // Withheld from the caller (always 0). An exact suppressed-group count
+  // distinguishes no matches from fewer-than-k matches. Participant
+  // receipts keep the count for the allowance owner (ADR 0144).
   uint64 suppressed_groups = 4;
   // The minimum group size the combined result was suppressed at.
   uint64 min_group_size = 5;

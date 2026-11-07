@@ -415,7 +415,8 @@ pub struct Combined {
     #[serde(with = "group_list")]
     pub groups: BTreeMap<GroupKey, CombinedGroup>,
     /// Groups suppressed inside tenants plus groups suppressed on the
-    /// combined result. Counted, never described.
+    /// combined result. Counted for participant receipts; never returned
+    /// on the caller response (ADR 0144).
     pub suppressed_groups: u64,
     /// The `k` the combined result was suppressed at: the largest among the
     /// contributing tenants.
