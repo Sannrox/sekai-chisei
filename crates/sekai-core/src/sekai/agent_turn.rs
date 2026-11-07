@@ -263,12 +263,25 @@ pub fn get(db: &RuntimeDb, turn_id: &str) -> Result<Option<AgentTurn>, TurnError
     }
 }
 
-/// Due turns in `namespace` a worker may claim, oldest due first.
+/// Due turns in `namespace` a worker may claim, oldest due first, including
+/// parked turns whose Action is decided.
 pub fn list_claimable(
     db: &RuntimeDb,
     namespace: &str,
     now_ms: i64,
     limit: i64,
+) -> Result<Vec<AgentTurn>, TurnError> {
+    list_claimable_maybe_resuming(db, namespace, now_ms, limit, true)
+}
+
+/// Due turns a worker may claim. When `include_resuming` is false, parked
+/// turns that resume with a continuation are omitted.
+pub fn list_claimable_maybe_resuming(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+    limit: i64,
+    include_resuming: bool,
 ) -> Result<Vec<AgentTurn>, TurnError> {
     let cap = if limit <= 0 { 50 } else { limit.min(500) };
     let mut claimable = match db {
@@ -280,7 +293,9 @@ pub fn list_claimable(
     // A parked turn is listed once its Action is decided. Parked turns are
     // read on their own, so ones still awaiting a decision never crowd out
     // claimable turns or decided parks behind them.
-    claimable.extend(decided_parked_turns(db, Some(namespace), cap)?);
+    if include_resuming {
+        claimable.extend(decided_parked_turns(db, Some(namespace), cap)?);
+    }
     claimable.sort_by(|left, right| {
         (left.due_at_ms, &left.turn_id).cmp(&(right.due_at_ms, &right.turn_id))
     });
@@ -517,6 +532,20 @@ pub fn claim(
     ttl_ms: i64,
     now_ms: i64,
 ) -> Result<AgentTurn, TurnError> {
+    claim_accepting_continuation(db, namespace, runtime_id, turn_id, ttl_ms, now_ms, true)
+}
+
+/// Claims `turn_id`. When `accepts_continuation` is false, a parked resume is
+/// refused from the locked row after freeze and deletion retirement.
+pub fn claim_accepting_continuation(
+    db: &RuntimeDb,
+    namespace: &str,
+    runtime_id: &str,
+    turn_id: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    accepts_continuation: bool,
+) -> Result<AgentTurn, TurnError> {
     if runtime_id.trim().is_empty() {
         return Err(TurnError::Invalid("runtime_id required".into()));
     }
@@ -554,6 +583,11 @@ pub fn claim(
     let checked = (turn.claim_generation, turn.parked_action_id.clone());
     let mut exhausted = false;
     let claimed = edit(db, turn_id, |turn| {
+        if turn.is_parked() && !accepts_continuation {
+            return Err(TurnError::Invalid(
+                "claimer does not accept continuation".into(),
+            ));
+        }
         // Resume only the park whose decision was read: a turn reclaimed and
         // parked again meanwhile waits on its new Action.
         let resuming = resumes
@@ -1728,6 +1762,16 @@ mod tests {
             // Once decided it resumes at a new generation, naming the Action.
             decide(db, &action, "admitted");
             assert_eq!(list_claimable(db, ns, now, 10).unwrap().len(), 1);
+            assert!(
+                list_claimable_maybe_resuming(db, ns, now, 10, false)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                claim_accepting_continuation(db, ns, "runner-b", &turn.turn_id, 1_000, now, false)
+                    .unwrap_err(),
+                TurnError::Invalid("claimer does not accept continuation".into())
+            );
             let resumed = claim(db, ns, "runner-b", &turn.turn_id, 1_000, now).unwrap();
             assert_eq!(resumed.claim_generation, held.claim_generation + 1);
             assert_eq!(resumed.parked_action_id, action);

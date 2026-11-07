@@ -1266,6 +1266,8 @@ message WakeSiteAgentInstanceResponse {
 message ListClaimableAgentTurnsRequest {
   string namespace = 1;
   int32 limit = 2;
+  // When false, parked turns that would resume with a continuation are omitted.
+  bool accepts_continuation = 3;
 }
 message ListClaimableAgentTurnsResponse {
   repeated AgentTurn turns = 1;
@@ -1288,6 +1290,9 @@ message ClaimAgentTurnRequest {
   string runtime_id = 2;
   string turn_id = 3;
   int64 ttl_ms = 4;
+  // Claimers that do not set this are refused a parked turn: continuation is
+  // the only resume signal, and re-planning a parked turn as new duplicates work.
+  bool accepts_continuation = 5;
 }
 message ClaimAgentTurnResponse {
   AgentTurn turn = 1;

@@ -65,6 +65,8 @@ impl SekaiServiceImpl {
         entries.push(preview_transform_capability(experimental));
         entries.push(adhoc_transform_capability(experimental));
         entries.push(object_set_inputs_capability(experimental));
+        entries.push(agent_turn_runtime_token_capability(experimental));
+        entries.push(agent_turn_parked_capability(experimental));
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(entries)
     }
@@ -366,6 +368,7 @@ fn capability_product_tier(name: &str) -> &'static str {
         other if other.contains("kioku") => "experimental",
         "sekai.search.query" | "sekai.search.status" => "experimental",
         "sekai.relations.neighborhood" | "sekai.relations.paths" => "experimental",
+        "sekai.agent_turn.runtime_token" | "sekai.agent_turn.parked" => "experimental",
         _ => "advanced",
     }
 }
@@ -899,6 +902,34 @@ fn search_status_capability(enabled: bool) -> CapabilityEntry {
     entry
 }
 
+fn agent_turn_runtime_token_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.agent_turn.runtime_token".into(),
+        "ClaimAgentTurn mints a turn-bound runtime token (ADR 0142).".into(),
+        "runtime",
+        "sekai.ClaimAgentTurnRequest",
+        "sekai.ClaimAgentTurnResponse",
+    );
+    entry.required_scopes = vec!["agent_turn_worker".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "agent_turn_worker".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+fn agent_turn_parked_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        "sekai.agent_turn.parked".into(),
+        "A parked turn resumes with continuation; claimers must set accepts_continuation.".into(),
+        "runtime",
+        "sekai.ClaimAgentTurnRequest",
+        "sekai.ClaimAgentTurnResponse",
+    );
+    entry.required_scopes = vec!["agent_turn_worker".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "agent_turn_worker".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
 fn experimental_rpc_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         crate::rpc_maturity::EXPERIMENTAL_CAPABILITY.into(),
@@ -994,6 +1025,33 @@ mod tests {
         }
         assert_eq!(neighborhood_capability(true).lifecycle_state, "active");
         assert_eq!(paths_capability(true).lifecycle_state, "active");
+    }
+
+    #[test]
+    fn agent_turn_capabilities_follow_the_experimental_gate() {
+        for (entry, name) in [
+            (
+                agent_turn_runtime_token_capability(false),
+                "sekai.agent_turn.runtime_token",
+            ),
+            (
+                agent_turn_parked_capability(false),
+                "sekai.agent_turn.parked",
+            ),
+        ] {
+            assert_eq!(entry.lifecycle_state, "disabled");
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.product_tier, "experimental");
+            assert_eq!(
+                crate::rpc_maturity::capability_backing_rpc(&entry.name),
+                Some("ClaimAgentTurn")
+            );
+        }
+        assert_eq!(
+            agent_turn_runtime_token_capability(true).lifecycle_state,
+            "active"
+        );
+        assert_eq!(agent_turn_parked_capability(true).lifecycle_state, "active");
     }
 
     #[test]

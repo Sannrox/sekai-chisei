@@ -21,9 +21,9 @@ The `0.1.x` surface provides:
   policy, budget, and transport outcomes;
 - cancellable `PlanExecution` and `ExecutePlanStream` calls;
 - operation-event reporting and receipt lookup;
-- a versioned runtime-claim module (`sekai.sdk-runtime-claim/v1`) for Action
-  and isolated-process transform work, with typed fence, contention, denial,
-  and unavailability errors; and
+- a versioned runtime-claim module (`sekai.sdk-runtime-claim/v1`) for Action,
+  isolated-process transform, and agent-turn work, with typed fence, contention,
+  denial, and unavailability errors; and
 - an explicit native raw tonic escape hatch for unsupported RPCs.
 
 `CoreLoopTransport` is injectable, so deterministic tests and hosts such as

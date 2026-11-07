@@ -24,10 +24,11 @@ use uuid::Uuid;
 
 use crate::protocol::sekai::{
     AckActionWorkRequest, AckActionWorkResponse, AckAgentTurnRequest, AckAgentTurnResponse,
-    AgentTurn, ApplyStreamingTransformBatchRequest, ApplyStreamingTransformBatchResponse,
-    ClaimActionWorkRequest, ClaimActionWorkResponse, ClaimAgentTurnRequest, ClaimAgentTurnResponse,
-    ClaimTransformWorkRequest, ClaimTransformWorkResponse, HeartbeatActionClaimRequest,
-    HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
+    AgentTurn, AgentTurnContinuation, ApplyStreamingTransformBatchRequest,
+    ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
+    ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
+    ClaimTransformWorkResponse, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
+    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
     HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
     ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
@@ -249,6 +250,35 @@ impl AgentTurnFence {
             generation: turn.claim_generation,
             fencing_token: turn.fencing_token.clone(),
         }
+    }
+}
+
+/// A held agent-turn claim: the turn, its fence, the minted runtime token,
+/// and the continuation when this claim resumes a parked turn.
+///
+/// `continuation` is the only resume signal. A worker that re-plans a parked
+/// turn as new will not reproduce the original Action idempotency key.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimedAgentTurn {
+    pub turn: AgentTurn,
+    pub fence: AgentTurnFence,
+    pub runtime_token: String,
+    pub token_expires_at_ms: i64,
+    pub continuation: Option<AgentTurnContinuation>,
+}
+
+impl ClaimedAgentTurn {
+    fn from_response(response: ClaimAgentTurnResponse) -> Option<Self> {
+        let turn = response.turn?;
+        let fence = AgentTurnFence::of(&turn);
+        Some(Self {
+            fence,
+            turn,
+            runtime_token: response.runtime_token,
+            token_expires_at_ms: response.runtime_token_expires_at_ms,
+            continuation: response.continuation,
+        })
     }
 }
 
@@ -670,20 +700,25 @@ impl<'a> RuntimeClaimClient<'a> {
         let listed: ListClaimableAgentTurnsResponse = self
             .list_unary(
                 LIST_AGENT_TURN,
-                ListClaimableAgentTurnsRequest { namespace, limit },
+                ListClaimableAgentTurnsRequest {
+                    namespace,
+                    limit,
+                    accepts_continuation: true,
+                },
             )
             .await?;
         Ok(listed.turns)
     }
 
     /// Claims `turn_id`. A turn that is gone, held, finished, or refused
-    /// because its instance is frozen is contention.
+    /// because its instance is frozen is contention. Declares continuation
+    /// support so a parked resume is not re-planned as a new turn.
     pub async fn claim_agent_turn(
         &self,
         runtime_id: impl Into<String>,
         turn_id: impl Into<String>,
         ttl: Duration,
-    ) -> Result<ClaimAttempt<AgentTurn>, RuntimeClaimError> {
+    ) -> Result<ClaimAttempt<ClaimedAgentTurn>, RuntimeClaimError> {
         let namespace = self.namespace()?.to_string();
         match self
             .client
@@ -695,13 +730,13 @@ impl<'a> RuntimeClaimClient<'a> {
                     runtime_id: runtime_id.into(),
                     turn_id: turn_id.into(),
                     ttl_ms: duration_millis(ttl)?,
+                    accepts_continuation: true,
                 },
                 self.options(false),
             )
             .await
         {
-            Ok(response) => Ok(response
-                .turn
+            Ok(response) => Ok(ClaimedAgentTurn::from_response(response)
                 .map_or(ClaimAttempt::Contended, ClaimAttempt::Claimed)),
             Err(error) => RuntimeClaimError::from_agent_turn_claim(error),
         }
@@ -712,7 +747,7 @@ impl<'a> RuntimeClaimClient<'a> {
         &self,
         runtime_id: impl Into<String>,
         ttl: Duration,
-    ) -> Result<ClaimAttempt<AgentTurn>, RuntimeClaimError> {
+    ) -> Result<ClaimAttempt<ClaimedAgentTurn>, RuntimeClaimError> {
         let Some(candidate) = self.list_agent_turns(1).await?.into_iter().next() else {
             return Ok(ClaimAttempt::Idle);
         };
@@ -1035,6 +1070,50 @@ mod tests {
             )),
             Err(RuntimeClaimError::Unavailable(_))
         ));
+        assert!(matches!(
+            RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(
+                SdkErrorCode::InvalidArgument
+            )),
+            Err(RuntimeClaimError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn claimed_agent_turn_keeps_token_and_continuation() {
+        let turn = AgentTurn {
+            turn_id: "t1".into(),
+            claim_owner: "runner".into(),
+            claim_generation: 3,
+            fencing_token: "fence".into(),
+            ..Default::default()
+        };
+        let continuation = AgentTurnContinuation {
+            action_instance_id: "a1".into(),
+            status: "admitted".into(),
+            approval_decision: "grant".into(),
+            deny_reason: String::new(),
+        };
+        let claimed = ClaimedAgentTurn::from_response(ClaimAgentTurnResponse {
+            turn: Some(turn.clone()),
+            runtime_token: "rt_token".into(),
+            runtime_token_expires_at_ms: 9,
+            continuation: Some(continuation.clone()),
+        })
+        .expect("turn present");
+        assert_eq!(claimed.turn, turn);
+        assert_eq!(
+            claimed.fence,
+            AgentTurnFence {
+                turn_id: "t1".into(),
+                runtime_id: "runner".into(),
+                generation: 3,
+                fencing_token: "fence".into(),
+            }
+        );
+        assert_eq!(claimed.runtime_token, "rt_token");
+        assert_eq!(claimed.token_expires_at_ms, 9);
+        assert_eq!(claimed.continuation.as_ref(), Some(&continuation));
+        assert!(ClaimedAgentTurn::from_response(ClaimAgentTurnResponse::default()).is_none());
     }
 
     #[test]

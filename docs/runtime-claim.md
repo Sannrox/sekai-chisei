@@ -101,7 +101,9 @@ credentials under the same namespace and tenant checks as other Action RPCs.
 Agent-turn claims mint the same kind of token (ADR 0142, #2005).
 `ClaimAgentTurn` and `HeartbeatAgentTurnClaim` return `runtime_token` and
 `runtime_token_expires_at_ms` bound to the turn's namespace, turn, runtime and
-claim generation. The token acts as the instance's `principal_id`, with the
+claim generation. `sekai-client` maps a claim onto `ClaimedAgentTurn` so the
+token and continuation are not dropped. DiscoverCapabilities advertises
+`sekai.agent_turn.runtime_token` and `sekai.agent_turn.parked`. The token acts as the instance's `principal_id`, with the
 claiming worker as its `act`, so both need access to the namespace. It
 authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn` and
 `SubmitActionInstance`, and only while the turn is claimed at that generation
@@ -129,7 +131,9 @@ that lands before the acknowledgement still records the continuation, and
 the turn is then immediately resumable. A frozen or deleted instance's parked turn is retired instead
 of reclaimed. Agent-turn queue gauges count parked turns whose decision
 stands. The next claim carries `continuation`: the
-Action's id, status and approval decision. A granted Action was applied, once,
+Action's id, status and approval decision. Continuation is the only resume
+signal; a claimer that does not set `accepts_continuation` does not see
+those parked turns, and a targeted claim is `INVALID_ARGUMENT`. A granted Action was applied, once,
 by its grant, so the resumed run reads the outcome instead of applying it
 again. A turn parks at most three times; a fourth park fails it.
 
