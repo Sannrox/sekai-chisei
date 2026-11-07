@@ -7544,6 +7544,102 @@ async fn dataset_row_reads_honour_property_grants() {
     }
 }
 
+/// #2101: a row read loads the binding and active policy once, then reuses
+/// them for tenant visibility and the column allowlist.
+#[tokio::test]
+async fn dataset_hot_reads_load_binding_and_policy_once() {
+    use crate::db::runtime_db::source_batch_auth_counters::{OBJECT_LOOKUPS, POLICY_LOOKUPS};
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Caller {
+        Tenant,
+        TenantFree,
+    }
+    for caller in [Caller::Tenant, Caller::TenantFree] {
+        let svc = match caller {
+            Caller::Tenant => enterprise_service(),
+            Caller::TenantFree => service(),
+        };
+        let runtime = svc.db.runtime();
+        seed_lineage_object(&svc, "hot-object", "allowed");
+        runtime
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: "hot".into(),
+                name: "hot".into(),
+                columns: ["id", "note"]
+                    .map(|name| crate::sekai::dataset::ColumnDef {
+                        name: name.into(),
+                        col_type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .into(),
+                object_id: "hot-object".into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        runtime
+            .append_rows(
+                "hot",
+                &[HashMap::from([
+                    ("id".into(), "1".into()),
+                    ("note".into(), "hidden".into()),
+                ])],
+            )
+            .unwrap();
+        let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+            contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "allowed".into(),
+            kind: "widget".into(),
+            rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                predicates: vec![crate::sekai::object_security::ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![crate::sekai::object_security::PropertyGrant {
+                property: "id".into(),
+                access: crate::sekai::object_security::PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: None,
+            required_purpose: None,
+        };
+        let revision = runtime
+            .put_object_security_policy(&policy, "root", "put-hot", 1)
+            .unwrap();
+        runtime
+            .activate_object_security_policies(
+                "allowed",
+                &BTreeMap::from([("widget".into(), revision.revision_digest)]),
+                "root",
+                "activate-hot",
+                2,
+            )
+            .unwrap();
+        OBJECT_LOOKUPS.with(|c| c.set(0));
+        POLICY_LOOKUPS.with(|c| c.set(0));
+        let request = match caller {
+            Caller::Tenant => with_tenant_context(QueryRowsRequest {
+                dataset_id: "hot".into(),
+                query: None,
+            }),
+            Caller::TenantFree => with_principal(QueryRowsRequest {
+                dataset_id: "hot".into(),
+                query: None,
+            }),
+        };
+        let rows = svc.query_rows(request).await.unwrap().into_inner().rows;
+        assert_eq!(
+            rows[0].values,
+            HashMap::from([("id".to_string(), "1".to_string())]),
+            "{caller:?}"
+        );
+        let objects = OBJECT_LOOKUPS.with(|c| c.get());
+        let policies = POLICY_LOOKUPS.with(|c| c.get());
+        assert_eq!(objects, 1, "{caller:?} binding lookups {objects}");
+        assert_eq!(policies, 1, "{caller:?} policy lookups {policies}");
+    }
+}
+
 /// A tenant credential reaches the dataset version and health RPCs through
 /// the real assertion interceptor; each handler, not admission, must refuse a
 /// dataset bound to another tenant's namespace, as `QueryRows` does.
