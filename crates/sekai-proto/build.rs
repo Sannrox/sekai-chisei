@@ -66,6 +66,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sekai.VerifyAttestationResponse.archived_at_ms",
             "#[serde(default)]",
         )
+        .field_attribute(
+            "sekai.ClaimAgentTurnRequest.accepts_continuation",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.ListClaimableAgentTurnsRequest.accepts_continuation",
+            "#[serde(default)]",
+        )
         .compile_protos(
             &[
                 format!("{proto_root}/sekai.proto"),

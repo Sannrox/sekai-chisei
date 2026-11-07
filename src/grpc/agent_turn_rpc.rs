@@ -420,11 +420,12 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListClaimableAgentTurnsResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
         let inner = req.into_inner();
-        let turns = agent_turn::list_claimable(
+        let turns = agent_turn::list_claimable_maybe_resuming(
             self.db.runtime(),
             &inner.namespace,
             now_millis(),
             i64::from(inner.limit),
+            inner.accepts_continuation,
         )
         .map_err(turn_status)?;
         Ok(Response::new(ListClaimableAgentTurnsResponse {
@@ -439,13 +440,14 @@ impl SekaiServiceImpl {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
         let now = now_millis();
         let inner = req.get_ref();
-        let turn = agent_turn::claim(
+        let turn = agent_turn::claim_accepting_continuation(
             self.db.runtime(),
             &inner.namespace,
             &inner.runtime_id,
             &inner.turn_id,
             inner.ttl_ms,
             now,
+            inner.accepts_continuation,
         )
         .map_err(turn_status)?;
         let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;

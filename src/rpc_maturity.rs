@@ -281,6 +281,7 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.relations.traverse" => Some("Traverse"),
         "sekai.relations.neighborhood" => Some("ExpandNeighborhood"),
         "sekai.relations.paths" => Some("FindPaths"),
+        "sekai.agent_turn.runtime_token" | "sekai.agent_turn.parked" => Some("ClaimAgentTurn"),
         "sekai.semantic.expand_relations" => Some("ExpandRelations"),
         "sekai.context.retrieve" => Some("RetrieveContext"),
         "sekai.semantic.explain_derivation" => Some("ExplainDerivation"),

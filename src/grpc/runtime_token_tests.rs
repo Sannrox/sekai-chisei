@@ -436,6 +436,7 @@ async fn claim_turn(
         runtime_id: "runner-a".into(),
         turn_id: turn_id.into(),
         ttl_ms: 60_000,
+        accepts_continuation: true,
     });
     let mut context = tenant_context(&format!("tenant-{suffix}"));
     context.principal.subject = TURN_WORKER.into();
@@ -736,6 +737,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         runtime_id: "runner-a".into(),
         turn_id: turn_id.clone(),
         ttl_ms: 60_000,
+        accepts_continuation: true,
     });
     let mut context = tenant_context("tenant-a");
     context.principal.subject = TURN_WORKER.into();
@@ -794,6 +796,44 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
             )
             .unwrap();
     }
+
+    let list = |accepts_continuation: bool| {
+        let mut request = Request::new(crate::grpc::pb::sekai::ListClaimableAgentTurnsRequest {
+            namespace: "ns-a".into(),
+            limit: 10,
+            accepts_continuation,
+        });
+        let mut context = tenant_context("tenant-a");
+        context.principal.subject = TURN_WORKER.into();
+        request.extensions_mut().insert(context);
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static(TURN_WORKER));
+        plane.service.list_claimable_agent_turns(request)
+    };
+    assert!(
+        list(false).await.unwrap().into_inner().turns.is_empty(),
+        "claimers that omit continuation do not see a parked resume"
+    );
+    assert_eq!(list(true).await.unwrap().into_inner().turns.len(), 1);
+
+    let mut refused = Request::new(crate::grpc::pb::sekai::ClaimAgentTurnRequest {
+        namespace: "ns-a".into(),
+        runtime_id: "runner-a".into(),
+        turn_id: turn_id.clone(),
+        ttl_ms: 60_000,
+        accepts_continuation: false,
+    });
+    let mut context = tenant_context("tenant-a");
+    context.principal.subject = TURN_WORKER.into();
+    refused.extensions_mut().insert(context);
+    refused
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static(TURN_WORKER));
+    let refused = plane.service.claim_agent_turn(refused).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert_eq!(refused.message(), "claimer does not accept continuation");
+
     let resumed = claim_turn(&plane, "a", &turn_id).await;
     let continuation = resumed.continuation.unwrap();
     assert_eq!(

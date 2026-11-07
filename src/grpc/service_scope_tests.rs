@@ -502,6 +502,7 @@ async fn claim_turn(
             runtime_id: "runner-a".into(),
             turn_id: turn_id.into(),
             ttl_ms: 60_000,
+            accepts_continuation: true,
         },
     )?;
     plane
@@ -546,6 +547,7 @@ async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
                 crate::grpc::pb::sekai::ListClaimableAgentTurnsRequest {
                     namespace: IN_SCOPE.into(),
                     limit: 10,
+                    accepts_continuation: true,
                 },
             )
             .unwrap(),

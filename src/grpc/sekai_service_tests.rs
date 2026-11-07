@@ -34347,6 +34347,7 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
             ListClaimableAgentTurnsRequest {
                 namespace: "ops".into(),
                 limit: 10,
+                accepts_continuation: false,
             },
             "local",
         ))
@@ -34362,6 +34363,7 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
                 runtime_id: "runner-a".into(),
                 turn_id: turn.turn_id.clone(),
                 ttl_ms: 60_000,
+                accepts_continuation: true,
             },
             "local",
         ))
@@ -34445,6 +34447,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                 runtime_id: "runner-a".into(),
                 turn_id,
                 ttl_ms: 60_000,
+                accepts_continuation: true,
             },
             "local",
         ))
@@ -35051,6 +35054,7 @@ async fn transform_ticks_admit_due_agent_schedule_wakes() {
             ListClaimableAgentTurnsRequest {
                 namespace: "ops".into(),
                 limit: 10,
+                accepts_continuation: false,
             },
             "local",
         ))
