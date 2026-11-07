@@ -2547,47 +2547,13 @@ fn authorize_transform_dataset_reads(
     dataset_ids.sort();
     dataset_ids.dedup();
     for dataset_id in dataset_ids {
-        authorize_transform_dataset_read(service, principals, tenant_context, &dataset_id)?;
-    }
-    Ok(())
-}
-
-fn authorize_transform_dataset_read(
-    service: &SekaiServiceImpl,
-    principals: &[String],
-    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
-    dataset_id: &str,
-) -> Result<(), Status> {
-    let dataset = service
-        .db
-        .runtime()
-        .get_dataset(dataset_id)
-        .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
-        principals,
-        &dataset,
-        false,
-    )?;
-    if !dataset.object_id.is_empty() {
-        if let Some(object) = service
+        let dataset = service
             .db
             .runtime()
-            .get_object(&dataset.object_id)
+            .get_dataset(&dataset_id)
             .map_err(Status::internal)?
-        {
-            if !object_is_visible(
-                service.db.runtime(),
-                &service.security,
-                &object,
-                principals,
-                tenant_context,
-            ) {
-                return Err(Status::permission_denied("access denied"));
-            }
-        }
+            .ok_or_else(|| Status::not_found("dataset not found"))?;
+        authorize_dataset(service, principals, tenant_context, &dataset, false)?;
     }
     Ok(())
 }
@@ -2606,31 +2572,7 @@ fn authorize_preview_inputs(
             .get_dataset(&dataset_id)
             .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("dataset not found"))?;
-        check_dataset_access(
-            service.db.runtime(),
-            &service.security,
-            principals,
-            &dataset,
-            false,
-        )?;
-        if !dataset.object_id.is_empty() {
-            if let Some(object) = service
-                .db
-                .runtime()
-                .get_object(&dataset.object_id)
-                .map_err(Status::internal)?
-            {
-                if !object_is_visible(
-                    service.db.runtime(),
-                    &service.security,
-                    &object,
-                    principals,
-                    tenant_context,
-                ) {
-                    return Err(Status::permission_denied("access denied"));
-                }
-            }
-        }
+        authorize_dataset(service, principals, tenant_context, &dataset, false)?;
         if let Some(allowed) = preview_column_allowlist(service, &dataset)? {
             column_allowlists.insert(dataset_id, allowed);
         }
