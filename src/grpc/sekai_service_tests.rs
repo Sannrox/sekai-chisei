@@ -7005,6 +7005,238 @@ async fn enterprise_transform_inputs_require_live_namespace_binding() {
     }
 }
 
+/// #2105: Create, Append and Update reach the interceptor, then authorize
+/// Write on a live binding object in a writable namespace. Unbound, orphan
+/// and foreign datasets stay refused.
+#[tokio::test]
+async fn enterprise_dataset_writes_require_live_namespace_binding() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tonic::service::Interceptor;
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    let runtime = svc.db.runtime();
+    for (dataset_id, namespace) in [
+        ("bound-ds", Some("allowed")),
+        ("unbound-ds", None),
+        ("orphan-ds", Some("allowed")),
+        ("foreign-ds", Some("foreign")),
+    ] {
+        let object_id = namespace.map_or(String::new(), |namespace| {
+            let id = format!("{dataset_id}-object");
+            seed_lineage_object(&svc, &id, namespace);
+            id
+        });
+        runtime
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: vec![crate::sekai::dataset::ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id,
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    seed_lineage_object(&svc, "create-bound-object", "allowed");
+    seed_lineage_object(&svc, "create-foreign-object", "foreign");
+    seed_lineage_object(&svc, "create-orphan-object", "allowed");
+    runtime.delete_object("orphan-ds-object").unwrap();
+    runtime.delete_object("create-orphan-object").unwrap();
+
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    fn token(authority: &AssertionAuthority, scopes: &[&str]) -> String {
+        authority
+            .sign(&IdentityAssertion {
+                contract_version: IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: Some("tenant-test".into()),
+                scopes: scopes.iter().map(|scope| (*scope).into()).collect(),
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    }
+    fn admit<T>(
+        interceptor: &mut crate::grpc::TokenAuthInterceptor,
+        authority: &AssertionAuthority,
+        method: &'static str,
+        scopes: &[&str],
+        body: T,
+    ) -> Request<T> {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {}", token(authority, scopes))).unwrap(),
+        );
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+        let (metadata, extensions, ()) = interceptor.call(req).unwrap().into_parts();
+        Request::from_parts(metadata, extensions, body)
+    }
+    fn dataset(id: &str, object_id: &str) -> Dataset {
+        Dataset {
+            id: id.into(),
+            name: id.into(),
+            columns: vec![ColumnDef {
+                name: "id".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: object_id.into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }
+    }
+    let denied = tonic::Code::PermissionDenied;
+    let write: &[&str] = &["sekai.read", "sekai.write"];
+    let created = svc
+        .create_dataset(admit(
+            &mut interceptor,
+            &authority,
+            "CreateDataset",
+            write,
+            CreateDatasetRequest {
+                dataset: Some(dataset("create-bound", "create-bound-object")),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .dataset
+        .unwrap();
+    assert_eq!(created.id, "create-bound");
+    assert_eq!(created.object_id, "create-bound-object");
+    for (case, object_id) in [
+        ("unbound", ""),
+        ("orphan", "create-orphan-object"),
+        ("foreign", "create-foreign-object"),
+    ] {
+        assert_eq!(
+            svc.create_dataset(admit(
+                &mut interceptor,
+                &authority,
+                "CreateDataset",
+                write,
+                CreateDatasetRequest {
+                    dataset: Some(dataset(&format!("create-{case}"), object_id)),
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "CreateDataset {case}"
+        );
+    }
+
+    let appended = svc
+        .append_rows(admit(
+            &mut interceptor,
+            &authority,
+            "AppendRows",
+            write,
+            AppendRowsRequest {
+                dataset_id: "bound-ds".into(),
+                rows: vec![Row {
+                    values: HashMap::from([("id".into(), "bound-ds".into())]),
+                }],
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .count;
+    assert_eq!(appended, 1);
+    for dataset_id in ["unbound-ds", "orphan-ds", "foreign-ds"] {
+        assert_eq!(
+            svc.append_rows(admit(
+                &mut interceptor,
+                &authority,
+                "AppendRows",
+                write,
+                AppendRowsRequest {
+                    dataset_id: dataset_id.into(),
+                    rows: vec![Row {
+                        values: HashMap::from([("id".into(), dataset_id.into())]),
+                    }],
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "AppendRows {dataset_id}"
+        );
+    }
+
+    let updated = svc
+        .update_dataset(admit(
+            &mut interceptor,
+            &authority,
+            "UpdateDataset",
+            write,
+            UpdateDatasetRequest {
+                dataset: Some(Dataset {
+                    name: "bound-renamed".into(),
+                    ..dataset("bound-ds", "bound-ds-object")
+                }),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .dataset
+        .unwrap();
+    assert_eq!(updated.name, "bound-renamed");
+    for (dataset_id, object_id) in [
+        ("unbound-ds", ""),
+        ("orphan-ds", "orphan-ds-object"),
+        ("foreign-ds", "foreign-ds-object"),
+    ] {
+        assert_eq!(
+            svc.update_dataset(admit(
+                &mut interceptor,
+                &authority,
+                "UpdateDataset",
+                write,
+                UpdateDatasetRequest {
+                    dataset: Some(dataset(dataset_id, object_id)),
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "UpdateDataset {dataset_id}"
+        );
+    }
+}
+
 /// #2097: rows are held to the binding object's readable columns when its
 /// policy enforces property grants, for a tenant caller and a tenant-free one,
 /// on the live rows, a version snapshot, and the rows a rollback returns.

@@ -149,6 +149,7 @@ pub(super) async fn create_dataset(
 ) -> Result<Response<CreateDatasetResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let dataset = req
         .into_inner()
         .dataset
@@ -160,13 +161,7 @@ pub(super) async fn create_dataset(
             crate::sekai::object_set_input::PIN_PREFIX
         )));
     }
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
-        &principals,
-        &parsed,
-        true,
-    )?;
+    authorize_dataset(service, &principals, tenant_context.as_ref(), &parsed, true)?;
     service
         .db
         .runtime()
@@ -182,6 +177,7 @@ pub(super) async fn update_dataset(
 ) -> Result<Response<UpdateDatasetResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let dataset = req
         .into_inner()
         .dataset
@@ -193,10 +189,10 @@ pub(super) async fn update_dataset(
         .get_dataset(&parsed.id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &existing,
         true,
     )?;
@@ -205,6 +201,8 @@ pub(super) async fn update_dataset(
         // control-plane admins (`root` / UDS transport `local`) and the
         // gateway service principal for `llm_calls` schema convergence.
         // UDS force-local identity must not block sekaictl gateway setup.
+        // Tenant callers already fail `authorize_dataset` on an unbound
+        // dataset; this exception is tenant-free only.
         let control_plane_admin = principals
             .iter()
             .any(|principal| matches!(principal.as_str(), "root" | "local"));
@@ -219,13 +217,7 @@ pub(super) async fn update_dataset(
             ));
         }
     }
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
-        &principals,
-        &parsed,
-        true,
-    )?;
+    authorize_dataset(service, &principals, tenant_context.as_ref(), &parsed, true)?;
     service
         .db
         .runtime()
@@ -285,6 +277,7 @@ pub(super) async fn append_rows(
 ) -> Result<Response<AppendRowsResponse>, Status> {
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let inner = req.into_inner();
     let dataset = service
         .db
@@ -292,10 +285,10 @@ pub(super) async fn append_rows(
         .get_dataset(&inner.dataset_id)
         .map_err(Status::internal)?
         .ok_or(Status::not_found("dataset not found"))?;
-    check_dataset_access(
-        service.db.runtime(),
-        &service.security,
+    authorize_dataset(
+        service,
         &principals,
+        tenant_context.as_ref(),
         &dataset,
         true,
     )?;
@@ -349,12 +342,13 @@ pub(super) async fn query_rows(
 }
 
 /// The access decision of the dataset RPCs admitted for tenant credentials
-/// (`QueryRows`, versions, rollback, health checks and alerts). Every caller
-/// passes the principal checks of [`check_dataset_access`]. A tenant caller
-/// must also hold Read, or Write when `write`, on the namespace of the
-/// dataset's binding object, and see that object; a dataset with no live
-/// binding object has no namespace and is refused, as are guests, here as
-/// well as at the interceptor. Tenant-free callers keep the principal checks.
+/// (`QueryRows`, versions, rollback, health, CreateDataset, AppendRows,
+/// UpdateDataset). Every caller passes the principal checks of
+/// [`check_dataset_access`]. A tenant caller must also hold Read, or Write
+/// when `write`, on the namespace of the dataset's binding object, and see
+/// that object; a dataset with no live binding object has no namespace and
+/// is refused, as are guests, here as well as at the interceptor.
+/// Tenant-free callers keep the principal checks.
 fn authorize_dataset(
     service: &SekaiServiceImpl,
     principals: &[String],
