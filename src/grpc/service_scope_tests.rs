@@ -559,11 +559,15 @@ async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
     assert_eq!(listed.len(), 1);
     let claimed = claim_turn(&plane, IN_SCOPE, &in_scope).await.unwrap();
     let turn = claimed.turn.unwrap();
-    // Its turn token acts as the instance, with the worker as actor.
+    // Its turn token acts as the instance; the worker is not `act`.
     let token = verified_token(&plane, &claimed.runtime_token);
     assert_eq!(
-        (token.subject.as_str(), token.act.as_deref()),
-        ("agent:a-in", Some(WORKER))
+        (
+            token.subject.as_str(),
+            token.act.as_deref(),
+            token.worker.as_deref()
+        ),
+        ("agent:a-in", Some("root"), Some(WORKER))
     );
     assert!(!token.service_principal);
     plane
