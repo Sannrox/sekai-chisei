@@ -161,27 +161,83 @@ impl Config {
         }
     }
 
+    /// The identity-assertion verifier, or `None` when none is configured.
+    /// Reads `SEKAI_ASSERTION_ED25519_KEYS` and `SEKAI_ASSERTION_ACCEPT_HMAC`
+    /// beside the fields on this config.
     pub fn assertion_authority(
         &self,
     ) -> Result<Option<crate::identity_assertion::AssertionAuthority>, String> {
-        match (
-            self.assertion_issuer.as_deref(),
-            self.assertion_audience.as_deref(),
-            self.assertion_hmac_key.as_deref(),
-        ) {
-            (None, None, None) => Ok(None),
-            (Some(issuer), Some(audience), Some(key))
-                if !issuer.is_empty() && !audience.is_empty() && !key.is_empty() =>
-            {
-                Ok(Some(crate::identity_assertion::AssertionAuthority::new(
-                    issuer, audience, key.as_bytes(),
-                )))
-            }
-            _ => Err(
-                "assertion authority requires SEKAI_ASSERTION_ISSUER, SEKAI_ASSERTION_AUDIENCE, and SEKAI_ASSERTION_HMAC_KEY together"
-                    .into(),
-            ),
+        self.assertion_authority_with(
+            optional_env("SEKAI_ASSERTION_ED25519_KEYS").as_deref(),
+            optional_env("SEKAI_ASSERTION_ACCEPT_HMAC").as_deref(),
+        )
+    }
+
+    /// [`Self::assertion_authority`] with the Ed25519 public keys and the
+    /// HMAC acceptance switch given instead of read from the environment.
+    /// Issuer and audience are required with either key; HMAC acceptance
+    /// defaults on and may be off only when Ed25519 keys are configured.
+    pub fn assertion_authority_with(
+        &self,
+        ed25519_keys: Option<&str>,
+        accept_hmac: Option<&str>,
+    ) -> Result<Option<crate::identity_assertion::AssertionAuthority>, String> {
+        use crate::identity_assertion::{AssertionAuthority, AssertionVerifyingKeys};
+        let nonempty = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+        let (issuer, audience, hmac_key) = (
+            nonempty(&self.assertion_issuer),
+            nonempty(&self.assertion_audience),
+            nonempty(&self.assertion_hmac_key),
+        );
+        if [
+            &self.assertion_issuer,
+            &self.assertion_audience,
+            &self.assertion_hmac_key,
+        ]
+        .iter()
+        .all(|value| value.is_none())
+            && ed25519_keys.is_none()
+            && accept_hmac.is_none()
+        {
+            return Ok(None);
         }
+        let accept_hmac = match accept_hmac {
+            None | Some("1") => true,
+            Some("0") => false,
+            Some(_) => return Err("SEKAI_ASSERTION_ACCEPT_HMAC must be 0 or 1".into()),
+        };
+        let ed25519_keys = ed25519_keys
+            .map(AssertionVerifyingKeys::parse)
+            .transpose()?;
+        let authority = match (issuer, audience, hmac_key, ed25519_keys) {
+            (Some(issuer), Some(audience), Some(key), keys) => {
+                let authority = AssertionAuthority::new(issuer, audience, key.into_bytes());
+                match keys {
+                    Some(keys) => authority.with_ed25519_keys(keys),
+                    None if !accept_hmac => {
+                        return Err(
+                            "SEKAI_ASSERTION_ACCEPT_HMAC=0 requires SEKAI_ASSERTION_ED25519_KEYS"
+                                .into(),
+                        );
+                    }
+                    None => authority,
+                }
+            }
+            (Some(issuer), Some(audience), None, Some(keys)) => {
+                AssertionAuthority::ed25519_only(issuer, audience, keys)
+            }
+            _ => {
+                return Err(
+                    "assertion authority requires SEKAI_ASSERTION_ISSUER, SEKAI_ASSERTION_AUDIENCE, and SEKAI_ASSERTION_HMAC_KEY or SEKAI_ASSERTION_ED25519_KEYS together"
+                        .into(),
+                );
+            }
+        };
+        Ok(Some(if accept_hmac {
+            authority
+        } else {
+            authority.without_hmac_assertions()
+        }))
     }
 
     pub fn grpc_tcp_mode(&self, active_credentials: bool) -> GrpcTcpMode {
@@ -390,14 +446,93 @@ mod tests {
     #[test]
     fn assertion_authority_requires_all_three_or_none() {
         let mut config = test_config();
-        assert!(config.assertion_authority().unwrap().is_none());
+        assert!(
+            config
+                .assertion_authority_with(None, None)
+                .unwrap()
+                .is_none()
+        );
         config.assertion_issuer = Some("https://issuer.test".into());
-        assert!(config.assertion_authority().is_err());
+        assert!(config.assertion_authority_with(None, None).is_err());
         config.assertion_audience = Some("https://sekai.test".into());
-        assert!(config.assertion_authority().is_err());
+        assert!(config.assertion_authority_with(None, None).is_err());
         config.assertion_hmac_key = Some("test-hmac-key".into());
-        let authority = config.assertion_authority().unwrap().expect("installed");
+        let authority = config
+            .assertion_authority_with(None, None)
+            .unwrap()
+            .expect("installed");
         assert_eq!(authority.issuer, "https://issuer.test");
         assert_eq!(authority.audience, "https://sekai.test");
+    }
+
+    #[test]
+    fn assertion_authority_takes_ed25519_public_keys_and_an_hmac_switch() {
+        use crate::identity_assertion::{AssertionReject, Ed25519AssertionSigner};
+        let signer = Ed25519AssertionSigner::new("k1", &[1; 32]).unwrap();
+        let keys = format!("k1={}", signer.public_key());
+        let mut config = test_config();
+        // The switch or keys alone are partial configuration.
+        assert!(config.assertion_authority_with(None, Some("0")).is_err());
+        assert!(config.assertion_authority_with(Some(&keys), None).is_err());
+        config.assertion_issuer = Some("https://issuer.test".into());
+        config.assertion_audience = Some("https://sekai.test".into());
+        // Issuer and audience need a key.
+        assert!(config.assertion_authority_with(None, None).is_err());
+        let ed25519_only = config
+            .assertion_authority_with(Some(&keys), None)
+            .unwrap()
+            .expect("installed");
+        assert!(ed25519_only.seal("srt1.", b"{}").is_err());
+
+        config.assertion_hmac_key = Some("test-hmac-key".into());
+        assert!(config.assertion_authority_with(None, Some("0")).is_err());
+        assert!(
+            config
+                .assertion_authority_with(Some(&keys), Some("off"))
+                .is_err()
+        );
+        assert!(
+            config
+                .assertion_authority_with(Some("k1=bad"), None)
+                .is_err()
+        );
+        let hmac_token = |authority: &crate::identity_assertion::AssertionAuthority| {
+            authority
+                .sign(&crate::identity_assertion::IdentityAssertion {
+                    contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+                    issuer: "https://issuer.test".into(),
+                    audience: "https://sekai.test".into(),
+                    subject: "subject-a".into(),
+                    credential_id: "credential-a".into(),
+                    credential_kind: "machine".into(),
+                    tenant_id: None,
+                    space: None,
+                    space_role: None,
+                    act: None,
+                    scopes: vec!["sekai.read".into()],
+                    expires_at: 100,
+                    nonce: "n".into(),
+                    device: None,
+                })
+                .unwrap()
+        };
+        for accept in [None, Some("1")] {
+            let both = config
+                .assertion_authority_with(Some(&keys), accept)
+                .unwrap()
+                .expect("installed");
+            assert!(both.verify(&hmac_token(&both), 50, None).is_ok());
+        }
+        let ed25519_and_sealing = config
+            .assertion_authority_with(Some(&keys), Some("0"))
+            .unwrap()
+            .expect("installed");
+        assert_eq!(
+            ed25519_and_sealing
+                .verify(&hmac_token(&ed25519_and_sealing), 50, None)
+                .unwrap_err(),
+            AssertionReject::Signature
+        );
+        assert!(ed25519_and_sealing.seal("srt1.", b"{}").is_ok());
     }
 }
