@@ -641,7 +641,10 @@ impl PostgresDb {
                 "projection_target_ambiguous",
                 "target external identity resolves to multiple objects",
             ))
-        } else if targets[0].get::<_, String>(1) != envelope.target.object_kind {
+        } else if !crate::sekai::feedback_package::evidence_target_kind_matches_object(
+            &envelope.target.object_kind,
+            &targets[0].get::<_, String>(1),
+        ) {
             Some((
                 "projection_target_kind_mismatch",
                 "target object kind does not match the admitted envelope",
