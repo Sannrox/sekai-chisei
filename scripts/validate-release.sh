@@ -13,6 +13,7 @@ fail() {
 python3 scripts/changelog-notes.py --self-test
 python3 scripts/release-manifest.py --self-test
 python3 scripts/release-sbom.py --self-test
+python3 scripts/check-semver.py --self-test
 bash scripts/verify-release-tag.sh self-test
 
 workflow=".github/workflows/release.yml"
@@ -125,6 +126,12 @@ if grep -F 'merged:<=' scripts/release-package.sh >/dev/null; then
 fi
 grep -F -- "--match 'v*' --exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
   || fail "changelog-draft.sh must start from the last final tag, never an rc or beta tag"
+grep -F "python3 scripts/check-semver.py pr" .github/workflows/ci.yml >/dev/null \
+  || fail "ci.yml Semver job must run scripts/check-semver.py pr"
+grep -F "python3 scripts/check-semver.py release" "$workflow" >/dev/null \
+  || fail "${workflow} must run scripts/check-semver.py release on a tagged release"
+grep -F "Public API vs last final tag" "$workflow" >/dev/null \
+  || fail "${workflow} must keep the tag-baseline semver step"
 if grep -E '(:latest|tag: latest)' build/release.sh build/release-images.sh >/dev/null; then
   fail "image scripts must not produce a latest image tag"
 fi
