@@ -19,15 +19,17 @@ applies the RPC's read or write action.
 | `RollbackDataset` | the dataset's binding object | write |
 | `ListDatasetHealthChecks`, `ListDatasetHealthResults`, `ListDatasetAlerts` | the dataset's binding object | read |
 | `PutDatasetHealthCheck`, `RunDatasetHealthChecks` | the dataset's binding object | write |
+| `ListDatasetBranches`, `CompareDatasetBranch` (#2104) | the dataset's binding object | read |
+| `CreateDatasetBranch`, `DeleteDatasetBranch`, `ProposeDatasetBranchMerge`, `MergeDatasetBranch` (#2104) | the dataset's binding object | write |
 
 These handlers make one decision (`authorize_dataset`). A dataset with no
 binding object, or whose binding object is gone, has no namespace and is
 refused with `PERMISSION_DENIED`. `CreateDataset` therefore binds a live
 object in a writable namespace. The binding object must also be visible to
 the caller (markings and object security policy). Guests stay refused; a host
-grant does not admit them. The dataset branch RPCs authorize a bound
-dataset's namespace in `branch_caller`, and governed transforms check their
-inputs' binding objects for visibility.
+grant does not admit them. Branch RPCs call `authorize_dataset` from
+`branch_caller`. Governed transforms check their inputs' binding objects for
+visibility.
 
 When the binding object's policy enforces property grants, rows are held to
 the readable columns for every caller, tenant or not: a `QueryRows`
@@ -35,8 +37,9 @@ projection or filter naming another column is refused, an unprojected query
 returns only the readable ones, and version snapshots and the rows a rollback
 returns drop the others. A policy that grants no column refuses the read.
 `enterprise_query_rows_requires_namespace_read_for_the_tenant`,
-`enterprise_dataset_reads_refuse_another_tenants_dataset` and
-`enterprise_dataset_writes_require_live_namespace_binding` drive the real
+`enterprise_dataset_reads_refuse_another_tenants_dataset`,
+`enterprise_dataset_writes_require_live_namespace_binding` and
+`enterprise_branch_rpcs_must_refuse_unbound_like_query_rows` drive the real
 interceptor and the handlers, and `dataset_row_reads_honour_property_grants`
 covers the columns.
 

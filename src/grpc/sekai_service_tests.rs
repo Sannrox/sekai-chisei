@@ -7237,6 +7237,173 @@ async fn enterprise_dataset_writes_require_live_namespace_binding() {
     }
 }
 
+/// #2104: branch RPCs use `authorize_dataset`, so a tenant QueryRows refuses
+/// on unbound or orphan datasets cannot create or list branches of them.
+#[tokio::test]
+async fn enterprise_branch_rpcs_must_refuse_unbound_like_query_rows() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use tonic::service::Interceptor;
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    let runtime = svc.db.runtime();
+    for (dataset_id, namespace) in [
+        ("bound-ds", Some("allowed")),
+        ("unbound-ds", None),
+        ("orphan-ds", Some("allowed")),
+    ] {
+        let object_id = namespace.map_or(String::new(), |namespace| {
+            let id = format!("{dataset_id}-object");
+            seed_lineage_object(&svc, &id, namespace);
+            id
+        });
+        runtime
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: vec![crate::sekai::dataset::ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id,
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        runtime
+            .append_rows(
+                dataset_id,
+                &[HashMap::from([("id".into(), dataset_id.into())])],
+            )
+            .unwrap();
+    }
+    runtime.delete_object("orphan-ds-object").unwrap();
+
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    fn token(authority: &AssertionAuthority, scopes: &[&str]) -> String {
+        authority
+            .sign(&IdentityAssertion {
+                contract_version: IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: Some("tenant-test".into()),
+                scopes: scopes.iter().map(|scope| (*scope).into()).collect(),
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    }
+    fn admit<T>(
+        interceptor: &mut crate::grpc::TokenAuthInterceptor,
+        authority: &AssertionAuthority,
+        method: &'static str,
+        scopes: &[&str],
+        body: T,
+    ) -> Request<T> {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {}", token(authority, scopes))).unwrap(),
+        );
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+        let (metadata, extensions, ()) = interceptor.call(req).unwrap().into_parts();
+        Request::from_parts(metadata, extensions, body)
+    }
+    let denied = tonic::Code::PermissionDenied;
+    let read: &[&str] = &["sekai.read"];
+    let write: &[&str] = &["sekai.read", "sekai.write"];
+
+    assert_eq!(
+        svc.query_rows(admit(
+            &mut interceptor,
+            &authority,
+            "QueryRows",
+            read,
+            QueryRowsRequest {
+                dataset_id: "unbound-ds".into(),
+                query: None,
+            },
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        denied
+    );
+    assert_eq!(
+        svc.create_dataset_branch(admit(
+            &mut interceptor,
+            &authority,
+            "CreateDatasetBranch",
+            write,
+            CreateDatasetBranchRequest {
+                dataset_id: "unbound-ds".into(),
+                name: "dev".into(),
+                from_version_id: String::new(),
+            },
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        denied
+    );
+    assert_eq!(
+        svc.list_dataset_branches(admit(
+            &mut interceptor,
+            &authority,
+            "ListDatasetBranches",
+            read,
+            ListDatasetBranchesRequest {
+                dataset_id: "orphan-ds".into(),
+            },
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        denied
+    );
+
+    let branch = svc
+        .create_dataset_branch(admit(
+            &mut interceptor,
+            &authority,
+            "CreateDatasetBranch",
+            write,
+            CreateDatasetBranchRequest {
+                dataset_id: "bound-ds".into(),
+                name: "dev".into(),
+                from_version_id: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .branch
+        .unwrap();
+    assert_eq!(branch.dataset_id, "bound-ds");
+    assert_eq!(branch.name, "dev");
+}
+
 /// #2097: rows are held to the binding object's readable columns when its
 /// policy enforces property grants, for a tenant caller and a tenant-free one,
 /// on the live rows, a version snapshot, and the rows a rollback returns.
