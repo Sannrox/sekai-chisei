@@ -442,15 +442,26 @@ impl SekaiServiceImpl {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
         let now = now_millis();
         let inner = req.get_ref();
-        let turn = agent_turn::claim_accepting_continuation(
-            self.db.runtime(),
-            &inner.namespace,
-            &inner.runtime_id,
-            &inner.turn_id,
-            inner.ttl_ms,
-            now,
-            inner.accepts_continuation,
-        )
+        let turn = if inner.turn_id.trim().is_empty() {
+            agent_turn::claim_next(
+                self.db.runtime(),
+                &inner.namespace,
+                &inner.runtime_id,
+                inner.ttl_ms,
+                now,
+                inner.accepts_continuation,
+            )
+        } else {
+            agent_turn::claim_accepting_continuation(
+                self.db.runtime(),
+                &inner.namespace,
+                &inner.runtime_id,
+                &inner.turn_id,
+                inner.ttl_ms,
+                now,
+                inner.accepts_continuation,
+            )
+        }
         .map_err(turn_status)?;
         let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;
         let continuation = continuation_for(self.db.runtime(), &turn)?;

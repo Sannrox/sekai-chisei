@@ -1289,6 +1289,9 @@ message ListSiteAgentInstanceTurnsResponse {
 message ClaimAgentTurnRequest {
   string namespace = 1;
   string runtime_id = 2;
+  // Empty claims the next due turn in the namespace (pending, expired
+  // claims, and decided parks when accepts_continuation). PostgreSQL skips
+  // rows locked by other workers.
   string turn_id = 3;
   int64 ttl_ms = 4;
   // Claimers that do not set this are refused a parked turn: continuation is
