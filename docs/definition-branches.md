@@ -6,11 +6,14 @@ runtime facts. The experimental product-tier contract now also publishes or
 rejects one pinned candidate through a proposal, compares two revisions,
 classifies compatibility, and proposes an append-only rollback of a prior
 published revision. Rollback never rewrites history.
-Branch, proposal, rollback, compare, compatibility, and fact-migration RPCs are
-classified `experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1`
-or the `experimental-rpcs` Cargo feature is enabled. See
-[rpc-maturity.md](rpc-maturity.md). `GetPublishedDefinitionRevision` stays
-`stable`. `ListPublishedDefinitionRevisions` is an additive experimental read of merge history.
+`CreateDefinitionBranch`, `ApplyDefinitionBranchEdit`,
+`CompareDefinitionRevisions`, `ReportDefinitionConsumerImpact`, and
+`CreateDefinitionProposal` are `stable` (#2095). `GetPublishedDefinitionRevision`
+stays `stable`. Remaining branch, proposal, rollback, compatibility, and
+fact-migration RPCs stay `experimental` and are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+See [rpc-maturity.md](rpc-maturity.md). `ListPublishedDefinitionRevisions` is an
+additive experimental read of merge history.
 
 ## Contract
 
@@ -389,7 +392,8 @@ isolated-process), and rollbacks are exempt. See
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`
 `GetDefinitionBranch`, `CreateDefinitionBranch`, and `ApplyDefinitionBranchEdit`
-through the normal server-established RPC identity. All three remain experimental.
+through the normal server-established RPC identity. `CreateDefinitionBranch` and
+`ApplyDefinitionBranchEdit` are `stable`; `GetDefinitionBranch` stays experimental.
 Creation and editing require actual namespace write scope and grants; editing
 also requires revision-wide read visibility and administration of changed members.
 The server attributes writes to the authenticated subject, not caller metadata.

@@ -20,7 +20,7 @@ pub const CREATE_LINK_TOOL: &str = "sekai.links.create";
 /// (#1090). Compare is a CLI projection with no wire RPC, so it has no tool.
 pub const RESOLVE_EVALUATION_TOOL: &str = "chisei.evaluation.resolve";
 pub const EXECUTE_EVALUATION_TOOL: &str = "chisei.evaluation.execute";
-/// Definition-branch tools (#1311). Backing RPCs stay experimental.
+/// Definition-branch tools (#1311). Backing RPCs are stable (#2095).
 pub const CREATE_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.create";
 pub const EDIT_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.edit";
 pub const DIFF_DEFINITIONS_TOOL: &str = "sekai.definitions.diff";

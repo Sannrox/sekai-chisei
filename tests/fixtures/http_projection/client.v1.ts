@@ -5,7 +5,12 @@ export const HTTP_PROJECTION_CONTRACT = "sekai.http-projection/v1";
 export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "ApplySourceBatch" },
   { service: "sekai.SekaiService", rpc: "GetSourceSyncState" },
+  { service: "sekai.SekaiService", rpc: "CreateDefinitionBranch" },
+  { service: "sekai.SekaiService", rpc: "ApplyDefinitionBranchEdit" },
+  { service: "sekai.SekaiService", rpc: "CreateDefinitionProposal" },
   { service: "sekai.SekaiService", rpc: "GetPublishedDefinitionRevision" },
+  { service: "sekai.SekaiService", rpc: "CompareDefinitionRevisions" },
+  { service: "sekai.SekaiService", rpc: "ReportDefinitionConsumerImpact" },
   { service: "sekai.SekaiService", rpc: "CreateObject" },
   { service: "sekai.SekaiService", rpc: "GetObject" },
   { service: "sekai.SekaiService", rpc: "UpdateObject" },
