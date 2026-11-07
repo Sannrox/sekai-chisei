@@ -34904,7 +34904,7 @@ async fn working_memory_read_keeps_the_guest_ceiling() {
 }
 
 /// Property grants still strip withheld keys. Live `content` is not
-/// exempt from those grants (ADR 0139 is change-history classification).
+/// exempt from those grants.
 #[tokio::test]
 async fn working_memory_read_projects_property_grants() {
     use crate::sekai::object_security::{
@@ -35020,6 +35020,127 @@ async fn working_memory_read_projects_property_grants() {
         Some("line-7")
     );
     assert!(!listed[0].properties.contains_key(memory::CONTENT_PROPERTY));
+}
+
+/// Live `content` is a restricted property. A requester who can read the
+/// item but is not an object admin gets the same redaction as GetObject.
+#[tokio::test]
+async fn working_memory_list_redacts_restricted_content_like_get_object() {
+    use crate::sekai::site_agent_memory as memory;
+    let svc = service();
+    memory::install(svc.db.runtime(), "ops", "root", 1).unwrap();
+    svc.schema_definitions.refresh_snapshot().unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("principal_id".into(), "svc-line-7".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "note-open".into(),
+            kind: memory::KIND.into(),
+            name: "note-open".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+                (memory::CONTENT_PROPERTY.into(), "valve 3 sticks".into()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let listed = svc
+        .list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+            Some("alice"),
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .items;
+    assert_eq!(listed.len(), 1);
+    let listed_content = listed[0]
+        .properties
+        .get(memory::CONTENT_PROPERTY)
+        .map(String::as_str);
+    let got = svc
+        .get_object(with_delegated_act(
+            GetObjectRequest {
+                id: "note-open".into(),
+            },
+            "svc-line-7",
+            Some("alice"),
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .object
+        .unwrap();
+    assert_eq!(
+        got.properties
+            .get(memory::CONTENT_PROPERTY)
+            .map(String::as_str),
+        listed_content
+    );
+    assert_eq!(listed_content, Some(REDACTED_VALUE));
+
+    grant_object_role(&svc, "note-open", "svc-line-7", security::Role::Admin);
+    let listed = svc
+        .list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit: 0,
+            },
+            "svc-line-7",
+            None,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .items;
+    assert_eq!(listed.len(), 1);
+    let listed_content = listed[0]
+        .properties
+        .get(memory::CONTENT_PROPERTY)
+        .map(String::as_str);
+    let got = svc
+        .get_object(with_delegated_act(
+            GetObjectRequest {
+                id: "note-open".into(),
+            },
+            "svc-line-7",
+            None,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .object
+        .unwrap();
+    assert_eq!(
+        got.properties
+            .get(memory::CONTENT_PROPERTY)
+            .map(String::as_str),
+        listed_content
+    );
+    assert_eq!(listed_content, Some("valve 3 sticks"));
 }
 
 #[tokio::test]

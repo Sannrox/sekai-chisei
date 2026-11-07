@@ -649,6 +649,10 @@ impl SekaiServiceImpl {
         let live =
             crate::sekai::site_agent_memory::list_live_for_instance(db, namespace, instance_id)
                 .map_err(Status::internal)?;
+        let schema = self
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
         let mut items = Vec::new();
         for item in live {
             // Guest ceiling and shared-space kind/marking are request-shaped;
@@ -662,12 +666,19 @@ impl SekaiServiceImpl {
             if !principal_may_read_memory(self, item.clone(), &requester)? {
                 continue;
             }
-            // Property grants still apply. Live `content`'s restricted
-            // classification covers change history, not this read (ADR 0139).
-            let item = match db.project_object_property_grants(item) {
+            // Same projection as GetObject: grants, then restricted `content`
+            // redacted for the requester (`act`) and the instance principal.
+            // The agent sees live notes only when that principal is an
+            // object admin, as GetObject would (#2033).
+            let item = match self.project_for_response(
+                item,
+                &schema,
+                &principals,
+                tenant_context.as_ref(),
+            ) {
                 Ok(item) => item,
-                Err(error) if error.starts_with("object_security_denied") => continue,
-                Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+                Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
+                Err(status) => return Err(status),
             };
             items.push(to_proto_obj(&item));
             if items.len() == limit {
