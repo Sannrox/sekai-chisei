@@ -1636,7 +1636,14 @@ pub fn build_services_for_plane(
         sekai_service::SekaiServiceImpl::wrong_plane_placeholder(sekai_store.clone())
     }
     .with_site_id(config.site_id.clone())
-    .with_runtime_token_authority(config.assertion_authority()?.map(Arc::new))
+    // Only an authority with the HMAC key mints runtime and service tokens;
+    // without one, claims return no token rather than failing after commit.
+    .with_runtime_token_authority(
+        config
+            .assertion_authority()?
+            .filter(crate::identity_assertion::AssertionAuthority::can_seal)
+            .map(Arc::new),
+    )
     .with_agent_ceiling(config.actor_chain_enforcement);
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
@@ -2421,6 +2428,48 @@ mod tests {
             MetadataValue::try_from(format!("Bearer {token}")).expect("bearer metadata"),
         );
         request
+    }
+
+    #[test]
+    fn the_boundary_authenticates_ed25519_assertions_and_can_refuse_hmac() {
+        use crate::identity_assertion::{AssertionVerifyingKeys, Ed25519AssertionSigner};
+        let signer = Ed25519AssertionSigner::new("k1", &[1; 32]).unwrap();
+        let keys = AssertionVerifyingKeys::parse(&format!("k1={}", signer.public_key())).unwrap();
+        let authority = test_assertion_authority()
+            .with_ed25519_keys(keys)
+            .without_hmac_assertions();
+        let expires_at = chrono::Utc::now().timestamp() + 60;
+        let hmac = authority
+            .sign(&test_assertion_claims(
+                &uuid::Uuid::new_v4().to_string(),
+                expires_at,
+            ))
+            .unwrap();
+        let ed25519 = signer
+            .sign(&test_assertion_claims(
+                &uuid::Uuid::new_v4().to_string(),
+                expires_at,
+            ))
+            .unwrap();
+        let mut interceptor = interceptor_with_authority(authority);
+        let call = |interceptor: &mut TokenAuthInterceptor, token: &str| {
+            let mut request = bearer_request(token);
+            request.extensions_mut().insert(tonic::GrpcMethod::new(
+                "sekai.SekaiService",
+                "ListSchemaTypes",
+            ));
+            interceptor.call(request)
+        };
+        let request = call(&mut interceptor, &ed25519).unwrap();
+        let context = request
+            .extensions()
+            .get::<crate::enterprise::AuthenticatedContext>()
+            .unwrap();
+        assert_eq!(context.principal.subject, "subject-a");
+        assert_eq!(
+            call(&mut interceptor, &hmac).unwrap_err().message(),
+            "invalid assertion signature"
+        );
     }
 
     #[test]

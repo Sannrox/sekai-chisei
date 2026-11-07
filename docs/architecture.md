@@ -330,9 +330,12 @@ internal authenticated context; caller metadata never constructs that context.
 A configured authority may issue a short-lived, audience-bound, one-use
 assertion (`sekai.identity-assertion/v1`) that fills the same context;
 see [ADR 0078](decisions/0078-audience-bound-assertions.md). The live
-`TokenAuthInterceptor` verifies `sia1.` tokens when
-`SEKAI_ASSERTION_ISSUER`, `SEKAI_ASSERTION_AUDIENCE`, and
-`SEKAI_ASSERTION_HMAC_KEY` are set together. Partial config is refused.
+`TokenAuthInterceptor` verifies HMAC `sia1.` tokens with
+`SEKAI_ASSERTION_HMAC_KEY` and Ed25519 `sia2.` tokens with the public keys in
+`SEKAI_ASSERTION_ED25519_KEYS` ([ADR 0145](decisions/0145-ed25519-identity-assertions.md)),
+once `SEKAI_ASSERTION_ISSUER` and `SEKAI_ASSERTION_AUDIENCE` are set with
+either. Partial config is refused. `SEKAI_ASSERTION_ACCEPT_HMAC=0` refuses
+`sia1.`.
 No authority configured stays community behavior. Caller-selected tenant
 headers fail closed. An assertion may bind a device with an optional
 `device` claim; protected RPCs then require the device's per-request proof
