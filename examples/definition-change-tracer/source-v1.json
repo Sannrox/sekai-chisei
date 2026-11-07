@@ -1,0 +1,21 @@
+{
+  "contract_version": "example.definition-change-tracer-source/v1",
+  "source": "github",
+  "source_instance": "acme/ops",
+  "records": [
+    {
+      "external_id": "12",
+      "source_version": "node-v1",
+      "kind": "Issue",
+      "title": "First ticket",
+      "state": "open"
+    },
+    {
+      "external_id": "13",
+      "source_version": "node-v1",
+      "kind": "Issue",
+      "title": "Related ticket",
+      "state": "open"
+    }
+  ]
+}

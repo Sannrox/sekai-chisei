@@ -165,6 +165,7 @@ const SEPARATE_TARGETS: &[&str] = &[
     "chisei_runtime_db_ratchet",
     "db_signals",
     "dedup_signals",
+    "definition_change_tracer_example",
     "deploy_kubernetes_manifest",
     "emit_git_version",
     "epistemic_replication_example",

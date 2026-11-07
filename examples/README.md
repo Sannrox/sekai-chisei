@@ -221,3 +221,19 @@ branch and opens a proposal. Approve and merge stay off MCP.
 cargo test --locked --test it mcp_definition_branch
 ```
 
+## definition_change_tracer
+
+[definition_change_tracer.rs](definition_change_tracer.rs) is a local
+deterministic tracer for the agent-driven definition-change path. Domain
+vocabulary stays under [definition-change-tracer/](definition-change-tracer/).
+The agent uses the stable MCP draft-and-propose and link tools; source ingest
+uses `ApplySourceBatch`; a second principal approves and merges over gRPC.
+
+```bash
+cargo run --locked --example definition_change_tracer
+cargo test --locked --test definition_change_tracer_example
+```
+
+See [the fixture walkthrough](../docs/definition-change-tracer.md) for the
+step receipts and out-of-tree reuse.
+
