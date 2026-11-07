@@ -13,7 +13,9 @@ stays `stable`. Remaining branch, proposal, rollback, compatibility, and
 fact-migration RPCs stay `experimental` and are rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
 See [rpc-maturity.md](rpc-maturity.md). `ListPublishedDefinitionRevisions` is an
-additive experimental read of merge history.
+additive experimental read of merge history. The isolated tracer in
+[definition-change-tracer.md](definition-change-tracer.md) walks the agent MCP
+path plus human approve and merge on an in-memory plane.
 
 ## Contract
 

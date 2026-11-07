@@ -98,6 +98,8 @@ lives in the separate [research index](research/README.md).
 - [Governed definition branches](definition-branches.md) — namespace-scoped
   content-addressed revisions, compare-and-swap branch edits, and proposal
   merge onto the published head.
+- [Definition-change tracer](definition-change-tracer.md) — local MCP
+  define, ingest, link, propose, and human approve/merge fixture.
 - [Standalone ontology crate](../crates/sekai-ontology/README.md) — embedded
   library and local `sekai` CLI.
 - [Capability catalogs](capability-catalog.md) — native discovery and the HTTP

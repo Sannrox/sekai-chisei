@@ -192,6 +192,10 @@ name = "source_writeback_example"
 path = "tests/source_writeback_example.rs"
 
 [[test]]
+name = "definition_change_tracer_example"
+path = "tests/definition_change_tracer_example.rs"
+
+[[test]]
 name = "warehouse_table_ingest"
 path = "tests/warehouse_table_ingest.rs"
 
