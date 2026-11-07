@@ -13,6 +13,17 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_objects_by_ids(&self, ids: &[String]) -> Result<Vec<Object>, String> {
+        #[cfg(any(test, feature = "gateway-test-support"))]
+        if !ids.is_empty() {
+            source_batch_auth_counters::OBJECT_LOOKUPS.with(|c| c.set(c.get() + 1));
+        }
+        match self {
+            Self::Sqlite(db) => db.list_objects_by_ids(ids),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.list_objects_by_ids(ids)),
+        }
+    }
+
     pub fn get_object_with_policy_context(
         &self,
         id: &str,

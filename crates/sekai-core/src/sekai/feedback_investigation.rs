@@ -25,7 +25,7 @@ use crate::sekai::action_work_lifecycle::{
 };
 use crate::sekai::feedback_package::{
     ACTION_DISPATCH, ACTION_FINDING, ACTION_HYPOTHESIS, ACTION_INVESTIGATION,
-    KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, PACKAGE_VERSION,
+    KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, OUTCOME_QUALITY_EVALUATION, PACKAGE_VERSION,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 
@@ -275,12 +275,11 @@ pub fn decide_filing(
     ) {
         return FilingDecision::Internal;
     }
-    if cluster.has_measured_reproduction {
-        return FilingDecision::Qualifying;
-    }
-    // Model-proposed steps are hypotheses, not a measured reproduction.
     if cluster.observations.iter().all(precludes_tenkai_defect) {
         return FilingDecision::Internal;
+    }
+    if cluster.has_measured_reproduction {
+        return FilingDecision::Qualifying;
     }
     if analysis.attribution != Attribution::Tenkai {
         return FilingDecision::Internal;
@@ -520,7 +519,7 @@ fn namespace_has_measured_reproduction(
     )
     .map_err(InvestigateError::Internal)?;
     for object in results {
-        if object.properties.get("measured").map(String::as_str) != Some("true") {
+        if !is_measured_reproduction(&object) {
             continue;
         }
         let Some(observation_id) = object.properties.get("observation_id") else {
@@ -542,6 +541,11 @@ fn namespace_has_measured_reproduction(
         }
     }
     Ok(false)
+}
+
+fn is_measured_reproduction(object: &Object) -> bool {
+    object.properties.get("measured").map(String::as_str) == Some("true")
+        && object.properties.get("outcome").map(String::as_str) != Some(OUTCOME_QUALITY_EVALUATION)
 }
 
 pub fn investigate_claimed(
@@ -648,7 +652,8 @@ fn write_records(
             "name": cluster.signature,
             "observation_id": cluster.trigger_id,
             "outcome": outcome.to_string(),
-            "measured": analysis.independently_verified_reproduction,
+            // Model-proposed independently_verified_reproduction is not measured.
+            "measured": false,
         }),
         &format!("feedback:inv:{key}"),
         now_ms,
@@ -815,6 +820,7 @@ mod tests {
         install,
     };
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     const NAMESPACE: &str = "ops";
@@ -1160,6 +1166,22 @@ mod tests {
     }
 
     #[test]
+    fn measured_reproduction_does_not_override_precludes() {
+        let cluster = cluster_from_observations(
+            NAMESPACE,
+            "o-1",
+            "api:cancelled",
+            10_000,
+            vec![view("o-1", "api:cancelled", "op-1", "cancelled", 1_000)],
+            true,
+        );
+        assert_eq!(
+            decide_filing(&cluster, &tenkai_analysis()),
+            FilingDecision::Internal
+        );
+    }
+
+    #[test]
     fn inconclusive_and_malformed_stay_internal() {
         let cluster = cluster_from_observations(
             NAMESPACE,
@@ -1359,7 +1381,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             investigation.properties.get("measured").map(String::as_str),
-            Some("true")
+            Some("false")
         );
         assert_eq!(
             runtime
@@ -1370,6 +1392,80 @@ mod tests {
             KIND_HYPOTHESIS
         );
         ack_investigation(&runtime, &claimed, ACTOR, ACK_OUTCOME_COMPLETED, "", now).unwrap();
+    }
+
+    #[test]
+    fn quality_stubs_and_model_flags_are_not_measured_reproductions() {
+        let runtime = db();
+        record_observation(
+            &runtime,
+            "o-1",
+            "api:tenkai_failed",
+            "op-1",
+            "defect",
+            1_000,
+        );
+        let cluster = gather_cluster(&runtime, NAMESPACE, "o-1", 10_000).unwrap();
+        assert!(!cluster.has_measured_reproduction);
+        let report =
+            record_investigation(&runtime, &cluster, &tenkai_analysis(), ACTOR, 10_000).unwrap();
+        let investigation = runtime
+            .get_object(&report.investigation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            investigation.properties.get("measured").map(String::as_str),
+            Some("false")
+        );
+        assert!(
+            !gather_cluster(&runtime, NAMESPACE, "o-1", 11_000)
+                .unwrap()
+                .has_measured_reproduction
+        );
+
+        runtime
+            .create_object(&Object {
+                id: "fb-inv-quality-stub".into(),
+                kind: KIND_INVESTIGATION_RESULT.into(),
+                name: "quality".into(),
+                namespace: NAMESPACE.into(),
+                external_id: "fb-inv-quality-stub".into(),
+                properties: HashMap::from([
+                    ("observation_id".into(), "o-1".into()),
+                    ("outcome".into(), OUTCOME_QUALITY_EVALUATION.into()),
+                    ("measured".into(), "true".into()),
+                ]),
+                created: 12_000,
+                updated: 12_000,
+            })
+            .unwrap();
+        assert!(
+            !gather_cluster(&runtime, NAMESPACE, "o-1", 13_000)
+                .unwrap()
+                .has_measured_reproduction
+        );
+
+        runtime
+            .create_object(&Object {
+                id: "fb-inv-measured".into(),
+                kind: KIND_INVESTIGATION_RESULT.into(),
+                name: "reproduced".into(),
+                namespace: NAMESPACE.into(),
+                external_id: "fb-inv-measured".into(),
+                properties: HashMap::from([
+                    ("observation_id".into(), "o-1".into()),
+                    ("outcome".into(), "reproduced".into()),
+                    ("measured".into(), "true".into()),
+                ]),
+                created: 14_000,
+                updated: 14_000,
+            })
+            .unwrap();
+        assert!(
+            gather_cluster(&runtime, NAMESPACE, "o-1", 15_000)
+                .unwrap()
+                .has_measured_reproduction
+        );
     }
 
     #[test]

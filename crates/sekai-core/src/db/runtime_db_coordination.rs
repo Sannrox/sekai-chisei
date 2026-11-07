@@ -388,6 +388,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_grants_for_object_ids(&self, object_ids: &[String]) -> Result<Vec<Grant>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_grants_for_object_ids(object_ids),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_grants_for_object_ids(object_ids))
+            }
+        }
+    }
+
     pub fn list_namespace_roles_for_principal(
         &self,
         principal: &str,

@@ -266,6 +266,44 @@ impl SekaiDb {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Keyed grant load (`object_id IN (...)`) for a page of members.
+    pub fn list_grants_for_object_ids(&self, object_ids: &[String]) -> Result<Vec<Grant>, String> {
+        const MAX_IDS_PER_QUERY: usize = 500;
+        let mut object_ids = object_ids
+            .iter()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        object_ids.sort_unstable();
+        object_ids.dedup();
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut grants = Vec::new();
+        let conn = self.conn();
+        for batch in object_ids.chunks(MAX_IDS_PER_QUERY) {
+            let placeholders = (1..=batch.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id,object_id,principal,role,created,purpose,not_after_ms,exception_reason
+                 FROM sekai_grants WHERE object_id IN ({placeholders})
+                 ORDER BY object_id, created, id"
+            );
+            let params = batch
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect::<Vec<_>>();
+            let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params.as_slice(), grant_from_row)
+                .map_err(|error| error.to_string())?;
+            grants.extend(rows.filter_map(|row| row.ok()));
+        }
+        Ok(grants)
+    }
+
     pub fn list_all_grants(&self) -> Result<Vec<Grant>, String> {
         let conn = self.conn();
         let mut stmt = conn
