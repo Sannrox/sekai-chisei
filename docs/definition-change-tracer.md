@@ -54,3 +54,8 @@ Copy `examples/definition-change-tracer/` and drive the same steps against
 | Diff / impact | MCP | `sekai.definitions.diff`, `sekai.definitions.impact` |
 | Open proposal | MCP | `sekai.definitions.proposal.create` |
 | Approve / merge | gRPC | `ApproveDefinitionProposal`, `MergeDefinitionProposal` |
+
+`ApproveDefinitionProposal` and `MergeDefinitionProposal` stay experimental.
+A live server rejects them unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` Cargo feature is enabled. The in-process fixture invokes
+them the same way the MCP definition-branch test already does.
