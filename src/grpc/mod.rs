@@ -1813,12 +1813,16 @@ fn spawn_admission_reconciler(
     });
 }
 
-/// Run retention on a schedule (#1987, ADR 0129). Every replica may run it;
-/// `archive_retained_records` is idempotent per dataset and cutoff, so a
-/// crash mid-run is safe to repeat and two ticks archive each record once.
+/// Run retention on a schedule (#1987, ADR 0129). PostgreSQL elects one
+/// replica per tick (`pg_try_advisory_lock`); others skip. Operator
+/// `sekaictl admin retention run` waits on the same lock. SQLite's writer
+/// serializes runs. `archive_retained_records` is idempotent per dataset
+/// and cutoff, so a crash mid-run is safe to repeat. Missed ticks delay
+/// rather than burst after a long run (#2028).
 fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let db = db.clone();
@@ -1829,6 +1833,7 @@ fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
                     &stores,
                     chrono::Utc::now().timestamp_millis(),
                     false,
+                    true,
                 )
             })
             .await;

@@ -48,13 +48,23 @@ impl RuntimeDb {
     /// cutoff into the in-database archive and remove or redact them in the
     /// hot tables, one transaction per batch. Idempotent and safe to run on
     /// several replicas at once. `dry_run` reports the counts and writes
-    /// nothing. The plane tick and `sekaictl admin retention` call this.
+    /// nothing. Operator `run` waits for a busy PostgreSQL replica lock;
+    /// scheduled ticks pass `skip_if_busy` and skip.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
+        self.archive_retained_records_locked(now, dry_run, false)
+    }
+
+    pub fn archive_retained_records_locked(
+        &self,
+        now: i64,
+        dry_run: bool,
+        skip_if_busy: bool,
+    ) -> Result<ArchiveRun, String> {
         match self {
             Self::Sqlite(db) => db.archive_retained_records(now, dry_run),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.archive_retained_records(now, dry_run))
-            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.archive_retained_records_locked(now, dry_run, skip_if_busy)
+            }),
         }
     }
 

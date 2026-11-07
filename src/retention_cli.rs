@@ -31,6 +31,7 @@ pub fn run_retention_command(args: Vec<String>) -> Result<(), BoxErr> {
                     layout,
                     Utc::now().timestamp_millis(),
                     false,
+                    false,
                 )
                 .map_err(std::io::Error::other)?,
             )
@@ -108,12 +109,13 @@ pub(crate) fn archive_admitted(
     stores: &CombinedStoreLayout,
     now: i64,
     dry_run: bool,
+    skip_if_busy: bool,
 ) -> Result<ArchiveRun, String> {
     crate::db::postgres::off_runtime(|| {
         if !dry_run {
             crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
         }
-        db.archive_retained_records(now, dry_run)
+        db.archive_retained_records_locked(now, dry_run, skip_if_busy)
     })
 }
 
@@ -477,10 +479,10 @@ mod tests {
         crate::store_relocate::write_runtime_generation(&layout.sekai_runtime(), 9).unwrap();
         let db = layout.sekai_runtime();
         let before = db.retention_archive_status().unwrap();
-        let err = archive_admitted(&db, &layout, 2 * DAY_MS, false).unwrap_err();
+        let err = archive_admitted(&db, &layout, 2 * DAY_MS, false, false).unwrap_err();
         assert!(err.contains("restamp"), "{err}");
         assert_eq!(db.retention_archive_status().unwrap(), before);
-        let dry = archive_admitted(&db, &layout, 2 * DAY_MS, true).unwrap();
+        let dry = archive_admitted(&db, &layout, 2 * DAY_MS, true, false).unwrap();
         assert!(dry.dry_run);
         assert_eq!(db.retention_archive_status().unwrap(), before);
         let policy = RetentionPolicy {
@@ -546,7 +548,8 @@ mod tests {
             }
             .opens_split()
         );
-        let run = archive_admitted(layout.sekai_runtime().as_ref(), &layout, 1, false).unwrap();
+        let run =
+            archive_admitted(layout.sekai_runtime().as_ref(), &layout, 1, false, false).unwrap();
         assert!(!run.dry_run);
     }
 }

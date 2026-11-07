@@ -233,6 +233,8 @@ impl SekaiDb {
                 reason TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_content_events_created
+                ON sekai_content_events(created_at_ms, id);
             CREATE TABLE IF NOT EXISTS sekai_reconciliation_cases (
                 id TEXT PRIMARY KEY,
                 namespace TEXT NOT NULL,
