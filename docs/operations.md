@@ -45,7 +45,10 @@ cargo run --bin sekaictl -- admin access credential revoke <principal>
 Authenticated TCP infers a `0.0.0.0` bind when `SEKAI_BIND` is unset. Public
 binds require `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY` unless the operator explicitly
 sets `SEKAI_ALLOW_PLAINTEXT=1`. Set `SEKAI_BIND` when the inferred address is not
-appropriate.
+appropriate. Set `SEKAI_TLS_CLIENT_CA` to a client CA PEM to require a client
+certificate on that TLS listener; missing or unreadable files fail closed at
+startup. Unset keeps server-TLS-only. Pair the cutover so callers present a
+certificate before the server requires one.
 
 The server has no environment-token bootstrap. `SEKAI_CREDENTIAL` is read only
 by clients such as `sekaictl` and the gateway after a durable principal-scoped

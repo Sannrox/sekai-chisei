@@ -45,7 +45,8 @@ template.
 | `SEKAI_AGENT_REQUESTS_PER_MINUTE` | `60` | Token-bucket refill for the agent when `act` is present |
 | `SEKAI_TLS_CERT` | unset | Server certificate PEM path |
 | `SEKAI_TLS_KEY` | unset | Server private-key PEM path |
-| `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA; the control-plane server does not request client certificates |
+| `SEKAI_TLS_CA` | unset | Optional CA PEM for **outbound** gRPC clients (and CLIs) that must trust a private server CA. Not a server mTLS client-CA |
+| `SEKAI_TLS_CLIENT_CA` | unset | Optional client CA PEM path. When set with server TLS, the gRPC listener requires a client certificate signed by this CA. Missing or unreadable files fail closed at startup. Unset keeps server-TLS-only (no client certificate required). `sekaictl` and `sekai-client` do not present a client certificate yet; pair the cutover with a client that can |
 | `SEKAI_ALLOW_PLAINTEXT` | unset | Set `1` to explicitly allow authenticated public TCP without TLS |
 | `SEKAI_SITE_ID` | `local` | Site/region pin stamped on coordination leases and online permit redemption; multi-region sites use a distinct non-empty id (see [region-pins.md](region-pins.md)) |
 | `SEKAI_FEEDBACK_GITHUB_OWNER` | unset | Combined-mode GitHub publisher (#1232): repository owner. Unset, the publisher idles. |

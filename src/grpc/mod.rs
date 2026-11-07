@@ -35,7 +35,7 @@ use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::server::NamedService;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status, metadata::MetadataValue};
 use tonic_health::ServingStatus;
 use tonic_health::server::HealthReporter;
@@ -1139,13 +1139,20 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
         .tls_key
         .clone()
         .filter(|value| !value.trim().is_empty());
+    let client_ca = config
+        .tls_client_ca
+        .clone()
+        .filter(|value| !value.trim().is_empty());
 
-    match (cert, key) {
-        (Some(cert), Some(key)) => Ok(Some((cert, key))),
-        (Some(_), None) | (None, Some(_)) => {
+    match (cert, key, client_ca) {
+        (Some(cert), Some(key), _) => Ok(Some((cert, key))),
+        (None, None, Some(_)) => {
+            Err("SEKAI_TLS_CLIENT_CA requires SEKAI_TLS_CERT and SEKAI_TLS_KEY".to_string())
+        }
+        (Some(_), None, _) | (None, Some(_), _) => {
             Err("both SEKAI_TLS_CERT and SEKAI_TLS_KEY are required for TLS".to_string())
         }
-        (None, None) => {
+        (None, None, None) => {
             if bind_addr == "0.0.0.0" && !config.allow_plaintext {
                 Err("0.0.0.0 requires TLS certificates; set SEKAI_TLS_CERT, SEKAI_TLS_KEY, or SEKAI_ALLOW_PLAINTEXT=1".to_string())
             } else {
@@ -1153,6 +1160,32 @@ pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, St
             }
         }
     }
+}
+
+fn nonempty_tls_path(value: Option<&str>) -> Option<&str> {
+    value.filter(|path| !path.trim().is_empty())
+}
+
+/// Build the gRPC TLS config. A set `client_ca` requires a client certificate
+/// signed by that CA (`client_auth_optional` stays false). Unreadable CA files
+/// fail closed here, before listen.
+fn grpc_server_tls_config(
+    cert: &str,
+    key: &str,
+    client_ca: Option<&str>,
+) -> Result<ServerTlsConfig, std::io::Error> {
+    let identity = Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
+    let mut tls = ServerTlsConfig::new().identity(identity);
+    if let Some(client_ca) = nonempty_tls_path(client_ca) {
+        let pem = std::fs::read(client_ca).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("SEKAI_TLS_CLIENT_CA is unreadable: {error}"),
+            )
+        })?;
+        tls = tls.client_ca_root(Certificate::from_pem(pem));
+    }
+    Ok(tls)
 }
 
 pub fn run(
@@ -1498,14 +1531,14 @@ where
 {
     let maybe_tls = tls_policy(bind_addr, config).map_err(std::io::Error::other)?;
     let addr = format!("{}:{}", bind_addr, port).parse()?;
-    tracing::info!(addr = %addr, "gRPC server listening");
 
     let mut server = Server::builder().layer(MetricsLayer);
     if let Some((cert, key)) = maybe_tls {
         install_rustls_crypto_provider();
-        let identity = Identity::from_pem(std::fs::read(cert)?, std::fs::read(key)?);
-        server = server.tls_config(ServerTlsConfig::new().identity(identity))?;
+        let client_ca = nonempty_tls_path(config.tls_client_ca.as_deref());
+        server = server.tls_config(grpc_server_tls_config(&cert, &key, client_ca)?)?;
     }
+    tracing::info!(addr = %addr, "gRPC server listening");
 
     server
         .add_service(health_service)
@@ -2244,6 +2277,7 @@ mod tests {
         let mut config = Config::from_env();
         config.tls_cert = None;
         config.tls_key = None;
+        config.tls_client_ca = None;
         config.allow_plaintext = false;
         config
     }
@@ -3354,6 +3388,74 @@ mod tests {
         let config = base_config();
         let err = tls_policy("0.0.0.0", &config).unwrap_err();
         assert!(err.contains("SEKAI_TLS_CERT"));
+    }
+
+    #[test]
+    fn tls_policy_rejects_client_ca_without_server_certs() {
+        let mut config = base_config();
+        config.tls_client_ca = Some("client-ca.pem".into());
+        let err = tls_policy("127.0.0.1", &config).unwrap_err();
+        assert!(err.contains("SEKAI_TLS_CLIENT_CA"));
+    }
+
+    #[test]
+    fn tls_policy_keeps_server_tls_without_client_ca() {
+        let mut config = base_config();
+        config.tls_cert = Some("cert.pem".into());
+        config.tls_key = Some("key.pem".into());
+        assert_eq!(
+            tls_policy("0.0.0.0", &config).unwrap(),
+            Some(("cert.pem".into(), "key.pem".into()))
+        );
+    }
+
+    #[test]
+    fn unreadable_client_ca_fails_closed_before_listen() {
+        install_rustls_crypto_provider();
+        const CERT: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.pem");
+        const KEY: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.key");
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        let missing = dir.path().join("missing-ca.pem");
+        std::fs::write(&cert_path, CERT).unwrap();
+        std::fs::write(&key_path, KEY).unwrap();
+        let err = grpc_server_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(missing.to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SEKAI_TLS_CLIENT_CA"), "{err}");
+    }
+
+    #[test]
+    fn client_ca_root_config_does_not_panic() {
+        install_rustls_crypto_provider();
+        const CERT: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.pem");
+        const KEY: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/server.key");
+        const CLIENT_CA: &[u8] =
+            include_bytes!("../../crates/sekai-client/tests/fixtures/tls/client-ca.pem");
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        let ca_path = dir.path().join("client-ca.pem");
+        std::fs::write(&cert_path, CERT).unwrap();
+        std::fs::write(&key_path, KEY).unwrap();
+        std::fs::write(&ca_path, CLIENT_CA).unwrap();
+        let tls = grpc_server_tls_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            Some(ca_path.to_str().unwrap()),
+        )
+        .expect("client CA file must load");
+        Server::builder()
+            .tls_config(tls)
+            .expect("required client auth must build");
     }
 
     #[test]
