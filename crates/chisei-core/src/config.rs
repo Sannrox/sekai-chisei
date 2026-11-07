@@ -42,9 +42,6 @@ pub struct Config {
     pub leak_review_model: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    /// Client CA PEM path. When set with server TLS, the gRPC listener requires
-    /// a client certificate signed by this CA. Unset keeps server-TLS-only.
-    pub tls_client_ca: Option<String>,
     pub allow_plaintext: bool,
     pub insecure: bool,
     /// Hex-encoded Ed25519 seed used only to sign short-lived external-action permits.
@@ -119,9 +116,6 @@ impl Config {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             tls_key: env::var("SEKAI_TLS_KEY")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            tls_client_ca: env::var("SEKAI_TLS_CLIENT_CA")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",

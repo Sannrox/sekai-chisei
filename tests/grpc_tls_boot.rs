@@ -194,7 +194,7 @@ async fn spawned_binary_requires_client_certificate_when_client_ca_is_set() {
     let without_cert = health_connect(server.port, client_tls(None), &server.log_path).await;
     assert!(
         without_cert.is_err(),
-        "missing client certificate must be refused: {without_cert:?}"
+        "missing client certificate must be refused"
     );
 
     let other = health_connect(
@@ -208,7 +208,7 @@ async fn spawned_binary_requires_client_certificate_when_client_ca_is_set() {
     .await;
     assert!(
         other.is_err(),
-        "client certificate signed by another CA must be refused: {other:?}"
+        "client certificate signed by another CA must be refused"
     );
 
     let status = health_connect(

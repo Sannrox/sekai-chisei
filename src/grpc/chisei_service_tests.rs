@@ -1145,7 +1145,6 @@ fn config(db_path: &str) -> Config {
         leak_review_model: None,
         tls_cert: None,
         tls_key: None,
-        tls_client_ca: None,
         allow_plaintext: false,
         insecure: false,
         permit_signing_key: Some("07".repeat(32)),

@@ -74,7 +74,6 @@ fn fixture_config() -> Config {
         leak_review_model: None,
         tls_cert: None,
         tls_key: None,
-        tls_client_ca: None,
         allow_plaintext: false,
         insecure: true,
         permit_signing_key: Some(PERMIT_SEED.into()),

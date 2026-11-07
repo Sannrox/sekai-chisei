@@ -1130,17 +1130,27 @@ fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+fn client_ca_path() -> Option<String> {
+    std::env::var("SEKAI_TLS_CLIENT_CA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 pub fn tls_policy(bind_addr: &str, config: &Config) -> Result<Option<(String, String)>, String> {
+    tls_listen_policy(bind_addr, config, client_ca_path())
+}
+
+fn tls_listen_policy(
+    bind_addr: &str,
+    config: &Config,
+    client_ca: Option<String>,
+) -> Result<Option<(String, String)>, String> {
     let cert = config
         .tls_cert
         .clone()
         .filter(|value| !value.trim().is_empty());
     let key = config
         .tls_key
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let client_ca = config
-        .tls_client_ca
         .clone()
         .filter(|value| !value.trim().is_empty());
 
@@ -1535,8 +1545,12 @@ where
     let mut server = Server::builder().layer(MetricsLayer);
     if let Some((cert, key)) = maybe_tls {
         install_rustls_crypto_provider();
-        let client_ca = nonempty_tls_path(config.tls_client_ca.as_deref());
-        server = server.tls_config(grpc_server_tls_config(&cert, &key, client_ca)?)?;
+        let client_ca = client_ca_path();
+        server = server.tls_config(grpc_server_tls_config(
+            &cert,
+            &key,
+            nonempty_tls_path(client_ca.as_deref()),
+        )?)?;
     }
     tracing::info!(addr = %addr, "gRPC server listening");
 
@@ -2277,7 +2291,6 @@ mod tests {
         let mut config = Config::from_env();
         config.tls_cert = None;
         config.tls_key = None;
-        config.tls_client_ca = None;
         config.allow_plaintext = false;
         config
     }
@@ -3392,9 +3405,9 @@ mod tests {
 
     #[test]
     fn tls_policy_rejects_client_ca_without_server_certs() {
-        let mut config = base_config();
-        config.tls_client_ca = Some("client-ca.pem".into());
-        let err = tls_policy("127.0.0.1", &config).unwrap_err();
+        let config = base_config();
+        let err =
+            tls_listen_policy("127.0.0.1", &config, Some("client-ca.pem".into())).unwrap_err();
         assert!(err.contains("SEKAI_TLS_CLIENT_CA"));
     }
 
