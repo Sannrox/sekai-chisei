@@ -57,6 +57,7 @@ const REMOTE_PENDING_INFLIGHT: &str = "pending:inflight:";
 const MANAGED_END: &str = "<!-- /sekai-feedback -->";
 const DAY_MS: i64 = 86_400_000;
 const INFLIGHT_TTL_MS: i64 = 60_000;
+const PERMIT_TTL_MS: i64 = 3_600_000;
 
 /// Configured public Tenkai repository the executor may write.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +125,9 @@ pub struct PublishIntent {
     pub draft: IssueDraft,
     pub arguments_digest: String,
     pub mapping_id: String,
+    /// Inflight fence token for a create attempt. Distinct tokens get distinct
+    /// permit keys so a failed create can authorize again after revert.
+    pub attempt_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +237,55 @@ pub fn arguments_digest(operation: PublishOperation, body: &str) -> String {
         "sha256:{:x}",
         Sha256::digest(format!("{op}\n{body}\n").as_bytes())
     )
+}
+
+/// Permit operation id for one GitHub mutate intent.
+///
+/// Distinct arguments, update issue numbers, and create-attempt tokens get
+/// distinct keys so a later contentful update or a failed create retry is not
+/// refused as a digest conflict on an earlier row.
+pub fn permit_operation_id(intent: &PublishIntent) -> String {
+    let digest = digest_suffix(&intent.arguments_digest);
+    match intent.operation {
+        PublishOperation::Create => {
+            let attempt = create_attempt_suffix(&intent.attempt_token);
+            format!(
+                "feedback-gh-{}-create-{digest}-{attempt}",
+                intent.mapping_id
+            )
+        }
+        PublishOperation::Update { number } => {
+            format!("feedback-gh-{}-update-{number}-{digest}", intent.mapping_id)
+        }
+    }
+}
+
+/// Deadline encoded in the permit request for `intent`.
+///
+/// Create attempts use the inflight claim time so the digest is stable for that
+/// fence. Updates bucket wall-clock time into `PERMIT_TTL_MS` windows so a
+/// same-body refresh inside the window replays instead of conflicting.
+pub fn permit_deadline_ms(intent: &PublishIntent, now_ms: i64) -> i64 {
+    if let Some(started) = inflight_started_ms(&intent.attempt_token) {
+        return started.saturating_add(PERMIT_TTL_MS);
+    }
+    let bucket = now_ms.div_euclid(PERMIT_TTL_MS).saturating_add(2);
+    bucket.saturating_mul(PERMIT_TTL_MS)
+}
+
+fn digest_suffix(digest: &str) -> &str {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    let end = hex.len().min(16);
+    &hex[..end]
+}
+
+fn create_attempt_suffix(token: &str) -> &str {
+    token
+        .strip_prefix(REMOTE_PENDING_INFLIGHT)
+        .and_then(|value| value.rsplit_once(':'))
+        .map(|(_, attempt)| attempt)
+        .filter(|attempt| !attempt.is_empty())
+        .unwrap_or("missing")
 }
 
 pub fn utc_day(now_ms: i64) -> i64 {
@@ -589,11 +642,12 @@ pub fn publish_finding(
     if created_today >= target.daily_cap {
         return Err(PublishError::DailyCap);
     }
-    claim_inflight(db, actor, &draft, &mapping, now_ms)?;
+    let attempt_token = claim_inflight(db, actor, &draft, &mapping, now_ms)?;
     let intent = PublishIntent {
         operation: PublishOperation::Create,
         arguments_digest: arguments_digest(PublishOperation::Create, &managed),
         mapping_id: mapping_id.clone(),
+        attempt_token,
         draft: draft.clone(),
     };
     let proof = match permits.authorize_and_redeem(&intent) {
@@ -692,6 +746,7 @@ fn update_existing(
             &body,
         ),
         mapping_id: mapping_id.to_string(),
+        attempt_token: String::new(),
         draft: draft.clone(),
     };
     let proof = permits
@@ -819,7 +874,7 @@ fn claim_inflight(
     draft: &IssueDraft,
     mapping: &Object,
     now_ms: i64,
-) -> Result<(), PublishError> {
+) -> Result<String, PublishError> {
     let token = format!(
         "{REMOTE_PENDING_INFLIGHT}{now_ms}:{}",
         uuid::Uuid::new_v4().simple()
@@ -838,7 +893,7 @@ fn claim_inflight(
         .map_err(PublishError::Internal)?
         .ok_or_else(|| PublishError::Internal("inflight mapping disappeared".into()))?;
     if stored.properties.get("remote_id").map(String::as_str) == Some(token.as_str()) {
-        Ok(())
+        Ok(token)
     } else {
         Err(PublishError::Retryable(
             "another publisher holds the create fence".into(),
@@ -846,12 +901,15 @@ fn claim_inflight(
     }
 }
 
-fn inflight_age_ms(remote_id: &str, now_ms: i64) -> Option<i64> {
+fn inflight_started_ms(remote_id: &str) -> Option<i64> {
     remote_id
         .strip_prefix(REMOTE_PENDING_INFLIGHT)
         .and_then(|value| value.split(':').next())
-        .and_then(|value| value.parse::<i64>().ok())
-        .map(|started| now_ms.saturating_sub(started))
+        .and_then(|value| value.parse().ok())
+}
+
+fn inflight_age_ms(remote_id: &str, now_ms: i64) -> Option<i64> {
+    inflight_started_ms(remote_id).map(|started| now_ms.saturating_sub(started))
 }
 
 fn revert_mapping(
@@ -1683,6 +1741,45 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct RecordingPermit {
+        ids: Mutex<Vec<String>>,
+    }
+
+    impl RecordingPermit {
+        fn ids(&self) -> Vec<String> {
+            self.ids.lock().unwrap().clone()
+        }
+    }
+
+    impl PermitGate for RecordingPermit {
+        fn authorize_and_redeem(&self, intent: &PublishIntent) -> Result<PermitProof, PermitError> {
+            self.ids.lock().unwrap().push(permit_operation_id(intent));
+            AllowPermit.authorize_and_redeem(intent)
+        }
+    }
+
+    fn sample_intent(
+        operation: PublishOperation,
+        body: &str,
+        attempt_token: &str,
+    ) -> PublishIntent {
+        PublishIntent {
+            arguments_digest: arguments_digest(operation, body),
+            mapping_id: "fb-ext-deadbeefdeadbeef".into(),
+            attempt_token: attempt_token.into(),
+            operation,
+            draft: IssueDraft {
+                title: "title".into(),
+                managed_body: body.into(),
+                marker: "marker".into(),
+                signature: "signature".into(),
+                finding_id: "finding".into(),
+                namespace: NAMESPACE.into(),
+            },
+        }
+    }
+
     #[test]
     fn github_target_parse_rejects_empty_and_slashes() {
         assert!(GitHubTarget::parse("", "tenkai", 5).is_none());
@@ -1690,6 +1787,53 @@ mod tests {
         let target = GitHubTarget::parse("tenkai-org", "tenkai", 0).unwrap();
         assert_eq!(target.daily_cap, DEFAULT_DAILY_CAP);
         assert_eq!(target.repository(), "tenkai-org/tenkai");
+    }
+
+    #[test]
+    fn permit_operation_id_changes_with_create_attempt_and_update_digest() {
+        let first = sample_intent(
+            PublishOperation::Create,
+            "body",
+            "pending:inflight:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let retry = sample_intent(
+            PublishOperation::Create,
+            "body",
+            "pending:inflight:2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        assert_ne!(permit_operation_id(&first), permit_operation_id(&retry));
+        let update = sample_intent(PublishOperation::Update { number: 7 }, "body", "");
+        let changed = sample_intent(PublishOperation::Update { number: 7 }, "body-2", "");
+        let other_issue = sample_intent(PublishOperation::Update { number: 8 }, "body", "");
+        assert_ne!(permit_operation_id(&update), permit_operation_id(&changed));
+        assert_ne!(
+            permit_operation_id(&update),
+            permit_operation_id(&other_issue)
+        );
+        assert_eq!(permit_operation_id(&update), permit_operation_id(&update));
+    }
+
+    #[test]
+    fn permit_deadline_is_stable_within_the_ttl_window() {
+        let update = sample_intent(PublishOperation::Update { number: 1 }, "body", "");
+        let now = 1_700_000_000_000;
+        assert_eq!(
+            permit_deadline_ms(&update, now),
+            permit_deadline_ms(&update, now + 30_000)
+        );
+        let create = sample_intent(
+            PublishOperation::Create,
+            "body",
+            "pending:inflight:1700000000000:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        assert_eq!(
+            permit_deadline_ms(&create, now),
+            1_700_000_000_000 + PERMIT_TTL_MS
+        );
+        assert_eq!(
+            permit_deadline_ms(&create, now + 30_000),
+            1_700_000_000_000 + PERMIT_TTL_MS
+        );
     }
 
     #[test]
@@ -1833,6 +1977,63 @@ mod tests {
             assert!(matches!(error, PublishError::Permit(_)));
         }
         assert_eq!(github.created(), 0);
+    }
+
+    #[test]
+    fn rate_limited_create_retries_with_a_new_permit_operation_id() {
+        let runtime = db();
+        let finding = qualifying_cluster(&runtime, "a", "api:tenkai_failed", "impact", "");
+        let github = MemoryGitHub::new();
+        let permits = RecordingPermit::default();
+        github.fail_create(GitHubErrorKind::RateLimited);
+        assert!(matches!(
+            publish(&runtime, &github, &permits, &finding).unwrap_err(),
+            PublishError::GitHub(GitHubError::RateLimited)
+        ));
+        *github.create_error.lock().unwrap() = None;
+        publish(&runtime, &github, &permits, &finding).unwrap();
+        let ids = permits.ids();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids[0].contains("-create-"), "{}", ids[0]);
+        assert!(ids[1].contains("-create-"), "{}", ids[1]);
+    }
+
+    #[test]
+    fn later_contentful_update_uses_a_distinct_permit_operation_id() {
+        let runtime = db();
+        let finding = qualifying_cluster(
+            &runtime,
+            "a",
+            "api:tenkai_failed",
+            "apply cannot finish",
+            "",
+        );
+        let github = MemoryGitHub::new();
+        let permits = RecordingPermit::default();
+        publish(&runtime, &github, &permits, &finding).unwrap();
+        let later = qualifying_cluster(
+            &runtime,
+            "b",
+            "api:tenkai_failed",
+            "apply still cannot finish after retry",
+            "",
+        );
+        publish(&runtime, &github, &permits, &later).unwrap();
+        let third = qualifying_cluster(
+            &runtime,
+            "c",
+            "api:tenkai_failed",
+            "apply failed a third time",
+            "",
+        );
+        publish(&runtime, &github, &permits, &third).unwrap();
+        let ids = permits.ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0].contains("-create-"), "{}", ids[0]);
+        assert!(ids[1].contains("-update-"), "{}", ids[1]);
+        assert!(ids[2].contains("-update-"), "{}", ids[2]);
+        assert_ne!(ids[1], ids[2]);
     }
 
     #[test]
