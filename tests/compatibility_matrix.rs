@@ -1,7 +1,8 @@
 //! Compatibility matrix projection and consumer pin check (#873).
 
 use sekai_chisei::compatibility_matrix::{
-    self, CompatibilityMatrix, MATRIX_CONTRACT, check_consumer, protocol_revision,
+    self, CompatibilityMatrix, MATRIX_CONTRACT, check_consumer, check_tenkai_products,
+    protocol_revision,
 };
 use std::fs;
 use std::path::Path;
@@ -119,4 +120,10 @@ fn generate_round_trips_the_workspace_matrix() {
     let out = root.path().join("compatibility.json");
     compatibility_matrix::write_matrix(&out, &matrix).unwrap();
     assert_eq!(CompatibilityMatrix::from_path(&out).unwrap(), matrix);
+}
+
+#[test]
+fn tenkai_products_provide_the_matrix_contracts() {
+    // A version bump or contract bump fails here until `deploy/` is refreshed.
+    check_tenkai_products(".", &workspace_matrix()).unwrap();
 }

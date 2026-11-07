@@ -6,13 +6,14 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin compatibility generate [--root <dir>] [--out <file>]\n  sekaictl admin compatibility check --matrix <file> --consumer <dir>"
+    "sekaictl admin compatibility generate [--root <dir>] [--out <file>]\n  sekaictl admin compatibility check --matrix <file> --consumer <dir>\n  sekaictl admin compatibility check-tenkai [--root <dir>]"
 }
 
 pub async fn run_compatibility_command(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
         Some("generate") => generate(parse_generate(&args[1..])?),
         Some("check") => check(parse_check(&args[1..])?),
+        Some("check-tenkai") => check_tenkai(parse_root(&args[1..])?),
         _ => Err(std::io::Error::other(usage()).into()),
     }
 }
@@ -32,6 +33,19 @@ fn generate(config: GenerateConfig) -> Result<(), BoxErr> {
         CompatibilityMatrix::from_workspace(&config.root).map_err(std::io::Error::other)?;
     compatibility_matrix::write_matrix(&config.out, &matrix).map_err(std::io::Error::other)?;
     println!("{}", config.out.display());
+    Ok(())
+}
+
+/// Release check: the Tenkai products declare the contracts this tree provides.
+fn check_tenkai(root: PathBuf) -> Result<(), BoxErr> {
+    let matrix = CompatibilityMatrix::from_workspace(&root).map_err(std::io::Error::other)?;
+    if let Err(message) = compatibility_matrix::check_tenkai_products(&root, &matrix) {
+        eprintln!("{message}");
+        return Err(std::io::Error::other("Tenkai products are stale").into());
+    }
+    for (id, version) in &matrix.contracts {
+        println!("{id} {version}");
+    }
     Ok(())
 }
 
@@ -67,6 +81,14 @@ fn parse_generate(args: &[String]) -> Result<GenerateConfig, BoxErr> {
         }
     }
     Ok(GenerateConfig { root, out })
+}
+
+fn parse_root(args: &[String]) -> Result<PathBuf, BoxErr> {
+    match args {
+        [] => Ok(PathBuf::from(".")),
+        [flag, root] if flag == "--root" => Ok(PathBuf::from(root)),
+        _ => Err(std::io::Error::other(usage()).into()),
+    }
 }
 
 fn parse_check(args: &[String]) -> Result<CheckConfig, BoxErr> {

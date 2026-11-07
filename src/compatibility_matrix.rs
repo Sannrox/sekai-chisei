@@ -3,10 +3,13 @@
 //! The matrix is derived from shipped Cargo, proto, and SDK metadata. It does
 //! not invent compatibility. A consumer pin check compares exact package
 //! versions. Protocol and artifact bytes are verified by `client_package`,
-//! not by this manifest and lockfile check.
+//! not by this manifest and lockfile check. It also lists the RPC contracts
+//! the Tenkai products in `deploy/` provide, and checks those products declare
+//! them.
 
 use crate::sekai::client_package;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +19,18 @@ pub const TYPESCRIPT_PACKAGE: &str = "@sannrox/sekai-chisei-sdk";
 pub const PYTHON_PACKAGE: &str = "sekai-chisei-sdk";
 
 const PROTO_FILES: &[&str] = &["sekai.proto", "chisei.proto"];
+
 const TRACKED_CRATES: &[&str] = &["sekai-client", "sekai-proto", "sekai-chisei"];
+
+/// RPC contracts Chisei provides to dependents, as `(id, version)`. The only
+/// source for these versions; RELEASING.md says which change moves which.
+pub const PROVIDED_CONTRACTS: &[(&str, &str)] = &[
+    ("chisei.admin-rpc", "1.0.0"),
+    ("chisei.enterprise-rpc", "1.0.0"),
+];
+
+/// Tenkai products that must declare [`PROVIDED_CONTRACTS`] at release.
+pub const TENKAI_PRODUCTS: &[&str] = &["deploy/tenkai.toml", "deploy/kubernetes/tenkai.toml"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +41,9 @@ pub struct CompatibilityMatrix {
     pub minimum_compatible_server: String,
     #[serde(default)]
     pub identity_assertion_contract: String,
+    /// Provided RPC contract versions by id; empty in matrices before #2114.
+    #[serde(default)]
+    pub contracts: BTreeMap<String, String>,
     pub packages: CompatibilityPackages,
 }
 
@@ -120,6 +137,7 @@ impl CompatibilityMatrix {
             minimum_compatible_server: server_version.clone(),
             identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
                 .into(),
+            contracts: provided_contracts(),
             packages: CompatibilityPackages {
                 sekai_chisei: server_version,
                 sekai_proto,
@@ -504,6 +522,63 @@ fn require_in_tree_package_pins(root: &Path, matrix: &CompatibilityMatrix) -> Re
             matrix.expected_revision_label()
         )),
     }
+}
+
+fn provided_contracts() -> BTreeMap<String, String> {
+    PROVIDED_CONTRACTS
+        .iter()
+        .map(|(id, version)| (id.to_string(), version.to_string()))
+        .collect()
+}
+
+/// The Tenkai compatibility profile (v2) a release's products declare: one
+/// component, pinned to a digest of the release version, providing the matrix
+/// contracts. The pin moves only with a version bump, so CI can hold every
+/// commit to it without each proto change rewriting the products.
+pub fn tenkai_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
+    let pin = client_package::digest_bytes(
+        "tenkai-component",
+        &format!("sekai-chisei@{}", matrix.server_version),
+    )?;
+    let mut profile = format!(
+        "[compatibility]\n\
+         version = 2\n\
+         # Evidence binds one release digest; one day is Tenkai's maximum.\n\
+         max_evidence_age_ms = 86400000\n\
+         \n\
+         [compatibility.components.sekai-chisei.pin]\n\
+         kind = \"digest\"\n\
+         value = \"{pin}\"\n\
+         \n\
+         [compatibility.components.sekai-chisei.provides]\n"
+    );
+    for (id, version) in &matrix.contracts {
+        profile.push_str(&format!("\"{id}\" = \"{version}\"\n"));
+    }
+    Ok(profile)
+}
+
+/// Fails unless every product in [`TENKAI_PRODUCTS`] under `root` ends with
+/// [`tenkai_profile`]. The error carries the block to paste.
+pub fn check_tenkai_products(
+    root: impl AsRef<Path>,
+    matrix: &CompatibilityMatrix,
+) -> Result<(), String> {
+    let profile = tenkai_profile(matrix)?;
+    let stale: Vec<&str> = TENKAI_PRODUCTS
+        .iter()
+        .copied()
+        .filter(|product| {
+            read_text(&root.as_ref().join(product)).map_or(true, |body| !body.ends_with(&profile))
+        })
+        .collect();
+    if stale.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} must end with this compatibility profile:\n\n{profile}",
+        stale.join(" and ")
+    ))
 }
 
 pub fn protocol_revision(root: impl AsRef<Path>) -> Result<String, String> {
@@ -1020,6 +1095,7 @@ mod tests {
             minimum_compatible_server: "1.0.1".into(),
             identity_assertion_contract: crate::identity_assertion::IDENTITY_ASSERTION_VERSION
                 .into(),
+            contracts: provided_contracts(),
             packages: CompatibilityPackages {
                 sekai_chisei: "1.0.1".into(),
                 sekai_proto: "1.0.1".into(),
@@ -1036,6 +1112,41 @@ mod tests {
         fs::create_dir_all(&consumer).unwrap();
         fs::write(consumer.join("Cargo.toml"), body).unwrap();
         (root, consumer)
+    }
+
+    #[test]
+    fn tenkai_products_must_end_with_the_release_profile() {
+        let matrix = sample_matrix();
+        let profile = tenkai_profile(&matrix).unwrap();
+        let mut next = matrix.clone();
+        next.server_version = "1.0.2".into();
+        assert_ne!(
+            tenkai_profile(&next).unwrap(),
+            profile,
+            "a version bump moves the pin"
+        );
+        assert!(
+            profile.contains("\"chisei.enterprise-rpc\" = \"1.0.0\""),
+            "{profile}"
+        );
+        let root = TempDir::new().unwrap();
+        fs::create_dir_all(root.path().join("deploy/kubernetes")).unwrap();
+        let product = format!("[product]\nname = \"sekai-chisei\"\n\n{profile}");
+        fs::write(root.path().join("deploy/tenkai.toml"), &product).unwrap();
+        fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), &product).unwrap();
+        check_tenkai_products(root.path(), &matrix).unwrap();
+
+        let stale = product.replace(
+            "\"chisei.admin-rpc\" = \"1.0.0\"",
+            "\"chisei.admin-rpc\" = \"0.9.0\"",
+        );
+        fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), stale).unwrap();
+        let error = check_tenkai_products(root.path(), &matrix).unwrap_err();
+        assert!(
+            error.starts_with("deploy/kubernetes/tenkai.toml must end with"),
+            "{error}"
+        );
+        assert!(error.ends_with(&profile), "{error}");
     }
 
     #[test]
