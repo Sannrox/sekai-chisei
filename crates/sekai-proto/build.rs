@@ -42,6 +42,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sekai.EvaluateObjectSetResponse.source",
             "#[serde(default)]",
         )
+        .field_attribute(
+            "sekai.ListDecisionsResponse.earliest_retained_seq",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.ListDecisionsResponse.retained_from_ms",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.ListObjectChangesResponse.earliest_retained_seq",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.ListObjectChangesResponse.retained_from_ms",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.VerifyAttestationResponse.archived",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.VerifyAttestationResponse.archived_at_ms",
+            "#[serde(default)]",
+        )
         .compile_protos(
             &[
                 format!("{proto_root}/sekai.proto"),
