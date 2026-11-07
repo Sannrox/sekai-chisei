@@ -71,7 +71,7 @@ commit a copy. `generate` reproduces it for any checkout.
 
 `contracts` lists the RPC contracts the release provides, by id and version
 (`chisei.enterprise-rpc`, `chisei.admin-rpc`). A Tenkai dependent requires
-those ids at the version of the release it pins. `deploy/tenkai.toml` and
+those contract versions, not Chisei's release version. `deploy/tenkai.toml` and
 `deploy/kubernetes/tenkai.toml` provide the same contracts in their v2
 compatibility profile; `check-tenkai` (in CI and at release) refuses products
 that disagree with the matrix. [RELEASING.md](../RELEASING.md#contract-versions)

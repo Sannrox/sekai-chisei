@@ -48,14 +48,15 @@ development apply is limited to the built-in `local` environment.
 The product declares a compatibility profile that provides Chisei's RPC
 contracts to dependents ([contract versions](../RELEASING.md#contract-versions)).
 Tenkai plans it only with an observation of its component recorded within the
-last day. `observation.json` repeats the pin and `provides` from the profile at
-the end of `deploy/kubernetes/tenkai.toml`:
+last day. After publish, put the release digest, the pin from the profile at
+the end of `deploy/kubernetes/tenkai.toml`, and the observation time into
+`observation.json`:
 
 ```json
 {
   "version": 1,
   "environment": "local",
-  "release_digest": "<release digest from the check report>",
+  "release_digest": "<published release digest>",
   "observed_at_ms": 1790000000000,
   "components": {
     "sekai-chisei": {
@@ -73,9 +74,8 @@ the end of `deploy/kubernetes/tenkai.toml`:
 ```bash
 tenkaictl env cluster-config set local /path/to/kubeconfig
 tenkaictl publish deploy/kubernetes/tenkai.toml --allow-unsigned-development
-# Put the release digest this report names into observation.json.
-tenkaictl env compatibility check local sekai-chisei@1.5.0
 tenkaictl env compatibility record local observation.json
+tenkaictl env compatibility check local sekai-chisei@1.5.0
 tenkaictl promote sekai-chisei@1.5.0 stable
 tenkaictl env subscribe local sekai-chisei=stable
 PLAN=$(tenkaictl plan --env local | sed -n 's/^plan id: //p')

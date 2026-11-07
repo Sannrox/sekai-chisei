@@ -569,7 +569,7 @@ pub fn check_tenkai_products(
         .iter()
         .copied()
         .filter(|product| {
-            read_text(&root.as_ref().join(product)).map_or(true, |body| !body.ends_with(&profile))
+            !read_text(&root.as_ref().join(product)).is_ok_and(|body| body.ends_with(&profile))
         })
         .collect();
     if stale.is_empty() {
@@ -1115,6 +1115,13 @@ mod tests {
     }
 
     #[test]
+    fn workspace_tenkai_products_match_the_release_profile() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let matrix = CompatibilityMatrix::from_workspace(&root).unwrap();
+        check_tenkai_products(&root, &matrix).unwrap();
+    }
+
+    #[test]
     fn tenkai_products_must_end_with_the_release_profile() {
         let matrix = sample_matrix();
         let profile = tenkai_profile(&matrix).unwrap();
@@ -1448,5 +1455,14 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, MATRIX_UNSUPPORTED);
+    }
+
+    #[test]
+    fn matrices_before_provided_contracts_still_parse() {
+        let matrix = CompatibilityMatrix::from_json(&format!(
+            r#"{{"contract_version":"{MATRIX_CONTRACT}","server_version":"1","proto_revision":"sha256:x","minimum_compatible_server":"1","packages":{{"sekai-chisei":"1","sekai-proto":"1","sekai-client":"1","typescript":"1","python":"1"}}}}"#
+        ))
+        .unwrap();
+        assert!(matrix.contracts.is_empty());
     }
 }

@@ -20,8 +20,8 @@ The tag must equal the workspace version in the root `Cargo.toml`
    `CHANGELOG.md`; the release step writes the section from merged work.
 3. Refresh the compatibility profile at the end of `deploy/tenkai.toml` and
    `deploy/kubernetes/tenkai.toml`; its pin follows the version.
-   `sekaictl admin compatibility check-tenkai` prints the block, and CI
-   refuses the bump until it matches.
+   On mismatch, `sekaictl admin compatibility check-tenkai` prints the
+   block to paste, and CI refuses the bump until it matches.
 4. Land the version-bump pull request. The workspace version, CHANGELOG
    heading, and Tenkai products move together.
 
