@@ -155,7 +155,9 @@ comments in `docker-compose.yml`). The server detects active credentials in its
 database and enables authenticated TCP. Public `0.0.0.0` TCP also requires
 `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY`, or an explicit
 `SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext deployment, or an explicit
-loopback `SEKAI_BIND`.
+loopback `SEKAI_BIND`. Set `SEKAI_TLS_CLIENT_CA` when that TLS listener must
+require a client certificate; missing or unreadable files fail closed at
+startup.
 
 ## Container tasks on shared state
 

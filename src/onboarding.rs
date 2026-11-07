@@ -395,6 +395,16 @@ fn check_transport_security() -> DoctorCheck {
             "set both TLS paths or unset both and use the default local Unix socket",
         );
     }
+    let client_ca = std::env::var("SEKAI_TLS_CLIENT_CA")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    if client_ca.is_some() && (cert.is_none() || key.is_none()) {
+        return DoctorCheck::failed(
+            "TLS/auth",
+            "SEKAI_TLS_CLIENT_CA requires SEKAI_TLS_CERT and SEKAI_TLS_KEY",
+            "set server TLS files before requiring a client certificate",
+        );
+    }
     if std::env::var("SEKAI_INSECURE").ok().as_deref() == Some("1") {
         return DoctorCheck::warning(
             "TLS/auth",

@@ -44,6 +44,8 @@ For network-accessible deployments, issue principal-scoped credentials with
 `SEKAI_CREDENTIAL`; the server does not accept an environment bootstrap token.
 `0.0.0.0` requires TLS (`SEKAI_TLS_CERT` + `SEKAI_TLS_KEY`) unless
 `SEKAI_ALLOW_PLAINTEXT=1` is explicitly set.
+`SEKAI_TLS_CLIENT_CA` requires a client certificate signed by that CA; missing
+or unreadable files fail closed at startup. Unset keeps server-TLS-only.
 `SEKAI_INSECURE=1` TCP trusts local transport and forces the caller principal to
 `local` (client `x-principal` is ignored). The default Unix socket
 (`SEKAI_SOCKET`) uses the same forced-`local` identity when no bearer token is

@@ -37,6 +37,8 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
 kubectl -n local create secret tls sekai-chisei-tls \
   --cert=tls.crt --key=tls.key
 # Keep tls.crt if clients need SEKAI_TLS_CA. Remove tls.key.
+# Client certificates are optional: set SEKAI_TLS_CLIENT_CA to a CA PEM to
+# require one. Missing or unreadable files fail closed at startup.
 rm tls.key
 ```
 
