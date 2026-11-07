@@ -22,8 +22,9 @@
 //! operation outcomes) nor decision memory (precedents of parked reviews).
 //! `ListSiteAgentWorkingMemory` (#1968) is the agent-turn read: an item is
 //! returned only when the instance principal and the requester can each
-//! read it. SQLite is the reference store, as for site agent instances
-//! (ADR 0136).
+//! read it. Live `content` uses the same restricted classification, so the
+//! list redacts it as GetObject does for the same request. SQLite is the
+//! reference store, as for site agent instances (ADR 0136).
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, Object, PropertyFilter};
