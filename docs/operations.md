@@ -170,10 +170,10 @@ The same commands work on SQLite and PostgreSQL. On PostgreSQL decisions,
 attestations, object changes, LLM calls, task observations and content
 events are covered (migration 0135 adds the observation `data_class` and
 `retention_tombstone` columns). Object changes follow the dataset-wide
-`audit` policy on both backends. Audit records are archived only after the
-ledger verifies, on both backends; a failed check refuses the whole run and
-names the failure, and `RuntimeDb::verify_ledger` reports it on either
-backend. See
+`audit` policy on both backends. Expired audit records are archived only after that prefix verifies, on both
+backends; a failed check refuses the whole run and names the failure. Idle
+ticks with nothing expired skip the walk. `RuntimeDb::verify_ledger` still
+reports the full chain on either backend. See
 [postgres-sekai-parity.md](postgres-sekai-parity.md).
 
 ## Gateway safeguards

@@ -176,6 +176,46 @@ pub fn chain_head(client: &mut impl postgres::GenericClient) -> Result<(i64, Str
         .unwrap_or((0, String::new())))
 }
 
+/// Cheap forged/incomplete probes. Retention runs these before skipping the
+/// hash walk so a NULL `seq` that sorts last cannot hide a broken ledger.
+pub(crate) fn ledger_chain_metadata_ok(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), String> {
+    let anchor_seq: i64 = client
+        .query_opt(
+            "SELECT seq FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
+            &[],
+        )
+        .map_err(|error| error.to_string())?
+        .map_or(0, |row| row.get(0));
+    let forged: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM sekai_decisions WHERE seq <= $1)",
+            &[&anchor_seq],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    if forged {
+        return Err(format!(
+            "entries at or below purge anchor seq {anchor_seq}: forged historical records"
+        ));
+    }
+    let incomplete: bool = client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT 1 FROM sekai_decisions
+                WHERE seq IS NULL OR prev_hash IS NULL OR entry_hash IS NULL
+             )",
+            &[],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    if incomplete {
+        return Err("audit ledger contains incomplete chain metadata".into());
+    }
+    Ok(())
+}
+
 /// Verify the decision ledger as SQLite's `verify_ledger` does, with the
 /// same report: no row at or below the latest purge anchor, complete chain
 /// metadata, then from the anchor (or genesis) contiguous sequence numbers,
@@ -185,6 +225,15 @@ pub fn chain_head(client: &mut impl postgres::GenericClient) -> Result<(i64, Str
 /// ledger lock) so concurrent writes cannot split the walk.
 pub fn verify_ledger_in(
     client: &mut impl postgres::GenericClient,
+) -> Result<ledger::LedgerVerification, String> {
+    verify_ledger_in_through(client, None)
+}
+
+/// Same as [`verify_ledger_in`], with `through_seq` limiting the walk to
+/// that prefix (retention verifies only the expired rows it will archive).
+pub(crate) fn verify_ledger_in_through(
+    client: &mut impl postgres::GenericClient,
+    through_seq: Option<i64>,
 ) -> Result<ledger::LedgerVerification, String> {
     const BATCH: i64 = 1000;
     let (anchor_seq, anchor_hash) = client
@@ -206,33 +255,33 @@ pub fn verify_ledger_in(
                 head_hash: head.1,
             }
         };
-    let forged: i64 = client
+    let forged: bool = client
         .query_one(
-            "SELECT COUNT(*) FROM sekai_decisions WHERE seq <= $1",
+            "SELECT EXISTS (SELECT 1 FROM sekai_decisions WHERE seq <= $1)",
             &[&anchor_seq],
         )
         .map_err(|error| error.to_string())?
         .get(0);
-    if forged > 0 {
+    if forged {
         return Ok(report(
             false,
             anchor_seq,
-            format!(
-                "{forged} entr(ies) at or below purge anchor seq {anchor_seq}: forged historical records"
-            ),
+            format!("entries at or below purge anchor seq {anchor_seq}: forged historical records"),
             0,
             (anchor_seq, anchor_hash),
         ));
     }
-    let incomplete: i64 = client
+    let incomplete: bool = client
         .query_one(
-            "SELECT COUNT(*) FROM sekai_decisions
-             WHERE seq IS NULL OR prev_hash IS NULL OR entry_hash IS NULL",
+            "SELECT EXISTS (
+                SELECT 1 FROM sekai_decisions
+                WHERE seq IS NULL OR prev_hash IS NULL OR entry_hash IS NULL
+             )",
             &[],
         )
         .map_err(|error| error.to_string())?
         .get(0);
-    if incomplete > 0 {
+    if incomplete {
         return Ok(report(
             false,
             anchor_seq + 1,
@@ -247,8 +296,10 @@ pub fn verify_ledger_in(
             .query(
                 "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
                         seq,prev_hash,entry_hash
-                 FROM sekai_decisions WHERE seq > $1 ORDER BY seq LIMIT $2",
-                &[&expected_seq, &BATCH],
+                 FROM sekai_decisions
+                 WHERE seq > $1 AND ($3::bigint IS NULL OR seq <= $3)
+                 ORDER BY seq LIMIT $2",
+                &[&expected_seq, &BATCH, &through_seq],
             )
             .map_err(|error| error.to_string())?;
         if rows.is_empty() {
