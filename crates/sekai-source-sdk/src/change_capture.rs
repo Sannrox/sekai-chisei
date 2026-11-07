@@ -20,7 +20,7 @@ pub const CHANGE_CAPTURE_CONFORMANCE_VERSION: &str = "sekai.change-capture-confo
 pub enum PositionFamily {
     /// PostgreSQL WAL LSN, `X/Y` in hex.
     PostgresLsn,
-    /// MySQL executed GTID set, `uuid:1-5:7,uuid:1-3`.
+    /// MySQL executed GTID set, `uuid:1-5:7,uuid:tag:1-3`.
     MysqlGtidSet,
     /// SQL Server commit LSN, `VLF:block:slot` as 8, 8 and 4 hex digits.
     SqlServerLsn,
@@ -33,7 +33,9 @@ pub enum PositionFamily {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourcePosition {
     Lsn(u64),
-    /// Source UUID to sorted, merged, inclusive transaction-number ranges.
+    /// Source UUID, or `uuid:tag` for a tagged GTID, to sorted merged
+    /// inclusive transaction-number ranges. Untagged and tagged transactions
+    /// of one UUID stay distinct keys.
     GtidSet(BTreeMap<String, Vec<(u64, u64)>>),
     SqlServerLsn(u32, u32, u16),
     Scn(u64),
@@ -100,6 +102,48 @@ fn hex_u32(raw: &str) -> Option<u32> {
     u32::from_str_radix(raw, 16).ok()
 }
 
+/// Inclusive GTID interval `m` or `m-n` with `m >= 1` and `n >= m`.
+fn gtid_interval(part: &str) -> Option<(u64, u64)> {
+    let (start, end) = match part.split_once('-') {
+        Some((start, end)) => (start.parse().ok()?, end.parse().ok()?),
+        None => {
+            let single: u64 = part.parse().ok()?;
+            (single, single)
+        }
+    };
+    if start == 0 || end < start {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+/// MySQL GTID tag: `[A-Za-z_][A-Za-z0-9_]{0,31}`.
+fn is_gtid_tag(part: &str) -> bool {
+    let mut chars = part.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    let mut len = 1;
+    for ch in chars {
+        len += 1;
+        if len > 32 || !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return false;
+        }
+    }
+    true
+}
+
+fn gtid_set_key(uuid: &str, tag: Option<&str>) -> String {
+    match tag {
+        None => uuid.to_string(),
+        Some(tag) => format!("{uuid}:{tag}"),
+    }
+}
+
 fn parse_gtid_set(raw: &str) -> Option<SourcePosition> {
     let mut set: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
     if raw.trim().is_empty() {
@@ -107,28 +151,33 @@ fn parse_gtid_set(raw: &str) -> Option<SourcePosition> {
         return Some(SourcePosition::GtidSet(set));
     }
     for member in raw.split(',') {
+        // uuid:[tag:]interval[:[tag:]interval]...
         let mut parts = member.trim().split(':');
         let uuid = parts.next()?.to_ascii_lowercase();
         if !is_uuid(&uuid) {
             return None;
         }
-        let ranges = set.entry(uuid).or_default();
-        let mut any = false;
-        for interval in parts {
-            any = true;
-            let (start, end) = match interval.split_once('-') {
-                Some((start, end)) => (start.parse().ok()?, end.parse().ok()?),
-                None => {
-                    let single: u64 = interval.parse().ok()?;
-                    (single, single)
+        let mut tag: Option<String> = None;
+        let mut saw_interval = false;
+        let mut awaiting_interval = false;
+        for part in parts {
+            if let Some(range) = gtid_interval(part) {
+                awaiting_interval = false;
+                saw_interval = true;
+                set.entry(gtid_set_key(&uuid, tag.as_deref()))
+                    .or_default()
+                    .push(range);
+            } else if is_gtid_tag(part) {
+                if awaiting_interval {
+                    return None;
                 }
-            };
-            if start == 0 || end < start {
+                awaiting_interval = true;
+                tag = Some(part.to_ascii_lowercase());
+            } else {
                 return None;
             }
-            ranges.push((start, end));
         }
-        if !any {
+        if !saw_interval || awaiting_interval {
             return None;
         }
     }
@@ -754,6 +803,11 @@ mod tests {
             (gtid, "not-a-uuid:1"),
             (gtid, "------------------------------------:1"),
             (gtid, &format!("{a}:5-1")),
+            (gtid, &format!("{a}:mytag")),
+            (gtid, &format!("{a}:mytag:")),
+            (gtid, &format!("{a}:1-5:mytag")),
+            (gtid, &format!("{a}:my-tag:1")),
+            (gtid, &format!("{a}:{}:1", "a".repeat(33))),
         ] {
             assert!(
                 family.parse(bad).is_err(),
@@ -761,6 +815,91 @@ mod tests {
                 family.token()
             );
         }
+    }
+
+    #[test]
+    fn mysql_tagged_gtids_parse_and_stay_distinct_from_untagged() {
+        let gtid = PositionFamily::MysqlGtidSet;
+        let a = "3E11FA47-71CA-11E1-9E33-C80AA9429562";
+        let tagged = gtid.parse(&format!("{a}:mytag:1-5")).unwrap();
+        let SourcePosition::GtidSet(set) = &tagged else {
+            panic!("expected a GTID set");
+        };
+        assert_eq!(
+            set.get(&format!("{}:mytag", a.to_ascii_lowercase()))
+                .map(Vec::as_slice),
+            Some(&[(1, 5)][..])
+        );
+        assert!(!set.contains_key(&a.to_ascii_lowercase()));
+
+        let mixed = gtid
+            .parse(&format!("{a}:Domain_1:1-3:15-21:Domain_2:8-52"))
+            .unwrap();
+        let SourcePosition::GtidSet(set) = &mixed else {
+            panic!("expected a GTID set");
+        };
+        let uuid = a.to_ascii_lowercase();
+        assert_eq!(
+            set.get(&format!("{uuid}:domain_1")).map(Vec::as_slice),
+            Some(&[(1, 3), (15, 21)][..])
+        );
+        assert_eq!(
+            set.get(&format!("{uuid}:domain_2")).map(Vec::as_slice),
+            Some(&[(8, 52)][..])
+        );
+
+        let untagged_then_tag = gtid.parse(&format!("{a}:1-3:foobar:1-2")).unwrap();
+        let SourcePosition::GtidSet(set) = &untagged_then_tag else {
+            panic!("expected a GTID set");
+        };
+        assert_eq!(set.get(&uuid).map(Vec::as_slice), Some(&[(1, 3)][..]));
+        assert_eq!(
+            set.get(&format!("{uuid}:foobar")).map(Vec::as_slice),
+            Some(&[(1, 2)][..])
+        );
+
+        let small = gtid.parse(&format!("{a}:mytag:1-5")).unwrap();
+        let large = gtid.parse(&format!("{a}:mytag:1-6")).unwrap();
+        assert_eq!(small.compare(&large), Some(Ordering::Less));
+        // Tagged and untagged transactions of one UUID are different TSIDs.
+        let untagged = gtid.parse(&format!("{a}:1-5")).unwrap();
+        assert_eq!(small.compare(&untagged), None);
+    }
+
+    #[test]
+    fn tagged_mysql_gtid_fixture_conforms() {
+        let family = PositionFamily::MysqlGtidSet;
+        let a = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let (key_columns, mut events) = change_capture_fixture(family);
+        let tagged = [
+            format!("{a}:mytag:1-10"),
+            format!("{a}:mytag:1-11"),
+            format!("{a}:mytag:1-12"),
+        ];
+        for event in &mut events {
+            match event {
+                CaptureEvent::Snapshot { position, .. } => *position = tagged[0].clone(),
+                CaptureEvent::Change(change) => {
+                    change.commit_position = if change.transaction_id == "tx-1" {
+                        tagged[1].clone()
+                    } else {
+                        tagged[2].clone()
+                    };
+                }
+                CaptureEvent::TransactionEnd {
+                    commit_position, ..
+                } => {
+                    *commit_position = tagged[1].clone();
+                }
+                _ => {}
+            }
+        }
+        let summary = assert_change_capture(family, &key_columns, None, &events)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            (summary.generations, summary.transactions, summary.changes),
+            (1, 2, 3)
+        );
     }
 
     fn fixture() -> Vec<CaptureEvent> {
