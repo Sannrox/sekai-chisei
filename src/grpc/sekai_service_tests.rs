@@ -6740,6 +6740,271 @@ async fn enterprise_query_rows_requires_namespace_read_for_the_tenant() {
     }
 }
 
+/// #2106: Preview, RunAdHoc and Put authorize each input as `QueryRows` does.
+/// A tenant who may act in `allowed` still cannot read a host-global unbound
+/// dataset or one whose binding object is gone.
+#[tokio::test]
+async fn enterprise_transform_inputs_require_live_namespace_binding() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+    use tonic::service::Interceptor;
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(TestEnterpriseExtension)))
+            .unwrap(),
+    )));
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let svc = SekaiServiceImpl::new(store.clone());
+    let runtime = svc.db.runtime();
+    for (dataset_id, namespace) in [
+        ("bound-in", Some("allowed")),
+        ("bound-out", Some("allowed")),
+        ("unbound-in", None),
+        ("orphan-in", Some("allowed")),
+        ("foreign-in", Some("foreign")),
+    ] {
+        let object_id = namespace.map_or(String::new(), |namespace| {
+            let id = format!("{dataset_id}-object");
+            seed_lineage_object(&svc, &id, namespace);
+            id
+        });
+        runtime
+            .create_dataset(&crate::sekai::dataset::Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: vec![crate::sekai::dataset::ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id,
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        runtime
+            .append_rows(
+                dataset_id,
+                &[HashMap::from([("id".into(), dataset_id.into())])],
+            )
+            .unwrap();
+    }
+    runtime.delete_object("orphan-in-object").unwrap();
+
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new()),
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    fn token(authority: &AssertionAuthority, scopes: &[&str]) -> String {
+        authority
+            .sign(&IdentityAssertion {
+                contract_version: IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: Some("tenant-test".into()),
+                scopes: scopes.iter().map(|scope| (*scope).into()).collect(),
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    }
+    fn admit<T>(
+        interceptor: &mut crate::grpc::TokenAuthInterceptor,
+        authority: &AssertionAuthority,
+        method: &'static str,
+        scopes: &[&str],
+        body: T,
+    ) -> Request<T> {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {}", token(authority, scopes))).unwrap(),
+        );
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", method));
+        let (metadata, extensions, ()) = interceptor.call(req).unwrap().into_parts();
+        Request::from_parts(metadata, extensions, body)
+    }
+    fn transform(input: &str) -> GovernedTransform {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "allowed".into(),
+            transform_id: format!("{input}-t"),
+            input_dataset_id: input.into(),
+            output_dataset_id: "bound-out".into(),
+            profile: ANALYTICAL_CLASS.into(),
+            sql: "SELECT id FROM input".into(),
+            ..GovernedTransform::default()
+        }
+    }
+    let denied = tonic::Code::PermissionDenied;
+    let read: &[&str] = &["sekai.read"];
+    let write: &[&str] = &["sekai.read", "sekai.write"];
+
+    let rows = svc
+        .query_rows(admit(
+            &mut interceptor,
+            &authority,
+            "QueryRows",
+            read,
+            QueryRowsRequest {
+                dataset_id: "bound-in".into(),
+                query: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .rows;
+    assert_eq!(rows[0].values["id"], "bound-in");
+    for dataset_id in ["unbound-in", "orphan-in", "foreign-in"] {
+        let err = svc
+            .query_rows(admit(
+                &mut interceptor,
+                &authority,
+                "QueryRows",
+                read,
+                QueryRowsRequest {
+                    dataset_id: dataset_id.into(),
+                    query: None,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), denied, "QueryRows {dataset_id}");
+    }
+
+    let previewed = svc
+        .preview_governed_transform(admit(
+            &mut interceptor,
+            &authority,
+            "PreviewGovernedTransform",
+            read,
+            PreviewGovernedTransformRequest {
+                transform: Some(transform("bound-in")),
+                row_cap: 0,
+                preview_id: String::new(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(previewed.inputs[0].rows_read, 1, "{}", previewed.error);
+    assert_eq!(previewed.rows[0].values["id"], "bound-in");
+    for input in ["unbound-in", "orphan-in", "foreign-in"] {
+        assert_eq!(
+            svc.preview_governed_transform(admit(
+                &mut interceptor,
+                &authority,
+                "PreviewGovernedTransform",
+                read,
+                PreviewGovernedTransformRequest {
+                    transform: Some(transform(input)),
+                    row_cap: 0,
+                    preview_id: String::new(),
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "Preview {input}"
+        );
+    }
+
+    let ran = svc
+        .run_ad_hoc_governed_transform(admit(
+            &mut interceptor,
+            &authority,
+            "RunAdHocGovernedTransform",
+            write,
+            RunAdHocGovernedTransformRequest {
+                transform: Some(transform("bound-in")),
+                session_label: "explore".into(),
+                idempotency_key: "ok".into(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        runtime
+            .query_rows(&ran.scratch_dataset_id, &Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    for (input, key) in [("unbound-in", "u"), ("orphan-in", "o"), ("foreign-in", "f")] {
+        assert_eq!(
+            svc.run_ad_hoc_governed_transform(admit(
+                &mut interceptor,
+                &authority,
+                "RunAdHocGovernedTransform",
+                write,
+                RunAdHocGovernedTransformRequest {
+                    transform: Some(transform(input)),
+                    session_label: "explore".into(),
+                    idempotency_key: key.into(),
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "RunAdHoc {input}"
+        );
+    }
+
+    assert_eq!(
+        svc.put_governed_transform(admit(
+            &mut interceptor,
+            &authority,
+            "PutGovernedTransform",
+            write,
+            PutGovernedTransformRequest {
+                transform: Some(transform("bound-in")),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .transform
+        .unwrap()
+        .transform_id,
+        "bound-in-t"
+    );
+    for input in ["unbound-in", "orphan-in", "foreign-in"] {
+        assert_eq!(
+            svc.put_governed_transform(admit(
+                &mut interceptor,
+                &authority,
+                "PutGovernedTransform",
+                write,
+                PutGovernedTransformRequest {
+                    transform: Some(transform(input)),
+                },
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            denied,
+            "Put {input}"
+        );
+    }
+}
+
 /// #2097: rows are held to the binding object's readable columns when its
 /// policy enforces property grants, for a tenant caller and a tenant-free one,
 /// on the live rows, a version snapshot, and the rows a rollback returns.
@@ -7236,6 +7501,7 @@ async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
 #[tokio::test]
 async fn rollback_dataset_requires_write_access() {
     let svc = service();
+    seed_lineage_object(&svc, "protected-version-object", "ops");
     svc.create_dataset(with_principal(CreateDatasetRequest {
         dataset: Some(Dataset {
             id: "protected-versions".into(),
@@ -8023,6 +8289,7 @@ async fn consumer_violation_list_page_token_omits_tenant_filtered_events() {
 #[tokio::test]
 async fn update_dataset_requires_write_access_to_existing_binding() {
     let svc = service();
+    seed_lineage_object(&svc, "protected-object", "ops");
     svc.create_dataset(with_principal(CreateDatasetRequest {
         dataset: Some(Dataset {
             id: "protected-dataset".into(),
@@ -18486,6 +18753,19 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
     let runtime = Arc::new(RuntimeDb::Sqlite(sqlite));
     let store = crate::db::store::SekaiStore::from_shared_runtime(runtime.clone());
     for id in ["scoped-in", "scoped-out"] {
+        let object_id = format!("{id}-object");
+        runtime
+            .create_object(&domain::Object {
+                id: object_id.clone(),
+                kind: "widget".into(),
+                name: id.into(),
+                namespace: "allowed".into(),
+                external_id: format!("widget:{object_id}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         runtime
             .create_dataset(&Dataset {
                 id: id.into(),
@@ -18495,7 +18775,7 @@ async fn scoped_transform_preview_and_reads_cross_server_transport() {
                     col_type: "string".into(),
                     classification: "public".into(),
                 }],
-                object_id: String::new(),
+                object_id,
                 created: 1,
                 partition_keys: Vec::new(),
             })
@@ -18766,6 +19046,28 @@ async fn scoped_put_governed_transform_requires_namespace_write_and_readable_dat
     let runtime = Arc::new(RuntimeDb::Sqlite(sqlite));
     let store = crate::db::store::SekaiStore::from_shared_runtime(runtime.clone());
     for id in ["scoped-in", "scoped-out", "hidden-in"] {
+        let object_id = if id == "hidden-in" {
+            "hidden-object".into()
+        } else {
+            format!("{id}-object")
+        };
+        let namespace = if id == "hidden-in" {
+            "foreign"
+        } else {
+            "allowed"
+        };
+        runtime
+            .create_object(&crate::domain::Object {
+                id: object_id.clone(),
+                kind: "widget".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: format!("widget:{object_id}"),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
         runtime
             .create_dataset(&Dataset {
                 id: id.into(),
@@ -18775,28 +19077,12 @@ async fn scoped_put_governed_transform_requires_namespace_write_and_readable_dat
                     col_type: "string".into(),
                     classification: "public".into(),
                 }],
-                object_id: if id == "hidden-in" {
-                    "hidden-object".into()
-                } else {
-                    String::new()
-                },
+                object_id,
                 created: 1,
                 partition_keys: Vec::new(),
             })
             .unwrap();
     }
-    runtime
-        .create_object(&crate::domain::Object {
-            id: "hidden-object".into(),
-            kind: "widget".into(),
-            name: "hidden-object".into(),
-            namespace: "foreign".into(),
-            external_id: "widget:hidden-object".into(),
-            properties: HashMap::new(),
-            created: 0,
-            updated: 0,
-        })
-        .unwrap();
     let authority = Arc::new(AssertionAuthority::new(
         "https://issuer.test",
         "https://sekai.test",

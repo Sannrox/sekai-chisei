@@ -1678,17 +1678,10 @@ pub(super) fn check_dataset_access(
         .map_err(Status::internal)?
     {
         Some(object) => object,
-        None if is_managed_team_principal(db, principals)? => {
-            return Err(Status::permission_denied(
-                "team dataset binding object is unavailable",
-            ));
-        }
         None => {
-            return if write {
-                check_write(security, &dataset.object_id, principals)
-            } else {
-                check_read(security, &dataset.object_id, principals)
-            };
+            return Err(Status::permission_denied(
+                "dataset binding object is unavailable",
+            ));
         }
     };
     check_team_namespace(db, principals, &object.namespace, write)?;
