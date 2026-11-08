@@ -201,6 +201,8 @@ const RETENTION_PREDICATE_INDEXES_SCHEMA: &str =
     include_str!("postgres/0140_retention_predicate_indexes.sql");
 const AGENT_TURN_CLAIM_INDEX_SCHEMA: &str =
     include_str!("postgres/0141_agent_turn_claim_index.sql");
+const SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA: &str =
+    include_str!("postgres/0142_site_agent_memory_instance_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1016,6 +1018,12 @@ const MIGRATIONS: &[Migration] = &[
         140,
         "agent_turn_claim_index",
         AGENT_TURN_CLAIM_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        141,
+        "site_agent_memory_instance_index",
+        SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2816,6 +2824,29 @@ mod tests {
         assert!(
             AGENT_TURN_CLAIM_INDEX_SCHEMA
                 .contains("WHERE status IN ('pending', 'claimed', 'parked')")
+        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+    }
+
+    #[test]
+    fn site_agent_memory_instance_index_matches_the_keyset_query() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "site_agent_memory_instance_index")
+            .expect("site_agent_memory_instance_index");
+        assert_eq!(migration.version, 141);
+        assert!(matches!(migration.owner, MigrationOwner::Sekai));
+        assert!(
+            SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA
+                .contains("idx_sekai_objects_site_agent_memory_instance")
+        );
+        assert!(
+            SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA
+                .contains("sekai_jsonb_object(properties) ->> 'instance_id'")
+        );
+        assert!(
+            SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA.contains("WHERE kind = 'site_agent_memory'")
         );
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
     }

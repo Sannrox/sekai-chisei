@@ -1356,9 +1356,13 @@ message ListSiteAgentWorkingMemoryRequest {
   // instance in this namespace.
   string turn_id = 3;
   int32 limit = 4;
+  // Empty for the first page (lowest id); otherwise the previous
+  // next_page_token. Live items are ordered by object id.
+  string page_token = 5;
 }
 message ListSiteAgentWorkingMemoryResponse {
   repeated Object items = 1;
+  string next_page_token = 2;
 }
 message TransformRunInputRow {
   string alias = 1;

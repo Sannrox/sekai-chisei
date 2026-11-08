@@ -680,6 +680,7 @@ async fn a_turn_token_working_memory_read_uses_the_admitted_requester() {
                 instance_id: "line-a".into(),
                 turn_id,
                 limit: 0,
+                page_token: String::new(),
             },
         ))
         .await
@@ -716,6 +717,7 @@ async fn a_turn_token_does_not_inherit_a_changed_instance_principal() {
                 instance_id: "line-a".into(),
                 turn_id,
                 limit: 0,
+                page_token: String::new(),
             },
         ))
         .await

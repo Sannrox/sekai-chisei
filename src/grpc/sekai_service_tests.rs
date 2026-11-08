@@ -35511,6 +35511,7 @@ async fn working_memory_read_intersects_agent_and_requester() {
                 instance_id: "line-7".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
             act,
@@ -35544,6 +35545,7 @@ async fn working_memory_read_intersects_agent_and_requester() {
                 instance_id: "line-7".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "mallory",
             Some("bob"),
@@ -35578,6 +35580,7 @@ async fn working_memory_read_intersects_agent_and_requester() {
                 instance_id: "line-hidden".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
             Some("alice"),
@@ -35592,12 +35595,117 @@ async fn working_memory_read_intersects_agent_and_requester() {
                 instance_id: "no-such".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
         ))
         .await
         .unwrap_err();
     assert_eq!(missing.code(), tonic::Code::NotFound);
+}
+
+/// Keyset pages of visible items: a hidden or forgotten row does not fill
+/// the page, and the next token is the last returned id (#2034).
+#[tokio::test]
+async fn working_memory_list_pages_visible_items_by_id() {
+    use crate::sekai::site_agent_memory as memory;
+    let svc = service();
+    memory::install(svc.db.runtime(), "ops", "root", 1).unwrap();
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("principal_id".into(), "svc-line-7".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    sealed_principal_profile(&svc, "svc-line-7", "confidential");
+    let note = |id: &str, content: &str, marking: Option<&str>, forgotten: bool| {
+        let mut properties = HashMap::from([
+            (memory::INSTANCE_PROPERTY.into(), "line-7".into()),
+            (memory::CONTENT_PROPERTY.into(), content.into()),
+        ]);
+        if let Some(marking) = marking {
+            properties.insert(
+                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                marking.into(),
+            );
+        }
+        if forgotten {
+            properties.insert(memory::FORGOTTEN_PROPERTY.into(), "true".into());
+        }
+        crate::domain::Object {
+            id: id.into(),
+            kind: memory::KIND.into(),
+            name: id.into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    };
+    svc.db
+        .runtime()
+        .create_object(&note("note-a", "a", None, false))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-acl", "hidden", Some("confidential"), false))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-b", "b", None, false))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-c", "c", None, false))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&note("note-gone", "", None, true))
+        .unwrap();
+
+    let list = |limit: i32, page_token: &str| {
+        svc.list_site_agent_working_memory(with_delegated_act(
+            ListSiteAgentWorkingMemoryRequest {
+                namespace: "ops".into(),
+                instance_id: "line-7".into(),
+                turn_id: String::new(),
+                limit,
+                page_token: page_token.into(),
+            },
+            "svc-line-7",
+            Some("alice"),
+        ))
+    };
+    let first = list(2, "").await.unwrap().into_inner();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["note-a", "note-b"]
+    );
+    assert_eq!(first.next_page_token, "note-b");
+    let second = list(2, &first.next_page_token).await.unwrap().into_inner();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["note-c"]
+    );
+    assert!(second.next_page_token.is_empty());
+    let invalid = list(2, "note-b|extra").await.unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
 }
 
 /// A guest grant's marking ceiling still hides a memory item even when the
@@ -35667,6 +35775,7 @@ async fn working_memory_read_keeps_the_guest_ceiling() {
             instance_id: "line-7".into(),
             turn_id: String::new(),
             limit: 0,
+            page_token: String::new(),
         },
         "svc-line-7",
     );
@@ -35786,6 +35895,7 @@ async fn working_memory_read_projects_property_grants() {
                 instance_id: "line-7".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
             None,
@@ -35849,6 +35959,7 @@ async fn working_memory_list_redacts_restricted_content_like_get_object() {
                 instance_id: "line-7".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
             Some("alice"),
@@ -35891,6 +36002,7 @@ async fn working_memory_list_redacts_restricted_content_like_get_object() {
                 instance_id: "line-7".into(),
                 turn_id: String::new(),
                 limit: 0,
+                page_token: String::new(),
             },
             "svc-line-7",
             None,

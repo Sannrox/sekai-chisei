@@ -414,6 +414,9 @@ impl SekaiDb {
             );
             CREATE INDEX IF NOT EXISTS idx_objects_kind ON sekai_objects(kind);
             CREATE INDEX IF NOT EXISTS idx_objects_external_id ON sekai_objects(external_id);
+            CREATE INDEX IF NOT EXISTS idx_sekai_objects_site_agent_memory_instance
+                ON sekai_objects (namespace, json_extract(properties, '$.instance_id'), id)
+                WHERE kind = 'site_agent_memory';
             CREATE UNIQUE INDEX IF NOT EXISTS idx_sekai_objects_observation_external_id
                 ON sekai_objects(namespace, external_id)
                 WHERE kind = 'feedback_observation' AND external_id <> '';
@@ -1168,6 +1171,49 @@ impl SekaiDb {
         let mut effective_filter = filter.clone();
         effective_filter.limit = i32::MAX;
         self.list_objects_page(&effective_filter)
+    }
+
+    /// Live site-agent working memory of one instance, keyset by id.
+    /// Forgotten rows stay in the store and are excluded here (#2034).
+    pub fn list_live_site_agent_memory(
+        &self,
+        namespace: &str,
+        instance_id: &str,
+        after_id: Option<&str>,
+        limit: i32,
+    ) -> Result<Vec<Object>, String> {
+        if limit <= 0 {
+            return Err("limit must be positive".into());
+        }
+        let limit = limit.min(MAX_LIST_LIMIT);
+        let conn = self.conn();
+        let mut sql = format!(
+            "SELECT {LIST_OBJECT_COLUMNS} FROM sekai_objects
+             WHERE kind = 'site_agent_memory'
+               AND namespace = ?1
+               AND json_extract(properties, '$.instance_id') = ?2
+               AND ifnull(json_extract(properties, '$.forgotten'), '') <> 'true'"
+        );
+        if after_id.is_some() {
+            sql.push_str(" AND id > ?3 ORDER BY id LIMIT ?4");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    params![namespace, instance_id, after_id, limit],
+                    row_to_object,
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        } else {
+            sql.push_str(" ORDER BY id LIMIT ?3");
+            let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![namespace, instance_id, limit], row_to_object)
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())
+        }
     }
 
     /// One unfiltered page (no principal, marking, or policy filter) without `excluded_kinds`.

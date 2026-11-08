@@ -7,6 +7,17 @@
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
+use std::collections::HashSet;
+
+/// Namespace-invariant object-access residual for one working-memory list.
+struct MemoryDecider {
+    /// `None` is an invalid active policy or a namespace the principal
+    /// cannot read: every item is omitted.
+    compiled: Option<crate::sekai::policy_decision::CompiledObjectAccess>,
+    deny_unmarked: bool,
+    trusted: bool,
+    namespace_ok: bool,
+}
 
 fn turn_status(error: TurnError) -> Status {
     let message = error.to_string();
@@ -646,46 +657,99 @@ impl SekaiServiceImpl {
         } else {
             inner.limit.min(crate::domain::MAX_LIST_LIMIT)
         } as usize;
-        let live =
-            crate::sekai::site_agent_memory::list_live_for_instance(db, namespace, instance_id)
-                .map_err(Status::internal)?;
+        let mut cursor = crate::sekai::site_agent_memory::parse_page_token(&inner.page_token)
+            .map_err(Status::invalid_argument)?;
+        let agent_decider = compile_memory_decider(self, namespace, &agent)?;
+        let requester_decider = if requester == agent {
+            None
+        } else {
+            Some(compile_memory_decider(self, namespace, &requester)?)
+        };
+        let need_grants = agent_decider.deny_unmarked
+            || requester_decider
+                .as_ref()
+                .is_some_and(|decider| decider.deny_unmarked);
         let schema = self
             .schema_definitions
             .snapshot()
             .map_err(map_schema_definition_lifecycle_error)?;
         let mut items = Vec::new();
-        for item in live {
-            // Guest ceiling and shared-space kind/marking are request-shaped;
-            // they sit on top of the independent principal checks (#1968).
-            if !collaboration_permits_memory(db, tenant_context.as_ref(), &item)? {
-                continue;
+        loop {
+            let remaining = (limit + 1).saturating_sub(items.len());
+            if remaining == 0 {
+                break;
             }
-            if !principal_may_read_memory(self, item.clone(), &agent)? {
-                continue;
+            let page_size = remaining.min(crate::domain::MAX_LIST_LIMIT as usize) as i32;
+            let page = crate::sekai::site_agent_memory::list_live_page(
+                db,
+                namespace,
+                instance_id,
+                cursor.as_deref(),
+                page_size,
+            )
+            .map_err(Status::internal)?;
+            if page.is_empty() {
+                break;
             }
-            if !principal_may_read_memory(self, item.clone(), &requester)? {
-                continue;
+            let fetched = page.len();
+            let (agent_grants, requester_grants) =
+                memory_page_grants(db, &page, &agent, &requester, need_grants)?;
+            for item in page {
+                cursor = Some(item.id.clone());
+                // Guest ceiling and shared-space kind/marking are request-shaped;
+                // they sit on top of the independent principal checks (#1968).
+                if !collaboration_permits_memory(db, tenant_context.as_ref(), &item)? {
+                    continue;
+                }
+                if !principal_may_read_memory(self, &agent_decider, &item, &agent, &agent_grants)? {
+                    continue;
+                }
+                let requester_ok = match &requester_decider {
+                    Some(decider) => principal_may_read_memory(
+                        self,
+                        decider,
+                        &item,
+                        &requester,
+                        &requester_grants,
+                    )?,
+                    None => true,
+                };
+                if !requester_ok {
+                    continue;
+                }
+                // Same projection as GetObject: grants, then restricted `content`
+                // redacted for the requester (`act`) and the instance principal.
+                // The agent sees live notes only when that principal is an
+                // object admin, as GetObject would (#2033).
+                let item = match self.project_for_response(
+                    item,
+                    &schema,
+                    &principals,
+                    tenant_context.as_ref(),
+                ) {
+                    Ok(item) => item,
+                    Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
+                    Err(status) => return Err(status),
+                };
+                items.push(to_proto_obj(&item));
+                if items.len() == limit + 1 {
+                    break;
+                }
             }
-            // Same projection as GetObject: grants, then restricted `content`
-            // redacted for the requester (`act`) and the instance principal.
-            // The agent sees live notes only when that principal is an
-            // object admin, as GetObject would (#2033).
-            let item = match self.project_for_response(
-                item,
-                &schema,
-                &principals,
-                tenant_context.as_ref(),
-            ) {
-                Ok(item) => item,
-                Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
-                Err(status) => return Err(status),
-            };
-            items.push(to_proto_obj(&item));
-            if items.len() == limit {
+            if items.len() == limit + 1 || fetched < page_size as usize {
                 break;
             }
         }
-        Ok(Response::new(ListSiteAgentWorkingMemoryResponse { items }))
+        let next_page_token = if items.len() == limit + 1 {
+            items.truncate(limit);
+            items.last().map(|item| item.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(Response::new(ListSiteAgentWorkingMemoryResponse {
+            items,
+            next_page_token,
+        }))
     }
 }
 
@@ -734,6 +798,149 @@ fn collaboration_permits_memory(
     }
 }
 
+fn compile_memory_decider(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    principal: &str,
+) -> Result<MemoryDecider, Status> {
+    let runtime = service.db.runtime();
+    let principals = [principal.to_string()];
+    let namespace_ok = match check_team_namespace(runtime, &principals, namespace, false) {
+        Ok(()) => true,
+        Err(status) if memory_auth_outage(&status) => return Err(status),
+        Err(_) => false,
+    };
+    let deny_unmarked = deny_unmarked_for_namespace(runtime, namespace)?;
+    let trusted = crate::sekai::markings::is_trusted_service_principal(principal);
+    if !namespace_ok {
+        return Ok(MemoryDecider {
+            compiled: None,
+            deny_unmarked,
+            trusted,
+            namespace_ok: false,
+        });
+    }
+    let policy =
+        match runtime.active_object_policy(namespace, crate::sekai::site_agent_memory::KIND) {
+            Ok(policy) => policy,
+            Err(error) if error.starts_with("object_security_denied") => {
+                return Ok(MemoryDecider {
+                    compiled: None,
+                    deny_unmarked,
+                    trusted,
+                    namespace_ok: true,
+                });
+            }
+            Err(_) => return Err(Status::unavailable("object authorization unavailable")),
+        };
+    let lattice = load_classification_lattice(runtime, namespace)?;
+    let authority = resolve_principal_authority(runtime, &principals)?;
+    let context = principal_policy_context_from(&principals, None);
+    let activation = runtime
+        .get_object_security_activation(namespace)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+    let activation_digest = match activation.as_ref() {
+        Some(activation) => {
+            crate::sekai::object_security::object_security_activation_digest(activation)
+                .unwrap_or_else(|_| "legacy".into())
+        }
+        None => "legacy".into(),
+    };
+    let compiled = crate::sekai::policy_decision::compile_object_access(
+        crate::sekai::policy_decision::PolicyCompileRequest {
+            namespace,
+            kind: crate::sekai::site_agent_memory::KIND,
+            operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+            context: &context,
+            authority: &authority,
+            lattice: lattice.as_ref(),
+            policy: policy.as_ref(),
+            activation_digest: &activation_digest,
+            purpose: None,
+            purpose_authorization: None,
+            now_ms: now_millis(),
+            namespace_granted: true,
+        },
+    )
+    .map_err(Status::internal)?;
+    Ok(MemoryDecider {
+        compiled: Some(compiled),
+        deny_unmarked,
+        trusted,
+        namespace_ok: true,
+    })
+}
+
+fn memory_page_grants(
+    db: &RuntimeDb,
+    page: &[crate::domain::Object],
+    agent: &str,
+    requester: &str,
+    need_grants: bool,
+) -> Result<(HashSet<String>, HashSet<String>), Status> {
+    if !need_grants {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+    let grant_ids = page
+        .iter()
+        .filter(|object| crate::sekai::markings::object_marking_token(object).is_none())
+        .map(|object| object.id.clone())
+        .collect::<Vec<_>>();
+    if grant_ids.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+    let grants = db
+        .list_grants_for_object_ids(&grant_ids)
+        .map_err(Status::internal)?;
+    let for_principal = |principal: &str| {
+        grants
+            .iter()
+            .filter(|grant| grant.principal == principal)
+            .map(|grant| grant.object_id.clone())
+            .collect::<HashSet<_>>()
+    };
+    Ok((for_principal(agent), for_principal(requester)))
+}
+
+fn memory_policy_allows(decider: &MemoryDecider, object: &crate::domain::Object) -> bool {
+    let Some(compiled) = &decider.compiled else {
+        return false;
+    };
+    let decision = compiled.decide(object);
+    !matches!(
+        (decision.outcome, decision.denied_by),
+        (
+            crate::sekai::policy_decision::PolicyOutcome::Deny,
+            Some(layer)
+        ) if layer != crate::sekai::policy_decision::PolicyLayer::Marking
+    )
+}
+
+fn memory_marking_allows(
+    decider: &MemoryDecider,
+    object: &crate::domain::Object,
+    explicit_grants: &HashSet<String>,
+) -> bool {
+    if crate::sekai::markings::object_marking_token(object).is_none() {
+        return crate::sekai::markings::unmarked_access_decision(
+            decider.deny_unmarked,
+            decider.trusted,
+            explicit_grants.contains(&object.id),
+        ) != crate::sekai::markings::MarkingDecision::Deny;
+    }
+    let Some(compiled) = &decider.compiled else {
+        return false;
+    };
+    compiled.decide(object).denied_by != Some(crate::sekai::policy_decision::PolicyLayer::Marking)
+}
+
+fn memory_auth_outage(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Internal | tonic::Code::Unavailable
+    )
+}
+
 /// Whether `principal` may read `object` on its own: namespace, grants,
 /// object-security policy and markings. `tenant_context` stays `None` so
 /// the check is that principal, not the request's scopes or `act`
@@ -741,27 +948,27 @@ fn collaboration_permits_memory(
 /// outage stays an error.
 fn principal_may_read_memory(
     service: &SekaiServiceImpl,
-    object: crate::domain::Object,
+    decider: &MemoryDecider,
+    object: &crate::domain::Object,
     principal: &str,
+    explicit_grants: &HashSet<String>,
 ) -> Result<bool, Status> {
-    let object_id = object.id.clone();
+    if !decider.namespace_ok {
+        return Ok(false);
+    }
     let principals = [principal.to_string()];
-    match require_visible_object_contents(
+    match check_object_acl_with_audit(
         service.db.runtime(),
         &service.security,
-        object,
+        &object.id,
         &principals,
         None,
-        &format!("list_site_agent_working_memory:{object_id}"),
-        None,
+        crate::sekai::object_security::ObjectSecurityOperation::Read,
     ) {
-        Ok(_) => Ok(true),
-        Err(status)
-            if status.code() == tonic::Code::Internal
-                || status.code() == tonic::Code::Unavailable =>
-        {
-            Err(status)
-        }
-        Err(_) => Ok(false),
+        Ok(()) => {}
+        Err(status) if memory_auth_outage(&status) => return Err(status),
+        Err(_) => return Ok(false),
     }
+    Ok(memory_policy_allows(decider, object)
+        && memory_marking_allows(decider, object, explicit_grants))
 }
