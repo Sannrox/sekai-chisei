@@ -4,7 +4,7 @@
 //! is the [`SourceSystem`], and every create or update goes through the permit,
 //! Action, and execution-evidence path there.
 //!
-//! - Each (namespace, problem signature) owns one issue, found by a public
+//! - Each (namespace, problem signature, scope) owns one issue, found by a public
 //!   marker in its body. The marker is the writeback key, so a marker written
 //!   for another namespace never matches. Only the body's first line counts,
 //!   so a marker quoted in maintainer text never matches.
@@ -199,14 +199,14 @@ impl IssuePublisher {
             .get("observation_id")
             .cloned()
             .unwrap_or_default();
-        let signature = self
+        let trigger = self
             .get(sekai, &anchor)
             .await?
             .filter(|observation| observation.namespace == self.namespace)
             .as_ref()
             .and_then(observation_view)
-            .map(|view| view.problem_signature)
             .ok_or("the finding's observation is not visible")?;
+        let (signature, scope) = (trigger.problem_signature, trigger.scope);
         // A measured reproduction can share the observation; only the bucket
         // analysis parses as one.
         let analysis = self
@@ -221,19 +221,22 @@ impl IssuePublisher {
                 .ok()
             });
         // The same plane-recorded check filing used, never the model's own claim.
-        let measured = self.measured_reproduction(sekai, &signature).await?;
+        let measured = self
+            .measured_reproduction(sekai, &signature, &scope)
+            .await?;
         let observations = self
             .list(sekai, KIND_OBSERVATION, "problem_signature", &signature)
             .await?;
         let draft = draft(
             &self.namespace,
             &signature,
+            &scope,
             analysis.as_ref(),
             measured,
             &observations,
         );
 
-        let marker = public_marker(&self.namespace, &signature);
+        let marker = public_marker(&self.namespace, &signature, &scope);
         let issues = tracker.own_issues()?;
         let current = issues
             .iter()
@@ -282,11 +285,12 @@ impl IssuePublisher {
     }
 
     /// A runtime-recorded measured reproduction of any observation with this
-    /// signature, matching the investigator's filing check.
+    /// signature and scope, matching the investigator's filing check.
     async fn measured_reproduction(
         &self,
         sekai: &SekaiServiceImpl,
         signature: &str,
+        scope: &str,
     ) -> Result<bool, String> {
         let measured = self
             .list(sekai, KIND_INVESTIGATION_RESULT, "measured", "true")
@@ -304,7 +308,7 @@ impl IssuePublisher {
                 .filter(|observation| observation.namespace == self.namespace)
                 .as_ref()
                 .and_then(observation_view)
-                .is_some_and(|view| view.problem_signature == signature)
+                .is_some_and(|view| view.problem_signature == signature && view.scope == scope)
             {
                 return Ok(true);
             }
@@ -373,11 +377,13 @@ pub struct IssueDraft {
     pub managed_body: String,
 }
 
-/// Public title and managed section for one signature. Producer text enters
-/// only through [`public_token`] and [`public_version`].
+/// Public title and managed section for one (signature, scope). Producer
+/// text enters only through [`public_token`] and [`public_version`]. The
+/// scope itself never appears; it only separates issues.
 pub fn draft(
     namespace: &str,
     signature: &str,
+    scope: &str,
     analysis: Option<&InvestigationAnalysis>,
     measured: bool,
     observations: &[Object],
@@ -392,12 +398,9 @@ pub fn draft(
     let views: Vec<_> = observations
         .iter()
         .filter_map(observation_view)
-        .filter(|view| view.problem_signature == signature)
+        .filter(|view| view.problem_signature == signature && view.scope == scope)
         .collect();
-    let operations: BTreeSet<_> = views
-        .iter()
-        .flat_map(|view| view.occurrence_ids.iter())
-        .collect();
+    let operations: BTreeSet<_> = views.iter().map(|view| &view.operation_id).collect();
     let version = observations
         .iter()
         .filter_map(|object| object.properties.get("tenkai_version"))
@@ -417,16 +420,16 @@ pub fn draft(
         title: public_title(operation, reason),
         managed_body: format!(
             "{}\n{sections}\n{MANAGED_END}",
-            marker_comment(&public_marker(namespace, signature))
+            marker_comment(&public_marker(namespace, signature, scope))
         ),
     }
 }
 
-/// Opaque per (namespace, signature): reveals neither.
-pub fn public_marker(namespace: &str, signature: &str) -> String {
+/// Opaque per (namespace, signature, scope): reveals none of them.
+pub fn public_marker(namespace: &str, signature: &str, scope: &str) -> String {
     let digest = format!(
         "{:x}",
-        Sha256::digest(format!("{namespace}\0{signature}").as_bytes())
+        Sha256::digest(format!("{namespace}\0{signature}\0{scope}").as_bytes())
     );
     format!("{MARKER_PREFIX}{}", &digest[..16])
 }

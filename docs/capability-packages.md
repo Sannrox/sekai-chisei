@@ -18,10 +18,12 @@ deploy, or authorize invocation. See
 
 Closed member kinds are `change_set`, `action_type`, `ontology`, and
 `evaluation`. The evidence and finding domain package
-(`pkg:feedback.evidence-finding/v1`, ADR 0095) certifies ontology, Action
+(`pkg:feedback.evidence-finding/v2`, ADR 0095) certifies ontology, Action
 type, and evaluation members from `tests/fixtures/feedback/`. Observation
 evidence may target `feedback_observation` or tenant-mode
 `tenant_feedback_observation`; both write `feedback_observation` objects.
+Observations carry `operation_id`, `observed_at_ms`, and `scope`; the v1
+fixtures stay frozen for namespaces certified on v1.
 The security
 finding and exposure package (`pkg:security.finding-exposure/v1`, ADR 0135)
 certifies the same member kinds from `tests/fixtures/security/`. Its
@@ -67,8 +69,10 @@ The investigator advances an object-change binding of kind
 `feedback_observation` and type `feedback.investigation.dispatch`, then takes
 one fenced ActionWork claim per dispatch. The binding's first run arms it and
 does not backfill. It gathers the same-signature cluster with a
-property-filtered `ListObjects` and requests one bounded analysis per
-(namespace, signature, 24-hour window) through `PlanExecution` and
+property-filtered `ListObjects`, keeps observations in the trigger's scope
+observed in the last 24 hours (observed time clamped to ingest time), and
+counts distinct `operation_id`s. It requests one bounded analysis per
+(namespace, signature, scope, 24-hour window) through `PlanExecution` and
 `ExecutePlanStream`. Later dispatches in the window reuse the stored analysis.
 It writes investigation, hypothesis, and finding objects through their
 governed Actions as `feedback-investigation`. Namespace model budgets apply;
@@ -80,7 +84,7 @@ The publisher treats the repository as a source writeback target
 (`adapters/source_writeback.rs`). It posts only findings the investigation
 runtime recorded (`recorded_by` is `feedback-investigation`), so a namespace
 writer cannot qualify a finding by setting `classification`. A public marker
-per (namespace, signature) is the writeback key, and the issue's number and
+per (namespace, signature, scope) is the writeback key, and the issue's number and
 update time are the record version. A lost create is seen on the next decision,
 so it is never repeated. An unchanged issue needs no permit, and later
 occurrences rewrite only the managed section and keep maintainer text. Only

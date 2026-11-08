@@ -114,6 +114,24 @@ the public marker, so no external-issue mapping object or pending state
 machine is kept. The quality worker was removed. The plane keeps only the
 types-only package, and the `SEKAI_FEEDBACK_*` variables no longer exist.
 
+Package v2 (`pkg:feedback.evidence-finding/v2`) fixed what recurrence counts.
+The v1 fixtures had changed in place after shipping, so they are now frozen
+and a shipped version never changes again. The observation Action requires
+three more fields:
+
+- `operation_id`: the plan or deployment operation. Retries, lease takeovers,
+  and step-plus-plan failures of one operation share it.
+- `observed_at_ms`: when the producer observed it.
+- `scope`: the environment or tenant.
+
+An occurrence id stays per attempt and is opaque: replay of one id is one
+occurrence, and a `@version` suffix carries no meaning. Recurrence counts
+distinct `operation_id`s within one (signature, scope) on observed time
+clamped to ingest time, so a drained backlog does not recur and a fast
+producer clock cannot pull an observation forward. Action type versions are
+keyed by namespace, so namespaces certified on v1 keep their v1 types until
+an operator installs v2.
+
 ## Validation
 
 Crate tests install the fixtures into an in-memory runtime and cover portable

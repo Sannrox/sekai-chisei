@@ -154,13 +154,26 @@ fn producer() -> EvidenceProducerCapability {
     }
 }
 
+/// One attempt of `operation` in the `prod` scope, observed now.
+fn observe(db: &RuntimeDb, id: &str, operation: &str, classification: &str) {
+    observe_at(db, id, operation, "prod", now_ms(), classification);
+}
+
 /// Seed one observation the way a producer delivers it: accepted evidence,
-/// then the observation Action naming it.
-fn observe(db: &RuntimeDb, id: &str, occurrence: &str, classification: &str) {
+/// then the observation Action naming it. The occurrence is the attempt, so
+/// every observation has its own; `operation` groups attempts.
+fn observe_at(
+    db: &RuntimeDb,
+    id: &str,
+    operation: &str,
+    scope: &str,
+    observed_at_ms: i64,
+    classification: &str,
+) {
     let now = now_ms();
     let content = json!({
         "problem_signature": SIGNATURE,
-        "occurrence_ids": occurrence,
+        "occurrence_ids": id,
         "classification": classification,
         "disposition": "open"
     });
@@ -212,7 +225,10 @@ fn observe(db: &RuntimeDb, id: &str, occurrence: &str, classification: &str) {
                     "name": SIGNATURE,
                     "source_evidence": evidence,
                     "problem_signature": SIGNATURE,
-                    "occurrence_ids": occurrence,
+                    "occurrence_ids": id,
+                    "operation_id": operation,
+                    "observed_at_ms": observed_at_ms,
+                    "scope": scope,
                     "classification": classification,
                     "disposition": "open"
                 })
@@ -369,8 +385,76 @@ async fn retries_of_one_operation_stay_internal() {
     let plane = armed_plane().await;
     observe(&plane.db, "o-1", "op-1", "defect");
     observe(&plane.db, "o-2", "op-1", "defect");
+    observe(&plane.db, "o-3", "op-1", "defect");
     let reports = drain(&plane, &Scripted::tenkai()).await;
-    assert_eq!(reports.len(), 2);
+    assert_eq!(reports.len(), 3);
+    assert!(
+        reports
+            .iter()
+            .all(|report| report.filing == FilingDecision::Internal)
+    );
+}
+
+#[tokio::test]
+async fn a_drained_backlog_is_not_recurrence() {
+    let plane = armed_plane().await;
+    let day = feedback_investigation::RECURRENCE_WINDOW_MS;
+    let now = now_ms();
+    for (index, (id, op)) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")]
+        .into_iter()
+        .enumerate()
+    {
+        // Observed days apart, ingested together after an outage.
+        observe_at(
+            &plane.db,
+            id,
+            op,
+            "prod",
+            now - index as i64 * 2 * day,
+            "defect",
+        );
+    }
+    let analyzer = Scripted::tenkai();
+    let reports = drain(&plane, &analyzer).await;
+    assert_eq!(
+        analyzer.calls.get(),
+        1,
+        "expired triggers are never analyzed"
+    );
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].filing, FilingDecision::Internal);
+}
+
+#[tokio::test]
+async fn a_blank_scope_is_never_investigated() {
+    let plane = armed_plane().await;
+    observe_at(&plane.db, "o-1", "op-1", " ", now_ms(), "defect");
+    let runtime = investigator();
+    runtime.run_binding(&plane.sekai).await.unwrap();
+    let analyzer = Scripted::tenkai();
+    assert!(
+        runtime
+            .run_once(&plane.sekai, &analyzer, now_ms())
+            .await
+            .is_err()
+    );
+    assert_eq!(analyzer.calls.get(), 0);
+}
+
+#[tokio::test]
+async fn one_signature_in_two_scopes_is_two_problems() {
+    let plane = armed_plane().await;
+    let now = now_ms();
+    for (id, op, scope) in [
+        ("o-1", "op-1", "prod"),
+        ("o-2", "op-2", "prod"),
+        ("o-3", "op-3", "staging"),
+    ] {
+        observe_at(&plane.db, id, op, scope, now, "defect");
+    }
+    let analyzer = Scripted::tenkai();
+    let reports = drain(&plane, &analyzer).await;
+    assert_eq!(analyzer.calls.get(), 2, "one model call per scope");
     assert!(
         reports
             .iter()
@@ -408,6 +492,7 @@ async fn an_object_planted_at_the_bucket_id_is_never_trusted() {
         let request = AnalysisRequest {
             namespace: NAMESPACE.into(),
             signature: SIGNATURE.into(),
+            scope: "prod".into(),
             observations: Vec::new(),
             distinct_operations: 0,
             window,
@@ -624,9 +709,10 @@ fn the_prompt_is_sent_once_and_bounded() {
     let observations = (0..PROMPT_OBSERVATION_CAP * 4)
         .map(|index| feedback_investigation::ObservationView {
             object_id: format!("o-{index}"),
-            created_ms: index as i64,
+            observed_ms: index as i64,
             problem_signature: SIGNATURE.into(),
-            occurrence_ids: vec![format!("op-{index}")],
+            scope: "prod".into(),
+            operation_id: format!("op-{index}"),
             classification: "defect".into(),
             disposition: "open".into(),
         })
@@ -634,6 +720,7 @@ fn the_prompt_is_sent_once_and_bounded() {
     let request = AnalysisRequest {
         namespace: NAMESPACE.into(),
         signature: SIGNATURE.into(),
+        scope: "prod".into(),
         distinct_operations: observations.len(),
         observations,
         window: 7,
@@ -927,7 +1014,7 @@ async fn an_unchanged_finding_needs_no_permit_or_write() {
 #[tokio::test]
 async fn another_namespaces_marker_is_never_adopted() {
     let publication = publication().await;
-    let foreign = draft("other", SIGNATURE, None, false, &[]);
+    let foreign = draft("other", SIGNATURE, "prod", None, false, &[]);
     publication
         .tracker
         .github
@@ -991,7 +1078,7 @@ async fn a_new_occurrence_updates_the_managed_section_and_keeps_maintainer_text(
 async fn a_marker_quoted_in_maintainer_text_is_not_a_match() {
     let publication = publication().await;
     let ours = written(publication.decide().await);
-    let quoting = draft(NAMESPACE, "api:other_failure", None, false, &[]);
+    let quoting = draft(NAMESPACE, "api:other_failure", "prod", None, false, &[]);
     publication
         .tracker
         .github
@@ -1032,7 +1119,14 @@ async fn a_lost_end_marker_refuses_the_update_and_keeps_maintainer_text() {
 async fn the_daily_cap_defers_new_issues() {
     let publication = publication().await;
     for index in 0..feedback_github_issues::DEFAULT_DAILY_CAP {
-        let other = draft(NAMESPACE, &format!("api:other_{index}"), None, false, &[]);
+        let other = draft(
+            NAMESPACE,
+            &format!("api:other_{index}"),
+            "prod",
+            None,
+            false,
+            &[],
+        );
         publication
             .tracker
             .github
@@ -1047,6 +1141,7 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
     let issue = draft(
         NAMESPACE,
         "api @acme/oncall:<!--/sekai-feedback--> **x**",
+        "prod",
         None,
         false,
         &[],
@@ -1067,6 +1162,7 @@ fn the_published_reason_is_the_last_signature_segment() {
     let issue = draft(
         NAMESPACE,
         "controller:apply:tenkai_failed",
+        "prod",
         None,
         false,
         &[],
@@ -1095,12 +1191,12 @@ fn only_plain_identifiers_and_semver_are_published() {
             "tenkai-private",
         ),
     ] {
-        let issue = draft(NAMESPACE, signature, None, false, &[]);
+        let issue = draft(NAMESPACE, signature, "prod", None, false, &[]);
         for text in [&issue.title, &issue.managed_body] {
             assert!(!text.contains(fragment), "{fragment:?} leaked: {text}");
         }
     }
-    let plain = draft(NAMESPACE, "api:tenkai_failed", None, false, &[]);
+    let plain = draft(NAMESPACE, "api:tenkai_failed", "prod", None, false, &[]);
     assert_eq!(plain.title, "feedback: api tenkai_failed");
     let mut observation = sekai_chisei::grpc::pb::sekai::Object::default();
     for (version, published) in [
@@ -1118,6 +1214,7 @@ fn only_plain_identifiers_and_semver_are_published() {
         let issue = draft(
             NAMESPACE,
             SIGNATURE,
+            "prod",
             None,
             false,
             std::slice::from_ref(&observation),
