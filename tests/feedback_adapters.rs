@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use feedback_github_issues::{
     ABSENT, GitHubIssue, GitHubIssues, IssuePublisher, IssueTracker, Publish, draft,
-    maintainer_text, sanitize_public_text,
+    maintainer_text,
 };
 use feedback_investigation::{
     AnalysisError, AnalysisRequest, Attribution, FeedbackAnalyzer, FilingDecision,
@@ -38,6 +38,7 @@ use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
 use sekai_chisei::grpc::pb::sekai::{
     ClaimActionWorkRequest, GetObjectRequest, ListClaimableActionWorkRequest,
+    SubmitActionInstanceRequest,
 };
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::sekai::action_binding::{
@@ -56,8 +57,8 @@ use sekai_chisei::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycl
 use sekai_chisei::sekai::evidence_store::{EvidenceProducerCapability, canonical_content_digest};
 use sekai_chisei::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE;
 use sekai_chisei::sekai::feedback_package::{
-    ACTION_DISPATCH, ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE,
-    INVESTIGATION_RUNTIME, KIND_FINDING, KIND_HYPOTHESIS, KIND_INVESTIGATION_RESULT,
+    ACTION_DISPATCH, ACTION_INVESTIGATION, ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION,
+    EVIDENCE_TYPE, INVESTIGATION_RUNTIME, KIND_FINDING, KIND_HYPOTHESIS, KIND_INVESTIGATION_RESULT,
     KIND_OBSERVATION, PACKAGE_VERSION, install,
 };
 use sekai_chisei::sekai::object_change_subscription::OP_CREATE;
@@ -373,6 +374,37 @@ async fn retries_of_one_operation_stay_internal() {
             .iter()
             .all(|report| report.filing == FilingDecision::Internal)
     );
+}
+
+#[tokio::test]
+async fn a_writer_submitted_measurement_does_not_qualify() {
+    let plane = armed_plane().await;
+    observe(&plane.db, "o-1", "op-1", "defect");
+    plane
+        .sekai
+        .submit_action_instance(with_principal(
+            SubmitActionInstanceRequest {
+                namespace: NAMESPACE.into(),
+                type_id: ACTION_INVESTIGATION.into(),
+                version: PACKAGE_VERSION.into(),
+                parameters_json: json!({
+                    "object_id": "inv-forged",
+                    "name": SIGNATURE,
+                    "observation_id": "o-1",
+                    "outcome": "reproduced",
+                    "measured": true,
+                })
+                .to_string(),
+                idempotency_key: "forged".into(),
+                ..Default::default()
+            },
+            OPERATOR,
+        ))
+        .await
+        .unwrap();
+    let reports = drain(&plane, &Scripted::tenkai()).await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].filing, FilingDecision::Internal);
 }
 
 #[tokio::test]
@@ -791,7 +823,7 @@ async fn an_unchanged_finding_needs_no_permit_or_write() {
 #[tokio::test]
 async fn another_namespaces_marker_is_never_adopted() {
     let publication = publication().await;
-    let foreign = draft("other", SIGNATURE, None, false, &[], REPOSITORY);
+    let foreign = draft("other", SIGNATURE, None, false, &[]);
     publication
         .tracker
         .github
@@ -855,14 +887,7 @@ async fn a_new_occurrence_updates_the_managed_section_and_keeps_maintainer_text(
 async fn the_daily_cap_defers_new_issues() {
     let publication = publication().await;
     for index in 0..feedback_github_issues::DEFAULT_DAILY_CAP {
-        let other = draft(
-            NAMESPACE,
-            &format!("api:other_{index}"),
-            None,
-            false,
-            &[],
-            REPOSITORY,
-        );
+        let other = draft(NAMESPACE, &format!("api:other_{index}"), None, false, &[]);
         publication
             .tracker
             .github
@@ -873,42 +898,6 @@ async fn the_daily_cap_defers_new_issues() {
 }
 
 #[test]
-fn public_text_never_carries_private_identifiers() {
-    let samples = [
-        "reached 10.1.2.3 from /Users/ops/secret and acme/private-ops#9 on ops.internal.example",
-        "path `/home/ops/.ssh/id_rsa` leaked",
-        "store /srv/tenant/data/export.json",
-        "host `<db01.tenant.example>` and `ops.internal.example`",
-        "contact ops@tenant.example",
-        "addr fd00::1 and [2001:db8::1]",
-        "Authorization: Bearer ghp_exampletoken",
-    ];
-    for sample in samples {
-        let sanitized = sanitize_public_text(sample, REPOSITORY);
-        for needle in [
-            "10.1.2.3",
-            "/Users/ops/secret",
-            "/home/ops/.ssh/id_rsa",
-            "/srv/tenant/data/export.json",
-            "db01.tenant.example",
-            "ops.internal.example",
-            "ops@tenant.example",
-            "fd00::1",
-            "2001:db8::1",
-            "ghp_exampletoken",
-            "acme/private-ops#9",
-        ] {
-            assert!(
-                !sanitized.contains(needle),
-                "leaked {needle:?} from {sample:?}"
-            );
-        }
-    }
-    let own = sanitize_public_text("see github.com/tenkai-org/tenkai#1", REPOSITORY);
-    assert!(own.contains("github.com/tenkai-org/tenkai#1"), "{own}");
-}
-
-#[test]
 fn signature_text_cannot_format_ping_or_end_the_managed_section() {
     let issue = draft(
         NAMESPACE,
@@ -916,7 +905,6 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
         None,
         false,
         &[],
-        REPOSITORY,
     );
     for needle in ["@", "<!--/", "**"] {
         assert!(!issue.title.contains(needle), "{}", issue.title);
@@ -930,23 +918,46 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
 }
 
 #[test]
-fn private_values_glued_into_a_signature_are_redacted() {
+fn only_plain_identifiers_and_semver_are_published() {
     for (signature, secret) in [
         (
             "connect(db01.tenant.example):timeout",
             "db01.tenant.example",
         ),
-        (
-            "file=/home/ops/.ssh/id_rsa:read_failed",
-            "/home/ops/.ssh/id_rsa",
-        ),
+        ("file=/home/ops/.ssh/id_rsa:read_failed", "id_rsa"),
         ("user=ops@tenant.example:denied", "tenant.example"),
-        ("sync,acme/private-ops#9:failed", "private-ops"),
+        ("api:fd00::1234", "1234"),
+        ("open(C:\\Users\\alice\\secret.txt):failed", "alice"),
+        ("sync github.com/acme/private-ops:failed", "private-ops"),
+        (
+            "tenkai-org/tenkai-private/issues/4:failed",
+            "tenkai-private",
+        ),
     ] {
-        let issue = draft(NAMESPACE, signature, None, false, &[], REPOSITORY);
+        let issue = draft(NAMESPACE, signature, None, false, &[]);
         for text in [&issue.title, &issue.managed_body] {
             assert!(!text.contains(secret), "{secret:?} leaked: {text}");
         }
+    }
+    let plain = draft(NAMESPACE, "api:tenkai_failed", None, false, &[]);
+    assert_eq!(plain.title, "feedback: api tenkai_failed");
+    let mut observation = sekai_chisei::grpc::pb::sekai::Object::default();
+    for (version, published) in [
+        ("0.7.1-rc.1", true),
+        ("10.1.2.3", false),
+        ("ops.host", false),
+    ] {
+        observation
+            .properties
+            .insert("tenkai_version".into(), version.into());
+        let issue = draft(
+            NAMESPACE,
+            SIGNATURE,
+            None,
+            false,
+            std::slice::from_ref(&observation),
+        );
+        assert_eq!(issue.managed_body.contains(version), published, "{version}");
     }
 }
 

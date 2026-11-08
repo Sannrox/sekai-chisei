@@ -710,8 +710,11 @@ impl Investigator {
             )
             .await?;
         for result in measured {
-            if result.properties.get("outcome").map(String::as_str)
-                == Some(OUTCOME_QUALITY_EVALUATION)
+            // Writers can submit `measured=true`; only the runtime's own
+            // results count, like the finding gate in `publication_permitted`.
+            let property = |key: &str| result.properties.get(key).map(String::as_str);
+            if property(PROPERTY_RECORDED_BY) != Some(INVESTIGATION_RUNTIME)
+                || property("outcome") == Some(OUTCOME_QUALITY_EVALUATION)
             {
                 continue;
             }
