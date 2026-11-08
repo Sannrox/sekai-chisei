@@ -160,6 +160,15 @@ pub struct InvestigateReport {
     pub analyzed: bool,
 }
 
+/// What one claimed dispatch came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dispatch {
+    Investigated(InvestigateReport),
+    /// The trigger left the recurrence window before it was claimed. Acked
+    /// without a model call or records, so it cannot anchor a fresh bucket.
+    Expired,
+}
+
 #[derive(Debug)]
 pub enum AnalysisError {
     BudgetExhausted,
@@ -480,7 +489,7 @@ impl Investigator {
         sekai: &SekaiServiceImpl,
         analyzer: &A,
         now_ms: i64,
-    ) -> Result<Option<InvestigateReport>, String> {
+    ) -> Result<Option<Dispatch>, String> {
         let Some((effect, observation_id)) = self.claim(sekai).await? else {
             return Ok(None);
         };
@@ -613,8 +622,15 @@ impl Investigator {
         analyzer: &A,
         observation_id: &str,
         now_ms: i64,
-    ) -> Result<InvestigateReport, Investigation> {
+    ) -> Result<Dispatch, Investigation> {
         let cluster = self.gather_cluster(sekai, observation_id, now_ms).await?;
+        if !cluster
+            .observations
+            .iter()
+            .any(|observation| observation.object_id == cluster.trigger_id)
+        {
+            return Ok(Dispatch::Expired);
+        }
         let request = AnalysisRequest {
             namespace: cluster.namespace.clone(),
             signature: cluster.signature.clone(),
@@ -660,12 +676,14 @@ impl Investigator {
         let filing = decide_filing(&cluster, &anchor.analysis);
         self.write_records(sekai, &cluster, &anchor, filing, &key)
             .await
-            .map(|(finding_id, hypothesis_ids)| InvestigateReport {
-                filing,
-                investigation_id,
-                finding_id,
-                hypothesis_ids,
-                analyzed,
+            .map(|(finding_id, hypothesis_ids)| {
+                Dispatch::Investigated(InvestigateReport {
+                    filing,
+                    investigation_id,
+                    finding_id,
+                    hypothesis_ids,
+                    analyzed,
+                })
             })
     }
 

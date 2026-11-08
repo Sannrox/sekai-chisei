@@ -24,7 +24,7 @@ use feedback_github_issues::{
     maintainer_text,
 };
 use feedback_investigation::{
-    AnalysisError, AnalysisRequest, Attribution, FeedbackAnalyzer, FilingDecision,
+    AnalysisError, AnalysisRequest, Attribution, Dispatch, FeedbackAnalyzer, FilingDecision,
     InvestigationAnalysis, Investigator, PROMPT_OBSERVATION_CAP, analysis_input,
     publication_permitted,
 };
@@ -318,12 +318,14 @@ async fn drain(
     let runtime = investigator();
     runtime.run_binding(&plane.sekai).await.unwrap();
     let mut reports = Vec::new();
-    while let Some(report) = runtime
+    while let Some(dispatch) = runtime
         .run_once(&plane.sekai, analyzer, now_ms())
         .await
         .unwrap()
     {
-        reports.push(report);
+        if let Dispatch::Investigated(report) = dispatch {
+            reports.push(report);
+        }
     }
     reports
 }
