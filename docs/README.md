@@ -96,6 +96,8 @@ If you want to deploy or operate the control plane:
   distance, contains, and intersects over named property claims.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
+- [Binding Ezu from outside the plane](ezu-adapter.md) — geo feed and
+  fence events as an adapter over subscriptions, leases and Action submits.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable
   commit/abort, plane-owned checkpoints, and fixed GitHub Issue/PullRequest
   identity.

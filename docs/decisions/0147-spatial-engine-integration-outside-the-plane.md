@@ -37,6 +37,8 @@ work over the generic RPCs:
 - fence events become `SubmitActionInstance` calls keyed by the Ezu event
   id, so a retry never submits twice.
 
+[ezu-adapter.md](../ezu-adapter.md) describes both loops.
+
 ## Alternatives considered
 
 - Keep the in-plane code until an adapter exists. It keeps paying build,
