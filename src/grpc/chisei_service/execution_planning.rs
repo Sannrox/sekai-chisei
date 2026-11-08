@@ -70,6 +70,10 @@ impl ChiseiServiceImpl {
             }
         };
         plan.impact_route_class = routing.class.as_str().into();
+        if plan.resolved_model == crate::composition::lookup_first::LOOKUP_PROVIDER {
+            plan.impact_route_decision = ImpactRouteOutcome::Allowed.as_str().into();
+            return Ok(());
+        }
         if let Err(reason) = routing.check_resolved(&plan.resolved_model) {
             plan.impact_route_decision = ImpactRouteOutcome::Refused.as_str().into();
             return Err(reason);
@@ -136,6 +140,28 @@ impl ChiseiServiceImpl {
             &input.user_id,
             &input.budget_work_unit,
         )?;
+        // Lookup-first hits must not fail closed on an empty provider pool
+        // (#2108). Execute already short-circuits before provider selection;
+        // planning skips routing when the same lookup would hit.
+        if crate::composition::lookup_first::is_lookup_first_capability(&input.task_type)
+            && matches!(
+                crate::composition::lookup_first::try_lookup_first(
+                    &input.task_type,
+                    &input.namespace,
+                    authenticated_actor,
+                    &input.spec,
+                    self.sekai_facts.reader(),
+                ),
+                Ok(crate::composition::lookup_first::LookupDecision::Hit { .. })
+            )
+        {
+            return self.lookup_first_hit_plan(
+                plan_id,
+                input,
+                authenticated_actor,
+                normalized_user_id,
+            );
+        }
         let action_impact = crate::chisei::action_impact::ActionImpact::resolve(
             self.sekai_facts.reader(),
             input.action_claim.as_ref().map(action_claim_ref),
@@ -720,6 +746,59 @@ impl ChiseiServiceImpl {
             impact_route_decision: impact_outcome
                 .map(|outcome| outcome.as_str().into())
                 .unwrap_or_default(),
+        })
+    }
+
+    /// Plan a lookup-first hit without resolving a provider route (#2108).
+    fn lookup_first_hit_plan(
+        &self,
+        plan_id: String,
+        mut input: ExecutionInput,
+        authenticated_actor: &str,
+        normalized_user_id: String,
+    ) -> Result<ExecutionPlan, Status> {
+        let usage = self
+            .budget
+            .get_usage_with_metric(&normalized_user_id, METRIC_TOKENS);
+        input.user_id = normalized_user_id.clone();
+        input.estimated_tokens = 0;
+        input.preferred_runtime = crate::composition::lookup_first::LOOKUP_PROVIDER.into();
+        input.preferred_model = crate::composition::lookup_first::LOOKUP_PROVIDER.into();
+        let prepared_messages = if input.messages.is_empty() {
+            vec![ChatMessage {
+                role: "user".into(),
+                content: input.spec.clone(),
+                tool_call_id: String::new(),
+                tool_calls: Vec::new(),
+            }]
+        } else {
+            input.messages.clone()
+        };
+        Ok(ExecutionPlan {
+            plan_id,
+            enriched_spec: input.spec.clone(),
+            prepared_system: input.system.clone(),
+            prepared_messages,
+            tools: input.tools.clone(),
+            max_tokens: input.max_tokens,
+            input: Some(input),
+            resolved_runtime: crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
+            resolved_model: crate::composition::lookup_first::LOOKUP_PROVIDER.into(),
+            budget: Some(BudgetVerdict {
+                allowed: true,
+                usage: Some(BudgetUsage {
+                    user_id: usage.user_id,
+                    tokens_used: usage.tokens_used,
+                    max_tokens: usage.max_tokens,
+                    period_type: usage.period_type.as_str().into(),
+                    period_start: usage.period_start,
+                }),
+                reason: String::new(),
+            }),
+            executable: true,
+            created_at: chrono::Utc::now().timestamp_millis(),
+            planning_actor: authenticated_actor.into(),
+            ..Default::default()
         })
     }
 
