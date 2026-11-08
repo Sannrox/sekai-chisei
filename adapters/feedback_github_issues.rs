@@ -6,7 +6,8 @@
 //!
 //! - Each (namespace, problem signature) owns one issue, found by a public
 //!   marker in its body. The marker is the writeback key, so a marker written
-//!   for another namespace never matches.
+//!   for another namespace never matches. Only the body's first line counts,
+//!   so a marker quoted in maintainer text never matches.
 //! - Only issues the executor's own account opened are managed or counted
 //!   toward the daily cap. Markers are public; a pasted copy is ignored.
 //! - The record version is `absent` or the issue's number and `updated_at`. A
@@ -99,7 +100,7 @@ impl<G: GitHubIssues> IssueTracker<G> {
         Ok(self
             .own_issues()?
             .into_iter()
-            .find(|issue| issue.body.contains(&needle)))
+            .find(|issue| issue.body.starts_with(&needle)))
     }
 
     fn daily_cap(&self) -> u32 {
@@ -157,7 +158,7 @@ impl<G: GitHubIssues> SourceSystem for IssueTracker<G> {
             Some(issue) => self.github.update(
                 issue.number,
                 title,
-                &merge_maintainer_body(&issue.body, managed),
+                &merge_maintainer_body(&issue.body, managed)?,
             )?,
         };
         Ok(issue_version(Some(&written)))
@@ -235,7 +236,15 @@ impl IssuePublisher {
         let issues = tracker.own_issues()?;
         let current = issues
             .iter()
-            .find(|issue| issue.body.contains(&marker_comment(&marker)));
+            .find(|issue| issue.body.starts_with(&marker_comment(&marker)));
+        if let Some(issue) = current
+            && maintainer_text(&issue.body).is_none()
+        {
+            return Err(format!(
+                "issue #{} lost its managed end marker; restore it to resume updates",
+                issue.number
+            ));
+        }
         if let Some(issue) = current
             && issue.title == draft.title
             && issue.body.starts_with(&draft.managed_body)
@@ -394,21 +403,21 @@ fn marker_comment(marker: &str) -> String {
 }
 
 /// The managed section followed by whatever maintainers wrote below it.
-pub fn merge_maintainer_body(existing: &str, managed: &str) -> String {
-    let maintainer = maintainer_text(existing);
-    if maintainer.is_empty() {
+/// Refuses when the end marker is gone: there is no telling where
+/// maintainer text starts, and guessing would drop or duplicate it.
+pub fn merge_maintainer_body(existing: &str, managed: &str) -> Result<String, String> {
+    let maintainer = maintainer_text(existing).ok_or("managed end marker missing")?;
+    Ok(if maintainer.is_empty() {
         managed.to_string()
     } else {
         format!("{managed}\n\n{maintainer}")
-    }
+    })
 }
 
-pub fn maintainer_text(body: &str) -> String {
-    match body.find(MANAGED_END) {
-        Some(index) => body[index + MANAGED_END.len()..].trim().to_string(),
-        None if body.contains(&format!("<!-- {MARKER_PREFIX}")) => String::new(),
-        None => body.trim().to_string(),
-    }
+/// Text below the managed section, or `None` without its end marker.
+pub fn maintainer_text(body: &str) -> Option<String> {
+    body.find(MANAGED_END)
+        .map(|index| body[index + MANAGED_END.len()..].trim().to_string())
 }
 
 /// Issues this adapter created today (UTC), across all markers.
@@ -417,7 +426,9 @@ pub fn new_issues_today(issues: &[GitHubIssue], now_ms: i64) -> u32 {
     let prefix = format!("<!-- {MARKER_PREFIX}");
     issues
         .iter()
-        .filter(|issue| issue.created_ms.div_euclid(DAY_MS) == day && issue.body.contains(&prefix))
+        .filter(|issue| {
+            issue.created_ms.div_euclid(DAY_MS) == day && issue.body.starts_with(&prefix)
+        })
         .count() as u32
 }
 

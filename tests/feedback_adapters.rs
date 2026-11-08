@@ -894,6 +894,47 @@ async fn a_new_occurrence_updates_the_managed_section_and_keeps_maintainer_text(
 }
 
 #[tokio::test]
+async fn a_marker_quoted_in_maintainer_text_is_not_a_match() {
+    let publication = publication().await;
+    let ours = written(publication.decide().await);
+    let quoting = draft(NAMESPACE, "api:other_failure", None, false, &[]);
+    publication
+        .tracker
+        .github
+        .create(
+            &quoting.title,
+            &format!("{}\n\nRelated: <!-- {} -->", quoting.managed_body, ours.key),
+        )
+        .unwrap();
+    assert_eq!(written(publication.decide().await).expected_version, ABSENT);
+}
+
+#[tokio::test]
+async fn a_lost_end_marker_refuses_the_update_and_keeps_maintainer_text() {
+    let publication = publication().await;
+    publication.publish().await;
+    let edited = {
+        let mut issues = publication.tracker.github.issues.borrow_mut();
+        issues[0].body =
+            issues[0].body.replace("<!-- /sekai-feedback -->", "") + "\n\nMaintainer notes.";
+        issues[0].updated_ms += 1;
+        issues[0].body.clone()
+    };
+    observe(&publication.plane.db, "o-4", "op-4", "defect");
+    let error = publication
+        .publisher
+        .decide(
+            &publication.plane.sekai,
+            &publication.tracker,
+            &publication.finding_id,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("end marker"), "{error}");
+    assert_eq!(publication.tracker.github.issues.borrow()[0].body, edited);
+}
+
+#[tokio::test]
 async fn the_daily_cap_defers_new_issues() {
     let publication = publication().await;
     for index in 0..feedback_github_issues::DEFAULT_DAILY_CAP {
@@ -924,7 +965,7 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
         .replacen("<!-- /sekai-feedback -->", "", 1);
     assert!(!body.contains("sekai-feedback-->"), "{body}");
     assert!(!body.contains('@'), "{body}");
-    assert_eq!(maintainer_text(&issue.managed_body), "");
+    assert_eq!(maintainer_text(&issue.managed_body).as_deref(), Some(""));
 }
 
 #[test]
