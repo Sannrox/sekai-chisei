@@ -535,12 +535,11 @@ impl Investigator {
             else {
                 continue;
             };
-            if instance.type_id != ACTION_DISPATCH {
-                continue;
-            }
-            let Some(observation_id) = dispatch_observation(&instance.parameters_json) else {
-                continue;
-            };
+            // Work routed to this runtime that it cannot do is claimed and
+            // failed, so it never stays claimable ahead of real dispatches.
+            let observation_id = (instance.type_id == ACTION_DISPATCH)
+                .then(|| dispatch_observation(&instance.parameters_json))
+                .flatten();
             // Another runtime may win the race; that dispatch is theirs.
             let Ok(claimed) = sekai
                 .claim_action_work(with_principal(
@@ -556,8 +555,15 @@ impl Investigator {
             else {
                 continue;
             };
-            if let Some(effect) = claimed.into_inner().effect {
-                return Ok(Some((effect, observation_id)));
+            let Some(effect) = claimed.into_inner().effect else {
+                continue;
+            };
+            match observation_id {
+                Some(observation_id) => return Ok(Some((effect, observation_id))),
+                None => {
+                    self.ack(sekai, &effect, ACK_FAILED, "invalid_dispatch")
+                        .await?
+                }
             }
         }
         Ok(None)

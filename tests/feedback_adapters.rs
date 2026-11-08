@@ -929,6 +929,27 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
     assert_eq!(maintainer_text(&issue.managed_body), "");
 }
 
+#[test]
+fn private_values_glued_into_a_signature_are_redacted() {
+    for (signature, secret) in [
+        (
+            "connect(db01.tenant.example):timeout",
+            "db01.tenant.example",
+        ),
+        (
+            "file=/home/ops/.ssh/id_rsa:read_failed",
+            "/home/ops/.ssh/id_rsa",
+        ),
+        ("user=ops@tenant.example:denied", "tenant.example"),
+        ("sync,acme/private-ops#9:failed", "private-ops"),
+    ] {
+        let issue = draft(NAMESPACE, signature, None, false, &[], REPOSITORY);
+        for text in [&issue.title, &issue.managed_body] {
+            assert!(!text.contains(secret), "{secret:?} leaked: {text}");
+        }
+    }
+}
+
 fn fixture_config() -> Config {
     Config {
         grpc_port: 0,

@@ -348,7 +348,7 @@ pub fn draft(
     observations: &[Object],
     repository: &str,
 ) -> IssueDraft {
-    let public = |text: &str| public_token(&sanitize_public_text(text, repository));
+    let public = |text: &str| public_token(&sanitize_public_text(&words(text), repository));
     let (operation, reason) = signature.rsplit_once(':').unwrap_or((signature, ""));
     let (operation, reason) = (public(operation), public(reason));
     let attribution = analysis
@@ -427,6 +427,21 @@ pub fn new_issues_today(issues: &[GitHubIssue], now_ms: i64) -> u32 {
         .iter()
         .filter(|issue| issue.created_ms.div_euclid(DAY_MS) == day && issue.body.contains(&prefix))
         .count() as u32
+}
+
+/// Producer text split into the words the redactors inspect. A private value
+/// glued to other text (`file=/home/x`, `connect(db01.example)`) becomes its
+/// own word, so it is redacted before [`public_token`] joins the words again.
+fn words(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '@' | '#' | '~') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect()
 }
 
 /// One signature part as plain identifier text. Anything else (markup,
