@@ -309,7 +309,8 @@ impl SekaiDb {
 
     /// Takes the unused key of a stopped step with `closing` (a denied
     /// record), only while `holder` still owns the plan's execution. False
-    /// when the key is taken or the claim is lost.
+    /// when the key is taken or the claim is lost. A writer targeting a
+    /// forgotten memory item is stored with empty `content` (#2037).
     pub fn close_plan_step_key(
         &self,
         closing: &ActionInstance,
@@ -318,9 +319,15 @@ impl SekaiDb {
     ) -> Result<bool, String> {
         self.migrate_action_instances()?;
         closing.validate_fields()?;
+        let mut stored = closing.clone();
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        crate::sekai::action_instance::sqlite_redact_if_forgotten_writer(&tx, &mut stored)?;
         let evidence_json =
-            serde_json::to_string(&closing.evidence_submission_ids).map_err(|e| e.to_string())?;
-        self.conn()
+            serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        let inserted = tx
             .execute(
                 "INSERT INTO sekai_action_instances
                  (instance_id, namespace, type_id, version, principal, parameters_json,
@@ -333,29 +340,30 @@ impl SekaiDb {
                                  AND json_extract(body_json, '$.claim_holder') = ?19)
                  ON CONFLICT (namespace, idempotency_key) DO NOTHING",
                 rusqlite::params![
-                    closing.instance_id,
-                    closing.namespace,
-                    closing.type_id,
-                    closing.version,
-                    closing.principal,
-                    closing.parameters_json,
-                    closing.request_digest,
-                    closing.idempotency_key,
-                    closing.operation_id,
-                    closing.status,
-                    closing.deny_reason,
+                    stored.instance_id,
+                    stored.namespace,
+                    stored.type_id,
+                    stored.version,
+                    stored.principal,
+                    stored.parameters_json,
+                    stored.request_digest,
+                    stored.idempotency_key,
+                    stored.operation_id,
+                    stored.status,
+                    stored.deny_reason,
                     evidence_json,
-                    closing.policy_decision,
-                    closing.budget_decision,
-                    closing.created_at_ms,
-                    closing.decided_at_ms,
-                    encode(closing)?,
+                    stored.policy_decision,
+                    stored.budget_decision,
+                    stored.created_at_ms,
+                    stored.decided_at_ms,
+                    encode(&stored)?,
                     plan_id,
                     holder
                 ],
             )
-            .map(|inserted| inserted == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted == 1)
     }
 }
 
@@ -590,7 +598,9 @@ impl PostgresDb {
     }
 
     /// As on SQLite; the execution row is share-locked, so a takeover that
-    /// is replacing the claim commits first and the statement sees it.
+    /// is replacing the claim commits first and the statement sees it. A
+    /// writer targeting a forgotten memory item is stored with empty
+    /// `content` (#2037).
     pub fn close_plan_step_key(
         &self,
         closing: &ActionInstance,
@@ -598,9 +608,25 @@ impl PostgresDb {
         holder: &str,
     ) -> Result<bool, String> {
         closing.validate_fields()?;
+        let mut stored = closing.clone();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if crate::sekai::site_agent_memory::is_writer_action(&stored.type_id)
+            && let Some(object_id) =
+                crate::sekai::site_agent_memory::writer_object_id(&stored.parameters_json)
+        {
+            crate::db::postgres_audit::lock_object_lifecycle(&mut tx, &object_id)?;
+        }
+        crate::db::postgres_action_instance::postgres_redact_if_forgotten_writer(
+            &mut tx,
+            &mut stored,
+        )?;
         let evidence_json =
-            serde_json::to_string(&closing.evidence_submission_ids).map_err(|e| e.to_string())?;
-        self.connection()?
+            serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        let body_json = encode(&stored)?;
+        let inserted = tx
             .execute(
                 "INSERT INTO sekai_action_instances
                  (instance_id, namespace, type_id, version, principal, parameters_json,
@@ -616,29 +642,30 @@ impl PostgresDb {
                                FOR SHARE)
                  ON CONFLICT (namespace, idempotency_key) DO NOTHING",
                 &[
-                    &closing.instance_id,
-                    &closing.namespace,
-                    &closing.type_id,
-                    &closing.version,
-                    &closing.principal,
-                    &closing.parameters_json,
-                    &closing.request_digest,
-                    &closing.idempotency_key,
-                    &closing.operation_id,
-                    &closing.status,
-                    &closing.deny_reason,
+                    &stored.instance_id,
+                    &stored.namespace,
+                    &stored.type_id,
+                    &stored.version,
+                    &stored.principal,
+                    &stored.parameters_json,
+                    &stored.request_digest,
+                    &stored.idempotency_key,
+                    &stored.operation_id,
+                    &stored.status,
+                    &stored.deny_reason,
                     &evidence_json,
-                    &closing.policy_decision,
-                    &closing.budget_decision,
-                    &closing.created_at_ms,
-                    &closing.decided_at_ms,
-                    &encode(closing)?,
+                    &stored.policy_decision,
+                    &stored.budget_decision,
+                    &stored.created_at_ms,
+                    &stored.decided_at_ms,
+                    &body_json,
                     &plan_id,
                     &holder,
                 ],
             )
-            .map(|inserted| inserted == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(inserted == 1)
     }
 }
 

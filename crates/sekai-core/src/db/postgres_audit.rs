@@ -691,6 +691,8 @@ pub fn update_object_in(
 /// - `apply_admission_object_write`
 /// - `release_admission`
 /// - `grant_parked_action_instance`
+/// - `close_plan_step_key` (object lock, then the closing insert)
+/// - `backfill_forgotten_memory_action_redaction` (object lock, then redact)
 /// - `postgres_redact_forgotten_memory_actions` (the forgotten object is
 ///   already held)
 ///

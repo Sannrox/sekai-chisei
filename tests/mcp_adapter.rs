@@ -497,3 +497,251 @@ async fn evaluation_tools_bind_the_session_namespace_and_fail_closed() {
     .unwrap();
     assert!(failed(&forged), "{forged}");
 }
+
+fn evaluate_set_call(
+    id: i64,
+    operation_id: &str,
+    descriptor: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id": id,
+        "method":"tools/call",
+        "params":{
+            "name":"sekai.objects.evaluate_set",
+            "arguments":{
+                "operation_id": operation_id,
+                "input":{"descriptor": descriptor}
+            }
+        }
+    })
+}
+
+fn receipt_call(id: i64, operation_id: &str) -> serde_json::Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id": id,
+        "method":"tools/call",
+        "params":{
+            "name":"chisei.receipt.read",
+            "arguments":{
+                "operation_id": operation_id,
+                "input":{"operation_id": operation_id}
+            }
+        }
+    })
+}
+
+fn query_record_from_receipt(reply: &serde_json::Value) -> serde_json::Value {
+    let receipt_json = reply["result"]["structuredContent"]["output"]["receipt_json"]
+        .as_str()
+        .expect("receipt_json");
+    let receipt: serde_json::Value = serde_json::from_str(receipt_json).expect("receipt json");
+    let outcome = receipt["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["kind"] == "outcome_recorded")
+        .expect("outcome event");
+    serde_json::from_str(
+        outcome["attributes"]["query_record"]
+            .as_str()
+            .expect("query_record"),
+    )
+    .expect("query record json")
+}
+
+#[tokio::test]
+async fn evaluate_set_returns_rows_and_a_receipt_naming_query_and_versions() {
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
+    let evaluated = handle_message(
+        &surface,
+        evaluate_set_call(1, "op-set-ok", surface.object_set_descriptor("widget")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(evaluated["result"]["isError"], false, "{evaluated}");
+    let output = &evaluated["result"]["structuredContent"]["output"];
+    assert_eq!(output["outcome"], "ok");
+    assert!(
+        !output["queryDigest"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+    let members = output["members"].as_array().expect("members");
+    assert_eq!(members.len(), 2, "{evaluated}");
+    assert!(
+        members
+            .iter()
+            .any(|member| member["id"] == surface.object_id)
+    );
+    assert!(
+        members
+            .iter()
+            .any(|member| member["id"] == surface.peer_object_id)
+    );
+    let versions = output["objectVersions"].as_array().expect("objectVersions");
+    assert_eq!(versions.len(), members.len());
+    for member in members {
+        let id = member["id"].as_str().unwrap();
+        assert!(
+            versions.iter().any(|version| version["id"] == id
+                && !version["version"].as_str().unwrap_or_default().is_empty()),
+            "missing version for {id}: {output}"
+        );
+    }
+
+    let receipt = handle_message(&surface, receipt_call(2, "op-set-ok"))
+        .await
+        .unwrap();
+    assert_eq!(receipt["result"]["isError"], false, "{receipt}");
+    let record = query_record_from_receipt(&receipt);
+    assert_eq!(record["query_digest"], output["queryDigest"]);
+    assert_eq!(record["outcome"], "ok");
+    assert_eq!(
+        record["object_versions"].as_array().map(Vec::len),
+        Some(members.len())
+    );
+    let replayed = sekai_chisei::sekai::object_set::replay_object_set_query(
+        &serde_json::from_value(record.clone()).expect("query record"),
+    )
+    .expect("replay");
+    assert_eq!(replayed.len(), members.len());
+    assert!(replayed.iter().any(|member| member.id == surface.object_id));
+}
+
+#[tokio::test]
+async fn evaluate_set_denies_unauthorized_type_with_receipt_and_no_leaked_rows() {
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
+    surface.deny_object_type("secret").expect("deny secret");
+    let evaluated = handle_message(
+        &surface,
+        evaluate_set_call(1, "op-set-deny", surface.object_set_descriptor("secret")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(evaluated["result"]["isError"], false, "{evaluated}");
+    let output = &evaluated["result"]["structuredContent"]["output"];
+    assert_eq!(output["outcome"], "denied", "{evaluated}");
+    assert_eq!(output["total"], 0);
+    assert!(output["members"].as_array().unwrap().is_empty());
+    assert!(output["objectVersions"].as_array().unwrap().is_empty());
+    let dumped = evaluated.to_string();
+    assert!(
+        !dumped.contains(&surface.secret_object_id),
+        "denied evaluate_set leaked the secret id: {evaluated}"
+    );
+    assert!(
+        !dumped.contains("classified-token-xyz"),
+        "denied evaluate_set leaked secret payload: {evaluated}"
+    );
+
+    let receipt = handle_message(&surface, receipt_call(2, "op-set-deny"))
+        .await
+        .unwrap();
+    assert_eq!(receipt["result"]["isError"], false, "{receipt}");
+    let dumped_receipt = receipt.to_string();
+    assert!(
+        !dumped_receipt.contains(&surface.secret_object_id),
+        "denied receipt leaked the secret id: {receipt}"
+    );
+    assert!(
+        !dumped_receipt.contains("classified-token-xyz"),
+        "denied receipt leaked secret payload: {receipt}"
+    );
+    let record = query_record_from_receipt(&receipt);
+    assert_eq!(record["outcome"], "denied");
+    assert!(record["members"].as_array().unwrap().is_empty());
+    assert!(record["object_versions"].as_array().unwrap().is_empty());
+    let replayed = sekai_chisei::sekai::object_set::replay_object_set_query(
+        &serde_json::from_value(record).expect("query record"),
+    )
+    .expect("replay denied");
+    assert!(replayed.is_empty());
+}
+
+#[tokio::test]
+async fn evaluate_set_receipt_replays_the_read_at_recorded_versions() {
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
+    let first = handle_message(
+        &surface,
+        evaluate_set_call(1, "op-set-replay", surface.object_set_descriptor("widget")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let first_output = &first["result"]["structuredContent"]["output"];
+    let original_color = first_output["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["id"] == surface.object_id)
+        .and_then(|member| member["properties"]["color"].as_str())
+        .unwrap()
+        .to_string();
+    let original_version = first_output["objectVersions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|version| version["id"] == surface.object_id)
+        .and_then(|version| version["version"].as_str())
+        .unwrap()
+        .to_string();
+    assert_eq!(original_color, "blue");
+
+    surface
+        .mutate_object_color(&surface.object_id, "green")
+        .await
+        .expect("mutate");
+
+    let live = handle_message(
+        &surface,
+        evaluate_set_call(2, "op-set-live", surface.object_set_descriptor("widget")),
+    )
+    .await
+    .unwrap();
+    let live_output = &live["result"]["structuredContent"]["output"];
+    let live_color = live_output["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["id"] == surface.object_id)
+        .and_then(|member| member["properties"]["color"].as_str())
+        .unwrap();
+    let live_version = live_output["objectVersions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|version| version["id"] == surface.object_id)
+        .and_then(|version| version["version"].as_str())
+        .unwrap();
+    assert_eq!(live_color, "green");
+    assert_ne!(live_version, original_version);
+
+    let receipt = handle_message(&surface, receipt_call(3, "op-set-replay"))
+        .await
+        .unwrap();
+    let record: sekai_chisei::sekai::object_set::ObjectSetQueryRecord =
+        serde_json::from_value(query_record_from_receipt(&receipt)).expect("query record");
+    let replayed =
+        sekai_chisei::sekai::object_set::replay_object_set_query(&record).expect("replay");
+    let replayed_widget = replayed
+        .iter()
+        .find(|member| member.id == surface.object_id)
+        .expect("replayed widget");
+    assert_eq!(
+        replayed_widget.properties.get("color").map(String::as_str),
+        Some("blue")
+    );
+    assert_eq!(replayed_widget.version, original_version);
+}

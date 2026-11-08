@@ -1,10 +1,16 @@
 //! Authorized EvaluateObjectSet over existing list and one-hop traverse.
 
 use super::*;
+use crate::chisei::receipt::{
+    GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
+    ReceiptEventKind,
+};
+use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::object_set::{
     BoundObjectSet, ObjectSetDescriptor as DomainObjectSetDescriptor, ObjectSetError,
-    ObjectSetTraversal as DomainObjectSetTraversal,
+    ObjectSetQueryRecord, ObjectSetTraversal as DomainObjectSetTraversal,
 };
+use std::collections::BTreeMap;
 
 const INDEX_SCAN_BATCH_SIZE: i32 = 256;
 
@@ -12,6 +18,12 @@ struct ObjectSetAuthority<'a> {
     principals: &'a [String],
     tenant_context: Option<&'a RequestEnterpriseContext>,
     purpose: Option<&'a crate::sekai::purpose_authorization::PurposePresentation>,
+}
+
+struct QueryAttribution {
+    operation_id: Option<String>,
+    actor: String,
+    type_denied: bool,
 }
 
 impl SekaiServiceImpl {
@@ -29,9 +41,32 @@ impl SekaiServiceImpl {
             tenant_context: tenant_context.as_ref(),
             purpose: purpose.as_ref(),
         };
+        let operation_id = Self::catalog_metadata_value(&req, "x-sekai-operation-id");
+        let actor = principals.first().cloned().unwrap_or_default();
         let inner = req.into_inner();
         let bound =
             self.authorize_object_set_read(&principals, tenant_context.as_ref(), inner.descriptor)?;
+        let type_denied = object_set_type_denied(
+            self.db.runtime(),
+            &bound.descriptor.namespace,
+            &bound.descriptor.kind,
+        )?;
+        let attribution = QueryAttribution {
+            operation_id,
+            actor,
+            type_denied,
+        };
+        if attribution.type_denied {
+            return self.object_set_page(
+                &bound,
+                Vec::new(),
+                0,
+                String::new(),
+                Vec::new(),
+                crate::sekai::object_set::EVALUATE_SOURCE_UNKNOWN.into(),
+                &attribution,
+            );
+        }
         let principal_context_digest =
             crate::sekai::purpose_authorization::purpose_bound_context_digest(
                 &policy_context
@@ -79,6 +114,7 @@ impl SekaiServiceImpl {
                 &authority,
                 inner.required_freshness_ms,
                 now_millis(),
+                &attribution,
             );
         }
         if self
@@ -95,6 +131,7 @@ impl SekaiServiceImpl {
                 (&principal_context_digest, &policy_activation_digest),
                 now_millis(),
                 &authority,
+                &attribution,
             );
         }
         let (near, total) = list_objects_with_marking(
@@ -143,17 +180,215 @@ impl SekaiServiceImpl {
         } else {
             String::new()
         };
+        self.object_set_page(
+            &bound,
+            members,
+            total,
+            next_page_token,
+            Vec::new(),
+            crate::sekai::object_set::EVALUATE_SOURCE_UNKNOWN.into(),
+            &attribution,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn object_set_page(
+        &self,
+        bound: &BoundObjectSet,
+        mut members: Vec<domain::Object>,
+        mut total: i32,
+        mut next_page_token: String,
+        mut aggregates: Vec<ObjectSetAggregateRow>,
+        source: String,
+        attribution: &QueryAttribution,
+    ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        if attribution.type_denied {
+            members.clear();
+            aggregates.clear();
+            total = 0;
+            next_page_token.clear();
+        }
+        let outcome = if attribution.type_denied {
+            crate::sekai::object_set::OUTCOME_DENIED
+        } else if members.is_empty() && aggregates.is_empty() {
+            crate::sekai::object_set::OUTCOME_EMPTY
+        } else {
+            crate::sekai::object_set::OUTCOME_OK
+        };
+        let record = crate::sekai::object_set::query_record(bound, &members, outcome)
+            .map_err(Status::internal)?;
+        if let Some(operation_id) = attribution.operation_id.as_deref() {
+            self.persist_object_set_query_receipt(
+                operation_id,
+                &attribution.actor,
+                &bound.descriptor.namespace,
+                &record,
+            )?;
+        }
         Ok(Response::new(EvaluateObjectSetResponse {
             contract_version: bound.descriptor.contract_version.clone(),
-            definition_digest: bound.descriptor.definition_digest,
-            kind: bound.member_kind,
+            definition_digest: bound.descriptor.definition_digest.clone(),
+            kind: bound.member_kind.clone(),
             members: members.iter().map(to_proto_obj).collect(),
             total,
             next_page_token,
             authority: false,
-            aggregates: Vec::new(),
-            source: crate::sekai::object_set::EVALUATE_SOURCE_UNKNOWN.into(),
+            aggregates,
+            source,
+            query_digest: record.query_digest,
+            object_versions: record
+                .object_versions
+                .into_iter()
+                .map(|version| ObjectVersionRead {
+                    id: version.id,
+                    version: version.version,
+                })
+                .collect(),
+            outcome: outcome.into(),
         }))
+    }
+
+    fn persist_object_set_query_receipt(
+        &self,
+        operation_id: &str,
+        actor: &str,
+        namespace: &str,
+        record: &ObjectSetQueryRecord,
+    ) -> Result<(), Status> {
+        let now = now_millis();
+        let event = |suffix: &str,
+                     parent: Option<&str>,
+                     kind: ReceiptEventKind,
+                     attributes: BTreeMap<String, String>,
+                     references: Vec<GovernedReference>| {
+            OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.into(),
+                parent_event_id: parent.map(|value| format!("{operation_id}:{value}")),
+                timestamp_ms: now,
+                surface: kind.surface(),
+                kind,
+                actor: actor.into(),
+                references,
+                attributes,
+            }
+        };
+        let attributes = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let query_record =
+            serde_json::to_string(record).map_err(|error| Status::internal(error.to_string()))?;
+        let denied = record.outcome == crate::sekai::object_set::OUTCOME_DENIED;
+        let policy_decision = if denied { "deny" } else { "allow" };
+        let budget_decision = if denied {
+            "not_applicable_policy_denied"
+        } else {
+            "not_applicable_read"
+        };
+        let references = if denied {
+            Vec::new()
+        } else {
+            record
+                .object_versions
+                .iter()
+                .map(|version| GovernedReference {
+                    kind: "object".into(),
+                    reference: version.id.clone(),
+                    content_hash: Some(version.version.clone()),
+                    disclosed_fields: Vec::new(),
+                    omitted: false,
+                    omission_reason: None,
+                })
+                .collect()
+        };
+        let intent = event(
+            "intent",
+            None,
+            ReceiptEventKind::IntentRecorded,
+            attributes(&[
+                ("capability", "EvaluateObjectSet"),
+                ("query_digest", &record.query_digest),
+                ("kind", &record.kind),
+            ]),
+            Vec::new(),
+        );
+        let policy = event(
+            "policy",
+            Some("intent"),
+            ReceiptEventKind::PolicyDecided,
+            attributes(&[("decision", policy_decision)]),
+            Vec::new(),
+        );
+        let routing = event(
+            "routing",
+            Some("policy"),
+            ReceiptEventKind::RouteSelected,
+            attributes(&[("route", "native")]),
+            Vec::new(),
+        );
+        let budget = event(
+            "budget",
+            Some("routing"),
+            ReceiptEventKind::BudgetDecided,
+            attributes(&[("decision", budget_decision)]),
+            Vec::new(),
+        );
+        let mut outcome_attributes = attributes(&[
+            ("outcome", &record.outcome),
+            ("query_digest", &record.query_digest),
+            ("kind", &record.kind),
+            ("definition_digest", &record.definition_digest),
+        ]);
+        outcome_attributes.insert(
+            crate::sekai::object_set::QUERY_RECORD_ATTR.into(),
+            query_record,
+        );
+        let outcome = event(
+            "outcome",
+            Some("budget"),
+            ReceiptEventKind::OutcomeRecorded,
+            outcome_attributes,
+            references,
+        );
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.into(),
+            parent_operation_id: None,
+            namespace: namespace.into(),
+            operation_class: crate::sekai::object_set::QUERY_RECEIPT_CLASS.into(),
+            initiating_actor: actor.into(),
+            schema_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            policy_version: "object_security".into(),
+            started_at_ms: now,
+            completed_at_ms: Some(now),
+            events: vec![intent, policy, routing, budget, outcome],
+            uncovered_surfaces: Vec::new(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: None,
+        };
+        if let Some(cross_store) = &self.cross_store {
+            cross_store
+                .chisei_runtime_arc()
+                .put_operation_receipt(&receipt)
+                .map_err(Status::internal)
+        } else {
+            self.db
+                .runtime()
+                .put_operation_receipt(&receipt)
+                .map_err(Status::internal)
+        }
+    }
+}
+
+fn object_set_type_denied(db: &RuntimeDb, namespace: &str, kind: &str) -> Result<bool, Status> {
+    match db.active_object_policy(namespace, kind) {
+        Ok(_) => Ok(false),
+        Err(error) if error.starts_with("object_security_denied") => Ok(true),
+        Err(_) => Err(Status::unavailable("object authorization unavailable")),
     }
 }
 
@@ -296,6 +531,7 @@ impl SekaiServiceImpl {
         }
         Ok(bound)
     }
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_indexed_object_set(
         &self,
         bound: &BoundObjectSet,
@@ -304,6 +540,7 @@ impl SekaiServiceImpl {
         cursor_authority: (&str, &str),
         now_ms: i64,
         authority: &ObjectSetAuthority<'_>,
+        attribution: &QueryAttribution,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         let (principal_context_digest, policy_activation_digest) = cursor_authority;
         let status = self
@@ -417,17 +654,15 @@ impl SekaiServiceImpl {
         } else {
             String::new()
         };
-        Ok(Response::new(EvaluateObjectSetResponse {
-            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
-            definition_digest: bound.descriptor.definition_digest.clone(),
-            kind: bound.member_kind.clone(),
-            members: objects.iter().map(to_proto_obj).collect(),
+        self.object_set_page(
+            bound,
+            objects,
             total,
             next_page_token,
-            authority: false,
-            aggregates: Vec::new(),
-            source: crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
-        }))
+            Vec::new(),
+            crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
+            attribution,
+        )
     }
 
     fn authorized_index_object(
@@ -653,6 +888,7 @@ impl SekaiServiceImpl {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn evaluate_aggregated_object_set(
         &self,
         bound: &BoundObjectSet,
@@ -660,6 +896,7 @@ impl SekaiServiceImpl {
         authority: &ObjectSetAuthority<'_>,
         required_freshness_ms: i64,
         now_ms: i64,
+        attribution: &QueryAttribution,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         let constrained = authority.tenant_context.is_some();
         let engine = if constrained {
@@ -916,24 +1153,24 @@ impl SekaiServiceImpl {
         };
         let aggregates = crate::sekai::object_set::aggregate_groups(&rows, &aggregation.function)
             .map_err(map_object_set_error)?;
-        Ok(Response::new(EvaluateObjectSetResponse {
-            contract_version: bound.descriptor.contract_version.clone(),
-            definition_digest: bound.descriptor.definition_digest.clone(),
-            kind: bound.member_kind.clone(),
-            members: Vec::new(),
-            total: aggregates.len() as i32,
-            next_page_token: String::new(),
-            authority: false,
-            aggregates: aggregates
-                .into_iter()
-                .map(|row| ObjectSetAggregateRow {
-                    group_key: row.group_key,
-                    value: row.value,
-                    count: row.count,
-                })
-                .collect(),
-            source: crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
-        }))
+        let aggregates = aggregates
+            .into_iter()
+            .map(|row| ObjectSetAggregateRow {
+                group_key: row.group_key,
+                value: row.value,
+                count: row.count,
+            })
+            .collect::<Vec<_>>();
+        let total = aggregates.len() as i32;
+        self.object_set_page(
+            bound,
+            Vec::new(),
+            total,
+            String::new(),
+            aggregates,
+            crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION.into(),
+            attribution,
+        )
     }
 }
 

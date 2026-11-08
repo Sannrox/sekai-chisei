@@ -16,7 +16,8 @@
 //! that wrote the item (#1969), leaving each Action's stored request digest
 //! as it was so receipt and digest verification still match the original
 //! submit. Later Action and decision-memory writes that still name a
-//! forgotten item store empty `content` too.
+//! forgotten item store empty `content` too. Opening a store redacts writer
+//! Actions for items forgotten before that erase existed (#2037).
 //!
 //! Working memory is neither Kioku (epistemic memory Chisei derives from
 //! operation outcomes) nor decision memory (precedents of parked reviews).
@@ -433,6 +434,7 @@ mod tests {
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionOutcome,
         ActionInstanceAdmissionRequest,
     };
+    use crate::sekai::plan_execution::{EXECUTION_RUNNING, PlanExecution};
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -723,6 +725,155 @@ mod tests {
             }),
             "{listed:?}"
         );
+    }
+
+    /// Pre-#2032 forget left `content` on the writer Action. The open-path
+    /// backfill empties it and keeps the stored request digest.
+    #[test]
+    fn backfill_redacts_writer_actions_forgotten_before_erase() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        restore_writer_content(&db, &created.instance.instance_id, "valve 3 sticks");
+        let restored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&restored), "valve 3 sticks");
+        assert_eq!(
+            restored
+                .offline
+                .as_ref()
+                .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                .flatten()
+                .as_deref(),
+            Some("valve 3 sticks")
+        );
+        let digest = restored.request_digest.clone();
+
+        db.migrate_all().unwrap();
+        db.migrate_all().unwrap();
+
+        let stored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&stored), "");
+        assert!(
+            !stored.parameters_json.contains("valve 3 sticks"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(
+            stored
+                .offline
+                .as_ref()
+                .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                .flatten()
+                .as_deref(),
+            Some("")
+        );
+        assert_eq!(stored.request_digest, digest);
+    }
+
+    /// Closing a plan-step key after forget must not store the forgotten
+    /// note in the closing Action.
+    #[test]
+    fn close_plan_step_key_after_forget_does_not_reintroduce_content() {
+        let db = setup();
+        remember(&db, "create", AGENT).unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        db.put_plan_execution(&PlanExecution {
+            namespace: NAMESPACE.into(),
+            plan_id: "plan-1".into(),
+            simulation_id: "sim-1".into(),
+            simulation_digest: "sha256:one".into(),
+            status: EXECUTION_RUNNING.into(),
+            next_step: 0,
+            steps: Vec::new(),
+            stop_reason: String::new(),
+            stopped_at_step: None,
+            started_by: AGENT.into(),
+            updated_at_ms: 1,
+            revision: 0,
+            claim_holder: "run-a".into(),
+            claim_until_ms: 10_000,
+        })
+        .unwrap();
+        let closing = writer_action(
+            "close-1",
+            ACTION_UPDATE,
+            "close-step",
+            "valve 3 sticks",
+            STATUS_DENIED,
+        );
+        let digest = closing.request_digest.clone();
+        assert!(db.close_plan_step_key(&closing, "plan-1", "run-a").unwrap());
+        let stored = db.get_action_instance("close-1").unwrap().unwrap();
+        assert_eq!(stored_content(&stored), "");
+        assert!(
+            !stored.parameters_json.contains("valve 3 sticks"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(stored.request_digest, digest);
+    }
+
+    fn restore_writer_content(db: &RuntimeDb, instance_id: &str, note: &str) {
+        let RuntimeDb::Sqlite(inner) = db else {
+            panic!("sqlite fixture");
+        };
+        let conn = inner.conn();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM sekai_action_instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut instance: ActionInstance = serde_json::from_str(&body).unwrap();
+        let mut value: Value = serde_json::from_str(&instance.parameters_json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(CONTENT_PROPERTY.into(), json!(note));
+        instance.parameters_json = value.to_string();
+        instance.offline = Some(crate::sekai::offline_action::OfflineSubmission {
+            prepared_at_ms: 5,
+            base_updated_ms: 1,
+            base_properties: [(CONTENT_PROPERTY.into(), Some(note.into()))].into(),
+            lease_id: String::new(),
+            device_id: String::new(),
+        });
+        let body = serde_json::to_string(&instance).unwrap();
+        conn.execute(
+            "UPDATE sekai_action_instances
+             SET parameters_json = ?2, body_json = ?3
+             WHERE instance_id = ?1",
+            rusqlite::params![instance_id, instance.parameters_json, body],
+        )
+        .unwrap();
     }
 
     fn decision_row(id: &str, note: &str) -> crate::sekai::decision_memory::DecisionMemory {
