@@ -33,15 +33,13 @@ use sekai_chisei::grpc::pb::sekai::{
     GetObjectRequest, ListFilter, ListObjectsRequest, Object, PropertyFilter,
 };
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
-use sekai_chisei::sekai::feedback_package::{
-    INVESTIGATION_RUNTIME, KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, PROPERTY_RECORDED_BY,
-};
+use sekai_chisei::sekai::feedback_package::{KIND_INVESTIGATION_RESULT, KIND_OBSERVATION};
 use sha2::{Digest, Sha256};
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request};
 
 use crate::feedback_investigation::{
-    InvestigationAnalysis, observation_view, publication_permitted,
+    InvestigationAnalysis, observation_view, publication_permitted, runtime_investigation,
 };
 use crate::source_writeback::{SourceSystem, WritebackIntent};
 
@@ -212,13 +210,7 @@ impl IssuePublisher {
             .list(sekai, KIND_INVESTIGATION_RESULT, "observation_id", &anchor)
             .await?
             .into_iter()
-            .find(|investigation| {
-                investigation
-                    .properties
-                    .get(PROPERTY_RECORDED_BY)
-                    .map(String::as_str)
-                    == Some(INVESTIGATION_RUNTIME)
-            });
+            .find(runtime_investigation);
         let property = |key: &str| {
             investigation
                 .as_ref()

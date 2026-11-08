@@ -288,6 +288,16 @@ pub fn decide_filing(
     }
 }
 
+/// An investigation result this runtime recorded. Writers can submit results
+/// with `measured=true`, and stored quality evaluations are not reproductions;
+/// neither counts.
+pub fn runtime_investigation(result: &Object) -> bool {
+    let property = |key: &str| result.properties.get(key).map(String::as_str);
+    result.kind == KIND_INVESTIGATION_RESULT
+        && property(PROPERTY_RECORDED_BY) == Some(INVESTIGATION_RUNTIME)
+        && property("outcome") != Some(OUTCOME_QUALITY_EVALUATION)
+}
+
 /// A qualifying finding the investigation runtime recorded. Writer-submitted
 /// findings carry no recorder stamp and never publish.
 pub fn publication_permitted(finding: &Object) -> bool {
@@ -713,12 +723,7 @@ impl Investigator {
             )
             .await?;
         for result in measured {
-            // Writers can submit `measured=true`; only the runtime's own
-            // results count, like the finding gate in `publication_permitted`.
-            let property = |key: &str| result.properties.get(key).map(String::as_str);
-            if property(PROPERTY_RECORDED_BY) != Some(INVESTIGATION_RUNTIME)
-                || property("outcome") == Some(OUTCOME_QUALITY_EVALUATION)
-            {
+            if !runtime_investigation(&result) {
                 continue;
             }
             let Some(observation_id) = result.properties.get("observation_id") else {
