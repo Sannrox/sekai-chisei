@@ -62,8 +62,7 @@ writeback effects.
    unavailable. Placement labels (ADR 0129) and the per-kind
    `accepts_continuation` style flags become kind options on the request.
 4. **The old RPCs stay, as wrappers.** Each existing family calls the
-   engine and keeps its wire shape until the next major version. So do the
-   saved-export delivery RPCs once `export_delivery` exists. A rolling
+   engine and keeps its wire shape until the next major version. A rolling
    deploy mixes old and new planes without a schema change. Old and new
    claim calls on the same row see the same generation and token.
 5. **One set of gauges.** The ADR 0129 queue-depth gauges are labelled by

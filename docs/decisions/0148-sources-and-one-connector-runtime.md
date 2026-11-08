@@ -54,6 +54,8 @@ object they all hang off.
    - an egress allowlist, which the runtime applies before it connects and
      which fails closed;
    - placement labels, matched as transform `requires` are (ADR 0129);
+   - a sync interval `every_ms`, ticked on the transform schedule graph
+     like a saved export's.
    - an owner, markings and an optional certification pin (ADR 0055).
 
    Source batches, saved exports and writeback effects name a Source.
@@ -65,7 +67,10 @@ object they all hang off.
    A Source keeps the existing `source` and `source_instance` tokens as
    fields, for example `github` and `owner/repo`. A batch names the Source
    as a handle, and the plane resolves it to those tokens. Object identity,
-   `source_id(source, source_instance, external_id)`, does not change.
+   `source_id(source, source_instance, external_id)`, does not change. One
+   Source owns each `(namespace, source, source_instance)`. While that
+   Source is disabled, the plane refuses batches for its tokens, whether
+   they name the handle or not.
 2. **Connector types replace adapters.** A connector type implements the
    `sekai-source-sdk` operations it supports:
    - `check` and `discover`;
@@ -91,9 +96,12 @@ object they all hang off.
    work queue (ADR 0149), and adds no claim RPCs of its own. The
    deployment layer runs as many runtimes as it needs. The plane never
    pushes and holds no vendor code.
-4. **Credentials stay with the runtime.** A credential reference names a
-   secret that the runtime resolves locally. The plane stores the
-   reference, never the value. A Source whose credential cannot be resolved
+4. **Credentials stay with the runtime.** A credential reference is a
+   handle the operator issues. The runtime binds each handle to the
+   namespaces and destinations it may serve, and refuses a Source whose
+   namespace or configured destination is outside that binding. A namespace
+   administrator can name a handle but cannot point it elsewhere. The
+   plane stores the reference, never the value. A Source whose credential cannot be resolved
    fails the run visibly as `unavailable` and is not retried in a loop.
    Plane-held credentials sealed to a runtime key are a possible later
    extension, not part of this decision.
@@ -138,10 +146,12 @@ object they all hang off.
   The Ezu adapter keeps the ADR 0147 design.
 - The runtime is a new deployable. It has to survive crash, takeover and
   rolling deploy as any claim worker does.
-- The saved-export delivery RPCs (`ListDeliverableExportArtifacts`,
-  `AcknowledgeExportDelivery`) become wrappers of the `export_delivery`
-  kind, as ADR 0149 decision 4 does for the older claim families. An old
-  adapter and a new runtime cannot both hold one artifact.
+- The saved-export delivery RPCs keep their wire shape and stay unfenced.
+  Once an artifact is claimed as `export_delivery` work,
+  `ListDeliverableExportArtifacts` hides it, and `FetchExportArtifact` and
+  `AcknowledgeExportDelivery` refuse it for anyone but the claim holder.
+  An old adapter and a new runtime therefore cannot both copy it off the
+  plane.
 - This ADR depends on ADR 0149. Source, delivery and effect work are new
   kinds of that queue, not new claim families. They stay experimental
   until the queue's RPCs are stable.
