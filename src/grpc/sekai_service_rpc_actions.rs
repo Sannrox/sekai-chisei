@@ -895,7 +895,8 @@ fn list_decidable_action_instances(
             if action_instance_passes_marking(service, &deciders, instance)?
                 && crate::sekai::action_instance_admission::may_decide(
                     type_def,
-                    instance,
+                    &instance.principal,
+                    &instance.review,
                     &decider,
                     &deciders,
                     decider_is_namespace_admin,
@@ -2182,12 +2183,12 @@ fn refused_or_unavailable(status: &Status) -> Result<bool, String> {
     }
 }
 
-/// Whether `decider` could decide a plan step as a single parked Action:
-/// entitled for its type (a named approver, else a namespace admin), able
-/// to decide its review queue placement, and able to read its object. Used
-/// to decide a plan review (#1678) and rechecked before each executed step
-/// (#1679).
-fn plan_step_decider<'a>(
+/// Whether `decider`, presenting `deciders`, could decide a plan step as a
+/// single parked Action submitted by the planner: `may_decide` for its type
+/// and the review queue placement the step would get, and able to read its
+/// object. Used to decide a plan review (#1678) and rechecked before each
+/// executed step (#1679).
+pub(super) fn plan_step_decider<'a>(
     service: &'a SekaiServiceImpl,
     decider: &'a str,
     deciders: &'a [String],
@@ -2215,14 +2216,6 @@ fn plan_step_decider<'a>(
         else {
             return Ok(false);
         };
-        let entitled = if type_def.approvers.is_empty() {
-            decider_is_namespace_admin
-        } else {
-            type_def
-                .approvers
-                .iter()
-                .any(|approver| approver == decider)
-        };
         let placement = crate::sekai::review_queue::place(
             &type_def.review_queue,
             &step.parameters_json,
@@ -2230,13 +2223,14 @@ fn plan_step_decider<'a>(
             &plan.planner,
             &type_def.approvers,
         );
-        if !entitled
-            || !crate::sekai::review_queue::reviewer_may_decide(
-                &type_def.review_queue,
-                &placement,
-                decider,
-            )
-        {
+        if !crate::sekai::action_instance_admission::may_decide(
+            &type_def,
+            &plan.planner,
+            &placement,
+            decider,
+            deciders,
+            decider_is_namespace_admin,
+        ) {
             return Ok(false);
         }
         if decider_has_request {
