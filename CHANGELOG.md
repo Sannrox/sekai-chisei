@@ -6,6 +6,74 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 2.0.0
+
+Upgrade notes:
+
+- Rust library consumers must update `sekai-proto` to 2.0.0, `sekai-core` to 3.0.0, and `sekai-client` to 1.0.0. Additive proto fields, receipt pairing, and constructible struct fields break exhaustive literals. Server and protocol family version is 2.0.0.
+- Tenkai products that wrap Chisei must declare the contracts this release provides (`chisei.admin-rpc`, `chisei.enterprise-rpc`). A product without those provides holds dependents that require them (#2134).
+- MCP `evaluate_set` results are paired with query receipts. Callers that parsed the previous unreceipted shape must read the receipt (#2160).
+- A turn-token's `act` is the person the agent acts for, not the worker. Agent-turn claim keeps the token and continuation on the claim response (#2126, #2127).
+- Archived attestation reads are distinct from missing. Clients that treated both as not-found must branch (#2125).
+- Additive gRPC RPCs generate default stubs. Regenerated clients pick up the new methods (#2158).
+- `ListSiteAgentWorkingMemory` pages by instance. Clients that assumed a single unbounded page must follow the cursor (#2156).
+- Forgotten memory Actions record erase markers. PostgreSQL applies schema versions 139–142 (`retention_predicate_indexes`, `agent_turn_claim_index`, `site_agent_memory_instance_index`, `writer_memory_object_indexes`). Backup the store before the first 2.0.0 boot. A binary or image rollback to 1.5.0 does not undo applied schema (#2129, #2131, #2156, #2164, #2167).
+- SQLite no longer seeds default retention policies. Operators who relied on the seed must set policy explicitly (#2118).
+
+### Breaking
+
+- Distinguish archived attestation reads from missing (#2125).
+- Keep the agent-turn token and continuation on claim (#2126).
+- Keep turn-token `act` as the person the agent acts for (#2127).
+- Tenkai products declare the contracts Chisei provides (#2134).
+- Retry GitHub publish permits after digest conflicts (#2148).
+- Page `ListSiteAgentWorkingMemory` by instance (#2156).
+- Generate default gRPC stubs for additive RPCs (#2158).
+- Pair `evaluate_set` results with query receipts (#2160).
+- Record erase markers for forgotten memory Actions (#2164).
+
+### Upgrade
+
+- Stop seeding SQLite default retention policies (#2118).
+- Skip idle retention ticks and lock only expired rows (#2129).
+- Skip-lock agent-turn claim-next (#2131).
+- Backfill forgotten memory Action redaction (#2162).
+- Index forget redaction by writer object_id (#2167).
+
+### Added
+
+- Verify Ed25519 identity assertions by key id (#2136).
+- Require a client certificate when a client CA is set (#2139).
+- Promote definition-change MCP RPCs to stable (#2144).
+- Add a definition-change tracer fixture (#2146).
+
+### Changed
+
+- Move root-independent tests and examples off the root package (#2115).
+- Load binding and policy once on hot reads (#2147).
+- Hoist invariant FederatedAggregate auth (#2153).
+
+### Fixed
+
+- Add policy list, set, and delete CLI (#2120).
+- Withhold federated suppressed-group count from callers (#2128).
+- Verify only expired ledger prefixes (#2130).
+- Redact working-memory list like GetObject (#2135).
+- Install rustls CryptoProvider before TLS listen (#2137).
+- Refuse unbound and orphan transform inputs (#2138).
+- Admit CreateDataset, AppendRows, UpdateDataset for enterprise (#2140).
+- Refuse unbound dataset branches for enterprise (#2141).
+- Compare public API to last tag and require `#[non_exhaustive]` (#2142).
+- Accept tagged MySQL GTID sets (#2143).
+- Accept tenant-mode observation evidence targets (#2145).
+- Confirm recovery when Tenkai signatures embed the reason (#2150).
+- Page past the 256-row list cap for recurrence and publish (#2152).
+- Do not treat quality evaluations as measured reproductions (#2154).
+- Lock PostgreSQL objects before Action rows (#2161).
+- Label served gRPC methods from proto inventory (#2163).
+- Plan lookup-first hits without a provider (#2165).
+- Refuse turn workers that are the instance principal (#2166).
+
 ## 1.5.0
 
 Upgrade notes:

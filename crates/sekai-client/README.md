@@ -10,7 +10,7 @@ provider routing, persistence, and receipts.
 
 ## Supported surface
 
-The `0.1.x` surface provides:
+The `1.x` surface provides:
 
 - HTTPS, loopback HTTP, and Unix-socket tonic transport setup;
 - in-memory bearer credentials with redacted `Debug` output;
@@ -41,10 +41,10 @@ processing semantics can consume the cancellable stream directly.
 
 ## Compatibility and migration policy
 
-The crate follows semver within `0.1.x`: additive public API changes are
-preferred, and breaking changes require a new minor version before `1.0.0`.
-The crate's major protocol dependency is `sekai-proto` `1.x`; generated
-bindings are never copied into this package. A consumer should pin compatible
+The crate follows semver on `1.x`: additive public API changes are preferred,
+and breaking changes require a new major. The crate's major protocol
+dependency is `sekai-proto` `2.x`; generated bindings are never copied into
+this package. A consumer should pin compatible
 `sekai-client` and `sekai-proto` versions together and migrate from raw tonic
 clients by replacing connection, metadata, timeout, error, and stream plumbing
 with `CoreLoopClient` calls. Unsupported RPCs can remain on `client.raw()`
