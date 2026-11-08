@@ -28,7 +28,9 @@ pub const EXPERIMENTAL_CAPABILITY: &str = "sekai.rpc.experimental";
 const EXPERIMENTAL_MESSAGE: &str =
     "rpc is experimental; enable SEKAI_EXPERIMENTAL_RPCS=1 or the experimental-rpcs build feature";
 const REMOVE_MESSAGE: &str = "rpc is classified for removal; enable SEKAI_EXPERIMENTAL_RPCS=1 to invoke during the deprecation window";
-const UNKNOWN_MESSAGE: &str = "rpc has no maturity classification";
+/// The refusal for an RPC missing from the table. `sekai-client` matches
+/// this text to treat the RPC as not served by this plane; keep them equal.
+pub const UNKNOWN_MESSAGE: &str = "rpc has no maturity classification";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

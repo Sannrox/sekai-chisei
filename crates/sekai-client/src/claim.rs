@@ -8,8 +8,9 @@
 //!
 //! Every kind goes through the one claim family of ADR 0149
 //! (`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim`, `AckWork`);
-//! the per-kind methods narrow its `oneof` payloads. Planes that predate
-//! that family serve only the per-kind RPCs, so upgrade planes first.
+//! the per-kind methods narrow its `oneof` payloads. On a plane that does
+//! not serve that family, each call falls back to the per-kind RPC, so
+//! planes and workers upgrade in either order.
 //!
 //! `SdkError` does not retain arbitrary server status text. Allowlisted
 //! `delegator_*` tokens are kept as `reason_code` so claim and owned-claim
@@ -29,12 +30,17 @@ use uuid::Uuid;
 
 pub use crate::protocol::sekai::WorkKind;
 use crate::protocol::sekai::{
-    AckActionWorkResponse, AckAgentTurnResponse, AckWorkRequest, AckWorkResponse, ActionAckOptions,
-    AgentTurn, AgentTurnAckOptions, AgentTurnContinuation, AgentTurnWorkOptions,
-    ApplyStreamingTransformBatchRequest, ApplyStreamingTransformBatchResponse,
-    ClaimActionWorkResponse, ClaimAgentTurnResponse, ClaimTransformWorkResponse, ClaimWorkRequest,
-    ClaimWorkResponse, HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimResponse,
-    HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest, HeartbeatWorkClaimResponse,
+    AckActionWorkRequest, AckActionWorkResponse, AckAgentTurnRequest, AckAgentTurnResponse,
+    AckWorkRequest, AckWorkResponse, ActionAckOptions, AgentTurn, AgentTurnAckOptions,
+    AgentTurnContinuation, AgentTurnWorkOptions, ApplyStreamingTransformBatchRequest,
+    ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
+    ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
+    ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, HeartbeatActionClaimRequest,
+    HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
+    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest,
+    HeartbeatWorkClaimResponse, ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
+    ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
+    ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
     ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
     ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
@@ -63,10 +69,17 @@ const LIST_WORK: &str = "/sekai.SekaiService/ListClaimableWork";
 const CLAIM_WORK: &str = "/sekai.SekaiService/ClaimWork";
 const HEARTBEAT_WORK: &str = "/sekai.SekaiService/HeartbeatWorkClaim";
 const ACK_WORK: &str = "/sekai.SekaiService/AckWork";
-// The per-kind paths `DispatchKind` names. The client itself calls the
-// work family above.
+// The per-kind paths: `DispatchKind` names them, and the client falls back
+// to them on a plane without the work family.
 const LIST_ACTION: &str = "/sekai.SekaiService/ListClaimableActionWork";
 const CLAIM_ACTION: &str = "/sekai.SekaiService/ClaimActionWork";
+const HEARTBEAT_ACTION: &str = "/sekai.SekaiService/HeartbeatActionClaim";
+const ACK_ACTION: &str = "/sekai.SekaiService/AckActionWork";
+const HEARTBEAT_TRANSFORM: &str = "/sekai.SekaiService/HeartbeatTransformClaim";
+const LIST_AGENT_TURN: &str = "/sekai.SekaiService/ListClaimableAgentTurns";
+const CLAIM_AGENT_TURN: &str = "/sekai.SekaiService/ClaimAgentTurn";
+const HEARTBEAT_AGENT_TURN: &str = "/sekai.SekaiService/HeartbeatAgentTurnClaim";
+const ACK_AGENT_TURN: &str = "/sekai.SekaiService/AckAgentTurn";
 const REPORT_ACTION: &str = "/sekai.SekaiService/ReportActionClaimEvent";
 const REGISTER_TRANSFORM_RUNTIME: &str = "/sekai.SekaiService/RegisterTransformRuntime";
 const LIST_TRANSFORM: &str = "/sekai.SekaiService/ListClaimableTransformWork";
@@ -477,27 +490,25 @@ impl<'a> RuntimeClaimClient<'a> {
         Req: prost::Message + Default + Clone + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
-        self.client
-            .raw()
-            .unary(path, request, self.options(retryable))
+        self.call(path, request, retryable)
             .await
             .map_err(|error| RuntimeClaimError::from_sdk(error, owned_fence))
     }
 
-    async fn list_unary<Req, Resp>(
+    async fn call<Req, Resp>(
         &self,
         path: &str,
         request: Req,
-    ) -> Result<Resp, RuntimeClaimError>
+        retryable: bool,
+    ) -> Result<Resp, SdkError>
     where
         Req: prost::Message + Default + Clone + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
         self.client
             .raw()
-            .unary(path, request, self.options(true))
+            .unary(path, request, self.options(retryable))
             .await
-            .map_err(RuntimeClaimError::from_list)
     }
 
     /// Lists claimable work of `kind` in the client's namespace. Agent turns
@@ -508,26 +519,23 @@ impl<'a> RuntimeClaimClient<'a> {
         runtime_id: impl Into<String>,
         limit: i32,
     ) -> Result<Vec<claimable_work::Payload>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let listed: ListClaimableWorkResponse = self
-            .list_unary(
-                LIST_WORK,
-                ListClaimableWorkRequest {
-                    kind: kind.into(),
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    limit,
-                    options: (kind == WorkKind::AgentTurn).then_some(
-                        list_claimable_work_request::Options::AgentTurn(turn_options()),
-                    ),
-                },
-            )
-            .await?;
-        Ok(listed
-            .work
-            .into_iter()
-            .filter_map(|work| work.payload)
-            .collect())
+        let request = ListClaimableWorkRequest {
+            kind: kind.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: (kind == WorkKind::AgentTurn).then_some(
+                list_claimable_work_request::Options::AgentTurn(turn_options()),
+            ),
+        };
+        match self.call(LIST_WORK, request.clone(), true).await {
+            Ok(ListClaimableWorkResponse { work }) => {
+                Ok(work.into_iter().filter_map(|work| work.payload).collect())
+            }
+            Err(error) if unserved(&error) => self.list_per_kind(request).await,
+            Err(error) => Err(error),
+        }
+        .map_err(RuntimeClaimError::from_list)
     }
 
     /// Claims `work_id` of `kind` in the client's namespace; an empty
@@ -542,36 +550,27 @@ impl<'a> RuntimeClaimClient<'a> {
         ttl: Duration,
         request_id: Option<String>,
     ) -> Result<ClaimAttempt<claim_work_response::Payload>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let work_id = work_id.into();
-        let request_id = match kind {
-            WorkKind::Action => request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            _ => String::new(),
+        let request = ClaimWorkRequest {
+            kind: kind.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            work_id: work_id.into(),
+            ttl_ms: duration_millis(ttl)?,
+            request_id: match kind {
+                WorkKind::Action => request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                _ => String::new(),
+            },
+            options: (kind == WorkKind::AgentTurn)
+                .then_some(claim_work_request::Options::AgentTurn(turn_options())),
         };
-        let claimed = self
-            .client
-            .raw()
-            .unary::<_, ClaimWorkResponse>(
-                CLAIM_WORK,
-                ClaimWorkRequest {
-                    kind: kind.into(),
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    work_id: work_id.clone(),
-                    ttl_ms: duration_millis(ttl)?,
-                    request_id,
-                    options: (kind == WorkKind::AgentTurn)
-                        .then_some(claim_work_request::Options::AgentTurn(turn_options())),
-                },
-                self.options(false),
-            )
-            .await;
+        let claimed = match self.call(CLAIM_WORK, request.clone(), false).await {
+            Ok(ClaimWorkResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) => self.claim_per_kind(request.clone()).await,
+            Err(error) => Err(error),
+        };
         match claimed {
-            Ok(response) => response
-                .payload
-                .map(ClaimAttempt::Claimed)
-                .ok_or_else(unexpected_response),
-            Err(error) => RuntimeClaimError::from_claim(kind, &work_id, error),
+            Ok(payload) => Ok(ClaimAttempt::Claimed(payload)),
+            Err(error) => RuntimeClaimError::from_claim(kind, &request.work_id, error),
         }
     }
 
@@ -581,22 +580,20 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &WorkFence,
         ttl: Duration,
     ) -> Result<heartbeat_work_claim_response::Payload, RuntimeClaimError> {
-        let renewed: HeartbeatWorkClaimResponse = self
-            .unary(
-                HEARTBEAT_WORK,
-                HeartbeatWorkClaimRequest {
-                    kind: fence.kind.into(),
-                    work_id: fence.work_id.clone(),
-                    runtime_id: fence.runtime_id.clone(),
-                    claim_generation: fence.generation,
-                    fencing_token: fence.fencing_token.clone(),
-                    ttl_ms: duration_millis(ttl)?,
-                },
-                false,
-                true,
-            )
-            .await?;
-        renewed.payload.ok_or_else(unexpected_response)
+        let request = HeartbeatWorkClaimRequest {
+            kind: fence.kind.into(),
+            work_id: fence.work_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            claim_generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+            ttl_ms: duration_millis(ttl)?,
+        };
+        match self.call(HEARTBEAT_WORK, request.clone(), false).await {
+            Ok(HeartbeatWorkClaimResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) => self.heartbeat_per_kind(request).await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| RuntimeClaimError::from_sdk(error, true))
     }
 
     /// Ends the held claim `fence` with `outcome` (`completed`, `failed` or
@@ -609,24 +606,290 @@ impl<'a> RuntimeClaimClient<'a> {
         reason: String,
         options: Option<ack_work_request::Options>,
     ) -> Result<ack_work_response::Payload, RuntimeClaimError> {
-        let acked: AckWorkResponse = self
-            .unary(
-                ACK_WORK,
-                AckWorkRequest {
-                    kind: fence.kind.into(),
-                    work_id: fence.work_id.clone(),
-                    runtime_id: fence.runtime_id.clone(),
-                    claim_generation: fence.generation,
-                    fencing_token: fence.fencing_token.clone(),
-                    outcome: outcome.into(),
-                    reason,
-                    options,
-                },
-                fence.kind == WorkKind::AgentTurn,
-                true,
-            )
-            .await?;
-        acked.payload.ok_or_else(unexpected_response)
+        let request = AckWorkRequest {
+            kind: fence.kind.into(),
+            work_id: fence.work_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            claim_generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+            outcome: outcome.into(),
+            reason,
+            options,
+        };
+        let retryable = fence.kind == WorkKind::AgentTurn;
+        match self.call(ACK_WORK, request.clone(), retryable).await {
+            Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) => self.ack_per_kind(request).await,
+            Err(error) => Err(error),
+        }
+        .map_err(|error| RuntimeClaimError::from_sdk(error, true))
+    }
+
+    // Per-kind fallback for planes that predate the work family, so planes
+    // and workers upgrade in either order. Each mirrors the plane's own
+    // translation in `claimable_work_rpc.rs`. Remove with the per-kind RPCs
+    // at the next major.
+
+    async fn list_per_kind(
+        &self,
+        request: ListClaimableWorkRequest,
+    ) -> Result<Vec<claimable_work::Payload>, SdkError> {
+        use claimable_work::Payload;
+        let kind = request.kind();
+        let ListClaimableWorkRequest {
+            namespace,
+            runtime_id,
+            limit,
+            options,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => {
+                let listed: ListClaimableActionWorkResponse = self
+                    .call(
+                        LIST_ACTION,
+                        ListClaimableActionWorkRequest {
+                            namespace,
+                            runtime_id,
+                            limit: u32::try_from(limit)
+                                .map_err(|_| SdkError::invalid_argument())?,
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.effects.into_iter().map(Payload::Action).collect()
+            }
+            WorkKind::Transform => {
+                let listed: ListClaimableTransformWorkResponse = self
+                    .call(
+                        LIST_TRANSFORM,
+                        ListClaimableTransformWorkRequest {
+                            namespace,
+                            runtime_id,
+                            limit,
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.work.into_iter().map(Payload::Transform).collect()
+            }
+            WorkKind::AgentTurn => {
+                let listed: ListClaimableAgentTurnsResponse = self
+                    .call(
+                        LIST_AGENT_TURN,
+                        ListClaimableAgentTurnsRequest {
+                            namespace,
+                            limit,
+                            accepts_continuation: matches!(
+                                options,
+                                Some(list_claimable_work_request::Options::AgentTurn(options))
+                                    if options.accepts_continuation
+                            ),
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.turns.into_iter().map(Payload::AgentTurn).collect()
+            }
+            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+        })
+    }
+
+    async fn claim_per_kind(
+        &self,
+        request: ClaimWorkRequest,
+    ) -> Result<claim_work_response::Payload, SdkError> {
+        use claim_work_response::Payload;
+        let kind = request.kind();
+        let ClaimWorkRequest {
+            namespace,
+            runtime_id,
+            work_id,
+            ttl_ms,
+            request_id,
+            options,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => Payload::Action(
+                self.call(
+                    CLAIM_ACTION,
+                    ClaimActionWorkRequest {
+                        effect_id: work_id,
+                        runtime_id,
+                        request_id,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Transform => Payload::Transform(
+                self.call(
+                    CLAIM_TRANSFORM,
+                    ClaimTransformWorkRequest {
+                        namespace,
+                        runtime_id,
+                        run_id: work_id,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::AgentTurn => Payload::AgentTurn(
+                self.call(
+                    CLAIM_AGENT_TURN,
+                    ClaimAgentTurnRequest {
+                        namespace,
+                        runtime_id,
+                        turn_id: work_id,
+                        ttl_ms,
+                        accepts_continuation: matches!(
+                            options,
+                            Some(claim_work_request::Options::AgentTurn(options))
+                                if options.accepts_continuation
+                        ),
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+        })
+    }
+
+    async fn heartbeat_per_kind(
+        &self,
+        request: HeartbeatWorkClaimRequest,
+    ) -> Result<heartbeat_work_claim_response::Payload, SdkError> {
+        use heartbeat_work_claim_response::Payload;
+        let kind = request.kind();
+        let HeartbeatWorkClaimRequest {
+            work_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            ttl_ms,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => Payload::Action(
+                self.call(
+                    HEARTBEAT_ACTION,
+                    HeartbeatActionClaimRequest {
+                        effect_id: work_id,
+                        runtime_id,
+                        claim_generation: action_generation(claim_generation)?,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Transform => Payload::Transform(
+                self.call(
+                    HEARTBEAT_TRANSFORM,
+                    HeartbeatTransformClaimRequest {
+                        run_id: work_id,
+                        runtime_id,
+                        claim_generation,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::AgentTurn => Payload::AgentTurn(
+                self.call(
+                    HEARTBEAT_AGENT_TURN,
+                    HeartbeatAgentTurnClaimRequest {
+                        turn_id: work_id,
+                        runtime_id,
+                        claim_generation,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+        })
+    }
+
+    async fn ack_per_kind(
+        &self,
+        request: AckWorkRequest,
+    ) -> Result<ack_work_response::Payload, SdkError> {
+        use ack_work_response::Payload;
+        let kind = request.kind();
+        let AckWorkRequest {
+            work_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            outcome,
+            reason,
+            options,
+            ..
+        } = request;
+        // As on the plane, omitted options are the kind's defaults.
+        Ok(match kind {
+            WorkKind::Action => {
+                let options = match options {
+                    None => ActionAckOptions::default(),
+                    Some(ack_work_request::Options::Action(options)) => options,
+                    Some(_) => return Err(SdkError::invalid_argument()),
+                };
+                Payload::Action(
+                    self.call(
+                        ACK_ACTION,
+                        AckActionWorkRequest {
+                            effect_id: work_id,
+                            runtime_id,
+                            claim_generation: action_generation(claim_generation)?,
+                            fencing_token,
+                            outcome,
+                            reason,
+                            request_id: options.request_id,
+                            checkpoint_store_id: options.checkpoint_store_id,
+                            checkpoint_ref: options.checkpoint_ref,
+                            checkpoint_digest: options.checkpoint_digest,
+                            artifact_json: options.artifact_json,
+                        },
+                        false,
+                    )
+                    .await?,
+                )
+            }
+            WorkKind::AgentTurn => {
+                let options = match options {
+                    None => AgentTurnAckOptions::default(),
+                    Some(ack_work_request::Options::AgentTurn(options)) => options,
+                    Some(_) => return Err(SdkError::invalid_argument()),
+                };
+                Payload::AgentTurn(
+                    self.call(
+                        ACK_AGENT_TURN,
+                        AckAgentTurnRequest {
+                            turn_id: work_id,
+                            runtime_id,
+                            claim_generation,
+                            fencing_token,
+                            outcome,
+                            reason,
+                            parked_action_instance_id: options.parked_action_instance_id,
+                        },
+                        true,
+                    )
+                    .await?,
+                )
+            }
+            _ => return Err(SdkError::invalid_argument()),
+        })
     }
 
     pub async fn list_action_work(
@@ -1035,6 +1298,29 @@ impl<'a> RuntimeClaimClient<'a> {
 }
 
 /// A response without its kind's payload, or with another kind's.
+/// Whether a work-family call may have hit a plane without that family.
+/// Such a plane answers `Unimplemented` (see `UNSERVED_RPC_MESSAGE` in the
+/// crate root for its maturity gate), or its auth refuses the unknown method
+/// first with `PermissionDenied`: runtime tokens on heartbeat and acknowledge,
+/// enterprise-scoped credentials on every call. The per-kind RPC runs its own
+/// auth, so a real denial still comes back denied, one call later.
+fn unserved(error: &SdkError) -> bool {
+    matches!(
+        error.code,
+        SdkErrorCode::Unimplemented | SdkErrorCode::PermissionDenied
+    )
+}
+
+/// A work-family response without its `oneof` payload.
+fn missing_payload() -> SdkError {
+    SdkError::new(SdkErrorCode::Internal)
+}
+
+/// Action RPCs carry the claim generation unsigned.
+fn action_generation(generation: i64) -> Result<u64, SdkError> {
+    u64::try_from(generation).map_err(|_| SdkError::invalid_argument())
+}
+
 fn unexpected_response() -> RuntimeClaimError {
     RuntimeClaimError::Transport(SdkError::new(SdkErrorCode::Internal))
 }

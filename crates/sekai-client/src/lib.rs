@@ -174,6 +174,11 @@ impl SdkErrorCode {
     }
 }
 
+/// What a plane's RPC maturity gate answers for an RPC it does not know.
+/// Such a plane does not serve the RPC, so the SDK reports `Unimplemented`,
+/// as a plane without the gate would.
+const UNSERVED_RPC_MESSAGE: &str = "rpc has no maturity classification";
+
 /// A safe, bounded error. Arbitrary server status text is deliberately not
 /// retained: it may contain provider or credential material. An allowlisted
 /// machine-readable `reason_code` (delegator refusals) is kept so the
@@ -232,13 +237,14 @@ impl SdkError {
         options: &CallOptions,
         request_id: &str,
     ) -> Self {
-        let mut error = Self::for_call(
-            SdkErrorCode::from_status(status.code()),
-            service,
-            method,
-            options,
-            request_id,
-        );
+        let code = if status.code() == tonic::Code::FailedPrecondition
+            && status.message() == UNSERVED_RPC_MESSAGE
+        {
+            SdkErrorCode::Unimplemented
+        } else {
+            SdkErrorCode::from_status(status.code())
+        };
+        let mut error = Self::for_call(code, service, method, options, request_id);
         error.reason_code = claim::allowlisted_reason_code(status.message());
         error
     }
