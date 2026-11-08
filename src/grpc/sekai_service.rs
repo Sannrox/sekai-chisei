@@ -15,6 +15,8 @@ mod capability_discovery;
 mod catalog_invocation;
 #[path = "catalog_rpc.rs"]
 mod catalog_rpc;
+#[path = "claimable_work_rpc.rs"]
+mod claimable_work_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
 #[path = "data_export_rpc.rs"]
@@ -253,6 +255,10 @@ impl SekaiService for SekaiServiceImpl {
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
+        list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
+        claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
+        heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
+        ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;
         list_site_agent_working_memory => list_site_agent_working_memory_rpc(ListSiteAgentWorkingMemoryRequest) -> ListSiteAgentWorkingMemoryResponse;
         grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;
         revoke_namespace_export => revoke_namespace_export_rpc(RevokeNamespaceExportRequest) -> RevokeNamespaceExportResponse;

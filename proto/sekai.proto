@@ -1341,6 +1341,116 @@ message AckAgentTurnRequest {
 message AckAgentTurnResponse {
   AgentTurn turn = 1;
 }
+// Experimental (ADR 0149). A kind of claimable work. Every kind follows the
+// ADR 0129 claim contract; the old per-kind RPCs and these see the same
+// claim on the same row.
+enum WorkKind {
+  WORK_KIND_UNSPECIFIED = 0;
+  WORK_KIND_TRANSFORM = 1;
+  WORK_KIND_ACTION = 2;
+  WORK_KIND_AGENT_TURN = 3;
+}
+// Options of a list or claim of agent turns.
+message AgentTurnWorkOptions {
+  // When false, parked turns that would resume with a continuation are
+  // neither listed nor claimed.
+  bool accepts_continuation = 1;
+}
+message ListClaimableWorkRequest {
+  WorkKind kind = 1;
+  string namespace = 2;
+  // Transform and Action work: lists only work this runtime may take.
+  string runtime_id = 3;
+  int32 limit = 4;
+  oneof options {
+    AgentTurnWorkOptions agent_turn = 10;
+  }
+}
+// One claimable item; the set field names its kind.
+message ClaimableWork {
+  oneof payload {
+    TransformWork transform = 1;
+    ActionEffect action = 2;
+    AgentTurn agent_turn = 3;
+  }
+}
+message ListClaimableWorkResponse {
+  repeated ClaimableWork work = 1;
+}
+message ClaimWorkRequest {
+  WorkKind kind = 1;
+  // Transform work and agent turns. Action work is named by work_id alone.
+  string namespace = 2;
+  string runtime_id = 3;
+  // run_id, effect_id or turn_id. Empty claims the next due item, for
+  // transform work and agent turns.
+  string work_id = 4;
+  int64 ttl_ms = 5;
+  // Action work: the idempotency key of this claim. Required for it.
+  string request_id = 6;
+  oneof options {
+    AgentTurnWorkOptions agent_turn = 10;
+  }
+}
+// The kind's own claim response, as its per-kind RPC returns it.
+message ClaimWorkResponse {
+  oneof payload {
+    ClaimTransformWorkResponse transform = 1;
+    ClaimActionWorkResponse action = 2;
+    ClaimAgentTurnResponse agent_turn = 3;
+  }
+}
+message HeartbeatWorkClaimRequest {
+  WorkKind kind = 1;
+  // run_id, effect_id or turn_id.
+  string work_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  int64 ttl_ms = 6;
+}
+message HeartbeatWorkClaimResponse {
+  oneof payload {
+    HeartbeatTransformClaimResponse transform = 1;
+    HeartbeatActionClaimResponse action = 2;
+    HeartbeatAgentTurnClaimResponse agent_turn = 3;
+  }
+}
+// Action-work fields of an acknowledge; see AckActionWorkRequest.
+message ActionAckOptions {
+  string request_id = 1;
+  string checkpoint_store_id = 2;
+  string checkpoint_ref = 3;
+  string checkpoint_digest = 4;
+  string artifact_json = 5;
+}
+// Agent-turn fields of an acknowledge; see AckAgentTurnRequest.
+message AgentTurnAckOptions {
+  string parked_action_instance_id = 1;
+}
+// Action work and agent turns only. Transform work is acknowledged by
+// WriteTransformRunResult, which carries its output.
+message AckWorkRequest {
+  WorkKind kind = 1;
+  // effect_id or turn_id.
+  string work_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  // completed, failed or parked.
+  string outcome = 6;
+  string reason = 7;
+  oneof options {
+    ActionAckOptions action = 10;
+    AgentTurnAckOptions agent_turn = 11;
+  }
+}
+message AckWorkResponse {
+  oneof payload {
+    AckActionWorkResponse action = 1;
+    AckAgentTurnResponse agent_turn = 2;
+  }
+}
 // Experimental (#1968). Live (not forgotten) working memory of one site
 // agent instance, for an agent turn. An item is returned only when the
 // instance principal and the requester can each read it on their own.
@@ -5047,6 +5157,12 @@ service SekaiService {
   rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
   rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
   rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
+  // Experimental (ADR 0149). One claim family over every work kind; each
+  // call runs the kind's own RPC above, so both families see one claim.
+  rpc ListClaimableWork(ListClaimableWorkRequest) returns (ListClaimableWorkResponse);
+  rpc ClaimWork(ClaimWorkRequest) returns (ClaimWorkResponse);
+  rpc HeartbeatWorkClaim(HeartbeatWorkClaimRequest) returns (HeartbeatWorkClaimResponse);
+  rpc AckWork(AckWorkRequest) returns (AckWorkResponse);
   rpc ListSiteAgentWorkingMemory(ListSiteAgentWorkingMemoryRequest) returns (ListSiteAgentWorkingMemoryResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
