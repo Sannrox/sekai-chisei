@@ -207,18 +207,19 @@ impl IssuePublisher {
             .and_then(observation_view)
             .map(|view| view.problem_signature)
             .ok_or("the finding's observation is not visible")?;
-        let investigation = self
+        // A measured reproduction can share the observation; only the bucket
+        // analysis parses as one.
+        let analysis = self
             .list(sekai, KIND_INVESTIGATION_RESULT, "observation_id", &anchor)
             .await?
-            .into_iter()
-            .find(runtime_investigation);
-        let property = |key: &str| {
-            investigation
-                .as_ref()
-                .and_then(|investigation| investigation.properties.get(key))
-        };
-        let analysis = property("outcome")
-            .and_then(|outcome| serde_json::from_str::<InvestigationAnalysis>(outcome).ok());
+            .iter()
+            .filter(|investigation| runtime_investigation(investigation))
+            .find_map(|investigation| {
+                serde_json::from_str::<InvestigationAnalysis>(
+                    investigation.properties.get("outcome")?,
+                )
+                .ok()
+            });
         // The same plane-recorded check filing used, never the model's own claim.
         let measured = self.measured_reproduction(sekai, &signature).await?;
         let observations = self

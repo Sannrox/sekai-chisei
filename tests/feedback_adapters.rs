@@ -881,9 +881,10 @@ async fn a_measured_reproduction_of_any_observation_is_published() {
         &publication.plane,
         INVESTIGATION_RUNTIME,
         json!({
-            "object_id": "inv-measured",
+            // Sorts before the bucket analysis on the same observation.
+            "object_id": "a-measured",
             "name": SIGNATURE,
-            "observation_id": "o-3",
+            "observation_id": "o-1",
             "outcome": "reproduced",
             "measured": true,
         }),
@@ -892,6 +893,7 @@ async fn a_measured_reproduction_of_any_observation_is_published() {
     publication.publish().await;
     let issues = publication.tracker.github.issues.borrow();
     assert!(issues[0].body.contains("## Reproduction\n\nMeasured."));
+    assert!(issues[0].body.contains("## Attribution\n\ntenkai"));
 }
 
 #[tokio::test]
