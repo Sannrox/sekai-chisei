@@ -28,7 +28,7 @@ use crate::sekai::execution_evidence::{
     EXECUTION_EVIDENCE_SCHEMA, EXECUTION_EVIDENCE_TYPE, ExecutionEvidence, ExecutionLifecycleState,
 };
 use crate::sekai::feedback_investigation::{
-    eq_property, github_dispatch_permitted, list_feedback_objects,
+    eq_property, github_dispatch_permitted, list_feedback_objects, runtime_recorded,
 };
 use crate::sekai::feedback_package::{
     ACTION_EXTERNAL_ISSUE, KIND_EXTERNAL_ISSUE, KIND_FINDING, KIND_HYPOTHESIS,
@@ -1220,6 +1220,9 @@ fn related_object(
         if object.properties.get("observation_id").map(String::as_str) != Some(observation_id) {
             continue;
         }
+        if kind == KIND_INVESTIGATION_RESULT && !runtime_recorded(&object) {
+            continue;
+        }
         let parses_analysis = object
             .properties
             .get("outcome")
@@ -1494,10 +1497,14 @@ mod tests {
     use crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle;
     use crate::sekai::evidence_store::{EvidenceProducerCapability, canonical_content_digest};
     use crate::sekai::feedback_investigation::{
-        Attribution, InvestigationAnalysis, record_investigation,
+        Attribution, CLASSIFICATION_QUALIFYING, InvestigationAnalysis, github_dispatch_permitted,
+        record_investigation,
     };
-    use crate::sekai::feedback_package::{EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, install};
+    use crate::sekai::feedback_package::{
+        EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, KIND_FINDING, install,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     const NAMESPACE: &str = "ops";
@@ -2316,6 +2323,31 @@ mod tests {
         };
         let report = record_investigation(&runtime, &cluster, &analysis, ACTOR, 2_000).unwrap();
         let finding = runtime.get_object(&report.finding_id).unwrap().unwrap();
+        let github = MemoryGitHub::new();
+        let error = publish(&runtime, &github, &AllowPermit, &finding).unwrap_err();
+        assert!(matches!(error, PublishError::NotQualifying));
+        assert_eq!(github.created(), 0);
+    }
+
+    #[test]
+    fn writer_created_qualifying_finding_is_not_published() {
+        let runtime = db();
+        let finding = Object {
+            id: "writer-find".into(),
+            kind: KIND_FINDING.into(),
+            name: "forged".into(),
+            namespace: NAMESPACE.into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("classification".into(), CLASSIFICATION_QUALIFYING.into()),
+                ("observation_id".into(), "o-1".into()),
+                ("statement".into(), "forged impact".into()),
+            ]),
+            created: 1_000,
+            updated: 1_000,
+        };
+        runtime.create_object(&finding).unwrap();
+        assert!(!github_dispatch_permitted(&finding));
         let github = MemoryGitHub::new();
         let error = publish(&runtime, &github, &AllowPermit, &finding).unwrap_err();
         assert!(matches!(error, PublishError::NotQualifying));

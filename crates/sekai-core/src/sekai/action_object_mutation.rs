@@ -653,22 +653,25 @@ fn validate_object_write(
     submitter: Option<Submitter<'_>>,
     now_ms: i64,
 ) -> Result<(), ActionObjectMutationError> {
-    crate::sekai::feedback_package::validate_object_write(db, planned, now_ms)
-        .and_then(|()| {
-            crate::sekai::security_package::validate_object_write(db, planned, submitter, now_ms)
-        })
-        .and_then(|()| {
-            crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms)
-        })
-        .and_then(|()| {
-            crate::sekai::site_agent_memory::validate_object_write(
-                db,
-                planned,
-                submitter.map(|submitter| submitter.principal),
-            )
-        })
-        .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
-        .map_err(ActionObjectMutationError::FailedPrecondition)
+    crate::sekai::feedback_package::validate_object_write_for(
+        db,
+        planned,
+        submitter.map(|submitter| submitter.principal),
+        now_ms,
+    )
+    .and_then(|()| {
+        crate::sekai::security_package::validate_object_write(db, planned, submitter, now_ms)
+    })
+    .and_then(|()| crate::sekai::site_agent_instance::validate_object_write(db, planned, now_ms))
+    .and_then(|()| {
+        crate::sekai::site_agent_memory::validate_object_write(
+            db,
+            planned,
+            submitter.map(|submitter| submitter.principal),
+        )
+    })
+    .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, planned, now_ms))
+    .map_err(ActionObjectMutationError::FailedPrecondition)
 }
 
 /// Best-effort follow-up after an Action's object write is durable. Runs

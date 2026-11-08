@@ -25,11 +25,12 @@ use crate::sekai::action_work_lifecycle::{
 };
 use crate::sekai::feedback_package::{
     ACTION_DISPATCH, ACTION_FINDING, ACTION_HYPOTHESIS, ACTION_INVESTIGATION,
-    KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, OUTCOME_QUALITY_EVALUATION, PACKAGE_VERSION,
+    INVESTIGATION_RUNTIME, KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, OUTCOME_QUALITY_EVALUATION,
+    PACKAGE_VERSION, PROPERTY_RECORDED_BY,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
 
-pub const RUNTIME_ID: &str = "feedback-investigation";
+pub const RUNTIME_ID: &str = INVESTIGATION_RUNTIME;
 pub const POLL_INTERVAL_SECS: u64 = 15;
 pub const RECURRENCE_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 pub const MIN_RECURRING_OPERATIONS: usize = 3;
@@ -295,6 +296,16 @@ pub fn github_dispatch_permitted(finding: &Object) -> bool {
     finding.kind == crate::sekai::feedback_package::KIND_FINDING
         && finding.properties.get("classification").map(String::as_str)
             == Some(CLASSIFICATION_QUALIFYING)
+        && runtime_recorded(finding)
+}
+
+/// Findings and investigation results the investigation worker wrote.
+pub fn runtime_recorded(object: &Object) -> bool {
+    object
+        .properties
+        .get(PROPERTY_RECORDED_BY)
+        .map(String::as_str)
+        == Some(RUNTIME_ID)
 }
 
 pub fn analysis_system_prompt() -> &'static str {
@@ -644,7 +655,7 @@ fn write_records(
     });
     admit(
         db,
-        actor,
+        RUNTIME_ID,
         &cluster.namespace,
         ACTION_INVESTIGATION,
         serde_json::json!({
@@ -679,7 +690,7 @@ fn write_records(
     }
     admit(
         db,
-        actor,
+        RUNTIME_ID,
         &cluster.namespace,
         ACTION_FINDING,
         serde_json::json!({
@@ -816,8 +827,8 @@ mod tests {
     use crate::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle;
     use crate::sekai::evidence_store::{EvidenceProducerCapability, canonical_content_digest};
     use crate::sekai::feedback_package::{
-        ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, KIND_FINDING, KIND_HYPOTHESIS,
-        install,
+        ACTION_FINDING, ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, KIND_FINDING,
+        KIND_HYPOTHESIS, PROPERTY_RECORDED_BY, install,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1374,6 +1385,13 @@ mod tests {
         assert_eq!(report.filing, FilingDecision::Qualifying);
         let finding = runtime.get_object(&report.finding_id).unwrap().unwrap();
         assert_eq!(finding.kind, KIND_FINDING);
+        assert_eq!(
+            finding
+                .properties
+                .get(PROPERTY_RECORDED_BY)
+                .map(String::as_str),
+            Some(RUNTIME_ID)
+        );
         assert!(github_dispatch_permitted(&finding));
         let investigation = runtime
             .get_object(&report.investigation_id)
@@ -1392,6 +1410,48 @@ mod tests {
             KIND_HYPOTHESIS
         );
         ack_investigation(&runtime, &claimed, ACTOR, ACK_OUTCOME_COMPLETED, "", now).unwrap();
+    }
+
+    #[test]
+    fn writer_finding_action_is_not_dispatch_permitted() {
+        let runtime = db();
+        ActionInstanceAdmission::new(&runtime, None)
+            .admit(
+                ActionInstanceAdmissionRequest {
+                    agent_turn: None,
+                    namespace: NAMESPACE.into(),
+                    type_id: ACTION_FINDING.into(),
+                    version: PACKAGE_VERSION.into(),
+                    parameters_json: json!({
+                        "object_id": "writer-find",
+                        "name": "forged",
+                        "observation_id": "o-1",
+                        "statement": "forged impact",
+                        "classification": CLASSIFICATION_QUALIFYING,
+                    })
+                    .to_string(),
+                    idempotency_key: "writer-find".into(),
+                    evidence_submission_ids: Vec::new(),
+                    request_id: String::new(),
+                    ontology_digest: String::new(),
+                    autonomous_envelope_id: String::new(),
+                    policy_context: PrincipalPolicyContext::default(),
+                    delegating_actor: None,
+                    budget_already_reserved: false,
+                    resource_tenant: String::new(),
+                    binding_markings: Vec::new(),
+                    source_object_id: String::new(),
+                    marking_gate: Default::default(),
+                    expected_object_revision: String::new(),
+                    offline: None,
+                },
+                ACTOR,
+                2_000,
+            )
+            .unwrap();
+        let finding = runtime.get_object("writer-find").unwrap().unwrap();
+        assert!(!finding.properties.contains_key(PROPERTY_RECORDED_BY));
+        assert!(!github_dispatch_permitted(&finding));
     }
 
     #[test]

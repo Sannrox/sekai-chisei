@@ -35,6 +35,10 @@ pub const KIND_INVESTIGATION_RESULT: &str = "feedback_investigation_result";
 pub const KIND_HYPOTHESIS: &str = "feedback_hypothesis";
 pub const KIND_EXTERNAL_ISSUE: &str = "feedback_external_issue";
 pub const KIND_VERIFICATION: &str = "feedback_verification";
+/// Stamped only by the investigation worker. Callers cannot set it.
+pub const PROPERTY_RECORDED_BY: &str = "recorded_by";
+/// Principal the investigation worker uses when it writes findings.
+pub const INVESTIGATION_RUNTIME: &str = "feedback-investigation";
 /// Outcome written by the quality pass. Not a measured reproduction.
 pub const OUTCOME_QUALITY_EVALUATION: &str = "quality-evaluation";
 pub const ACTION_OBSERVATION: &str = "feedback.observation.record";
@@ -44,6 +48,21 @@ pub const ACTION_DISPATCH: &str = "feedback.investigation.dispatch";
 pub const ACTION_HYPOTHESIS: &str = "feedback.hypothesis.record";
 pub const ACTION_EXTERNAL_ISSUE: &str = "feedback.external_issue.record";
 pub const ACTION_VERIFICATION: &str = "feedback.verification.record";
+
+/// Package kinds written only through their governed Actions (#2053).
+pub fn is_package_kind(kind: &str) -> bool {
+    [
+        KIND_OBSERVATION,
+        KIND_TENANT_OBSERVATION,
+        KIND_FINDING,
+        KIND_INVESTIGATION_RESULT,
+        KIND_HYPOTHESIS,
+        KIND_EXTERNAL_ISSUE,
+        KIND_VERIFICATION,
+    ]
+    .contains(&kind)
+}
+
 pub const EVIDENCE_TYPE: &str = "feedback.observation";
 pub const EVIDENCE_SCHEMA_VERSION: &str = "1.0.0";
 
@@ -306,8 +325,30 @@ pub fn validate_object_write(
     object: &mut Object,
     now_ms: i64,
 ) -> Result<(), String> {
+    validate_object_write_for(db, object, None, now_ms)
+}
+
+/// Same rules as [`validate_object_write`], plus the investigation-runtime
+/// recorder stamp when `submitter` is [`INVESTIGATION_RUNTIME`] (#2053).
+pub(crate) fn validate_object_write_for(
+    db: &RuntimeDb,
+    object: &mut Object,
+    submitter: Option<&str>,
+    now_ms: i64,
+) -> Result<(), String> {
     match object.kind.as_str() {
         KIND_OBSERVATION => validate_observation_evidence(db, object, now_ms),
+        KIND_FINDING | KIND_INVESTIGATION_RESULT => {
+            // Overwrites whatever the caller sent: the recorder is a fact of
+            // the investigation admission, not a parameter (#2053).
+            object.properties.remove(PROPERTY_RECORDED_BY);
+            if submitter == Some(INVESTIGATION_RUNTIME) {
+                object
+                    .properties
+                    .insert(PROPERTY_RECORDED_BY.into(), INVESTIGATION_RUNTIME.into());
+            }
+            Ok(())
+        }
         KIND_VERIFICATION => validate_verification_subject(db, object),
         _ => Ok(()),
     }
@@ -468,6 +509,25 @@ mod tests {
         let runtime = db();
         install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
         runtime
+    }
+
+    #[test]
+    fn package_kinds_are_the_feedback_object_kinds() {
+        for kind in [
+            KIND_OBSERVATION,
+            KIND_TENANT_OBSERVATION,
+            KIND_FINDING,
+            KIND_INVESTIGATION_RESULT,
+            KIND_HYPOTHESIS,
+            KIND_EXTERNAL_ISSUE,
+            KIND_VERIFICATION,
+        ] {
+            assert!(is_package_kind(kind), "{kind}");
+        }
+        assert!(!is_package_kind("component"));
+        assert!(!is_package_kind(
+            crate::sekai::security_package::KIND_FINDING
+        ));
     }
 
     fn installed_file() -> (tempfile::TempDir, RuntimeDb) {

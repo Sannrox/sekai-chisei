@@ -35004,6 +35004,41 @@ async fn security_package_objects_refuse_direct_writes() {
     );
 }
 
+/// Feedback package objects change only through their Actions (#2053): a
+/// namespace writer cannot CreateObject a qualifying finding for the GitHub
+/// publisher to pick up.
+#[tokio::test]
+async fn feedback_package_objects_refuse_direct_writes() {
+    let svc = service();
+    for kind in [
+        crate::sekai::feedback_package::KIND_OBSERVATION,
+        crate::sekai::feedback_package::KIND_FINDING,
+        crate::sekai::feedback_package::KIND_INVESTIGATION_RESULT,
+        crate::sekai::feedback_package::KIND_HYPOTHESIS,
+        crate::sekai::feedback_package::KIND_EXTERNAL_ISSUE,
+        crate::sekai::feedback_package::KIND_VERIFICATION,
+    ] {
+        let created = svc
+            .create_object(with_principal(CreateObjectRequest {
+                object: Some(Object {
+                    id: format!("direct-{kind}"),
+                    kind: kind.into(),
+                    name: "direct".into(),
+                    namespace: "ns".into(),
+                    properties: HashMap::from([(
+                        crate::sekai::feedback_package::PROPERTY_RECORDED_BY.into(),
+                        crate::sekai::feedback_investigation::RUNTIME_ID.into(),
+                    )]),
+                    ..Default::default()
+                }),
+                lease_precondition: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(created.code(), tonic::Code::PermissionDenied, "{kind}");
+    }
+}
+
 /// Federated aggregate allowances (#1921): only the namespace's admin
 /// publishes or withdraws one, a refused function is invalid, and a
 /// withdrawn allowance no longer reads as current.
