@@ -138,7 +138,12 @@ fn publish_pass(db: &RuntimeDb, chisei: &ChiseiServiceImpl) -> Result<(), String
                     tracing::warn!(namespace = %namespace, %error, "feedback GitHub publish failed")
                 }
                 Err(PublishError::Internal(error)) => {
-                    return Err(error);
+                    tracing::error!(
+                        namespace = %namespace,
+                        finding = %finding.id,
+                        %error,
+                        "feedback GitHub publish skipped; later findings continue"
+                    );
                 }
             }
         }
