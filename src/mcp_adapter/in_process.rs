@@ -298,6 +298,11 @@ impl InProcessSurface {
             ))
             .await
             .map_err(|error| error.message().to_string())?;
+        Ok(())
+    }
+
+    /// Bind evaluate_set to a published revision of the synthetic kinds.
+    pub fn seed_object_set_definition(&mut self) -> Result<(), String> {
         self.definition_digest = seed_published_definition(self.db.as_ref())?;
         Ok(())
     }

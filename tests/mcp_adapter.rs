@@ -553,7 +553,10 @@ fn query_record_from_receipt(reply: &serde_json::Value) -> serde_json::Value {
 
 #[tokio::test]
 async fn evaluate_set_returns_rows_and_a_receipt_naming_query_and_versions() {
-    let surface = InProcessSurface::synthetic().await.unwrap();
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
     let evaluated = handle_message(
         &surface,
         evaluate_set_call(1, "op-set-ok", surface.object_set_descriptor("widget")),
@@ -613,7 +616,10 @@ async fn evaluate_set_returns_rows_and_a_receipt_naming_query_and_versions() {
 
 #[tokio::test]
 async fn evaluate_set_denies_unauthorized_type_with_receipt_and_no_leaked_rows() {
-    let surface = InProcessSurface::synthetic().await.unwrap();
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
     surface.deny_object_type("secret").expect("deny secret");
     let evaluated = handle_message(
         &surface,
@@ -663,7 +669,10 @@ async fn evaluate_set_denies_unauthorized_type_with_receipt_and_no_leaked_rows()
 
 #[tokio::test]
 async fn evaluate_set_receipt_replays_the_read_at_recorded_versions() {
-    let surface = InProcessSurface::synthetic().await.unwrap();
+    let mut surface = InProcessSurface::synthetic().await.unwrap();
+    surface
+        .seed_object_set_definition()
+        .expect("object-set definition");
     let first = handle_message(
         &surface,
         evaluate_set_call(1, "op-set-replay", surface.object_set_descriptor("widget")),
