@@ -12,6 +12,7 @@
   [ADR 0090](0090-object-change-action-bindings.md),
   [ADR 0129](0129-scheduling-ownership.md),
   [ADR 0130](0130-governed-export.md),
+  [ADR 0149](0149-one-claimable-work-queue.md),
   [ADR 0147](0147-spatial-engine-integration-outside-the-plane.md)
 
 ## Context
@@ -67,8 +68,9 @@ object they all hang off.
    and the evidence producers become types.
 3. **One connector runtime.** A single worker binary holds the connector
    types. It never links the control-plane package. It claims sync, delivery
-   and effect work for the Sources it is entitled to, through the ADR 0129
-   claim client: claims, heartbeats, generations and fencing tokens. The
+   and effect work for the Sources it is entitled to, as the
+   `source_sync`, `export_delivery` and `external_effect` kinds of the one
+   work queue (ADR 0149), and adds no claim RPCs of its own. The
    deployment layer runs as many runtimes as it needs. The plane never
    pushes and holds no vendor code.
 4. **Credentials stay with the runtime.** A credential reference names a
@@ -114,8 +116,9 @@ object they all hang off.
   connector type.
 - The runtime is a new deployable. It has to survive crash, takeover and
   rolling deploy as any claim worker does.
-- Source, delivery and effect claims are new work kinds in the claim
-  client, which needs experimental RPCs until they are stable.
+- This ADR depends on ADR 0149. Source, delivery and effect work are new
+  kinds of that queue, not new claim families. They stay experimental
+  until the queue's RPCs are stable.
 
 ## Validation
 
