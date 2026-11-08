@@ -165,6 +165,8 @@ fn seed_effect(db: &RuntimeDb, effect_id: &str, namespace: &str, type_id: &str) 
         admission_lease: None,
         admission_ontology_digest: None,
         admission_budget_already_reserved: false,
+        erased_properties: Vec::new(),
+        erased_request_digest: String::new(),
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

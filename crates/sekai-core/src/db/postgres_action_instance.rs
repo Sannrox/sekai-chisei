@@ -426,6 +426,7 @@ impl PostgresDb {
                         None,
                         &crate::sekai::audit::ChangeAttribution::default(),
                     )?;
+                    postgres_restore_forgotten_memory_actions(&mut tx, previous)?;
                 }
             }
         }
@@ -560,7 +561,7 @@ impl PostgresDb {
             existing_params.as_deref(),
             &stored,
         ) {
-            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored)?;
         }
         let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let updated = tx
@@ -728,7 +729,7 @@ impl PostgresDb {
             Some(&existing_params),
             &stored,
         ) {
-            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored);
+            crate::sekai::site_agent_memory::redact_writer_instance(&mut stored)?;
         }
         let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let updated = transaction
@@ -959,7 +960,7 @@ pub(crate) fn postgres_redact_if_forgotten_writer<C: postgres::GenericClient>(
     instance: &mut ActionInstance,
 ) -> Result<(), String> {
     if postgres_writer_target_forgotten(client, instance)? {
-        crate::sekai::site_agent_memory::redact_writer_instance(instance);
+        crate::sekai::site_agent_memory::redact_writer_instance(instance)?;
     }
     Ok(())
 }
@@ -1054,7 +1055,7 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
         let mut instance: ActionInstance = serde_json::from_str(&body_json)
             .map_err(|error| format!("corrupt action instance body: {error}"))?;
         instance.parameters_json = parameters_json;
-        if !redact_writer_instance(&mut instance) {
+        if !redact_writer_instance(&mut instance)? {
             continue;
         }
         let parameters_json = instance.parameters_json.clone();
@@ -1124,6 +1125,67 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
             .execute(
                 "UPDATE sekai_action_decision_memory SET body_json = $2 WHERE memory_id = $1",
                 &[&memory_id, &body_json],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Restore writer Action `content` when an admission undo restores a
+/// memory item that forget had emptied (#2038).
+pub(crate) fn postgres_restore_forgotten_memory_actions<C: postgres::GenericClient>(
+    client: &mut C,
+    previous: &crate::domain::Object,
+) -> Result<(), String> {
+    use crate::sekai::site_agent_memory::{
+        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, CONTENT_PROPERTY, KIND, is_forgotten,
+        restore_writer_instance,
+    };
+    if previous.kind != KIND || is_forgotten(previous) {
+        return Ok(());
+    }
+    let Some(content) = previous.properties.get(CONTENT_PROPERTY) else {
+        return Ok(());
+    };
+    let rows = client
+        .query(
+            "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
+             WHERE namespace = $1
+               AND type_id IN ($2, $3, $4)
+               AND parameters_json::jsonb ->> 'object_id' = $5
+             ORDER BY instance_id
+             FOR UPDATE",
+            &[
+                &previous.namespace,
+                &ACTION_CREATE,
+                &ACTION_UPDATE,
+                &ACTION_FORGET,
+                &previous.id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    let mut updates = Vec::new();
+    for row in rows {
+        let instance_id: String = row.get(0);
+        let parameters_json: String = row.get(1);
+        let body_json: String = row.get(2);
+        let mut instance: ActionInstance = serde_json::from_str(&body_json)
+            .map_err(|error| format!("corrupt action instance body: {error}"))?;
+        instance.parameters_json = parameters_json;
+        if !restore_writer_instance(&mut instance, content) {
+            continue;
+        }
+        let parameters_json = instance.parameters_json.clone();
+        let body_json = serde_json::to_string(&instance).map_err(|error| error.to_string())?;
+        updates.push((instance_id, parameters_json, body_json));
+    }
+    for (instance_id, parameters_json, body_json) in updates {
+        client
+            .execute(
+                "UPDATE sekai_action_instances
+                 SET parameters_json = $2, body_json = $3
+                 WHERE instance_id = $1",
+                &[&instance_id, &parameters_json, &body_json],
             )
             .map_err(|error| error.to_string())?;
     }
