@@ -1080,7 +1080,7 @@ fn the_published_reason_is_the_last_signature_segment() {
 
 #[test]
 fn only_plain_identifiers_and_semver_are_published() {
-    for (signature, secret) in [
+    for (signature, fragment) in [
         (
             "connect(db01.tenant.example):timeout",
             "db01.tenant.example",
@@ -1097,7 +1097,7 @@ fn only_plain_identifiers_and_semver_are_published() {
     ] {
         let issue = draft(NAMESPACE, signature, None, false, &[]);
         for text in [&issue.title, &issue.managed_body] {
-            assert!(!text.contains(secret), "{secret:?} leaked: {text}");
+            assert!(!text.contains(fragment), "{fragment:?} leaked: {text}");
         }
     }
     let plain = draft(NAMESPACE, "api:tenkai_failed", None, false, &[]);
