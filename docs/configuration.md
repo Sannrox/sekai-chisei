@@ -52,9 +52,9 @@ template.
 | `SEKAI_FEEDBACK_GITHUB_OWNER` | unset | Combined-mode GitHub publisher (#1232): repository owner. Unset, the publisher idles. |
 | `SEKAI_FEEDBACK_GITHUB_REPO` | unset | Combined-mode GitHub publisher: repository name. Unset, the publisher idles. |
 | `SEKAI_FEEDBACK_GITHUB_TOKEN` | unset | Combined-mode GitHub publisher: bearer for Issues. Missing credentials stay visible and retryable and do not mutate. Treat as a secret. |
-| `SEKAI_FEEDBACK_GITHUB_RUN_AS` | `feedback-github` | Principal that authorizes and redeems the GitHub permit. |
+| `SEKAI_FEEDBACK_GITHUB_RUN_AS` | `feedback-github` | Self-authorizing plane actor that authorizes and redeems the GitHub permit. `root` and `local` are refused. |
 | `SEKAI_FEEDBACK_GITHUB_DAILY_CAP` | `5` | Maximum new GitHub issues created per UTC day. Excess qualifying findings stay queued. |
-| `SEKAI_FEEDBACK_GITHUB_API` | `https://api.github.com` | GitHub API origin used by the publisher. |
+| `SEKAI_FEEDBACK_GITHUB_API` | `https://api.github.com` | GitHub API base URL. The permit binds its origin (scheme and host); userinfo is refused. |
 | `SEKAI_FEEDBACK_QUALITY_RUN_AS` | `feedback-quality` | Principal that records verification and issue quality (#1233). |
 | `SEKAI_FEEDBACK_QUALITY_PROMOTE` | unset | Set `1` to promote quality records into a `feedback-quality-` eval suite. Unset, records stay inspectable without silent promotion. |
 | `SEKAI_EZU_URL` | unset | Ezu HTTP and Arrow Flight address for fence-binding event reads and geo-feed writes ([ezu-geo-feed.md](ezu-geo-feed.md)) |
