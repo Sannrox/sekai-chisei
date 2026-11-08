@@ -456,18 +456,36 @@ async fn object_above_the_profile_marking_ceiling_is_refused() {
 /// A site agent instance acting as `agent:<namespace>` with one pending
 /// manual turn in `namespace`.
 fn seed_turn(plane: &Plane, namespace: &str) -> String {
+    seed_turn_named(
+        plane,
+        namespace,
+        &format!("line-{namespace}"),
+        &format!("agent:{namespace}"),
+    )
+}
+
+/// A site agent instance acting as `principal` with one pending manual turn.
+fn seed_turn_as(plane: &Plane, namespace: &str, principal: &str) -> String {
+    seed_turn_named(
+        plane,
+        namespace,
+        &format!("line-{namespace}-{principal}"),
+        principal,
+    )
+}
+
+fn seed_turn_named(plane: &Plane, namespace: &str, instance_id: &str, principal: &str) -> String {
     let db = plane.service.db.runtime();
-    let principal = format!("agent:{namespace}");
-    db.ensure_team_namespace(namespace, &principal, Role::Admin, "root")
+    db.ensure_team_namespace(namespace, principal, Role::Admin, "root")
         .unwrap();
     db.create_object(&crate::domain::Object {
-        id: format!("line-{namespace}"),
+        id: instance_id.into(),
         kind: crate::sekai::site_agent_instance::KIND.into(),
-        name: format!("line-{namespace}"),
+        name: instance_id.into(),
         namespace: namespace.into(),
         external_id: String::new(),
         properties: HashMap::from([
-            ("principal_id".to_string(), principal),
+            ("principal_id".to_string(), principal.into()),
             ("frozen".to_string(), "false".to_string()),
         ]),
         created: 1,
@@ -478,9 +496,9 @@ fn seed_turn(plane: &Plane, namespace: &str) -> String {
         db,
         crate::sekai::agent_turn::Wake {
             namespace: namespace.into(),
-            instance_id: format!("line-{namespace}"),
+            instance_id: instance_id.into(),
             cause: crate::sekai::agent_turn::Cause::Manual,
-            cause_ref: format!("wake-{namespace}"),
+            cause_ref: format!("wake-{instance_id}"),
             due_at_ms: 1,
         },
         "root",
@@ -600,6 +618,68 @@ async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
             .await
             .unwrap_err(),
         "namespace",
+    );
+}
+
+#[tokio::test]
+async fn a_turn_worker_must_not_be_the_instance_principal() {
+    let plane = plane();
+    plane
+        .service
+        .db
+        .runtime()
+        .put_service_principal(&ServicePrincipalRegistration {
+            capabilities: vec![crate::sekai::service_principal::AGENT_TURN_WORKER.into()],
+            ..registration()
+        })
+        .unwrap()
+        .unwrap();
+    let own = seed_turn_as(&plane, IN_SCOPE, WORKER);
+    let other = seed_turn(&plane, IN_SCOPE);
+
+    let status = claim_turn(&plane, IN_SCOPE, &own).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert!(
+        status
+            .message()
+            .contains("turn worker must not be the instance principal"),
+        "{status:?}"
+    );
+    assert_eq!(
+        crate::sekai::agent_turn::get(plane.service.db.runtime(), &own)
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
+    );
+
+    let claimed = plane
+        .service
+        .claim_agent_turn(
+            authenticated(
+                &plane,
+                &service_token(&plane),
+                "ClaimAgentTurn",
+                crate::grpc::pb::sekai::ClaimAgentTurnRequest {
+                    namespace: IN_SCOPE.into(),
+                    runtime_id: "runner-a".into(),
+                    turn_id: String::new(),
+                    ttl_ms: 60_000,
+                    accepts_continuation: true,
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(claimed.turn.unwrap().turn_id, other);
+    assert_eq!(
+        crate::sekai::agent_turn::get(plane.service.db.runtime(), &own)
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
     );
 }
 

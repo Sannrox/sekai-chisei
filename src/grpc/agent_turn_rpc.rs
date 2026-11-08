@@ -152,6 +152,7 @@ impl SekaiServiceImpl {
             let turn = agent_turn::get(self.db.runtime(), turn_id)
                 .map_err(turn_status)?
                 .ok_or_else(|| turn_status(TurnError::NotFound))?;
+            refuse_instance_as_worker(claims.worker.as_deref().unwrap_or(""), &turn.principal_id)?;
             // The store replays the same fence and outcome, or refuses.
             if acked && turn.is_acknowledged() {
                 return self.authorize_acked_turn_token(req, claims, &turn);
@@ -173,10 +174,11 @@ impl SekaiServiceImpl {
         let namespace = match scope {
             Scope::Namespace(namespace) => namespace.to_string(),
             Scope::Turn(turn_id) | Scope::AckedTurn(turn_id) => {
-                agent_turn::get(self.db.runtime(), turn_id)
+                let turn = agent_turn::get(self.db.runtime(), turn_id)
                     .map_err(turn_status)?
-                    .map(|turn| turn.namespace)
-                    .ok_or_else(|| turn_status(TurnError::NotFound))?
+                    .ok_or_else(|| turn_status(TurnError::NotFound))?;
+                refuse_instance_as_worker(&calling_worker_subject(req), &turn.principal_id)?;
+                turn.namespace
             }
         };
         check_team_namespace(self.db.runtime(), &principals, &namespace, true)?;
@@ -452,17 +454,25 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ClaimAgentTurnResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
         let now = now_millis();
+        let worker = calling_worker_subject(&req);
         let inner = req.get_ref();
         let turn = if inner.turn_id.trim().is_empty() {
-            agent_turn::claim_next(
+            agent_turn::claim_next_for_worker(
                 self.db.runtime(),
                 &inner.namespace,
                 &inner.runtime_id,
+                &worker,
                 inner.ttl_ms,
                 now,
                 inner.accepts_continuation,
             )
         } else {
+            if let Some(turn) = agent_turn::get(self.db.runtime(), &inner.turn_id)
+                .map_err(turn_status)?
+                .filter(|turn| turn.namespace == inner.namespace)
+            {
+                refuse_instance_as_worker(&worker, &turn.principal_id)?;
+            }
             agent_turn::claim_accepting_continuation(
                 self.db.runtime(),
                 &inner.namespace,
@@ -751,6 +761,34 @@ impl SekaiServiceImpl {
             next_page_token,
         }))
     }
+}
+
+const INSTANCE_AS_WORKER: &str = "turn worker must not be the instance principal";
+
+fn refuse_instance_as_worker(worker: &str, principal_id: &str) -> Result<(), Status> {
+    let worker = worker.trim();
+    let principal_id = principal_id.trim();
+    if !worker.is_empty() && worker == principal_id {
+        return Err(Status::permission_denied(INSTANCE_AS_WORKER));
+    }
+    Ok(())
+}
+
+/// Claiming worker: turn-token `worker`, else the caller's subject.
+fn calling_worker_subject<T: 'static>(req: &Request<T>) -> String {
+    if let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() {
+        return claims.worker.clone().unwrap_or_default();
+    }
+    if let Some(context) = req
+        .extensions()
+        .get::<crate::enterprise::AuthenticatedContext>()
+    {
+        return context.principal.subject.clone();
+    }
+    caller_principals(req)
+        .into_iter()
+        .find(|principal| principal != "anonymous")
+        .unwrap_or_default()
 }
 
 /// The person the calling token acts for: `act`, else the caller.

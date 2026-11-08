@@ -109,10 +109,13 @@ token and continuation are not dropped. DiscoverCapabilities advertises
 `sekai.agent_turn.runtime_token` and `sekai.agent_turn.parked`. The token acts as the instance's `principal_id`. `act` is the person the
 turn acts for when a human requester admitted it, and is absent on scheduled
 and change-driven turns; the claiming worker is a distinct `worker` claim.
-Follow-up checks that bind agent and requester use `act`, never the worker. It
-authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn` and
-`SubmitActionInstance`, and only while the turn is claimed at that generation
-and its lease holds. A submission with it must name the turn's namespace and is
+Follow-up checks that bind agent and requester use `act`, never the worker. The
+claiming worker's subject must not be the instance `principal_id` (ADR 0146).
+It authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn`,
+`SubmitActionInstance` and `ListSiteAgentWorkingMemory`, and only while the
+turn is claimed at that generation and its lease holds. `GetObject` and
+`GetOperationReceipt` stay off the token; the worker reads those with its own
+credential. A submission with it must name the turn's namespace and is
 refused while the instance is frozen. Its admission records the turn and
 generation, and commits only while the turn is still claimed at that
 generation: a submission still in flight when another worker reclaims the

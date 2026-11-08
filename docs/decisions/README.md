@@ -171,4 +171,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0143: Runtime-token `act` is the delegating requester](0143-runtime-token-act-is-the-requester.md)
 - [ADR 0144: FederatedAggregate withholds the suppressed-group count from the caller](0144-federated-aggregate-withholds-suppressed-count.md)
 - [ADR 0145: Ed25519 identity assertions verified by key id](0145-ed25519-identity-assertions.md)
+- [ADR 0146: A turn worker is never the instance principal](0146-turn-worker-is-not-the-instance.md)
 <!-- adr-index:end -->

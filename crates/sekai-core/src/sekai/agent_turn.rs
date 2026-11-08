@@ -644,6 +644,29 @@ pub fn claim_next(
     now_ms: i64,
     accepts_continuation: bool,
 ) -> Result<AgentTurn, TurnError> {
+    claim_next_for_worker(
+        db,
+        namespace,
+        runtime_id,
+        "",
+        ttl_ms,
+        now_ms,
+        accepts_continuation,
+    )
+}
+
+/// [`claim_next`], skipping turns whose instance principal is `worker_principal`
+/// so a worker cannot lease its own instance (ADR 0146). Empty
+/// `worker_principal` skips none.
+pub fn claim_next_for_worker(
+    db: &RuntimeDb,
+    namespace: &str,
+    runtime_id: &str,
+    worker_principal: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    accepts_continuation: bool,
+) -> Result<AgentTurn, TurnError> {
     if runtime_id.trim().is_empty() {
         return Err(TurnError::Invalid("runtime_id required".into()));
     }
@@ -652,6 +675,7 @@ pub fn claim_next(
         RuntimeDb::Sqlite(store) => store.claim_next_agent_turn(
             namespace,
             runtime_id,
+            worker_principal,
             ttl_ms,
             now_ms,
             accepts_continuation,
@@ -661,6 +685,7 @@ pub fn claim_next(
             store.claim_next_agent_turn(
                 namespace,
                 runtime_id,
+                worker_principal,
                 ttl_ms,
                 now_ms,
                 accepts_continuation,
@@ -1430,10 +1455,12 @@ impl SekaiDb {
         Ok(turn)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn claim_next_agent_turn(
         &self,
         namespace: &str,
         runtime_id: &str,
+        worker_principal: &str,
         ttl_ms: i64,
         now_ms: i64,
         accepts_continuation: bool,
@@ -1446,6 +1473,7 @@ impl SekaiDb {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut skipped: Vec<String> = Vec::new();
         let accepts = if accepts_continuation { 1i64 } else { 0 };
+        let worker = worker_principal.trim();
         loop {
             let sql = format!(
                 "SELECT {COLUMNS} FROM sekai_agent_turn
@@ -1463,6 +1491,10 @@ impl SekaiDb {
                 tx.commit()?;
                 return Ok(None);
             };
+            if !worker.is_empty() && worker == turn.principal_id {
+                skipped.push(turn.turn_id);
+                continue;
+            }
             let instance = instance_check_sqlite(&tx, namespace, &turn.instance_id)?;
             let parked_decided = if turn.is_parked() {
                 parked_action_decided_on_sqlite(&tx, &turn.parked_action_id)?
@@ -1760,10 +1792,12 @@ impl PostgresDb {
         Ok(turn)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn claim_next_agent_turn(
         &self,
         namespace: &str,
         runtime_id: &str,
+        worker_principal: &str,
         ttl_ms: i64,
         now_ms: i64,
         accepts_continuation: bool,
@@ -1772,6 +1806,7 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction()?;
         let mut skipped: Vec<String> = Vec::new();
+        let worker = worker_principal.trim();
         loop {
             let sql = format!(
                 "SELECT {COLUMNS} FROM sekai_agent_turn
@@ -1792,6 +1827,10 @@ impl PostgresDb {
                 return Ok(None);
             };
             let mut turn = pg_turn(&row)?;
+            if !worker.is_empty() && worker == turn.principal_id {
+                skipped.push(turn.turn_id);
+                continue;
+            }
             let instance = instance_check_pg(&mut tx, namespace, &turn.instance_id)?;
             let parked_decided = if turn.is_parked() {
                 parked_action_decided_on_pg(&mut tx, &turn.parked_action_id)?
@@ -2498,6 +2537,28 @@ mod tests {
         assert!(taken.claim_generation > live.claim_generation);
     }
 
+    fn claim_next_skips_worker_instance_contract(db: &RuntimeDb, ns: &str) {
+        let own = seed(db, ns, "own", false);
+        let other = seed(db, ns, "other", false);
+        let mut instance = db.get_object(&own).unwrap().unwrap();
+        instance
+            .properties
+            .insert("principal_id".into(), "self-worker".into());
+        db.update_object(&instance).unwrap();
+        let own_turn = admit(db, wake(ns, &own, Cause::Manual, "own"), "plane", 1).unwrap();
+        let other_turn = admit(db, wake(ns, &other, Cause::Manual, "other"), "plane", 1).unwrap();
+        let taken = claim_next_for_worker(db, ns, "w1", "self-worker", 1_000, 100, true).unwrap();
+        assert_eq!(taken.turn_id, other_turn.turn_id);
+        assert_eq!(get(db, &own_turn.turn_id).unwrap().unwrap().status, PENDING);
+        assert_eq!(
+            claim_next_for_worker(db, ns, "w1", "self-worker", 1_000, 100, true).unwrap_err(),
+            TurnError::NotFound
+        );
+        let remaining =
+            claim_next_for_worker(db, ns, "w2", "other-worker", 1_000, 100, true).unwrap();
+        assert_eq!(remaining.turn_id, own_turn.turn_id);
+    }
+
     fn park_turn(db: &RuntimeDb, ns: &str, turn: &AgentTurn, tag: &str, at: i64) -> String {
         let held = claim(db, ns, "runner-a", &turn.turn_id, 1_000, at).unwrap();
         let action = parked_action(db, ns, &held, tag);
@@ -2637,6 +2698,7 @@ mod tests {
         instance_history(&RuntimeDb::memory(), "site");
         claim_next_contract(&RuntimeDb::memory(), "site");
         claim_next_park_order_contract(&RuntimeDb::memory(), "site");
+        claim_next_skips_worker_instance_contract(&RuntimeDb::memory(), "site");
     }
 
     #[test]
@@ -2659,6 +2721,8 @@ mod tests {
         claim_next_contract(&db, &ns);
         let parks = format!("next-parks-{}-{}", std::process::id(), uuid::Uuid::new_v4());
         claim_next_park_order_contract(&db, &parks);
+        let own = format!("own-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        claim_next_skips_worker_instance_contract(&db, &own);
     }
 
     #[test]

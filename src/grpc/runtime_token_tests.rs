@@ -518,6 +518,8 @@ async fn a_turn_claim_returns_a_token_acting_as_the_instance() {
         "HeartbeatActionClaim",
         "ClaimAgentTurn",
         "DecideActionInstance",
+        "GetObject",
+        "GetOperationReceipt",
     ] {
         assert_eq!(
             authenticate(&plane, &claimed.runtime_token, method)
@@ -725,6 +727,113 @@ async fn a_turn_token_does_not_inherit_a_changed_instance_principal() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
+}
+
+#[tokio::test]
+async fn a_credential_admin_must_not_claim_its_own_instance() {
+    let plane = plane();
+    let db = plane.service.db.runtime();
+    db.ensure_team_namespace("ns-a", TURN_WORKER, Role::Admin, "root")
+        .unwrap();
+    db.create_object(&crate::domain::Object {
+        id: "line-a".into(),
+        kind: crate::sekai::site_agent_instance::KIND.into(),
+        name: "line-a".into(),
+        namespace: "ns-a".into(),
+        external_id: String::new(),
+        properties: HashMap::from([
+            ("principal_id".to_string(), TURN_WORKER.into()),
+            ("frozen".to_string(), "false".to_string()),
+        ]),
+        created: 1,
+        updated: 1,
+    })
+    .unwrap();
+    let turn_id = crate::sekai::agent_turn::admit(
+        db,
+        crate::sekai::agent_turn::Wake {
+            namespace: "ns-a".into(),
+            instance_id: "line-a".into(),
+            cause: crate::sekai::agent_turn::Cause::Manual,
+            cause_ref: "wake-a".into(),
+            due_at_ms: 1,
+        },
+        "root",
+        1,
+    )
+    .unwrap()
+    .turn_id;
+    let err = plane
+        .service
+        .claim_agent_turn({
+            let mut request = Request::new(crate::grpc::pb::sekai::ClaimAgentTurnRequest {
+                namespace: "ns-a".into(),
+                runtime_id: "runner-a".into(),
+                turn_id: turn_id.clone(),
+                ttl_ms: 60_000,
+                accepts_continuation: true,
+            });
+            let mut context = tenant_context("tenant-a");
+            context.principal.subject = TURN_WORKER.into();
+            request.extensions_mut().insert(context);
+            request
+                .metadata_mut()
+                .insert("x-principal", MetadataValue::from_static(TURN_WORKER));
+            request
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message()
+            .contains("turn worker must not be the instance principal"),
+        "{err:?}"
+    );
+    assert_eq!(
+        crate::sekai::agent_turn::get(db, &turn_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "pending"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_token_whose_worker_is_the_instance_is_refused() {
+    let plane = plane();
+    let turn_id = seed_turn(&plane, "a");
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let turn = claimed.turn.unwrap();
+    let mut claims = RuntimeTokenClaims::verify(
+        &plane.authority,
+        &claimed.runtime_token,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    claims.worker = Some(claims.subject.clone());
+    let token = claims.sign(&plane.authority).unwrap();
+    let err = plane
+        .service
+        .heartbeat_agent_turn_claim(with_token(
+            &plane,
+            &token,
+            "HeartbeatAgentTurnClaim",
+            crate::grpc::pb::sekai::HeartbeatAgentTurnClaimRequest {
+                turn_id,
+                runtime_id: turn.claim_owner,
+                claim_generation: turn.claim_generation,
+                fencing_token: turn.fencing_token,
+                ttl_ms: 60_000,
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message()
+            .contains("turn worker must not be the instance principal"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
