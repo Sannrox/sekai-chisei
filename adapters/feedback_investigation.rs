@@ -7,8 +7,11 @@
 //!    `feedback.investigation.dispatch` work.
 //! 2. `ListClaimableActionWork` and `ClaimActionWork` take one fenced claim.
 //!    Concurrent runtimes never hold the same dispatch.
-//! 3. `ListObjects` gathers the same-signature cluster in the recurrence window.
-//! 4. One model call per (namespace, signature, window bucket) through
+//! 3. `ListObjects` gathers the same-problem cluster in the recurrence window.
+//!    A problem is a signature within one scope (environment or tenant), and
+//!    recurrence counts distinct `operation_id`s on observed time, clamped to
+//!    ingest time. Retries of one operation and a drained backlog never recur.
+//! 4. One model call per (namespace, problem, window bucket) through
 //!    `PlanExecution` and `ExecutePlanStream`. Later dispatches in the bucket
 //!    reuse the stored analysis and only re-decide filing.
 //! 5. `SubmitActionInstance` records investigation, hypothesis, and finding
@@ -18,7 +21,9 @@
 //! findings it records so publication can tell them from writer-submitted
 //! ones. Internal and malformed results never set the qualifying
 //! classification. The claim, list, and binding RPCs are experimental: the
-//! plane needs `SEKAI_EXPERIMENTAL_RPCS=1`. Every write is idempotent by key,
+//! plane needs `SEKAI_EXPERIMENTAL_RPCS=1`. Observations must carry the
+//! package v2 fields (`operation_id`, `observed_at_ms`, `scope`); v1 records
+//! are not investigated. Every write is idempotent by key,
 //! so a crash before the ack replays into the same objects.
 
 use std::collections::BTreeSet;
@@ -122,9 +127,13 @@ impl InvestigationAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationView {
     pub object_id: String,
-    pub created_ms: i64,
+    /// When the producer observed it, never later than ingest.
+    pub observed_ms: i64,
     pub problem_signature: String,
-    pub occurrence_ids: Vec<String>,
+    /// Environment or tenant. Equal signatures in two scopes are two problems.
+    pub scope: String,
+    /// The plan or deployment operation. Attempts of one operation share it.
+    pub operation_id: String,
     pub classification: String,
     pub disposition: String,
 }
@@ -134,6 +143,7 @@ pub struct ObservationCluster {
     pub namespace: String,
     pub trigger_id: String,
     pub signature: String,
+    pub scope: String,
     /// Oldest first.
     pub observations: Vec<ObservationView>,
     pub distinct_operations: Vec<String>,
@@ -144,6 +154,7 @@ pub struct ObservationCluster {
 pub struct AnalysisRequest {
     pub namespace: String,
     pub signature: String,
+    pub scope: String,
     pub observations: Vec<ObservationView>,
     pub distinct_operations: usize,
     /// Recurrence window index: dispatch time divided by [`RECURRENCE_WINDOW_MS`].
@@ -184,30 +195,28 @@ pub trait FeedbackAnalyzer {
     ) -> Result<InvestigationAnalysis, AnalysisError>;
 }
 
-/// Split occurrence identifiers. Replayed delivery of one id is one operation.
-pub fn parse_occurrence_ids(raw: &str) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    raw.split(|c: char| c == ',' || c.is_whitespace())
-        .map(str::trim)
-        .filter(|id| !id.is_empty() && seen.insert(id.to_string()))
-        .map(str::to_string)
-        .collect()
-}
-
 pub fn observation_view(object: &Object) -> Option<ObservationView> {
     if object.kind != KIND_OBSERVATION {
         return None;
     }
     let property = |key: &str| object.properties.get(key).cloned().unwrap_or_default();
     let signature = property("problem_signature").trim().to_string();
-    if signature.is_empty() {
+    let operation_id = property("operation_id").trim().to_string();
+    // A blank scope would merge every unscoped tenant into one problem.
+    let scope = property("scope").trim().to_string();
+    if signature.is_empty() || operation_id.is_empty() || scope.is_empty() {
         return None;
     }
+    // A producer clock ahead of ingest cannot move an observation forward.
+    let observed_ms = property("observed_at_ms")
+        .parse::<i64>()
+        .map_or(object.created, |observed| observed.min(object.created));
     Some(ObservationView {
         object_id: object.id.clone(),
-        created_ms: object.created,
+        observed_ms,
         problem_signature: signature,
-        occurrence_ids: parse_occurrence_ids(&property("occurrence_ids")),
+        scope,
+        operation_id,
         classification: property("classification"),
         disposition: property("disposition"),
     })
@@ -241,6 +250,7 @@ pub fn cluster_from_observations(
     namespace: &str,
     trigger_id: &str,
     signature: &str,
+    scope: &str,
     now_ms: i64,
     observations: Vec<ObservationView>,
     has_measured_reproduction: bool,
@@ -249,25 +259,28 @@ pub fn cluster_from_observations(
     let mut in_window: Vec<ObservationView> = observations
         .into_iter()
         .filter(|observation| {
-            observation.problem_signature == signature && observation.created_ms >= window_start
+            observation.problem_signature == signature
+                && observation.scope == scope
+                && observation.observed_ms >= window_start
         })
         .collect();
     in_window.sort_by(|left, right| {
-        left.created_ms
-            .cmp(&right.created_ms)
+        left.observed_ms
+            .cmp(&right.observed_ms)
             .then(left.object_id.cmp(&right.object_id))
     });
     let mut seen = BTreeSet::new();
     let distinct_operations = in_window
         .iter()
-        .flat_map(|observation| observation.occurrence_ids.iter())
-        .filter(|occurrence| seen.insert(occurrence.as_str()))
+        .map(|observation| &observation.operation_id)
+        .filter(|operation| seen.insert(operation.as_str()))
         .cloned()
         .collect();
     ObservationCluster {
         namespace: namespace.into(),
         trigger_id: trigger_id.into(),
         signature: signature.into(),
+        scope: scope.into(),
         observations: in_window,
         distinct_operations,
         has_measured_reproduction,
@@ -325,16 +338,17 @@ pub fn analysis_system_prompt() -> &'static str {
 pub fn analysis_prompt(request: &AnalysisRequest) -> String {
     let listed = request.observations.len().min(PROMPT_OBSERVATION_CAP);
     let mut body = format!(
-        "Signature: {}\nObservations in window: {}\nDistinct operations: {}\nNewest {listed}:\n",
+        "Signature: {}\nScope: {}\nObservations in window: {}\nDistinct operations: {}\nNewest {listed}:\n",
         request.signature,
+        request.scope,
         request.observations.len(),
         request.distinct_operations,
     );
     for observation in request.observations.iter().rev().take(listed) {
         body.push_str(&format!(
-            "- id={} occurrences={} classification={} disposition={}\n",
+            "- id={} operation={} classification={} disposition={}\n",
             observation.object_id,
-            observation.occurrence_ids.join(","),
+            observation.operation_id,
             observation.classification,
             observation.disposition
         ));
@@ -634,6 +648,7 @@ impl Investigator {
         let request = AnalysisRequest {
             namespace: cluster.namespace.clone(),
             signature: cluster.signature.clone(),
+            scope: cluster.scope.clone(),
             observations: cluster.observations.clone(),
             distinct_operations: cluster.distinct_operations.len(),
             window: now_ms.div_euclid(RECURRENCE_WINDOW_MS),
@@ -715,13 +730,12 @@ impl Investigator {
             .iter()
             .filter_map(observation_view)
             .collect();
-        let measured = self
-            .has_measured_reproduction(sekai, &trigger.problem_signature)
-            .await?;
+        let measured = self.has_measured_reproduction(sekai, &trigger).await?;
         Ok(cluster_from_observations(
             &self.namespace,
             observation_id,
             &trigger.problem_signature,
+            &trigger.scope,
             now_ms,
             views,
             measured,
@@ -731,7 +745,7 @@ impl Investigator {
     async fn has_measured_reproduction(
         &self,
         sekai: &SekaiServiceImpl,
-        signature: &str,
+        trigger: &ObservationView,
     ) -> Result<bool, Investigation> {
         let measured = self
             .list(
@@ -748,11 +762,10 @@ impl Investigator {
                 continue;
             };
             if let Some(observation) = self.get(sekai, observation_id).await?
-                && observation
-                    .properties
-                    .get("problem_signature")
-                    .map(String::as_str)
-                    == Some(signature)
+                && observation_view(&observation).is_some_and(|view| {
+                    view.problem_signature == trigger.problem_signature
+                        && view.scope == trigger.scope
+                })
             {
                 return Ok(true);
             }
@@ -935,14 +948,14 @@ enum Investigation {
     Invalid(String),
 }
 
-/// (namespace, signature, window bucket), so one recurring problem costs one
-/// model call per window however many observations arrive.
-/// The planner request id carries it too, so each window's analysis keeps
-/// its own planner and audit records.
+/// (namespace, signature, scope, window bucket), so one recurring problem
+/// costs one model call per window however many observations arrive. The
+/// planner request id carries it too, so each window's analysis keeps its
+/// own planner and audit records.
 fn bucket_key(request: &AnalysisRequest) -> String {
     let material = format!(
-        "{}\0{}\0{}",
-        request.namespace, request.signature, request.window
+        "{}\0{}\0{}\0{}",
+        request.namespace, request.signature, request.scope, request.window
     );
     format!("{:x}", Sha256::digest(material.as_bytes()))[..16].to_string()
 }

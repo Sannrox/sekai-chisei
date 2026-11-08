@@ -23,9 +23,12 @@ use crate::sekai::schema::{
     ObjectType, PropertyDef, PropertyType, default_property_classification,
 };
 
-pub const PACKAGE_ID: &str = "pkg:feedback.evidence-finding/v1";
-pub const PACKAGE_VERSION: &str = "1";
-pub const CERTIFICATION_ID: &str = "cert:feedback.evidence-finding/v1";
+/// A shipped package version never changes in place; a change is a new
+/// version with its own fixtures (#2063). v2 adds observation
+/// `operation_id`, `observed_at_ms`, and `scope` as v2 (#2061).
+pub const PACKAGE_ID: &str = "pkg:feedback.evidence-finding/v2";
+pub const PACKAGE_VERSION: &str = "2";
+pub const CERTIFICATION_ID: &str = "cert:feedback.evidence-finding/v2";
 pub const KIND_OBSERVATION: &str = "feedback_observation";
 /// Tenant-mode evidence target from tenkai 0.7.0. Objects stay
 /// [`KIND_OBSERVATION`]; only the evidence `target_kind` uses this token.
@@ -68,15 +71,15 @@ pub const EVIDENCE_SCHEMA_VERSION: &str = "1.0.0";
 
 pub const ONTOLOGY_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/feedback/ontology-v1.json"
+    "/../../tests/fixtures/feedback/ontology-v2.json"
 ));
 pub const DOMAIN_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/feedback/domain-v1.json"
+    "/../../tests/fixtures/feedback/domain-v2.json"
 ));
 pub const ACTION_TYPES_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../tests/fixtures/feedback/action-types-v1.json"
+    "/../../tests/fixtures/feedback/action-types-v2.json"
 ));
 pub const EVALUATION_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -87,8 +90,8 @@ pub const EVIDENCE_SCHEMA_JSON: &str = include_str!(concat!(
     "/../../tests/fixtures/feedback/evidence-schema-v1.json"
 ));
 
-const MEMBER_ONTOLOGY_ID: &str = "feedback.ontology/v1";
-const MEMBER_ACTION_ID: &str = "feedback.actions/v1";
+const MEMBER_ONTOLOGY_ID: &str = "feedback.ontology/v2";
+const MEMBER_ACTION_ID: &str = "feedback.actions/v2";
 const MEMBER_EVALUATION_ID: &str = "feedback.evaluation/v1";
 
 #[derive(Deserialize)]
@@ -530,6 +533,30 @@ mod tests {
         ));
     }
 
+    /// The v1 fixtures are what installed v1 namespaces were certified against.
+    /// Changing them breaks those certifications; ship a new version instead.
+    #[test]
+    fn shipped_v1_fixtures_stay_frozen() {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/feedback");
+        for (file, digest) in [
+            (
+                "ontology-v1.json",
+                "5e508d150beaad1e627a1bbb152d6f60782dd9064641e18ce26aad2986da08bf",
+            ),
+            (
+                "domain-v1.json",
+                "106a530f60fad7f945b4c4db54de35663e418627832bbaea5a1ce8c3ee6a2b28",
+            ),
+            (
+                "action-types-v1.json",
+                "5863220cd14453580e430ee01af57d25036022e329377eff2dea0c8087544214",
+            ),
+        ] {
+            let bytes = std::fs::read(format!("{fixtures}/{file}")).unwrap();
+            assert_eq!(fixture_digest(&bytes), format!("sha256:{digest}"), "{file}");
+        }
+    }
+
     fn installed_file() -> (tempfile::TempDir, RuntimeDb) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sekai.db");
@@ -583,6 +610,9 @@ mod tests {
         let content = json!({
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1,occ-2",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -744,6 +774,9 @@ mod tests {
             "source_evidence": evidence_id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1,occ-2",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -814,6 +847,9 @@ mod tests {
             "source_evidence": evidence_id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -862,6 +898,9 @@ mod tests {
             "source_evidence": evidence_id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -919,7 +958,7 @@ mod tests {
             .admit(
                 admit_request(
                     ACTION_OBSERVATION,
-                    r#"{"object_id":"obs-1","name":"timeout","source_evidence":"missing","problem_signature":"sig:timeout","occurrence_ids":"occ-1","classification":"defect","disposition":"open"}"#,
+                    r#"{"object_id":"obs-1","name":"timeout","source_evidence":"missing","problem_signature":"sig:timeout","occurrence_ids":"occ-1","operation_id":"op-1","observed_at_ms":1000,"scope":"prod","classification":"defect","disposition":"open"}"#,
                     "obs-no-evidence",
                     vec![],
                 ),
@@ -945,6 +984,9 @@ mod tests {
             "source_evidence": rejected.submission.id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -980,6 +1022,9 @@ mod tests {
             "source_evidence": accepted.submission.id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -1017,6 +1062,9 @@ mod tests {
             "source_evidence": evidence_id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -1038,6 +1086,9 @@ mod tests {
             "source_evidence": evidence_id,
             "problem_signature": "sig:timeout",
             "occurrence_ids": "occ-1",
+            "operation_id": "op-1",
+            "observed_at_ms": 1_000,
+            "scope": "prod",
             "classification": "defect",
             "disposition": "open"
         });
@@ -1120,6 +1171,9 @@ mod tests {
                         "source_evidence": evidence_id,
                         "problem_signature": "sig:timeout",
                         "occurrence_ids": "occ-1",
+                        "operation_id": "op-1",
+                        "observed_at_ms": 1_000,
+                        "scope": "prod",
                         "classification": "defect",
                         "disposition": "open"
                     });
