@@ -1,22 +1,40 @@
-//! Feedback runtimes outside the plane: investigation through public RPCs
-//! against an in-process plane. The analyzer is scripted; the plane, claims,
-//! bindings, and Action writes are real.
+//! Feedback runtimes outside the plane: investigation and GitHub publication
+//! through public RPCs against an in-process plane. The analyzer and GitHub
+//! are scripted; the plane, claims, bindings, permits, and Action writes are
+//! real.
 
 #[allow(dead_code)]
 #[path = "../adapters/feedback_investigation.rs"]
 mod feedback_investigation;
 
-use std::cell::Cell;
+#[allow(dead_code)]
+#[path = "../adapters/source_writeback.rs"]
+mod source_writeback;
+
+#[allow(dead_code)]
+#[path = "../adapters/feedback_github_issues.rs"]
+mod feedback_github_issues;
+
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use feedback_github_issues::{
+    ABSENT, GitHubIssue, GitHubIssues, IssuePublisher, IssueTracker, Publish, draft,
+    sanitize_public_text,
+};
 use feedback_investigation::{
     AnalysisError, AnalysisRequest, Attribution, FeedbackAnalyzer, FilingDecision,
     InvestigationAnalysis, Investigator, PROMPT_OBSERVATION_CAP, analysis_input,
     publication_permitted,
 };
+use sekai_chisei::chisei::external_permit::signing_key_from_hex;
+use sekai_chisei::chisei::sekai_facts::SekaiFacts;
+use sekai_chisei::config::Config;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
+use sekai_chisei::db::store::SekaiStore;
+use sekai_chisei::grpc::chisei_service::ChiseiServiceImpl;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
 use sekai_chisei::grpc::pb::sekai::{
     ClaimActionWorkRequest, GetObjectRequest, ListClaimableActionWorkRequest,
@@ -28,12 +46,14 @@ use sekai_chisei::sekai::action_binding::{
 use sekai_chisei::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionRequest,
 };
+use sekai_chisei::sekai::action_policy::ActionPolicy;
 use sekai_chisei::sekai::evidence::{
     EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
     EvidenceSignal, EvidenceTarget, SchemaCompatibility,
 };
 use sekai_chisei::sekai::evidence_admission_lifecycle::EvidenceAdmissionLifecycle;
 use sekai_chisei::sekai::evidence_store::{EvidenceProducerCapability, canonical_content_digest};
+use sekai_chisei::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE;
 use sekai_chisei::sekai::feedback_package::{
     ACTION_DISPATCH, ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE,
     INVESTIGATION_RUNTIME, KIND_FINDING, KIND_HYPOTHESIS, KIND_OBSERVATION, PACKAGE_VERSION,
@@ -42,11 +62,12 @@ use sekai_chisei::sekai::feedback_package::{
 use sekai_chisei::sekai::object_change_subscription::OP_CREATE;
 use sekai_chisei::sekai::security::Role;
 use serde_json::json;
+use source_writeback::{PermitTrust, WritebackIntent, WritebackProfile};
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 
 const NAMESPACE: &str = "ops";
-const OPERATOR: &str = "operator";
+const OPERATOR: &str = "local";
 const PRODUCER: &str = "producer:feedback";
 const BINDING: &str = "feedback-dispatch";
 const SIGNATURE: &str = "api:tenkai_failed";
@@ -478,4 +499,387 @@ fn the_prompt_is_sent_once_and_bounded() {
             .contains(&format!("o-{}", PROMPT_OBSERVATION_CAP * 4 - 1))
     );
     assert!(input.estimated_tokens > 1_024);
+}
+
+// ---- GitHub publication ----
+
+const EXECUTOR: &str = "executor:github-issues";
+const REPOSITORY: &str = "tenkai-org/tenkai";
+const PERMIT_SEED: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+const PERMIT_ISSUER: &str = "issuer:test";
+const PERMIT_KEY_ID: &str = "key-1";
+
+/// In-memory repository. `lose_next_create` commits the issue and then fails,
+/// the way a dropped response looks to the executor.
+#[derive(Default)]
+struct FakeGitHub {
+    issues: RefCell<Vec<GitHubIssue>>,
+    creates: Cell<usize>,
+    updates: Cell<usize>,
+    lose_next_create: Cell<bool>,
+    clock: Cell<i64>,
+}
+
+impl FakeGitHub {
+    fn tick(&self) -> i64 {
+        self.clock.set(self.clock.get().max(now_ms()) + 1);
+        self.clock.get()
+    }
+}
+
+impl GitHubIssues for FakeGitHub {
+    fn list(&self) -> Result<Vec<GitHubIssue>, String> {
+        Ok(self.issues.borrow().clone())
+    }
+
+    fn create(&self, title: &str, body: &str) -> Result<GitHubIssue, String> {
+        let at = self.tick();
+        let issue = GitHubIssue {
+            number: self.issues.borrow().len() as u64 + 1,
+            title: title.into(),
+            body: body.into(),
+            created_ms: at,
+            updated_ms: at,
+        };
+        self.issues.borrow_mut().push(issue.clone());
+        self.creates.set(self.creates.get() + 1);
+        if self.lose_next_create.replace(false) {
+            return Err("response lost".into());
+        }
+        Ok(issue)
+    }
+
+    fn update(&self, number: u64, title: &str, body: &str) -> Result<GitHubIssue, String> {
+        let at = self.tick();
+        let mut issues = self.issues.borrow_mut();
+        let issue = issues
+            .iter_mut()
+            .find(|issue| issue.number == number)
+            .ok_or("no such issue")?;
+        issue.title = title.into();
+        issue.body = body.into();
+        issue.updated_ms = at;
+        self.updates.set(self.updates.get() + 1);
+        Ok(issue.clone())
+    }
+}
+
+struct Publication {
+    plane: Plane,
+    chisei: ChiseiServiceImpl,
+    profile: WritebackProfile,
+    tracker: IssueTracker<FakeGitHub>,
+    publisher: IssuePublisher,
+    finding_id: String,
+}
+
+/// A plane with one qualifying finding and a bootstrapped writeback profile.
+async fn publication() -> Publication {
+    let plane = armed_plane().await;
+    for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
+        observe(&plane.db, id, op, "defect");
+    }
+    let finding_id = drain(&plane, &Scripted::tenkai())
+        .await
+        .into_iter()
+        .rfind(|report| report.filing == FilingDecision::Qualifying)
+        .unwrap()
+        .finding_id;
+    let now = now_ms();
+    plane
+        .db
+        .upsert_action_policy(&ActionPolicy::allow_all(format!("agent:{OPERATOR}")))
+        .unwrap();
+    plane
+        .db
+        .upsert_evidence_producer(
+            &EvidenceProducerCapability {
+                producer_identity: EXECUTOR.into(),
+                source_types: vec!["host_executor".into()],
+                source_instances: vec![format!("{EXECUTOR}:writeback")],
+                evidence_types: vec![EXECUTION_EVIDENCE_TYPE.into()],
+                target_kinds: vec![KIND_FINDING.into(), "action".into()],
+                max_payload_bytes: 64 * 1024,
+                max_relationships: 8,
+                ..producer()
+            },
+            now,
+        )
+        .unwrap();
+    let store = SekaiStore::from_shared_runtime(plane.db.clone());
+    let chisei = ChiseiServiceImpl::new(
+        sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(plane.db.clone()),
+        fixture_config(),
+    )
+    .with_sekai_facts(SekaiFacts::in_process(store))
+    .unwrap();
+    let profile = WritebackProfile {
+        namespace: NAMESPACE.into(),
+        action_type_id: "feedback.github_issue.write".into(),
+        action_type_version: "1".into(),
+        external_action_type: "github.issues.write/v1".into(),
+        parameter_schema: "github.issues.write.params/v1".into(),
+        executor: EXECUTOR.into(),
+        harness: "harness:feedback-github".into(),
+        host_capability: "github.issues.write/v1".into(),
+        target_kind: KIND_FINDING.into(),
+    };
+    profile.bootstrap(&plane.sekai, OPERATOR).await.unwrap();
+    Publication {
+        plane,
+        chisei,
+        profile,
+        tracker: IssueTracker {
+            github: FakeGitHub::default(),
+            repository: REPOSITORY.into(),
+            daily_cap: 0,
+        },
+        publisher: IssuePublisher {
+            namespace: NAMESPACE.into(),
+            principal: OPERATOR.into(),
+        },
+        finding_id,
+    }
+}
+
+impl Publication {
+    async fn decide(&self) -> Publish {
+        self.publisher
+            .decide(&self.plane.sekai, &self.tracker, &self.finding_id)
+            .await
+            .unwrap()
+    }
+
+    async fn write(&self, intent: &WritebackIntent) -> Result<String, String> {
+        let key = signing_key_from_hex(PERMIT_SEED).unwrap().verifying_key();
+        let trust = PermitTrust {
+            key: &key,
+            issuer: PERMIT_ISSUER,
+            key_id: PERMIT_KEY_ID,
+        };
+        self.profile
+            .run(
+                &self.plane.sekai,
+                &self.chisei,
+                &self.tracker,
+                OPERATOR,
+                &trust,
+                intent,
+            )
+            .await
+            .map(|outcome| outcome.new_version)
+    }
+
+    /// Decide and write until nothing is left to do.
+    async fn publish(&self) {
+        while let Publish::Write(intent) = self.decide().await {
+            self.write(&intent).await.unwrap();
+        }
+    }
+
+    fn issue_count(&self) -> usize {
+        self.tracker.github.issues.borrow().len()
+    }
+}
+
+fn written(publish: Publish) -> WritebackIntent {
+    match publish {
+        Publish::Write(intent) => intent,
+        other => panic!("expected a write, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_qualifying_finding_publishes_one_sanitized_issue() {
+    let publication = publication().await;
+    publication.publish().await;
+    let issues = publication.tracker.github.issues.borrow();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].title, "feedback: api tenkai_failed");
+    assert!(
+        issues[0]
+            .body
+            .contains("3 observations across 3 operations.")
+    );
+    assert!(issues[0].body.contains("## Attribution\n\ntenkai"));
+    assert!(issues[0].body.contains("Not independently measured."));
+}
+
+#[tokio::test]
+async fn a_lost_create_is_reconciled_without_a_second_issue() {
+    let publication = publication().await;
+    let intent = written(publication.decide().await);
+    assert_eq!(intent.expected_version, ABSENT);
+    publication.tracker.github.lose_next_create.set(true);
+    assert!(publication.write(&intent).await.is_err());
+    // The issue exists; the next decision sees it and has nothing to change.
+    assert_eq!(publication.decide().await, Publish::Unchanged);
+    assert_eq!(publication.tracker.github.creates.get(), 1);
+    // Replaying the stale intent is refused instead of creating again.
+    assert!(publication.write(&intent).await.is_err());
+    assert_eq!(publication.issue_count(), 1);
+}
+
+#[tokio::test]
+async fn an_unchanged_finding_needs_no_permit_or_write() {
+    let publication = publication().await;
+    publication.publish().await;
+    let writes =
+        || publication.tracker.github.creates.get() + publication.tracker.github.updates.get();
+    let before = writes();
+    for _ in 0..3 {
+        assert_eq!(publication.decide().await, Publish::Unchanged);
+    }
+    assert_eq!(writes(), before);
+}
+
+#[tokio::test]
+async fn another_namespaces_marker_is_never_adopted() {
+    let publication = publication().await;
+    let foreign = draft("other", SIGNATURE, None, false, &[], REPOSITORY);
+    publication
+        .tracker
+        .github
+        .create(&foreign.title, &foreign.managed_body)
+        .unwrap();
+    let intent = written(publication.decide().await);
+    assert_eq!(intent.expected_version, ABSENT);
+    publication.write(&intent).await.unwrap();
+    assert_eq!(publication.issue_count(), 2);
+}
+
+#[tokio::test]
+async fn a_new_occurrence_updates_the_managed_section_and_keeps_maintainer_text() {
+    let publication = publication().await;
+    publication.publish().await;
+    {
+        let mut issues = publication.tracker.github.issues.borrow_mut();
+        issues[0]
+            .body
+            .push_str("\n\nMaintainer: tracked in the next release.");
+        issues[0].updated_ms += 1;
+    }
+    observe(&publication.plane.db, "o-4", "op-4", "defect");
+    let intent = written(publication.decide().await);
+    assert_ne!(intent.expected_version, ABSENT);
+    publication.write(&intent).await.unwrap();
+    let issues = publication.tracker.github.issues.borrow();
+    assert_eq!(issues.len(), 1);
+    assert!(
+        issues[0]
+            .body
+            .contains("4 observations across 4 operations.")
+    );
+    assert!(
+        issues[0]
+            .body
+            .ends_with("Maintainer: tracked in the next release.")
+    );
+}
+
+#[tokio::test]
+async fn the_daily_cap_defers_new_issues() {
+    let publication = publication().await;
+    for index in 0..feedback_github_issues::DEFAULT_DAILY_CAP {
+        let other = draft(
+            NAMESPACE,
+            &format!("api:other_{index}"),
+            None,
+            false,
+            &[],
+            REPOSITORY,
+        );
+        publication
+            .tracker
+            .github
+            .create(&other.title, &other.managed_body)
+            .unwrap();
+    }
+    assert_eq!(publication.decide().await, Publish::DailyCapReached);
+}
+
+#[test]
+fn public_text_never_carries_private_identifiers() {
+    let samples = [
+        "reached 10.1.2.3 from /Users/ops/secret and acme/private-ops#9 on ops.internal.example",
+        "path `/home/ops/.ssh/id_rsa` leaked",
+        "store /srv/tenant/data/export.json",
+        "host `<db01.tenant.example>` and `ops.internal.example`",
+        "contact ops@tenant.example",
+        "addr fd00::1 and [2001:db8::1]",
+        "Authorization: Bearer ghp_exampletoken",
+    ];
+    for sample in samples {
+        let sanitized = sanitize_public_text(sample, REPOSITORY);
+        for needle in [
+            "10.1.2.3",
+            "/Users/ops/secret",
+            "/home/ops/.ssh/id_rsa",
+            "/srv/tenant/data/export.json",
+            "db01.tenant.example",
+            "ops.internal.example",
+            "ops@tenant.example",
+            "fd00::1",
+            "2001:db8::1",
+            "ghp_exampletoken",
+            "acme/private-ops#9",
+        ] {
+            assert!(
+                !sanitized.contains(needle),
+                "leaked {needle:?} from {sample:?}"
+            );
+        }
+    }
+    let own = sanitize_public_text("see github.com/tenkai-org/tenkai#1", REPOSITORY);
+    assert!(own.contains("github.com/tenkai-org/tenkai#1"), "{own}");
+}
+
+fn fixture_config() -> Config {
+    Config {
+        grpc_port: 0,
+        sekai_bind: None,
+        ops_port: None,
+        ops_bind: "127.0.0.1".into(),
+        http_port: None,
+        http_bind: "127.0.0.1".into(),
+        sekai_socket: None,
+        db_path: ":memory:".into(),
+        anthropic_api_key: None,
+        openai_api_key: None,
+        ollama_url: "http://127.0.0.1:11434".into(),
+        native_llm_url: None,
+        sample_rate: 0.0,
+        sample_risk_threshold: 0.7,
+        scoring_enabled: false,
+        scoring_interval_secs: 60,
+        scoring_model: "claude-opus-4-8".into(),
+        scoring_batch_size: 16,
+        default_data_class: "unclassified".into(),
+        safe_egress_providers: vec![],
+        gateway_provided_providers: vec![],
+        routing_endpoint_allowlist: vec![],
+        routing_credential_refs: vec![],
+        gateway_receipt_principals: vec![],
+        leak_review_model: None,
+        tls_cert: None,
+        tls_key: None,
+        allow_plaintext: false,
+        insecure: true,
+        permit_signing_key: Some(PERMIT_SEED.into()),
+        permit_issuer: PERMIT_ISSUER.into(),
+        permit_key_id: PERMIT_KEY_ID.into(),
+        governed_subject_provenance_signing_key: Some("09".repeat(32)),
+        governed_subject_provenance_key_not_before_ms: 0,
+        governed_subject_provenance_key_expires_at_ms: i64::MAX,
+        governed_subject_provenance_ttl_ms: 24 * 60 * 60 * 1_000,
+        site_id: "local".into(),
+        budget_topology: Default::default(),
+        assertion_issuer: None,
+        assertion_audience: None,
+        assertion_hmac_key: None,
+        sekai_endpoint: None,
+        actor_chain_enforcement: false,
+        principal_requests_per_minute: 60,
+        agent_requests_per_minute: 60,
+    }
 }
