@@ -2,7 +2,8 @@
 
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{
-    insert_created_object_in, lock_object_lifecycle, row_to_object, update_object_in,
+    insert_created_object_in, lock_object_lifecycle, lock_object_lifecycles, row_to_object,
+    update_object_in,
 };
 use crate::sekai::action_instance::{
     ActionInstance, AdmissionLease, AdmissionUndo, FencedAdmissionWrite, ParkedGrantOutcome,
@@ -230,8 +231,16 @@ impl PostgresDb {
         let written = match write {
             ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
         };
-        // Object then Action: the same order as forget redaction (#1969).
-        lock_object_lifecycle(&mut tx, &written.id)?;
+        // Object then Action: written object and references in id order,
+        // then the reservation row (#2036).
+        postgres_share_lock_object_ids(
+            &mut tx,
+            std::iter::once(written.id.as_str()).chain(
+                references
+                    .iter()
+                    .map(crate::sekai::action_instance::PlanReference::id),
+            ),
+        )?;
         if matches!(write, ParkedGrantWrite::Update(_)) {
             // Keep PostgreSQL's monotonic revision token: an update that
             // does not advance `updated` is a revision conflict, as on
@@ -336,6 +345,16 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        // Object then Action: the undo target before the reservation row (#2036).
+        match undo {
+            AdmissionUndo::AbortCreate { object_id, .. } => {
+                postgres_share_lock_object_ids(&mut tx, [object_id.as_str()])?;
+            }
+            AdmissionUndo::RestoreUpdate { previous, .. } => {
+                postgres_share_lock_object_ids(&mut tx, [previous.id.as_str()])?;
+            }
+            AdmissionUndo::None => {}
+        }
         if !postgres_admission_fence_holds(&mut tx, instance_id, lease, false)? {
             return Ok(false);
         }
@@ -571,11 +590,37 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        // Object then Action: the same order as forget redaction (#1969).
+        let peeked: Option<String> = transaction
+            .query_opt(
+                "SELECT status FROM sekai_action_instances WHERE instance_id = $1",
+                &[&granted.instance_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if peeked.as_deref() != Some(STATUS_PARKED) {
+            return Ok(ParkedGrantOutcome::NotParked);
+        }
+        let written = write.map(|write| match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        });
+        let writer_target =
+            crate::sekai::site_agent_memory::writer_object_id(&granted.parameters_json);
+        // Object then Action: every object this grant will row-lock, in id
+        // order, then the parked instance (#2036).
+        postgres_share_lock_object_ids(
+            &mut transaction,
+            std::iter::once(target_object_id)
+                .chain(written.iter().map(|object| object.id.as_str()))
+                .chain(writer_target.as_deref())
+                .chain(
+                    references
+                        .iter()
+                        .map(crate::sekai::action_instance::PlanReference::id),
+                ),
+        )?;
         let current = if target_object_id.is_empty() {
             None
         } else {
-            lock_object_lifecycle(&mut transaction, target_object_id)?;
             transaction
                 .query_opt(
                     "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -586,6 +631,17 @@ impl PostgresDb {
                 .map(row_to_object)
                 .transpose()?
         };
+        if let Some(reason) = postgres_site_agent_refusal(
+            &mut transaction,
+            &granted.namespace,
+            &granted.principal,
+            written,
+        )? {
+            return Ok(ParkedGrantOutcome::Refused(reason));
+        }
+        if postgres_changed_reference(&mut transaction, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
+        }
         let row = transaction
             .query_opt(
                 "SELECT status, parameters_json FROM sekai_action_instances
@@ -600,17 +656,6 @@ impl PostgresDb {
         };
         if status != STATUS_PARKED {
             return Ok(ParkedGrantOutcome::NotParked);
-        }
-        let written = write.map(|write| match write {
-            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
-        });
-        if let Some(reason) = postgres_site_agent_refusal(
-            &mut transaction,
-            &granted.namespace,
-            &granted.principal,
-            written,
-        )? {
-            return Ok(ParkedGrantOutcome::Refused(reason));
         }
         if let Some(claim) = claim {
             // Share-locked: a takeover replacing the claim commits first.
@@ -629,9 +674,6 @@ impl PostgresDb {
         if !target_object_id.is_empty()
             && object_state_digest(current.as_ref())? != parked_object_digest
         {
-            return Ok(ParkedGrantOutcome::Stale);
-        }
-        if postgres_changed_reference(&mut transaction, references)?.is_some() {
             return Ok(ParkedGrantOutcome::Stale);
         }
         let previous = match write {
@@ -954,6 +996,7 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
              WHERE namespace = $1
                AND type_id IN ($2, $3, $4)
                AND parameters_json::jsonb ->> 'object_id' = $5
+             ORDER BY instance_id
              FOR UPDATE",
             &[
                 &object.namespace,
@@ -992,12 +1035,26 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
     let rows = match client.query(
         "SELECT memory_id, body_json FROM sekai_action_decision_memory
          WHERE namespace = $1 AND type_id IN ($2, $3, $4)
+           AND (
+             CASE
+               WHEN coalesce(body_json::jsonb ->> 'parameters_json', '') IN ('', 'null')
+                 THEN NULL
+               ELSE (body_json::jsonb ->> 'parameters_json')::jsonb ->> 'object_id'
+             END = $5
+             OR CASE
+               WHEN coalesce(body_json::jsonb ->> 'facts_json', '') IN ('', 'null')
+                 THEN NULL
+               ELSE (body_json::jsonb ->> 'facts_json')::jsonb ->> 'object_id'
+             END = $5
+           )
+         ORDER BY memory_id
          FOR UPDATE",
         &[
             &object.namespace,
             &ACTION_CREATE,
             &ACTION_UPDATE,
             &ACTION_FORGET,
+            &object.id,
         ],
     ) {
         Ok(rows) => rows,
@@ -1135,10 +1192,29 @@ pub(crate) fn postgres_admission_fence_holds<C: postgres::GenericClient>(
     }))
 }
 
+/// Lifecycle and `FOR SHARE` row locks for `object_ids` in sorted unique
+/// order, before any Action row lock in the same transaction (#2036).
+fn postgres_share_lock_object_ids(
+    tx: &mut postgres::Transaction<'_>,
+    object_ids: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), String> {
+    let ids = crate::db::postgres_audit::ordered_object_lock_ids(object_ids);
+    lock_object_lifecycles(tx, &ids)?;
+    for id in ids {
+        tx.query_opt(
+            "SELECT 1 FROM sekai_objects WHERE id = $1 FOR SHARE",
+            &[&id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// The id of the first of `references` no longer as planning read it
 /// (#1941). A present one is read `FOR SHARE` and an absent one holds its
 /// lifecycle lock, which a create takes, so each stays as read until commit;
-/// in id order, so two writers lock in one order.
+/// in id order, so two writers lock in one order. Callers take those same
+/// object locks before any Action row lock (#2036).
 fn postgres_changed_reference(
     tx: &mut postgres::Transaction<'_>,
     references: &[crate::sekai::action_instance::PlanReference],
@@ -1166,4 +1242,305 @@ fn postgres_changed_reference(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::runtime_db::RuntimeDb;
+    use crate::domain::Object;
+    use crate::sekai::action_instance::{
+        FencedAdmissionWrite, ParkedGrantOutcome, ParkedGrantWrite, PlanReference, STATUS_ADMITTED,
+        STATUS_DENIED, object_state_digest, reserve_for_test, sample_for_test,
+    };
+    use crate::sekai::plan_execution::{EXECUTION_RUNNING, PlanExecution};
+    use crate::sekai::site_agent_memory::{
+        ACTION_CREATE, ACTION_UPDATE, CONTENT_PROPERTY, FORGOTTEN_PROPERTY, KIND,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Barrier};
+
+    fn postgres_deadlock(error: &str) -> bool {
+        error.contains("40P01") || error.contains("deadlock detected")
+    }
+
+    fn record(id: &str, kind: &str, updated: i64, properties: HashMap<String, String>) -> Object {
+        Object {
+            id: id.into(),
+            kind: kind.into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties,
+            created: updated,
+            updated,
+        }
+    }
+
+    /// Admission, parked grant, plan-step close and forget on overlapping
+    /// objects wait in one lock order and neither deadlock nor drop a
+    /// successful write (#2036).
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_admission_grant_close_and_forget_do_not_deadlock() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = Arc::new(RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect())));
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let note_id = format!("note-{run}");
+        let grant_id = format!("grant-{run}");
+        let created_id = format!("created-{run}");
+        let mut note_properties = HashMap::new();
+        note_properties.insert("instance_id".into(), format!("line-{run}"));
+        note_properties.insert(CONTENT_PROPERTY.into(), "secret".into());
+        let note = record(&note_id, KIND, 500, note_properties);
+        db.create_object_with_audit(&note, "a").unwrap();
+        db.create_object_with_audit(
+            &record(&grant_id, "customer_record", 500, HashMap::new()),
+            "a",
+        )
+        .unwrap();
+        let mut writer = sample_for_test(STATUS_ADMITTED);
+        writer.instance_id = format!("writer-{run}");
+        writer.idempotency_key = format!("key-writer-{run}");
+        writer.operation_id = format!("op-writer-{run}");
+        writer.type_id = ACTION_CREATE.into();
+        writer.parameters_json = format!(r#"{{"object_id":"{note_id}","content":"secret"}}"#);
+        db.put_action_instance(&writer).unwrap();
+        let decision = |id: &str, object_id: &str, content: &str| {
+            let parameters = format!(r#"{{"object_id":"{object_id}","content":"{content}"}}"#);
+            crate::sekai::decision_memory::DecisionMemory {
+                memory_id: id.into(),
+                namespace: "acme".into(),
+                type_id: ACTION_UPDATE.into(),
+                version: "1".into(),
+                instance_id: id.into(),
+                outcome: "grant".into(),
+                reason: "ok".into(),
+                conditions_json: String::new(),
+                facts_json: parameters.clone(),
+                decided_by: "operator".into(),
+                decided_at_ms: 10,
+                superseded: false,
+                parameters_json: parameters,
+            }
+        };
+        db.put_decision_memory(&decision(&format!("mem-{run}"), &note_id, "secret"))
+            .unwrap();
+        for index in 0..32 {
+            db.put_decision_memory(&decision(
+                &format!("noise-{run}-{index}"),
+                &format!("other-{run}-{index}"),
+                "noise",
+            ))
+            .unwrap();
+        }
+        let grant_target = db.get_object(&grant_id).unwrap().unwrap();
+        let parked_digest = object_state_digest(Some(&grant_target)).unwrap();
+        let mut parked = sample_for_test(crate::sekai::action_instance::STATUS_PARKED);
+        parked.instance_id = format!("parked-{run}");
+        parked.idempotency_key = format!("key-parked-{run}");
+        parked.operation_id = format!("op-parked-{run}");
+        db.put_action_instance(&parked).unwrap();
+        db.put_plan_execution(&PlanExecution {
+            namespace: "acme".into(),
+            plan_id: format!("plan-{run}"),
+            simulation_id: "sim-1".into(),
+            simulation_digest: "sha256:one".into(),
+            status: EXECUTION_RUNNING.into(),
+            next_step: 0,
+            steps: Vec::new(),
+            stop_reason: String::new(),
+            stopped_at_step: None,
+            started_by: "planner".into(),
+            updated_at_ms: 1,
+            revision: 0,
+            claim_holder: format!("run-{run}"),
+            claim_until_ms: 10_000,
+        })
+        .unwrap();
+
+        let note = db.get_object(&note_id).unwrap().unwrap();
+        let grant_target = db.get_object(&grant_id).unwrap().unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let admission = {
+            let (db, barrier, note, created_id, run) = (
+                Arc::clone(&db),
+                Arc::clone(&barrier),
+                note.clone(),
+                created_id.clone(),
+                run.clone(),
+            );
+            std::thread::spawn(move || {
+                let (instance_id, lease) = reserve_for_test(&db, &format!("ai-admit-{run}"), 100);
+                let write = ParkedGrantWrite::Create(record(
+                    &created_id,
+                    "customer_record",
+                    700,
+                    HashMap::new(),
+                ));
+                barrier.wait();
+                db.apply_admission_object_write(
+                    &instance_id,
+                    &lease,
+                    &write,
+                    None,
+                    &[PlanReference::Present(note)],
+                    "a",
+                    &crate::sekai::audit::ChangeAttribution::default(),
+                )
+                .map(|outcome| match outcome {
+                    FencedAdmissionWrite::Applied(_) => "Applied".into(),
+                    FencedAdmissionWrite::FenceLost => "FenceLost".into(),
+                    FencedAdmissionWrite::Refused(reason) => format!("Refused({reason})"),
+                })
+            })
+        };
+        let forget = {
+            let (db, barrier, mut forgotten, run) = (
+                Arc::clone(&db),
+                Arc::clone(&barrier),
+                note.clone(),
+                run.clone(),
+            );
+            forgotten.updated += 1;
+            forgotten
+                .properties
+                .insert(CONTENT_PROPERTY.into(), String::new());
+            forgotten
+                .properties
+                .insert(FORGOTTEN_PROPERTY.into(), "true".into());
+            std::thread::spawn(move || {
+                let (instance_id, lease) = reserve_for_test(&db, &format!("ai-forget-{run}"), 100);
+                let write = ParkedGrantWrite::Update(forgotten);
+                barrier.wait();
+                db.apply_admission_object_write(
+                    &instance_id,
+                    &lease,
+                    &write,
+                    None,
+                    &[],
+                    "a",
+                    &crate::sekai::audit::ChangeAttribution::default(),
+                )
+                .map(|outcome| match outcome {
+                    FencedAdmissionWrite::Applied(_) => "Applied".into(),
+                    FencedAdmissionWrite::FenceLost => "FenceLost".into(),
+                    FencedAdmissionWrite::Refused(reason) => format!("Refused({reason})"),
+                })
+            })
+        };
+        let grant = {
+            let (db, barrier, parked, grant_target, note, parked_digest) = (
+                Arc::clone(&db),
+                Arc::clone(&barrier),
+                parked,
+                grant_target,
+                note,
+                parked_digest,
+            );
+            std::thread::spawn(move || {
+                let mut updated = grant_target.clone();
+                updated.updated += 1;
+                updated.name = "granted".into();
+                let granted = crate::sekai::action_instance::ActionInstance {
+                    status: STATUS_ADMITTED.into(),
+                    ..parked
+                };
+                barrier.wait();
+                db.grant_parked_action_instance(
+                    &granted,
+                    &grant_target.id,
+                    &parked_digest,
+                    Some(&ParkedGrantWrite::Update(updated)),
+                    &[PlanReference::Present(note)],
+                    "a",
+                    None,
+                )
+                .map(|outcome| match outcome {
+                    ParkedGrantOutcome::Granted { .. } => "Granted".into(),
+                    ParkedGrantOutcome::NotParked => "NotParked".into(),
+                    ParkedGrantOutcome::Refused(reason) => format!("Refused({reason})"),
+                    ParkedGrantOutcome::ClaimLost => "ClaimLost".into(),
+                    ParkedGrantOutcome::Stale => "Stale".into(),
+                })
+            })
+        };
+        let close = {
+            let (db, barrier, run) = (Arc::clone(&db), Arc::clone(&barrier), run.clone());
+            std::thread::spawn(move || {
+                let mut closing = sample_for_test(STATUS_DENIED);
+                closing.instance_id = format!("close-{run}");
+                closing.idempotency_key = format!("close-{run}");
+                closing.operation_id = format!("op-close-{run}");
+                closing.request_digest = "plan_execution_stopped:step_refused".into();
+                barrier.wait();
+                db.close_plan_step_key(&closing, &format!("plan-{run}"), &format!("run-{run}"))
+                    .map(|inserted| format!("inserted={inserted}"))
+            })
+        };
+
+        let outcomes = [admission, forget, grant, close].map(|worker| worker.join().unwrap());
+        for outcome in &outcomes {
+            if let Err(error) = outcome {
+                assert!(
+                    !postgres_deadlock(error),
+                    "deadlock (SQLSTATE 40P01): {error}; outcomes={outcomes:?}"
+                );
+            }
+        }
+        let created = db.get_object(&created_id).unwrap();
+        if outcomes[0]
+            .as_ref()
+            .is_ok_and(|outcome| outcome.contains("Applied"))
+        {
+            assert!(created.is_some(), "admission applied but object missing");
+        }
+        let stored_note = db.get_object(&note_id).unwrap().unwrap();
+        if outcomes[1]
+            .as_ref()
+            .is_ok_and(|outcome| outcome.contains("Applied"))
+        {
+            assert_eq!(
+                stored_note
+                    .properties
+                    .get(FORGOTTEN_PROPERTY)
+                    .map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                stored_note
+                    .properties
+                    .get(CONTENT_PROPERTY)
+                    .map(String::as_str),
+                Some("")
+            );
+            let memory = db
+                .get_decision_memory(&format!("mem-{run}"))
+                .unwrap()
+                .unwrap();
+            assert!(
+                !memory.parameters_json.contains("secret"),
+                "{}",
+                memory.parameters_json
+            );
+        }
+        if outcomes[2]
+            .as_ref()
+            .is_ok_and(|outcome| outcome.contains("Granted"))
+        {
+            assert_eq!(db.get_object(&grant_id).unwrap().unwrap().name, "granted");
+        }
+        assert_eq!(
+            outcomes[3].as_ref().map(String::as_str),
+            Ok("inserted=true")
+        );
+        let noise = db
+            .get_decision_memory(&format!("noise-{run}-0"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            noise.parameters_json.contains("noise"),
+            "{}",
+            noise.parameters_json
+        );
+    }
 }
