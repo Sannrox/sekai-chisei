@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
@@ -28,11 +28,12 @@ use crate::sekai::execution_evidence::{
     EXECUTION_EVIDENCE_SCHEMA, EXECUTION_EVIDENCE_TYPE, ExecutionEvidence, ExecutionLifecycleState,
 };
 use crate::sekai::feedback_investigation::{
-    eq_property, github_dispatch_permitted, list_feedback_objects, runtime_recorded,
+    eq_property, github_dispatch_permitted, list_feedback_objects, observation_view,
+    parse_occurrence_ids, runtime_recorded,
 };
 use crate::sekai::feedback_package::{
-    ACTION_EXTERNAL_ISSUE, KIND_EXTERNAL_ISSUE, KIND_FINDING, KIND_HYPOTHESIS,
-    KIND_INVESTIGATION_RESULT, KIND_OBSERVATION, PACKAGE_VERSION,
+    ACTION_EXTERNAL_ISSUE, KIND_EXTERNAL_ISSUE, KIND_FINDING, KIND_INVESTIGATION_RESULT,
+    KIND_OBSERVATION, PACKAGE_VERSION,
 };
 use crate::sekai::governed_action_type::{
     EFFECT_KIND_NOTIFY, GovernedActionType, OBJECT_MUTATION_UPDATE,
@@ -453,8 +454,11 @@ pub fn ensure_adapter_types(
 }
 
 pub fn sanitize_public_text(text: &str, target: &GitHubTarget) -> String {
-    let mut out = redact_paths(text);
+    let mut out = redact_secrets(text);
+    out = redact_emails(&out);
     out = redact_ipv4(&out);
+    out = redact_ipv6(&out);
+    out = redact_paths(&out);
     out = redact_foreign_refs(&out, target);
     redact_hostnames(&out, target)
 }
@@ -560,62 +564,26 @@ pub fn draft_from_finding(
         .as_ref()
         .and_then(|object| object.properties.get("outcome"))
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    let impact = outcome
+    let (operation, reason) = signature_parts(&signature);
+    let operation = public_token(&sanitize_public_text(&operation, target));
+    let reason = public_token(&sanitize_public_text(&reason, target));
+    let attribution = public_attribution(outcome.as_ref());
+    let (observation_count, operation_count, version) =
+        recurrence_fields(db, &finding.namespace, &signature, target)?;
+    let measured = investigation
         .as_ref()
-        .and_then(|value| value.get("impact"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let impact = if impact.is_empty() {
-        finding
-            .properties
-            .get("statement")
-            .map(String::as_str)
-            .unwrap_or("Qualifying finding")
+        .and_then(|object| object.properties.get("measured"))
+        .map(String::as_str)
+        == Some("true");
+    let title = public_title(&operation, &reason);
+    let reproduction = if measured {
+        "Measured."
     } else {
-        impact
+        "Not independently measured."
     };
-    let reproduction = outcome
-        .as_ref()
-        .and_then(|value| value.get("proposed_reproduction"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let hypotheses = hypothesis_statements(db, &finding.namespace, &observation_id)?;
-    let versions = outcome
-        .as_ref()
-        .and_then(|value| value.get("affected_versions"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unspecified");
-    let impact = sanitize_public_text(impact, target);
-    let reproduction = sanitize_public_text(reproduction, target);
-    let versions = sanitize_public_text(versions, target);
-    let hypotheses: Vec<String> = hypotheses
-        .into_iter()
-        .map(|statement| sanitize_public_text(&statement, target))
-        .filter(|statement| !statement.is_empty())
-        .collect();
-    let title = public_title(&impact, &signature);
-    let mut managed = format!(
-        "## Impact\n\n{impact}\n\n## Affected versions\n\n{versions}\n\n## Reproduction\n\n"
+    let managed = format!(
+        "## Operation\n\n{operation}\n\n## Reason\n\n{reason}\n\n## Attribution\n\n{attribution}\n\n## Recurrence\n\n{observation_count} observations across {operation_count} operations.\n\n## Controller version\n\n{version}\n\n## Reproduction\n\n{reproduction}\n\n## Acceptance\n\nA measured verification of the investigation result confirms the documented reproduction no longer fails."
     );
-    if reproduction.is_empty() {
-        managed.push_str("Not independently measured.");
-    } else {
-        managed.push_str(&reproduction);
-    }
-    managed.push_str("\n\n## Hypotheses\n\n");
-    if hypotheses.is_empty() {
-        managed.push_str("None recorded.");
-    } else {
-        for statement in &hypotheses {
-            managed.push_str("- ");
-            managed.push_str(statement);
-            managed.push('\n');
-        }
-    }
-    managed.push_str("\n## Acceptance\n\n");
-    managed.push_str("A measured verification of the investigation result confirms the documented reproduction no longer fails.");
     Ok(IssueDraft {
         title,
         managed_body: managed,
@@ -1237,49 +1205,198 @@ fn related_object(
     Ok(fallback)
 }
 
-fn hypothesis_statements(
+fn signature_parts(signature: &str) -> (String, String) {
+    match signature.rsplit_once(':') {
+        Some((operation, reason)) => (operation.to_string(), reason.to_string()),
+        None => (signature.to_string(), String::new()),
+    }
+}
+
+fn public_token(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "[redacted]" {
+        "unspecified".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn public_attribution(outcome: Option<&serde_json::Value>) -> &'static str {
+    match outcome
+        .and_then(|value| value.get("attribution"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("tenkai") => "tenkai",
+        Some("application") => "application",
+        Some("expected_wait") => "expected_wait",
+        Some("cancellation") => "cancellation",
+        Some("inconclusive") => "inconclusive",
+        Some("malformed") => "malformed",
+        _ => "unspecified",
+    }
+}
+
+fn public_version(raw: &str) -> Option<&str> {
+    let version = raw.trim();
+    if version.is_empty() || version.len() > 32 {
+        return None;
+    }
+    version
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+        .then_some(version)
+}
+
+fn recurrence_fields(
     db: &RuntimeDb,
     namespace: &str,
-    observation_id: &str,
-) -> Result<Vec<String>, PublishError> {
+    signature: &str,
+    target: &GitHubTarget,
+) -> Result<(usize, usize, String), PublishError> {
     let listed = list_feedback_objects(
         db,
         namespace,
-        KIND_HYPOTHESIS,
-        vec![eq_property("observation_id", observation_id)],
+        KIND_OBSERVATION,
+        vec![eq_property("problem_signature", signature)],
     )
     .map_err(PublishError::Internal)?;
-    Ok(listed
-        .into_iter()
-        .filter(|object| {
-            object.properties.get("observation_id").map(String::as_str) == Some(observation_id)
-        })
-        .filter_map(|object| object.properties.get("statement").cloned())
-        .collect())
+    let mut operations = BTreeSet::new();
+    let mut version = String::new();
+    let mut observations = 0;
+    for object in listed {
+        let Some(view) = observation_view(&object) else {
+            continue;
+        };
+        if view.problem_signature != signature {
+            continue;
+        }
+        observations += 1;
+        for occurrence in parse_occurrence_ids(
+            object
+                .properties
+                .get("occurrence_ids")
+                .map(String::as_str)
+                .unwrap_or(""),
+        ) {
+            operations.insert(occurrence);
+        }
+        if version.is_empty()
+            && let Some(found) = object
+                .properties
+                .get("tenkai_version")
+                .map(String::as_str)
+                .and_then(public_version)
+        {
+            version = found.to_string();
+        }
+    }
+    let version = public_token(&sanitize_public_text(
+        if version.is_empty() {
+            "unspecified"
+        } else {
+            &version
+        },
+        target,
+    ));
+    Ok((observations, operations.len(), version))
 }
 
-fn public_title(impact: &str, signature: &str) -> String {
-    let source = if impact.trim().is_empty() {
-        signature
-    } else {
-        impact
+fn public_title(operation: &str, reason: &str) -> String {
+    let mut title = format!("feedback: {operation}");
+    if !reason.is_empty() && reason != "unspecified" {
+        title.push(' ');
+        title.push_str(reason);
+    }
+    if title.len() > 72 {
+        title.truncate(72);
+    }
+    title
+}
+
+const TOKEN_TRIM: &str = ",.;:()[]{}<>\"'`*";
+
+fn trim_token(token: &str) -> &str {
+    token.trim_matches(|c: char| TOKEN_TRIM.contains(c))
+}
+
+fn match_at(haystack: &[char], start: usize, needle: &str) -> bool {
+    let needle: Vec<char> = needle.chars().collect();
+    if start + needle.len() > haystack.len() {
+        return false;
+    }
+    haystack[start..start + needle.len()] == needle
+}
+
+fn redact_secrets(text: &str) -> String {
+    let orig: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < orig.len() {
+        if match_at(&lower, i, "authorization:") {
+            out.push_str("[redacted]");
+            i += "authorization:".len();
+            while i < orig.len() && orig[i].is_whitespace() {
+                i += 1;
+            }
+            if match_at(&lower, i, "bearer") {
+                i += "bearer".len();
+                while i < orig.len() && orig[i].is_whitespace() {
+                    i += 1;
+                }
+            }
+            while i < orig.len() && !orig[i].is_whitespace() {
+                i += 1;
+            }
+            continue;
+        }
+        let bearer_boundary = i == 0 || !lower[i - 1].is_ascii_alphanumeric();
+        if bearer_boundary && match_at(&lower, i, "bearer") {
+            let after = i + "bearer".len();
+            if after < orig.len() && orig[after].is_whitespace() {
+                out.push_str("[redacted]");
+                i = after;
+                while i < orig.len() && orig[i].is_whitespace() {
+                    i += 1;
+                }
+                while i < orig.len() && !orig[i].is_whitespace() {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(orig[i]);
+        i += 1;
+    }
+    out
+}
+
+fn redact_emails(text: &str) -> String {
+    let mut out = String::new();
+    for token in split_keep(text) {
+        if is_email(trim_token(&token)) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(&token);
+        }
+    }
+    out
+}
+
+fn is_email(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
     };
-    let line = source.lines().next().unwrap_or(source).trim();
-    let mut title = String::new();
-    for word in line.split_whitespace() {
-        if title.len() + word.len() + 1 > 72 {
-            break;
-        }
-        if !title.is_empty() {
-            title.push(' ');
-        }
-        title.push_str(word);
-    }
-    if title.is_empty() {
-        "Qualifying finding".into()
-    } else {
-        title
-    }
+    !local.is_empty()
+        && !domain.is_empty()
+        && !domain.contains('@')
+        && domain.contains('.')
+        && local
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        && domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
 }
 
 fn redact_ipv4(text: &str) -> String {
@@ -1296,6 +1413,32 @@ fn redact_ipv4(text: &str) -> String {
         }
     }
     out
+}
+
+fn redact_ipv6(text: &str) -> String {
+    let mut out = String::new();
+    for token in split_keep(text) {
+        if is_ipv6(trim_token(&token)) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(&token);
+        }
+    }
+    out
+}
+
+fn is_ipv6(token: &str) -> bool {
+    let host = token
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(token);
+    let host = host.split('%').next().unwrap_or(host);
+    let colons = host.chars().filter(|c| *c == ':').count();
+    colons >= 2
+        && host.contains(':')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
 }
 
 fn ipv4_char_len(chars: &[char], start: usize) -> Option<usize> {
@@ -1344,24 +1487,21 @@ fn redact_paths(text: &str) -> String {
 }
 
 fn is_private_path(token: &str) -> bool {
-    let trimmed = token.trim_matches(|c: char| ",.;:()[]{}\"'".contains(c));
-    trimmed.starts_with("/Users/")
-        || trimmed.starts_with("/home/")
-        || trimmed.starts_with("/var/")
-        || trimmed.starts_with("/tmp/")
-        || trimmed.starts_with("/opt/")
-        || trimmed.starts_with("/etc/")
-        || (trimmed.len() > 3
-            && trimmed.as_bytes()[0].is_ascii_alphabetic()
-            && trimmed.as_bytes().get(1) == Some(&b':')
-            && trimmed.as_bytes().get(2) == Some(&b'\\'))
+    let trimmed = trim_token(token);
+    if trimmed.len() > 1 && trimmed.starts_with('/') {
+        return true;
+    }
+    trimmed.len() > 3
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+        && trimmed.as_bytes().get(1) == Some(&b':')
+        && trimmed.as_bytes().get(2) == Some(&b'\\')
 }
 
 fn redact_foreign_refs(text: &str, target: &GitHubTarget) -> String {
     let allowed = target.repository();
     let mut out = String::new();
     for token in split_keep(text) {
-        let trimmed = token.trim_matches(|c: char| ",.;:()[]{}\"'".contains(c));
+        let trimmed = trim_token(&token);
         if is_foreign_issue_ref(trimmed, &allowed) {
             out.push_str("[redacted]");
         } else {
@@ -1400,7 +1540,7 @@ fn is_foreign_issue_ref(token: &str, allowed: &str) -> bool {
 fn redact_hostnames(text: &str, target: &GitHubTarget) -> String {
     let mut out = String::new();
     for token in split_keep(text) {
-        let trimmed = token.trim_matches(|c: char| ",.;:()[]{}\"'".contains(c));
+        let trimmed = trim_token(&token);
         if is_private_host(trimmed, target) {
             out.push_str("[redacted]");
         } else {
@@ -1410,15 +1550,12 @@ fn redact_hostnames(text: &str, target: &GitHubTarget) -> String {
     out
 }
 
-fn is_private_host(token: &str, target: &GitHubTarget) -> bool {
+fn is_private_host(token: &str, _target: &GitHubTarget) -> bool {
     let token = token.strip_prefix("http://").unwrap_or(token);
     let token = token.strip_prefix("https://").unwrap_or(token);
     let host = token.split('/').next().unwrap_or(token);
     let host = host.split(':').next().unwrap_or(host);
     if host.eq_ignore_ascii_case("github.com") {
-        return false;
-    }
-    if host.contains(&target.owner) {
         return false;
     }
     let labels: Vec<&str> = host.split('.').collect();
@@ -2001,9 +2138,14 @@ mod tests {
         assert!(report.created);
         assert_eq!(github.created(), 1);
         let issue = &github.issues()[0];
-        assert!(issue.body.contains("apply cannot finish"));
-        assert!(issue.body.contains("## Hypotheses"));
+        assert_eq!(issue.title, "feedback: api tenkai_failed");
+        assert!(issue.body.contains("## Operation"));
+        assert!(issue.body.contains("api"));
+        assert!(issue.body.contains("tenkai_failed"));
+        assert!(issue.body.contains("tenkai"));
+        assert!(issue.body.contains("3 observations across 3 operations."));
         assert!(issue.body.contains("## Acceptance"));
+        assert!(!issue.body.contains("apply cannot finish"));
         let mapping = runtime.get_object(&report.mapping_id).unwrap().unwrap();
         assert_eq!(
             mapping.properties.get("remote_id").map(String::as_str),
@@ -2033,8 +2175,11 @@ mod tests {
             })
             .unwrap();
         let draft = draft_from_finding(&runtime, &finding, &target()).unwrap();
-        assert!(draft.managed_body.contains("apply cannot finish"));
-        assert!(draft.managed_body.contains("replay the same plan"));
+        assert!(draft.managed_body.contains("timeout"));
+        assert!(draft.managed_body.contains("tenkai"));
+        assert!(!draft.managed_body.contains("apply cannot finish"));
+        assert!(!draft.managed_body.contains("replay the same plan"));
+        assert!(!draft.managed_body.contains("quality-evaluation"));
     }
 
     #[test]
@@ -2066,8 +2211,9 @@ mod tests {
         assert!(!report.created);
         assert_eq!(github.created(), 1);
         let body = &github.issues()[0].body;
-        assert!(body.contains("apply still cannot finish after retry"));
+        assert!(body.contains("6 observations across 6 operations."));
         assert!(body.contains("Maintainer: parked until the next cut."));
+        assert!(!body.contains("apply still cannot finish after retry"));
     }
 
     #[test]
@@ -2236,9 +2382,89 @@ mod tests {
     }
 
     #[test]
+    fn public_draft_omits_model_text_and_uses_template_fields() {
+        let runtime = db();
+        let poison = "apply failed at 10.1.2.3 from /Users/ops/secret";
+        let finding = qualifying_cluster(&runtime, "a", "api:tenkai_failed", poison, poison);
+        let draft = draft_from_finding(&runtime, &finding, &target()).unwrap();
+        assert_eq!(draft.title, "feedback: api tenkai_failed");
+        assert!(draft.managed_body.contains("## Operation\n\napi"));
+        assert!(draft.managed_body.contains("## Reason\n\ntenkai_failed"));
+        assert!(draft.managed_body.contains("## Attribution\n\ntenkai"));
+        assert!(
+            draft
+                .managed_body
+                .contains("3 observations across 3 operations.")
+        );
+        assert!(draft.managed_body.contains("Not independently measured."));
+        assert!(!draft.title.contains(poison), "{}", draft.title);
+        assert!(
+            !draft.managed_body.contains(poison),
+            "{}",
+            draft.managed_body
+        );
+        assert!(
+            !draft.managed_body.contains("10.1.2.3"),
+            "{}",
+            draft.managed_body
+        );
+        assert!(
+            !draft.managed_body.contains("/Users/ops/secret"),
+            "{}",
+            draft.managed_body
+        );
+    }
+
+    #[test]
+    fn sanitize_public_text_redacts_private_identifiers() {
+        let target = target();
+        let samples = [
+            "reached 10.1.2.3 from /Users/ops/secret and acme/private-ops#9 on ops.internal.example",
+            "path `/home/ops/.ssh/id_rsa` leaked",
+            "store /srv/tenant/data/export.json",
+            "host `<db01.tenant.example>` and `ops.internal.example`",
+            "owner-shaped tenkai-org.internal.example",
+            "contact ops@tenant.example",
+            "addr fd00::1 and [2001:db8::1]",
+            "Authorization: Bearer ghp_exampletoken",
+        ];
+        for sample in samples {
+            let sanitized = sanitize_public_text(sample, &target);
+            assert!(
+                sanitized.contains("[redacted]"),
+                "expected redaction in {sample:?} -> {sanitized:?}"
+            );
+            for needle in [
+                "10.1.2.3",
+                "/Users/ops/secret",
+                "/home/ops/.ssh/id_rsa",
+                "/srv/tenant/data/export.json",
+                "db01.tenant.example",
+                "ops.internal.example",
+                "tenkai-org.internal.example",
+                "ops@tenant.example",
+                "fd00::1",
+                "2001:db8::1",
+                "ghp_exampletoken",
+                "acme/private-ops#9",
+            ] {
+                assert!(
+                    !sanitized.contains(needle),
+                    "leaked {needle:?} from {sample:?} -> {sanitized:?}"
+                );
+            }
+        }
+        let github = sanitize_public_text("see github.com/tenkai-org/tenkai#1", &target);
+        assert!(
+            github.contains("github.com/tenkai-org/tenkai#1"),
+            "{github}"
+        );
+    }
+
+    #[test]
     fn publication_strips_private_identifiers_from_adversarial_input() {
         let runtime = db();
-        let poison = "reached 10.1.2.3 from /Users/ops/secret and acme/private-ops#9 on ops.internal.example";
+        let poison = "reached 10.1.2.3 from /Users/ops/secret and acme/private-ops#9 on ops.internal.example `/home/ops/.ssh/id_rsa` /srv/tenant/data `<db01.tenant.example>` tenkai-org.internal.example ops@tenant.example fd00::1 Authorization: Bearer ghp_exampletoken";
         let finding = qualifying_cluster(
             &runtime,
             "a",
@@ -2249,11 +2475,24 @@ mod tests {
         let github = MemoryGitHub::new();
         publish(&runtime, &github, &AllowPermit, &finding).unwrap();
         let body = &github.issues()[0].body;
-        assert!(!body.contains("10.1.2.3"), "{body}");
-        assert!(!body.contains("/Users/ops/secret"), "{body}");
-        assert!(!body.contains("acme/private-ops#9"), "{body}");
-        assert!(!body.contains("ops.internal.example"), "{body}");
-        assert!(body.contains("[redacted]"));
+        let title = &github.issues()[0].title;
+        for needle in [
+            "10.1.2.3",
+            "/Users/ops/secret",
+            "acme/private-ops#9",
+            "ops.internal.example",
+            "/home/ops/.ssh/id_rsa",
+            "/srv/tenant/data",
+            "db01.tenant.example",
+            "tenkai-org.internal.example",
+            "ops@tenant.example",
+            "fd00::1",
+            "ghp_exampletoken",
+            "apply failed at",
+        ] {
+            assert!(!body.contains(needle), "{needle} in {body}");
+            assert!(!title.contains(needle), "{needle} in {title}");
+        }
     }
 
     #[test]
