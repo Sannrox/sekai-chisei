@@ -1,7 +1,7 @@
 //! Shared SQLite/PostgreSQL conformance for dataset health checks (#1411).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use sekai_chisei::db::dataset::DatasetBackend;
 use sekai_chisei::db::runtime_db::RuntimeDb;
@@ -145,6 +145,137 @@ fn exercise(db: &dyn DatasetBackend, prefix: &str) {
         .collect();
     assert_eq!(late.len(), 2);
     assert_eq!(late[1].state, ALERT_RESOLVED);
+}
+
+/// What a binary before #2187 wrote on a cadence `RunDatasetHealthChecks`:
+/// a scheduled check is due when `last_run_ms + every_ms <= now`, and the run
+/// sets `last_run_ms = now`. Only that write decides whether a new plane
+/// treats the bucket as taken, so the judgment itself is not replayed here.
+fn old_binary_cadence_run(db: &RuntimeDb, dataset_id: &str, now_ms: i64) -> bool {
+    let sql_due = "every_ms > 0 AND (last_run_ms = 0 OR last_run_ms + every_ms <= ";
+    let ran = match db {
+        RuntimeDb::Sqlite(sqlite) => sqlite
+            .conn()
+            .execute(
+                &format!(
+                    "UPDATE sekai_dataset_health_checks SET last_run_ms = ?1
+                     WHERE dataset_id = ?2 AND {sql_due}?1)"
+                ),
+                rusqlite::params![now_ms, dataset_id],
+            )
+            .unwrap(),
+        RuntimeDb::Postgres(postgres) => postgres
+            .connection()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE sekai_dataset_health_checks SET last_run_ms = $1
+                     WHERE dataset_id = $2 AND {sql_due}$1)"
+                ),
+                &[&now_ms, &dataset_id],
+            )
+            .unwrap() as usize,
+    };
+    ran == 1
+}
+
+/// Two planes over one store tick at the same instant: the due check runs
+/// once. A mixed deploy, where an old binary still runs checks on a cadence,
+/// runs it at most once per bucket in either order (#2187).
+fn exercise_schedule(plane_a: &RuntimeDb, plane_b: &RuntimeDb, prefix: &str) {
+    let dataset_id = format!("{prefix}-scheduled");
+    plane_a
+        .create_dataset(&dataset(dataset_id.as_str()))
+        .unwrap();
+    plane_a
+        .append_rows(
+            &dataset_id,
+            &[HashMap::from([
+                ("kind".into(), "v1".into()),
+                ("n".into(), "1".into()),
+            ])],
+        )
+        .unwrap();
+    let mut scheduled = check("sched", &dataset_id, KIND_ROW_COUNT);
+    scheduled.min_rows = 1;
+    scheduled.every_ms = 1_000;
+    plane_a.put_dataset_health_check(&scheduled).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let ticks: Vec<_> = [plane_a.clone(), plane_b.clone()]
+        .into_iter()
+        .map(|plane| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                plane.tick_dataset_health_checks(5_500).unwrap()
+            })
+        })
+        .collect();
+    let judged: usize = ticks.into_iter().map(|tick| tick.join().unwrap()).sum();
+    assert_eq!(judged, 1, "two planes ticking at once run a due check once");
+    assert_eq!(plane_b.tick_dataset_health_checks(5_999).unwrap(), 0);
+
+    // Old binary first: its run takes bucket 6 for the new planes too.
+    assert!(old_binary_cadence_run(plane_a, &dataset_id, 6_500));
+    assert_eq!(plane_b.tick_dataset_health_checks(6_999).unwrap(), 0);
+    // New plane first: the old rule sees the claim and does not run again.
+    assert_eq!(plane_a.tick_dataset_health_checks(7_500).unwrap(), 1);
+    assert!(!old_binary_cadence_run(plane_b, &dataset_id, 7_999));
+    // At the boundary, in both orders. New plane late in bucket 8, old binary
+    // at the start of bucket 9: last + every is still ahead, so no rerun.
+    assert_eq!(plane_a.tick_dataset_health_checks(8_999).unwrap(), 1);
+    assert!(!old_binary_cadence_run(plane_b, &dataset_id, 9_000));
+    assert_eq!(plane_b.tick_dataset_health_checks(9_000).unwrap(), 1);
+    // Old binary at the start of bucket 10, new plane at its end.
+    assert!(old_binary_cadence_run(plane_a, &dataset_id, 10_000));
+    assert_eq!(plane_b.tick_dataset_health_checks(10_999).unwrap(), 0);
+    assert_eq!(plane_a.tick_dataset_health_checks(11_000).unwrap(), 1);
+
+    // A new binary's `RunDatasetHealthChecks` goes through the same claim,
+    // so an old outside cron pointed at it dedupes with the tick.
+    assert!(
+        plane_a
+            .run_dataset_health_checks(&dataset_id, 11_500)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        plane_a
+            .run_dataset_health_checks(&dataset_id, 12_000)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(plane_b.tick_dataset_health_checks(12_500).unwrap(), 0);
+}
+
+#[test]
+fn sqlite_dataset_health_schedule_runs_once_across_planes() {
+    let path = std::env::temp_dir().join(format!(
+        "sekai-dataset-health-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let path = path.to_string_lossy().into_owned();
+    let open = || {
+        RuntimeDb::Sqlite(Arc::new(
+            sekai_chisei::db::sekai::SekaiDb::new(&path).unwrap(),
+        ))
+    };
+    exercise_schedule(&open(), &open(), "sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_dataset_health_schedule_runs_once_across_planes() {
+    let scratch = ScratchDatabase::create();
+    let plane_a = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let plane_b = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    exercise_schedule(&plane_a, &plane_b, "pg");
 }
 
 #[test]

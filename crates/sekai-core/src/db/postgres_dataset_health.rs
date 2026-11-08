@@ -3,7 +3,8 @@ use crate::sekai::dataset::{ColumnDef, RowFilter, parse_columns};
 use crate::sekai::dataset_health::{
     ALERT_FIRING, ALERT_KIND_JOB, ALERT_KIND_SCHEDULE, ALERT_REASON_FAILED, ALERT_REASON_LATE,
     ALERT_REASON_RETRIED, ALERT_RESOLVED, DatasetAlert, DatasetHealthCheck, DatasetHealthResult,
-    DatasetHealthState, evaluate_health_check, validate_health_check,
+    DatasetHealthState, HealthRunScope, evaluate_health_check, scheduled_check_due,
+    scheduled_check_late, validate_health_check,
 };
 use crate::sekai::dataset_version::{self, DatasetVersion};
 use postgres::Transaction;
@@ -91,12 +92,44 @@ impl PostgresDb {
         dataset_id: &str,
         now_ms: i64,
     ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.run_health_checks(dataset_id, now_ms, HealthRunScope::WithUnscheduled)
+    }
+
+    pub fn list_scheduled_health_datasets(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT DISTINCT dataset_id FROM sekai_dataset_health_checks
+                 WHERE every_ms > 0 ORDER BY dataset_id",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    pub fn tick_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.run_health_checks(dataset_id, now_ms, HealthRunScope::ScheduledOnly)
+    }
+
+    fn run_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+        scope: HealthRunScope,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        // The same lock old binaries take, so their run and a tick serialize.
         crate::db::postgres::lock_dataset_rows(&mut tx, dataset_id)?;
-        let results = run_health_checks_pg(&mut tx, dataset_id, now_ms)?;
+        let results = run_health_checks_pg(&mut tx, dataset_id, now_ms, scope)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(results)
     }
@@ -219,63 +252,40 @@ fn upsert_check_pg(tx: &mut Transaction<'_>, check: &DatasetHealthCheck) -> Resu
     .map_err(|error| error.to_string())
 }
 
-/// Apply due scheduled checks. Callers invoke `RunDatasetHealthChecks`
-/// on the stored cadence; this crate does not start a background worker.
+/// Mirrors the SQLite `run_health_checks_tx`: a scheduled check is claimed
+/// by a conditional update of `last_run_ms` under the dataset row lock, and
+/// claim, judgment, and alerts commit together.
 fn run_health_checks_pg(
     tx: &mut Transaction<'_>,
     dataset_id: &str,
     now_ms: i64,
+    scope: HealthRunScope,
 ) -> Result<Vec<DatasetHealthResult>, String> {
-    let checks = list_checks_pg(tx, dataset_id)?;
-    let mut due_ids = Vec::new();
-    let mut recover_ids = Vec::new();
-    for check in &checks {
-        if check.every_ms <= 0 {
-            due_ids.push(check.check_id.clone());
-            continue;
-        }
-        let due =
-            check.last_run_ms == 0 || check.last_run_ms.saturating_add(check.every_ms) <= now_ms;
-        let late =
-            check.last_run_ms > 0 && check.last_run_ms.saturating_add(check.every_ms) < now_ms;
-        if late {
-            emit_alert_pg(
-                tx,
-                ALERT_KIND_SCHEDULE,
-                &format!("{}/{}", check.dataset_id, check.check_id),
-                dataset_id,
-                &check.tenant,
-                &check.space,
-                ALERT_REASON_LATE,
-                ALERT_FIRING,
-                now_ms,
-            )?;
-        }
-        if due {
-            due_ids.push(check.check_id.clone());
-            if !late {
-                recover_ids.push(check.clone());
-            }
-        }
-    }
-    let version = latest_version_pg(tx, dataset_id)?;
-    let Some(version) = version else {
+    let Some(version) = latest_version_pg(tx, dataset_id)? else {
         return Ok(Vec::new());
     };
-    let results = if due_ids.is_empty() {
-        Vec::new()
-    } else {
-        judge_version_pg(tx, dataset_id, &version, now_ms, Some(&due_ids))?
-    };
-    for check_id in &due_ids {
-        tx.execute(
-            "UPDATE sekai_dataset_health_checks SET last_run_ms = $1
-             WHERE dataset_id = $2 AND check_id = $3",
-            &[&now_ms, &dataset_id, check_id],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    for check in &recover_ids {
+    let mut due_ids = Vec::new();
+    for check in list_checks_pg(tx, dataset_id)? {
+        if check.every_ms <= 0 {
+            if scope == HealthRunScope::WithUnscheduled {
+                due_ids.push(check.check_id);
+            }
+            continue;
+        }
+        if !scheduled_check_due(check.last_run_ms, check.every_ms, now_ms) {
+            continue;
+        }
+        let claimed = tx
+            .execute(
+                "UPDATE sekai_dataset_health_checks SET last_run_ms = $1
+                 WHERE dataset_id = $2 AND check_id = $3 AND last_run_ms = $4",
+                &[&now_ms, &dataset_id, &check.check_id, &check.last_run_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if claimed != 1 {
+            continue;
+        }
+        let late = scheduled_check_late(check.last_run_ms, check.every_ms, now_ms);
         emit_alert_pg(
             tx,
             ALERT_KIND_SCHEDULE,
@@ -284,11 +294,15 @@ fn run_health_checks_pg(
             &check.tenant,
             &check.space,
             ALERT_REASON_LATE,
-            ALERT_RESOLVED,
+            if late { ALERT_FIRING } else { ALERT_RESOLVED },
             now_ms,
         )?;
+        due_ids.push(check.check_id);
     }
-    Ok(results)
+    if due_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    judge_version_pg(tx, dataset_id, &version, now_ms, Some(&due_ids))
 }
 
 fn latest_version_pg(

@@ -8278,6 +8278,28 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .collect();
     assert_eq!(late.len(), 2);
     assert_eq!(late[1].state, "resolved");
+
+    // The schedule tick runs the due check with no outside caller (#2187).
+    svc.tick_governed_transforms(with_named_principal(
+        TickGovernedTransformsRequest { now_ms: 9_500 },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let judged = svc
+        .list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
+            dataset_id: "health".into(),
+            version_id: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .results;
+    assert!(
+        judged
+            .iter()
+            .any(|result| result.check_id == "fresh" && result.judged_at_ms == 9_500)
+    );
 }
 
 fn dataset_consumer_binding(
