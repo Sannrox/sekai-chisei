@@ -607,11 +607,7 @@ pub fn publish_finding(
     let draft = draft_from_finding(db, finding, target)?;
     ensure_adapter_types(db, &draft.namespace, actor, now_ms).map_err(PublishError::Internal)?;
     let mapping_id = mapping_object_id(&draft.namespace, &draft.signature);
-    fence_mapping(db, actor, &draft, &mapping_id, now_ms)?;
-    let mapping = db
-        .get_object(&mapping_id)
-        .map_err(PublishError::Internal)?
-        .ok_or_else(|| PublishError::Internal("mapping fence disappeared".into()))?;
+    let mapping = fence_mapping(db, actor, &draft, &mapping_id, now_ms)?;
     let listed = match github.list() {
         Ok(issues) => issues,
         Err(GitHubError::MissingCredentials) => {
@@ -865,19 +861,47 @@ fn finish_published(
     })
 }
 
+fn mapping_belongs(object: &Object, namespace: &str) -> bool {
+    object.namespace == namespace && object.kind == KIND_EXTERNAL_ISSUE
+}
+
+fn occupied_mapping_error() -> PublishError {
+    PublishError::Retryable("mapping id occupied by a foreign or mismatched object".into())
+}
+
+/// Mapping used for GitHub publish, or `None` when the id is missing or not owned.
+fn owned_mapping(
+    db: &RuntimeDb,
+    namespace: &str,
+    mapping_id: &str,
+) -> Result<Option<Object>, PublishError> {
+    let Some(object) = db.get_object(mapping_id).map_err(PublishError::Internal)? else {
+        return Ok(None);
+    };
+    if mapping_belongs(&object, namespace) {
+        Ok(Some(object))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Admit this namespace's mapping, or fail closed if the id belongs elsewhere.
 fn fence_mapping(
     db: &RuntimeDb,
     actor: &str,
     draft: &IssueDraft,
     mapping_id: &str,
     now_ms: i64,
-) -> Result<(), PublishError> {
+) -> Result<Object, PublishError> {
+    if let Some(object) = owned_mapping(db, &draft.namespace, mapping_id)? {
+        return Ok(object);
+    }
     if db
         .get_object(mapping_id)
         .map_err(PublishError::Internal)?
         .is_some()
     {
-        return Ok(());
+        return Err(occupied_mapping_error());
     }
     match admit(
         db,
@@ -898,13 +922,21 @@ fn fence_mapping(
         "",
         now_ms,
     ) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(PublishError::Internal(error))
-            if error.contains("already exists") || error.contains("AlreadyExists") =>
+            if error.contains("already exists") || error.contains("AlreadyExists") => {}
+        Err(error) => return Err(error),
+    }
+    match owned_mapping(db, &draft.namespace, mapping_id)? {
+        Some(object) => Ok(object),
+        None if db
+            .get_object(mapping_id)
+            .map_err(PublishError::Internal)?
+            .is_some() =>
         {
-            Ok(())
+            Err(occupied_mapping_error())
         }
-        Err(error) => Err(error),
+        None => Err(PublishError::Internal("mapping fence disappeared".into())),
     }
 }
 
@@ -928,10 +960,8 @@ fn claim_inflight(
         &object_revision(mapping),
         now_ms,
     )?;
-    let stored = db
-        .get_object(&mapping.id)
-        .map_err(PublishError::Internal)?
-        .ok_or_else(|| PublishError::Internal("inflight mapping disappeared".into()))?;
+    let stored =
+        owned_mapping(db, &draft.namespace, &mapping.id)?.ok_or_else(occupied_mapping_error)?;
     if stored.properties.get("remote_id").map(String::as_str) == Some(token.as_str()) {
         Ok(token)
     } else {
@@ -960,13 +990,21 @@ fn revert_mapping(
     remote_id: &str,
     now_ms: i64,
 ) {
-    let revision = db
-        .get_object(mapping_id)
+    let Some(object) = owned_mapping(db, &draft.namespace, mapping_id)
         .ok()
         .flatten()
-        .map(|object| object_revision(&object))
-        .unwrap_or_default();
-    let _ = bind_mapping(db, actor, draft, mapping_id, remote_id, &revision, now_ms);
+    else {
+        return;
+    };
+    let _ = bind_mapping(
+        db,
+        actor,
+        draft,
+        mapping_id,
+        remote_id,
+        &object_revision(&object),
+        now_ms,
+    );
 }
 
 fn bind_mapping(
@@ -1638,7 +1676,7 @@ mod tests {
         record_investigation,
     };
     use crate::sekai::feedback_package::{
-        EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, KIND_FINDING, install,
+        EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE, KIND_EXTERNAL_ISSUE, KIND_FINDING, install,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1650,6 +1688,7 @@ mod tests {
     struct MemoryGitHub {
         issues: Mutex<Vec<GitHubIssue>>,
         creates: Mutex<u32>,
+        updates: Mutex<u32>,
         next_number: Mutex<u64>,
         create_error: Mutex<Option<GitHubErrorKind>>,
         update_error: Mutex<Option<GitHubErrorKind>>,
@@ -1681,6 +1720,7 @@ mod tests {
             Self {
                 issues: Mutex::new(Vec::new()),
                 creates: Mutex::new(0),
+                updates: Mutex::new(0),
                 next_number: Mutex::new(1),
                 create_error: Mutex::new(None),
                 update_error: Mutex::new(None),
@@ -1695,6 +1735,10 @@ mod tests {
 
         fn created(&self) -> u32 {
             *self.creates.lock().unwrap()
+        }
+
+        fn updated(&self) -> u32 {
+            *self.updates.lock().unwrap()
         }
 
         fn issues(&self) -> Vec<GitHubIssue> {
@@ -1749,6 +1793,7 @@ mod tests {
             if let Some(kind) = *self.update_error.lock().unwrap() {
                 return Err(kind.to_error());
             }
+            *self.updates.lock().unwrap() += 1;
             let mut issues = self.issues.lock().unwrap();
             let issue = issues
                 .iter_mut()
@@ -2566,6 +2611,107 @@ mod tests {
         let error = publish(&runtime, &github, &AllowPermit, &finding).unwrap_err();
         assert!(matches!(error, PublishError::NotQualifying));
         assert_eq!(github.created(), 0);
+    }
+
+    #[test]
+    fn foreign_namespace_mapping_does_not_redirect_publish() {
+        let runtime = db();
+        let finding = qualifying_cluster(
+            &runtime,
+            "a",
+            "api:tenkai_failed",
+            "apply cannot finish",
+            "",
+        );
+        let mapping_id = mapping_object_id(NAMESPACE, "api:tenkai_failed");
+        runtime
+            .create_object(&Object {
+                id: mapping_id,
+                kind: KIND_EXTERNAL_ISSUE.into(),
+                name: "forged".into(),
+                namespace: "attacker".into(),
+                external_id: String::new(),
+                properties: HashMap::from([
+                    ("finding_id".into(), "forged-finding".into()),
+                    ("tracker".into(), TRACKER.into()),
+                    ("remote_id".into(), "github:tenkai-org/tenkai#1".into()),
+                ]),
+                created: 1_000,
+                updated: 1_000,
+            })
+            .unwrap();
+        let github = MemoryGitHub::new();
+        github.issues.lock().unwrap().push(GitHubIssue {
+            number: 1,
+            title: "unrelated".into(),
+            body: "keep me".into(),
+            created_ms: 1_700_000_000_000,
+        });
+        *github.next_number.lock().unwrap() = 2;
+        let error = publish(&runtime, &github, &AllowPermit, &finding).unwrap_err();
+        assert!(
+            matches!(error, PublishError::Retryable(ref reason) if reason.contains("occupied")),
+            "{error:?}"
+        );
+        assert_eq!(github.created(), 0);
+        assert_eq!(github.updated(), 0);
+        let issue = &github.issues()[0];
+        assert_eq!(issue.number, 1);
+        assert_eq!(issue.title, "unrelated");
+        assert_eq!(issue.body, "keep me");
+
+        let later = qualifying_cluster(&runtime, "c", "api:budget_exhausted", "second", "");
+        let report = publish(&runtime, &github, &AllowPermit, &later).unwrap();
+        assert!(report.created);
+        assert_eq!(github.created(), 1);
+        assert_eq!(github.updated(), 0);
+        assert_eq!(github.issues()[0].title, "unrelated");
+        assert_eq!(github.issues()[1].title, "feedback: api budget_exhausted");
+    }
+
+    #[test]
+    fn mismatched_kind_mapping_does_not_redirect_publish() {
+        let runtime = db();
+        let finding = qualifying_cluster(
+            &runtime,
+            "k",
+            "api:tenkai_failed",
+            "apply cannot finish",
+            "",
+        );
+        let mapping_id = mapping_object_id(NAMESPACE, "api:tenkai_failed");
+        runtime
+            .create_object(&Object {
+                id: mapping_id,
+                kind: KIND_FINDING.into(),
+                name: "forged".into(),
+                namespace: NAMESPACE.into(),
+                external_id: String::new(),
+                properties: HashMap::from([
+                    ("finding_id".into(), "forged-finding".into()),
+                    ("tracker".into(), TRACKER.into()),
+                    ("remote_id".into(), "github:tenkai-org/tenkai#1".into()),
+                ]),
+                created: 1_000,
+                updated: 1_000,
+            })
+            .unwrap();
+        let github = MemoryGitHub::new();
+        github.issues.lock().unwrap().push(GitHubIssue {
+            number: 1,
+            title: "unrelated".into(),
+            body: "keep me".into(),
+            created_ms: 1_700_000_000_000,
+        });
+        let error = publish(&runtime, &github, &AllowPermit, &finding).unwrap_err();
+        assert!(
+            matches!(error, PublishError::Retryable(ref reason) if reason.contains("occupied")),
+            "{error:?}"
+        );
+        assert_eq!(github.created(), 0);
+        assert_eq!(github.updated(), 0);
+        assert_eq!(github.issues()[0].title, "unrelated");
+        assert_eq!(github.issues()[0].body, "keep me");
     }
 
     #[test]
