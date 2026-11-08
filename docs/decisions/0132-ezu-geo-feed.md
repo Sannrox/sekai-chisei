@@ -1,11 +1,11 @@
 # ADR 0132: Fenced incremental feed of object geo changes into Ezu
 
-- Status: accepted
+- Status: superseded by ADR 0147
 - Date: 2026-10-25
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1797 (#1797)
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0147](0147-spatial-engine-integration-outside-the-plane.md)
 - Related: [ADR 0121](0121-fence-event-bindings.md), #1565, #1798
 
 ## Context

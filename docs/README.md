@@ -94,10 +94,10 @@ If you want to deploy or operate the control plane:
   evaluated against pinned dataset revisions.
 - [Governed geospatial queries](geospatial-queries.md) — authorized point,
   distance, contains, and intersects over named property claims.
-- [Fenced Ezu geo feed](ezu-geo-feed.md) — incremental object geo changes
-  and GeoArrow backfill into Ezu under a run lease and durable cursor.
 - [External evaluator adapters](evaluator-adapters.md) — namespace-scoped,
   authenticated execution for operator-deployed domain evaluators.
+- [Binding Ezu from outside the plane](ezu-adapter.md) — geo feed and
+  fence events as an adapter over subscriptions, leases and Action submits.
 - [Inbound object sync](object-sync.md) — bounded source batches, durable
   commit/abort, plane-owned checkpoints, and fixed GitHub Issue/PullRequest
   identity.

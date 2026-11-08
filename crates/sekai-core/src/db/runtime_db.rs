@@ -103,8 +103,6 @@ mod documents;
 mod event_stream;
 #[path = "runtime_db_evidence.rs"]
 mod evidence;
-#[path = "runtime_db_ezu_geo_feed.rs"]
-mod ezu_geo_feed;
 #[path = "runtime_db_federation.rs"]
 mod federation;
 #[path = "runtime_db_functions.rs"]

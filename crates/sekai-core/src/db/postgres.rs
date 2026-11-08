@@ -205,6 +205,7 @@ const SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA: &str =
     include_str!("postgres/0142_site_agent_memory_instance_index.sql");
 const WRITER_MEMORY_OBJECT_INDEXES_SCHEMA: &str =
     include_str!("postgres/0143_writer_memory_object_indexes.sql");
+const DROP_EZU_STATE_SCHEMA: &str = include_str!("postgres/0145_drop_ezu_state.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1039,6 +1040,12 @@ const MIGRATIONS: &[Migration] = &[
         "external_action_reclaim_index",
         "",
         MigrationOwner::Chisei,
+    ),
+    mig(
+        144,
+        "drop_ezu_state",
+        DROP_EZU_STATE_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

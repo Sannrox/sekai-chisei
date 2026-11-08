@@ -122,6 +122,18 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    /// The in-plane fence bindings and geo feed are removed (ADR 0147).
+    /// PostgreSQL drops the same tables in `0145_drop_ezu_state`.
+    fn drop_ezu_state(&self) -> Result<(), String> {
+        self.conn()
+            .execute_batch(
+                "DROP TABLE IF EXISTS sekai_fence_binding_receipts;
+                 DROP TABLE IF EXISTS sekai_fence_bindings;
+                 DROP TABLE IF EXISTS sekai_ezu_geo_feeds;",
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub fn new(path: &str) -> Result<Self, String> {
         Self::new_for_plane(path, crate::db::schema_plane::SchemaPlane::Shared)
     }
@@ -383,6 +395,7 @@ impl SekaiDb {
         self.migrate_functions()?;
         self.migrate_handoffs()?;
         self.drop_legacy_action_types()?;
+        self.drop_ezu_state()?;
         self.migrate_governed_action_types()?;
         self.migrate_action_instances()?;
         self.migrate_decision_memory()?;
@@ -2665,6 +2678,37 @@ mod tests {
                 .any(|detail| detail.contains("sqlite_autoindex_sekai_objects_1")),
             "unexpected namespace listing plan: {plan:?}"
         );
+    }
+
+    #[test]
+    fn open_drops_removed_ezu_tables() {
+        let path = temp_db_path("ezu-drop");
+        let tables = [
+            "sekai_fence_bindings",
+            "sekai_fence_binding_receipts",
+            "sekai_ezu_geo_feeds",
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            for table in tables {
+                conn.execute_batch(&format!("CREATE TABLE {table} (namespace TEXT)"))
+                    .unwrap();
+            }
+        }
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        for table in tables {
+            let exists: bool = db
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "{table} survived open");
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

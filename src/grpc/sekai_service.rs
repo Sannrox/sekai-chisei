@@ -37,10 +37,6 @@ mod definition_consumer_impact;
 mod embedding_spec_rpc;
 #[path = "explain_value_rpc.rs"]
 mod explain_value_rpc;
-#[path = "ezu_geo_feed.rs"]
-mod ezu_geo_feed;
-#[path = "fence_binding.rs"]
-mod fence_binding;
 #[path = "graph_explore_rpc.rs"]
 mod graph_explore_rpc;
 #[path = "media_upload_rpc.rs"]
@@ -277,11 +273,6 @@ impl SekaiService for SekaiServiceImpl {
         generate_definition_change_bundle => generate_visible_definition_change_bundle(GenerateDefinitionChangeBundleRequest) -> GenerateDefinitionChangeBundleResponse;
         put_action_binding => put_action_binding_definition(PutActionBindingRequest) -> PutActionBindingResponse;
         run_action_binding => run_action_binding_once(RunActionBindingRequest) -> RunActionBindingResponse;
-        put_fence_binding => put_fence_binding_definition(PutFenceBindingRequest) -> PutFenceBindingResponse;
-        run_fence_binding => run_fence_binding_once(RunFenceBindingRequest) -> RunFenceBindingResponse;
-        put_ezu_geo_feed => put_ezu_geo_feed_definition(PutEzuGeoFeedRequest) -> PutEzuGeoFeedResponse;
-        run_ezu_geo_feed => run_ezu_geo_feed_once(RunEzuGeoFeedRequest) -> RunEzuGeoFeedResponse;
-        backfill_ezu_geo_feed => backfill_ezu_geo_feed_once(BackfillEzuGeoFeedRequest) -> BackfillEzuGeoFeedResponse;
     }
 
     async fn export_object_set(

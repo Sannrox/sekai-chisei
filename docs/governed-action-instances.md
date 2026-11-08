@@ -372,7 +372,7 @@ emitted anymore.
 An instance carries the marking it was derived from (#1706): the least upper
 bound, under the namespace lattice, of the markings of the object its
 `object_id` parameter names, the object a binding submitted it for, and the
-binding's own `markings` (action and fence bindings). Admission reads them;
+binding's own `markings`. Admission reads them;
 an unknown or incomparable token refuses the submit. A binding's source
 object that no longer exists (a delete event) can no longer show its
 marking, so it counts as the namespace lattice's top (`restricted` without a

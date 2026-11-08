@@ -1,11 +1,11 @@
 # ADR 0133: GeoArrow backfill for the Ezu geo feed
 
-- Status: accepted
+- Status: superseded by ADR 0147
 - Date: 2026-10-25
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1798 (#1798)
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0147](0147-spatial-engine-integration-outside-the-plane.md)
 - Related: [ADR 0132](0132-ezu-geo-feed.md), #1565
 
 ## Context
