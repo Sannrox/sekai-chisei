@@ -124,7 +124,7 @@ pub(super) async fn plan_execution(
 pub(super) async fn execute_plan_stream(
     service: &ChiseiServiceImpl,
     req: Request<ExecutePlanRequest>,
-) -> Result<Response<<ChiseiServiceImpl as ChiseiService>::ExecutePlanStreamStream>, Status> {
+) -> Result<Response<tonic::codegen::BoxStream<ExecutePlanStreamEvent>>, Status> {
     let actor = authenticated_actor(&req);
     let context = enterprise_authenticated_context(&req)?.cloned();
     let requested_plan = req
@@ -270,8 +270,7 @@ pub(super) async fn plan_content_execution(
 pub(super) async fn execute_content_plan_stream(
     service: &ChiseiServiceImpl,
     req: Request<ExecuteContentPlanRequest>,
-) -> Result<Response<<ChiseiServiceImpl as ChiseiService>::ExecuteContentPlanStreamStream>, Status>
-{
+) -> Result<Response<tonic::codegen::BoxStream<ExecuteContentPlanStreamEvent>>, Status> {
     let actor = authenticated_actor(&req);
     let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();

@@ -107,7 +107,7 @@ impl ChiseiServiceImpl {
         actor: String,
         context: Option<crate::enterprise::AuthenticatedContext>,
         requested_plan: ExecutionPlan,
-    ) -> Result<<Self as ChiseiService>::ExecutePlanStreamStream, Status> {
+    ) -> Result<tonic::codegen::BoxStream<ExecutePlanStreamEvent>, Status> {
         self.require_in_process_namespace_policy()?;
         let mut plan = {
             let mut plans = self

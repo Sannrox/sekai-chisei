@@ -11,7 +11,8 @@
 
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// New fields may appear; construct with `..Default::default()`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServicePrincipalRegistration {
     pub principal: String,
     /// Owning tenant; empty only for a registration made without tenant

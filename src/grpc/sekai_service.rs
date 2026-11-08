@@ -284,31 +284,24 @@ impl SekaiService for SekaiServiceImpl {
         backfill_ezu_geo_feed => backfill_ezu_geo_feed_once(BackfillEzuGeoFeedRequest) -> BackfillEzuGeoFeedResponse;
     }
 
-    type ReadTransformRunInputsStream = Pin<
-        Box<dyn futures_util::Stream<Item = Result<ReadTransformRunInputsResponse, Status>> + Send>,
-    >;
-    type ExportDatasetVersionStream = ExportStream;
-    type ExportObjectSetStream = ExportStream;
-    type FetchExportArtifactStream = ExportStream;
-
     async fn export_object_set(
         &self,
         req: Request<ExportObjectSetRequest>,
-    ) -> Result<Response<Self::ExportObjectSetStream>, Status> {
+    ) -> Result<Response<ExportStream>, Status> {
         self.export_object_set_rpc(req).await
     }
 
     async fn export_dataset_version(
         &self,
         req: Request<ExportDatasetVersionRequest>,
-    ) -> Result<Response<Self::ExportDatasetVersionStream>, Status> {
+    ) -> Result<Response<ExportStream>, Status> {
         self.export_dataset_version_rpc(req).await
     }
 
     async fn fetch_export_artifact(
         &self,
         req: Request<FetchExportArtifactRequest>,
-    ) -> Result<Response<Self::FetchExportArtifactStream>, Status> {
+    ) -> Result<Response<ExportStream>, Status> {
         self.fetch_export_artifact_rpc(req).await
     }
 
@@ -1510,7 +1503,7 @@ impl SekaiService for SekaiServiceImpl {
     async fn read_transform_run_inputs(
         &self,
         req: Request<ReadTransformRunInputsRequest>,
-    ) -> Result<Response<Self::ReadTransformRunInputsStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ReadTransformRunInputsResponse>>, Status> {
         rpc_data::read_transform_run_inputs(self, req).await
     }
     async fn write_transform_run_result(
