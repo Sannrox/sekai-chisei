@@ -519,18 +519,128 @@ chisei_store_trait! {
     }
 }
 
-chisei_store_trait! {
-    /// External action authorizations and blast-radius accounting.
-    pub trait ChiseiExternalActionStore {
-        fn claim_external_action_authorization(&self, request: &ExternalActionRequest, request_digest: &str, authorization_id: &str, now_ms: i64) -> Result<AuthorizationClaim, String>;
-        fn put_external_action_authorization(&self, record: &AuthorizationRecord) -> Result<(), String>;
-        fn compare_and_swap_external_action_authorization(&self, expected: &AuthorizationRecord, next: &AuthorizationRecord) -> Result<bool, String>;
-        fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
-        fn list_expired_reserved_external_action_authorizations(&self, now_ms: i64) -> Result<Vec<AuthorizationRecord>, String>;
-        fn release_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest) -> Result<(), String>;
-        fn abandon_external_action_claim(&self, request: &ExternalActionRequest, request_digest: &str) -> Result<(), String>;
-        fn get_external_action_authorization_by_id(&self, authorization_id: &str) -> Result<Option<AuthorizationRecord>, String>;
-        fn reserve_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest, max_mutations: Option<u32>, max_deletes: Option<u32>) -> Result<(), String>;
+/// External action authorizations and blast-radius accounting.
+pub trait ChiseiExternalActionStore {
+    fn claim_external_action_authorization(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+        authorization_id: &str,
+        now_ms: i64,
+    ) -> Result<AuthorizationClaim, String>;
+    fn put_external_action_authorization(&self, record: &AuthorizationRecord)
+    -> Result<(), String>;
+    fn compare_and_swap_external_action_authorization(
+        &self,
+        expected: &AuthorizationRecord,
+        next: &AuthorizationRecord,
+    ) -> Result<bool, String>;
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        self.list_external_action_authorizations()
+            .map(|records| crate::chisei::external_action::filter_expired_reserved(records, now_ms))
+    }
+    fn release_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+    ) -> Result<(), String>;
+    fn abandon_external_action_claim(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+    ) -> Result<(), String>;
+    fn get_external_action_authorization_by_id(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<AuthorizationRecord>, String>;
+    fn reserve_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+        max_mutations: Option<u32>,
+        max_deletes: Option<u32>,
+    ) -> Result<(), String>;
+}
+
+impl ChiseiExternalActionStore for ChiseiStore {
+    fn claim_external_action_authorization(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+        authorization_id: &str,
+        now_ms: i64,
+    ) -> Result<AuthorizationClaim, String> {
+        self.inner.claim_external_action_authorization(
+            request,
+            request_digest,
+            authorization_id,
+            now_ms,
+        )
+    }
+    fn put_external_action_authorization(
+        &self,
+        record: &AuthorizationRecord,
+    ) -> Result<(), String> {
+        self.inner.put_external_action_authorization(record)
+    }
+    fn compare_and_swap_external_action_authorization(
+        &self,
+        expected: &AuthorizationRecord,
+        next: &AuthorizationRecord,
+    ) -> Result<bool, String> {
+        self.inner
+            .compare_and_swap_external_action_authorization(expected, next)
+    }
+    fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
+        self.inner.list_external_action_authorizations()
+    }
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        self.inner
+            .list_expired_reserved_external_action_authorizations(now_ms)
+    }
+    fn release_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+    ) -> Result<(), String> {
+        self.inner
+            .release_external_action_blast_radius(authorization_id, request)
+    }
+    fn abandon_external_action_claim(
+        &self,
+        request: &ExternalActionRequest,
+        request_digest: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .abandon_external_action_claim(request, request_digest)
+    }
+    fn get_external_action_authorization_by_id(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<AuthorizationRecord>, String> {
+        self.inner
+            .get_external_action_authorization_by_id(authorization_id)
+    }
+    fn reserve_external_action_blast_radius(
+        &self,
+        authorization_id: &str,
+        request: &ExternalActionRequest,
+        max_mutations: Option<u32>,
+        max_deletes: Option<u32>,
+    ) -> Result<(), String> {
+        self.inner.reserve_external_action_blast_radius(
+            authorization_id,
+            request,
+            max_mutations,
+            max_deletes,
+        )
     }
 }
 

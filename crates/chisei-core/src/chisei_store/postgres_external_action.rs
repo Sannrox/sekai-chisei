@@ -76,7 +76,10 @@ pub trait PostgresExternalActionPostgresDbExt {
     fn list_expired_reserved_external_action_authorizations(
         &self,
         now_ms: i64,
-    ) -> Result<Vec<AuthorizationRecord>, String>;
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        self.list_external_action_authorizations()
+            .map(|records| crate::chisei::external_action::filter_expired_reserved(records, now_ms))
+    }
 }
 
 impl PostgresExternalActionPostgresDbExt for PostgresDb {

@@ -268,6 +268,19 @@ pub struct AuthorizationRecord {
     pub decision_updated_at_ms: i64,
 }
 
+pub(crate) fn filter_expired_reserved(
+    records: Vec<AuthorizationRecord>,
+    now_ms: i64,
+) -> Vec<AuthorizationRecord> {
+    records
+        .into_iter()
+        .filter(|record| {
+            (record.budget_reserved || record.blast_radius_reserved)
+                && record.decision.expires_at_ms <= now_ms
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationClaim {
     Claimed(String),
@@ -334,7 +347,10 @@ pub trait ExternalActionSekaiDbExt {
     fn list_expired_reserved_external_action_authorizations(
         &self,
         now_ms: i64,
-    ) -> Result<Vec<AuthorizationRecord>, String>;
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        self.list_external_action_authorizations()
+            .map(|records| filter_expired_reserved(records, now_ms))
+    }
 }
 
 impl ExternalActionSekaiDbExt for SekaiDb {
