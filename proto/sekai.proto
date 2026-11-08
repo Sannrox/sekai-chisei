@@ -2885,6 +2885,12 @@ message ActionInstance {
   // Why the instance parked and who may decide it (#1867). Set when it
   // parked, kept after the decision; unset for an instance that never parked.
   ActionApprovalRequirement approval = 28;
+  // Properties emptied on purpose (working-memory forget). Empty when the
+  // stored parameters still match request_digest (#2038).
+  repeated string erased_properties = 29;
+  // Digest of the stored parameters after erase. Distinguishes a legitimate
+  // erase from other edits of the stored parameters.
+  string erased_request_digest = 30;
 }
 // What required approval for a parked ActionInstance, as admission saw it.
 message ActionApprovalRequirement {

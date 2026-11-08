@@ -866,6 +866,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             admission_lease: Some(lease.clone()),
             admission_ontology_digest: ontology_digest.clone(),
             admission_budget_already_reserved: budget_already_reserved,
+            erased_properties: Vec::new(),
+            erased_request_digest: String::new(),
         };
         let planned_effects = plan_admission_effects(&type_def, &instance, now)?;
 
@@ -6192,6 +6194,8 @@ mod tests {
             admission_lease: None,
             admission_ontology_digest: None,
             admission_budget_already_reserved: false,
+            erased_properties: Vec::new(),
+            erased_request_digest: String::new(),
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

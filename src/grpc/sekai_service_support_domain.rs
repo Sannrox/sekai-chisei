@@ -533,6 +533,8 @@ pub(super) fn to_proto_action_instance(
                 approver_role: approval.approver_role.clone(),
             }
         }),
+        erased_properties: domain.erased_properties.clone(),
+        erased_request_digest: domain.erased_request_digest.clone(),
     }
 }
 fn to_proto_offline_submission(

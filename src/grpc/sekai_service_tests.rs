@@ -19994,6 +19994,8 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
         admission_lease: None,
         admission_ontology_digest: None,
         admission_budget_already_reserved: false,
+        erased_properties: Vec::new(),
+        erased_request_digest: String::new(),
     }
 }
 

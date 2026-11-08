@@ -724,6 +724,8 @@ mod tests {
             admission_lease: None,
             admission_ontology_digest: None,
             admission_budget_already_reserved: false,
+            erased_properties: Vec::new(),
+            erased_request_digest: String::new(),
         };
         db.put_action_instance(&instance).unwrap();
     }
@@ -859,6 +861,8 @@ mod tests {
             admission_lease: None,
             admission_ontology_digest: None,
             admission_budget_already_reserved: false,
+            erased_properties: Vec::new(),
+            erased_request_digest: String::new(),
         };
         db.put_action_instance(&failed).unwrap();
         let snapshot = offer(&db, "acme", "agent:fixture", "dispatch", test_threshold()).unwrap();

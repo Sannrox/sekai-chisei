@@ -15,9 +15,14 @@
 //! Forget also empties `content` in the retained parameters of the Actions
 //! that wrote the item (#1969), leaving each Action's stored request digest
 //! as it was so receipt and digest verification still match the original
-//! submit. Later Action and decision-memory writes that still name a
+//! submit. The Action records `erased_properties` and a digest of the
+//! emptied parameters so a verifier can tell that erase from tampering
+//! (#2038). Later Action and decision-memory writes that still name a
 //! forgotten item store empty `content` too. Opening a store redacts writer
-//! Actions for items forgotten before that erase existed (#2037).
+//! Actions for items forgotten before that erase existed (#2037) and records
+//! the erase marker when content is already empty but unmarked. Releasing
+//! a forget admission that already wrote restores the item and the writer
+//! Action parameters together.
 //!
 //! Working memory is neither Kioku (epistemic memory Chisei derives from
 //! operation outcomes) nor decision memory (precedents of parked reviews).
@@ -295,12 +300,13 @@ pub fn writer_object_id(parameters_json: &str) -> Option<String> {
 }
 
 /// Empty `content` on a writer Action, including an offline base value.
-/// Keeps the stored request digest.
+/// Keeps the stored request digest and records the erase so a verifier
+/// can tell it from tampering (#2038).
 pub fn redact_writer_instance(
     instance: &mut crate::sekai::action_instance::ActionInstance,
-) -> bool {
+) -> Result<bool, String> {
     if !is_writer_action(&instance.type_id) {
-        return false;
+        return Ok(false);
     }
     let mut changed = false;
     if let Some(redacted) = redact_content_parameter(&instance.parameters_json) {
@@ -314,7 +320,173 @@ pub fn redact_writer_instance(
         content.clear();
         changed = true;
     }
-    changed
+    if changed || unmarked_empty_content_mismatch(instance)? {
+        record_content_erase_marker(instance)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn parameter_content(parameters_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()?
+        .get(CONTENT_PROPERTY)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn unmarked_empty_content_mismatch(
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> Result<bool, String> {
+    if instance
+        .erased_properties
+        .iter()
+        .any(|property| property == CONTENT_PROPERTY)
+    {
+        return Ok(false);
+    }
+    let Some(content) = parameter_content(&instance.parameters_json) else {
+        return Ok(false);
+    };
+    if !content.is_empty() {
+        return Ok(false);
+    }
+    let current = crate::sekai::action_instance::compute_request_digest_with_envelope(
+        &instance.namespace,
+        &instance.type_id,
+        &instance.version,
+        &instance.parameters_json,
+        &instance.evidence_submission_ids,
+        &instance.autonomous_envelope_id,
+    )?;
+    Ok(current != instance.request_digest)
+}
+
+fn record_content_erase_marker(
+    instance: &mut crate::sekai::action_instance::ActionInstance,
+) -> Result<(), String> {
+    if !instance
+        .erased_properties
+        .iter()
+        .any(|property| property == CONTENT_PROPERTY)
+    {
+        instance
+            .erased_properties
+            .push(CONTENT_PROPERTY.to_string());
+    }
+    instance.erased_request_digest =
+        crate::sekai::action_instance::compute_request_digest_with_envelope(
+            &instance.namespace,
+            &instance.type_id,
+            &instance.version,
+            &instance.parameters_json,
+            &instance.evidence_submission_ids,
+            &instance.autonomous_envelope_id,
+        )?;
+    Ok(())
+}
+
+/// Put `content` back into a writer Action emptied by forget, and clear
+/// the erase marker, only when the restored parameters match the stored
+/// request digest. Earlier writers for the same item stay erased.
+pub fn restore_writer_instance(
+    instance: &mut crate::sekai::action_instance::ActionInstance,
+    content: &str,
+) -> bool {
+    if !is_writer_action(&instance.type_id) {
+        return false;
+    }
+    let Some(restored) = restore_content_parameter(&instance.parameters_json, content) else {
+        return false;
+    };
+    let Ok(digest) = crate::sekai::action_instance::compute_request_digest_with_envelope(
+        &instance.namespace,
+        &instance.type_id,
+        &instance.version,
+        &restored,
+        &instance.evidence_submission_ids,
+        &instance.autonomous_envelope_id,
+    ) else {
+        return false;
+    };
+    if digest != instance.request_digest {
+        return false;
+    }
+    instance.parameters_json = restored;
+    if let Some(offline) = instance.offline.as_mut()
+        && let Some(stored) = offline.base_properties.get_mut(CONTENT_PROPERTY)
+        && stored.as_ref().is_none_or(|value| value.is_empty())
+    {
+        *stored = Some(content.to_string());
+    }
+    instance
+        .erased_properties
+        .retain(|property| property != CONTENT_PROPERTY);
+    if instance.erased_properties.is_empty() {
+        instance.erased_request_digest.clear();
+    }
+    true
+}
+
+fn restore_content_parameter(parameters_json: &str, content: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(parameters_json).ok()?;
+    let object = value.as_object_mut()?;
+    let current = object.get(CONTENT_PROPERTY)?.as_str()?;
+    if !current.is_empty() {
+        return None;
+    }
+    object.insert(
+        CONTENT_PROPERTY.to_string(),
+        serde_json::Value::String(content.to_string()),
+    );
+    serde_json::to_string(&value).ok()
+}
+
+/// Distinguishes a legitimate forget erase from a modified stored body.
+pub fn verify_writer_request_digest(
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> Result<(), String> {
+    let current = crate::sekai::action_instance::compute_request_digest_with_envelope(
+        &instance.namespace,
+        &instance.type_id,
+        &instance.version,
+        &instance.parameters_json,
+        &instance.evidence_submission_ids,
+        &instance.autonomous_envelope_id,
+    )?;
+    if instance
+        .erased_properties
+        .iter()
+        .any(|property| property != CONTENT_PROPERTY)
+    {
+        return Err("unknown erased property".into());
+    }
+    let marked = instance
+        .erased_properties
+        .iter()
+        .any(|property| property == CONTENT_PROPERTY);
+    if !marked {
+        if !instance.erased_request_digest.is_empty() {
+            return Err("erase digest without erased properties".into());
+        }
+        if current != instance.request_digest {
+            return Err("parameters do not match request digest".into());
+        }
+        return Ok(());
+    }
+    if !is_writer_action(&instance.type_id) {
+        return Err("erase marker on a non-writer Action".into());
+    }
+    if redact_content_parameter(&instance.parameters_json).is_some() {
+        return Err("erased content is not empty".into());
+    }
+    if instance.erased_request_digest != current {
+        return Err("erased parameters do not match erase digest".into());
+    }
+    if instance.request_digest == current {
+        return Err("erase marker with unchanged request digest".into());
+    }
+    Ok(())
 }
 
 /// True when the stored writer row already has empty `content` and
@@ -427,8 +599,8 @@ pub fn validate_object_write(
 mod tests {
     use super::*;
     use crate::sekai::action_instance::{
-        ActionInstance, AdmissionLease, STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED,
-        compute_request_digest, lease_clock_ms,
+        ActionInstance, AdmissionLease, AdmissionUndo, FencedAdmissionWrite, ParkedGrantWrite,
+        STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED, compute_request_digest, lease_clock_ms,
     };
     use crate::sekai::action_instance_admission::{
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionOutcome,
@@ -680,6 +852,9 @@ mod tests {
             &stored.evidence_submission_ids,
         )
         .unwrap();
+        assert_eq!(stored.erased_properties, vec![CONTENT_PROPERTY.to_string()]);
+        assert_eq!(stored.erased_request_digest, from_redacted);
+        verify_writer_request_digest(&stored).unwrap();
         assert_ne!(from_redacted, stored.request_digest);
         assert_eq!(
             compute_request_digest(
@@ -725,6 +900,228 @@ mod tests {
             }),
             "{listed:?}"
         );
+    }
+
+    /// A verifier accepts a marked erase and rejects an unmarked empty
+    /// body or a later edit of another parameter.
+    #[test]
+    fn verifier_distinguishes_erase_from_tampering() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        let stored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        verify_writer_request_digest(&stored).unwrap();
+
+        let mut unmarked = stored.clone();
+        unmarked.erased_properties.clear();
+        unmarked.erased_request_digest.clear();
+        assert!(
+            verify_writer_request_digest(&unmarked).is_err(),
+            "empty content without an erase marker"
+        );
+
+        let mut edited = stored.clone();
+        let mut value: Value = serde_json::from_str(&edited.parameters_json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("object_id".into(), json!("other"));
+        edited.parameters_json = value.to_string();
+        assert!(
+            verify_writer_request_digest(&edited).is_err(),
+            "erase digest must cover the emptied parameters"
+        );
+    }
+
+    /// Releasing a forget admission that already wrote restores the item
+    /// and the writer Action parameters together.
+    #[test]
+    fn release_admission_undo_after_forget_restores_writer_parameters() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        let previous = db.get_object("note-1").unwrap().unwrap();
+        let lease = AdmissionLease::first();
+        let mut forget = writer_action(
+            "forget-1",
+            ACTION_FORGET,
+            "forget-undo",
+            "",
+            STATUS_ADMITTED,
+        );
+        forget.admission_lease = Some(lease.clone());
+        db.put_action_instance(&forget).unwrap();
+        let mut forgotten = previous.clone();
+        forgotten.updated += 1;
+        forgotten
+            .properties
+            .insert(CONTENT_PROPERTY.into(), String::new());
+        forgotten
+            .properties
+            .insert(FORGOTTEN_PROPERTY.into(), "true".into());
+        assert!(matches!(
+            db.apply_admission_object_write(
+                "forget-1",
+                &lease,
+                &ParkedGrantWrite::Update(forgotten.clone()),
+                Some(&previous),
+                &[],
+                AGENT,
+                &crate::sekai::audit::ChangeAttribution::default(),
+            )
+            .unwrap(),
+            FencedAdmissionWrite::Applied(_)
+        ));
+        let redacted = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&redacted), "");
+        verify_writer_request_digest(&redacted).unwrap();
+
+        assert!(
+            db.release_admission(
+                "forget-1",
+                &lease,
+                &AdmissionUndo::RestoreUpdate {
+                    previous: previous.clone(),
+                    applied_updated: forgotten.updated,
+                },
+                AGENT,
+            )
+            .unwrap()
+        );
+        let restored_note = db.get_object("note-1").unwrap().unwrap();
+        assert_eq!(
+            restored_note
+                .properties
+                .get(CONTENT_PROPERTY)
+                .map(String::as_str),
+            Some("valve 3 sticks")
+        );
+        assert!(!is_forgotten(&restored_note));
+        let restored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&restored), "valve 3 sticks");
+        assert!(restored.erased_properties.is_empty());
+        verify_writer_request_digest(&restored).unwrap();
+        assert!(db.get_action_instance("forget-1").unwrap().is_none());
+    }
+
+    /// Undo restores the latest writer and leaves earlier writers erased.
+    #[test]
+    fn release_admission_undo_after_update_restores_only_matching_writer() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        let updated = admit(
+            &db,
+            ACTION_UPDATE,
+            json!({"object_id": "note-1", "content": "valve 3 still sticks"}),
+            "update",
+            AGENT,
+        )
+        .unwrap();
+        let previous = db.get_object("note-1").unwrap().unwrap();
+        let lease = AdmissionLease::first();
+        let mut forget = writer_action(
+            "forget-1",
+            ACTION_FORGET,
+            "forget-undo",
+            "",
+            STATUS_ADMITTED,
+        );
+        forget.admission_lease = Some(lease.clone());
+        db.put_action_instance(&forget).unwrap();
+        let mut forgotten = previous.clone();
+        forgotten.updated += 1;
+        forgotten
+            .properties
+            .insert(CONTENT_PROPERTY.into(), String::new());
+        forgotten
+            .properties
+            .insert(FORGOTTEN_PROPERTY.into(), "true".into());
+        assert!(matches!(
+            db.apply_admission_object_write(
+                "forget-1",
+                &lease,
+                &ParkedGrantWrite::Update(forgotten.clone()),
+                Some(&previous),
+                &[],
+                AGENT,
+                &crate::sekai::audit::ChangeAttribution::default(),
+            )
+            .unwrap(),
+            FencedAdmissionWrite::Applied(_)
+        ));
+        assert!(
+            db.release_admission(
+                "forget-1",
+                &lease,
+                &AdmissionUndo::RestoreUpdate {
+                    previous: previous.clone(),
+                    applied_updated: forgotten.updated,
+                },
+                AGENT,
+            )
+            .unwrap()
+        );
+        let restored_note = db.get_object("note-1").unwrap().unwrap();
+        assert_eq!(
+            restored_note
+                .properties
+                .get(CONTENT_PROPERTY)
+                .map(String::as_str),
+            Some("valve 3 still sticks")
+        );
+        let restored_update = db
+            .get_action_instance(&updated.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&restored_update), "valve 3 still sticks");
+        assert!(restored_update.erased_properties.is_empty());
+        verify_writer_request_digest(&restored_update).unwrap();
+        let restored_create = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&restored_create), "");
+        assert_eq!(
+            restored_create.erased_properties,
+            vec![CONTENT_PROPERTY.to_string()]
+        );
+        verify_writer_request_digest(&restored_create).unwrap();
     }
 
     /// Pre-#2032 forget left `content` on the writer Action. The open-path
@@ -788,6 +1185,54 @@ mod tests {
             Some("")
         );
         assert_eq!(stored.request_digest, digest);
+        assert_eq!(stored.erased_properties, vec![CONTENT_PROPERTY.to_string()]);
+        verify_writer_request_digest(&stored).unwrap();
+    }
+
+    /// #2037 emptied content and kept the digest without an erase marker.
+    /// Open-path backfill records the marker so a verifier can tell the
+    /// erase from tampering.
+    #[test]
+    fn backfill_marks_writer_actions_redacted_before_erase_marker() {
+        let db = setup();
+        let created = admit(
+            &db,
+            ACTION_CREATE,
+            json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+            "create",
+            AGENT,
+        )
+        .unwrap();
+        admit(
+            &db,
+            ACTION_FORGET,
+            json!({"object_id": "note-1", "content": "", "forgotten": "true"}),
+            "forget",
+            AGENT,
+        )
+        .unwrap();
+        strip_erase_marker(&db, &created.instance.instance_id);
+        let unmarked = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&unmarked), "");
+        assert!(unmarked.erased_properties.is_empty());
+        assert!(unmarked.erased_request_digest.is_empty());
+        assert!(verify_writer_request_digest(&unmarked).is_err());
+        let digest = unmarked.request_digest.clone();
+
+        db.migrate_all().unwrap();
+        db.migrate_all().unwrap();
+
+        let stored = db
+            .get_action_instance(&created.instance.instance_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_content(&stored), "");
+        assert_eq!(stored.request_digest, digest);
+        assert_eq!(stored.erased_properties, vec![CONTENT_PROPERTY.to_string()]);
+        verify_writer_request_digest(&stored).unwrap();
     }
 
     /// Closing a plan-step key after forget must not store the forgotten
@@ -866,12 +1311,37 @@ mod tests {
             lease_id: String::new(),
             device_id: String::new(),
         });
+        instance.erased_properties.clear();
+        instance.erased_request_digest.clear();
         let body = serde_json::to_string(&instance).unwrap();
         conn.execute(
             "UPDATE sekai_action_instances
              SET parameters_json = ?2, body_json = ?3
              WHERE instance_id = ?1",
             rusqlite::params![instance_id, instance.parameters_json, body],
+        )
+        .unwrap();
+    }
+
+    fn strip_erase_marker(db: &RuntimeDb, instance_id: &str) {
+        let RuntimeDb::Sqlite(inner) = db else {
+            panic!("sqlite fixture");
+        };
+        let conn = inner.conn();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM sekai_action_instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut instance: ActionInstance = serde_json::from_str(&body).unwrap();
+        instance.erased_properties.clear();
+        instance.erased_request_digest.clear();
+        let body = serde_json::to_string(&instance).unwrap();
+        conn.execute(
+            "UPDATE sekai_action_instances SET body_json = ?2 WHERE instance_id = ?1",
+            rusqlite::params![instance_id, body],
         )
         .unwrap();
     }
@@ -1005,6 +1475,8 @@ mod tests {
             admission_lease: None,
             admission_ontology_digest: None,
             admission_budget_already_reserved: false,
+            erased_properties: Vec::new(),
+            erased_request_digest: String::new(),
         }
     }
 

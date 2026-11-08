@@ -695,6 +695,8 @@ pub fn update_object_in(
 /// - `backfill_forgotten_memory_action_redaction` (object lock, then redact)
 /// - `postgres_redact_forgotten_memory_actions` (the forgotten object is
 ///   already held)
+/// - `postgres_restore_forgotten_memory_actions` (the restored object is
+///   already held)
 ///
 /// Object-only callers (audit, objects, object_sync, dataset_branch,
 /// governed_transform, catalog_criticality) must not take an Action row

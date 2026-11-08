@@ -2349,6 +2349,8 @@ fn seed_claimed_action_of(
         admission_lease: None,
         admission_ontology_digest: None,
         admission_budget_already_reserved: false,
+        erased_properties: Vec::new(),
+        erased_request_digest: String::new(),
     })
     .unwrap();
     crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(db)
