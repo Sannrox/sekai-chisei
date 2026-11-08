@@ -51,12 +51,16 @@ object they all hang off.
    - a connector type and version;
    - configuration validated against that type's schema;
    - a credential reference;
-   - an egress allowlist;
+   - an egress allowlist, which the runtime applies before it connects and
+     which fails closed;
+   - placement labels, matched as transform `requires` are (ADR 0129);
    - an owner, markings and an optional certification pin (ADR 0055).
 
    Source batches, saved exports and writeback effects name a Source.
    Today they name a free-form source instance, an export id, or nothing.
-   Deleting or disabling a Source stops all its work.
+   Deleting or disabling a Source stops all its work. It raises the
+   generation of every live claim on that work, so a runtime still holding
+   one cannot write back, and the plane refuses webhook deliveries for it.
 
    A Source keeps the existing `source` and `source_instance` tokens as
    fields, for example `github` and `owner/repo`. A batch names the Source
@@ -70,18 +74,19 @@ object they all hang off.
    - `apply` for writeback effects.
 
    A type declares its operations, its configuration schema and its
-   credential slots. GitHub, relational sources and the Ezu spatial engine
-   become types. Ezu receives its feed as an export delivery and returns
-   fence events through `read_changes`.
+   credential slots. GitHub and relational sources become types first.
 
-   Programs that are not integrations with one external system stay as
-   they are. These are evidence producers, the feedback investigator
-   (which claims Action work), projections, and workflow and autonomy
-   programs. A type gains a new operation only when a new integration
-   needs it.
+   Programs whose loop these operations do not express stay as they are:
+   - the Ezu adapter, which follows an object-change subscription and
+     submits Action instances (ADR 0147);
+   - evidence producers;
+   - the feedback investigator, which claims Action work;
+   - projections, and workflow and autonomy programs.
+
+   A type gains a new operation only when an integration needs it.
 3. **One connector runtime.** A single worker binary holds the connector
    types. It never links the control-plane package. It claims sync, delivery
-   and effect work for the Sources it is entitled to, as the
+   and effect work for the Sources whose placement labels it meets, as the
    `source_sync`, `export_delivery` and `external_effect` kinds of the one
    work queue (ADR 0149), and adds no claim RPCs of its own. The
    deployment layer runs as many runtimes as it needs. The plane never
@@ -89,9 +94,9 @@ object they all hang off.
 4. **Credentials stay with the runtime.** A credential reference names a
    secret that the runtime resolves locally. The plane stores the
    reference, never the value. A Source whose credential cannot be resolved
-   reports `unavailable` and is not retried in a loop. Plane-held
-   credentials sealed to a runtime key are a possible later extension, not
-   part of this decision.
+   fails the run visibly as `unavailable` and is not retried in a loop.
+   Plane-held credentials sealed to a runtime key are a possible later
+   extension, not part of this decision.
 5. **Work comes from the existing schedules.**
    - **Syncs:** a schedule. A pull sync is `source_sync` work. A webhook
      delivery stays on the plane (ADR 0035). The plane verifies it and
@@ -103,9 +108,10 @@ object they all hang off.
 
    Automation stays with Action bindings (ADR 0090). A Source adds no
    trigger language of its own.
-6. **Health is per Source.** Last success, lag, failure class and the
-   runtime that holds the current claim. All of it is read from the plane's
-   own records, never from a live probe (ADR 0046).
+6. **Health is per Source and kind.** Last success, lag, failure class and
+   the runtime that holds the current claim, for each of the Source's work
+   kinds. All of it is read from the plane's own records, never from a live
+   probe (ADR 0046).
 
 ## Alternatives considered
 
@@ -129,9 +135,13 @@ object they all hang off.
   tokens, so object ids stay the same.
 - The reference adapters under `adapters/` that sync, deliver or write back
   become connector types. The others stay as they are.
-  `docs/ezu-adapter.md` becomes the description of the Ezu connector type.
+  The Ezu adapter keeps the ADR 0147 design.
 - The runtime is a new deployable. It has to survive crash, takeover and
   rolling deploy as any claim worker does.
+- The saved-export delivery RPCs (`ListDeliverableExportArtifacts`,
+  `AcknowledgeExportDelivery`) become wrappers of the `export_delivery`
+  kind, as ADR 0149 decision 4 does for the older claim families. An old
+  adapter and a new runtime cannot both hold one artifact.
 - This ADR depends on ADR 0149. Source, delivery and effect work are new
   kinds of that queue, not new claim families. They stay experimental
   until the queue's RPCs are stable.
