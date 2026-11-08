@@ -10,7 +10,8 @@
 - Related: [ADR 0052](0052-capability-package-certification.md),
   [ADR 0073](0073-source-and-action-objects.md),
   [ADR 0079](0079-evaluation-promotion-gate.md),
-  [ADR 0084](0084-system-one-action-function.md)
+  [ADR 0084](0084-system-one-action-function.md),
+  [#2053](https://github.com/Sannrox/sekai-chisei/issues/2053)
 
 ## Context
 
@@ -89,7 +90,10 @@ evidence plus a durable external-issue mapping and a public-safe marker.
 Lost create or update responses stay pending reconciliation and are never
 retried blindly. Publication strips private environment identifiers and
 private issue references. The default cap is five new issues per UTC day.
-Tracker adapters remain outside this package.
+Tracker adapters remain outside this package. Feedback kinds change only
+through their governed Actions (#2053). Direct object writes and streaming
+transform apply refuse them. The publisher posts only findings the
+investigation runtime recorded (`recorded_by` is `feedback-investigation`).
 
 Issue #1233 adds a Combined-mode quality worker that matches later
 observations to the same problem class, retains Tenkai versions from

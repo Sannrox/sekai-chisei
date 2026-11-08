@@ -74,7 +74,10 @@ or update one issue on the configured repository after external-action
 authorization, permit redemption, and execution evidence. The publisher is a
 self-authorizing plane actor (`SEKAI_FEEDBACK_GITHUB_RUN_AS`, default
 `feedback-github`): actor, intended executor, and redeemer are that principal.
-`root` and `local` are refused. The permit binds the repository and the GitHub
+`root` and `local` are refused. Feedback kinds change only through their
+governed Actions. The publisher posts only findings the investigation runtime
+recorded (`recorded_by` is `feedback-investigation`); a namespace writer
+cannot qualify a finding by setting `classification`. The permit binds the repository and the GitHub
 API origin (scheme and host). Publication strips private environment identifiers and private
 repository or issue references. A durable mapping and public-safe marker
 connect each problem signature to its issue; later occurrences update managed

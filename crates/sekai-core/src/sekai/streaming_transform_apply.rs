@@ -209,6 +209,11 @@ pub fn apply(
             "security package objects change only through their governed Actions".into(),
         ));
     }
+    if crate::sekai::feedback_package::is_package_kind(type_def.object_kind.trim()) {
+        return Err(StreamingApplyError::PermissionDenied(
+            "feedback package objects change only through their governed Actions".into(),
+        ));
+    }
     // This RPC has no envelope_id. Autonomous types require a live envelope on
     // SubmitActionInstance; refuse them here until that contract is on the wire.
     if type_def.type_id.starts_with("autonomous.") {
@@ -499,7 +504,7 @@ fn revalidate_after_marking(
     object: &mut Object,
     now_ms: i64,
 ) -> Result<(), StreamingApplyError> {
-    crate::sekai::feedback_package::validate_object_write(db, object, now_ms)
+    crate::sekai::feedback_package::validate_object_write(db, object, None, now_ms)
         .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, object, now_ms))
         .map_err(StreamingApplyError::FailedPrecondition)
 }
