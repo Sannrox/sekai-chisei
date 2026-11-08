@@ -22,7 +22,6 @@ pub mod evaluation_execution;
 pub mod evaluation_manifest;
 pub mod evaluation_plan;
 pub mod evidence_vocabulary;
-pub mod feedback_quality_eval;
 pub use sekai_types::evolve;
 pub mod external_action;
 pub mod external_action_lifecycle;

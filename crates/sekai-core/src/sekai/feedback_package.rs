@@ -35,11 +35,11 @@ pub const KIND_INVESTIGATION_RESULT: &str = "feedback_investigation_result";
 pub const KIND_HYPOTHESIS: &str = "feedback_hypothesis";
 pub const KIND_EXTERNAL_ISSUE: &str = "feedback_external_issue";
 pub const KIND_VERIFICATION: &str = "feedback_verification";
-/// Stamped only by the investigation worker. Callers cannot set it.
+/// Stamped by the plane when [`INVESTIGATION_RUNTIME`] submits. Callers cannot set it.
 pub const PROPERTY_RECORDED_BY: &str = "recorded_by";
-/// Principal the investigation worker uses when it writes findings.
+/// Principal the investigation runtime uses when it writes findings.
 pub const INVESTIGATION_RUNTIME: &str = "feedback-investigation";
-/// Outcome written by the quality pass. Not a measured reproduction.
+/// Outcome the retired quality pass wrote. Not a measured reproduction.
 pub const OUTCOME_QUALITY_EVALUATION: &str = "quality-evaluation";
 pub const ACTION_OBSERVATION: &str = "feedback.observation.record";
 pub const ACTION_FINDING: &str = "feedback.finding.record";
