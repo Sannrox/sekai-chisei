@@ -85,6 +85,23 @@ window. Cycles are refused at Put. Failed upstream runs mark downstream
 outputs `blocked`; a later success unblocks them. Cancelling a run skips
 not-yet-started downstream work and records that on the receipts.
 
+A dataset health check with `every_ms` greater than zero is also a member of
+this schedule graph (#2187). `TickGovernedTransforms` runs it once per due
+bucket (`now / every_ms`), with no caller outside the plane. The check's
+stored `last_run_ms` is the schedule cursor: a run claims the bucket by a
+conditional update of `last_run_ms`, and that claim commits together with the
+judgment and the alerts. So two planes ticking at once run a due check once,
+and a crash before the commit leaves the bucket for the next tick. A run that
+starts after a whole bucket passed with no run fires the `late` schedule
+alert; the next on-time run resolves it. `RunDatasetHealthChecks` stays the
+on-demand call for one dataset. It runs every unscheduled check, and runs a
+scheduled check only through the same claim, so a cadence caller and the tick
+together still run each bucket once. Planes from before #2187 run a scheduled
+check when `last_run_ms + every_ms <= now` and write the same field. In a
+mixed deploy, each side sees the other's run, and a check runs at most once
+per bucket. As with every schedule member, a run late in one bucket and a run
+early in the next are both on time.
+
 An isolated-process definition may declare `requires`, placement labels as
 key and value pairs, part of its definition digest when non-empty (#1733,
 ADR 0129). A worker registers its labels for its runtime id in a namespace

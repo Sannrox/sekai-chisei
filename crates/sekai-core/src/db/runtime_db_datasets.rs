@@ -381,6 +381,38 @@ impl RuntimeDb {
         }
     }
 
+    /// Admits the due scheduled health checks of every dataset, as members of
+    /// the transform schedule graph (ADR 0103, #2187). Each dataset commits on
+    /// its own, so one failing dataset does not hold back the others; its
+    /// claim rolls back, the next tick retries it, and the first error is
+    /// returned after every dataset was tried. Returns the number of results.
+    pub fn tick_dataset_health_checks(&self, now_ms: i64) -> Result<usize, String> {
+        let datasets = match self {
+            Self::Sqlite(db) => db.list_scheduled_health_datasets()?,
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_scheduled_health_datasets())?
+            }
+        };
+        let mut judged = 0;
+        let mut first_error = None;
+        for dataset_id in datasets {
+            let ticked = match self {
+                Self::Sqlite(db) => db.tick_dataset_health_checks(&dataset_id, now_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.tick_dataset_health_checks(&dataset_id, now_ms)
+                }),
+            };
+            match ticked {
+                Ok(results) => judged += results.len(),
+                Err(error) => {
+                    tracing::warn!(%error, %dataset_id, "scheduled dataset health check failed");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(judged), Err)
+    }
+
     pub fn emit_consumer_violation(
         &self,
         emit: &crate::sekai::consumer_violation::EmitViolation<'_>,

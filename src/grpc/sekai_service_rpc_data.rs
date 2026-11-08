@@ -4845,6 +4845,13 @@ pub(super) async fn tick_governed_transforms(
             }
         }
     }
+    // Scheduled dataset health checks join the same graph (#2187). Last, so a
+    // failing dataset fails the tick visibly without holding back other work.
+    let health_runtime = runtime.clone();
+    tokio::task::spawn_blocking(move || health_runtime.tick_dataset_health_checks(now_ms))
+        .await
+        .map_err(|_| Status::internal("dataset health tick failed"))?
+        .map_err(Status::internal)?;
     let runs = runs
         .iter()
         .map(|run| {
