@@ -174,4 +174,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0146: A turn worker is never the instance principal](0146-turn-worker-is-not-the-instance.md)
 - [ADR 0147: Spatial engine integration runs outside the plane](0147-spatial-engine-integration-outside-the-plane.md)
 - [ADR 0148: Sources are first-class; one connector runtime runs every integration](0148-sources-and-one-connector-runtime.md) (proposed)
+- [ADR 0149: One claimable work queue, with typed kinds](0149-one-claimable-work-queue.md) (proposed)
 <!-- adr-index:end -->
