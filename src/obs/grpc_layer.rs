@@ -1,13 +1,22 @@
+use crate::db::chisei_rpc_inventory::{CHISEI_SERVICE_PROTO, parse_service_rpcs};
+use crate::db::sekai_rpc_inventory::{SEKAI_SERVICE_PROTO, parse_sekai_service_rpcs};
 use futures_util::future::BoxFuture;
 use http::{HeaderMap, Request, Response};
 use http_body::{Body, Frame};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tower::{Layer, Service};
 use tracing::{Instrument, debug, info_span, warn};
+
+/// gRPC service name as it appears on the wire (`package.Service`).
+const SEKAI_GRPC_SERVICE: &str = "sekai.SekaiService";
+const CHISEI_GRPC_SERVICE: &str = "chisei.ChiseiService";
+const HEALTH_GRPC_SERVICE: &str = "grpc.health.v1.Health";
 
 #[derive(Clone, Default)]
 pub struct MetricsLayer;
@@ -212,100 +221,38 @@ fn parse_grpc_path(path: &str) -> (String, String) {
     }
 }
 
+/// Methods the combined plane actually serves, keyed by wire service name.
+///
+/// Sekai and Chisei come from the checked-in proto inventories so adding an
+/// RPC does not require a second edit here. Health is the well-known tonic
+/// service registered next to them. Unknown paths stay unlabelled.
+fn served_rpc_index() -> &'static HashMap<&'static str, HashSet<&'static str>> {
+    static INDEX: OnceLock<HashMap<&'static str, HashSet<&'static str>>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
+        index.insert(
+            SEKAI_GRPC_SERVICE,
+            parse_sekai_service_rpcs(SEKAI_SERVICE_PROTO)
+                .expect("SekaiService proto inventory")
+                .into_iter()
+                .collect(),
+        );
+        index.insert(
+            CHISEI_GRPC_SERVICE,
+            parse_service_rpcs(CHISEI_SERVICE_PROTO, "ChiseiService")
+                .expect("ChiseiService proto inventory")
+                .into_iter()
+                .collect(),
+        );
+        index.insert(HEALTH_GRPC_SERVICE, HashSet::from(["Check", "Watch"]));
+        index
+    })
+}
+
 fn known_rpc(service: &str, method: &str) -> bool {
-    match service {
-        "sekai.SekaiService" => matches!(
-            method,
-            "AcquireLease"
-                | "GetLease"
-                | "RefreshLease"
-                | "ReleaseLease"
-                | "TakeoverExpiredLease"
-                | "CreateObject"
-                | "GetObject"
-                | "UpdateObject"
-                | "DeleteObject"
-                | "ListObjects"
-                | "FindByExternalId"
-                | "FindByProperty"
-                | "CreateLink"
-                | "DeleteLink"
-                | "GetLinks"
-                | "GetLinkedObjects"
-                | "Traverse"
-                | "ExpandNeighborhood"
-                | "FindPaths"
-                | "CreateDatasetBranch"
-                | "ListDatasetBranches"
-                | "DeleteDatasetBranch"
-                | "CompareDatasetBranch"
-                | "ProposeDatasetBranchMerge"
-                | "MergeDatasetBranch"
-                | "RunGovernedTransformOnBranch"
-                | "ReplayGovernedTransform"
-                | "GetTransformReplay"
-                | "ShadowGovernedTransform"
-                | "GetGovernedFactVersion"
-                | "ResolveInvariantSet"
-                | "ListSchemaTypes"
-                | "ListEvidenceAdapters"
-                | "CreateFunction"
-                | "ListFunctions"
-                | "CreateDataset"
-                | "UpdateDataset"
-                | "ListDatasets"
-                | "AppendRows"
-                | "QueryRows"
-                | "CreateVirtualTable"
-                | "ListVirtualTables"
-                | "CreateGrant"
-                | "DeleteGrant"
-                | "ListGrants"
-                | "CheckAccess"
-                | "RecordDecision"
-                | "ListDecisions"
-                | "ListObjectChanges"
-                | "ExplainValue"
-                | "GetLineage"
-                | "CreateContentionScope"
-                | "UpdateContentionScope"
-                | "GetContentionScope"
-                | "ListContentionScopes"
-                | "CreateWorkUnit"
-                | "GetWorkUnit"
-                | "ListWorkUnits"
-                | "TryAdmitWorkUnit"
-                | "HeartbeatWorkUnit"
-                | "CompleteWorkUnit"
-                | "FailWorkUnit"
-                | "CancelWorkUnit"
-                | "ListReservations"
-                | "ListRunEvents"
-                | "ReconcileWorkUnits"
-        ),
-        "chisei.ChiseiService" => matches!(
-            method,
-            "RecordUsage"
-                | "SetBudgetLimit"
-                | "SetNamespacePolicy"
-                | "PlanExecution"
-                | "ExecutePlanStream"
-                | "PlanContentExecution"
-                | "ExecuteContentPlanStream"
-                | "ReportOperationEvent"
-                | "GetOperationReceipt"
-                | "GetSampleObservation"
-                | "ClaimGatewayDispatch"
-                | "PutEvaluatorDefinition"
-                | "PutEvaluationPlan"
-                | "ResolveEvaluationPlan"
-                | "GetEvaluationGateEvidence"
-                | "ExecuteEvaluationManifest"
-                | "CancelEvaluationExecution"
-        ),
-        "grpc.health.v1.Health" => matches!(method, "Check" | "Watch"),
-        _ => false,
-    }
+    served_rpc_index()
+        .get(service)
+        .is_some_and(|methods| methods.contains(method))
 }
 
 fn grpc_code(headers: &HeaderMap) -> Option<String> {
@@ -424,6 +371,51 @@ mod tests {
                 ("sekai.SekaiService".into(), method.into())
             );
         }
+    }
+
+    #[test]
+    fn every_served_method_is_labelled() {
+        let mut saw_federated_aggregate = false;
+        let mut saw_apply_source_batch = false;
+        for (service, methods) in super::served_rpc_index() {
+            for method in methods {
+                assert_eq!(
+                    parse_grpc_path(&format!("/{service}/{method}")),
+                    ((*service).to_string(), (*method).to_string()),
+                    "{service}/{method} must not collapse to unknown"
+                );
+                if *service == super::SEKAI_GRPC_SERVICE && *method == "FederatedAggregate" {
+                    saw_federated_aggregate = true;
+                }
+                if *service == super::SEKAI_GRPC_SERVICE && *method == "ApplySourceBatch" {
+                    saw_apply_source_batch = true;
+                }
+            }
+        }
+        assert!(
+            saw_federated_aggregate,
+            "index must include FederatedAggregate (missing from the old hand list)"
+        );
+        assert!(
+            saw_apply_source_batch,
+            "index must include ApplySourceBatch (missing from the old hand list)"
+        );
+    }
+
+    #[test]
+    fn unknown_path_stays_unknown() {
+        assert_eq!(
+            parse_grpc_path("/sekai.SekaiService/NotARealRpc"),
+            ("unknown".into(), "unknown".into())
+        );
+        assert_eq!(
+            parse_grpc_path("/example.NotServed/ListObjects"),
+            ("unknown".into(), "unknown".into())
+        );
+        assert_eq!(
+            parse_grpc_path("/sekai.SekaiService/"),
+            ("unknown".into(), "unknown".into())
+        );
     }
 
     #[test]
