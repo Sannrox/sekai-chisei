@@ -90,7 +90,7 @@ pub struct PermitTrust<'a> {
 }
 
 /// One requested change to one record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritebackIntent {
     pub key: String,
     /// The record version the change was decided against.
