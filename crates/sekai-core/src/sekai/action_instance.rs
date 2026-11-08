@@ -1529,7 +1529,11 @@ fn sqlite_redact_forgotten_memory_decisions(
     let mut stmt = tx
         .prepare(
             "SELECT memory_id, body_json FROM sekai_action_decision_memory
-             WHERE namespace = ?1 AND type_id IN (?2, ?3, ?4)",
+             WHERE namespace = ?1 AND type_id IN (?2, ?3, ?4)
+               AND (
+                 json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id') = ?5
+                 OR json_extract(json_extract(body_json, '$.facts_json'), '$.object_id') = ?5
+               )",
         )
         .map_err(|error| error.to_string())?;
     let rows = stmt
@@ -1538,7 +1542,8 @@ fn sqlite_redact_forgotten_memory_decisions(
                 object.namespace,
                 ACTION_CREATE,
                 ACTION_UPDATE,
-                ACTION_FORGET
+                ACTION_FORGET,
+                object.id
             ],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )

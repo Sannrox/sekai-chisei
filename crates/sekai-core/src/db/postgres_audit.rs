@@ -677,6 +677,28 @@ pub fn update_object_in(
     Ok(Some(before))
 }
 
+/// Object lifecycle locks, then Action rows (#2036).
+///
+/// Every PostgreSQL transaction that takes an object lifecycle lock and an
+/// Action row lock (`sekai_action_instances` `FOR UPDATE` / `FOR SHARE`)
+/// takes object locks first, in id order, then the Action rows. Two
+/// transactions that share an object and an Action therefore wait in one
+/// order and cannot deadlock (SQLSTATE 40P01). Object locks in one
+/// transaction are also taken in id order, including the written object
+/// and each plan reference.
+///
+/// Combined object-then-Action paths:
+/// - `apply_admission_object_write`
+/// - `release_admission`
+/// - `grant_parked_action_instance`
+/// - `postgres_redact_forgotten_memory_actions` (the forgotten object is
+///   already held)
+///
+/// Object-only callers (audit, objects, object_sync, dataset_branch,
+/// governed_transform, catalog_criticality) must not take an Action row
+/// lock first in the same transaction. `postgres_changed_reference` takes
+/// object locks in id order and is called only after those ids are already
+/// in the sorted set.
 pub fn lock_object_lifecycle(
     transaction: &mut postgres::Transaction<'_>,
     object_id: &str,
@@ -688,6 +710,33 @@ pub fn lock_object_lifecycle(
         )
         .map(|_| ())
         .map_err(|error| format!("lock object lifecycle: {error}"))
+}
+
+/// Lifecycle locks for `object_ids` in sorted unique order (#2036).
+pub(crate) fn lock_object_lifecycles(
+    transaction: &mut postgres::Transaction<'_>,
+    object_ids: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Result<(), String> {
+    for id in ordered_object_lock_ids(object_ids) {
+        lock_object_lifecycle(transaction, &id)?;
+    }
+    Ok(())
+}
+
+/// Sorted unique object ids, skipping empty ids.
+pub(crate) fn ordered_object_lock_ids<I, S>(object_ids: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut ids: Vec<String> = object_ids
+        .into_iter()
+        .map(|id| id.as_ref().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn validate_namespace_identity(object: &Object) -> Result<(), String> {
@@ -779,5 +828,13 @@ mod tests {
             updated: 1,
         };
         assert!(validate_namespace_identity(&object).is_err());
+    }
+
+    #[test]
+    fn object_lifecycle_locks_sort_unique_ids() {
+        assert_eq!(
+            ordered_object_lock_ids(["b", "", "a", "b", "c"]),
+            ["a", "b", "c"]
+        );
     }
 }

@@ -750,6 +750,10 @@ mod tests {
         remember(&db, "create", AGENT).unwrap();
         db.put_decision_memory(&decision_row("decided", "valve 3 sticks"))
             .unwrap();
+        let mut other = decision_row("other-note", "leave this");
+        other.parameters_json = json!({"object_id": "note-2", "content": "leave this"}).to_string();
+        other.facts_json = other.parameters_json.clone();
+        db.put_decision_memory(&other).unwrap();
         admit(
             &db,
             ACTION_FORGET,
@@ -758,6 +762,12 @@ mod tests {
             AGENT,
         )
         .unwrap();
+        let kept = db.get_decision_memory("other-note").unwrap().unwrap();
+        assert!(
+            kept.parameters_json.contains("leave this"),
+            "{}",
+            kept.parameters_json
+        );
         let stored = db.get_decision_memory("decided").unwrap().unwrap();
         for field in [&stored.parameters_json, &stored.facts_json] {
             let content = serde_json::from_str::<Value>(field)
