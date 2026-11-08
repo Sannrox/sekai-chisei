@@ -1,11 +1,11 @@
 # ADR 0121: Bind Ezu geofence events to governed Actions
 
-- Status: accepted
+- Status: superseded by ADR 0147
 - Date: 2026-10-22
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/1564 (#1564)
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0147](0147-spatial-engine-integration-outside-the-plane.md)
 - Related: [ADR 0090](0090-object-change-action-bindings.md),
   [ADR 0089](0089-park-and-decide-action-instances.md)
 

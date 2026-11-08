@@ -37,7 +37,6 @@ const IMPLEMENTATION_SOURCES: &[&str] = &[
     include_str!("runtime_db_ontology.rs"),
     include_str!("runtime_db_functions.rs"),
     include_str!("runtime_db_federation.rs"),
-    include_str!("runtime_db_ezu_geo_feed.rs"),
     include_str!("runtime_db_workflow.rs"),
     include_str!("runtime_db_connector.rs"),
     include_str!("runtime_db_warehouse.rs"),

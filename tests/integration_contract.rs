@@ -27,7 +27,6 @@ const RUNTIME_DB: &str = concat!(
     include_str!("../crates/sekai-core/src/db/runtime_db_ontology.rs"),
     include_str!("../crates/sekai-core/src/db/runtime_db_functions.rs"),
     include_str!("../crates/sekai-core/src/db/runtime_db_federation.rs"),
-    include_str!("../crates/sekai-core/src/db/runtime_db_ezu_geo_feed.rs"),
     include_str!("../crates/sekai-core/src/db/runtime_db_workflow.rs"),
     include_str!("../crates/sekai-core/src/db/runtime_db_connector.rs"),
     include_str!("../crates/sekai-core/src/db/runtime_db_warehouse.rs"),

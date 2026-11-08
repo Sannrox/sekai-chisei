@@ -295,11 +295,6 @@ Edit the fixture, then regenerate with
 | `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.PutActionBinding` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.RunActionBinding` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.PutFenceBinding` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RunFenceBinding` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.PutEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RunEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.BackfillEzuGeoFeed` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |

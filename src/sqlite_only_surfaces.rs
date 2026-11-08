@@ -36,7 +36,6 @@ pub const RUNTIME_DB_SRC: &str = concat!(
     runtime_db_file!("runtime_db_ontology.rs"),
     runtime_db_file!("runtime_db_functions.rs"),
     runtime_db_file!("runtime_db_federation.rs"),
-    runtime_db_file!("runtime_db_ezu_geo_feed.rs"),
     runtime_db_file!("runtime_db_workflow.rs"),
     runtime_db_file!("runtime_db_connector.rs"),
     runtime_db_file!("runtime_db_warehouse.rs"),
