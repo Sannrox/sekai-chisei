@@ -71,8 +71,11 @@ records no finding. Inconclusive and malformed results stay `internal` and
 cannot dispatch a GitHub mutation. Combined-mode instances also run a GitHub
 publisher (#1232) on the same 15-second interval. Qualifying findings create
 or update one issue on the configured repository after external-action
-authorization, executor verification, permit redemption, and execution
-evidence. Publication strips private environment identifiers and private
+authorization, permit redemption, and execution evidence. The publisher is a
+self-authorizing plane actor (`SEKAI_FEEDBACK_GITHUB_RUN_AS`, default
+`feedback-github`): actor, intended executor, and redeemer are that principal.
+`root` and `local` are refused. The permit binds the repository and the GitHub
+API origin (scheme and host). Publication strips private environment identifiers and private
 repository or issue references. A durable mapping and public-safe marker
 connect each problem signature to its issue; later occurrences update managed
 content and leave maintainer text in place. Lost responses stay pending

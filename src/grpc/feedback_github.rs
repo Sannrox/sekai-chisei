@@ -16,12 +16,12 @@ use crate::sekai::external_permit::HostContext;
 use crate::sekai::feedback_github::{
     DEFAULT_DAILY_CAP, EXTERNAL_ACTION_TYPE, GitHubError, GitHubIssue, GitHubIssues, GitHubTarget,
     HARNESS, HOST_CAPABILITY, PARAMETER_SCHEMA, POLL_INTERVAL_SECS, PermitError, PermitGate,
-    PermitProof, PublishError, PublishIntent, PublishOperation, RUNTIME_ID, permit_deadline_ms,
-    permit_operation_id, publish_finding, qualifying_findings,
+    PermitProof, PublishError, PublishIntent, PublishOperation, RUNTIME_ID, github_api_origin,
+    permit_deadline_ms, permit_operation_id, permit_preconditions, permit_target_selectors,
+    publish_finding, publisher_principal, qualifying_findings,
 };
 use crate::sekai::feedback_package::PACKAGE_ID;
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -64,11 +64,20 @@ fn publish_pass(db: &RuntimeDb, chisei: &ChiseiServiceImpl) -> Result<(), String
     let Some(target) = configured_target() else {
         return Ok(());
     };
-    let run_as = configured_run_as();
-    let github = GitHubHttp::from_env(&target)?;
+    let Some(run_as) = publisher_principal(&configured_run_as()) else {
+        tracing::warn!("feedback GitHub RUN_AS cannot be root or local; publication skipped");
+        return Ok(());
+    };
+    let api = configured_api();
+    let Some(api_origin) = github_api_origin(&api) else {
+        tracing::warn!("feedback GitHub API origin is invalid; publication skipped");
+        return Ok(());
+    };
+    let github = GitHubHttp::from_env(&target, api)?;
     let permits = LivePermitGate {
         chisei,
         target: target.clone(),
+        api_origin,
         run_as: run_as.clone(),
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -149,11 +158,15 @@ fn configured_target() -> Option<GitHubTarget> {
 }
 
 fn configured_run_as() -> String {
-    std::env::var(RUN_AS_ENV)
+    std::env::var(RUN_AS_ENV).unwrap_or_default()
+}
+
+fn configured_api() -> String {
+    std::env::var(API_ENV)
         .ok()
-        .map(|value| value.trim().to_string())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| RUNTIME_ID.to_string())
+        .unwrap_or_else(|| DEFAULT_API.to_string())
 }
 
 fn permit_label(error: &PermitError) -> &'static str {
@@ -169,6 +182,7 @@ fn permit_label(error: &PermitError) -> &'static str {
 struct LivePermitGate<'a> {
     chisei: &'a ChiseiServiceImpl,
     target: GitHubTarget,
+    api_origin: String,
     run_as: String,
 }
 
@@ -192,7 +206,6 @@ impl LivePermitGate<'_> {
         intent: &PublishIntent,
         retry_suffix: Option<&str>,
     ) -> Result<PermitProof, tonic::Status> {
-        let resource = format!("github:{}", self.target.repository());
         let op = match intent.operation {
             PublishOperation::Create => "create",
             PublishOperation::Update { .. } => "update",
@@ -202,6 +215,9 @@ impl LivePermitGate<'_> {
             operation_id = format!("{operation_id}-r-{suffix}");
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let target_selectors =
+            permit_target_selectors(&intent.draft.namespace, &self.target, &self.api_origin);
+        let preconditions = permit_preconditions(&self.target, &self.api_origin);
         let authorized = self.chisei.authorize_from_authenticated(
             self.run_as.clone(),
             AuthorizeExternalActionRequest {
@@ -218,18 +234,12 @@ impl LivePermitGate<'_> {
                     action_type: EXTERNAL_ACTION_TYPE.into(),
                     parameter_schema: PARAMETER_SCHEMA.into(),
                     canonical_arguments_digest: intent.arguments_digest.clone(),
-                    policy_summary: std::collections::HashMap::from([(
-                        "repository".into(),
-                        self.target.repository(),
-                    )]),
-                    target_selectors: vec![format!(
-                        "project:{}/{}",
-                        intent.draft.namespace, resource
-                    )],
-                    immutable_preconditions: std::collections::HashMap::from([(
-                        "repository".into(),
-                        self.target.repository(),
-                    )]),
+                    policy_summary: std::collections::HashMap::from([
+                        ("repository".into(), self.target.repository()),
+                        ("api_origin".into(), self.api_origin.clone()),
+                    ]),
+                    target_selectors: target_selectors.clone(),
+                    immutable_preconditions: preconditions.clone().into_iter().collect(),
                     risk_class: "write".into(),
                     expected_effects: vec![format!("issue_{op}")],
                     requested_invocation_count: 1,
@@ -259,11 +269,8 @@ impl LivePermitGate<'_> {
             executor: self.run_as.clone(),
             requesting_harness: HARNESS.into(),
             canonical_arguments_digest: intent.arguments_digest.clone(),
-            target_selectors: vec![format!("project:{}/{}", intent.draft.namespace, resource)],
-            observed_preconditions: BTreeMap::from([(
-                "repository".into(),
-                self.target.repository(),
-            )]),
+            target_selectors,
+            observed_preconditions: preconditions,
             host_capabilities: vec![HOST_CAPABILITY.into()],
         };
         let key = permit_signing_key(&self.chisei.config)?.verifying_key();
@@ -340,16 +347,12 @@ struct GitHubHttp {
 }
 
 impl GitHubHttp {
-    fn from_env(target: &GitHubTarget) -> Result<Self, String> {
+    fn from_env(target: &GitHubTarget, api: String) -> Result<Self, String> {
         let token = std::env::var(TOKEN_ENV).unwrap_or_default();
-        let api = std::env::var(API_ENV)
-            .ok()
-            .map(|value| value.trim().trim_end_matches('/').to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_API.to_string());
         let client = reqwest::blocking::Client::builder()
             .user_agent("sekai-chisei-feedback-github")
             .timeout(Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self {
