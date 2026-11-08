@@ -7,6 +7,8 @@
 //! - Each (namespace, problem signature) owns one issue, found by a public
 //!   marker in its body. The marker is the writeback key, so a marker written
 //!   for another namespace never matches.
+//! - Only issues the executor's own account opened are managed or counted
+//!   toward the daily cap. Markers are public; a pasted copy is ignored.
 //! - The record version is `absent` or the issue's number and `updated_at`. A
 //!   create whose response was lost shows up as present on the next decision,
 //!   which becomes an update or nothing, never a second create.
@@ -57,10 +59,14 @@ pub struct GitHubIssue {
     pub body: String,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// Login of the account that opened the issue.
+    pub author: String,
 }
 
 /// The executor's view of one repository. The implementation holds the token.
 pub trait GitHubIssues {
+    /// The account the token acts as. Only issues it opened are managed.
+    fn login(&self) -> &str;
     /// Every issue in the repository, open and closed.
     fn list(&self) -> Result<Vec<GitHubIssue>, String>;
     fn create(&self, title: &str, body: &str) -> Result<GitHubIssue, String>;
@@ -78,11 +84,19 @@ pub struct IssueTracker<G> {
 }
 
 impl<G: GitHubIssues> IssueTracker<G> {
+    /// Issues the executor opened. Markers are public, so anyone can paste
+    /// one into an issue; those are never adopted and never use up the cap.
+    fn own_issues(&self) -> Result<Vec<GitHubIssue>, String> {
+        let login = self.github.login();
+        let mut issues = self.github.list()?;
+        issues.retain(|issue| issue.author == login);
+        Ok(issues)
+    }
+
     fn find(&self, marker: &str) -> Result<Option<GitHubIssue>, String> {
         let needle = marker_comment(marker);
         Ok(self
-            .github
-            .list()?
+            .own_issues()?
             .into_iter()
             .find(|issue| issue.body.contains(&needle)))
     }
@@ -133,7 +147,7 @@ impl<G: GitHubIssues> SourceSystem for IssueTracker<G> {
         }
         let written = match current {
             None => {
-                let issues = self.github.list()?;
+                let issues = self.own_issues()?;
                 if new_issues_today(&issues, now_ms()) >= self.daily_cap() {
                     return Err("daily new-issue cap reached".into());
                 }
@@ -224,7 +238,7 @@ impl IssuePublisher {
         );
 
         let marker = public_marker(&self.namespace, &signature);
-        let issues = tracker.github.list()?;
+        let issues = tracker.own_issues()?;
         let current = issues
             .iter()
             .find(|issue| issue.body.contains(&marker_comment(&marker)));

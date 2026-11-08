@@ -280,6 +280,7 @@ fn investigator() -> Investigator {
     Investigator {
         namespace: NAMESPACE.into(),
         binding_id: BINDING.into(),
+        instance_id: uuid::Uuid::new_v4().to_string(),
     }
 }
 
@@ -410,6 +411,43 @@ async fn budget_refusal_writes_nothing_and_releases_the_dispatch() {
 }
 
 #[tokio::test]
+async fn two_processes_never_share_a_live_claim() {
+    let plane = armed_plane().await;
+    observe(&plane.db, "o-1", "op-1", "defect");
+    let (first, second) = (investigator(), investigator());
+    first.run_binding(&plane.sekai).await.unwrap();
+    // Both list the dispatch before either claims it.
+    let listed = plane
+        .sekai
+        .list_claimable_action_work(with_principal(
+            ListClaimableActionWorkRequest {
+                namespace: NAMESPACE.into(),
+                runtime_id: INVESTIGATION_RUNTIME.into(),
+                limit: 16,
+            },
+            INVESTIGATION_RUNTIME,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .effects;
+    assert!(first.claim(&plane.sekai).await.unwrap().is_some());
+    let late = plane
+        .sekai
+        .claim_action_work(with_principal(
+            ClaimActionWorkRequest {
+                effect_id: listed[0].effect_id.clone(),
+                runtime_id: INVESTIGATION_RUNTIME.into(),
+                request_id: second.claim_request_id(&listed[0].effect_id),
+                ttl_ms: 60_000,
+            },
+            INVESTIGATION_RUNTIME,
+        ))
+        .await;
+    assert!(late.is_err(), "the second process loses the race");
+}
+
+#[tokio::test]
 async fn a_crashed_claim_is_taken_over_without_duplicate_records() {
     let plane = armed_plane().await;
     for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
@@ -504,6 +542,7 @@ fn the_prompt_is_sent_once_and_bounded() {
 // ---- GitHub publication ----
 
 const EXECUTOR: &str = "executor:github-issues";
+const EXECUTOR_LOGIN: &str = "feedback-bot";
 const REPOSITORY: &str = "tenkai-org/tenkai";
 const PERMIT_SEED: &str = "0707070707070707070707070707070707070707070707070707070707070707";
 const PERMIT_ISSUER: &str = "issuer:test";
@@ -525,14 +564,9 @@ impl FakeGitHub {
         self.clock.set(self.clock.get().max(now_ms()) + 1);
         self.clock.get()
     }
-}
 
-impl GitHubIssues for FakeGitHub {
-    fn list(&self) -> Result<Vec<GitHubIssue>, String> {
-        Ok(self.issues.borrow().clone())
-    }
-
-    fn create(&self, title: &str, body: &str) -> Result<GitHubIssue, String> {
+    /// An issue opened by `author`, the way anyone can on a public repository.
+    fn open_as(&self, author: &str, title: &str, body: &str) -> GitHubIssue {
         let at = self.tick();
         let issue = GitHubIssue {
             number: self.issues.borrow().len() as u64 + 1,
@@ -540,8 +574,24 @@ impl GitHubIssues for FakeGitHub {
             body: body.into(),
             created_ms: at,
             updated_ms: at,
+            author: author.into(),
         };
         self.issues.borrow_mut().push(issue.clone());
+        issue
+    }
+}
+
+impl GitHubIssues for FakeGitHub {
+    fn login(&self) -> &str {
+        EXECUTOR_LOGIN
+    }
+
+    fn list(&self) -> Result<Vec<GitHubIssue>, String> {
+        Ok(self.issues.borrow().clone())
+    }
+
+    fn create(&self, title: &str, body: &str) -> Result<GitHubIssue, String> {
+        let issue = self.open_as(EXECUTOR_LOGIN, title, body);
         self.creates.set(self.creates.get() + 1);
         if self.lose_next_create.replace(false) {
             return Err("response lost".into());
@@ -746,6 +796,25 @@ async fn another_namespaces_marker_is_never_adopted() {
     assert_eq!(intent.expected_version, ABSENT);
     publication.write(&intent).await.unwrap();
     assert_eq!(publication.issue_count(), 2);
+}
+
+#[tokio::test]
+async fn issues_opened_by_others_are_never_adopted_or_counted() {
+    let publication = publication().await;
+    let ours = written(publication.decide().await);
+    let github = &publication.tracker.github;
+    // A copy of the real managed section, plus enough spam to fill the cap.
+    let copy = format!("<!-- {} -->\nhijack", ours.key);
+    github.open_as("outsider", "copied", &copy);
+    for _ in 0..feedback_github_issues::DEFAULT_DAILY_CAP {
+        github.open_as("outsider", "spam", "<!-- sekai-feedback:0000 -->");
+    }
+    let intent = written(publication.decide().await);
+    assert_eq!(intent.expected_version, ABSENT);
+    publication.write(&intent).await.unwrap();
+    let issues = github.issues.borrow();
+    assert_eq!(issues[0].body, copy, "the outsider's issue is untouched");
+    assert_eq!(issues.last().unwrap().author, EXECUTOR_LOGIN);
 }
 
 #[tokio::test]

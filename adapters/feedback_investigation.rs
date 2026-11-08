@@ -433,6 +433,10 @@ pub struct Investigator {
     pub namespace: String,
     /// The `feedback.investigation.dispatch` binding on observation creates.
     pub binding_id: String,
+    /// Unique per process. Every runtime claims as [`INVESTIGATION_RUNTIME`],
+    /// and the plane replays a live claim to a matching request id, so the
+    /// request id carries this to keep two processes fenced apart.
+    pub instance_id: String,
 }
 
 impl Investigator {
@@ -488,7 +492,15 @@ impl Investigator {
         }
     }
 
-    async fn claim(
+    /// Distinct per process: the plane hands a live claim back to a request
+    /// with the same runtime and request id.
+    pub fn claim_request_id(&self, effect_id: &str) -> String {
+        format!("feedback-claim-{}-{effect_id}", self.instance_id)
+    }
+
+    /// Take one fenced dispatch claim with its observation id. `run_once`
+    /// calls this; runners that split claim from work may call it directly.
+    pub async fn claim(
         &self,
         sekai: &SekaiServiceImpl,
     ) -> Result<Option<(ActionEffect, String)>, String> {
@@ -533,7 +545,7 @@ impl Investigator {
                     ClaimActionWorkRequest {
                         effect_id: effect.effect_id.clone(),
                         runtime_id: INVESTIGATION_RUNTIME.into(),
-                        request_id: format!("feedback-claim-{}", effect.effect_id),
+                        request_id: self.claim_request_id(&effect.effect_id),
                         ttl_ms: CLAIM_TTL_MS,
                     },
                     INVESTIGATION_RUNTIME,
