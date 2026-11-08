@@ -1,8 +1,5 @@
 pub mod chisei_service;
 pub use sekai_admin_client::client;
-mod feedback_github;
-mod feedback_investigation;
-mod feedback_quality;
 mod provider_execution;
 pub mod remote_sekai;
 pub mod rpc_identity;
@@ -1802,13 +1799,6 @@ fn spawn_service_background_tasks(
     }
     if plane == ProcessPlane::Combined {
         spawn_embedding_catch_up(db.clone(), chisei_svc.clone());
-        feedback_investigation::spawn_feedback_investigation(
-            db.clone(),
-            sekai_svc.clone(),
-            chisei_svc.clone(),
-        );
-        feedback_github::spawn_feedback_github(db.clone(), chisei_svc.clone());
-        feedback_quality::spawn_feedback_quality(db.clone(), chisei_svc.clone());
     }
 }
 

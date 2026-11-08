@@ -59,49 +59,38 @@ tool-disable or outbound deny only after that Action is decided. A
 marking raise is recorded with `marking_audit=pending` until the lattice
 records it. A `fixed` disposition proposes lifting every active
 mitigation. The certification moves to `cert:security.finding-exposure/v1.5`.
-Combined-mode instances also run a feedback investigation worker (#1231)
-every 15 seconds in every namespace holding the evidence and finding package.
-Enabled object-change bindings of kind `feedback_observation` and type
-`feedback.investigation.dispatch` admit one fenced ActionWork claim per new
-observation. The first pin does not backfill. The worker claims at most one
-investigation at a time, requests bounded analysis through `PlanExecution`
-and `ExecutePlanStream` with no agent tools, and writes investigation,
-hypothesis, and finding objects. Namespace model budgets apply; exhaustion
-records no finding. Inconclusive and malformed results stay `internal` and
-cannot dispatch a GitHub mutation. Combined-mode instances also run a GitHub
-publisher (#1232) on the same 15-second interval. Qualifying findings create
-or update one issue on the configured repository after external-action
-authorization, permit redemption, and execution evidence. The publisher is a
-self-authorizing plane actor (`SEKAI_FEEDBACK_GITHUB_RUN_AS`, default
-`feedback-github`): actor, intended executor, and redeemer are that principal.
-`root` and `local` are refused. Feedback kinds change only through their
-governed Actions. The publisher posts only findings the investigation runtime
-recorded (`recorded_by` is `feedback-investigation`); a namespace writer
-cannot qualify a finding by setting `classification`. The permit binds the repository and the GitHub
-API origin (scheme and host). Publication strips private environment identifiers and private
-repository or issue references. A durable mapping and public-safe marker
-connect each problem signature to its issue; later occurrences update managed
-content and leave maintainer text in place. Lost responses stay pending
-reconciliation and are never retried blindly. Denied, expired, revoked,
-mismatched, or missing permits, missing credentials, disabled issues, and
-rate limits stay visible and retryable. The default cap is five new issues
-per UTC day (`SEKAI_FEEDBACK_GITHUB_DAILY_CAP`). Owner and repository come
-from `SEKAI_FEEDBACK_GITHUB_OWNER` and `SEKAI_FEEDBACK_GITHUB_REPO`; the
-token is `SEKAI_FEEDBACK_GITHUB_TOKEN`. Those bindings and ActionWork claims
-are experimental: community SQLite is the reference store, and community
-PostgreSQL leaves action bindings unavailable (ADR 0090). The GitHub
-publisher does not use action bindings.
-Combined-mode instances also run a feedback quality worker (#1233) on the
-same 15-second interval. Later observations of the same problem class are
-matched to published findings. Comparable success, absent telemetry, expected
-waits, and unrelated workloads stay distinct; recovery and verified
-reproduction are recorded only from measured signals. Quality records
-(`useful`, `duplicate`, `false_positive`, `recurring`, `improved`) live on
-verification objects. Issue closure, learning activation, and detector-policy
-changes stay maintainer-controlled. Promotion into a `feedback-quality-` eval
-suite is explicit (`SEKAI_FEEDBACK_QUALITY_PROMOTE=1` or the Chisei
-`promote_quality_to_eval` path) and is not Gunshi operator-feedback
-promotion.
+The plane runs no feedback workers. Investigation (#1231) and GitHub
+publication (#1232) are reference adapters outside the plane:
+`adapters/feedback_investigation.rs` and `adapters/feedback_github_issues.rs`,
+exercised by `tests/feedback_adapters.rs`.
+The investigator advances an object-change binding of kind
+`feedback_observation` and type `feedback.investigation.dispatch`, then takes
+one fenced ActionWork claim per dispatch. The binding's first run arms it and
+does not backfill. It gathers the same-signature cluster with a
+property-filtered `ListObjects` and requests one bounded analysis per
+(namespace, signature, 24-hour window) through `PlanExecution` and
+`ExecutePlanStream`. Later dispatches in the window reuse the stored analysis.
+It writes investigation, hypothesis, and finding objects through their
+governed Actions as `feedback-investigation`. Namespace model budgets apply;
+exhaustion records nothing and releases the claim. Inconclusive and malformed
+results stay `internal`. The bindings and claim RPCs are experimental
+(`SEKAI_EXPERIMENTAL_RPCS=1`; community PostgreSQL leaves action bindings
+unavailable, ADR 0090).
+The publisher treats the repository as a source writeback target
+(`adapters/source_writeback.rs`). It posts only findings the investigation
+runtime recorded (`recorded_by` is `feedback-investigation`), so a namespace
+writer cannot qualify a finding by setting `classification`. A public marker
+per (namespace, signature) is the writeback key, and the issue's number and
+update time are the record version. A lost create is seen on the next decision,
+so it is never repeated. An unchanged issue needs no permit, and later
+occurrences rewrite only the managed section and keep maintainer text. Only
+issues the executor's account opened are adopted or counted. Public text is an
+allowlist: a signature part appears only as plain identifier text and the
+version only as semver; anything else reads `unspecified`, and model text is
+never published. The executor holds the token. The daily new-issue cap
+defaults to five per UTC day.
+The quality worker (#1233) was removed. Existing `feedback-quality-` eval
+cases stay stored and are still excluded from judge rubrics.
 Neither package
 ships live instances, and neither is a runtime grant.
 

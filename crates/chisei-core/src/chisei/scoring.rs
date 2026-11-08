@@ -28,13 +28,29 @@ use tracing::{error, info, warn};
 use crate::chisei::budget::BudgetTracker;
 use crate::chisei::decision_ledger::{Decision, DecisionFilter};
 use crate::chisei::eval::{self, EvalStore};
-use crate::chisei::feedback_quality_eval::is_generated_quality_case;
 use crate::chisei::gunshi_feedback_eval::{is_feedback_suite_id, is_generated_feedback_case};
 use crate::chisei_store::{
     ChiseiDecisionStore, ChiseiEvalStore, ChiseiObservationStore, ChiseiStore,
 };
 use crate::config::Config;
 use chisei_provider::llm;
+
+/// Labels the retired feedback quality grader (#1233) promoted into
+/// `feedback-quality-` suites. Stored suites may still hold them; they are
+/// generated labels, not rubric criteria.
+fn is_generated_quality_case(case: &eval::Case) -> bool {
+    const LABELS: [&str; 3] = [
+        "feedback_quality",
+        "feedback_match_class",
+        "feedback_verification_result",
+    ];
+    case.id.starts_with("fb-q-")
+        && case
+            .assertions
+            .iter()
+            .map(|assertion| assertion.assert_type.as_str())
+            .eq(LABELS)
+}
 
 /// A sampled execution captured at execute time, carrying enough context to be scored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1216,6 +1232,29 @@ mod tests {
                     assert_type: "status".into(),
                     value: "ok".into(),
                 }],
+            }],
+        })
+        .unwrap();
+        // Stored by the retired quality grader; still generated labels.
+        eval.put_suite(eval::Suite {
+            id: "feedback-quality-acme".into(),
+            name: "quality".into(),
+            description: String::new(),
+            cases: vec![eval::Case {
+                id: "fb-q-find-1-measured".into(),
+                name: "feedback quality find-1".into(),
+                namespace: "acme".into(),
+                spec: String::new(),
+                assertions: [
+                    "feedback_quality",
+                    "feedback_match_class",
+                    "feedback_verification_result",
+                ]
+                .map(|assert_type| eval::Assertion {
+                    assert_type: assert_type.into(),
+                    value: "good".into(),
+                })
+                .to_vec(),
             }],
         })
         .unwrap();

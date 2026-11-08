@@ -105,6 +105,15 @@ suite is maintainer-controlled and is not Gunshi operator-feedback
 promotion. The worker never closes tracker issues, never activates learning,
 and never changes detector policy.
 
+Later, the three Combined-mode workers left the plane, in line with this
+decision's rule that tracker adapters stay outside the package. Investigation and GitHub
+publication are reference adapters under `adapters/` that use public RPCs.
+Investigation claims dispatches through fenced ActionWork and runs one
+analysis per signature window. Publication is a source writeback whose key is
+the public marker, so no external-issue mapping object or pending state
+machine is kept. The quality worker was removed. The plane keeps only the
+types-only package, and the `SEKAI_FEEDBACK_*` variables no longer exist.
+
 ## Validation
 
 Crate tests install the fixtures into an in-memory runtime and cover portable

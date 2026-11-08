@@ -35027,7 +35027,7 @@ async fn feedback_package_objects_refuse_direct_writes() {
                     namespace: "ns".into(),
                     properties: HashMap::from([(
                         crate::sekai::feedback_package::PROPERTY_RECORDED_BY.into(),
-                        crate::sekai::feedback_investigation::RUNTIME_ID.into(),
+                        crate::sekai::feedback_package::INVESTIGATION_RUNTIME.into(),
                     )]),
                     ..Default::default()
                 }),
