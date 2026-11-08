@@ -2900,12 +2900,17 @@ mod tests {
                 })
             })
             .collect();
-        for worker in workers {
-            // A pass that lost a race on the store is retried; the stored
-            // chains below are the outcome either way.
-            if worker.join().unwrap().is_err() {
-                run_reopen_pass(&runtime, NAMESPACE, ACTOR, 9_500).unwrap();
-            }
+        // Join every worker before any retry. Retrying inside the join
+        // loop races a sibling still inside admission and fails with
+        // FailedPrecondition("action instance admission is still in progress").
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        // A pass that lost a race on the store is retried; the stored
+        // chains below are the outcome either way.
+        if results.iter().any(Result::is_err) {
+            run_reopen_pass(&runtime, NAMESPACE, ACTOR, 9_500).unwrap();
         }
         for exposure_id in ["e-1", "e-2"] {
             let head = disposition_chain_head(&runtime, NAMESPACE, exposure_id)
