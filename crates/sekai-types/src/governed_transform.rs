@@ -19,6 +19,7 @@ use crate::transform_sql::{
     BUDGET_MEMORY, BUDGET_TIME, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_TIME_LIMIT_MS,
     compile_steps_sql, host_limit, validate_analytical_sql,
 };
+use crate::work_claim::{ClaimError, ClaimRecord, Fence, Hold, Takeable};
 
 pub const CONTRACT_VERSION: &str = "sekai.governed-transform/v1";
 pub const TRANSFORM_CLASS: &str = "projection";
@@ -1249,13 +1250,107 @@ pub fn normalize_transform_claim_ttl_ms(ttl_ms: i64) -> i64 {
 }
 
 pub fn transform_work_is_claimable(work: &TransformWork, now_ms: i64) -> bool {
-    match work.status.as_str() {
-        TRANSFORM_WORK_PENDING => true,
-        TRANSFORM_WORK_CLAIMED => {
-            work.claim_expires_at_ms <= now_ms && work.lease_expiries < MAX_TRANSFORM_LEASE_EXPIRIES
+    work.claim_record()
+        .is_takeable(work.hold(), MAX_TRANSFORM_LEASE_EXPIRIES, now_ms)
+}
+
+impl TransformWork {
+    /// The work's claim state, for the claim engine (ADR 0149).
+    pub fn claim_record(&self) -> ClaimRecord {
+        ClaimRecord {
+            owner: self.claim_owner.clone(),
+            generation: self.claim_generation,
+            fencing_token: self.fencing_token.clone(),
+            expires_at_ms: self.claim_expires_at_ms,
+            lease_expiries: self.lease_expiries,
         }
-        TRANSFORM_WORK_CANCELLED | TRANSFORM_WORK_COMPLETED | TRANSFORM_WORK_FAILED => false,
-        _ => false,
+    }
+
+    /// Stores `record` back into the work's claim columns.
+    pub fn set_claim_record(&mut self, record: ClaimRecord) {
+        self.claim_owner = record.owner;
+        self.claim_generation = record.generation;
+        self.fencing_token = record.fencing_token;
+        self.claim_expires_at_ms = record.expires_at_ms;
+        self.lease_expiries = record.lease_expiries;
+    }
+
+    /// What the work status means for its claim.
+    pub fn hold(&self) -> Hold {
+        match self.status.as_str() {
+            TRANSFORM_WORK_PENDING => Hold::Open,
+            TRANSFORM_WORK_CLAIMED => Hold::Held,
+            _ => Hold::Closed,
+        }
+    }
+
+    /// The first claim step: counts a lapsed lease into the work. On
+    /// [`ClaimError::LeaseLimit`] the caller fails the run.
+    pub fn count_lapse(&mut self, now_ms: i64) -> Result<Takeable, ClaimError> {
+        let mut record = self.claim_record();
+        let counted = record.count_lapse(self.hold(), MAX_TRANSFORM_LEASE_EXPIRIES, now_ms);
+        self.set_claim_record(record);
+        counted
+    }
+
+    /// The second claim step: claims the work for `runtime_id`.
+    pub fn grant_claim(&mut self, runtime_id: &str, ttl_ms: i64, now_ms: i64) {
+        let mut record = self.claim_record();
+        record.grant(
+            runtime_id,
+            normalize_transform_claim_ttl_ms(ttl_ms),
+            now_ms,
+            |_| uuid::Uuid::new_v4().to_string(),
+        );
+        self.set_claim_record(record);
+        self.status = TRANSFORM_WORK_CLAIMED.into();
+    }
+
+    /// Returns the claimed work to `pending` (see [`ClaimRecord::requeue`]).
+    pub fn requeue_claim(
+        &mut self,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        restore_lease_expiry: bool,
+    ) -> Result<(), ClaimError> {
+        let mut record = self.claim_record();
+        record.requeue(
+            self.hold(),
+            Fence {
+                owner: runtime_id,
+                generation: claim_generation,
+                token: fencing_token,
+            },
+            restore_lease_expiry,
+        )?;
+        self.set_claim_record(record);
+        self.status = TRANSFORM_WORK_PENDING.into();
+        Ok(())
+    }
+
+    /// Extends the live claim named by the fence.
+    pub fn heartbeat_claim(
+        &mut self,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), ClaimError> {
+        let mut record = self.claim_record();
+        record.heartbeat(
+            self.hold(),
+            Fence {
+                owner: runtime_id,
+                generation: claim_generation,
+                token: fencing_token,
+            },
+            normalize_transform_claim_ttl_ms(ttl_ms),
+            now_ms,
+        )?;
+        self.set_claim_record(record);
+        Ok(())
     }
 }
 
@@ -1282,10 +1377,11 @@ fn transform_claim_identity_matches(
     claim_generation: i64,
     fencing_token: &str,
 ) -> bool {
-    work.claim_owner == runtime_id
-        && work.claim_generation == claim_generation
-        && work.fencing_token == fencing_token
-        && !fencing_token.trim().is_empty()
+    work.claim_record().matches(Fence {
+        owner: runtime_id,
+        generation: claim_generation,
+        token: fencing_token,
+    })
 }
 
 pub fn transform_claim_is_current(
@@ -1294,8 +1390,14 @@ pub fn transform_claim_is_current(
     claim_generation: i64,
     fencing_token: &str,
 ) -> bool {
-    work.status == TRANSFORM_WORK_CLAIMED
-        && transform_claim_identity_matches(work, runtime_id, claim_generation, fencing_token)
+    work.claim_record().is_current(
+        work.hold(),
+        Fence {
+            owner: runtime_id,
+            generation: claim_generation,
+            token: fencing_token,
+        },
+    )
 }
 
 pub fn transform_completed_write_matches(
@@ -1315,8 +1417,17 @@ pub fn transform_claim_fence_matches(
     fencing_token: &str,
     now_ms: i64,
 ) -> bool {
-    transform_claim_is_current(work, runtime_id, claim_generation, fencing_token)
-        && work.claim_expires_at_ms > now_ms
+    work.claim_record()
+        .require_live(
+            work.hold(),
+            Fence {
+                owner: runtime_id,
+                generation: claim_generation,
+                token: fencing_token,
+            },
+            now_ms,
+        )
+        .is_ok()
 }
 
 pub fn budget_quarantined_run(

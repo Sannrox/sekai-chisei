@@ -38,3 +38,4 @@ pub mod system_one_bind;
 pub mod transform_replay;
 pub mod transform_shadow;
 pub mod transform_sql;
+pub mod work_claim;

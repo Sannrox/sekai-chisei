@@ -61,7 +61,15 @@ and does not embed credentials or provider routing.
 
 ## Lease rules (v1)
 
+Action work, transform work and agent turns share one claim engine
+(`sekai_types::work_claim`, ADR 0149): claiming, counting a lapsed lease,
+reclaiming under a higher generation, heartbeat and the fence check are the
+same code for every kind and on both stores. Each kind keeps its own row,
+token format and admission rules.
+
 - Only `runtime_dispatch` is claimable.
+- The claim TTL defaults to 60 s and may not exceed 24 h, on SQLite and
+  PostgreSQL alike.
 - Claim is exclusive while the lease is unexpired.
 - On lease expiry, another runtime may reclaim (generation increments).
 - Same `runtime_id` + `request_id` is idempotent while the lease is live.

@@ -2,6 +2,9 @@
 
 use crate::db::postgres::PostgresDb;
 use crate::sekai::action_effect::{
+    AckStep, ClaimStep, normalize_ttl_ms, validate_ack_outcome, validate_claim_request,
+};
+use crate::sekai::action_effect::{
     ActionEffect, EFFECT_STATUS_PENDING, runtime_id_is_blank, validate_no_nul,
 };
 use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
@@ -972,93 +975,23 @@ impl PostgresDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        use crate::sekai::action_effect::{
-            EFFECT_LIFECYCLE_CLAIMED, EFFECT_LIFECYCLE_DEAD_LETTERED, EFFECT_STATUS_CLAIMED,
-            EFFECT_STATUS_DEAD_LETTERED,
-        };
-        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
-        if runtime_id_is_blank(runtime_id) {
-            return Err("runtime_id required".into());
-        }
-        if request_id.trim().is_empty() {
-            return Err("request_id required".into());
-        }
+        let ttl = validate_claim_request(runtime_id, request_id, ttl_ms)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
-        let legacy_replay = effect.claim_expires_at_ms > now_ms
-            && effect.legacy_claim_replay_matches(runtime_id, request_id);
-        if !legacy_replay {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("request_id", request_id)?;
-        }
-        if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
-            return Err("only runtime_dispatch effects are claimable".into());
-        }
-        if effect.status == EFFECT_STATUS_CLAIMED
-            && effect.claim_owner == runtime_id
-            && effect.claim_request_id == request_id
-            && effect.claim_expires_at_ms > now_ms
-        {
-            return Ok(effect);
-        }
-        if !effect.is_claimable_at(now_ms) {
-            if effect.status == EFFECT_STATUS_CLAIMED && effect.claim_expires_at_ms > now_ms {
-                return Err(format!("effect already claimed by {}", effect.claim_owner));
-            }
-            return Err(format!("effect not claimable in status {}", effect.status));
-        }
-        if effect.status == EFFECT_STATUS_CLAIMED && effect.claim_expires_at_ms <= now_ms {
-            effect.lease_expiry_count = effect.lease_expiry_count.saturating_add(1);
-            if effect.max_lease_expiries > 0
-                && effect.lease_expiry_count >= effect.max_lease_expiries
-            {
-                effect.status = EFFECT_STATUS_DEAD_LETTERED.into();
-                effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
-                effect.failure_reason = "lease_expiry_limit_exceeded".into();
-                effect.updated_at_ms = now_ms;
+        match effect.take_claim(runtime_id, request_id, principal, ttl, now_ms)? {
+            ClaimStep::Replay => Ok(effect),
+            ClaimStep::Granted => {
                 pg_update_effect(&mut tx, &effect)?;
                 tx.commit().map_err(|error| error.to_string())?;
-                return Err("lease expiry retry limit exceeded; effect dead-lettered".into());
+                Ok(effect)
+            }
+            ClaimStep::DeadLettered(message) => {
+                pg_update_effect(&mut tx, &effect)?;
+                tx.commit().map_err(|error| error.to_string())?;
+                Err(message)
             }
         }
-        if effect.max_claim_attempts > 0 && effect.claim_attempt_count >= effect.max_claim_attempts
-        {
-            effect.status = EFFECT_STATUS_DEAD_LETTERED.into();
-            effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
-            effect.failure_reason = "claim_attempt_limit_exceeded".into();
-            effect.updated_at_ms = now_ms;
-            pg_update_effect(&mut tx, &effect)?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Err("claim retry limit exceeded; effect dead-lettered".into());
-        }
-        let generation = effect.claim_generation.saturating_add(1).max(1);
-        let ttl = if ttl_ms <= 0 { 60_000 } else { ttl_ms };
-        if ttl > 24 * 60 * 60 * 1_000 {
-            return Err("ttl_ms exceeds max".into());
-        }
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(effect_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(generation.to_string().as_bytes());
-        hasher.update(b":");
-        hasher.update(runtime_id.as_bytes());
-        let token = format!("fx-{:x}", hasher.finalize());
-        effect.status = EFFECT_STATUS_CLAIMED.into();
-        effect.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
-        effect.claim_attempt_count = effect.claim_attempt_count.saturating_add(1);
-        effect.claim_owner = runtime_id.into();
-        effect.claim_generation = generation;
-        effect.claim_fencing_token = token;
-        effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
-        effect.claim_request_id = request_id.into();
-        effect.claim_principal = principal.into();
-        effect.updated_at_ms = now_ms;
-        effect.failure_reason.clear();
-        pg_update_effect(&mut tx, &effect)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(effect)
     }
 
     pub fn heartbeat_action_claim(
@@ -1070,20 +1003,11 @@ impl PostgresDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        let ttl = if ttl_ms <= 0 { 60_000 } else { ttl_ms };
-        if ttl > 24 * 60 * 60 * 1_000 {
-            return Err("ttl_ms exceeds max".into());
-        }
+        let ttl = normalize_ttl_ms(ttl_ms)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
-        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("fencing_token", fencing_token_in)?;
-        }
-        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
-        effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
-        effect.updated_at_ms = now_ms;
+        effect.heartbeat_claim(runtime_id, generation, fencing_token_in, ttl, now_ms)?;
         pg_update_effect(&mut tx, &effect)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(effect)
@@ -1100,51 +1024,22 @@ impl PostgresDb {
         reason: &str,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        use crate::sekai::action_effect::{
-            ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, EFFECT_LIFECYCLE_AWAITING_CONTINUATION,
-            EFFECT_LIFECYCLE_COMPLETED, EFFECT_LIFECYCLE_FAILED, EFFECT_STATUS_COMPLETED,
-            EFFECT_STATUS_FAILED, EFFECT_STATUS_PARKED,
-        };
-        use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
-        validate_no_nul("reason", reason)?;
-        let status = match outcome {
-            ACK_OUTCOME_COMPLETED => EFFECT_STATUS_COMPLETED,
-            ACK_OUTCOME_FAILED => EFFECT_STATUS_FAILED,
-            other => {
-                return Err(format!(
-                    "invalid ack outcome {other:?}; parked requires park_action_work"
-                ));
-            }
-        };
+        validate_ack_outcome(outcome, reason)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
-        if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
-            return Err("only runtime_dispatch effects support ack".into());
+        if effect.ack_claim(
+            runtime_id,
+            generation,
+            fencing_token_in,
+            outcome,
+            reason,
+            now_ms,
+        )? == AckStep::Apply
+        {
+            pg_update_effect(&mut tx, &effect)?;
+            tx.commit().map_err(|error| error.to_string())?;
         }
-        let legacy_ack_replay = effect.legacy_claim_fence_matches(runtime_id, fencing_token_in)
-            || (effect.status == status
-                && effect.legacy_claim_terminal_replay_matches(runtime_id, fencing_token_in));
-        if !legacy_ack_replay {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("fencing_token", fencing_token_in)?;
-        }
-        if effect.status == status {
-            return Ok(effect);
-        }
-        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
-        effect.status = status.into();
-        effect.lifecycle_state = match status {
-            EFFECT_STATUS_COMPLETED => EFFECT_LIFECYCLE_COMPLETED,
-            EFFECT_STATUS_FAILED => EFFECT_LIFECYCLE_FAILED,
-            EFFECT_STATUS_PARKED => EFFECT_LIFECYCLE_AWAITING_CONTINUATION,
-            _ => status,
-        }
-        .into();
-        effect.failure_reason = reason.to_string();
-        effect.updated_at_ms = now_ms;
-        pg_update_effect(&mut tx, &effect)?;
-        tx.commit().map_err(|error| error.to_string())?;
         Ok(effect)
     }
 }
