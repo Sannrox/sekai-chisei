@@ -12,15 +12,15 @@ use crate::sekai::definition_branch::{
 };
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
-    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput,
-    ProposeDefinitionImport, ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
-    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
-    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
-    list_published_definition_history, merge_receipt_id, object_property_keys,
-    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
-    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
-    rollback_member_edits,
+    DefinitionMergePath, DefinitionProposal, DefinitionProposalApproval,
+    DefinitionProposalMergeResult, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
+    PreparedProposalDigestInput, ProposeDefinitionImport, ProposeDefinitionRollback,
+    PublishedDefinitionHistoryStore, PublishedDefinitionRevisionHistoryEntry, ReplacementProposal,
+    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, dataset_column_names,
+    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
+    object_property_keys, proposal_content_digest, reject_foreign_member_grants,
+    require_descendant_candidate, require_rollback_migration_plan,
+    rollback_may_drop_live_object_type_properties, rollback_member_edits,
 };
 
 impl PostgresDb {
@@ -701,9 +701,22 @@ impl PostgresDb {
         Ok(result)
     }
 
+    /// Merges a proposal on the direct path, as `MergeDefinitionProposal` does.
     pub fn merge_definition_proposal(
         &self,
         request: &MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        self.merge_definition_proposal_via(request, DefinitionMergePath::Direct, actor, now_ms)
+    }
+
+    /// Merges a proposal for `path`: only `BundleApply` publishes a
+    /// change-bundle proposal (`DefinitionProposal::require_merge_path`).
+    pub fn merge_definition_proposal_via(
+        &self,
+        request: &MergeDefinitionProposal,
+        path: DefinitionMergePath,
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
@@ -752,6 +765,7 @@ impl PostgresDb {
                     "definition_proposal_not_found: proposal is unavailable".to_string()
                 })?;
         proposal.require_open()?;
+        proposal.require_merge_path(path)?;
         if proposal.approvals.is_empty() {
             return Err(
                 "definition_proposal_missing_approval: merge requires a live approval".into(),

@@ -121,6 +121,21 @@ pub const MERGE_DATASOURCE_CHANGED: &str = "definition_bundle_apply_datasource_c
 /// Merge refusal: a dataset a change bundle migrated was written since.
 pub const MERGE_DATASET_MOVED: &str = "definition_bundle_apply_data_moved";
 
+/// Merge refusal: a change-bundle proposal publishes only through
+/// `ApplyDefinitionChangeBundle`, which migrates its data first.
+pub const MERGE_REQUIRES_BUNDLE_APPLY: &str = "definition_proposal_requires_bundle_apply";
+
+/// Who asks a store to merge a definition proposal. Internal to the server:
+/// no request field selects it, so a client can only merge `Direct`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionMergePath {
+    /// `MergeDefinitionProposal` and every other caller.
+    Direct,
+    /// The publish step of `ApplyDefinitionChangeBundle`.
+    BundleApply,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseDefinitionProposal {
     pub namespace: String,
@@ -668,6 +683,20 @@ impl DefinitionProposal {
     pub fn require_open(&self) -> Result<(), String> {
         if self.status != STATUS_OPEN {
             return Err("definition_proposal_not_open: proposal cannot accept this write".into());
+        }
+        Ok(())
+    }
+
+    /// Refuses a direct merge of a proposal created for a change bundle
+    /// (#1693): only bundle apply migrates its data before the publish. A
+    /// rollback's `migration_plan_digest` pins a plan, not a bundle, and
+    /// merges directly; so does a proposal without one.
+    pub fn require_merge_path(&self, path: DefinitionMergePath) -> Result<(), String> {
+        let bundle = self.restored_from_digest.is_empty() && !self.migration_plan_digest.is_empty();
+        if bundle && path != DefinitionMergePath::BundleApply {
+            return Err(format!(
+                "{MERGE_REQUIRES_BUNDLE_APPLY}: publish this proposal with ApplyDefinitionChangeBundle"
+            ));
         }
         Ok(())
     }

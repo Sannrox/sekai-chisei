@@ -123,6 +123,12 @@ regenerated from the proposal's pinned base and candidate with the request's
 the approved renames or defaults. A bundle with manual migration steps is
 refused.
 
+Apply is the only way to publish such a proposal: `MergeDefinitionProposal`
+refuses one whose `migration_plan_digest` names a change bundle with
+`FAILED_PRECONDITION` (`definition_proposal_requires_bundle_apply`), on both
+stores, so a hand merge cannot skip the data migration. A rollback's
+`migration_plan_digest` names a plan, not a bundle, and still merges by hand.
+
 Apply keeps a durable record (`sekai.definition-bundle-apply/v1`, one per
 proposal) of ordered steps:
 
@@ -152,8 +158,9 @@ proposal) of ordered steps:
    column definitions it reads under its dataset lock, so a source
    reclassified since a dry run never reaches live data under a new name.
 2. `publish` merges the definition proposal, last, with an idempotency key
-   derived from the record. A proposal already merged (by an earlier
-   attempt or by hand) completes the step. Every merged dataset must still
+   derived from the record. A proposal already merged by an earlier attempt
+   (or by hand before direct merges were refused) completes the step. Every
+   merged dataset must still
    be at the version its merge wrote, checked in the publish transaction
    itself (under the store's write lock on SQLite, each dataset's rows lock
    on PostgreSQL): a dataset written since fails the step

@@ -437,8 +437,12 @@ impl<T: 'static> StepContext<'_, T> {
                     expected_datasources: datasources,
                 };
                 request.request_digest().map_err(Status::invalid_argument)?;
-                let result = match db.merge_definition_proposal(&request, self.actor, now_millis())
-                {
+                let result = match db.merge_definition_proposal_via(
+                    &request,
+                    crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
+                    self.actor,
+                    now_millis(),
+                ) {
                     Ok(result) => result,
                     Err(error)
                         if error.starts_with(

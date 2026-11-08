@@ -31700,7 +31700,7 @@ async fn a_source_reclassified_after_the_dry_run_never_merges_its_copy() {
 }
 
 #[tokio::test]
-async fn an_apply_finishes_when_its_proposal_was_merged_meanwhile() {
+async fn a_direct_merge_of_a_bundle_proposal_is_refused() {
     let svc = service();
     let request =
         bundle_apply_fixture(&svc, "apply-takeover", &["id", "title", "state"], true).await;
@@ -31708,23 +31708,60 @@ async fn an_apply_finishes_when_its_proposal_was_merged_meanwhile() {
     let mut stale = request.clone();
     stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
     assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
-    // Someone merges the proposal before the apply runs again.
-    svc.merge_definition_proposal(with_named_principal(
-        MergeDefinitionProposalRequest {
-            namespace: "apply-takeover".into(),
-            proposal_id: "ap-cs-2".into(),
-            expected_published_digest: from.clone(),
-            idempotency_key: "manual-merge".into(),
-        },
-        "root",
-    ))
-    .await
-    .unwrap();
+    // A hand merge would publish without the migrated data.
+    let status = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: "apply-takeover".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: from.clone(),
+                idempotency_key: "manual-merge".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .starts_with(crate::sekai::definition_proposal::MERGE_REQUIRES_BUNDLE_APPLY),
+        "{status:?}"
+    );
+    assert_eq!(published_digest(&svc, "apply-takeover").await, from);
+}
+
+#[tokio::test]
+async fn an_apply_finishes_when_an_earlier_attempt_published() {
+    let svc = service();
+    let request =
+        bundle_apply_fixture(&svc, "apply-published", &["id", "title", "state"], true).await;
+    let from = request.expected_published_digest.clone();
+    let mut stale = request.clone();
+    stale.expected_published_digest = format!("sha256:{}", "0".repeat(64));
+    assert_eq!(apply_bundle(&svc, &stale).await.failed_step, "publish");
+    // An earlier attempt published, then crashed before recording the step.
+    svc.db
+        .runtime()
+        .merge_definition_proposal_via(
+            &crate::sekai::definition_proposal::MergeDefinitionProposal {
+                namespace: "apply-published".into(),
+                proposal_id: "ap-cs-2".into(),
+                expected_published_digest: from,
+                idempotency_key: "crashed-publish".into(),
+                expected_dataset_versions: Vec::new(),
+                expected_datasources: Vec::new(),
+            },
+            crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
+            "root",
+            now_millis(),
+        )
+        .unwrap();
     let done = apply_bundle(&svc, &stale).await;
     assert_eq!(done.status, "completed", "{done:?}");
     assert_eq!(
         done.steps[3].detail,
-        published_digest(&svc, "apply-takeover").await
+        published_digest(&svc, "apply-published").await
     );
 }
 
@@ -31858,12 +31895,13 @@ async fn rows_written_between_merge_and_publish_are_backfilled_before_publishing
 
 #[tokio::test]
 async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
+    // The publish step merges through the bundle path; a direct merge is refused first.
     let svc = service();
     let request = bundle_apply_fixture(&svc, "apply-fence", &["id", "title", "state"], true).await;
     let refused = svc
         .db
         .runtime()
-        .merge_definition_proposal(
+        .merge_definition_proposal_via(
             &definition_proposal_domain::MergeDefinitionProposal {
                 namespace: "apply-fence".into(),
                 proposal_id: "ap-cs-2".into(),
@@ -31872,6 +31910,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
                 expected_dataset_versions: vec![("tickets".into(), "not-the-latest".into())],
                 expected_datasources: Vec::new(),
             },
+            crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
             "root",
             1,
         )
@@ -31888,7 +31927,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
     let reconfigured = svc
         .db
         .runtime()
-        .merge_definition_proposal(
+        .merge_definition_proposal_via(
             &definition_proposal_domain::MergeDefinitionProposal {
                 namespace: "apply-fence".into(),
                 proposal_id: "ap-cs-2".into(),
@@ -31897,6 +31936,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
                 expected_dataset_versions: vec![("tickets".into(), latest)],
                 expected_datasources: vec![("Ticket".into(), "not-this-mapping".into())],
             },
+            crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
             "root",
             1,
         )

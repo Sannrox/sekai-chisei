@@ -1024,6 +1024,7 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
     // Names only blocking bindings, which consumers disclosed by opting in.
     if error.starts_with("definition_publish_blocked")
         || error.starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW)
+        || error.starts_with(crate::sekai::definition_proposal::MERGE_REQUIRES_BUNDLE_APPLY)
     {
         return Status::failed_precondition(error);
     }
