@@ -445,21 +445,20 @@ fn public_token(text: &str) -> &str {
     if plain { text } else { UNSPECIFIED }
 }
 
-/// `MAJOR.MINOR.PATCH` with an optional `-pre` or `+build` suffix.
+/// `MAJOR.MINOR.PATCH`, optionally `-alpha`, `-beta` or `-rc` with a number.
+/// Free-form pre-release and build suffixes can carry hosts or names.
 fn public_version(raw: &str) -> Option<&str> {
     let version = raw.trim();
-    let core = version.split(['-', '+']).next().unwrap_or_default();
-    let suffix = &version[core.len()..];
-    let parts: Vec<_> = core.split('.').collect();
-    (version.len() <= 32
-        && parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-        && suffix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')))
-    .then_some(version)
+    let (core, pre) = version.split_once('-').unwrap_or((version, ""));
+    let numeric = |part: &str| {
+        !part.is_empty() && part.len() <= 9 && part.chars().all(|c| c.is_ascii_digit())
+    };
+    let core_ok = core.split('.').count() == 3 && core.split('.').all(numeric);
+    let pre_ok = pre.is_empty() || {
+        let (label, number) = pre.split_once('.').unwrap_or((pre, "1"));
+        matches!(label, "alpha" | "beta" | "rc") && numeric(number)
+    };
+    (core_ok && pre_ok).then_some(version)
 }
 
 fn public_title(operation: &str, reason: &str) -> String {

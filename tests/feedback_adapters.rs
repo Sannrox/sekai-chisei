@@ -994,9 +994,13 @@ fn only_plain_identifiers_and_semver_are_published() {
     assert_eq!(plain.title, "feedback: api tenkai_failed");
     let mut observation = sekai_chisei::grpc::pb::sekai::Object::default();
     for (version, published) in [
+        ("0.7.1", true),
         ("0.7.1-rc.1", true),
         ("10.1.2.3", false),
         ("ops.host", false),
+        ("1.0.0-db01.tenant.example", false),
+        ("0.7.1+ops-alice", false),
+        ("1.2.3-10.0.0.12", false),
     ] {
         observation
             .properties

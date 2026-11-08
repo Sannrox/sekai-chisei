@@ -929,8 +929,6 @@ fn bucket_key(request: &AnalysisRequest) -> String {
     format!("{:x}", Sha256::digest(material.as_bytes()))[..16].to_string()
 }
 
-/// The analysis an earlier dispatch in this bucket stored. Unreadable
-/// outcomes stay internal rather than re-running the model.
 /// What every record in one bucket derives from: the first analysis and the
 /// observation that triggered it.
 struct BucketAnchor {
@@ -939,6 +937,8 @@ struct BucketAnchor {
 }
 
 impl BucketAnchor {
+    /// The analysis an earlier dispatch in this bucket stored. Unreadable
+    /// outcomes stay internal rather than re-running the model.
     fn from_stored(investigation: &Object, cluster: &ObservationCluster) -> Self {
         let property = |key: &str| investigation.properties.get(key);
         Self {
