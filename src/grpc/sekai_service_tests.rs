@@ -31895,12 +31895,13 @@ async fn rows_written_between_merge_and_publish_are_backfilled_before_publishing
 
 #[tokio::test]
 async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
+    // The publish step merges through the bundle path; a direct merge is refused first.
     let svc = service();
     let request = bundle_apply_fixture(&svc, "apply-fence", &["id", "title", "state"], true).await;
     let refused = svc
         .db
         .runtime()
-        .merge_definition_proposal(
+        .merge_definition_proposal_via(
             &definition_proposal_domain::MergeDefinitionProposal {
                 namespace: "apply-fence".into(),
                 proposal_id: "ap-cs-2".into(),
@@ -31909,6 +31910,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
                 expected_dataset_versions: vec![("tickets".into(), "not-the-latest".into())],
                 expected_datasources: Vec::new(),
             },
+            crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
             "root",
             1,
         )
@@ -31925,7 +31927,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
     let reconfigured = svc
         .db
         .runtime()
-        .merge_definition_proposal(
+        .merge_definition_proposal_via(
             &definition_proposal_domain::MergeDefinitionProposal {
                 namespace: "apply-fence".into(),
                 proposal_id: "ap-cs-2".into(),
@@ -31934,6 +31936,7 @@ async fn the_publish_refuses_a_dataset_moved_since_its_migration() {
                 expected_dataset_versions: vec![("tickets".into(), latest)],
                 expected_datasources: vec![("Ticket".into(), "not-this-mapping".into())],
             },
+            crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
             "root",
             1,
         )
