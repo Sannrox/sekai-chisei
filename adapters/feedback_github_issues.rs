@@ -429,10 +429,22 @@ pub fn new_issues_today(issues: &[GitHubIssue], now_ms: i64) -> u32 {
         .count() as u32
 }
 
+/// One signature part as plain identifier text. Anything else (markup,
+/// comment delimiters, `@` mentions) becomes `_`, so producer text cannot
+/// format the issue, end the managed section, or notify anyone.
 fn public_token(text: &str) -> String {
     match text.trim() {
         "" | "[redacted]" => "unspecified".into(),
-        trimmed => trimmed.to_string(),
+        trimmed => trimmed
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
     }
 }
 

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use feedback_github_issues::{
     ABSENT, GitHubIssue, GitHubIssues, IssuePublisher, IssueTracker, Publish, draft,
-    sanitize_public_text,
+    maintainer_text, sanitize_public_text,
 };
 use feedback_investigation::{
     AnalysisError, AnalysisRequest, Attribution, FeedbackAnalyzer, FilingDecision,
@@ -43,6 +43,7 @@ use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::sekai::action_binding::{
     ACTION_BINDING_CONTRACT, ActionBinding, ParameterSource,
 };
+use sekai_chisei::sekai::action_effect::EFFECT_STATUS_CLAIMED;
 use sekai_chisei::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionRequest,
 };
@@ -56,8 +57,8 @@ use sekai_chisei::sekai::evidence_store::{EvidenceProducerCapability, canonical_
 use sekai_chisei::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE;
 use sekai_chisei::sekai::feedback_package::{
     ACTION_DISPATCH, ACTION_OBSERVATION, EVIDENCE_SCHEMA_VERSION, EVIDENCE_TYPE,
-    INVESTIGATION_RUNTIME, KIND_FINDING, KIND_HYPOTHESIS, KIND_OBSERVATION, PACKAGE_VERSION,
-    install,
+    INVESTIGATION_RUNTIME, KIND_FINDING, KIND_HYPOTHESIS, KIND_INVESTIGATION_RESULT,
+    KIND_OBSERVATION, PACKAGE_VERSION, install,
 };
 use sekai_chisei::sekai::object_change_subscription::OP_CREATE;
 use sekai_chisei::sekai::security::Role;
@@ -238,7 +239,7 @@ fn observe(db: &RuntimeDb, id: &str, occurrence: &str, classification: &str) {
 
 /// Returns a fixed analysis and counts how often the model would be called.
 struct Scripted {
-    analysis: Result<InvestigationAnalysis, ()>,
+    analysis: Result<InvestigationAnalysis, fn() -> AnalysisError>,
     calls: Cell<usize>,
 }
 
@@ -259,9 +260,9 @@ impl Scripted {
         }
     }
 
-    fn out_of_budget() -> Self {
+    fn failing(error: fn() -> AnalysisError) -> Self {
         Self {
-            analysis: Err(()),
+            analysis: Err(error),
             calls: Cell::new(0),
         }
     }
@@ -270,9 +271,7 @@ impl Scripted {
 impl FeedbackAnalyzer for Scripted {
     async fn analyze(&self, _: &AnalysisRequest) -> Result<InvestigationAnalysis, AnalysisError> {
         self.calls.set(self.calls.get() + 1);
-        self.analysis
-            .clone()
-            .map_err(|()| AnalysisError::BudgetExhausted)
+        self.analysis.clone().map_err(|error| error())
     }
 }
 
@@ -386,38 +385,8 @@ async fn application_failures_never_qualify() {
     assert_eq!(reports.last().unwrap().filing, FilingDecision::Internal);
 }
 
-#[tokio::test]
-async fn budget_refusal_writes_nothing_and_releases_the_dispatch() {
-    let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
-    let runtime = investigator();
-    runtime.run_binding(&plane.sekai).await.unwrap();
-    let analyzer = Scripted::out_of_budget();
-    let report = runtime
-        .run_once(&plane.sekai, &analyzer, now_ms())
-        .await
-        .unwrap();
-    assert!(report.is_none());
-    assert_eq!(analyzer.calls.get(), 1);
-    let findings = plane
-        .db
-        .list_all_objects(&sekai_chisei::domain::ListFilter {
-            kind: Some(KIND_FINDING.into()),
-            namespace: Some(NAMESPACE.into()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(findings.is_empty());
-}
-
-#[tokio::test]
-async fn two_processes_never_share_a_live_claim() {
-    let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
-    let (first, second) = (investigator(), investigator());
-    first.run_binding(&plane.sekai).await.unwrap();
-    // Both list the dispatch before either claims it.
-    let listed = plane
+async fn claimable(plane: &Plane) -> Vec<sekai_chisei::grpc::pb::sekai::ActionEffect> {
+    plane
         .sekai
         .list_claimable_action_work(with_principal(
             ListClaimableActionWorkRequest {
@@ -430,7 +399,56 @@ async fn two_processes_never_share_a_live_claim() {
         .await
         .unwrap()
         .into_inner()
-        .effects;
+        .effects
+}
+
+#[tokio::test]
+async fn budget_and_outages_write_nothing_and_leave_the_dispatch_for_retry() {
+    let refusals: [fn() -> AnalysisError; 2] = [
+        || AnalysisError::BudgetExhausted,
+        || AnalysisError::Unavailable("planner unreachable".into()),
+    ];
+    for refusal in refusals {
+        let plane = armed_plane().await;
+        observe(&plane.db, "o-1", "op-1", "defect");
+        let runtime = investigator();
+        runtime.run_binding(&plane.sekai).await.unwrap();
+        let dispatch = claimable(&plane).await.remove(0).effect_id;
+        let analyzer = Scripted::failing(refusal);
+        assert!(
+            runtime
+                .run_once(&plane.sekai, &analyzer, now_ms())
+                .await
+                .is_err()
+        );
+        assert_eq!(analyzer.calls.get(), 1);
+        for kind in [KIND_INVESTIGATION_RESULT, KIND_FINDING] {
+            let written = plane
+                .db
+                .list_all_objects(&sekai_chisei::domain::ListFilter {
+                    kind: Some(kind.into()),
+                    namespace: Some(NAMESPACE.into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(written.is_empty(), "no {kind} anchors the bucket");
+        }
+        let effect = plane.db.get_action_effect(&dispatch).unwrap().unwrap();
+        assert_eq!(
+            effect.status, EFFECT_STATUS_CLAIMED,
+            "unacked, so it is offered again when the lease expires"
+        );
+    }
+}
+
+#[tokio::test]
+async fn two_processes_never_share_a_live_claim() {
+    let plane = armed_plane().await;
+    observe(&plane.db, "o-1", "op-1", "defect");
+    let (first, second) = (investigator(), investigator());
+    first.run_binding(&plane.sekai).await.unwrap();
+    // Both list the dispatch before either claims it.
+    let listed = claimable(&plane).await;
     assert!(first.claim(&plane.sekai).await.unwrap().is_some());
     let late = plane
         .sekai
@@ -456,22 +474,9 @@ async fn a_crashed_claim_is_taken_over_without_duplicate_records() {
     let runtime = investigator();
     runtime.run_binding(&plane.sekai).await.unwrap();
     // A runtime claims every dispatch with a short lease, then dies.
-    let claimable = plane
-        .sekai
-        .list_claimable_action_work(with_principal(
-            ListClaimableActionWorkRequest {
-                namespace: NAMESPACE.into(),
-                runtime_id: INVESTIGATION_RUNTIME.into(),
-                limit: 16,
-            },
-            INVESTIGATION_RUNTIME,
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .effects;
-    assert_eq!(claimable.len(), 3);
-    for effect in &claimable {
+    let pending = claimable(&plane).await;
+    assert_eq!(pending.len(), 3);
+    for effect in &pending {
         plane
             .sekai
             .claim_action_work(with_principal(
@@ -901,6 +906,27 @@ fn public_text_never_carries_private_identifiers() {
     }
     let own = sanitize_public_text("see github.com/tenkai-org/tenkai#1", REPOSITORY);
     assert!(own.contains("github.com/tenkai-org/tenkai#1"), "{own}");
+}
+
+#[test]
+fn signature_text_cannot_format_ping_or_end_the_managed_section() {
+    let issue = draft(
+        NAMESPACE,
+        "api @acme/oncall:<!--/sekai-feedback--> **x**",
+        None,
+        false,
+        &[],
+        REPOSITORY,
+    );
+    for needle in ["@", "<!--/", "**"] {
+        assert!(!issue.title.contains(needle), "{}", issue.title);
+    }
+    let body = issue
+        .managed_body
+        .replacen("<!-- /sekai-feedback -->", "", 1);
+    assert!(!body.contains("sekai-feedback-->"), "{body}");
+    assert!(!body.contains('@'), "{body}");
+    assert_eq!(maintainer_text(&issue.managed_body), "");
 }
 
 fn fixture_config() -> Config {

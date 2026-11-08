@@ -460,6 +460,9 @@ impl Investigator {
     }
 
     /// Claim and investigate one dispatch. `Ok(None)` when nothing is claimable.
+    /// A transient failure (budget, model, or plane unavailable) leaves the
+    /// claim unacked: it expires and the plane offers the dispatch again,
+    /// dead-lettering it after its lease-expiry limit.
     pub async fn run_once<A: FeedbackAnalyzer>(
         &self,
         sekai: &SekaiServiceImpl,
@@ -478,14 +481,13 @@ impl Investigator {
                 Ok(Some(report))
             }
             Err(Investigation::BudgetExhausted) => {
-                self.ack(sekai, &effect, ACK_FAILED, "budget_exhausted")
-                    .await?;
-                Ok(None)
+                Err("model budget exhausted; the dispatch retries after its claim expires".into())
             }
-            Err(Investigation::Failed(error)) => {
+            Err(Investigation::Failed(error)) => Err(error),
+            Err(Investigation::Invalid(error)) => {
                 // The claim expires and another runtime retries if this ack is lost.
                 let _ = self
-                    .ack(sekai, &effect, ACK_FAILED, "investigation_failed")
+                    .ack(sekai, &effect, ACK_FAILED, "invalid_dispatch")
                     .await;
                 Err(error)
             }
@@ -614,8 +616,9 @@ impl Investigator {
                     Err(AnalysisError::Malformed(_)) => {
                         InvestigationAnalysis::empty(Attribution::Malformed)
                     }
-                    Err(AnalysisError::Unavailable(_)) => {
-                        InvestigationAnalysis::empty(Attribution::Inconclusive)
+                    // Never anchor an outage: it would hold the bucket all window.
+                    Err(AnalysisError::Unavailable(error)) => {
+                        return Err(Investigation::Failed(error));
                     }
                 };
                 let anchor = BucketAnchor {
@@ -660,7 +663,7 @@ impl Investigator {
             .as_ref()
             .and_then(observation_view)
             .ok_or_else(|| {
-                Investigation::Failed(format!(
+                Investigation::Invalid(format!(
                     "{observation_id} is not a visible observation in {}",
                     self.namespace
                 ))
@@ -889,8 +892,12 @@ impl Investigator {
 }
 
 enum Investigation {
+    /// Transient: retried when the claim expires.
     BudgetExhausted,
+    /// Transient: retried when the claim expires.
     Failed(String),
+    /// The dispatch can never succeed; acked as failed.
+    Invalid(String),
 }
 
 /// (namespace, signature, window bucket), so one recurring problem costs one
