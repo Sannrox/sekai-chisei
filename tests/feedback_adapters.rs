@@ -564,6 +564,7 @@ fn the_prompt_is_sent_once_and_bounded() {
         signature: SIGNATURE.into(),
         distinct_operations: observations.len(),
         observations,
+        window: 7,
     };
     let input = analysis_input(&request, INVESTIGATION_RUNTIME);
     assert!(input.messages.is_empty(), "spec only, never both");
@@ -574,6 +575,15 @@ fn the_prompt_is_sent_once_and_bounded() {
             .contains(&format!("o-{}", PROMPT_OBSERVATION_CAP * 4 - 1))
     );
     assert!(input.estimated_tokens > 1_024);
+    let next_window = AnalysisRequest {
+        window: 8,
+        ..request.clone()
+    };
+    assert_ne!(
+        analysis_input(&next_window, INVESTIGATION_RUNTIME).request_id,
+        input.request_id,
+        "each window keeps its own planner records"
+    );
 }
 
 // ---- GitHub publication ----

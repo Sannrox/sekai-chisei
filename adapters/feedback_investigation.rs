@@ -146,6 +146,8 @@ pub struct AnalysisRequest {
     pub signature: String,
     pub observations: Vec<ObservationView>,
     pub distinct_operations: usize,
+    /// Recurrence window index: dispatch time divided by [`RECURRENCE_WINDOW_MS`].
+    pub window: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,7 +328,7 @@ pub fn analysis_prompt(request: &AnalysisRequest) -> String {
 pub fn analysis_input(request: &AnalysisRequest, principal: &str) -> ExecutionInput {
     let spec = analysis_prompt(request);
     ExecutionInput {
-        request_id: format!("feedback-inv-{}", bucket_key(request, 0)),
+        request_id: format!("feedback-inv-{}", bucket_key(request)),
         namespace: request.namespace.clone(),
         estimated_tokens: estimated_tokens(&spec),
         spec,
@@ -608,8 +610,9 @@ impl Investigator {
             signature: cluster.signature.clone(),
             observations: cluster.observations.clone(),
             distinct_operations: cluster.distinct_operations.len(),
+            window: now_ms.div_euclid(RECURRENCE_WINDOW_MS),
         };
-        let key = bucket_key(&request, now_ms);
+        let key = bucket_key(&request);
         let investigation_id = format!("fb-inv-{key}");
         let (anchor, analyzed) = match self.get(sekai, &investigation_id).await? {
             Some(stored) => (BucketAnchor::from_stored(&stored, &cluster), false),
@@ -911,12 +914,12 @@ enum Investigation {
 
 /// (namespace, signature, window bucket), so one recurring problem costs one
 /// model call per window however many observations arrive.
-fn bucket_key(request: &AnalysisRequest, now_ms: i64) -> String {
+/// The planner request id carries it too, so each window's analysis keeps
+/// its own planner and audit records.
+fn bucket_key(request: &AnalysisRequest) -> String {
     let material = format!(
         "{}\0{}\0{}",
-        request.namespace,
-        request.signature,
-        now_ms.div_euclid(RECURRENCE_WINDOW_MS)
+        request.namespace, request.signature, request.window
     );
     format!("{:x}", Sha256::digest(material.as_bytes()))[..16].to_string()
 }
