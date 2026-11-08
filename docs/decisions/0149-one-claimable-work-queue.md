@@ -1,6 +1,6 @@
 # ADR 0149: One claimable work queue, with typed kinds
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-08
 - Owners: @Sannrox
 - Discussion: none

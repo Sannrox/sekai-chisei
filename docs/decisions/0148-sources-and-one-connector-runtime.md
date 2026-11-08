@@ -1,6 +1,6 @@
 # ADR 0148: Sources are first-class; one connector runtime runs source integrations
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-08
 - Owners: @Sannrox
 - Discussion: none
