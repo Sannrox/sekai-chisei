@@ -19,6 +19,13 @@ pub const EVALUATE_SOURCE_SQL_PROJECTION: &str = "sql_projection";
 pub const EVALUATE_SOURCE_OBJECT_LOG: &str = "object_log";
 /// `EvaluateObjectSetResponse.source` when this replica cannot name a source (#2051).
 pub const EVALUATE_SOURCE_UNKNOWN: &str = "unknown";
+/// Receipt `operation_class` for one EvaluateObjectSet call (#2151).
+pub const QUERY_RECEIPT_CLASS: &str = "object_set_query";
+/// Outcome event attribute holding the JSON [`ObjectSetQueryRecord`].
+pub const QUERY_RECORD_ATTR: &str = "query_record";
+pub const OUTCOME_OK: &str = "ok";
+pub const OUTCOME_EMPTY: &str = "empty";
+pub const OUTCOME_DENIED: &str = "denied";
 pub const MAX_PROPERTY_FILTERS: usize = 4;
 pub const MAX_EVALUATE_LIMIT: i32 = domain::MAX_LIST_LIMIT;
 pub const DEFAULT_EVALUATE_LIMIT: i32 = domain::DEFAULT_LIST_LIMIT;
@@ -114,6 +121,117 @@ pub struct BoundObjectSet {
     pub filter: ListFilter,
     pub query_digest: String,
     pub member_kind: String,
+}
+
+/// One object identity at the content version a query read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVersionRead {
+    pub id: String,
+    pub version: String,
+}
+
+/// Canonical member projection recorded with a query receipt so the read
+/// can be replayed at those versions after later writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSetMemberSnapshot {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub namespace: String,
+    pub properties: BTreeMap<String, String>,
+    pub created: i64,
+    pub updated: i64,
+    pub version: String,
+}
+
+/// Query, outcome, and object versions recorded for one EvaluateObjectSet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSetQueryRecord {
+    pub query_digest: String,
+    pub definition_digest: String,
+    pub kind: String,
+    pub outcome: String,
+    pub object_versions: Vec<ObjectVersionRead>,
+    #[serde(default)]
+    pub members: Vec<ObjectSetMemberSnapshot>,
+}
+
+/// Canonical content version of one object as EvaluateObjectSet records it.
+pub fn object_read_version(object: &domain::Object) -> Result<String, String> {
+    crate::sekai::action_instance::object_state_digest(Some(object))
+}
+
+/// Snapshot the members a query returned, with the version of each.
+pub fn query_record(
+    bound: &BoundObjectSet,
+    members: &[domain::Object],
+    outcome: &str,
+) -> Result<ObjectSetQueryRecord, String> {
+    let denied = outcome == OUTCOME_DENIED;
+    let snapshots = if denied {
+        Vec::new()
+    } else {
+        members
+            .iter()
+            .map(member_snapshot)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(ObjectSetQueryRecord {
+        query_digest: bound.query_digest.clone(),
+        definition_digest: bound.descriptor.definition_digest.clone(),
+        kind: bound.member_kind.clone(),
+        outcome: outcome.into(),
+        object_versions: snapshots
+            .iter()
+            .map(|member| ObjectVersionRead {
+                id: member.id.clone(),
+                version: member.version.clone(),
+            })
+            .collect(),
+        members: snapshots,
+    })
+}
+
+/// Reconstruct the page the receipt recorded. Denied records return no rows
+/// and must not name objects.
+pub fn replay_object_set_query(
+    record: &ObjectSetQueryRecord,
+) -> Result<Vec<ObjectSetMemberSnapshot>, String> {
+    if record.outcome == OUTCOME_DENIED {
+        if !record.members.is_empty() || !record.object_versions.is_empty() {
+            return Err("denied query record leaked members".into());
+        }
+        return Ok(Vec::new());
+    }
+    if record.query_digest.trim().is_empty() {
+        return Err("query digest required".into());
+    }
+    for (member, version) in record.members.iter().zip(record.object_versions.iter()) {
+        if member.id != version.id || member.version != version.version {
+            return Err("query record versions do not match members".into());
+        }
+    }
+    if record.members.len() != record.object_versions.len() {
+        return Err("query record versions do not match members".into());
+    }
+    Ok(record.members.clone())
+}
+
+fn member_snapshot(object: &domain::Object) -> Result<ObjectSetMemberSnapshot, String> {
+    Ok(ObjectSetMemberSnapshot {
+        id: object.id.clone(),
+        kind: object.kind.clone(),
+        name: object.name.clone(),
+        namespace: object.namespace.clone(),
+        properties: object
+            .properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        created: object.created,
+        updated: object.updated,
+        version: object_read_version(object)?,
+    })
 }
 
 impl ObjectSetDescriptor {
@@ -705,5 +823,30 @@ mod tests {
             deep.prepare(&digest, &members),
             Err(ObjectSetError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn query_record_replays_versions_and_denied_leaks_nothing() {
+        let (digest, members) = catalog();
+        let bound = descriptor(&digest).prepare(&digest, &members).unwrap();
+        let object = domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "North".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("region".into(), "eu".into())]),
+            created: 1,
+            updated: 1,
+        };
+        let allowed = query_record(&bound, std::slice::from_ref(&object), OUTCOME_OK).unwrap();
+        let replayed = replay_object_set_query(&allowed).unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].id, "c1");
+        assert_eq!(replayed[0].version, object_read_version(&object).unwrap());
+        let denied = query_record(&bound, &[object], OUTCOME_DENIED).unwrap();
+        assert!(denied.members.is_empty());
+        assert!(denied.object_versions.is_empty());
+        assert!(replay_object_set_query(&denied).unwrap().is_empty());
     }
 }

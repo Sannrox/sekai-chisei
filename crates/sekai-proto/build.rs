@@ -39,7 +39,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
         .field_attribute(
+            "sekai.ObjectSetDescriptor.property_filters",
+            "#[serde(default)]",
+        )
+        .field_attribute("sekai.ObjectSetDescriptor.order_by", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.descending", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.limit", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.traversal", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.hops", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.aggregation", "#[serde(default)]")
+        .field_attribute("sekai.ObjectSetDescriptor.cost_limit", "#[serde(default)]")
+        .field_attribute(
+            "sekai.EvaluateObjectSetRequest.page_token",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.EvaluateObjectSetRequest.required_freshness_ms",
+            "#[serde(default)]",
+        )
+        .field_attribute(
             "sekai.EvaluateObjectSetResponse.source",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.EvaluateObjectSetResponse.query_digest",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.EvaluateObjectSetResponse.object_versions",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.EvaluateObjectSetResponse.outcome",
             "#[serde(default)]",
         )
         .field_attribute(

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,15 +11,25 @@ use crate::chisei::budget::BudgetTracker;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+use crate::domain::{self, ListFilter};
 use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
     CreateLinkRequest, CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest,
-    GovernedActionType, Link, Object, ObjectType, PropertyDef, PutGovernedActionTypeRequest,
+    GetObjectRequest, GovernedActionType, Link, Object, ObjectType, PropertyDef,
+    PutGovernedActionTypeRequest, UpdateObjectRequest,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::capability::CONTRACT_VERSION;
+use crate::sekai::definition_branch::{
+    DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
+};
+use crate::sekai::object_security::{
+    OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+    ObjectSecurityPredicate, ObjectSecurityRule,
+};
+use crate::sekai::object_set::CONTRACT_VERSION as OBJECT_SET_CONTRACT;
 use crate::sekai::security::{Grant, Role};
 
 use super::surface::{AdapterError, CatalogSnapshot, NativeRpc, NativeSurface, status_error};
@@ -35,6 +45,9 @@ const FOREIGN_OBJECT_ID: &str = "other-widget-1";
 const FOREIGN_PEER_OBJECT_ID: &str = "other-widget-2";
 const ACTION_TYPE: &str = "review.intake";
 const ACTION_VERSION: &str = "1.0.0";
+const SECRET_KIND: &str = "secret";
+const SECRET_OBJECT_ID: &str = "secret-1";
+const SECRET_PAYLOAD: &str = "classified-token-xyz";
 
 /// Isolated SQLite plane used by the synthetic example and conformance test.
 pub struct InProcessSurface {
@@ -46,6 +59,8 @@ pub struct InProcessSurface {
     pub foreign_peer_object_id: String,
     pub action_type: String,
     pub action_version: String,
+    pub definition_digest: String,
+    pub secret_object_id: String,
     pub sekai: SekaiServiceImpl,
     chisei: ChiseiServiceImpl,
     catalog: Mutex<Option<CatalogSnapshot>>,
@@ -111,7 +126,7 @@ impl InProcessSurface {
             ))
             .unwrap();
 
-        let surface = Self {
+        let mut surface = Self {
             principal: PRINCIPAL.into(),
             namespace: NAMESPACE.into(),
             object_id: OBJECT_ID.into(),
@@ -120,6 +135,8 @@ impl InProcessSurface {
             foreign_peer_object_id: FOREIGN_PEER_OBJECT_ID.into(),
             action_type: ACTION_TYPE.into(),
             action_version: ACTION_VERSION.into(),
+            definition_digest: String::new(),
+            secret_object_id: SECRET_OBJECT_ID.into(),
             sekai,
             chisei,
             catalog: Mutex::new(None),
@@ -130,7 +147,7 @@ impl InProcessSurface {
         Ok(surface)
     }
 
-    async fn seed(&self) -> Result<(), String> {
+    async fn seed(&mut self) -> Result<(), String> {
         self.sekai
             .create_schema_type(with_identity(
                 CreateSchemaTypeRequest {
@@ -140,6 +157,22 @@ impl InProcessSurface {
                         is_builtin: false,
                         implements: vec![],
                         properties: vec![property("name", true), property("color", true)],
+                    }),
+                },
+                &self.principal,
+                &self.namespace,
+            ))
+            .await
+            .map_err(|error| error.message().to_string())?;
+        self.sekai
+            .create_schema_type(with_identity(
+                CreateSchemaTypeRequest {
+                    r#type: Some(ObjectType {
+                        kind: SECRET_KIND.into(),
+                        description: "Synthetic secret".into(),
+                        is_builtin: false,
+                        implements: vec![],
+                        properties: vec![property("name", true), property("payload", true)],
                     }),
                 },
                 &self.principal,
@@ -265,8 +298,154 @@ impl InProcessSurface {
             ))
             .await
             .map_err(|error| error.message().to_string())?;
+        self.definition_digest = seed_published_definition(self.db.as_ref())?;
         Ok(())
     }
+
+    /// Activate object-security for every instantiated kind except `kind`.
+    /// An EvaluateObjectSet of that kind is then type-denied.
+    pub fn deny_object_type(&self, kind: &str) -> Result<(), String> {
+        let instantiated = self
+            .db
+            .list_objects(&ListFilter {
+                namespace: Some(self.namespace.clone()),
+                limit: 1000,
+                ..Default::default()
+            })
+            .map_err(|error| error.to_string())?;
+        let mut activation = BTreeMap::new();
+        for (index, instantiated_kind) in instantiated
+            .iter()
+            .map(|object| object.kind.as_str())
+            .filter(|instantiated_kind| *instantiated_kind != kind)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            let policy = ObjectSecurityPolicy {
+                contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+                namespace: self.namespace.clone(),
+                kind: instantiated_kind.into(),
+                rules: vec![ObjectSecurityRule {
+                    operation: ObjectSecurityOperation::Read,
+                    predicates: vec![ObjectSecurityPredicate::AllowAll],
+                }],
+                property_grants: None,
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = self
+                .db
+                .put_object_security_policy(
+                    &policy,
+                    "root",
+                    &format!("put-mcp-{instantiated_kind}"),
+                    10 + index as i64,
+                )
+                .map_err(|error| error.to_string())?;
+            activation.insert(instantiated_kind.to_string(), revision.revision_digest);
+        }
+        self.db
+            .activate_object_security_policies(
+                &self.namespace,
+                &activation,
+                "root",
+                "activate-mcp",
+                40,
+            )
+            .map_err(|error| error.to_string())?;
+        // Rows of the denied kind exist after activation so a leak would be
+        // visible; the kind has no policy, so EvaluateObjectSet must deny.
+        if kind == SECRET_KIND {
+            self.db
+                .create_object(&domain::Object {
+                    id: self.secret_object_id.clone(),
+                    kind: SECRET_KIND.into(),
+                    name: "vault".into(),
+                    namespace: self.namespace.clone(),
+                    external_id: String::new(),
+                    properties: HashMap::from([
+                        ("name".into(), "vault".into()),
+                        ("payload".into(), SECRET_PAYLOAD.into()),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Change one object's color after a query so receipt replay can be checked.
+    pub async fn mutate_object_color(&self, id: &str, color: &str) -> Result<(), String> {
+        let current = self
+            .sekai
+            .get_object(with_identity(
+                GetObjectRequest { id: id.into() },
+                &self.principal,
+                &self.namespace,
+            ))
+            .await
+            .map_err(|error| error.message().to_string())?
+            .into_inner()
+            .object
+            .ok_or_else(|| "object missing".to_string())?;
+        let mut object = current;
+        object.properties.insert("color".into(), color.into());
+        self.sekai
+            .update_object(with_identity(
+                UpdateObjectRequest {
+                    object: Some(object),
+                    lease_precondition: None,
+                },
+                &self.principal,
+                &self.namespace,
+            ))
+            .await
+            .map_err(|error| error.message().to_string())?;
+        Ok(())
+    }
+
+    pub fn object_set_descriptor(&self, kind: &str) -> serde_json::Value {
+        json!({
+            "contractVersion": OBJECT_SET_CONTRACT,
+            "namespace": self.namespace,
+            "kind": kind,
+            "definitionDigest": self.definition_digest,
+            "limit": 10
+        })
+    }
+}
+
+fn seed_published_definition(db: &RuntimeDb) -> Result<String, String> {
+    let members = ["widget", SECRET_KIND]
+        .into_iter()
+        .map(|kind| {
+            DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: kind.into(),
+                definition_json: format!(
+                    r#"{{"name":"{kind}","properties":{{"name":{{"type":"string"}}}}}}"#
+                ),
+                member_digest: String::new(),
+            }
+            .prepare(NAMESPACE)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let revision = prepare_revision(
+        NAMESPACE,
+        "",
+        members.iter().map(|item| DefinitionRevisionMember {
+            member_kind: item.member_kind.clone(),
+            member_id: item.member_id.clone(),
+            member_digest: item.member_digest.clone(),
+        }),
+        true,
+        "root",
+        1,
+    )?;
+    db.seed_published_definition_revision(&revision, &members)?;
+    Ok(revision.revision_digest)
 }
 
 #[async_trait]

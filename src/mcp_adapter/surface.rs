@@ -582,7 +582,10 @@ impl NativeSurface for FixtureSurface {
             NativeRpc::EvaluateObjectSet => Ok(json!({
                 "members": [],
                 "total": 0,
-                "authority": false
+                "authority": false,
+                "queryDigest": "",
+                "objectVersions": [],
+                "outcome": "empty"
             })),
             NativeRpc::DescribeObjectAction => Ok(json!({
                 "namespace": self.namespace,

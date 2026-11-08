@@ -1573,6 +1573,18 @@ message EvaluateObjectSetResponse {
   // when the replica cannot say. Additive; old clients ignore it. A page
   // is still not a permit (#2051).
   string source = 9;
+  // Digest of the evaluated descriptor. Additive; old clients ignore it.
+  string query_digest = 10;
+  // Object identity and content version for each returned member. Empty
+  // when the caller is denied the type. Additive; old clients ignore it.
+  repeated ObjectVersionRead object_versions = 11;
+  // ok, empty, or denied. Additive; old clients ignore it.
+  string outcome = 12;
+}
+// One object identity at the content version EvaluateObjectSet read (#2151).
+message ObjectVersionRead {
+  string id = 1;
+  string version = 2;
 }
 message ObjectChangeSubscriptionScope {
   string namespace = 1;
