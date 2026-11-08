@@ -1114,3 +1114,219 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         turn.claim_generation + 1
     );
 }
+
+// The one claimable-work family (ADR 0149): a claim taken through either
+// family is the same claim to the other, as in a rolling deploy.
+
+fn ack_work(
+    work_id: &str,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    kind: crate::grpc::pb::sekai::WorkKind,
+) -> crate::grpc::pb::sekai::AckWorkRequest {
+    crate::grpc::pb::sekai::AckWorkRequest {
+        kind: kind.into(),
+        work_id: work_id.into(),
+        runtime_id: runtime_id.into(),
+        claim_generation,
+        fencing_token: fencing_token.into(),
+        outcome: "completed".into(),
+        reason: String::new(),
+        options: None,
+    }
+}
+
+#[tokio::test]
+async fn action_work_claimed_on_either_family_is_acknowledged_on_the_other() {
+    use crate::grpc::pb::sekai::{
+        AckActionWorkRequest, ClaimWorkRequest, WorkKind, ack_work_response, claim_work_response,
+    };
+    let plane = plane();
+
+    // Old claim, new acknowledge, with the claim's runtime token.
+    let claimed = claim(&plane, "a").await;
+    let effect = claimed.effect.unwrap();
+    let acked = plane
+        .service
+        .ack_work(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckWork",
+            ack_work(
+                &effect.effect_id,
+                &effect.claim_owner,
+                i64::try_from(effect.claim_generation).unwrap(),
+                &effect.claim_fencing_token,
+                WorkKind::Action,
+            ),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(ack_work_response::Payload::Action(acked)) = acked.payload else {
+        panic!("an action acknowledge");
+    };
+    assert_eq!(acked.effect.unwrap().status, "completed");
+
+    // New claim, old acknowledge.
+    let mut request = Request::new(ClaimWorkRequest {
+        kind: WorkKind::Action.into(),
+        work_id: "effect-b".into(),
+        runtime_id: "runner-a".into(),
+        request_id: "claim-b".into(),
+        ttl_ms: 60_000,
+        ..Default::default()
+    });
+    request.extensions_mut().insert(tenant_context("tenant-b"));
+    request
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static(WORKER));
+    let Some(claim_work_response::Payload::Action(claimed)) = plane
+        .service
+        .claim_work(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .payload
+    else {
+        panic!("an action claim");
+    };
+    let effect = claimed.effect.unwrap();
+    let acked = plane
+        .service
+        .ack_action_work(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckActionWork",
+            AckActionWorkRequest {
+                effect_id: effect.effect_id.clone(),
+                runtime_id: effect.claim_owner.clone(),
+                claim_generation: effect.claim_generation,
+                fencing_token: effect.claim_fencing_token.clone(),
+                outcome: "completed".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(acked.effect.unwrap().status, "completed");
+}
+
+#[tokio::test]
+async fn an_agent_turn_claimed_on_either_family_is_acknowledged_on_the_other() {
+    use crate::grpc::pb::sekai::{
+        AckAgentTurnRequest, AgentTurnWorkOptions, ClaimWorkRequest, WorkKind, ack_work_response,
+        claim_work_request, claim_work_response,
+    };
+    let plane = plane();
+
+    let turn_id = seed_turn(&plane, "a");
+    let claimed = claim_turn(&plane, "a", &turn_id).await;
+    let turn = claimed.turn.unwrap();
+    let acked = plane
+        .service
+        .ack_work(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckWork",
+            ack_work(
+                &turn_id,
+                &turn.claim_owner,
+                turn.claim_generation,
+                &turn.fencing_token,
+                WorkKind::AgentTurn,
+            ),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let Some(ack_work_response::Payload::AgentTurn(acked)) = acked.payload else {
+        panic!("an agent-turn acknowledge");
+    };
+    assert_eq!(acked.turn.unwrap().status, "completed");
+
+    let turn_id = seed_turn(&plane, "b");
+    let mut request = Request::new(ClaimWorkRequest {
+        kind: WorkKind::AgentTurn.into(),
+        namespace: "ns-b".into(),
+        runtime_id: "runner-a".into(),
+        work_id: turn_id.clone(),
+        ttl_ms: 60_000,
+        options: Some(claim_work_request::Options::AgentTurn(
+            AgentTurnWorkOptions {
+                accepts_continuation: true,
+            },
+        )),
+        ..Default::default()
+    });
+    let mut context = tenant_context("tenant-b");
+    context.principal.subject = TURN_WORKER.into();
+    request.extensions_mut().insert(context);
+    request
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static(TURN_WORKER));
+    let Some(claim_work_response::Payload::AgentTurn(claimed)) = plane
+        .service
+        .claim_work(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .payload
+    else {
+        panic!("an agent-turn claim");
+    };
+    let turn = claimed.turn.unwrap();
+    let acked = plane
+        .service
+        .ack_agent_turn(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckAgentTurn",
+            AckAgentTurnRequest {
+                turn_id,
+                runtime_id: turn.claim_owner,
+                claim_generation: turn.claim_generation,
+                fencing_token: turn.fencing_token,
+                outcome: "completed".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(acked.turn.unwrap().status, "completed");
+}
+
+#[tokio::test]
+async fn a_runtime_token_reaches_only_its_own_kind_on_the_work_family() {
+    use crate::grpc::pb::sekai::{HeartbeatWorkClaimRequest, WorkKind};
+    let plane = plane();
+    let claimed = claim(&plane, "a").await;
+    let effect = claimed.effect.unwrap();
+    for kind in [WorkKind::AgentTurn, WorkKind::Transform] {
+        let status = plane
+            .service
+            .heartbeat_work_claim(with_token(
+                &plane,
+                &claimed.runtime_token,
+                "HeartbeatWorkClaim",
+                HeartbeatWorkClaimRequest {
+                    kind: kind.into(),
+                    work_id: effect.effect_id.clone(),
+                    runtime_id: effect.claim_owner.clone(),
+                    claim_generation: i64::try_from(effect.claim_generation).unwrap(),
+                    fencing_token: effect.claim_fencing_token.clone(),
+                    ttl_ms: 60_000,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{kind:?}");
+    }
+    for method in ["ListClaimableWork", "ClaimWork"] {
+        let status = authenticate(&plane, &claimed.runtime_token, method).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{method}");
+    }
+}

@@ -59,6 +59,21 @@ and does not embed credentials or provider routing.
 | `AckActionWork` | `completed` / `failed`, or a durably idempotent intentional park under the matching fence |
 | `ReportActionClaimEvent` | Append a fenced, idempotent resume/fallback event without checkpoint content |
 
+### One claim family (experimental, ADR 0149)
+
+`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim` and `AckWork` take a
+`kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`) and
+a `work_id` (the run, effect or turn id). Each call runs that kind's RPC
+above, with the same authorization, runtime-token binding and errors, and
+returns that RPC's response in a `oneof`. A claim taken through one family is
+heartbeated or acknowledged through the other, so a rolling deploy can mix
+them. Kind options travel in the request: `AgentTurnWorkOptions` for
+`accepts_continuation`, `request_id` for an Action claim, and
+`ActionAckOptions` or `AgentTurnAckOptions` on `AckWork`. Transform work has
+no `AckWork`; `WriteTransformRunResult` carries its output and acknowledges
+it. A runtime token reaches only its own kind on `HeartbeatWorkClaim` and
+`AckWork`, and transform work stays closed to enterprise-scoped credentials.
+
 ## Lease rules (v1)
 
 Action work, transform work and agent turns share one claim engine
@@ -99,7 +114,8 @@ minutes, whichever is first. `HeartbeatActionClaim` returns a refreshed token
 for the extended claim; refreshes never outlive the claiming credential.
 
 The token authenticates only `HeartbeatActionClaim`, `AckActionWork` and
-`ReportActionClaimEvent` for that exact claim. It is refused at or after its
+`ReportActionClaimEvent`, and `HeartbeatWorkClaim` and `AckWork` for Action
+work, for that exact claim. It is refused at or after its
 expiry, for another effect, namespace, runtime or generation, and when the
 installed identity extension no longer places the namespace in the token's
 tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
@@ -120,7 +136,8 @@ and change-driven turns; the claiming worker is a distinct `worker` claim.
 Follow-up checks that bind agent and requester use `act`, never the worker. The
 claiming worker's subject must not be the instance `principal_id` (ADR 0146).
 It authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn`,
-`SubmitActionInstance` and `ListSiteAgentWorkingMemory`, and only while the
+`HeartbeatWorkClaim` and `AckWork` for agent turns, `SubmitActionInstance`
+and `ListSiteAgentWorkingMemory`, and only while the
 turn is claimed at that generation and its lease holds. `GetObject` and
 `GetOperationReceipt` stay off the token; the worker reads those with its own
 credential. A submission with it must name the turn's namespace and is

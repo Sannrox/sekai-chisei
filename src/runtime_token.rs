@@ -31,6 +31,8 @@ pub const RUNTIME_TOKEN_METHODS: &[&str] = &[
     "HeartbeatActionClaim",
     "AckActionWork",
     "ReportActionClaimEvent",
+    "HeartbeatWorkClaim",
+    "AckWork",
 ];
 
 /// gRPC methods a turn token authenticates: its claim's follow-up calls,
@@ -39,6 +41,8 @@ pub const RUNTIME_TOKEN_METHODS: &[&str] = &[
 pub const TURN_TOKEN_METHODS: &[&str] = &[
     "HeartbeatAgentTurnClaim",
     "AckAgentTurn",
+    "HeartbeatWorkClaim",
+    "AckWork",
     "SubmitActionInstance",
     "ListSiteAgentWorkingMemory",
 ];

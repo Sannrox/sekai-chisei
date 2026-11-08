@@ -909,6 +909,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ClaimAgentTurn"
             | "HeartbeatAgentTurnClaim"
             | "AckAgentTurn"
+            // The claim family over every kind (ADR 0149) runs the kind's
+            // own handler; transform work stays refused to these credentials.
+            | "ListClaimableWork"
+            | "ClaimWork"
+            | "HeartbeatWorkClaim"
+            | "AckWork"
             // Dual-principal working-memory read (#1968): the handler
             // scopes it to the instance and, with a turn token, that turn.
             | "ListSiteAgentWorkingMemory"

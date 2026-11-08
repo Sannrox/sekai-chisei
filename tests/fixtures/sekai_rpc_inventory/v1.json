@@ -1357,6 +1357,76 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListClaimableWork",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-types/src/work_claim.rs",
+        "docs/decisions/0149-one-claimable-work-queue.md"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets",
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ClaimWork",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-types/src/work_claim.rs",
+        "docs/decisions/0149-one-claimable-work-queue.md"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets",
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "HeartbeatWorkClaim",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets",
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-types/src/work_claim.rs",
+        "docs/decisions/0149-one-claimable-work-queue.md"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets",
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "AckWork",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-types/src/work_claim.rs",
+        "docs/decisions/0149-one-claimable-work-queue.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph",
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListSiteAgentWorkingMemory",
       "kind": "persistent",
       "surfaces": [
