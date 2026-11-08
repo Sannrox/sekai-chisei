@@ -168,3 +168,30 @@ fn sekaictl_reads_context_expansion_and_derivation_without_the_experimental_gate
     ]);
     assert!(explained.contains("found=true"), "{explained}");
 }
+
+#[test]
+fn sekaictl_first_run_resolves_without_a_provider() {
+    let server = Running::start();
+    let output = server.ok(&[
+        "ontology",
+        "first-run",
+        "--domain",
+        &fixture("tests/fixtures/product_loop/domain-v1.json"),
+        "--seed",
+        &fixture("tests/fixtures/product_loop/seed-v1.json"),
+        "--resolve-object",
+        "svc-api",
+    ]);
+    assert!(
+        output.contains("3/3 run:"),
+        "first-run must complete the resolve step: {output}"
+    );
+    assert!(
+        output.contains("provider=lookup"),
+        "first-run resolve must be a lookup hit: {output}"
+    );
+    assert!(
+        output.contains("stop=lookup_hit"),
+        "first-run resolve must stop as lookup_hit: {output}"
+    );
+}

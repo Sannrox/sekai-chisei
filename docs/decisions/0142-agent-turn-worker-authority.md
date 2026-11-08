@@ -7,10 +7,11 @@
 - Issue: #1982
 - Supersedes: none
 - Superseded by: [ADR 0143](0143-runtime-token-act-is-the-requester.md) for the turn-token `act` claim only
+- Amended by: [ADR 0146](0146-turn-worker-is-not-the-instance.md) for worker identity and the turn-token read set
 - Related: [ADR 0099](0099-shared-identity-and-tenancy.md),
   [ADR 0136](0136-site-agent-instances.md),
   [ADR 0137](0137-agent-turns-share-the-scheduling-split.md),
-  [ADR 0139](0139-site-agent-working-memory.md), #1611, #1950, #2026
+  [ADR 0139](0139-site-agent-working-memory.md), #1611, #1950, #2026, #2047
 
 ## Context
 
