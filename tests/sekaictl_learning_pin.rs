@@ -360,12 +360,15 @@ async fn an_activated_learning_pinned_on_the_next_plan_is_cited_and_fails_closed
         .await,
         "proposed learning",
     );
+    // The proposer may not approve its own change.
     server.learning(&[
         "approve",
         "--namespace",
         NAMESPACE,
         "--learning-id",
         LEARNING_ID,
+        "--actor",
+        "reviewer",
     ]);
     assert_unavailable(
         plan(

@@ -265,6 +265,73 @@ fn stale_hidden_and_lease_loss_block_activation() {
     );
 }
 
+fn propose_as(db: &ChiseiStore, actor: &str, now_ms: i64) -> Result<LearningChange, String> {
+    propose_change(
+        db,
+        actor,
+        &ProposeLearningChange {
+            namespace: "payments".into(),
+            learning_id: "learning-1".into(),
+            evidence_digest: evidence(),
+        },
+        now_ms,
+    )
+}
+
+#[test]
+fn a_proposer_cannot_approve_and_the_refusal_is_audited() {
+    let db = db();
+    record_candidate(&db);
+    propose(&db, 1_000);
+
+    assert_eq!(
+        approve_change(&db, "operator", "payments", "learning-1", 2_000).unwrap_err(),
+        SELF_APPROVAL_DENIED
+    );
+    assert_eq!(
+        get_change(&db, "payments", "learning-1").unwrap().status,
+        STATUS_PROPOSED
+    );
+    let denied = db
+        .list_decisions_for_action_namespace(APPROVE_ACTION, "payments")
+        .unwrap();
+    assert_eq!(denied.len(), 1);
+    assert_eq!(denied[0].actor, "operator");
+    assert_eq!(denied[0].outcome, "denied");
+
+    let approved = approve_change(&db, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    assert_eq!(approved.status, STATUS_APPROVED);
+    assert_eq!(approved.approval.unwrap().approved_by, "reviewer");
+
+    // Re-proposing binds the candidate again, so the re-proposer is a
+    // proposer too and the earlier approval is gone.
+    propose_as(&db, "reviewer", 3_000).unwrap();
+    for actor in ["reviewer", "operator"] {
+        assert_eq!(
+            approve_change(&db, actor, "payments", "learning-1", 4_000).unwrap_err(),
+            SELF_APPROVAL_DENIED,
+            "{actor}"
+        );
+    }
+    assert_eq!(
+        approve_change(&db, "auditor", "payments", "learning-1", 4_000)
+            .unwrap()
+            .status,
+        STATUS_APPROVED
+    );
+}
+
+#[test]
+fn the_unix_socket_operator_may_approve_its_own_proposal() {
+    for actor in ["root", "local"] {
+        let db = db();
+        record_candidate(&db);
+        propose_as(&db, actor, 1_000).unwrap();
+        let approved = approve_change(&db, actor, "payments", "learning-1", 2_000).unwrap();
+        assert_eq!(approved.status, STATUS_APPROVED, "{actor}");
+    }
+}
+
 fn activate_candidate(db: &ChiseiStore) -> LearningChange {
     record_candidate(db);
     propose(db, 1_000);
