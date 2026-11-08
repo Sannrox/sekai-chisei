@@ -51,8 +51,46 @@ adapter's local disk is authoritative.
 
 ## Configuration
 
-The adapter reads `SEKAI_TARGET`, `SEKAI_CREDENTIAL`, the Ezu URL and the Ezu
-bearer. The bearer decides the Ezu namespace. The plane never sees it.
+### Plane, once per namespace
+
+A namespace administrator sets up:
+
+1. **Service principal.** `PutServicePrincipal` with `namespaces` set to
+   the namespace and, for fence events, `action_types` set to the bound
+   Action type. `IssueServicePrincipalToken` gives the adapter its bearer.
+   The principal reads objects as it is allowed to. A geometry property
+   above its classification ceiling is never sent to Ezu.
+2. **Action type** (fence events only).
+   `sekaictl admin governance action type put --file <type.json>`
+   defines the type the events submit, with a closed parameter schema. Pin
+   its version in the adapter configuration.
+3. **Leases.** `AcquireLease` and `TakeoverExpiredLease` are experimental.
+   The plane runs with `SEKAI_EXPERIMENTAL_RPCS=1`. Subscriptions, object
+   reads and Action submits are stable.
+
+No Ezu setting goes into the plane.
+
+### Adapter
+
+| Variable | Meaning |
+| --- | --- |
+| `SEKAI_TARGET` | Plane address |
+| `SEKAI_CREDENTIAL` | The service principal token |
+| `EZU_URL` | Ezu HTTP address. Bulk ingest uses the same address |
+| `EZU_TOKEN` | Ezu bearer. It decides the Ezu namespace |
+| `EZU_ADAPTER_CONFIG` | Path to the feed and binding document |
+
+The document replaces the old `sekai.ezu-geo-feed/v1` and
+`sekai.fence-binding/v1` bodies:
+
+- **Feed:** namespace, object kind, geometry property, Ezu collection,
+  optional filter fields.
+- **Binding:** namespace, fences, event kinds, Ezu collection and object
+  kind, Action type and version, and the mapping from event fields to
+  parameters.
+
+Changing the document needs no plane change. A changed feed scope starts a
+new subscription, and therefore a new snapshot.
 
 ## Tests
 
