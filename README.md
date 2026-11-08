@@ -11,9 +11,9 @@ receipt.**
 [Architecture](docs/architecture.md) · [Decisions](docs/decisions/README.md) ·
 [Vision](VISION.md)
 
-> **Project status:** stable 1.x. The ontology-first loop, SQLite persistence,
+> **Project status:** stable 2.x. The ontology-first loop, SQLite persistence,
 > principal credentials, policy pipeline, receipts, `sekaictl`, and core gRPC
-> catalog form the stable 1.x contract. Advanced and experimental capabilities
+> catalog form the stable 2.x contract. Advanced and experimental capabilities
 > remain explicitly classified and require opt-in discovery.
 
 Sekai (世界, "world") stores durable facts; Chisei (知性, "intellect") makes
@@ -34,7 +34,7 @@ runtime.
 - **Compatible entry paths.** Existing OpenAI- and Anthropic-compatible
   clients enter through the gateway; native integrations use governed gRPC.
   Both paths run under the same control plane.
-- **Local-first authority.** The stable 1.x graph and governance state live in
+- **Local-first authority.** The stable 2.x graph and governance state live in
   SQLite by default. PostgreSQL is a first-class community backend for the
   dual-backend inventory; remaining experimental and admin SQLite-only
   surfaces fail closed, as do Chisei `PlanExecution` and

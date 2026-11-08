@@ -2,14 +2,14 @@
 
 ## Supported versions
 
-Security fixes target the current 1.x release line and `main`. Pre-1.0 releases
-and older snapshots do not receive separate security support.
+Security fixes target the current 2.x release line and `main`. Older 1.x
+releases and pre-1.0 snapshots do not receive separate security support.
 
 | Version | Supported |
 | --- | --- |
-| Current 1.x | Yes |
+| Current 2.x | Yes |
 | Current `main` | Yes |
-| Pre-1.0 and older snapshots | No |
+| 1.x, pre-1.0, and older snapshots | No |
 
 ## Reporting a vulnerability
 

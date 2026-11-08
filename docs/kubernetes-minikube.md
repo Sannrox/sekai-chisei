@@ -77,8 +77,8 @@ the end of `deploy/kubernetes/tenkai.toml`, and the observation time into
 tenkaictl env cluster-config set local /path/to/kubeconfig
 tenkaictl publish deploy/kubernetes/tenkai.toml --allow-unsigned-development
 tenkaictl env compatibility record local observation.json
-tenkaictl env compatibility check local sekai-chisei@1.5.0
-tenkaictl promote sekai-chisei@1.5.0 stable
+tenkaictl env compatibility check local sekai-chisei@2.0.0
+tenkaictl promote sekai-chisei@2.0.0 stable
 tenkaictl env subscribe local sekai-chisei=stable
 PLAN=$(tenkaictl plan --env local | sed -n 's/^plan id: //p')
 tenkaictl apply "$PLAN" \
