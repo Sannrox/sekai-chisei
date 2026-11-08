@@ -12136,6 +12136,99 @@ async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
 }
 
 #[tokio::test]
+async fn plan_execution_lookup_first_hit_does_not_require_a_provider() {
+    use crate::composition::lookup_first;
+    use crate::sekai::semantic;
+
+    let svc = memory_service();
+    lookup_first::seed_s1_fixture_graph(&shared_sekai_store(&svc.db))
+        .expect("seed lookup fixtures");
+
+    let mut request = Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
+        input: Some(ExecutionInput {
+            request_id: "lookup-plan-hit".into(),
+            namespace: "acme".into(),
+            spec: r#"{"external_id":"widget:lookup-root"}"#.into(),
+            task_type: semantic::CAPABILITY_RESOLVE_REF.into(),
+            max_tokens: 256,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+
+    let plan = svc
+        .plan_execution(request)
+        .await
+        .expect("lookup hit must plan without a provider")
+        .into_inner()
+        .plan
+        .expect("plan body");
+    assert!(plan.executable, "lookup-hit plan must be executable");
+    assert_eq!(plan.resolved_model, lookup_first::LOOKUP_PROVIDER);
+    assert_eq!(plan.resolved_runtime, lookup_first::LOOKUP_PROVIDER);
+
+    let mut execute = Request::new(ExecutePlanRequest { plan: Some(plan) });
+    execute
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    let response = svc
+        .execute_plan(execute)
+        .await
+        .expect("lookup hit should execute")
+        .into_inner()
+        .response
+        .expect("response body");
+    assert_eq!(response.provider, lookup_first::LOOKUP_PROVIDER);
+    assert_eq!(response.stop_reason, lookup_first::LOOKUP_HIT_STOP_REASON);
+}
+
+#[tokio::test]
+async fn plan_execution_lookup_first_miss_still_fails_closed_without_a_provider() {
+    use crate::sekai::semantic;
+
+    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
+    let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
+    let mut cfg = config(":memory:");
+    cfg.native_llm_url = None;
+    cfg.anthropic_api_key = None;
+    cfg.openai_api_key = None;
+    cfg.gateway_provided_providers.clear();
+    let svc = ChiseiServiceImpl::new(chisei, cfg)
+        .with_sekai_facts(facts)
+        .unwrap();
+    let mut request = Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
+        input: Some(ExecutionInput {
+            request_id: "lookup-plan-miss".into(),
+            namespace: "acme".into(),
+            spec: r#"{"object_id":"does-not-exist"}"#.into(),
+            task_type: semantic::CAPABILITY_RESOLVE_REF.into(),
+            max_tokens: 256,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+
+    let error = svc.plan_execution(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("is not configured"),
+        "lookup miss must still fail closed on routing: {}",
+        error.message()
+    );
+}
+
+#[tokio::test]
 async fn execute_plan_lookup_first_incomplete_records_refusal_before_model_path() {
     use crate::composition::lookup_first;
     use crate::sekai::semantic;
