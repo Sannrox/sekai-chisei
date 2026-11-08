@@ -19,6 +19,16 @@ pub const ASSURANCE_VERSION: &str = "external-action.assurance/v1";
 pub const AUTHORIZATION_KIND: &str = "external_action_authorization";
 const CLAIM_LEASE_MS: i64 = 30_000;
 
+pub(crate) const SQLITE_LIST_EXPIRED_RESERVED: &str = "
+SELECT record_json FROM chisei_external_action_authorizations
+ WHERE record_json IS NOT NULL
+   AND (
+        json_extract(record_json, '$.budget_reserved') = 1
+     OR json_extract(record_json, '$.blast_radius_reserved') = 1
+   )
+   AND CAST(json_extract(record_json, '$.decision.expires_at_ms') AS INTEGER) <= ?1
+";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalActionRequest {
     pub version: String,
@@ -320,6 +330,11 @@ pub trait ExternalActionSekaiDbExt {
     ) -> Result<Option<AuthorizationRecord>, String>;
 
     fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String>;
 }
 
 impl ExternalActionSekaiDbExt for SekaiDb {
@@ -635,6 +650,25 @@ impl ExternalActionSekaiDbExt for SekaiDb {
             .map_err(|error| error.to_string())?;
         statement
             .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .map(|json| {
+                json.map_err(|error| error.to_string())
+                    .and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            })
+            .collect()
+    }
+
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        self.ensure_external_action_tables()?;
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(SQLITE_LIST_EXPIRED_RESERVED)
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(rusqlite::params![now_ms], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
             .map(|json| {
                 json.map_err(|error| error.to_string())

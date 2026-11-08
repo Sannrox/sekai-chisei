@@ -252,14 +252,7 @@ pub fn reclaim_expired(
     budget: &BudgetTracker,
     now_ms: i64,
 ) -> Result<(), String> {
-    for expected in db
-        .list_external_action_authorizations()?
-        .into_iter()
-        .filter(|record| {
-            (record.budget_reserved || record.blast_radius_reserved)
-                && record.decision.expires_at_ms <= now_ms
-        })
-    {
+    for expected in db.list_expired_reserved_external_action_authorizations(now_ms)? {
         let mut expired = expected.clone();
         expired.decision.decision = "deny".into();
         expired.decision.reason = "external-action authorization expired".into();
@@ -419,5 +412,88 @@ mod tests {
         assert!(!cancel(&mut record, "agent-1", "different", 300));
         assert_eq!(record.decision.reason, "stop");
         assert_eq!(record.decision.cancelled_at_ms, 200);
+    }
+
+    fn store_record(
+        db: &ChiseiStore,
+        suffix: &str,
+        expires_at_ms: i64,
+        budget_reserved: bool,
+        blast_radius_reserved: bool,
+    ) -> AuthorizationRecord {
+        let mut req = request();
+        req.operation_id = format!("op-{suffix}");
+        req.idempotency_key = format!("idem-{suffix}");
+        req.actor = format!("actor-{suffix}");
+        req.request_id = format!("req-{suffix}");
+        req.attempt_id = format!("attempt-{suffix}");
+        let digest = req.canonical_digest().unwrap();
+        let authorization_id = format!("auth-{suffix}");
+        db.claim_external_action_authorization(&req, &digest, &authorization_id, 1)
+            .unwrap();
+        let record = AuthorizationRecord {
+            request: req,
+            decision: ExternalActionDecision {
+                version: external_action::DECISION_VERSION.into(),
+                authorization_id,
+                request_digest: digest,
+                decision: "permit".into(),
+                reason: "test".into(),
+                approval_id: String::new(),
+                policy_scope: "team-a".into(),
+                policy_version: "sha256:policy".into(),
+                created_at_ms: 1,
+                expires_at_ms,
+                cancelled_at_ms: 0,
+                assurance: Default::default(),
+            },
+            approval_status: "approved".into(),
+            budget_reserved,
+            blast_radius_reserved,
+            decision_actor: "agent-1".into(),
+            decision_updated_at_ms: 1,
+        };
+        db.put_external_action_authorization(&record).unwrap();
+        record
+    }
+
+    #[test]
+    fn reclaim_selects_only_expired_reserved_authorizations() {
+        let db = ChiseiStore::memory();
+        store_record(&db, "expired-reserved", 50, true, false);
+        store_record(&db, "live-reserved", 5_000, true, false);
+        store_record(&db, "expired-free", 50, false, false);
+        let listed = db
+            .list_expired_reserved_external_action_authorizations(100)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|record| record.decision.authorization_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["auth-expired-reserved"]
+        );
+
+        let budget = BudgetTracker::new(db.clone());
+        reclaim_expired(&db, &budget, 100).unwrap();
+        let after = db.list_external_action_authorizations().unwrap();
+        let expired = after
+            .iter()
+            .find(|record| record.decision.authorization_id == "auth-expired-reserved")
+            .unwrap();
+        assert_eq!(expired.decision.decision, "deny");
+        assert_eq!(expired.approval_status, "expired");
+        assert!(!expired.budget_reserved);
+        let live = after
+            .iter()
+            .find(|record| record.decision.authorization_id == "auth-live-reserved")
+            .unwrap();
+        assert_eq!(live.decision.decision, "permit");
+        assert!(live.budget_reserved);
+        let free = after
+            .iter()
+            .find(|record| record.decision.authorization_id == "auth-expired-free")
+            .unwrap();
+        assert_eq!(free.decision.decision, "permit");
     }
 }

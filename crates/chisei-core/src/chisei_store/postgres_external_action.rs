@@ -8,6 +8,16 @@ use sekai_core::db::postgres::PostgresDb;
 /// Claim lease duration for in-progress authorization claims (matches SQLite).
 const CLAIM_LEASE_MS: i64 = 30_000;
 
+pub(crate) const POSTGRES_LIST_EXPIRED_RESERVED: &str = "
+SELECT record_json FROM chisei_external_action_authorizations
+ WHERE record_json IS NOT NULL
+   AND (
+        COALESCE((record_json::jsonb ->> 'budget_reserved')::boolean, false)
+     OR COALESCE((record_json::jsonb ->> 'blast_radius_reserved')::boolean, false)
+   )
+   AND COALESCE((record_json::jsonb #>> '{decision,expires_at_ms}')::bigint, 0) <= $1
+";
+
 pub trait PostgresExternalActionPostgresDbExt {
     fn claim_external_action_authorization(
         &self,
@@ -62,6 +72,11 @@ pub trait PostgresExternalActionPostgresDbExt {
     ) -> Result<Option<AuthorizationRecord>, String>;
 
     fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String>;
 }
 
 impl PostgresExternalActionPostgresDbExt for PostgresDb {
@@ -435,6 +450,22 @@ impl PostgresExternalActionPostgresDbExt for PostgresDb {
                  WHERE record_json IS NOT NULL",
                 &[],
             )
+            .map_err(|error| error.to_string())?;
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row.get(0);
+                serde_json::from_str(&json).map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String> {
+        let rows = self
+            .connection()?
+            .query(POSTGRES_LIST_EXPIRED_RESERVED, &[&now_ms])
             .map_err(|error| error.to_string())?;
         rows.into_iter()
             .map(|row| {

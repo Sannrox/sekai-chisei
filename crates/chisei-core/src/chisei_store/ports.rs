@@ -526,6 +526,7 @@ chisei_store_trait! {
         fn put_external_action_authorization(&self, record: &AuthorizationRecord) -> Result<(), String>;
         fn compare_and_swap_external_action_authorization(&self, expected: &AuthorizationRecord, next: &AuthorizationRecord) -> Result<bool, String>;
         fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+        fn list_expired_reserved_external_action_authorizations(&self, now_ms: i64) -> Result<Vec<AuthorizationRecord>, String>;
         fn release_external_action_blast_radius(&self, authorization_id: &str, request: &ExternalActionRequest) -> Result<(), String>;
         fn abandon_external_action_claim(&self, request: &ExternalActionRequest, request_digest: &str) -> Result<(), String>;
         fn get_external_action_authorization_by_id(&self, authorization_id: &str) -> Result<Option<AuthorizationRecord>, String>;

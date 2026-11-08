@@ -56,6 +56,11 @@ pub trait ChiseiExternalActionBackend: Send + Sync {
     ) -> Result<Option<AuthorizationRecord>, String>;
 
     fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
+
+    fn list_expired_reserved_external_action_authorizations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<AuthorizationRecord>, String>;
 }
 
 macro_rules! forward {
@@ -146,6 +151,13 @@ macro_rules! forward {
 
         fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String> {
             <$target as $ext>::list_external_action_authorizations(self)
+        }
+
+        fn list_expired_reserved_external_action_authorizations(
+            &self,
+            now_ms: i64,
+        ) -> Result<Vec<AuthorizationRecord>, String> {
+            <$target as $ext>::list_expired_reserved_external_action_authorizations(self, now_ms)
         }
     };
 }
