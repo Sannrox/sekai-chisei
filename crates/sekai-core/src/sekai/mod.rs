@@ -163,6 +163,9 @@ pub mod trust_score;
 pub mod value_explanation;
 pub mod virtual_pushdown;
 pub mod warehouse_projection;
+pub use sekai_types::work_claim;
+#[cfg(test)]
+mod work_claim_conformance;
 pub mod work_unit_lifecycle;
 pub mod workflow_action;
 pub mod write_freeze;
