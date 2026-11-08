@@ -32,6 +32,12 @@ runtime's placement labels; a run whose `requires` those labels do not meet
 is neither listed nor claimable for it, and a targeted claim of one is
 contention (see [governed-transforms.md](governed-transforms.md)).
 
+The client lists, claims, heartbeats and acknowledges every kind through the
+one claim family below (`list_work`, `claim_work`, `heartbeat_work`,
+`ack_work`); the per-kind methods are thin wrappers over it with the same
+signatures. It needs a plane that serves that family, so upgrade planes
+before workers. Older clients keep calling the per-kind RPCs, which stay.
+
 Typed errors keep fence loss, idle, contention, denial, and unavailability
 distinct. `SdkError` does not retain server status text, so the client maps
 by RPC role: list `FailedPrecondition` is unavailability (including the
