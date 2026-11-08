@@ -17,8 +17,9 @@ use sekai_chisei::sekai::definition_diff::{
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
-    CreateDefinitionProposal, MergeDefinitionProposal, ProposeDefinitionImport,
-    ProposeDefinitionRollback, STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN,
+    CreateDefinitionProposal, DefinitionMergePath, MERGE_REQUIRES_BUNDLE_APPLY,
+    MergeDefinitionProposal, ProposeDefinitionImport, ProposeDefinitionRollback, STATUS_CLOSED,
+    STATUS_MERGED, STATUS_OPEN,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -1802,6 +1803,121 @@ fn publish_revision(
     )
 }
 
+/// A proposal created with a change bundle's digest publishes only through
+/// bundle apply: a direct merge is refused and leaves the head alone (#2197).
+fn exercise_bundle_proposal_merge_path(
+    db: &dyn DefinitionBranchBackend,
+    merge_via: impl Fn(
+        &MergeDefinitionProposal,
+        DefinitionMergePath,
+    ) -> Result<DefinitionWriteResult, String>,
+    namespace: &str,
+) {
+    let base = seed_ticket(db, namespace, r#"{"name":"Ticket","properties":["title"]}"#);
+    db.create_definition_branch(
+        &CreateDefinitionBranch {
+            namespace: namespace.into(),
+            branch_id: "bundle".into(),
+            parent_revision_digest: base.clone(),
+            idempotency_key: "bundle-create".into(),
+        },
+        "author",
+        2,
+    )
+    .unwrap();
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(
+            &ApplyDefinitionBranchEdit {
+                namespace: namespace.into(),
+                branch_id: "bundle".into(),
+                expected_head_digest: base.clone(),
+                upserts: vec![member(
+                    namespace,
+                    "Ticket",
+                    r#"{"name":"Ticket","properties":["title","owner"]}"#,
+                )],
+                removals: Vec::new(),
+                idempotency_key: "bundle-edit".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "bundle".into(),
+            proposal_id: "bundle-cs".into(),
+            base_digest: base.clone(),
+            candidate_digest: result.revision.revision_digest.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "bundle-propose".into(),
+            major_revision: false,
+            migration_plan_digest: digest('b'),
+        },
+        "author",
+        4,
+    )
+    .unwrap();
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "bundle-cs".into(),
+            idempotency_key: "bundle-approve".into(),
+        },
+        "merger",
+        5,
+    )
+    .unwrap();
+    let merge = |key: &str| MergeDefinitionProposal {
+        namespace: namespace.into(),
+        proposal_id: "bundle-cs".into(),
+        expected_published_digest: base.clone(),
+        idempotency_key: key.into(),
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
+    };
+    let error = db
+        .merge_definition_proposal(&merge("bundle-merge-direct"), "merger", 6)
+        .unwrap_err();
+    assert!(error.starts_with(MERGE_REQUIRES_BUNDLE_APPLY), "{error}");
+    let error = merge_via(&merge("bundle-merge-direct"), DefinitionMergePath::Direct).unwrap_err();
+    assert!(error.starts_with(MERGE_REQUIRES_BUNDLE_APPLY), "{error}");
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        base
+    );
+    assert_eq!(
+        db.get_definition_proposal(namespace, "bundle-cs")
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_OPEN
+    );
+    let DefinitionWriteResult::MergeProposal { result: merged } = merge_via(
+        &merge("bundle-merge-apply"),
+        DefinitionMergePath::BundleApply,
+    )
+    .unwrap() else {
+        panic!("expected bundle apply merge");
+    };
+    assert_eq!(merged.proposal.status, STATUS_MERGED);
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        result.revision.revision_digest
+    );
+}
+
 fn exercise_published_revision_history(db: &dyn DefinitionBranchBackend, namespace: &str) {
     let (parent, _) = seed(db, namespace);
     let (first, first_receipt) = publish_revision(
@@ -1983,6 +2099,14 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_definition_import(&SekaiDb::new(":memory:").unwrap(), "sqlite-import");
     {
         let db = SekaiDb::new(":memory:").unwrap();
+        exercise_bundle_proposal_merge_path(
+            &db,
+            |request, path| db.merge_definition_proposal_via(request, path, "merger", 7),
+            "sqlite-bundle-merge",
+        );
+    }
+    {
+        let db = SekaiDb::new(":memory:").unwrap();
         let namespace = "sqlite-rollback-live";
         exercise_rollback_live_values(&db, namespace, || {
             db.create_object(&ticket_object(namespace, "open", Some("classified")))
@@ -2024,6 +2148,11 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_published_revision_history(db.as_ref(), &format!("{prefix}-history"));
     exercise_definition_rollback(db.as_ref(), &format!("{prefix}-rollback"));
     exercise_definition_import(db.as_ref(), &format!("{prefix}-import"));
+    exercise_bundle_proposal_merge_path(
+        db.as_ref(),
+        |request, path| db.merge_definition_proposal_via(request, path, "merger", 7),
+        &format!("{prefix}-bundle-merge"),
+    );
     {
         let namespace = format!("{prefix}-rollback-live");
         exercise_rollback_live_values(db.as_ref(), &namespace, || {

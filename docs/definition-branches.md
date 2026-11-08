@@ -71,7 +71,9 @@ frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
 enter the published member map. Optional `migration_plan_digest` names the
 [change bundle](definition-change-bundles.md#apply) the proposal migrates by;
 it is part of the approved proposal digest, so `ApplyDefinitionChangeBundle`
-runs only that bundle. Creating a proposal does not move the published head.
+runs only that bundle, and `MergeDefinitionProposal` refuses the proposal
+(`definition_proposal_requires_bundle_apply`): only apply publishes it.
+Creating a proposal does not move the published head.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
 An agent principal that created the proposal cannot approve or merge it,

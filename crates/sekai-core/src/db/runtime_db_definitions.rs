@@ -376,20 +376,26 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
+        self.merge_definition_proposal_via(
+            request,
+            crate::sekai::definition_proposal::DefinitionMergePath::Direct,
+            actor,
+            now_ms,
+        )
+    }
+
+    /// Merges for `path`; only bundle apply passes `BundleApply`.
+    pub fn merge_definition_proposal_via(
+        &self,
+        request: &MergeDefinitionProposal,
+        path: crate::sekai::definition_proposal::DefinitionMergePath,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
         let result = match self {
-            Self::Sqlite(db) => DefinitionBranchBackend::merge_definition_proposal(
-                db.as_ref(),
-                request,
-                actor,
-                now_ms,
-            ),
+            Self::Sqlite(db) => db.merge_definition_proposal_via(request, path, actor, now_ms),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                DefinitionBranchBackend::merge_definition_proposal(
-                    db.as_ref(),
-                    request,
-                    actor,
-                    now_ms,
-                )
+                db.merge_definition_proposal_via(request, path, actor, now_ms)
             }),
         }?;
         if matches!(result, DefinitionWriteResult::MergeProposal { .. }) {
