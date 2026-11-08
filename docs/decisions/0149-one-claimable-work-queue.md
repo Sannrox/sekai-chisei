@@ -51,6 +51,11 @@ writeback effects.
    `source_sync`, `export_delivery` and `external_effect`. A kind owns its
    payload, its admission rules and its write-back. The engine owns
    everything about who holds the work.
+
+   An item is a kind only when exactly one consumer must act on it and
+   the action has a side effect worth fencing. A per-recipient inbox
+   (violation notifications) and a feed with no recipient (the criticality
+   outbox) are not kinds.
 3. **One RPC family.** `ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim`
    and `AckWork` take a kind. The response carries a kind-specific payload
    as a `oneof`. Errors are one set: idle, contention, fence lost, denied,

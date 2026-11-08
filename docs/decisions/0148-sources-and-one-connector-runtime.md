@@ -1,4 +1,4 @@
-# ADR 0148: Sources are first-class; one connector runtime runs every integration
+# ADR 0148: Sources are first-class; one connector runtime runs source integrations
 
 - Status: proposed
 - Date: 2026-11-08
@@ -7,6 +7,7 @@
 - Supersedes: none
 - Superseded by: none
 - Related: [ADR 0022](0022-source-batch-transactions.md),
+  [ADR 0035](0035-source-webhook-transport.md),
   [ADR 0055](0055-connector-certification.md),
   [ADR 0060](0060-additive-source-type-descriptors.md),
   [ADR 0090](0090-object-change-action-bindings.md),
@@ -56,6 +57,11 @@ object they all hang off.
    Source batches, saved exports and writeback effects name a Source.
    Today they name a free-form source instance, an export id, or nothing.
    Deleting or disabling a Source stops all its work.
+
+   A Source keeps the existing `source` and `source_instance` tokens as
+   fields, for example `github` and `owner/repo`. A batch names the Source
+   as a handle, and the plane resolves it to those tokens. Object identity,
+   `source_id(source, source_instance, external_id)`, does not change.
 2. **Connector types replace adapters.** A connector type implements the
    `sekai-source-sdk` operations it supports:
    - `check` and `discover`;
@@ -64,8 +70,15 @@ object they all hang off.
    - `apply` for writeback effects.
 
    A type declares its operations, its configuration schema and its
-   credential slots. GitHub, the Ezu spatial engine, relational sources
-   and the evidence producers become types.
+   credential slots. GitHub, relational sources and the Ezu spatial engine
+   become types. Ezu receives its feed as an export delivery and returns
+   fence events through `read_changes`.
+
+   Programs that are not integrations with one external system stay as
+   they are. These are evidence producers, the feedback investigator
+   (which claims Action work), projections, and workflow and autonomy
+   programs. A type gains a new operation only when a new integration
+   needs it.
 3. **One connector runtime.** A single worker binary holds the connector
    types. It never links the control-plane package. It claims sync, delivery
    and effect work for the Sources it is entitled to, as the
@@ -80,7 +93,10 @@ object they all hang off.
    credentials sealed to a runtime key are a possible later extension, not
    part of this decision.
 5. **Work comes from the existing schedules.**
-   - **Syncs:** a schedule or a webhook delivery (ADR 0035).
+   - **Syncs:** a schedule. A pull sync is `source_sync` work. A webhook
+     delivery stays on the plane (ADR 0035). The plane verifies it and
+     applies it as a source batch, with no worker on that path. A Source
+     names the webhook's pinned key and source instance.
    - **Delivery:** a completed export artifact (ADR 0130).
    - **Effects:** an admitted Action with an `external_mutate` effect
      (#1085).
@@ -108,12 +124,12 @@ object they all hang off.
   owner, credential reference, last run and health.
 - A new integration is a connector type in the runtime plus a Source. It
   needs no new process, configuration format or plane change.
-- The free-form source instance on source batches becomes a Source id. The
-  existing GitHub profile is migrated to a Source, and old batches keep
-  their identity.
-- The reference adapters under `adapters/` become connector types or are
-  removed. `docs/ezu-adapter.md` becomes the description of the Ezu
-  connector type.
+- Batches gain a Source handle next to the free-form source instance. The
+  existing GitHub profile is migrated to a Source holding its current
+  tokens, so object ids stay the same.
+- The reference adapters under `adapters/` that sync, deliver or write back
+  become connector types. The others stay as they are.
+  `docs/ezu-adapter.md` becomes the description of the Ezu connector type.
 - The runtime is a new deployable. It has to survive crash, takeover and
   rolling deploy as any claim worker does.
 - This ADR depends on ADR 0149. Source, delivery and effect work are new
@@ -126,5 +142,7 @@ object they all hang off.
   applies a writeback effect. A test covers crash mid-claim, takeover after
   lease expiry, and a rolling deploy with two runtime versions.
 - The GitHub profile runs as a Source with unchanged object identity.
-- No integration outside the runtime needs its own credential or schedule
-  configuration.
+- A GitHub batch sent through a Source produces the same object ids as
+  before.
+- No sync, delivery or writeback integration outside the runtime needs its
+  own credential or schedule configuration.
