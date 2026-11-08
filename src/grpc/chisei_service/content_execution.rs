@@ -220,7 +220,7 @@ impl ChiseiServiceImpl {
         context: Option<crate::enterprise::AuthenticatedContext>,
         requested_plan: ContentExecutionPlanV1,
         resolved_parts: Vec<ResolvedContentPartV1>,
-    ) -> Result<<Self as ChiseiService>::ExecuteContentPlanStreamStream, Status> {
+    ) -> Result<tonic::codegen::BoxStream<ExecuteContentPlanStreamEvent>, Status> {
         self.require_in_process_namespace_policy()?;
         let requested_plan_id = requested_plan
             .execution

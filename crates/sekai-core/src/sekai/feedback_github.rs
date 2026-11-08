@@ -1,10 +1,10 @@
 //! Publish qualifying feedback findings to one configured GitHub repository (#1232).
 //!
-//! The executor authorizes an external action, verifies the permit, redeems it,
-//! mutates only the configured repository, and records execution evidence plus a
-//! durable `feedback_external_issue` mapping. A lost create or update is pending
-//! reconciliation: the next pass lists issues for the public marker and never
-//! retries the mutation blindly.
+//! The plane actor authorizes an external action, redeems the permit, mutates
+//! only the configured repository at the bound API origin, and records
+//! execution evidence plus a durable `feedback_external_issue` mapping. A lost
+//! create or update is pending reconciliation: the next pass lists issues for
+//! the public marker and never retries the mutation blindly.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,6 +101,82 @@ impl GitHubTarget {
             .and_then(|rest| rest.split_once('#'))
             .is_some_and(|(repo, _)| repo == self.repository())
     }
+}
+
+/// Scheme and host (optional port) of the GitHub API URL. Path and query are
+/// dropped. Userinfo, percent-encoding, whitespace, and control characters are
+/// refused so the permit cannot bind a credential or a host that HTTP parsing
+/// would rewrite.
+pub fn github_api_origin(api_url: &str) -> Option<String> {
+    let raw = api_url.trim();
+    let (scheme, rest) = raw
+        .strip_prefix("https://")
+        .map(|rest| ("https", rest))
+        .or_else(|| raw.strip_prefix("http://").map(|rest| ("http", rest)))?;
+    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if hostport.is_empty()
+        || hostport.contains(['@', '\\', '%'])
+        || hostport
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || ch.is_ascii_control())
+    {
+        return None;
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.contains(':')
+                && !port.is_empty()
+                && port.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            (host, Some(port))
+        }
+        _ if hostport.contains(':') => return None,
+        _ => (hostport, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    match port {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// Plane actor that authorizes and redeems. Empty defaults to [`RUNTIME_ID`].
+/// Privileged bootstrap principals are refused.
+pub fn publisher_principal(run_as: &str) -> Option<String> {
+    let value = run_as.trim();
+    if value.is_empty() {
+        return Some(RUNTIME_ID.into());
+    }
+    if matches!(value, "root" | "local") {
+        return None;
+    }
+    Some(value.into())
+}
+
+pub fn permit_target_selectors(
+    namespace: &str,
+    target: &GitHubTarget,
+    api_origin: &str,
+) -> Vec<String> {
+    // v1 permits refuse `://` in selectors; scheme stays in api_origin preconditions.
+    let hostport = api_origin
+        .strip_prefix("https://")
+        .or_else(|| api_origin.strip_prefix("http://"))
+        .unwrap_or(api_origin);
+    vec![
+        format!("project:{}/github:{}", namespace, target.repository()),
+        format!("project:{namespace}/github-api:{hostport}"),
+    ]
+}
+
+pub fn permit_preconditions(target: &GitHubTarget, api_origin: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("repository".into(), target.repository()),
+        ("api_origin".into(), api_origin.into()),
+    ])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1795,6 +1871,65 @@ mod tests {
         let target = GitHubTarget::parse("tenkai-org", "tenkai", 0).unwrap();
         assert_eq!(target.daily_cap, DEFAULT_DAILY_CAP);
         assert_eq!(target.repository(), "tenkai-org/tenkai");
+    }
+
+    #[test]
+    fn github_api_origin_binds_scheme_and_host() {
+        assert_eq!(
+            github_api_origin("https://api.github.com"),
+            Some("https://api.github.com".into())
+        );
+        assert_eq!(
+            github_api_origin(" https://api.github.com/api/v3 "),
+            Some("https://api.github.com".into())
+        );
+        assert_eq!(
+            github_api_origin("http://127.0.0.1:8443/repos"),
+            Some("http://127.0.0.1:8443".into())
+        );
+        assert!(github_api_origin("https://user:token@api.github.com").is_none());
+        assert!(github_api_origin("https://api.github.com%2eevil.com").is_none());
+        assert!(github_api_origin("https://api.github.com\tevil.com").is_none());
+        assert!(github_api_origin("ftp://api.github.com").is_none());
+        assert!(github_api_origin("not-a-url").is_none());
+    }
+
+    #[test]
+    fn publisher_principal_rejects_privileged_actors() {
+        assert_eq!(publisher_principal(""), Some(RUNTIME_ID.into()));
+        assert_eq!(publisher_principal("ops-bot"), Some("ops-bot".into()));
+        assert!(publisher_principal("root").is_none());
+        assert!(publisher_principal("local").is_none());
+        assert!(publisher_principal(" root ").is_none());
+    }
+
+    #[test]
+    fn permit_binds_repository_and_api_origin() {
+        let target = GitHubTarget::parse("tenkai-org", "tenkai", 5).unwrap();
+        let origin = "https://api.github.com";
+        let selectors = permit_target_selectors(NAMESPACE, &target, origin);
+        assert_eq!(
+            selectors,
+            [
+                "project:ops/github:tenkai-org/tenkai",
+                "project:ops/github-api:api.github.com"
+            ]
+        );
+        let project_root = format!("project:{NAMESPACE}/");
+        assert!(
+            selectors
+                .iter()
+                .all(|selector| selector.starts_with(&project_root) && !selector.contains("://"))
+        );
+        let preconditions = permit_preconditions(&target, origin);
+        assert_eq!(
+            preconditions.get("repository").map(String::as_str),
+            Some("tenkai-org/tenkai")
+        );
+        assert_eq!(
+            preconditions.get("api_origin").map(String::as_str),
+            Some(origin)
+        );
     }
 
     #[test]

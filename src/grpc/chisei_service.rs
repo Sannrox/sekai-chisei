@@ -2,7 +2,6 @@ use crate::chisei_store::ChiseiEvolveStore;
 use base64::Engine as _;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -628,12 +627,6 @@ impl ChiseiServiceImpl {
 
 #[tonic::async_trait]
 impl ChiseiService for ChiseiServiceImpl {
-    type ExecutePlanStreamStream =
-        Pin<Box<dyn futures_util::Stream<Item = Result<ExecutePlanStreamEvent, Status>> + Send>>;
-    type ExecuteContentPlanStreamStream = Pin<
-        Box<dyn futures_util::Stream<Item = Result<ExecuteContentPlanStreamEvent, Status>> + Send>,
-    >;
-
     async fn evaluate_governed_subject(
         &self,
         req: Request<EvaluateGovernedSubjectRequest>,
@@ -854,7 +847,7 @@ impl ChiseiService for ChiseiServiceImpl {
     async fn execute_plan_stream(
         &self,
         req: Request<ExecutePlanRequest>,
-    ) -> Result<Response<Self::ExecutePlanStreamStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ExecutePlanStreamEvent>>, Status> {
         rpc_execution::execute_plan_stream(self, req).await
     }
 
@@ -868,7 +861,7 @@ impl ChiseiService for ChiseiServiceImpl {
     async fn execute_content_plan_stream(
         &self,
         req: Request<ExecuteContentPlanRequest>,
-    ) -> Result<Response<Self::ExecuteContentPlanStreamStream>, Status> {
+    ) -> Result<Response<tonic::codegen::BoxStream<ExecuteContentPlanStreamEvent>>, Status> {
         rpc_execution::execute_content_plan_stream(self, req).await
     }
 

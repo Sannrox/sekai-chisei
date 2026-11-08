@@ -285,6 +285,9 @@ impl ClaimedAgentTurn {
 }
 
 /// How a worker finished an agent turn; the reason lands on its receipt.
+///
+/// New outcomes may appear; match with a wildcard.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentTurnAck {
     Completed {
@@ -302,6 +305,9 @@ pub enum AgentTurnAck {
 }
 
 /// Terminal or park acknowledgement for Action work.
+///
+/// New outcomes may appear; match with a wildcard.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActionAck {
     Completed {
