@@ -560,6 +560,22 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
+    /// Empty leftover `content` on writer Actions (and decision memory) for
+    /// items forgotten before #2032. Idempotent; object-then-Action order
+    /// matches forget (#2037).
+    pub fn backfill_forgotten_memory_action_redaction(&self) -> Result<(), String> {
+        let objects = list_forgotten_site_agent_memory(self)?;
+        for object in objects {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            sqlite_redact_forgotten_memory_actions(&tx, Some(&object))?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn get_action_instance_by_idempotency(
         &self,
         namespace: &str,
@@ -1399,7 +1415,7 @@ pub(crate) fn sqlite_turn_fence_refusal(
         .then(|| format!("agent turn {turn_id} is no longer claimed by this submission")))
 }
 
-fn sqlite_redact_if_forgotten_writer(
+pub(crate) fn sqlite_redact_if_forgotten_writer(
     tx: &rusqlite::Transaction<'_>,
     instance: &mut ActionInstance,
 ) -> Result<(), String> {
@@ -1443,6 +1459,27 @@ fn sqlite_stored_writer_already_redacted(
     incoming: &ActionInstance,
 ) -> bool {
     crate::sekai::site_agent_memory::stored_writer_already_redacted(stored_parameters, incoming)
+}
+
+fn list_forgotten_site_agent_memory(db: &SekaiDb) -> Result<Vec<crate::domain::Object>, String> {
+    use crate::db::sekai::row_to_object;
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated
+             FROM sekai_objects
+             WHERE kind = ?1 AND json_extract(properties, '$.forgotten') = 'true'
+             ORDER BY namespace, id",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![crate::sekai::site_agent_memory::KIND],
+            row_to_object,
+        )
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
 }
 
 /// Empty forgotten memory `content` in writer Action parameters, in this

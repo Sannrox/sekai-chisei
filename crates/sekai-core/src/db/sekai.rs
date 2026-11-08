@@ -386,6 +386,7 @@ impl SekaiDb {
         self.migrate_governed_action_types()?;
         self.migrate_action_instances()?;
         self.migrate_decision_memory()?;
+        self.backfill_forgotten_memory_action_redaction()?;
         self.migrate_action_effects()?;
         // Sekai-owned, as their PostgreSQL migrations are.
         self.migrate_action_plans()?;

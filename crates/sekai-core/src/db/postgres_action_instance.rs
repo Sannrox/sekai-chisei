@@ -209,6 +209,23 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    /// Empty leftover `content` on writer Actions (and decision memory) for
+    /// items forgotten before #2032. Idempotent; object-then-Action order
+    /// matches forget (#2037).
+    pub fn backfill_forgotten_memory_action_redaction(&self) -> Result<(), String> {
+        let objects = postgres_list_forgotten_site_agent_memory(self)?;
+        for object in objects {
+            let mut connection = self.connection()?;
+            let mut tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            lock_object_lifecycle(&mut tx, &object.id)?;
+            postgres_redact_forgotten_memory_actions(&mut tx, Some(&object))?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Applies an admission's object write only while `lease` still names the
     /// reservation's owner and generation and has not expired (#1930). A
     /// takeover bumps the generation, so a stale owner's write is refused.
@@ -915,7 +932,29 @@ fn postgres_insert_decision_memory<C: postgres::GenericClient>(
         .map_err(|error| error.to_string())
 }
 
-fn postgres_redact_if_forgotten_writer<C: postgres::GenericClient>(
+fn postgres_list_forgotten_site_agent_memory(
+    db: &PostgresDb,
+) -> Result<Vec<crate::domain::Object>, String> {
+    let mut connection = db.connection()?;
+    let rows = match connection.query(
+        &format!(
+            "SELECT {} FROM sekai_objects
+             WHERE kind = $1 AND properties::jsonb ->> 'forgotten' = 'true'
+             ORDER BY namespace, id",
+            crate::db::postgres_audit::OBJECT_COLUMNS
+        ),
+        &[&crate::sekai::site_agent_memory::KIND],
+    ) {
+        Ok(rows) => rows,
+        Err(error) if error.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE) => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    rows.into_iter().map(row_to_object).collect()
+}
+
+pub(crate) fn postgres_redact_if_forgotten_writer<C: postgres::GenericClient>(
     client: &mut C,
     instance: &mut ActionInstance,
 ) -> Result<(), String> {
@@ -1542,5 +1581,113 @@ mod tests {
             "{}",
             noise.parameters_json
         );
+    }
+
+    /// Pre-#2032 forget left `content` on the writer Action. Open-path
+    /// backfill empties it, and a later plan-step close does not restore it.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_backfill_and_plan_close_redact_forgotten_writer_content() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let note_id = format!("note-{run}");
+        let mut properties = HashMap::new();
+        properties.insert("instance_id".into(), format!("line-{run}"));
+        properties.insert(CONTENT_PROPERTY.into(), "secret".into());
+        let mut note = record(&note_id, KIND, 500, properties);
+        db.create_object_with_audit(&note, "a").unwrap();
+        let mut writer = sample_for_test(STATUS_ADMITTED);
+        writer.instance_id = format!("writer-{run}");
+        writer.idempotency_key = format!("key-writer-{run}");
+        writer.operation_id = format!("op-writer-{run}");
+        writer.type_id = ACTION_CREATE.into();
+        writer.parameters_json = format!(r#"{{"object_id":"{note_id}","content":"secret"}}"#);
+        writer.request_digest = crate::sekai::action_instance::compute_request_digest(
+            &writer.namespace,
+            &writer.type_id,
+            &writer.version,
+            &writer.parameters_json,
+            &writer.evidence_submission_ids,
+        )
+        .unwrap();
+        db.put_action_instance(&writer).unwrap();
+        note.updated += 1;
+        note.properties
+            .insert(CONTENT_PROPERTY.into(), String::new());
+        note.properties
+            .insert(FORGOTTEN_PROPERTY.into(), "true".into());
+        db.update_object_with_audit(&note, "a").unwrap();
+        let restored = db
+            .get_action_instance(&writer.instance_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            restored.parameters_json.contains("secret"),
+            "{}",
+            restored.parameters_json
+        );
+        let digest = restored.request_digest.clone();
+
+        db.backfill_forgotten_memory_action_redaction().unwrap();
+        db.backfill_forgotten_memory_action_redaction().unwrap();
+
+        let stored = db
+            .get_action_instance(&writer.instance_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.parameters_json.contains("secret"),
+            "{}",
+            stored.parameters_json
+        );
+        assert_eq!(stored.request_digest, digest);
+
+        db.put_plan_execution(&PlanExecution {
+            namespace: "acme".into(),
+            plan_id: format!("plan-{run}"),
+            simulation_id: "sim-1".into(),
+            simulation_digest: "sha256:one".into(),
+            status: EXECUTION_RUNNING.into(),
+            next_step: 0,
+            steps: Vec::new(),
+            stop_reason: String::new(),
+            stopped_at_step: None,
+            started_by: "planner".into(),
+            updated_at_ms: 1,
+            revision: 0,
+            claim_holder: format!("run-{run}"),
+            claim_until_ms: 10_000,
+        })
+        .unwrap();
+        let mut closing = sample_for_test(STATUS_DENIED);
+        closing.instance_id = format!("close-{run}");
+        closing.idempotency_key = format!("close-{run}");
+        closing.operation_id = format!("op-close-{run}");
+        closing.type_id = ACTION_UPDATE.into();
+        closing.parameters_json = format!(r#"{{"object_id":"{note_id}","content":"secret"}}"#);
+        closing.request_digest = crate::sekai::action_instance::compute_request_digest(
+            &closing.namespace,
+            &closing.type_id,
+            &closing.version,
+            &closing.parameters_json,
+            &closing.evidence_submission_ids,
+        )
+        .unwrap();
+        let close_digest = closing.request_digest.clone();
+        assert!(
+            db.close_plan_step_key(&closing, &format!("plan-{run}"), &format!("run-{run}"))
+                .unwrap()
+        );
+        let closed = db
+            .get_action_instance(&closing.instance_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !closed.parameters_json.contains("secret"),
+            "{}",
+            closed.parameters_json
+        );
+        assert_eq!(closed.request_digest, close_digest);
     }
 }

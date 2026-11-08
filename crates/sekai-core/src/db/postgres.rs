@@ -1226,6 +1226,9 @@ impl PostgresDb {
         // it is reported and left as it is.
         db.reject_legacy_tenant_state()?;
         db.migrate()?;
+        if schema_plane.includes_sekai() {
+            db.backfill_forgotten_memory_action_redaction()?;
+        }
         crate::db::schema_plane::reject_populated_foreign_postgres(&db, schema_plane)?;
         Ok(db)
     }

@@ -94,6 +94,15 @@ impl RuntimeDb {
         }
     }
 
+    pub fn backfill_forgotten_memory_action_redaction(&self) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.backfill_forgotten_memory_action_redaction(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.backfill_forgotten_memory_action_redaction())
+            }
+        }
+    }
+
     pub fn put_action_instance(
         &self,
         instance: &crate::sekai::action_instance::ActionInstance,
