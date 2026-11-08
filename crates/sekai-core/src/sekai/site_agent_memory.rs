@@ -785,6 +785,80 @@ mod tests {
         assert!(!is_writer_action("site.ping"));
     }
 
+    #[test]
+    fn writer_memory_object_index_sql_names_the_writer_actions() {
+        let sql = include_str!("../db/postgres/0143_writer_memory_object_indexes.sql");
+        for action in [ACTION_CREATE, ACTION_UPDATE, ACTION_FORGET] {
+            assert!(sql.contains(action), "{action}");
+        }
+    }
+
+    #[test]
+    fn forget_redaction_query_plans_use_writer_object_indexes() {
+        let db = setup();
+        let crate::db::runtime_db::RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite");
+        };
+        let conn = store.conn();
+        let index_names: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index'
+                       AND name IN (
+                         'idx_action_instances_writer_object',
+                         'idx_decision_memory_writer_parameters_object',
+                         'idx_decision_memory_writer_facts_object'
+                       )
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            index_names,
+            [
+                "idx_action_instances_writer_object",
+                "idx_decision_memory_writer_facts_object",
+                "idx_decision_memory_writer_parameters_object",
+            ]
+        );
+
+        let plan = |sql: &str| -> Vec<String> {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            stmt.query_map(["site", "note-1"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let action_plan = plan(crate::sekai::action_instance::SQLITE_REDACT_WRITER_ACTIONS);
+        assert!(
+            action_plan
+                .iter()
+                .any(|detail| detail.contains("idx_action_instances_writer_object")),
+            "unexpected action redaction plan: {action_plan:?}"
+        );
+        let parameters_plan =
+            plan(crate::sekai::action_instance::SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS);
+        assert!(
+            parameters_plan
+                .iter()
+                .any(|detail| detail.contains("idx_decision_memory_writer_parameters_object")),
+            "unexpected decision-memory parameters plan: {parameters_plan:?}"
+        );
+        let facts_plan =
+            plan(crate::sekai::action_instance::SQLITE_REDACT_DECISION_MEMORY_BY_FACTS);
+        assert!(
+            facts_plan
+                .iter()
+                .any(|detail| detail.contains("idx_decision_memory_writer_facts_object")),
+            "unexpected decision-memory facts plan: {facts_plan:?}"
+        );
+    }
+
     /// Forget empties retained writer-Action parameters so a reader of those
     /// Actions cannot recover the note, and keeps the original request digest.
     #[test]

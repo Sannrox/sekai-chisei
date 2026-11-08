@@ -563,7 +563,17 @@ impl SekaiDb {
             CREATE INDEX IF NOT EXISTS idx_action_instances_op
                 ON sekai_action_instances(operation_id);
             CREATE INDEX IF NOT EXISTS idx_action_instances_type
-                ON sekai_action_instances(namespace, type_id, version);",
+                ON sekai_action_instances(namespace, type_id, version);
+            CREATE INDEX IF NOT EXISTS idx_action_instances_writer_object
+                ON sekai_action_instances (
+                    namespace,
+                    json_extract(parameters_json, '$.object_id')
+                )
+                WHERE type_id IN (
+                    'site_agent.memory.create',
+                    'site_agent.memory.update',
+                    'site_agent.memory.forget'
+                );",
         )
         .map_err(|e| e.to_string())
     }
@@ -1491,43 +1501,58 @@ fn list_forgotten_site_agent_memory(db: &SekaiDb) -> Result<Vec<crate::domain::O
         .map_err(|error| error.to_string())
 }
 
+/// Writer-type literals must match [`crate::sekai::site_agent_memory`]
+/// create/update/forget so the partial indexes in `migrate_*` apply (#2048).
+pub(crate) const SQLITE_REDACT_WRITER_ACTIONS: &str =
+    "SELECT instance_id, parameters_json, body_json
+     FROM sekai_action_instances
+     WHERE namespace = ?1
+       AND type_id IN (
+         'site_agent.memory.create',
+         'site_agent.memory.update',
+         'site_agent.memory.forget'
+       )
+       AND json_extract(parameters_json, '$.object_id') = ?2";
+pub(crate) const SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS: &str = "SELECT memory_id, body_json
+     FROM sekai_action_decision_memory
+     WHERE namespace = ?1
+       AND type_id IN (
+         'site_agent.memory.create',
+         'site_agent.memory.update',
+         'site_agent.memory.forget'
+       )
+       AND json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id') = ?2";
+pub(crate) const SQLITE_REDACT_DECISION_MEMORY_BY_FACTS: &str = "SELECT memory_id, body_json
+     FROM sekai_action_decision_memory
+     WHERE namespace = ?1
+       AND type_id IN (
+         'site_agent.memory.create',
+         'site_agent.memory.update',
+         'site_agent.memory.forget'
+       )
+       AND json_extract(json_extract(body_json, '$.facts_json'), '$.object_id') = ?2";
+
 /// Empty forgotten memory `content` in writer Action parameters, in this
 /// transaction (#1969). Leaves each stored request digest as it was.
 pub(crate) fn sqlite_redact_forgotten_memory_actions(
     tx: &rusqlite::Transaction<'_>,
     written: Option<&crate::domain::Object>,
 ) -> Result<(), String> {
-    use crate::sekai::site_agent_memory::{
-        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, is_forgotten, redact_writer_instance,
-    };
+    use crate::sekai::site_agent_memory::{is_forgotten, redact_writer_instance};
     let Some(object) = written.filter(|object| is_forgotten(object)) else {
         return Ok(());
     };
     let mut stmt = tx
-        .prepare(
-            "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
-             WHERE namespace = ?1
-               AND type_id IN (?2, ?3, ?4)
-               AND json_extract(parameters_json, '$.object_id') = ?5",
-        )
+        .prepare(SQLITE_REDACT_WRITER_ACTIONS)
         .map_err(|error| error.to_string())?;
     let rows = stmt
-        .query_map(
-            params![
-                object.namespace,
-                ACTION_CREATE,
-                ACTION_UPDATE,
-                ACTION_FORGET,
-                object.id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+        .query_map(params![object.namespace, object.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();
     for row in rows {
@@ -1562,8 +1587,7 @@ pub(crate) fn sqlite_restore_forgotten_memory_actions(
     previous: &crate::domain::Object,
 ) -> Result<(), String> {
     use crate::sekai::site_agent_memory::{
-        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, CONTENT_PROPERTY, KIND, is_forgotten,
-        restore_writer_instance,
+        CONTENT_PROPERTY, KIND, is_forgotten, restore_writer_instance,
     };
     if previous.kind != KIND || is_forgotten(previous) {
         return Ok(());
@@ -1572,30 +1596,16 @@ pub(crate) fn sqlite_restore_forgotten_memory_actions(
         return Ok(());
     };
     let mut stmt = tx
-        .prepare(
-            "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
-             WHERE namespace = ?1
-               AND type_id IN (?2, ?3, ?4)
-               AND json_extract(parameters_json, '$.object_id') = ?5",
-        )
+        .prepare(SQLITE_REDACT_WRITER_ACTIONS)
         .map_err(|error| error.to_string())?;
     let rows = stmt
-        .query_map(
-            params![
-                previous.namespace,
-                ACTION_CREATE,
-                ACTION_UPDATE,
-                ACTION_FORGET,
-                previous.id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
+        .query_map(params![previous.namespace, previous.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();
     for row in rows {
@@ -1628,7 +1638,6 @@ fn sqlite_redact_forgotten_memory_decisions(
     object: &crate::domain::Object,
 ) -> Result<(), String> {
     use crate::sekai::decision_memory::DecisionMemory;
-    use crate::sekai::site_agent_memory::{ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE};
     let present: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master
@@ -1640,45 +1649,39 @@ fn sqlite_redact_forgotten_memory_decisions(
     if present == 0 {
         return Ok(());
     }
-    let mut stmt = tx
-        .prepare(
-            "SELECT memory_id, body_json FROM sekai_action_decision_memory
-             WHERE namespace = ?1 AND type_id IN (?2, ?3, ?4)
-               AND (
-                 json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id') = ?5
-                 OR json_extract(json_extract(body_json, '$.facts_json'), '$.object_id') = ?5
-               )",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map(
-            params![
-                object.namespace,
-                ACTION_CREATE,
-                ACTION_UPDATE,
-                ACTION_FORGET,
-                object.id
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map_err(|error| error.to_string())?;
+    let mut seen = std::collections::BTreeSet::new();
     let mut updates = Vec::new();
-    for row in rows {
-        let (memory_id, body_json) = row.map_err(|error| error.to_string())?;
-        let mut memory: DecisionMemory = serde_json::from_str(&body_json)
-            .map_err(|error| format!("corrupt decision memory: {error}"))?;
-        let object_id = crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+    for sql in [
+        SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS,
+        SQLITE_REDACT_DECISION_MEMORY_BY_FACTS,
+    ] {
+        let mut stmt = tx.prepare(sql).map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![object.namespace, object.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (memory_id, body_json) = row.map_err(|error| error.to_string())?;
+            if !seen.insert(memory_id.clone()) {
+                continue;
+            }
+            let mut memory: DecisionMemory = serde_json::from_str(&body_json)
+                .map_err(|error| format!("corrupt decision memory: {error}"))?;
+            let object_id = crate::sekai::site_agent_memory::writer_object_id(
+                &memory.parameters_json,
+            )
             .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json));
-        if object_id.as_deref() != Some(object.id.as_str()) {
-            continue;
+            if object_id.as_deref() != Some(object.id.as_str()) {
+                continue;
+            }
+            if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
+                continue;
+            }
+            let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+            updates.push((memory_id, body_json));
         }
-        if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
-            continue;
-        }
-        let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
-        updates.push((memory_id, body_json));
     }
-    drop(stmt);
     for (memory_id, body_json) in updates {
         tx.execute(
             "UPDATE sekai_action_decision_memory SET body_json = ?2 WHERE memory_id = ?1",
