@@ -32,6 +32,17 @@ runtime's placement labels; a run whose `requires` those labels do not meet
 is neither listed nor claimable for it, and a targeted claim of one is
 contention (see [governed-transforms.md](governed-transforms.md)).
 
+The client lists, claims, heartbeats and acknowledges every kind through the
+one claim family below (`list_work`, `claim_work`, `heartbeat_work`,
+`ack_work`); the per-kind methods are thin wrappers over it with the same
+signatures. When a plane may not serve the family (`UNIMPLEMENTED`, the
+maturity gate's refusal of an RPC it does not know, or `PERMISSION_DENIED`
+from auth that runs before that gate), each call falls back to that kind's
+per-kind RPC, so planes and workers upgrade in either order. The per-kind
+RPC runs its own auth, so a real denial still surfaces.
+Older clients keep calling the per-kind RPCs, which stay until the next
+major.
+
 Typed errors keep fence loss, idle, contention, denial, and unavailability
 distinct. `SdkError` does not retain server status text, so the client maps
 by RPC role: list `FailedPrecondition` is unavailability (including the

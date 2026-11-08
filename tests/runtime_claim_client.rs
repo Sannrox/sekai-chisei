@@ -1,7 +1,10 @@
 //! Runtime-claim client against SQLite and PostgreSQL planes (#1389).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -9,7 +12,7 @@ use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
-use sekai_chisei::rpc_maturity::RpcMaturityLayer;
+use sekai_chisei::rpc_maturity::{self, RpcMaturityLayer};
 use sekai_chisei::sekai::action_effect::plan_effects_for_admit;
 use sekai_chisei::sekai::action_instance::{ActionInstance, STATUS_ADMITTED};
 use sekai_chisei::sekai::dataset::{ColumnDef, Dataset};
@@ -19,14 +22,16 @@ use sekai_chisei::sekai::governed_transform::{
 use sekai_chisei::sekai::security::Role;
 use sekai_client::claim::{
     ActionAck, ActionFence, ClaimAttempt, DELEGATOR_DISABLED, RuntimeClaimError, TransformFence,
-    TransformWrite,
+    TransformWrite, WorkFence,
 };
 use sekai_client::protocol::sekai::TransformRunInputRow;
 use sekai_client::{ClientConfig, CoreLoopClient};
 use sekai_domain::gateway_keys::hash_gateway_key;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tower::Layer;
+use tonic::Status;
+use tonic::server::NamedService;
+use tower::{Layer, Service};
 
 use crate::postgres_scratch::ScratchDatabase;
 
@@ -40,11 +45,81 @@ struct ServingPlane {
     join: Option<tokio::task::JoinHandle<()>>,
 }
 
+/// The work family of ADR 0149, which planes before it do not serve.
+const WORK_FAMILY: [&str; 4] = [
+    "/sekai.SekaiService/ListClaimableWork",
+    "/sekai.SekaiService/ClaimWork",
+    "/sekai.SekaiService/HeartbeatWorkClaim",
+    "/sekai.SekaiService/AckWork",
+];
+
+/// Answers the work family as an older plane does, and records which of its
+/// RPCs were refused: its maturity gate refuses list and claim, and its auth
+/// refuses runtime-token heartbeat and acknowledge before that gate.
+#[derive(Clone)]
+struct OlderPlane<S> {
+    inner: S,
+    refuse_work_family: bool,
+    refused: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl<S: NamedService> NamedService for OlderPlane<S> {
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S, B, R> Service<http::Request<B>> for OlderPlane<S>
+where
+    S: Service<http::Request<B>, Response = http::Response<R>>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    R: Default + Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        let path = request.uri().path();
+        if self.refuse_work_family && WORK_FAMILY.contains(&path) {
+            self.refused.lock().unwrap().insert(path.to_string());
+            let refusal = if path.ends_with("WorkClaim") || path.ends_with("AckWork") {
+                Status::permission_denied("runtime token admits only calls for its claimed work")
+            } else {
+                Status::failed_precondition(rpc_maturity::UNKNOWN_MESSAGE)
+            }
+            .into_http();
+            return Box::pin(std::future::ready(Ok(refusal)));
+        }
+        Box::pin(self.inner.call(request))
+    }
+}
+
 impl ServingPlane {
     async fn start(db: RuntimeDb) -> Self {
+        Self::launch(db, false).await.0
+    }
+
+    /// A plane that predates the work family.
+    async fn start_older(db: RuntimeDb) -> (Self, Arc<Mutex<BTreeSet<String>>>) {
+        Self::launch(db, true).await
+    }
+
+    async fn launch(
+        db: RuntimeDb,
+        refuse_work_family: bool,
+    ) -> (Self, Arc<Mutex<BTreeSet<String>>>) {
         let store = SekaiStore::from_shared_runtime(Arc::new(db));
-        let service = RpcMaturityLayer::new(true)
-            .layer(SekaiServiceServer::new(SekaiServiceImpl::new(store)));
+        let refused = Arc::new(Mutex::new(BTreeSet::new()));
+        let service = OlderPlane {
+            inner: RpcMaturityLayer::new(true)
+                .layer(SekaiServiceServer::new(SekaiServiceImpl::new(store))),
+            refuse_work_family,
+            refused: refused.clone(),
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -57,11 +132,14 @@ impl ServingPlane {
                 .await
                 .unwrap();
         });
-        Self {
-            endpoint,
-            stop: Some(stop),
-            join: Some(join),
-        }
+        (
+            Self {
+                endpoint,
+                stop: Some(stop),
+                join: Some(join),
+            },
+            refused,
+        )
     }
 
     async fn client(&self) -> CoreLoopClient<sekai_client::GrpcTransport> {
@@ -481,6 +559,58 @@ fn postgres_runtime_claim_transform_placement_conformance() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_runtime_claim_action_conformance() {
     exercise_action(RuntimeDb::memory(), "sqlite-action").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plane_without_the_work_family_is_served_through_the_per_kind_rpcs() {
+    let db = RuntimeDb::memory();
+    seed_action(&db, "older-plane");
+    let (plane, refused) = ServingPlane::start_older(db).await;
+    let client = plane.client().await;
+    let claim = client.runtime_claim();
+
+    let claimed = match claim
+        .claim_next_action("runner-a", Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        ClaimAttempt::Claimed(claimed) => claimed,
+        other => panic!("expected claimed action, got {other:?}"),
+    };
+    let fence = ActionFence::from_effect(claimed.effect.as_ref().unwrap(), "runner-a");
+    assert!(matches!(
+        claim
+            .claim_action_work(&fence.effect_id, "runner-b", Duration::from_secs(30), None)
+            .await
+            .unwrap(),
+        ClaimAttempt::Contended
+    ));
+    claim
+        .heartbeat_action(&fence, Duration::from_secs(30))
+        .await
+        .expect("heartbeat through HeartbeatActionClaim");
+    // Omitted options are the kind's defaults, as on the plane.
+    claim
+        .ack_work(
+            &WorkFence::try_from(&fence).unwrap(),
+            "completed",
+            "done".into(),
+            None,
+        )
+        .await
+        .expect("ack through AckActionWork");
+    let stale = claim
+        .heartbeat_action(&fence, Duration::from_secs(30))
+        .await
+        .expect_err("acknowledged claim");
+    assert!(matches!(stale, RuntimeClaimError::FenceLost), "{stale}");
+
+    assert_eq!(
+        *refused.lock().unwrap(),
+        WORK_FAMILY.map(String::from).into_iter().collect(),
+        "every call tried the work family first"
+    );
+    plane.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
