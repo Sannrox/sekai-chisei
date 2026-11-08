@@ -323,6 +323,16 @@ fn fixture_digest(bytes: &[u8]) -> String {
 pub fn validate_object_write(
     db: &RuntimeDb,
     object: &mut Object,
+    now_ms: i64,
+) -> Result<(), String> {
+    validate_object_write_for(db, object, None, now_ms)
+}
+
+/// Same rules as [`validate_object_write`], plus the investigation-runtime
+/// recorder stamp when `submitter` is [`INVESTIGATION_RUNTIME`] (#2053).
+pub(crate) fn validate_object_write_for(
+    db: &RuntimeDb,
+    object: &mut Object,
     submitter: Option<&str>,
     now_ms: i64,
 ) -> Result<(), String> {

@@ -504,7 +504,7 @@ fn revalidate_after_marking(
     object: &mut Object,
     now_ms: i64,
 ) -> Result<(), StreamingApplyError> {
-    crate::sekai::feedback_package::validate_object_write(db, object, None, now_ms)
+    crate::sekai::feedback_package::validate_object_write(db, object, now_ms)
         .and_then(|()| crate::sekai::function_document::validate_lineage_write(db, object, now_ms))
         .map_err(StreamingApplyError::FailedPrecondition)
 }

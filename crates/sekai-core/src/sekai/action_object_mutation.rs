@@ -653,7 +653,7 @@ fn validate_object_write(
     submitter: Option<Submitter<'_>>,
     now_ms: i64,
 ) -> Result<(), ActionObjectMutationError> {
-    crate::sekai::feedback_package::validate_object_write(
+    crate::sekai::feedback_package::validate_object_write_for(
         db,
         planned,
         submitter.map(|submitter| submitter.principal),
