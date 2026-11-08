@@ -435,6 +435,58 @@ fn list_projected(
     Ok(out)
 }
 
+struct ObservationCache {
+    listed: Vec<QualityObservation>,
+    by_id: HashMap<String, QualityObservation>,
+}
+
+fn load_observation_cache(
+    db: &RuntimeDb,
+    namespace: &str,
+) -> Result<ObservationCache, QualityError> {
+    let listed_objects = list_projected(db, namespace, KIND_OBSERVATION)?;
+    let mut listed = Vec::with_capacity(listed_objects.len());
+    let mut by_id = HashMap::with_capacity(listed_objects.len());
+    for object in listed_objects {
+        let Some(view) = quality_observation(&object) else {
+            continue;
+        };
+        by_id.insert(view.view.object_id.clone(), view.clone());
+        listed.push(view);
+    }
+    Ok(ObservationCache { listed, by_id })
+}
+
+fn original_observation(
+    db: &RuntimeDb,
+    finding: &Object,
+    cache: &ObservationCache,
+) -> Result<Option<(String, QualityObservation)>, QualityError> {
+    let Some(observation_id) = finding.properties.get("observation_id") else {
+        return Ok(None);
+    };
+    if let Some(original) = cache.by_id.get(observation_id) {
+        let signature = original.view.problem_signature.trim();
+        if signature.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some((signature.to_string(), original.clone())));
+    }
+    let Some(signature) = finding_signature(db, finding)? else {
+        return Ok(None);
+    };
+    let Some(trigger_object) = db
+        .get_object(observation_id)
+        .map_err(|error| QualityError::Internal(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let trigger = db
+        .project_object_property_grants(trigger_object)
+        .map_err(|error| QualityError::Internal(error.to_string()))?;
+    Ok(quality_observation(&trigger).map(|original| (signature, original)))
+}
+
 fn quality_key(parts: &[&str]) -> String {
     let digest = format!("{:x}", Sha256::digest(parts.join("\0").as_bytes()));
     digest[..16].to_string()
@@ -583,34 +635,27 @@ pub fn evaluate_finding(
     actor: &str,
     now_ms: i64,
 ) -> Result<Option<QualityRecord>, QualityError> {
+    let cache = load_observation_cache(db, &finding.namespace)?;
+    evaluate_finding_cached(db, finding, earlier_signatures, &cache, actor, now_ms)
+}
+
+fn evaluate_finding_cached(
+    db: &RuntimeDb,
+    finding: &Object,
+    earlier_signatures: &HashMap<String, String>,
+    cache: &ObservationCache,
+    actor: &str,
+    now_ms: i64,
+) -> Result<Option<QualityRecord>, QualityError> {
     if finding.kind != KIND_FINDING {
         return Ok(None);
     }
-    let Some(signature) = finding_signature(db, finding)? else {
+    let Some((signature, original)) = original_observation(db, finding, cache)? else {
         return Ok(None);
     };
-    let Some(observation_id) = finding.properties.get("observation_id") else {
-        return Ok(None);
-    };
-    let Some(trigger_object) = db
-        .get_object(observation_id)
-        .map_err(|error| QualityError::Internal(error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let trigger = db
-        .project_object_property_grants(trigger_object)
-        .map_err(|error| QualityError::Internal(error.to_string()))?;
-    let Some(original) = quality_observation(&trigger) else {
-        return Ok(None);
-    };
-    let observations = list_projected(db, &finding.namespace, KIND_OBSERVATION)?;
     let mut matches = Vec::new();
     let mut had_later = false;
-    for object in observations {
-        let Some(later) = quality_observation(&object) else {
-            continue;
-        };
+    for later in &cache.listed {
         if later.view.created_ms < finding.created {
             continue;
         }
@@ -618,11 +663,11 @@ pub fn evaluate_finding(
             continue;
         }
         had_later = true;
-        let class = classify_observation(&original, &later);
+        let class = classify_observation(&original, later);
         matches.push(ObservationMatch {
-            observation_id: later.view.object_id,
+            observation_id: later.view.object_id.clone(),
             class,
-            tenkai_version: later.tenkai_version,
+            tenkai_version: later.tenkai_version.clone(),
         });
     }
     let match_class = primary_match_class(&matches, had_later);
@@ -662,10 +707,12 @@ pub fn evaluate_namespace(
             .cmp(&right.created)
             .then(left.id.cmp(&right.id))
     });
+    let cache = load_observation_cache(db, namespace)?;
     let mut earlier_signatures = HashMap::new();
     let mut records = Vec::new();
     for finding in findings {
-        let Some(record) = evaluate_finding(db, &finding, &earlier_signatures, actor, now_ms)?
+        let Some(record) =
+            evaluate_finding_cached(db, &finding, &earlier_signatures, &cache, actor, now_ms)?
         else {
             continue;
         };
@@ -1404,5 +1451,34 @@ mod tests {
                 .iter()
                 .all(|case| case.namespace == OTHER)
         );
+    }
+
+    #[test]
+    fn namespace_pass_matches_single_finding_evaluation() {
+        let runtime = db();
+        let finding = seed_finding(&runtime, "one", "api:agree", "0.5.0");
+        record_observation(
+            &runtime,
+            NAMESPACE,
+            "one-ok",
+            "api:agree",
+            "one-op-ok@0.6.0",
+            "ok",
+            21_000,
+        );
+        let namespaced = evaluate_namespace(&runtime, NAMESPACE, ACTOR, 30_000).unwrap();
+        let from_namespace = namespaced
+            .records
+            .iter()
+            .find(|record| record.finding_id == finding.id)
+            .expect("namespace record");
+        let solo = evaluate_finding(&runtime, &finding, &HashMap::new(), ACTOR, 30_000)
+            .unwrap()
+            .expect("solo record");
+        assert_eq!(solo.verification_id, from_namespace.verification_id);
+        assert_eq!(solo.match_class, from_namespace.match_class);
+        assert_eq!(solo.quality, from_namespace.quality);
+        assert_eq!(solo.tenkai_versions, from_namespace.tenkai_versions);
+        assert_eq!(solo.evidence_coverage, from_namespace.evidence_coverage);
     }
 }
