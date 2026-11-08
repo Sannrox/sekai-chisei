@@ -203,6 +203,8 @@ const AGENT_TURN_CLAIM_INDEX_SCHEMA: &str =
     include_str!("postgres/0141_agent_turn_claim_index.sql");
 const SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA: &str =
     include_str!("postgres/0142_site_agent_memory_instance_index.sql");
+const WRITER_MEMORY_OBJECT_INDEXES_SCHEMA: &str =
+    include_str!("postgres/0143_writer_memory_object_indexes.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1024,6 +1026,12 @@ const MIGRATIONS: &[Migration] = &[
         141,
         "site_agent_memory_instance_index",
         SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        142,
+        "writer_memory_object_indexes",
+        WRITER_MEMORY_OBJECT_INDEXES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2850,6 +2858,39 @@ mod tests {
         );
         assert!(
             SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA.contains("WHERE kind = 'site_agent_memory'")
+        );
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+    }
+
+    #[test]
+    fn writer_memory_object_indexes_match_forget_redaction_predicates() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "writer_memory_object_indexes")
+            .expect("writer_memory_object_indexes");
+        assert_eq!(migration.version, 142);
+        assert!(matches!(migration.owner, MigrationOwner::Sekai));
+        for action in [
+            "site_agent.memory.create",
+            "site_agent.memory.update",
+            "site_agent.memory.forget",
+        ] {
+            assert!(
+                WRITER_MEMORY_OBJECT_INDEXES_SCHEMA.contains(action),
+                "{action}"
+            );
+        }
+        assert!(WRITER_MEMORY_OBJECT_INDEXES_SCHEMA.contains("idx_action_instances_writer_object"));
+        assert!(
+            WRITER_MEMORY_OBJECT_INDEXES_SCHEMA.contains("parameters_json::jsonb ->> 'object_id'")
+        );
+        assert!(
+            WRITER_MEMORY_OBJECT_INDEXES_SCHEMA
+                .contains("idx_decision_memory_writer_parameters_object")
+        );
+        assert!(
+            WRITER_MEMORY_OBJECT_INDEXES_SCHEMA.contains("idx_decision_memory_writer_facts_object")
         );
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
     }

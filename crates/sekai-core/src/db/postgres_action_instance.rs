@@ -1017,6 +1017,37 @@ fn postgres_target_is_forgotten<C: postgres::GenericClient>(
     Ok(forgotten.as_deref() == Some("true"))
 }
 
+const POSTGRES_REDACT_DECISION_MEMORY_BY_PARAMETERS: &str = "SELECT memory_id, body_json
+     FROM sekai_action_decision_memory
+     WHERE namespace = $1
+       AND type_id IN (
+         'site_agent.memory.create',
+         'site_agent.memory.update',
+         'site_agent.memory.forget'
+       )
+       AND CASE
+         WHEN coalesce(body_json::jsonb ->> 'parameters_json', '') IN ('', 'null')
+           THEN NULL
+         ELSE (body_json::jsonb ->> 'parameters_json')::jsonb ->> 'object_id'
+       END = $2
+     ORDER BY memory_id
+     FOR UPDATE";
+const POSTGRES_REDACT_DECISION_MEMORY_BY_FACTS: &str = "SELECT memory_id, body_json
+     FROM sekai_action_decision_memory
+     WHERE namespace = $1
+       AND type_id IN (
+         'site_agent.memory.create',
+         'site_agent.memory.update',
+         'site_agent.memory.forget'
+       )
+       AND CASE
+         WHEN coalesce(body_json::jsonb ->> 'facts_json', '') IN ('', 'null')
+           THEN NULL
+         ELSE (body_json::jsonb ->> 'facts_json')::jsonb ->> 'object_id'
+       END = $2
+     ORDER BY memory_id
+     FOR UPDATE";
+
 /// Empty forgotten memory `content` in writer Action parameters, in this
 /// transaction (#1969). Leaves each stored request digest as it was.
 pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClient>(
@@ -1024,9 +1055,7 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
     written: Option<&crate::domain::Object>,
 ) -> Result<(), String> {
     use crate::sekai::decision_memory::DecisionMemory;
-    use crate::sekai::site_agent_memory::{
-        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, is_forgotten, redact_writer_instance,
-    };
+    use crate::sekai::site_agent_memory::{is_forgotten, redact_writer_instance};
     let Some(object) = written.filter(|object| is_forgotten(object)) else {
         return Ok(());
     };
@@ -1034,17 +1063,15 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
         .query(
             "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
              WHERE namespace = $1
-               AND type_id IN ($2, $3, $4)
-               AND parameters_json::jsonb ->> 'object_id' = $5
+               AND type_id IN (
+                 'site_agent.memory.create',
+                 'site_agent.memory.update',
+                 'site_agent.memory.forget'
+               )
+               AND parameters_json::jsonb ->> 'object_id' = $2
              ORDER BY instance_id
              FOR UPDATE",
-            &[
-                &object.namespace,
-                &ACTION_CREATE,
-                &ACTION_UPDATE,
-                &ACTION_FORGET,
-                &object.id,
-            ],
+            &[&object.namespace, &object.id],
         )
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();
@@ -1072,53 +1099,40 @@ pub(crate) fn postgres_redact_forgotten_memory_actions<C: postgres::GenericClien
             )
             .map_err(|error| error.to_string())?;
     }
-    let rows = match client.query(
-        "SELECT memory_id, body_json FROM sekai_action_decision_memory
-         WHERE namespace = $1 AND type_id IN ($2, $3, $4)
-           AND (
-             CASE
-               WHEN coalesce(body_json::jsonb ->> 'parameters_json', '') IN ('', 'null')
-                 THEN NULL
-               ELSE (body_json::jsonb ->> 'parameters_json')::jsonb ->> 'object_id'
-             END = $5
-             OR CASE
-               WHEN coalesce(body_json::jsonb ->> 'facts_json', '') IN ('', 'null')
-                 THEN NULL
-               ELSE (body_json::jsonb ->> 'facts_json')::jsonb ->> 'object_id'
-             END = $5
-           )
-         ORDER BY memory_id
-         FOR UPDATE",
-        &[
-            &object.namespace,
-            &ACTION_CREATE,
-            &ACTION_UPDATE,
-            &ACTION_FORGET,
-            &object.id,
-        ],
-    ) {
-        Ok(rows) => rows,
-        Err(error) if error.to_string().contains("sekai_action_decision_memory") => {
-            return Ok(());
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    let mut seen = std::collections::BTreeSet::new();
     let mut updates = Vec::new();
-    for row in rows {
-        let memory_id: String = row.get(0);
-        let body_json: String = row.get(1);
-        let mut memory: DecisionMemory = serde_json::from_str(&body_json)
-            .map_err(|error| format!("corrupt decision memory: {error}"))?;
-        let object_id = crate::sekai::site_agent_memory::writer_object_id(&memory.parameters_json)
+    for sql in [
+        POSTGRES_REDACT_DECISION_MEMORY_BY_PARAMETERS,
+        POSTGRES_REDACT_DECISION_MEMORY_BY_FACTS,
+    ] {
+        let rows = match client.query(sql, &[&object.namespace, &object.id]) {
+            Ok(rows) => rows,
+            Err(error) if error.to_string().contains("sekai_action_decision_memory") => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        for row in rows {
+            let memory_id: String = row.get(0);
+            if !seen.insert(memory_id.clone()) {
+                continue;
+            }
+            let body_json: String = row.get(1);
+            let mut memory: DecisionMemory = serde_json::from_str(&body_json)
+                .map_err(|error| format!("corrupt decision memory: {error}"))?;
+            let object_id = crate::sekai::site_agent_memory::writer_object_id(
+                &memory.parameters_json,
+            )
             .or_else(|| crate::sekai::site_agent_memory::writer_object_id(&memory.facts_json));
-        if object_id.as_deref() != Some(object.id.as_str()) {
-            continue;
+            if object_id.as_deref() != Some(object.id.as_str()) {
+                continue;
+            }
+            if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
+                continue;
+            }
+            let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
+            updates.push((memory_id, body_json));
         }
-        if !crate::sekai::site_agent_memory::redact_decision_memory(&mut memory) {
-            continue;
-        }
-        let body_json = serde_json::to_string(&memory).map_err(|error| error.to_string())?;
-        updates.push((memory_id, body_json));
     }
     for (memory_id, body_json) in updates {
         client
@@ -1138,8 +1152,7 @@ pub(crate) fn postgres_restore_forgotten_memory_actions<C: postgres::GenericClie
     previous: &crate::domain::Object,
 ) -> Result<(), String> {
     use crate::sekai::site_agent_memory::{
-        ACTION_CREATE, ACTION_FORGET, ACTION_UPDATE, CONTENT_PROPERTY, KIND, is_forgotten,
-        restore_writer_instance,
+        CONTENT_PROPERTY, KIND, is_forgotten, restore_writer_instance,
     };
     if previous.kind != KIND || is_forgotten(previous) {
         return Ok(());
@@ -1151,17 +1164,15 @@ pub(crate) fn postgres_restore_forgotten_memory_actions<C: postgres::GenericClie
         .query(
             "SELECT instance_id, parameters_json, body_json FROM sekai_action_instances
              WHERE namespace = $1
-               AND type_id IN ($2, $3, $4)
-               AND parameters_json::jsonb ->> 'object_id' = $5
+               AND type_id IN (
+                 'site_agent.memory.create',
+                 'site_agent.memory.update',
+                 'site_agent.memory.forget'
+               )
+               AND parameters_json::jsonb ->> 'object_id' = $2
              ORDER BY instance_id
              FOR UPDATE",
-            &[
-                &previous.namespace,
-                &ACTION_CREATE,
-                &ACTION_UPDATE,
-                &ACTION_FORGET,
-                &previous.id,
-            ],
+            &[&previous.namespace, &previous.id],
         )
         .map_err(|error| error.to_string())?;
     let mut updates = Vec::new();

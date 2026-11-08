@@ -83,7 +83,27 @@ impl SekaiDb {
                     body_json TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_decision_memory_type
-                    ON sekai_action_decision_memory(namespace, type_id, decided_at_ms DESC);",
+                    ON sekai_action_decision_memory(namespace, type_id, decided_at_ms DESC);
+                CREATE INDEX IF NOT EXISTS idx_decision_memory_writer_parameters_object
+                    ON sekai_action_decision_memory (
+                        namespace,
+                        json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id')
+                    )
+                    WHERE type_id IN (
+                        'site_agent.memory.create',
+                        'site_agent.memory.update',
+                        'site_agent.memory.forget'
+                    );
+                CREATE INDEX IF NOT EXISTS idx_decision_memory_writer_facts_object
+                    ON sekai_action_decision_memory (
+                        namespace,
+                        json_extract(json_extract(body_json, '$.facts_json'), '$.object_id')
+                    )
+                    WHERE type_id IN (
+                        'site_agent.memory.create',
+                        'site_agent.memory.update',
+                        'site_agent.memory.forget'
+                    );",
             )
             .map_err(|error| error.to_string())
     }
