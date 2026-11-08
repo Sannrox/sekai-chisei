@@ -1109,7 +1109,13 @@ impl ChiseiSqliteSchema for SekaiDb {
                     operation_id TEXT NOT NULL,
                     mutations INTEGER NOT NULL,
                     deletes INTEGER NOT NULL
-                );",
+                );
+                CREATE INDEX IF NOT EXISTS idx_chisei_ext_auth_reclaim
+                    ON chisei_external_action_authorizations (
+                        CAST(json_extract(record_json, '$.decision.expires_at_ms') AS INTEGER)
+                    )
+                    WHERE json_extract(record_json, '$.budget_reserved') = 1
+                       OR json_extract(record_json, '$.blast_radius_reserved') = 1;",
             )
             .map_err(|error| error.to_string())
     }
@@ -1485,5 +1491,50 @@ mod tests {
             .unwrap();
         assert_eq!(iteration_has_namespace, 1);
         assert_eq!(observation_has_attempts, 1);
+    }
+
+    #[test]
+    fn reclaim_query_plan_uses_reserved_expiry_index() {
+        let db = memory_sekai_with_chisei_schema();
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO chisei_external_action_authorizations
+                (actor, operation_id, idempotency_key, request_digest, authorization_id, record_json, claimed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                "actor",
+                "op",
+                "idem",
+                "digest",
+                "auth-plan",
+                r#"{"budget_reserved":true,"blast_radius_reserved":false,"decision":{"expires_at_ms":50}}"#,
+                1_i64,
+            ],
+        )
+        .unwrap();
+        let names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1")
+            .unwrap()
+            .query_map(["idx_chisei_ext_auth_reclaim"], |row| row.get(0))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
+        assert_eq!(names, vec!["idx_chisei_ext_auth_reclaim"]);
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::chisei::external_action::SQLITE_LIST_EXPIRED_RESERVED
+            ))
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map([100_i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|detail| detail.unwrap())
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_chisei_ext_auth_reclaim")),
+            "expected reclaim index in {plan:?}"
+        );
     }
 }

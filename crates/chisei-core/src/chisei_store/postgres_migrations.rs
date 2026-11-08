@@ -152,6 +152,12 @@ pub const CHISEI_PLANE_SQL: &[PlaneSql] = &[
         include_str!("postgres/0125_budget_work_unit_defaults.sql"),
         None,
     ),
+    plane(
+        143,
+        "external_action_reclaim_index",
+        include_str!("postgres/0144_external_action_reclaim_index.sql"),
+        None,
+    ),
 ];
 
 pub fn apply_chisei_postgres_schema(db: &PostgresDb) -> Result<(), String> {
@@ -242,5 +248,11 @@ mod tests {
         assert!(
             sql("chisei_usage_events").contains("CREATE TABLE IF NOT EXISTS chisei_usage_events")
         );
+
+        let reclaim = sql("external_action_reclaim_index");
+        assert!(reclaim.contains("idx_chisei_ext_auth_reclaim"));
+        assert!(reclaim.contains("budget_reserved"));
+        assert!(reclaim.contains("blast_radius_reserved"));
+        assert!(reclaim.contains("expires_at_ms"));
     }
 }

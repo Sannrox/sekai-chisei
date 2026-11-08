@@ -1034,6 +1034,12 @@ const MIGRATIONS: &[Migration] = &[
         WRITER_MEMORY_OBJECT_INDEXES_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        143,
+        "external_action_reclaim_index",
+        "",
+        MigrationOwner::Chisei,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -2893,6 +2899,21 @@ mod tests {
             WRITER_MEMORY_OBJECT_INDEXES_SCHEMA.contains("idx_decision_memory_writer_facts_object")
         );
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+    }
+
+    #[test]
+    fn external_action_reclaim_index_migration_is_chisei_owned() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "external_action_reclaim_index")
+            .expect("external_action_reclaim_index");
+        assert_eq!(migration.version, 143);
+        assert!(matches!(migration.owner, MigrationOwner::Chisei));
+        assert!(migration.sql.is_empty());
+        assert!(migration.statements(SchemaPlane::Sekai).is_empty());
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+        assert!(migration.statements(SchemaPlane::Shared).is_empty());
     }
 
     #[test]
