@@ -641,7 +641,7 @@ impl Investigator {
         let key = bucket_key(&request);
         let investigation_id = format!("fb-inv-{key}");
         let (anchor, analyzed) = match self.get(sekai, &investigation_id).await? {
-            Some(stored) => (BucketAnchor::from_stored(&stored, &cluster), false),
+            Some(stored) => (BucketAnchor::from_stored(&stored, &cluster)?, false),
             None => {
                 let analysis = match analyzer.analyze(&request).await {
                     Ok(analysis) => analysis,
@@ -667,7 +667,7 @@ impl Investigator {
                     Ok(()) => (anchor, true),
                     // Another runtime wrote this bucket first; its record wins.
                     Err(error) => match self.get(sekai, &investigation_id).await? {
-                        Some(stored) => (BucketAnchor::from_stored(&stored, &cluster), false),
+                        Some(stored) => (BucketAnchor::from_stored(&stored, &cluster)?, false),
                         None => return Err(error),
                     },
                 }
@@ -956,17 +956,28 @@ struct BucketAnchor {
 
 impl BucketAnchor {
     /// The analysis an earlier dispatch in this bucket stored. Unreadable
-    /// outcomes stay internal rather than re-running the model.
-    fn from_stored(investigation: &Object, cluster: &ObservationCluster) -> Self {
+    /// outcomes stay internal rather than re-running the model. The bucket id
+    /// is predictable, so an object the runtime did not record there is
+    /// refused rather than trusted as the analysis.
+    fn from_stored(
+        investigation: &Object,
+        cluster: &ObservationCluster,
+    ) -> Result<Self, Investigation> {
+        if !runtime_investigation(investigation) {
+            return Err(Investigation::Failed(format!(
+                "{} was not recorded by the investigation runtime",
+                investigation.id
+            )));
+        }
         let property = |key: &str| investigation.properties.get(key);
-        Self {
+        Ok(Self {
             analysis: property("outcome")
                 .and_then(|outcome| serde_json::from_str(outcome).ok())
                 .unwrap_or_else(|| InvestigationAnalysis::empty(Attribution::Inconclusive)),
             observation_id: property("observation_id")
                 .cloned()
                 .unwrap_or_else(|| cluster.trigger_id.clone()),
-        }
+        })
     }
 }
 

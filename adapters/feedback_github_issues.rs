@@ -219,8 +219,8 @@ impl IssuePublisher {
         };
         let analysis = property("outcome")
             .and_then(|outcome| serde_json::from_str::<InvestigationAnalysis>(outcome).ok());
-        // The plane-recorded flag, never the model's own claim.
-        let measured = property("measured").map(String::as_str) == Some("true");
+        // The same plane-recorded check filing used, never the model's own claim.
+        let measured = self.measured_reproduction(sekai, &signature).await?;
         let observations = self
             .list(sekai, KIND_OBSERVATION, "problem_signature", &signature)
             .await?;
@@ -278,6 +278,37 @@ impl IssuePublisher {
             idempotency_key: operation_id.clone(),
             operation_id,
         }))
+    }
+
+    /// A runtime-recorded measured reproduction of any observation with this
+    /// signature, matching the investigator's filing check.
+    async fn measured_reproduction(
+        &self,
+        sekai: &SekaiServiceImpl,
+        signature: &str,
+    ) -> Result<bool, String> {
+        let measured = self
+            .list(sekai, KIND_INVESTIGATION_RESULT, "measured", "true")
+            .await?;
+        for result in measured
+            .iter()
+            .filter(|result| runtime_investigation(result))
+        {
+            let Some(observation_id) = result.properties.get("observation_id") else {
+                continue;
+            };
+            if self
+                .get(sekai, observation_id)
+                .await?
+                .filter(|observation| observation.namespace == self.namespace)
+                .as_ref()
+                .and_then(observation_view)
+                .is_some_and(|view| view.problem_signature == signature)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn get(&self, sekai: &SekaiServiceImpl, id: &str) -> Result<Option<Object>, String> {
@@ -350,7 +381,8 @@ pub fn draft(
     measured: bool,
     observations: &[Object],
 ) -> IssueDraft {
-    let (operation, reason) = signature.split_once(':').unwrap_or((signature, ""));
+    // The reason is the last segment, as filing reads it.
+    let (operation, reason) = signature.rsplit_once(':').unwrap_or((signature, ""));
     let (operation, reason) = (public_token(operation), public_token(reason));
     let attribution = analysis
         .and_then(|analysis| serde_json::to_value(analysis.attribution).ok())
@@ -432,12 +464,13 @@ pub fn new_issues_today(issues: &[GitHubIssue], now_ms: i64) -> u32 {
         .count() as u32
 }
 
-/// One signature part, published only as plain identifier text: ASCII
-/// letters, digits, `_` and `-`, at most 64 characters. Anything else could
-/// carry a host, path, address, mention, or markup, so it is not published.
+/// One signature part, published only as plain identifier text: an ASCII
+/// letter, then letters, digits, `_` and `-`, at most 64 characters. Anything
+/// else could carry a host, path, address part, mention, or markup, so it is
+/// not published.
 fn public_token(text: &str) -> &str {
     let text = text.trim();
-    let plain = !text.is_empty()
+    let plain = text.starts_with(|c: char| c.is_ascii_alphabetic())
         && text.len() <= 64
         && text
             .chars()

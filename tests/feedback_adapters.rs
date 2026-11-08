@@ -378,6 +378,76 @@ async fn retries_of_one_operation_stay_internal() {
     );
 }
 
+/// Submit one investigation result as `principal`, which the plane stamps.
+async fn record_investigation(plane: &Plane, principal: &str, parameters: serde_json::Value) {
+    let key = parameters["object_id"].as_str().unwrap().to_string();
+    plane
+        .sekai
+        .submit_action_instance(with_principal(
+            SubmitActionInstanceRequest {
+                namespace: NAMESPACE.into(),
+                type_id: ACTION_INVESTIGATION.into(),
+                version: PACKAGE_VERSION.into(),
+                parameters_json: parameters.to_string(),
+                idempotency_key: key,
+                ..Default::default()
+            },
+            principal,
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_object_planted_at_the_bucket_id_is_never_trusted() {
+    let plane = armed_plane().await;
+    observe(&plane.db, "o-1", "op-1", "defect");
+    let window = now_ms().div_euclid(feedback_investigation::RECURRENCE_WINDOW_MS);
+    // Both windows, so a run that crosses midnight still meets the plant.
+    for window in [window, window + 1] {
+        let request = AnalysisRequest {
+            namespace: NAMESPACE.into(),
+            signature: SIGNATURE.into(),
+            observations: Vec::new(),
+            distinct_operations: 0,
+            window,
+        };
+        let request_id = analysis_input(&request, INVESTIGATION_RUNTIME).request_id;
+        let key = request_id.strip_prefix("feedback-inv-").unwrap();
+        record_investigation(
+            &plane,
+            OPERATOR,
+            json!({
+                "object_id": format!("fb-inv-{key}"),
+                "name": SIGNATURE,
+                "observation_id": "o-1",
+                "outcome": "{\"attribution\":\"tenkai\"}",
+                "measured": false,
+            }),
+        )
+        .await;
+    }
+    let runtime = investigator();
+    runtime.run_binding(&plane.sekai).await.unwrap();
+    let analyzer = Scripted::tenkai();
+    assert!(
+        runtime
+            .run_once(&plane.sekai, &analyzer, now_ms())
+            .await
+            .is_err()
+    );
+    assert_eq!(analyzer.calls.get(), 0);
+    let findings = plane
+        .db
+        .list_all_objects(&sekai_chisei::domain::ListFilter {
+            kind: Some(KIND_FINDING.into()),
+            namespace: Some(NAMESPACE.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(findings.is_empty());
+}
+
 #[tokio::test]
 async fn a_writer_submitted_measurement_does_not_qualify() {
     let plane = armed_plane().await;
@@ -805,6 +875,26 @@ async fn a_qualifying_finding_publishes_one_sanitized_issue() {
 }
 
 #[tokio::test]
+async fn a_measured_reproduction_of_any_observation_is_published() {
+    let publication = publication().await;
+    record_investigation(
+        &publication.plane,
+        INVESTIGATION_RUNTIME,
+        json!({
+            "object_id": "inv-measured",
+            "name": SIGNATURE,
+            "observation_id": "o-3",
+            "outcome": "reproduced",
+            "measured": true,
+        }),
+    )
+    .await;
+    publication.publish().await;
+    let issues = publication.tracker.github.issues.borrow();
+    assert!(issues[0].body.contains("## Reproduction\n\nMeasured."));
+}
+
+#[tokio::test]
 async fn a_lost_create_is_reconciled_without_a_second_issue() {
     let publication = publication().await;
     let intent = written(publication.decide().await);
@@ -968,6 +1058,22 @@ fn signature_text_cannot_format_ping_or_end_the_managed_section() {
     assert!(!body.contains("sekai-feedback-->"), "{body}");
     assert!(!body.contains('@'), "{body}");
     assert_eq!(maintainer_text(&issue.managed_body).as_deref(), Some(""));
+}
+
+#[test]
+fn the_published_reason_is_the_last_signature_segment() {
+    let issue = draft(
+        NAMESPACE,
+        "controller:apply:tenkai_failed",
+        None,
+        false,
+        &[],
+    );
+    assert!(
+        issue.managed_body.contains("## Reason\n\ntenkai_failed"),
+        "{}",
+        issue.managed_body
+    );
 }
 
 #[test]
