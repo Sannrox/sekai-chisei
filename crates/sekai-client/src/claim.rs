@@ -40,10 +40,11 @@ use crate::protocol::sekai::{
     ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
     ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
     ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, ConnectorSource,
-    ConnectorTypeRef, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
-    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
-    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest,
-    HeartbeatWorkClaimResponse, ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
+    ConnectorTypeRef, DeliverableExportArtifact, ExportDeliveryWorkOptions,
+    HeartbeatActionClaimRequest, HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest,
+    HeartbeatAgentTurnClaimResponse, HeartbeatTransformClaimRequest,
+    HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest, HeartbeatWorkClaimResponse,
+    ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
     ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
@@ -580,6 +581,47 @@ impl<'a> RuntimeClaimClient<'a> {
             .into_iter()
             .filter_map(|work| match work.payload {
                 Some(claimable_work::Payload::SourceSync(source)) => Some(source),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Lists export-delivery work a Source of one of `connector_types`
+    /// delivers (`(name, version)` pairs) and this runtime may take, so
+    /// artifacts left to other deliverers never fill its page. A plane
+    /// that predates the option lists every artifact.
+    pub async fn list_export_delivery_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<DeliverableExportArtifact>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::ExportDelivery.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::ExportDelivery(
+                ExportDeliveryWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::ExportDelivery(artifact)) => Some(artifact),
                 _ => None,
             })
             .collect())

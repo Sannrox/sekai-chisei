@@ -149,6 +149,12 @@ pub(super) fn source_to_proto(source: Source) -> ConnectorSource {
         created_at_ms: source.created_at_ms,
         updated_at_ms: source.updated_at_ms,
         sync: Some(proto_sync),
+        delivery: Some(ConnectorSourceDelivery {
+            last_success_at_ms: source.delivery.last_success_at_ms,
+            last_failure_at_ms: source.delivery.last_failure_at_ms,
+            last_failure: source.delivery.last_failure,
+            last_runtime: source.delivery.last_runtime,
+        }),
     }
 }
 

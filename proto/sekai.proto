@@ -726,6 +726,10 @@ message ExportDefinition {
   int64 created_at_ms = 6;
   // Interval for the transform schedule graph (ADR 0103). Zero is unscheduled.
   int64 every_ms = 7;
+  // The Source (ADR 0148) whose runtime delivers this export's artifacts.
+  // It must be active and of a type that delivers when saved. Empty leaves
+  // delivery to any claimer the artifact admits.
+  string delivery_source_id = 8;
 }
 message PutExportDefinitionRequest {
   ExportDefinition definition = 1;
@@ -771,6 +775,8 @@ message DeliverableExportArtifact {
   string content_digest = 4;
   int64 created_at_ms = 5;
   int64 expires_at_ms = 6;
+  // The Source that delivers it, from its definition; empty for none.
+  string delivery_source_id = 7;
 }
 message ListDeliverableExportArtifactsResponse {
   repeated DeliverableExportArtifact artifacts = 1;
@@ -1409,6 +1415,13 @@ message SourceSyncWorkOptions {
   // Sources of other types never fill its page. Empty lists every type.
   repeated ConnectorTypeRef connector_types = 1;
 }
+// Options of a list of export-delivery work.
+message ExportDeliveryWorkOptions {
+  // When set, lists only artifacts a Source delivers, of these types (the
+  // ones the runtime implements; empty means any type), so artifacts left
+  // to other deliverers never fill the runtime's page.
+  repeated ConnectorTypeRef connector_types = 1;
+}
 message ListClaimableWorkRequest {
   WorkKind kind = 1;
   string namespace = 2;
@@ -1419,6 +1432,7 @@ message ListClaimableWorkRequest {
   oneof options {
     AgentTurnWorkOptions agent_turn = 10;
     SourceSyncWorkOptions source_sync = 11;
+    ExportDeliveryWorkOptions export_delivery = 12;
   }
 }
 // One claimable item; the set field names its kind.
@@ -1505,8 +1519,10 @@ message AckWorkRequest {
   string runtime_id = 3;
   int64 claim_generation = 4;
   string fencing_token = 5;
-  // completed, failed or parked. Export delivery takes completed only; the
-  // acknowledge deletes the artifact's bytes. Source sync takes completed,
+  // completed, failed or parked. Export delivery takes completed, which
+  // deletes the artifact's bytes, or failed with the failure class as
+  // reason, which records the Source's delivery health and leaves the claim
+  // to lapse so the artifact is retried. Source sync takes completed,
   // or failed with the failure class as reason: unavailable, unreachable,
   // auth_failed, permission_missing, invalid or unsupported. A failed sync
   // waits for the next interval.
@@ -5080,6 +5096,16 @@ message ConnectorSource {
   int64 created_at_ms = 8;
   int64 updated_at_ms = 9;
   ConnectorSourceSync sync = 10;
+  ConnectorSourceDelivery delivery = 11;
+}
+// Where a Source's saved-export delivery stands.
+message ConnectorSourceDelivery {
+  int64 last_success_at_ms = 1;
+  int64 last_failure_at_ms = 2;
+  // The failure class of the last failed delivery; empty for none.
+  string last_failure = 3;
+  // The runtime that acknowledged the last delivery.
+  string last_runtime = 4;
 }
 message PutSourceRequest {
   string namespace = 1;

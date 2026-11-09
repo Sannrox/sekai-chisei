@@ -85,6 +85,20 @@ pub struct Source {
     pub updated_at_ms: i64,
     /// The sync claim and outcome; a put never writes it.
     pub sync: SyncState,
+    /// The last saved-export delivery through this Source.
+    pub delivery: DeliveryHealth,
+}
+
+/// Where a Source's saved-export delivery stands (ADR 0148: health per
+/// Source and per kind). Written only by an acknowledged delivery.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryHealth {
+    pub last_success_at_ms: i64,
+    pub last_failure_at_ms: i64,
+    /// The failure class of the last failed delivery; empty for none.
+    pub last_failure: String,
+    /// The runtime that acknowledged the last delivery.
+    pub last_runtime: String,
 }
 
 /// What an administrator may change with a put. Stored as JSON, so a later
@@ -346,14 +360,17 @@ macro_rules! columns {
          created_at_ms, updated_at_ms, record_json, sync_due_bucket, sync_claimed_bucket, \
          sync_done_bucket, sync_claim_owner, sync_claim_generation, sync_fencing_token, \
          sync_claim_expires_at_ms, sync_lease_expiries, sync_last_success_at_ms, \
-         sync_last_failure_at_ms, sync_last_failure, sync_last_runtime"
+         sync_last_failure_at_ms, sync_last_failure, sync_last_runtime, \
+         delivery_last_success_at_ms, delivery_last_failure_at_ms, delivery_last_failure, \
+         delivery_last_runtime"
     };
 }
 
 const COLUMNS: &str = columns!();
 
-/// The sync columns, added after the table (ADR 0149 claim record).
-const SYNC_COLUMNS: [(&str, &str); 13] = [
+/// The sync and delivery columns, added after the table (ADR 0149 claim
+/// record, ADR 0148 delivery health).
+const ADDED_COLUMNS: [(&str, &str); 17] = [
     ("sync_every_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_due_bucket", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_claimed_bucket", "INTEGER NOT NULL DEFAULT 0"),
@@ -367,6 +384,10 @@ const SYNC_COLUMNS: [(&str, &str); 13] = [
     ("sync_last_failure_at_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_last_failure", "TEXT NOT NULL DEFAULT ''"),
     ("sync_last_runtime", "TEXT NOT NULL DEFAULT ''"),
+    ("delivery_last_success_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("delivery_last_failure_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("delivery_last_failure", "TEXT NOT NULL DEFAULT ''"),
+    ("delivery_last_runtime", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Writes nothing when the id or the tokens are taken.
@@ -476,6 +497,7 @@ struct Row {
     updated_at_ms: i64,
     record_json: String,
     sync: SyncState,
+    delivery: DeliveryHealth,
 }
 
 impl Row {
@@ -492,6 +514,7 @@ impl Row {
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
             sync: self.sync,
+            delivery: self.delivery,
         })
     }
 }
@@ -523,6 +546,12 @@ fn sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             last_failure: row.get(19)?,
             last_runtime: row.get(20)?,
         },
+        delivery: DeliveryHealth {
+            last_success_at_ms: row.get(21)?,
+            last_failure_at_ms: row.get(22)?,
+            last_failure: row.get(23)?,
+            last_runtime: row.get(24)?,
+        },
     })
 }
 
@@ -553,8 +582,24 @@ fn postgres_row(row: &postgres::Row) -> Row {
             last_failure: row.get(19),
             last_runtime: row.get(20),
         },
+        delivery: DeliveryHealth {
+            last_success_at_ms: row.get(21),
+            last_failure_at_ms: row.get(22),
+            last_failure: row.get(23),
+            last_runtime: row.get(24),
+        },
     }
 }
+
+/// Records one acknowledged delivery: a success when `$1` is empty,
+/// otherwise a failure of that class.
+const DELIVERY_SQL: &str = "
+UPDATE sekai_sources SET
+    delivery_last_failure = CASE WHEN $1 = '' THEN delivery_last_failure ELSE $1 END,
+    delivery_last_success_at_ms = CASE WHEN $1 = '' THEN $2 ELSE delivery_last_success_at_ms END,
+    delivery_last_failure_at_ms = CASE WHEN $1 = '' THEN delivery_last_failure_at_ms ELSE $2 END,
+    delivery_last_runtime = $3
+WHERE namespace = $4 AND source_id = $5";
 
 fn list_sql(placeholder_after: &str, placeholder_limit: &str) -> String {
     format!(
@@ -577,7 +622,7 @@ impl SekaiDb {
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(|error| error.to_string())?;
-        for (column, definition) in SYNC_COLUMNS {
+        for (column, definition) in ADDED_COLUMNS {
             if !present.iter().any(|name| name == column) {
                 conn.execute_batch(&format!(
                     "ALTER TABLE sekai_sources ADD COLUMN {column} {definition}"
@@ -663,6 +708,23 @@ impl SekaiDb {
             ),
             rusqlite::params![namespace, source, source_instance],
         )
+    }
+
+    pub fn record_source_delivery(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        runtime_id: &str,
+        failure: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.conn()
+            .execute(
+                DELIVERY_SQL,
+                rusqlite::params![failure, now_ms, runtime_id, namespace, source_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
@@ -767,6 +829,23 @@ impl PostgresDb {
         )
     }
 
+    pub fn record_source_delivery(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        runtime_id: &str,
+        failure: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                DELIVERY_SQL,
+                &[&failure, &now_ms, &runtime_id, &namespace, &source_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
         self.postgres_source(
             &format!("SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"),
@@ -843,6 +922,27 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.get_source_by_tokens(namespace, source, source_instance),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.get_source_by_tokens(namespace, source, source_instance)
+            }),
+        }
+    }
+
+    /// Records the outcome of a delivery `runtime_id` acknowledged through
+    /// the Source: a success when `failure` is empty, otherwise that
+    /// failure class.
+    pub fn record_source_delivery(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        runtime_id: &str,
+        failure: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.record_source_delivery(namespace, source_id, runtime_id, failure, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.record_source_delivery(namespace, source_id, runtime_id, failure, now_ms)
             }),
         }
     }

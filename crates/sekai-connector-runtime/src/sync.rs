@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
 use sekai_source_sdk::{
-    ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, SourceConfig,
-    connector_type,
+    ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, ExportArtifact,
+    Operation, SourceConfig, connector_type,
 };
 
 use crate::credentials::{CredentialBindings, Credentials};
@@ -140,6 +140,16 @@ impl Connectors {
         self.0.keys().copied()
     }
 
+    /// The registered types that deliver saved exports.
+    pub fn delivery_types(&self) -> Vec<(&'static str, &'static str)> {
+        self.types()
+            .filter(|(name, version)| {
+                connector_type(name, version)
+                    .is_some_and(|connector| connector.supports(Operation::Deliver))
+            })
+            .collect()
+    }
+
     /// Whether this runtime runs Sources of the type the spec names.
     pub fn implements(&self, source: &ConnectorSource) -> bool {
         source.spec.as_ref().is_some_and(|spec| {
@@ -149,14 +159,41 @@ impl Connectors {
         })
     }
 
-    /// Runs one sync of a prepared Source. Blocking.
-    pub fn sync(&self, prepared: &Prepared) -> Result<(), SyncFailure> {
+    /// Whether this runtime delivers saved exports through Sources of the
+    /// type the spec names.
+    pub fn delivers(&self, source: &ConnectorSource) -> bool {
+        self.implements(source)
+            && source.spec.as_ref().is_some_and(|spec| {
+                connector_type(&spec.connector_type, &spec.connector_version)
+                    .is_some_and(|connector| connector.supports(Operation::Deliver))
+            })
+    }
+
+    fn open(&self, prepared: &Prepared) -> Result<Box<dyn Connector + Send>, SyncFailure> {
         let open = self
             .0
             .get(&(prepared.connector.name, prepared.connector.version))
             .ok_or(SyncFailure::Unsupported)?;
-        let mut connector = open(prepared)?;
-        connector.check()?;
+        Ok(open(prepared)?)
+    }
+
+    /// Runs one sync of a prepared Source. Blocking.
+    pub fn sync(&self, prepared: &Prepared) -> Result<(), SyncFailure> {
+        self.open(prepared)?.check()?;
+        Ok(())
+    }
+
+    /// Delivers one verified saved-export artifact through a prepared
+    /// Source. Blocking.
+    pub fn deliver(
+        &self,
+        prepared: &Prepared,
+        artifact: &ExportArtifact<'_>,
+    ) -> Result<(), SyncFailure> {
+        if !prepared.connector.supports(Operation::Deliver) {
+            return Err(SyncFailure::Unsupported);
+        }
+        self.open(prepared)?.deliver(artifact)?;
         Ok(())
     }
 }

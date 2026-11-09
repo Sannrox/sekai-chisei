@@ -1,6 +1,6 @@
 //! The claim loop: Source sync work from the plane's one work queue
 //! (ADR 0149), run under a heartbeated lease and acknowledged with its
-//! outcome.
+//! outcome. Saved-export delivery runs the same way ([`crate::delivery`]).
 //!
 //! The plane holds every piece of state. A runtime that dies mid-sync
 //! leaves a lease that lapses; another runtime then claims the Source under
@@ -12,15 +12,17 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
 
-use sekai_client::claim::{ClaimAttempt, RuntimeClaimError, WorkFence, WorkKind};
+use sekai_client::claim::{
+    ClaimAttempt, RuntimeClaimClient, RuntimeClaimError, WorkFence, WorkKind,
+};
 use sekai_client::protocol::sekai::{SourceSyncWork, ack_work_response, claim_work_response};
 use sekai_client::{ClientConfig, CoreLoopClient, GrpcTransport, SdkError};
 
 use crate::credentials::CredentialBindings;
 use crate::sync::{Connectors, SyncFailure, prepare};
 
-/// How many claimable Sources one pass looks at per namespace.
-const LIST_LIMIT: i32 = 50;
+/// How many claimable items one pass looks at per namespace and kind.
+pub(crate) const LIST_LIMIT: i32 = 50;
 
 /// What this runtime is and how long its leases run.
 #[derive(Debug, Clone)]
@@ -31,7 +33,7 @@ pub struct RuntimeOptions {
     pub lease: Duration,
 }
 
-/// The end of one claimed sync.
+/// The end of one claimed sync or delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Ran {
@@ -43,14 +45,23 @@ pub enum Ran {
     /// The claim was lost (lapsed, taken over or fenced by a disable);
     /// nothing was acknowledged.
     Lost { source_id: String },
+    /// A saved-export artifact delivered through a Source, acknowledged;
+    /// `Err` is the failure class the Source's health recorded.
+    Delivered {
+        receipt_id: String,
+        outcome: Result<(), SyncFailure>,
+    },
+    /// The delivery claim was lost, or the bytes could not be fetched under
+    /// it; the claim lapses and the artifact is delivered again.
+    DeliveryLost { receipt_id: String },
 }
 
 /// One connector runtime, serving a fixed set of namespaces.
 pub struct Runtime {
-    clients: Vec<CoreLoopClient<GrpcTransport>>,
-    options: RuntimeOptions,
-    bindings: CredentialBindings,
-    connectors: Connectors,
+    pub(crate) clients: Vec<CoreLoopClient<GrpcTransport>>,
+    pub(crate) options: RuntimeOptions,
+    pub(crate) bindings: CredentialBindings,
+    pub(crate) connectors: Connectors,
 }
 
 impl Runtime {
@@ -142,27 +153,12 @@ impl Runtime {
             Err(failure) => Err(failure),
             Ok(prepared) => {
                 let connectors = self.connectors.clone();
-                let mut job = tokio::task::spawn_blocking(move || connectors.sync(&prepared));
-                let mut beat = tokio::time::interval(self.options.lease / 3);
-                beat.tick().await;
-                loop {
-                    tokio::select! {
-                        joined = &mut job => {
-                            break joined.unwrap_or(Err(SyncFailure::Invalid));
-                        }
-                        _ = beat.tick() => {
-                            match claims.heartbeat_work(&fence, self.options.lease).await {
-                                Ok(_) => {}
-                                // The job's result is discarded; it ends on
-                                // its own, and the new holder syncs again.
-                                Err(RuntimeClaimError::FenceLost) => {
-                                    return Ok(Ran::Lost { source_id });
-                                }
-                                // A plane blip: the lease outlasts a few.
-                                Err(_) => {}
-                            }
-                        }
-                    }
+                match self
+                    .heartbeated(&claims, &fence, move || connectors.sync(&prepared))
+                    .await
+                {
+                    Some(outcome) => outcome,
+                    None => return Ok(Ran::Lost { source_id }),
                 }
             }
         };
@@ -179,13 +175,42 @@ impl Runtime {
         }
     }
 
-    /// One pass: claims and runs every due Source this runtime can run, in
-    /// each namespace in turn.
+    /// Runs `job` on the blocking pool, heartbeating `fence` every third of
+    /// the lease. `None` when the fence is lost: the job's result is then
+    /// dropped, the job ends on its own, and the new holder runs again.
+    pub(crate) async fn heartbeated(
+        &self,
+        claims: &RuntimeClaimClient<'_>,
+        fence: &WorkFence,
+        job: impl FnOnce() -> Result<(), SyncFailure> + Send + 'static,
+    ) -> Option<Result<(), SyncFailure>> {
+        let mut job = tokio::task::spawn_blocking(job);
+        let mut beat = tokio::time::interval(self.options.lease / 3);
+        beat.tick().await;
+        loop {
+            tokio::select! {
+                joined = &mut job => return Some(joined.unwrap_or(Err(SyncFailure::Invalid))),
+                _ = beat.tick() => match claims.heartbeat_work(fence, self.options.lease).await {
+                    Ok(_) => {}
+                    Err(RuntimeClaimError::FenceLost) => return None,
+                    // A plane blip: the lease outlasts a few.
+                    Err(_) => {}
+                },
+            }
+        }
+    }
+
+    /// One pass: claims and runs every due Source sync, then every
+    /// deliverable artifact of a Source this runtime can run, in each
+    /// namespace in turn.
     pub async fn pass(&self) -> Result<Vec<Ran>, RuntimeClaimError> {
         let mut ran = Vec::new();
         for index in 0..self.clients.len() {
             while let Some(work) = self.claim(index).await? {
                 ran.push(self.run(index, work).await?);
+            }
+            while let Some((source, work)) = self.claim_delivery(index).await? {
+                ran.push(self.deliver(index, source, work).await?);
             }
         }
         Ok(ran)

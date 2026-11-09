@@ -55,6 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
         .field_attribute("sekai.SourceBatch.source_id", "#[serde(default)]")
         .field_attribute(
+            "sekai.ExportDefinition.delivery_source_id",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.DeliverableExportArtifact.delivery_source_id",
+            "#[serde(default)]",
+        )
+        .field_attribute(
             "sekai.ObjectSetDescriptor.property_filters",
             "#[serde(default)]",
         )

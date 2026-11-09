@@ -6,8 +6,12 @@
 //! holds the operator's credential bindings; the plane holds only the
 //! handles. Placement, schedules and claims stay on the plane, so any
 //! number of runtimes can serve a namespace and any of them can stop.
+//!
+//! Besides syncs, it delivers saved exports whose definition names a
+//! Source of a type it implements ([`delivery`]).
 
 pub mod credentials;
+pub mod delivery;
 pub mod runtime;
 pub mod sync;
 
