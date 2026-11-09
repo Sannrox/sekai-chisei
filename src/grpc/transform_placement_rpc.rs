@@ -453,6 +453,7 @@ mod tests {
                 claim_generation,
                 fencing_token: work.fencing_token.clone(),
                 ttl_ms: 120_000,
+                namespace: String::new(),
             }))
         };
         let Some(heartbeat_work_claim_response::Payload::Transform(renewed)) =

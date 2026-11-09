@@ -79,6 +79,8 @@ mod db_work;
 mod ontology_health_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
+#[path = "source_rpc.rs"]
+mod source_rpc;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
 #[path = "trust_score_rpc.rs"]
@@ -589,6 +591,34 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetSourceHealthRequest>,
     ) -> Result<Response<GetSourceHealthResponse>, Status> {
         ontology_health_rpc::get_source_health(self, req).await
+    }
+
+    async fn put_source(
+        &self,
+        req: Request<PutSourceRequest>,
+    ) -> Result<Response<PutSourceResponse>, Status> {
+        source_rpc::put_source(self, req).await
+    }
+
+    async fn get_source(
+        &self,
+        req: Request<GetSourceRequest>,
+    ) -> Result<Response<GetSourceResponse>, Status> {
+        source_rpc::get_source(self, req).await
+    }
+
+    async fn list_sources(
+        &self,
+        req: Request<ListSourcesRequest>,
+    ) -> Result<Response<ListSourcesResponse>, Status> {
+        source_rpc::list_sources(self, req).await
+    }
+
+    async fn disable_source(
+        &self,
+        req: Request<DisableSourceRequest>,
+    ) -> Result<Response<DisableSourceResponse>, Status> {
+        source_rpc::disable_source(self, req).await
     }
 
     async fn dry_run_definition_change_bundle(
@@ -1923,3 +1953,7 @@ impl SekaiService for SekaiServiceImpl {
 #[cfg(test)]
 #[path = "sekai_service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "source_rpc_tests.rs"]
+mod source_rpc_tests;

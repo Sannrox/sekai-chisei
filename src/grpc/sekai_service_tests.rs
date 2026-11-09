@@ -37525,6 +37525,7 @@ async fn an_export_delivery_claimed_as_work_is_fetched_and_acked_only_by_its_hol
                 claim_generation: fence.claim_generation,
                 fencing_token: fence.fencing_token.clone(),
                 ttl_ms: 60_000,
+                namespace: String::new(),
             },
             "tester",
         ))

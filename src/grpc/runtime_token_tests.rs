@@ -1134,6 +1134,7 @@ fn ack_work(
         outcome: "completed".into(),
         reason: String::new(),
         options: None,
+        namespace: String::new(),
     }
 }
 
@@ -1323,6 +1324,7 @@ async fn a_runtime_token_reaches_only_its_own_kind_on_the_work_family() {
                     claim_generation: i64::try_from(effect.claim_generation).unwrap(),
                     fencing_token: effect.claim_fencing_token.clone(),
                     ttl_ms: 60_000,
+                    namespace: String::new(),
                 },
             ))
             .await

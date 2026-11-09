@@ -29,6 +29,15 @@ fn operator_pages(root: &Path) -> Vec<PathBuf> {
     pages
 }
 
+/// Whether `text` names `rpc` as a whole word, so `GetSource` is not found
+/// inside `GetSourceSyncState`.
+fn names_rpc(text: &str, rpc: &str) -> bool {
+    text.match_indices(rpc).any(|(at, _)| {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        !text[..at].ends_with(word) && !text[at + rpc.len()..].starts_with(word)
+    })
+}
+
 #[test]
 fn operator_docs_name_experimental_gate_when_they_name_gated_rpcs() {
     let table = RpcMaturityTable::load().expect("maturity table");
@@ -49,7 +58,7 @@ fn operator_docs_name_experimental_gate_when_they_name_gated_rpcs() {
         let text = fs::read_to_string(&page).unwrap_or_else(|error| {
             panic!("read {}: {error}", page.display());
         });
-        if !gated.iter().any(|rpc| text.contains(rpc)) {
+        if !gated.iter().any(|rpc| names_rpc(&text, rpc)) {
             continue;
         }
         if !text.contains("SEKAI_EXPERIMENTAL_RPCS") && !text.contains("experimental-rpcs") {
@@ -98,7 +107,7 @@ fn operator_docs_do_not_claim_supported_for_gated_rpcs() {
                 continue;
             }
             for rpc in &gated {
-                if trimmed.contains(*rpc) {
+                if names_rpc(trimmed, rpc) {
                     bad.push(format!("{rel}: {rpc}"));
                 }
             }

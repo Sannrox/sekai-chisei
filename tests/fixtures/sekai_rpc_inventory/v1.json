@@ -545,6 +545,62 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutSource",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source.rs",
+        "src/grpc/source_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetSource",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source.rs",
+        "src/grpc/source_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListSources",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source.rs",
+        "src/grpc/source_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "DisableSource",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source.rs",
+        "src/grpc/source_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GenerateDefinitionChangeBundle",
       "kind": "query",
       "surfaces": [],

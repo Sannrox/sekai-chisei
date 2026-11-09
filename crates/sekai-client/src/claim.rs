@@ -1,5 +1,5 @@
 //! Versioned runtime-claim client for Action, isolated-process transform,
-//! agent-turn and export-delivery work.
+//! agent-turn, export-delivery and Source sync work.
 //!
 //! Lives in `sekai-client` so Shikigami and kako pin one crate with
 //! `sekai-proto`. The plane remains authoritative; this module maps wire
@@ -11,7 +11,10 @@
 //! the per-kind methods narrow its `oneof` payloads. On a plane that does
 //! not serve that family, each call falls back to the per-kind RPC, so
 //! planes and workers upgrade in either order. Export delivery has no
-//! per-kind claim RPCs, so it needs a plane that serves the family.
+//! per-kind claim RPCs, nor has Source sync, so they need a plane that
+//! serves the family. Heartbeat and acknowledge carry the client's
+//! namespace, which Source sync needs because a Source id is unique only
+//! inside one namespace.
 //!
 //! `SdkError` does not retain arbitrary server status text. Allowlisted
 //! `delegator_*` tokens are kept as `reason_code` so claim and owned-claim
@@ -587,6 +590,7 @@ impl<'a> RuntimeClaimClient<'a> {
     ) -> Result<heartbeat_work_claim_response::Payload, RuntimeClaimError> {
         let request = HeartbeatWorkClaimRequest {
             kind: fence.kind.into(),
+            namespace: self.client.config().namespace.clone().unwrap_or_default(),
             work_id: fence.work_id.clone(),
             runtime_id: fence.runtime_id.clone(),
             claim_generation: fence.generation,
@@ -605,8 +609,8 @@ impl<'a> RuntimeClaimClient<'a> {
 
     /// Ends the held claim `fence` with `outcome` (`completed`, `failed` or
     /// `parked`). Transform work is acknowledged by its write-back instead.
-    /// Agent-turn and export-delivery acknowledges replay, so only they
-    /// retry.
+    /// Agent-turn, export-delivery and source-sync acknowledges replay, so
+    /// only they retry.
     pub async fn ack_work(
         &self,
         fence: &WorkFence,
@@ -616,6 +620,7 @@ impl<'a> RuntimeClaimClient<'a> {
     ) -> Result<ack_work_response::Payload, RuntimeClaimError> {
         let request = AckWorkRequest {
             kind: fence.kind.into(),
+            namespace: self.client.config().namespace.clone().unwrap_or_default(),
             work_id: fence.work_id.clone(),
             runtime_id: fence.runtime_id.clone(),
             claim_generation: fence.generation,
@@ -624,7 +629,10 @@ impl<'a> RuntimeClaimClient<'a> {
             reason,
             options,
         };
-        let retryable = matches!(fence.kind, WorkKind::AgentTurn | WorkKind::ExportDelivery);
+        let retryable = matches!(
+            fence.kind,
+            WorkKind::AgentTurn | WorkKind::ExportDelivery | WorkKind::SourceSync
+        );
         match self.call(ACK_WORK, request.clone(), retryable).await {
             Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
             Err(error) if unserved(&error) && has_per_kind_rpcs(fence.kind) => {
@@ -701,7 +709,7 @@ impl<'a> RuntimeClaimClient<'a> {
                     .await?;
                 listed.turns.into_iter().map(Payload::AgentTurn).collect()
             }
-            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -767,7 +775,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -830,7 +838,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -1321,7 +1329,8 @@ impl<'a> RuntimeClaimClient<'a> {
 /// enterprise-scoped credentials on every call. The per-kind RPC runs its own
 /// auth, so a real denial still comes back denied, one call later.
 /// Whether `kind` predates the work family and has its own claim RPCs to
-/// fall back to. Export delivery is claimable only through the family.
+/// fall back to. Export delivery and Source sync are claimable only through
+/// the family.
 fn has_per_kind_rpcs(kind: WorkKind) -> bool {
     matches!(
         kind,
