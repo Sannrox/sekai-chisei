@@ -303,7 +303,6 @@ fn execute_sql_inner(
         .map_err(map_engine_error)?;
     let names: Vec<String> = stmt
         .column_names()
-        .into_iter()
         .map(|name| name.to_string())
         .collect();
     let mut unique = BTreeSet::new();
