@@ -116,14 +116,31 @@ Upgrade notes:
   PostgreSQL goes from schema version 51 (file `0052`, the highest at 1.3.0)
   to 138 (file `0139`). Backup the store before the first 1.4.0 boot. A 1.3.0
   binary refuses a migrated PostgreSQL store with "newer than supported".
+- Model review is default deny. Native planning and execution, gateway
+  decide, and hosted routes refuse any model that is not `enabled` for the
+  namespace with `model_review.not_enabled`, and gateway failover drops
+  unreviewed candidates (ADR 0106, #1502, #1503, #1504). Initialization does
+  not mark existing routes enabled. Run `sekaictl admin model-review backfill`
+  once after the first 1.4.0 boot and before serving traffic; it enables the
+  currently routed hosted families and the registry-canonical policy models.
+  Use `sekaictl admin model-review set` or `family-set` for anything it does
+  not cover.
+- LLM functions need an evaluation-gate approval. `CreateFunction` refuses
+  LLM steps, and `InvokeFunction` and document extraction refuse an LLM
+  revision without an approval for its digest. Revisions stored before 1.4.0
+  have none, so republish them through the gated publish (#1487).
+- With an enterprise extension installed, any provider credential error
+  refuses execution instead of falling back to the process key. An extension
+  that wants the instance key returns it explicitly (#1488).
 - Retention runs on its own. Every Sekai plane instance archives eligible
   records on a one-minute tick (ADR 0129, #2020). SQLite stores carry the
   default policies seeded by earlier releases (`audit` 365 days, `llm_calls`
   90 days, `task_observations` 90 days), so the first 1.4.0 boot moves older
   rows into archive tables in the same database (ADR 0141). PostgreSQL has no
-  seeded policies and archives nothing until a policy is set (#2011). Run
-  `sekaictl admin retention dry-run` against the store before upgrading to see
-  what the tick will archive. 2.0.0 stops seeding these policies for fresh
+  seeded policies and archives nothing until a policy is set (#2011). To see
+  what the tick will archive, run the 1.4.0 `sekaictl admin retention
+  dry-run` against a restored copy of the backup, never the live store:
+  opening a store with 1.4.0 applies its schema. 2.0.0 stops seeding these policies for fresh
   stores and adds `sekaictl admin retention policy delete` (#2118, #2120).
 - Runtime tokens are new. Action work claims (#1509) and agent-turn claims
   (#2012) return a short-lived `sekai.runtime-token/v1` token that names
