@@ -232,10 +232,17 @@ impl SekaiDb {
         .transpose()
     }
 
-    /// Records the decision only while the review is undecided; `false`
-    /// when another decision landed first.
+    /// Records the decision only while the review is undecided, with its
+    /// audit row and receipt in the same transaction; `false`, writing
+    /// nothing, when another decision landed first.
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
-        self.conn()
+        let (audit, receipt) = review.decision_records();
+        crate::sekai::audit::validate_decision(&audit)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let updated = tx
             .execute(
                 "UPDATE sekai_plan_reviews SET decision = ?3, body_json = ?4
                  WHERE namespace = ?1 AND plan_id = ?2 AND decision = ''",
@@ -246,8 +253,15 @@ impl SekaiDb {
                     encode(review)?
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        crate::sekai::ledger::insert_chained_decision(&tx, &audit)?;
+        crate::db::chisei_receipt_sqlite::upsert_operation_receipt(&tx, &receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
@@ -528,7 +542,12 @@ impl PostgresDb {
     }
 
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
-        self.connection()?
+        let (audit, receipt) = review.decision_records();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let updated = tx
             .execute(
                 "UPDATE sekai_plan_reviews SET decision = $3, body_json = $4
                  WHERE namespace = $1 AND plan_id = $2 AND decision = ''",
@@ -539,8 +558,15 @@ impl PostgresDb {
                     &encode(review)?,
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        crate::db::postgres_decision::insert_chained_decision(&mut tx, &audit)?;
+        self.upsert_operation_receipt_on(&mut tx, &receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
     pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
         self.connection()?
