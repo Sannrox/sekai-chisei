@@ -57,5 +57,19 @@ A freshness or quality violation writes one durable delivery per
 Evidence is stored in full and omitted at read when the caller cannot read
 the dataset. Email and webhooks stay out of the core.
 
+A delivery is kept for 30 days from when it was written, acknowledged or
+not (`DELIVERY_RETENTION_MS` in `crates/sekai-core/src/sekai/consumer_violation.rs`).
+Every Sekai-serving instance sweeps expired deliveries about once a minute,
+in batches; on PostgreSQL concurrent sweeps skip rows another instance is
+deleting. Once swept, a delivery is absent from the list, and acknowledging it
+returns not found. A delivery past the bound may still be listed until the
+next sweep.
+
+Known gap: when Chisei reaches Sekai over the remote hop (split planes), a
+failed quality check writes no delivery. Sekai has no write RPC for it yet, so
+`crates/chisei-core/src/chisei/data_quality.rs` skips the emit and still
+closes the check as failed. Freshness violations and combined mode are not
+affected.
+
 See [ADR 0067](decisions/0067-definition-consumer-impact.md) and
 Discussion [863](https://github.com/Sannrox/sekai-chisei/discussions/863).

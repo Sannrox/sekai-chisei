@@ -2,7 +2,7 @@ use crate::db::definition_branch::binding_object;
 use crate::db::postgres::PostgresDb;
 use crate::domain::Object;
 use crate::sekai::consumer_violation::{
-    EmitViolation, ListViolationDeliveries, MEMBER_KIND_DATASET, ViolationDelivery,
+    EmitViolation, ListViolationDeliveries, MEMBER_KIND_DATASET, SWEEP_BATCH, ViolationDelivery,
     clamp_page_size, decode_page_token, encode_page_token, matching_recipients,
 };
 use crate::sekai::definition_consumer_impact::BINDING_KIND;
@@ -102,6 +102,36 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?;
         row.map(row_to_delivery).transpose()
+    }
+
+    /// Deletes at most [`SWEEP_BATCH`] deliveries written before
+    /// `cutoff_ms` and returns how many it deleted. The batch is locked
+    /// first and rows another instance holds are skipped, so concurrent
+    /// sweeps never wait on or overlap each other.
+    pub fn delete_expired_consumer_violations(&self, cutoff_ms: i64) -> Result<usize, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let (recipients, event_ids): (Vec<String>, Vec<String>) = tx
+            .query(
+                "SELECT recipient, event_id FROM sekai_consumer_violation_deliveries
+                 WHERE created_at_ms < $1 LIMIT $2 FOR UPDATE SKIP LOCKED",
+                &[&cutoff_ms, &SWEEP_BATCH],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .unzip();
+        let deleted = tx
+            .execute(
+                "DELETE FROM sekai_consumer_violation_deliveries
+                 WHERE (recipient, event_id) IN (SELECT * FROM unnest($1::TEXT[], $2::TEXT[]))",
+                &[&recipients, &event_ids],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        usize::try_from(deleted).map_err(|error| error.to_string())
     }
 
     pub fn acknowledge_consumer_violation(
@@ -228,14 +258,17 @@ fn row_to_delivery(row: postgres::Row) -> Result<ViolationDelivery, String> {
 mod tests {
     use super::*;
     use crate::db::postgres::ScratchDatabase;
+    use crate::db::runtime_db::RuntimeDb;
     use crate::domain::Object;
     use crate::sekai::consumer_violation::{
-        EmitViolation, KIND_FRESHNESS, ListViolationDeliveries, freshness_event_id,
+        DELIVERY_RETENTION_MS, EmitViolation, KIND_FRESHNESS, ListViolationDeliveries,
+        freshness_event_id,
     };
     use crate::sekai::definition_consumer_impact::{
         BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
     };
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn binding(id: &str, owner: &str, member_id: &str) -> Object {
         let mut binding = DefinitionConsumerBinding {
@@ -340,5 +373,107 @@ mod tests {
             .unwrap()
             .0;
         assert!(after.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_sweep_deletes_only_deliveries_past_retention() {
+        let scratch = ScratchDatabase::create();
+        let postgres = scratch.connect();
+        postgres
+            .create_object(&binding("a", "alice", "orders"))
+            .unwrap();
+        let db = RuntimeDb::Postgres(Arc::new(postgres));
+        let old = freshness_event_id("orders", "v1", "fresh");
+        let new = freshness_event_id("orders", "v2", "fresh");
+        for (event_id, now_ms) in [(&old, 1_000), (&new, 1_000 + DELIVERY_RETENTION_MS)] {
+            db.emit_consumer_violation(&EmitViolation {
+                kind: KIND_FRESHNESS,
+                namespace: "ops",
+                member_id: "orders",
+                event_id,
+                rule_id: "fresh",
+                evidence: "age_ms=12",
+                now_ms,
+            })
+            .unwrap();
+        }
+
+        let swept = db
+            .sweep_consumer_violation_deliveries(1_001 + DELIVERY_RETENTION_MS)
+            .unwrap();
+
+        assert_eq!(swept, 1);
+        let alice = ["alice".to_string()];
+        let inbox: Vec<_> = db
+            .list_consumer_violation_deliveries(&ListViolationDeliveries {
+                recipients: alice.to_vec(),
+                page_token: String::new(),
+                page_size: 0,
+                include_acknowledged: true,
+            })
+            .unwrap()
+            .0
+            .into_iter()
+            .map(|delivery| delivery.event_id)
+            .collect();
+        assert_eq!(inbox, [new]);
+        assert!(
+            db.get_consumer_violation_delivery(&alice, &old)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.acknowledge_consumer_violation(&alice, &old, 2)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_concurrent_sweeps_delete_each_expired_delivery_once() {
+        let scratch = ScratchDatabase::create();
+        let total = 3 * SWEEP_BATCH + 7;
+        let seed = scratch.connect();
+        seed.connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO sekai_consumer_violation_deliveries
+                 (recipient, event_id, kind, namespace, member_kind, member_id, rule_id, evidence, created_at_ms)
+                 SELECT 'alice', 'event-' || n, 'freshness', 'ops', 'dataset', 'orders', 'fresh', '', 0
+                 FROM generate_series(1, $1::BIGINT) AS n",
+                &[&total],
+            )
+            .unwrap();
+        let first_batch = seed
+            .delete_expired_consumer_violations(DELIVERY_RETENTION_MS)
+            .unwrap();
+        assert_eq!(first_batch as i64, SWEEP_BATCH);
+        // Each instance has its own pool, like two processes.
+        let sweeps: Vec<_> = (0..2)
+            .map(|_| {
+                let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+                std::thread::spawn(move || {
+                    db.sweep_consumer_violation_deliveries(DELIVERY_RETENTION_MS + 1)
+                })
+            })
+            .collect();
+        let swept: usize = sweeps
+            .into_iter()
+            .map(|sweep| sweep.join().unwrap().unwrap())
+            .sum();
+
+        assert_eq!((first_batch + swept) as i64, total);
+        let left: i64 = seed
+            .connection()
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM sekai_consumer_violation_deliveries",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0);
     }
 }
