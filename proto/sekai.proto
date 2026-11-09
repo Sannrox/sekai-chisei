@@ -4497,6 +4497,24 @@ message DefinitionProposal {
   string source_package_digest = 20;
   // Commit of the definition file tree this proposal imports (#1618).
   string source_commit = 21;
+  // Dataset branch merge proposals this proposal merges with (#2222), as
+  // pinned at creation. The caller sees one only when it may read that
+  // dataset in the proposal's tenant; otherwise the entry is only `hidden`.
+  // Readable entries come first, in dataset-id order. Empty for a proposal
+  // without attachments.
+  repeated DefinitionProposalDatasetAttachment dataset_proposals = 22;
+}
+
+// One dataset branch merge proposal attached to a definition proposal.
+message DefinitionProposalDatasetAttachment {
+  // True when the caller may not read the attached dataset proposal; every
+  // other field is then empty.
+  bool hidden = 1;
+  string dataset_id = 2;
+  string proposal_id = 3;
+  // Pinned when the definition proposal was created; part of its digest.
+  string parent_version_id = 4;
+  string branch_digest = 5;
 }
 
 message CreateDefinitionProposalRequest {

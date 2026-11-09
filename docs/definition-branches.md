@@ -88,6 +88,14 @@ cannot merge on its own (`FailedPrecondition`); closing the definition
 proposal releases it. The dataset proposal's own self-merge rule applies to
 the definition merger.
 
+Every RPC that returns a definition proposal lists its attachments in
+`dataset_proposals` (#2222): dataset id, dataset proposal id, and the pinned
+parent version and branch digest. A reader sees an attachment only when it
+passes the dataset branch read check for that dataset in the tenant the
+attachment was pinned in. Otherwise the entry carries only `hidden`, and
+hidden entries follow the readable ones, so a reader learns that the data
+exists and nothing else. A proposal without attachments omits the field.
+
 `ApproveDefinitionProposal` records a live approval on an open proposal.
 An agent principal that created the proposal cannot approve or merge it,
 including when that principal still holds namespace write and changed-member

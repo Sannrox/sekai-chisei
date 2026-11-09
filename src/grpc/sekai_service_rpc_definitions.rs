@@ -676,7 +676,12 @@ pub(super) async fn create_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(CreateDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
 pub(super) async fn get_definition_proposal(
@@ -725,7 +730,12 @@ pub(super) async fn get_definition_proposal(
         &proposal,
     )?;
     Ok(Response::new(GetDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
         lint_findings,
         lint_complete,
     }))
@@ -839,7 +849,12 @@ pub(super) async fn approve_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(ApproveDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
 /// The checks `ApproveDefinitionProposal` applies to a loaded proposal,
@@ -985,7 +1000,12 @@ pub(super) async fn merge_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(MergeDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&result.proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &result.proposal,
+        )?),
         previous_published_digest: result.previous_published_digest,
         published_revision: Some(to_proto_definition_revision(&result.published_revision)),
         receipt_id: result.receipt_id,
@@ -1039,7 +1059,12 @@ pub(super) async fn close_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(CloseDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
 pub(super) async fn get_published_definition_revision(
@@ -1276,7 +1301,12 @@ pub(super) async fn propose_definition_rollback(
     )
     .map_err(map_definition_write_error)?;
     Ok(Response::new(ProposeDefinitionRollbackResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
         preview: Some(to_proto_definition_revision_diff(&preview)),
     }))
 }

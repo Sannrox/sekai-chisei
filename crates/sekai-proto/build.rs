@@ -43,6 +43,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "sekai.CreateDefinitionProposalRequest.dataset_proposals",
             "#[serde(default)]",
         )
+        // Omitted when empty, so a v1 proposal serializes as before (#2222).
+        .field_attribute(
+            "sekai.DefinitionProposal.dataset_proposals",
+            "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]",
+        )
         .field_attribute(
             "sekai.DefinitionConsumerImpactPath.blocking",
             "#[serde(default)]",
