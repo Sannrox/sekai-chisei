@@ -34297,6 +34297,116 @@ async fn ontology_health_snapshots_are_recorded_once_per_window_and_read_by_what
 }
 
 #[tokio::test]
+async fn a_put_health_schedule_fills_the_trend_from_the_tick_and_halts_on_a_revoked_recorder() {
+    const DAY: i64 = 86_400_000;
+    let svc = service();
+    seed_definition_parent(&svc, "hsched");
+    grant_source_namespace(&svc, "hsched", "viewer", security::Role::Viewer);
+    let (_, alice) = svc
+        .db
+        .runtime()
+        .ensure_team_namespace("hsched", "alice", security::Role::Admin, "local")
+        .unwrap();
+    for grant in &alice {
+        svc.security.add_grant(grant);
+    }
+    let put = |principal: &'static str| {
+        svc.put_ontology_health_schedule(with_named_principal(
+            PutOntologyHealthScheduleRequest {
+                schedule: Some(OntologyHealthSchedule {
+                    namespace: "hsched".into(),
+                    window_ms: DAY,
+                    retention_ms: 7 * DAY,
+                    // Set by the plane; ignored on put.
+                    recorded_by: "mallory".into(),
+                    ..Default::default()
+                }),
+            },
+            principal,
+        ))
+    };
+    let tick = |now_ms| {
+        svc.tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms },
+            "local",
+        ))
+    };
+    let trend = |principal: &'static str| {
+        svc.list_ontology_health_trend(with_named_principal(
+            ListOntologyHealthTrendRequest {
+                namespace: "hsched".into(),
+            },
+            principal,
+        ))
+    };
+    let recorders = || {
+        let (snapshots, _) = svc
+            .db
+            .runtime()
+            .list_ontology_health_trend("hsched")
+            .unwrap();
+        snapshots
+            .into_iter()
+            .map(|snapshot| (snapshot.window_start_ms, snapshot.recorded_by))
+            .collect::<Vec<_>>()
+    };
+
+    // Only the namespace's administrator schedules, and records as itself.
+    assert_eq!(
+        put("viewer").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let stored = put("alice").await.unwrap().into_inner().schedule.unwrap();
+    assert_eq!(stored.recorded_by, "alice");
+
+    // The tick fills the trend with no outside caller, once per window.
+    tick(10 * DAY + 5).await.unwrap();
+    tick(10 * DAY + 9).await.unwrap();
+    assert_eq!(recorders(), [(10 * DAY, "alice".to_owned())]);
+    let shown = trend("alice").await.unwrap().into_inner();
+    assert_eq!(shown.snapshots.len(), 1);
+    assert_eq!(shown.schedule.unwrap().last_window_start_ms, 10 * DAY);
+    // A reader sees the trend but not the schedule.
+    assert_eq!(trend("viewer").await.unwrap().into_inner().schedule, None);
+
+    // Revoked: the next window fails the tick visibly and halts the schedule,
+    // so later ticks neither retry nor fail again.
+    for grant in &alice {
+        svc.db.runtime().delete_grant(&grant.id).unwrap();
+        svc.security
+            .remove_grant(&grant.object_id, &grant.principal);
+    }
+    let refused = tick(11 * DAY + 5).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("halted"),
+        "{}",
+        refused.message()
+    );
+    tick(12 * DAY + 5).await.unwrap();
+    assert_eq!(recorders().len(), 1);
+    let halted = trend("root").await.unwrap().into_inner().schedule.unwrap();
+    assert!(!halted.last_error.is_empty());
+
+    // Another administrator's put resumes it as them; delete stops it.
+    put("root").await.unwrap();
+    tick(13 * DAY + 5).await.unwrap();
+    assert_eq!(recorders()[1], (13 * DAY, "root".to_owned()));
+    let delete = || {
+        svc.delete_ontology_health_schedule(with_named_principal(
+            DeleteOntologyHealthScheduleRequest {
+                namespace: "hsched".into(),
+            },
+            "root",
+        ))
+    };
+    assert!(delete().await.unwrap().into_inner().deleted);
+    assert!(!delete().await.unwrap().into_inner().deleted);
+    tick(14 * DAY + 5).await.unwrap();
+    assert_eq!(recorders().len(), 2);
+}
+
+#[tokio::test]
 async fn a_dataset_version_exports_under_its_grant_without_withheld_columns() {
     use futures_util::StreamExt;
     let svc = service();

@@ -116,6 +116,7 @@ pub mod object_mutation;
 pub mod object_schema;
 pub mod offline_action;
 pub mod ontology_health;
+pub mod ontology_health_schedule;
 pub mod ontology_health_trend;
 pub mod ontology_lint;
 pub mod plan_execution;

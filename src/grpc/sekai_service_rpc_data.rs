@@ -4845,13 +4845,19 @@ pub(super) async fn tick_governed_transforms(
             }
         }
     }
-    // Scheduled dataset health checks join the same graph (#2187). Last, so a
-    // failing dataset fails the tick visibly without holding back other work.
+    // Scheduled dataset health checks (#2187) and ontology health snapshots
+    // (#2192) join the same graph. Last, and both always run, so a failing
+    // member fails the tick visibly without holding back other work.
     let health_runtime = runtime.clone();
-    tokio::task::spawn_blocking(move || health_runtime.tick_dataset_health_checks(now_ms))
-        .await
-        .map_err(|_| Status::internal("dataset health tick failed"))?
-        .map_err(Status::internal)?;
+    let datasets =
+        tokio::task::spawn_blocking(move || health_runtime.tick_dataset_health_checks(now_ms))
+            .await
+            .map_err(|_| Status::internal("dataset health tick failed"))?
+            .map_err(Status::internal);
+    let ontology =
+        super::ontology_health_rpc::tick_ontology_health_schedules(service, now_ms).await;
+    datasets?;
+    ontology?;
     let runs = runs
         .iter()
         .map(|run| {

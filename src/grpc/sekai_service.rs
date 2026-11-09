@@ -568,6 +568,20 @@ impl SekaiService for SekaiServiceImpl {
         ontology_health_rpc::list_ontology_health_trend(self, req).await
     }
 
+    async fn put_ontology_health_schedule(
+        &self,
+        req: Request<PutOntologyHealthScheduleRequest>,
+    ) -> Result<Response<PutOntologyHealthScheduleResponse>, Status> {
+        ontology_health_rpc::put_ontology_health_schedule(self, req).await
+    }
+
+    async fn delete_ontology_health_schedule(
+        &self,
+        req: Request<DeleteOntologyHealthScheduleRequest>,
+    ) -> Result<Response<DeleteOntologyHealthScheduleResponse>, Status> {
+        ontology_health_rpc::delete_ontology_health_schedule(self, req).await
+    }
+
     async fn dry_run_definition_change_bundle(
         &self,
         req: Request<DryRunDefinitionChangeBundleRequest>,

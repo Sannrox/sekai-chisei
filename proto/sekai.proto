@@ -4770,9 +4770,8 @@ message GetOntologyHealthResponse {
   bool complete = 3;
 }
 // Records one health snapshot of a namespace for the current window
-// (#1694). An external periodic caller drives it; the plane runs no
-// scheduler. The caller's schedule carries the window, retention and
-// threshold.
+// (#1694), on demand. A stored OntologyHealthSchedule records from the
+// transform schedule tick (#2192); this call stays for on-demand records.
 message RecordOntologyHealthSnapshotRequest {
   string namespace = 1;
   // Window length; the snapshot belongs to the window holding the current
@@ -4827,6 +4826,45 @@ message ListOntologyHealthTrendResponse {
   repeated OntologyHealthSnapshot snapshots = 1;
   // Only events whose snapshot the reader may see in full.
   repeated OntologyHealthEvent events = 2;
+  // The namespace's schedule, shown only to its administrator; absent when
+  // none is stored.
+  optional OntologyHealthSchedule schedule = 3;
+}
+// A namespace's health snapshot schedule (#2192): a member of the transform
+// schedule graph. TickGovernedTransforms records each due window as
+// recorded_by.
+message OntologyHealthSchedule {
+  string namespace = 1;
+  // Window length and cadence. At least one minute.
+  int64 window_ms = 2;
+  // At least one window.
+  int64 retention_ms = 3;
+  // 0-100.
+  uint32 threshold = 4;
+  // Set by the plane: the administrator that put it.
+  string recorded_by = 5;
+  // Set by the plane.
+  int64 updated_at_ms = 6;
+  // Set by the plane: start of the last recorded window; 0 before the first.
+  int64 last_window_start_ms = 7;
+  // Set by the plane: why the schedule halted; empty while it runs. A halted
+  // schedule records again after a put replaces it.
+  string last_error = 8;
+}
+// Creates or replaces the namespace's schedule. Only the namespace's
+// administrator, outside a tenant assertion; they become recorded_by.
+message PutOntologyHealthScheduleRequest {
+  OntologyHealthSchedule schedule = 1;
+}
+message PutOntologyHealthScheduleResponse {
+  OntologyHealthSchedule schedule = 1;
+}
+// Stops the schedule; the recorded trend stays.
+message DeleteOntologyHealthScheduleRequest {
+  string namespace = 1;
+}
+message DeleteOntologyHealthScheduleResponse {
+  bool deleted = 1;
 }
 message DefinitionPropertyRef {
   string object_type = 1;
@@ -5149,6 +5187,10 @@ service SekaiService {
       returns (RecordOntologyHealthSnapshotResponse);
   rpc ListOntologyHealthTrend(ListOntologyHealthTrendRequest)
       returns (ListOntologyHealthTrendResponse);
+  rpc PutOntologyHealthSchedule(PutOntologyHealthScheduleRequest)
+      returns (PutOntologyHealthScheduleResponse);
+  rpc DeleteOntologyHealthSchedule(DeleteOntologyHealthScheduleRequest)
+      returns (DeleteOntologyHealthScheduleResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

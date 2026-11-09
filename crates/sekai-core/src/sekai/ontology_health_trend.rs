@@ -1,7 +1,9 @@
 //! Stored ontology health trends and threshold events (#1694).
 //!
-//! An external periodic call records one snapshot of a namespace's part
-//! scores per time window; the plane runs no scheduler. Recording is
+//! A record stores one snapshot of a namespace's part scores per time
+//! window. A stored schedule (`ontology_health_schedule`, #2192) records
+//! from the transform schedule tick; `RecordOntologyHealthSnapshot` records
+//! on demand. Recording is
 //! idempotent per (namespace, window): the window's first record is kept and
 //! every later or concurrent one replays it. When the total (the lowest part)
 //! falls below the threshold, one event is written in the same transaction
@@ -106,6 +108,38 @@ pub struct RecordRequest<'a> {
     pub now_ms: i64,
 }
 
+/// Checks a record's or a schedule's window, retention and threshold, and
+/// returns the threshold.
+pub fn validate(
+    namespace: &str,
+    window_ms: i64,
+    retention_ms: i64,
+    threshold: u32,
+) -> Result<u8, TrendError> {
+    if namespace.trim().is_empty() {
+        return Err(TrendError::Invalid("namespace is required".into()));
+    }
+    if window_ms < MIN_WINDOW_MS {
+        return Err(TrendError::Invalid(format!(
+            "window_ms must be at least {MIN_WINDOW_MS}"
+        )));
+    }
+    if retention_ms < window_ms {
+        return Err(TrendError::Invalid(
+            "retention_ms must cover at least one window".into(),
+        ));
+    }
+    u8::try_from(threshold)
+        .ok()
+        .filter(|threshold| *threshold <= 100)
+        .ok_or_else(|| TrendError::Invalid("threshold must be 0-100".into()))
+}
+
+/// The start of the `window_ms` window holding `now_ms`.
+pub fn window_start(now_ms: i64, window_ms: i64) -> i64 {
+    now_ms - now_ms.rem_euclid(window_ms)
+}
+
 /// Records `parts`, scored from `datasets` and `definition_revision`, for
 /// the window holding `now_ms`.
 pub fn record(
@@ -115,24 +149,13 @@ pub fn record(
     datasets: &[String],
     definition_revision: &str,
 ) -> Result<Recorded, TrendError> {
-    if request.namespace.trim().is_empty() {
-        return Err(TrendError::Invalid("namespace is required".into()));
-    }
-    if request.window_ms < MIN_WINDOW_MS {
-        return Err(TrendError::Invalid(format!(
-            "window_ms must be at least {MIN_WINDOW_MS}"
-        )));
-    }
-    if request.retention_ms < request.window_ms {
-        return Err(TrendError::Invalid(
-            "retention_ms must cover at least one window".into(),
-        ));
-    }
-    let threshold = u8::try_from(request.threshold)
-        .ok()
-        .filter(|threshold| *threshold <= 100)
-        .ok_or_else(|| TrendError::Invalid("threshold must be 0-100".into()))?;
-    let window_start_ms = request.now_ms - request.now_ms.rem_euclid(request.window_ms);
+    let threshold = validate(
+        request.namespace,
+        request.window_ms,
+        request.retention_ms,
+        request.threshold,
+    )?;
+    let window_start_ms = window_start(request.now_ms, request.window_ms);
     let snapshot = HealthSnapshot {
         namespace: request.namespace.into(),
         window_start_ms,
