@@ -1624,6 +1624,10 @@ pub(super) fn map_source_sync_apply_error(error: String) -> Status {
             Status::failed_precondition("source sync contract version is unsupported")
         }
         "unbound_type_revision" => Status::failed_precondition("source type revision is not bound"),
+        "source_disabled" => Status::failed_precondition("source is disabled"),
+        "source_handle_mismatch" => {
+            Status::failed_precondition("the named source does not own this source_instance")
+        }
         "idempotency_conflict" | "replay_identity_conflict" | "source_identity_conflict" => {
             Status::already_exists("source sync identity conflict")
         }

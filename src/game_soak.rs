@@ -785,6 +785,7 @@ fn source_batch(
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     })
 }
 

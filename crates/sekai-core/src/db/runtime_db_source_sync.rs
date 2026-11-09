@@ -27,6 +27,15 @@ impl RuntimeDb {
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
     ) -> Result<SourceBatchResult, String> {
+        // A disabled Source stops every batch for its tokens (ADR 0148),
+        // whichever path the batch takes.
+        crate::sekai::source::admit_batch(
+            self,
+            &batch.namespace,
+            &batch.source,
+            &batch.source_instance,
+            "",
+        )?;
         match self {
             Self::Sqlite(db) => db.apply_source_batch_with_policy_generation(
                 batch,

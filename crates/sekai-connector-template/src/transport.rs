@@ -232,6 +232,7 @@ fn to_proto(batch: &SourceBatch) -> pb::SourceBatch {
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     }
 }
 

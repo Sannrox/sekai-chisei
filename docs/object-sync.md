@@ -192,6 +192,19 @@ version, and type revision. `current_cursor` must be empty for the first batch
 and must exactly equal the last committed cursor thereafter. The adapter may
 propose `proposed_next_cursor`; only the control plane persists it.
 
+A batch names the Source it syncs with `source_id`
+([ADR 0148](decisions/0148-sources-and-one-connector-runtime.md)). That Source
+must own the batch's `source` and `source_instance`, or the batch fails as
+`source_handle_mismatch`. Naming a Source changes no identity: object ids still
+derive from `source`, `source_instance` and each record's external id. A batch
+without `source_id` keeps the free-form `source_instance` path, which is
+deprecated. It stays open for active Sources too, so producers that predate
+`source_id` keep working through a rolling deploy. A disabled Source refuses
+every batch for its tokens, named or not, as `source_disabled`. The check reads
+the Source before the batch transaction: a batch admitted just before a disable
+commits can still apply, and a retry of a batch that applied before the disable
+is refused rather than replayed.
+
 The GitHub object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;

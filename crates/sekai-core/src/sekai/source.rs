@@ -288,6 +288,38 @@ pub fn disable(
         .ok_or(SourceError::NotFound)
 }
 
+/// Admits a batch for `source` and `source_instance` against the Source
+/// that owns those tokens (ADR 0148). `handle` is the Source id the batch
+/// names, or empty for a producer that predates Sources. A disabled Source
+/// refuses every batch for its tokens, named or not; a named Source must
+/// own them. An unnamed batch is admitted for unowned tokens and for an
+/// active Source, so older producers survive a rolling deploy. The read
+/// runs before the apply transaction, so a disable is best-effort for a
+/// batch already in flight. The error starts with the apply-error code the
+/// RPC layer maps.
+pub fn admit_batch(
+    db: &RuntimeDb,
+    namespace: &str,
+    source: &str,
+    source_instance: &str,
+    handle: &str,
+) -> Result<(), String> {
+    let owner = db.get_source_by_tokens(namespace, source, source_instance)?;
+    match owner {
+        Some(owner) if !handle.is_empty() && owner.source_id != handle => Err(format!(
+            "source_handle_mismatch: source {handle:?} does not own this source and source_instance"
+        )),
+        None if !handle.is_empty() => Err(format!(
+            "source_handle_mismatch: source {handle:?} does not own this source and source_instance"
+        )),
+        Some(owner) if owner.status != SourceStatus::Active => Err(format!(
+            "source_disabled: source {:?} is disabled",
+            owner.source_id
+        )),
+        _ => Ok(()),
+    }
+}
+
 const CREATE_SQLITE: &str = "
 CREATE TABLE IF NOT EXISTS sekai_sources (
     namespace TEXT NOT NULL,
@@ -618,6 +650,21 @@ impl SekaiDb {
         self.sqlite_source(DISABLE_SQL, rusqlite::params![now_ms, namespace, source_id])
     }
 
+    pub fn get_source_by_tokens(
+        &self,
+        namespace: &str,
+        source: &str,
+        source_instance: &str,
+    ) -> Result<Option<Source>, String> {
+        self.sqlite_source(
+            &format!(
+                "SELECT {COLUMNS} FROM sekai_sources
+                 WHERE namespace = $1 AND source = $2 AND source_instance = $3"
+            ),
+            rusqlite::params![namespace, source, source_instance],
+        )
+    }
+
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
         self.sqlite_source(
             &format!("SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"),
@@ -705,6 +752,21 @@ impl PostgresDb {
         self.postgres_source(DISABLE_SQL, &[&now_ms, &namespace, &source_id])
     }
 
+    pub fn get_source_by_tokens(
+        &self,
+        namespace: &str,
+        source: &str,
+        source_instance: &str,
+    ) -> Result<Option<Source>, String> {
+        self.postgres_source(
+            &format!(
+                "SELECT {COLUMNS} FROM sekai_sources
+                 WHERE namespace = $1 AND source = $2 AND source_instance = $3"
+            ),
+            &[&namespace, &source, &source_instance],
+        )
+    }
+
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
         self.postgres_source(
             &format!("SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"),
@@ -766,6 +828,22 @@ impl RuntimeDb {
             Self::Postgres(db) => {
                 crate::db::postgres::off_runtime(|| db.disable_source(namespace, source_id, now_ms))
             }
+        }
+    }
+
+    /// The Source that owns `source` and `source_instance` in `namespace`,
+    /// active or not.
+    pub fn get_source_by_tokens(
+        &self,
+        namespace: &str,
+        source: &str,
+        source_instance: &str,
+    ) -> Result<Option<Source>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_source_by_tokens(namespace, source, source_instance),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_source_by_tokens(namespace, source, source_instance)
+            }),
         }
     }
 
@@ -1166,11 +1244,46 @@ pub(crate) mod tests {
         assert_eq!(ids("", 10), ["repo-a", "repo-b"]);
         assert_eq!(ids("", 1), ["repo-a"]);
         assert_eq!(ids("repo-a", 10), ["repo-b"]);
+
+        // A batch is admitted against the Source that owns its tokens.
+        let admit = |instance: &str, handle: &str| admit_batch(&db, ns, "github", instance, handle);
+        assert_eq!(admit("acme/b", ""), Ok(()));
+        assert_eq!(admit("acme/b", "repo-b"), Ok(()));
+        assert_eq!(admit("acme/unowned", ""), Ok(()), "no Source owns these");
+        for (instance, handle) in [("acme/b", "repo-a"), ("acme/unowned", "repo-b")] {
+            assert!(
+                admit(instance, handle)
+                    .unwrap_err()
+                    .starts_with("source_handle_mismatch:")
+            );
+        }
+        disable(&db, ns, "repo-b", 9_000).unwrap();
+        for handle in ["", "repo-b"] {
+            assert!(
+                admit("acme/b", handle)
+                    .unwrap_err()
+                    .starts_with("source_disabled:")
+            );
+        }
     }
 
     #[test]
     fn sqlite_sources_put_get_list_and_disable() {
         contract(Arc::new(RuntimeDb::memory()), "acme");
+    }
+
+    #[test]
+    fn a_disabled_source_stops_its_batches() {
+        use crate::db::object_sync::tests::{PRODUCER, batch};
+        let db = RuntimeDb::memory();
+        put(&db, &github("acme", "ops", "acme/ops")).unwrap();
+        db.apply_source_batch(&batch("", "cursor:1", "batch-1"), PRODUCER, 100)
+            .unwrap();
+        disable(&db, "acme", "ops", 200).unwrap();
+        let refused = db
+            .apply_source_batch(&batch("cursor:1", "cursor:2", "batch-2"), PRODUCER, 300)
+            .unwrap_err();
+        assert!(refused.starts_with("source_disabled:"), "{refused}");
     }
 
     #[test]
