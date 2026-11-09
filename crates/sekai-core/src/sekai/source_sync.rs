@@ -182,16 +182,26 @@ pub fn tick(db: &RuntimeDb, now_ms: i64) -> Result<u64, String> {
 }
 
 /// At most `limit` Sources in `namespace` a runtime with `labels` may
-/// claim now, by id. Placement filters while walking every due Source, so
-/// due work placed elsewhere never hides work this runtime may take.
+/// claim now and `accepts`, by id. Placement and `accepts` filter while
+/// walking every due Source, so due work this runtime cannot take never
+/// hides work it can.
 pub fn list_claimable(
     db: &RuntimeDb,
     namespace: &str,
     labels: &BTreeMap<String, String>,
     now_ms: i64,
     limit: usize,
+    accepts: impl Fn(&Source) -> bool,
 ) -> Result<Vec<Source>, String> {
-    walk_claimable(db, namespace, labels, now_ms, limit, MAX_LIST_SOURCES)
+    walk_claimable(
+        db,
+        namespace,
+        labels,
+        now_ms,
+        limit,
+        MAX_LIST_SOURCES,
+        accepts,
+    )
 }
 
 fn walk_claimable(
@@ -201,6 +211,7 @@ fn walk_claimable(
     now_ms: i64,
     limit: usize,
     page: usize,
+    accepts: impl Fn(&Source) -> bool,
 ) -> Result<Vec<Source>, String> {
     let mut claimable = Vec::new();
     let mut after = String::new();
@@ -216,6 +227,7 @@ fn walk_claimable(
                 MAX_SOURCE_SYNC_LEASE_EXPIRIES,
                 now_ms,
             ) && placement_satisfied(&source.spec.placement, labels)
+                && accepts(source)
         }));
         if last_page {
             break;
@@ -286,7 +298,7 @@ pub fn claim_next(
     ttl_ms: i64,
     now_ms: i64,
 ) -> Result<Source, SyncError> {
-    for source in list_claimable(db, namespace, labels, now_ms, MAX_LIST_SOURCES)? {
+    for source in list_claimable(db, namespace, labels, now_ms, MAX_LIST_SOURCES, |_| true)? {
         match claim(
             db,
             namespace,
@@ -377,7 +389,7 @@ mod tests {
     }
 
     fn claimable(db: &RuntimeDb, ns: &str, now_ms: i64) -> Vec<String> {
-        list_claimable(db, ns, &labels("eu"), now_ms, MAX_LIST_SOURCES)
+        list_claimable(db, ns, &labels("eu"), now_ms, MAX_LIST_SOURCES, |_| true)
             .unwrap()
             .into_iter()
             .map(|source| source.source_id)
@@ -412,7 +424,7 @@ mod tests {
 
         // Placement: a runtime without the labels neither lists nor claims.
         assert!(
-            list_claimable(db, ns, &labels("us"), now, MAX_LIST_SOURCES)
+            list_claimable(db, ns, &labels("us"), now, MAX_LIST_SOURCES, |_| true)
                 .unwrap()
                 .is_empty()
         );
@@ -601,15 +613,18 @@ mod tests {
         let now = 10 * EVERY;
         db.tick_source_syncs("acme", now).unwrap();
         // One due row per page: the walk passes both us rows to find eu.
-        let found = walk_claimable(&db, "acme", &labels("eu"), now, 1, 1).unwrap();
+        let found = walk_claimable(&db, "acme", &labels("eu"), now, 1, 1, |_| true).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].source_id, "c");
-        let all = walk_claimable(&db, "acme", &labels("eu"), now, 10, 1).unwrap();
+        let all = walk_claimable(&db, "acme", &labels("eu"), now, 10, 1, |source| {
+            source.source_id != "d"
+        })
+        .unwrap();
         assert_eq!(
             all.iter()
                 .map(|source| source.source_id.as_str())
                 .collect::<Vec<_>>(),
-            ["c", "d"]
+            ["c"]
         );
     }
 

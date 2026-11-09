@@ -292,21 +292,34 @@ impl SekaiServiceImpl {
         namespace: &str,
         runtime_id: &str,
         limit: i32,
+        options: SourceSyncWorkOptions,
     ) -> Result<Vec<ConnectorSource>, Status> {
         self.source_sync_runtime(req, namespace)?;
         let labels = self.runtime_labels(namespace, runtime_id)?;
+        let implements = |source: &Source| {
+            options.connector_types.is_empty()
+                || options.connector_types.iter().any(|ty| {
+                    ty.name == source.spec.connector_type
+                        && ty.version == source.spec.connector_version
+                })
+        };
         let limit = usize::try_from(limit)
             .ok()
             .filter(|limit| *limit > 0)
             .unwrap_or(50)
             .min(source::MAX_LIST_SOURCES);
-        Ok(
-            source_sync::list_claimable(self.db.runtime(), namespace, &labels, now_millis(), limit)
-                .map_err(|_| Status::internal("source store unavailable"))?
-                .into_iter()
-                .map(source_to_proto)
-                .collect(),
+        Ok(source_sync::list_claimable(
+            self.db.runtime(),
+            namespace,
+            &labels,
+            now_millis(),
+            limit,
+            implements,
         )
+        .map_err(|_| Status::internal("source store unavailable"))?
+        .into_iter()
+        .map(source_to_proto)
+        .collect())
     }
 
     pub(super) fn claim_source_sync<T: std::any::Any>(

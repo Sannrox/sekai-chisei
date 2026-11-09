@@ -19,9 +19,18 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListClaimableWorkResponse>, Status> {
         let kind = admitted_kind(&req, req.get_ref().kind)?;
         let (metadata, extensions, inner) = req.into_parts();
-        let turn = inner.options.map(|options| match options {
-            list_claimable_work_request::Options::AgentTurn(turn) => turn,
-        });
+        let (turn, source_sync) = match inner.options {
+            Some(list_claimable_work_request::Options::AgentTurn(turn)) => (Some(turn), None),
+            Some(list_claimable_work_request::Options::SourceSync(options)) => {
+                if !matches!(kind, Kind::SourceSync) {
+                    return Err(Status::invalid_argument(
+                        "options do not match the work kind",
+                    ));
+                }
+                (None, Some(options))
+            }
+            None => (None, None),
+        };
         let payloads: Vec<claimable_work::Payload> = match kind {
             Kind::Transform => {
                 refuse_turn_options(turn)?;
@@ -90,6 +99,7 @@ impl SekaiServiceImpl {
                     &inner.namespace,
                     &inner.runtime_id,
                     inner.limit,
+                    source_sync.unwrap_or_default(),
                 )?
                 .into_iter()
                 .map(claimable_work::Payload::SourceSync)

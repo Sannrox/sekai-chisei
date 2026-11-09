@@ -39,8 +39,9 @@ use crate::protocol::sekai::{
     AgentTurnContinuation, AgentTurnWorkOptions, ApplyStreamingTransformBatchRequest,
     ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
     ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
-    ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, HeartbeatActionClaimRequest,
-    HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
+    ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, ConnectorSource,
+    ConnectorTypeRef, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
+    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
     HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest,
     HeartbeatWorkClaimResponse, ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
@@ -48,11 +49,11 @@ use crate::protocol::sekai::{
     ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
     ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
-    ReportActionClaimEventResponse, StreamingTransformInputPosition, StreamingTransformObjectEdit,
-    TransformLabel, TransformRunInputRow, WriteTransformRunResultRequest,
-    WriteTransformRunResultResponse, ack_work_request, ack_work_response, claim_work_request,
-    claim_work_response, claimable_work, heartbeat_work_claim_response,
-    list_claimable_work_request,
+    ReportActionClaimEventResponse, SourceSyncWorkOptions, StreamingTransformInputPosition,
+    StreamingTransformObjectEdit, TransformLabel, TransformRunInputRow,
+    WriteTransformRunResultRequest, WriteTransformRunResultResponse, ack_work_request,
+    ack_work_response, claim_work_request, claim_work_response, claimable_work,
+    heartbeat_work_claim_response, list_claimable_work_request,
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -542,6 +543,46 @@ impl<'a> RuntimeClaimClient<'a> {
             Err(error) => Err(error),
         }
         .map_err(RuntimeClaimError::from_list)
+    }
+
+    /// Lists Source sync work this runtime may take, of the connector types
+    /// it implements (`(name, version)` pairs), so Sources of other types
+    /// never fill its page.
+    pub async fn list_source_sync_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<ConnectorSource>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::SourceSync.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::SourceSync(
+                SourceSyncWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::SourceSync(source)) => Some(source),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Claims `work_id` of `kind` in the client's namespace; an empty

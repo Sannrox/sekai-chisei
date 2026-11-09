@@ -1,0 +1,19 @@
+[package]
+name = "sekai-connector-runtime"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The one connector runtime (ADR 0148): claims Source work from the plane and runs connector types."
+publish = false
+
+# Never depend on the control-plane packages (sekai-chisei, sekai-core,
+# chisei-core): the runtime talks to the plane only over gRPC.
+[dependencies]
+sekai-client = { version = "1.0.0", path = "../sekai-client" }
+sekai-source-sdk = { version = "1.4.0", path = "../sekai-source-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
