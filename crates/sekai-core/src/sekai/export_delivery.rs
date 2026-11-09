@@ -226,18 +226,19 @@ pub fn claim(
     ))
 }
 
-/// Claims the oldest open artifact in `namespace` whose receipt `may_claim`
-/// admits. A row lost to a concurrent claimer is skipped.
+/// Claims the oldest open artifact in `namespace` that `may_claim` admits,
+/// given its receipt and definition id. A row lost to a concurrent claimer
+/// is skipped.
 pub fn claim_next(
     db: &RuntimeDb,
     namespace: &str,
     owner: &str,
     ttl_ms: i64,
     now_ms: i64,
-    may_claim: impl Fn(&OperationReceipt) -> bool,
+    may_claim: impl Fn(&OperationReceipt, &str) -> bool,
 ) -> Result<DeliverableExportArtifact, DeliveryError> {
-    for (receipt, _, _) in open_artifacts(db, namespace, now_ms)? {
-        if !may_claim(&receipt) {
+    for (receipt, _, artifact) in open_artifacts(db, namespace, now_ms)? {
+        if !may_claim(&receipt, &artifact.definition_id) {
             continue;
         }
         match claim(db, &receipt, owner, ttl_ms, now_ms) {
@@ -418,7 +419,7 @@ pub(crate) mod tests {
             Err(DeliveryError::Claim(ClaimError::FenceLost))
         );
         assert_eq!(
-            claim_next(db, &ns, "runtime-b", 1_000, 2_100, |_| true),
+            claim_next(db, &ns, "runtime-b", 1_000, 2_100, |_, _| true),
             Err(DeliveryError::Unavailable)
         );
         assert!(
@@ -444,7 +445,7 @@ pub(crate) mod tests {
             DeliveryError::Claim(ClaimError::Closed)
         );
         assert_eq!(
-            claim_next(db, &ns, "runtime-b", 1_000, expires_at_ms + 1, |_| true),
+            claim_next(db, &ns, "runtime-b", 1_000, expires_at_ms + 1, |_, _| true),
             Err(DeliveryError::Unavailable)
         );
     }
@@ -455,19 +456,19 @@ pub(crate) mod tests {
         let ns = namespace(prefix);
         let second = completed_artifact_at(db, &ns, OPENED_AT_MS + 1);
         let first = completed_artifact_at(db, &ns, OPENED_AT_MS);
-        let taken = claim_next(db, &ns, "runtime-a", 1_000, 1_000, |_| true).unwrap();
+        let taken = claim_next(db, &ns, "runtime-a", 1_000, 1_000, |_, _| true).unwrap();
         assert_eq!(taken.receipt_id, first.operation_id);
         assert_eq!(taken.claim.owner, "runtime-a");
-        let next = claim_next(db, &ns, "runtime-b", 1_000, 1_000, |_| true).unwrap();
+        let next = claim_next(db, &ns, "runtime-b", 1_000, 1_000, |_, _| true).unwrap();
         assert_eq!(next.receipt_id, second.operation_id);
         assert_eq!(
-            claim_next(db, &ns, "runtime-c", 1_000, 1_000, |_| true),
+            claim_next(db, &ns, "runtime-c", 1_000, 1_000, |_, _| true),
             Err(DeliveryError::Unavailable)
         );
         let other = namespace(prefix);
         completed_artifact(db, &other);
         assert_eq!(
-            claim_next(db, &other, "runtime-c", 1_000, 1_000, |_| false),
+            claim_next(db, &other, "runtime-c", 1_000, 1_000, |_, _| false),
             Err(DeliveryError::Unavailable),
             "a caller the receipt does not admit gets nothing"
         );

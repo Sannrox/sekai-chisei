@@ -19,17 +19,22 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListClaimableWorkResponse>, Status> {
         let kind = admitted_kind(&req, req.get_ref().kind)?;
         let (metadata, extensions, inner) = req.into_parts();
-        let (turn, source_sync) = match inner.options {
-            Some(list_claimable_work_request::Options::AgentTurn(turn)) => (Some(turn), None),
+        let mismatched = || Status::invalid_argument("options do not match the work kind");
+        let (turn, source_sync, export_delivery) = match inner.options {
+            Some(list_claimable_work_request::Options::AgentTurn(turn)) => (Some(turn), None, None),
             Some(list_claimable_work_request::Options::SourceSync(options)) => {
                 if !matches!(kind, Kind::SourceSync) {
-                    return Err(Status::invalid_argument(
-                        "options do not match the work kind",
-                    ));
+                    return Err(mismatched());
                 }
-                (None, Some(options))
+                (None, Some(options), None)
             }
-            None => (None, None),
+            Some(list_claimable_work_request::Options::ExportDelivery(options)) => {
+                if !matches!(kind, Kind::ExportDelivery) {
+                    return Err(mismatched());
+                }
+                (None, None, Some(options))
+            }
+            None => (None, None, None),
         };
         let payloads: Vec<claimable_work::Payload> = match kind {
             Kind::Transform => {
@@ -86,10 +91,16 @@ impl SekaiServiceImpl {
             Kind::ExportDelivery => {
                 refuse_turn_options(turn)?;
                 let req = Request::from_parts(metadata, extensions, ());
-                self.list_claimable_export_deliveries(&req, &inner.namespace, inner.limit)?
-                    .into_iter()
-                    .map(claimable_work::Payload::ExportDelivery)
-                    .collect()
+                self.list_claimable_export_deliveries(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    inner.limit,
+                    export_delivery,
+                )?
+                .into_iter()
+                .map(claimable_work::Payload::ExportDelivery)
+                .collect()
             }
             Kind::SourceSync => {
                 refuse_turn_options(turn)?;
@@ -361,28 +372,35 @@ impl SekaiServiceImpl {
                 )
             }
             Kind::ExportDelivery => {
-                let Some(ack_work_request::Options::ExportDelivery(options)) = inner.options else {
-                    return Err(Status::invalid_argument(
-                        "export delivery needs ExportDeliveryAckOptions with the digest",
-                    ));
-                };
-                if inner.outcome != "completed" {
-                    return Err(Status::invalid_argument(
-                        "export delivery is acknowledged as completed",
-                    ));
-                }
                 let req = Request::from_parts(metadata, extensions, ());
                 let fence = Fence {
                     owner: &inner.runtime_id,
                     generation: inner.claim_generation,
                     token: &inner.fencing_token,
                 };
-                ack_work_response::Payload::ExportDelivery(self.ack_export_delivery(
-                    &req,
-                    &inner.work_id,
-                    fence,
-                    &options.content_digest,
-                )?)
+                let acknowledged = match (inner.outcome.as_str(), inner.options) {
+                    ("completed", Some(ack_work_request::Options::ExportDelivery(options))) => self
+                        .ack_export_delivery(
+                            &req,
+                            &inner.work_id,
+                            fence,
+                            &options.content_digest,
+                        )?,
+                    ("completed", _) => {
+                        return Err(Status::invalid_argument(
+                            "export delivery needs ExportDeliveryAckOptions with the digest",
+                        ));
+                    }
+                    ("failed", None | Some(ack_work_request::Options::ExportDelivery(_))) => {
+                        self.fail_export_delivery(&req, &inner.work_id, fence, &inner.reason)?
+                    }
+                    _ => {
+                        return Err(Status::invalid_argument(
+                            "export delivery is acknowledged as completed or failed",
+                        ));
+                    }
+                };
+                ack_work_response::Payload::ExportDelivery(acknowledged)
             }
             Kind::SourceSync => {
                 if inner.options.is_some() {

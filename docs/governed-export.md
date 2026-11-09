@@ -178,3 +178,24 @@ deliver. The plane holds no destination credentials.
 - A claim lapses at its expiry and any eligible claimer may take the
   artifact again at a higher generation. Reclaims are not limited: the
   artifact's retention bounds them.
+- A definition may name a delivery Source with `delivery_source_id`
+  ([ADR 0148](decisions/0148-sources-and-one-connector-runtime.md)). Saving
+  it needs that Source to be active and of a type that delivers
+  (`FAILED_PRECONDITION` otherwise). Its artifacts then go only to a runtime
+  whose registered labels satisfy the Source's placement, while the Source
+  is active: other claimers neither list nor claim them, the deprecated
+  list leaves them out, and an unfenced fetch or acknowledge refuses them
+  (`NOT_FOUND`). Disabling or re-placing the Source also ends a claim
+  already taken: its heartbeat fails as a lost fence and its fenced fetch
+  is refused. A runtime lists only such artifacts, of the types it
+  delivers through, with `ExportDeliveryWorkOptions`, so artifacts left to
+  other deliverers never fill its page. The connector runtime claims them,
+  fetches under the fence, verifies the digest, and delivers through the
+  Source with the credential bound in the runtime. The Source is read from the definition as
+  it stands at delivery time.
+- `AckWork` with outcome `failed` and a failure class as `reason`
+  (`unavailable`, `unreachable`, `auth_failed`, `permission_missing`,
+  `invalid` or `unsupported`) records a failed delivery under a live fence.
+  It keeps the bytes and the claim, which lapses, so the artifact is tried
+  again a lease later until it expires. Every acknowledged delivery, failed
+  or completed, lands in the delivery Source's `delivery` health.

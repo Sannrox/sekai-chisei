@@ -217,6 +217,7 @@ const PENDING_DECISION_INDEXES_SCHEMA: &str =
     include_str!("postgres/0150_pending_decision_indexes.sql");
 const SOURCES_SCHEMA: &str = include_str!("postgres/0151_sources.sql");
 const SOURCE_SYNC_SCHEMA: &str = include_str!("postgres/0152_source_sync.sql");
+const SOURCE_DELIVERY_SCHEMA: &str = include_str!("postgres/0153_source_delivery.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1093,6 +1094,12 @@ const MIGRATIONS: &[Migration] = &[
         151,
         "source_sync",
         SOURCE_SYNC_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        152,
+        "source_delivery",
+        SOURCE_DELIVERY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

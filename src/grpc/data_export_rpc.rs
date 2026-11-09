@@ -945,7 +945,7 @@ fn check_definition_id(id: &str) -> Result<(), Status> {
     }
 }
 
-fn decode_definition(record_json: &str) -> Result<ExportDefinition, Status> {
+pub(super) fn decode_definition(record_json: &str) -> Result<ExportDefinition, Status> {
     serde_json::from_str(record_json).map_err(|_| Status::internal("export definition unreadable"))
 }
 
@@ -1080,6 +1080,9 @@ impl SekaiServiceImpl {
         definition.owner = owner.clone();
         definition.created_at_ms = 0;
         self.prepare_definition_export(ExportCaller::owner(&owner), &definition)?;
+        if !definition.delivery_source_id.is_empty() {
+            self.check_delivery_source(&definition.namespace, &definition.delivery_source_id)?;
+        }
         let body = serde_json::to_string(&definition)
             .map_err(|_| Status::internal("export definition unencodable"))?;
         definition.created_at_ms = now_millis();
@@ -1259,40 +1262,133 @@ impl SekaiServiceImpl {
         Ok(receipt)
     }
 
+    /// The Source that delivers the artifacts of `definition_id`, from the
+    /// definition as it stands now; empty for none or a deleted definition.
+    fn delivery_source_id(&self, namespace: &str, definition_id: &str) -> Result<String, Status> {
+        let Some((_, record_json)) = self
+            .db
+            .runtime()
+            .get_export_definition(namespace, definition_id)
+            .map_err(Status::internal)?
+        else {
+            return Ok(String::new());
+        };
+        Ok(decode_definition(&record_json)?.delivery_source_id)
+    }
+
+    /// Whether `runtime_id` may claim an artifact `delivery_source_id`
+    /// delivers (ADR 0148): any runtime when empty, otherwise only while the
+    /// Source is active and its placement matches the runtime's labels.
+    /// With `types`, only Source-bound artifacts of those types (any type
+    /// when empty) are admitted.
+    fn delivery_runtime_admitted(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+        delivery_source_id: &str,
+        types: Option<&[ConnectorTypeRef]>,
+    ) -> Result<bool, Status> {
+        if delivery_source_id.is_empty() {
+            return Ok(types.is_none());
+        }
+        let db = self.db.runtime();
+        let Some(source) = db
+            .get_source(namespace, delivery_source_id)
+            .map_err(|_| Status::internal("source store unavailable"))?
+        else {
+            return Ok(false);
+        };
+        if source.status != crate::sekai::source::SourceStatus::Active {
+            return Ok(false);
+        }
+        let typed = types.is_none_or(|types| {
+            types.is_empty()
+                || types.iter().any(|ty| {
+                    ty.name == source.spec.connector_type
+                        && ty.version == source.spec.connector_version
+                })
+        });
+        if !typed {
+            return Ok(false);
+        }
+        let labels = db
+            .registered_runtime_labels(namespace, runtime_id)
+            .map_err(|_| Status::internal("runtime labels unavailable"))?;
+        Ok(sekai_types::governed_transform::placement_satisfied(
+            &source.spec.placement,
+            &labels,
+        ))
+    }
+
+    /// A delivery Source must be active and of a type that delivers.
+    fn check_delivery_source(&self, namespace: &str, source_id: &str) -> Result<(), Status> {
+        let source = self
+            .db
+            .runtime()
+            .get_source(namespace, source_id)
+            .map_err(|_| Status::internal("source store unavailable"))?
+            .ok_or_else(|| Status::failed_precondition("delivery source not found"))?;
+        if source.status != crate::sekai::source::SourceStatus::Active {
+            return Err(Status::failed_precondition("delivery source is disabled"));
+        }
+        let delivers = sekai_source_sdk::connector_type(
+            &source.spec.connector_type,
+            &source.spec.connector_version,
+        )
+        .is_some_and(|connector| connector.supports(sekai_source_sdk::Operation::Deliver));
+        if !delivers {
+            return Err(Status::failed_precondition(
+                "delivery source type does not deliver exports",
+            ));
+        }
+        Ok(())
+    }
+
     /// Completed artifacts in `namespace` no live claim holds, that the
-    /// caller may deliver, oldest first.
+    /// caller may deliver and `admits` lets through by delivery Source,
+    /// oldest first.
     fn deliverable_artifacts<T>(
         &self,
         req: &Request<T>,
         namespace: &str,
+        admits: impl Fn(&str) -> Result<bool, Status>,
     ) -> Result<Vec<DeliverableExportArtifact>, Status>
     where
         T: std::any::Any,
     {
         let principals = self.saved_export_caller(req, namespace, false)?;
-        Ok(export_delivery::list_deliverable_export_artifacts(
+        let mut deliverable = Vec::new();
+        for artifact in export_delivery::list_deliverable_export_artifacts(
             self.db.runtime(),
             namespace,
             now_millis(),
         )
         .map_err(Status::internal)?
-        .into_iter()
-        .filter(|artifact| {
-            self.delivery_caller_may_access(
+        {
+            if !self.delivery_caller_may_access(
                 &principals,
                 &artifact.initiating_actor,
                 &artifact.namespace,
-            )
-        })
-        .map(to_proto_deliverable)
-        .collect())
+            ) {
+                continue;
+            }
+            let delivery_source_id =
+                self.delivery_source_id(&artifact.namespace, &artifact.definition_id)?;
+            if admits(&delivery_source_id)? {
+                deliverable.push(to_proto_deliverable(artifact, delivery_source_id));
+            }
+        }
+        Ok(deliverable)
     }
 
     pub(super) async fn list_deliverable_export_artifacts_rpc(
         &self,
         req: Request<ListDeliverableExportArtifactsRequest>,
     ) -> Result<Response<ListDeliverableExportArtifactsResponse>, Status> {
-        let artifacts = self.deliverable_artifacts(&req, &req.get_ref().namespace)?;
+        // An artifact a Source delivers is left to that Source's runtime.
+        let artifacts = self.deliverable_artifacts(&req, &req.get_ref().namespace, |source| {
+            Ok(source.is_empty())
+        })?;
         Ok(Response::new(ListDeliverableExportArtifactsResponse {
             artifacts,
         }))
@@ -1309,6 +1405,16 @@ impl SekaiServiceImpl {
         let receipt = self.delivery_receipt(&req, &receipt_id, false)?;
         let content_digest =
             crate::sekai::data_export::completed_digest(&receipt).ok_or_else(unavailable)?;
+        // Only the claim holder, a runtime the Source admitted, reads an
+        // artifact a Source delivers.
+        match &claim {
+            None if self.source_delivers(&receipt, &receipt_id)? => return Err(unavailable()),
+            // A Source disabled or re-placed since the claim stops the read.
+            Some(claim) if !self.still_admitted(&receipt, &receipt_id, &claim.runtime_id)? => {
+                return Err(unavailable());
+            }
+            _ => {}
+        }
         if !self
             .db
             .runtime()
@@ -1395,8 +1501,11 @@ impl SekaiServiceImpl {
         &self,
         req: Request<AcknowledgeExportDeliveryRequest>,
     ) -> Result<Response<AcknowledgeExportDeliveryResponse>, Status> {
-        self.delivery_receipt(&req, &req.get_ref().receipt_id, true)?;
+        let receipt = self.delivery_receipt(&req, &req.get_ref().receipt_id, true)?;
         let inner = req.into_inner();
+        if inner.claim.is_none() && self.source_delivers(&receipt, &inner.receipt_id)? {
+            return Err(Status::not_found("export artifact unavailable"));
+        }
         export_delivery::acknowledge_export_delivery(
             self.db.runtime(),
             &inner.receipt_id,
@@ -1405,23 +1514,33 @@ impl SekaiServiceImpl {
             now_millis(),
         )
         .map_err(delivery_status)?;
+        if let Some(claim) = &inner.claim {
+            self.record_delivery(&receipt, &inner.receipt_id, &claim.runtime_id, "")?;
+        }
         Ok(Response::new(AcknowledgeExportDeliveryResponse {
             acknowledged: true,
         }))
     }
 
-    /// `ListClaimableWork` for export delivery: what the deprecated list
-    /// returns, at most `limit` when positive.
+    /// `ListClaimableWork` for export delivery: the open artifacts the
+    /// caller may deliver whose delivery Source, if any, admits
+    /// `runtime_id`, at most `limit` when positive. `options` narrows the
+    /// list to Source-bound artifacts of the runtime's types.
     pub(super) fn list_claimable_export_deliveries<T>(
         &self,
         req: &Request<T>,
         namespace: &str,
+        runtime_id: &str,
         limit: i32,
+        options: Option<ExportDeliveryWorkOptions>,
     ) -> Result<Vec<DeliverableExportArtifact>, Status>
     where
         T: std::any::Any,
     {
-        let mut artifacts = self.deliverable_artifacts(req, namespace)?;
+        let types = options.map(|options| options.connector_types);
+        let mut artifacts = self.deliverable_artifacts(req, namespace, |source| {
+            self.delivery_runtime_admitted(namespace, runtime_id, source, types.as_deref())
+        })?;
         if let Ok(limit) = usize::try_from(limit)
             && limit > 0
         {
@@ -1431,7 +1550,9 @@ impl SekaiServiceImpl {
     }
 
     /// `ClaimWork` for export delivery: claims `receipt_id`, or the oldest
-    /// artifact in `namespace` the caller may deliver when it is empty.
+    /// artifact in `namespace` the caller may deliver when it is empty. An
+    /// artifact a Source delivers is claimable only by a runtime that
+    /// Source admits.
     pub(super) fn claim_export_delivery<T>(
         &self,
         req: &Request<T>,
@@ -1450,21 +1571,38 @@ impl SekaiServiceImpl {
         let now = now_millis();
         let claimed = if receipt_id.is_empty() {
             let principals = self.saved_export_caller(req, namespace, true)?;
-            export_delivery::claim_next(db, namespace, runtime_id, ttl_ms, now, |receipt| {
+            let admitted = |receipt: &OperationReceipt, definition_id: &str| {
                 self.delivery_caller_may_access(
                     &principals,
                     &receipt.initiating_actor,
                     &receipt.namespace,
-                )
-            })
+                ) && self
+                    .delivery_source_id(namespace, definition_id)
+                    .and_then(|source| {
+                        self.delivery_runtime_admitted(namespace, runtime_id, &source, None)
+                    })
+                    .unwrap_or(false)
+            };
+            export_delivery::claim_next(db, namespace, runtime_id, ttl_ms, now, admitted)
         } else {
             let receipt = self.delivery_receipt(req, receipt_id, true)?;
             if receipt.namespace != namespace {
                 return Err(Status::not_found("export artifact unavailable"));
             }
+            let definition_id = db
+                .export_artifact(receipt_id)
+                .map_err(Status::internal)?
+                .map(|artifact| artifact.definition_id)
+                .unwrap_or_default();
+            let source = self.delivery_source_id(namespace, &definition_id)?;
+            if !self.delivery_runtime_admitted(namespace, runtime_id, &source, None)? {
+                return Err(Status::not_found("export artifact unavailable"));
+            }
             export_delivery::claim(db, &receipt, runtime_id, ttl_ms, now)
         };
-        claimed.map(to_proto_delivery_work).map_err(delivery_status)
+        let artifact = claimed.map_err(delivery_status)?;
+        let source = self.delivery_source_id(namespace, &artifact.definition_id)?;
+        Ok(to_proto_delivery_work(artifact, source))
     }
 
     /// `HeartbeatWorkClaim` for export delivery.
@@ -1479,15 +1617,24 @@ impl SekaiServiceImpl {
         T: std::any::Any,
     {
         let receipt = self.delivery_receipt(req, receipt_id, true)?;
-        export_delivery::heartbeat(self.db.runtime(), &receipt, fence, ttl_ms, now_millis())
-            .map(to_proto_delivery_work)
-            .map_err(delivery_status)
+        // A Source disabled or re-placed since the claim ends it: the
+        // runtime reads the refusal as a lost fence and stops delivering.
+        if !self.still_admitted(&receipt, receipt_id, fence.owner)? {
+            return Err(delivery_status(DeliveryError::Claim(
+                crate::sekai::work_claim::ClaimError::FenceLost,
+            )));
+        }
+        let artifact =
+            export_delivery::heartbeat(self.db.runtime(), &receipt, fence, ttl_ms, now_millis())
+                .map_err(delivery_status)?;
+        let source = self.delivery_source_id(&artifact.namespace, &artifact.definition_id)?;
+        Ok(to_proto_delivery_work(artifact, source))
     }
 
     /// `AckWork` for export delivery: the digest check and the fence check
     /// of the deprecated acknowledge, which deletes the bytes. A wrong digest
     /// is `INVALID_ARGUMENT` here, so `FAILED_PRECONDITION` means only a
-    /// lost fence.
+    /// lost fence. The delivery Source, if any, records the success.
     pub(super) fn ack_export_delivery<T>(
         &self,
         req: &Request<T>,
@@ -1498,7 +1645,7 @@ impl SekaiServiceImpl {
     where
         T: std::any::Any,
     {
-        self.delivery_receipt(req, receipt_id, true)?;
+        let receipt = self.delivery_receipt(req, receipt_id, true)?;
         export_delivery::acknowledge_export_delivery(
             self.db.runtime(),
             receipt_id,
@@ -1514,7 +1661,111 @@ impl SekaiServiceImpl {
             }
             error => delivery_status(error),
         })?;
+        // A retry of the acknowledge replays and records the success again.
+        self.record_delivery(&receipt, receipt_id, fence.owner, "")?;
         Ok(AcknowledgeExportDeliveryResponse { acknowledged: true })
+    }
+
+    /// `AckWork` for a failed export delivery: under a live fence, records
+    /// the failure class on the delivery Source, if any, and leaves the
+    /// claim to lapse, so the artifact is retried after the lease until it
+    /// expires.
+    pub(super) fn fail_export_delivery<T>(
+        &self,
+        req: &Request<T>,
+        receipt_id: &str,
+        fence: Fence<'_>,
+        reason: &str,
+    ) -> Result<AcknowledgeExportDeliveryResponse, Status>
+    where
+        T: std::any::Any,
+    {
+        let failure = crate::sekai::source_sync::SyncFailure::from_wire_name(reason)
+            .filter(|failure| *failure != crate::sekai::source_sync::SyncFailure::LeaseExpired)
+            .ok_or_else(|| {
+                Status::invalid_argument(
+                    "a failed export delivery names its failure class as reason",
+                )
+            })?;
+        let receipt = self.delivery_receipt(req, receipt_id, true)?;
+        if !self
+            .db
+            .runtime()
+            .export_artifact_is_deliverable(receipt_id, Some(fence), now_millis())
+            .map_err(Status::internal)?
+        {
+            return Err(delivery_status(DeliveryError::Claim(
+                crate::sekai::work_claim::ClaimError::FenceLost,
+            )));
+        }
+        self.record_delivery(&receipt, receipt_id, fence.owner, failure.wire_name())?;
+        Ok(AcknowledgeExportDeliveryResponse {
+            acknowledged: false,
+        })
+    }
+
+    /// Records a delivery outcome on the Source that delivers `receipt_id`,
+    /// if one does.
+    fn record_delivery(
+        &self,
+        receipt: &OperationReceipt,
+        receipt_id: &str,
+        runtime_id: &str,
+        failure: &str,
+    ) -> Result<(), Status> {
+        let source = self.artifact_delivery_source(receipt, receipt_id)?;
+        if source.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .runtime()
+            .record_source_delivery(
+                &receipt.namespace,
+                &source,
+                runtime_id,
+                failure,
+                now_millis(),
+            )
+            .map_err(|_| Status::internal("source store unavailable"))
+    }
+
+    /// The Source that delivers `receipt_id`, from its definition; empty
+    /// for none.
+    fn artifact_delivery_source(
+        &self,
+        receipt: &OperationReceipt,
+        receipt_id: &str,
+    ) -> Result<String, Status> {
+        let definition_id = self
+            .db
+            .runtime()
+            .export_artifact(receipt_id)
+            .map_err(Status::internal)?
+            .map(|artifact| artifact.definition_id)
+            .unwrap_or_default();
+        self.delivery_source_id(&receipt.namespace, &definition_id)
+    }
+
+    /// Whether `runtime_id` is still admitted to deliver `receipt_id` by
+    /// its delivery Source, if it has one.
+    fn still_admitted(
+        &self,
+        receipt: &OperationReceipt,
+        receipt_id: &str,
+        runtime_id: &str,
+    ) -> Result<bool, Status> {
+        let source = self.artifact_delivery_source(receipt, receipt_id)?;
+        self.delivery_runtime_admitted(&receipt.namespace, runtime_id, &source, None)
+    }
+
+    fn source_delivers(
+        &self,
+        receipt: &OperationReceipt,
+        receipt_id: &str,
+    ) -> Result<bool, Status> {
+        Ok(!self
+            .artifact_delivery_source(receipt, receipt_id)?
+            .is_empty())
     }
 }
 
@@ -1536,6 +1787,7 @@ fn delivery_status(error: DeliveryError) -> Status {
 
 fn to_proto_deliverable(
     artifact: export_delivery::DeliverableExportArtifact,
+    delivery_source_id: String,
 ) -> DeliverableExportArtifact {
     DeliverableExportArtifact {
         receipt_id: artifact.receipt_id,
@@ -1544,15 +1796,17 @@ fn to_proto_deliverable(
         content_digest: artifact.content_digest,
         created_at_ms: artifact.created_at_ms,
         expires_at_ms: artifact.expires_at_ms,
+        delivery_source_id,
     }
 }
 
 fn to_proto_delivery_work(
     mut artifact: export_delivery::DeliverableExportArtifact,
+    delivery_source_id: String,
 ) -> ExportDeliveryWork {
     let claim = std::mem::take(&mut artifact.claim);
     ExportDeliveryWork {
-        artifact: Some(to_proto_deliverable(artifact)),
+        artifact: Some(to_proto_deliverable(artifact, delivery_source_id)),
         claim_owner: claim.owner,
         claim_generation: claim.generation,
         fencing_token: claim.fencing_token,

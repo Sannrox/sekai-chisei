@@ -37373,6 +37373,25 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
 
 /// One completed scheduled artifact in `exp`, initiated by `tester`.
 async fn scheduled_export_artifact(svc: &SekaiServiceImpl) -> DeliverableExportArtifact {
+    scheduled_export(svc, "").await;
+    let mut listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    listed.remove(0)
+}
+
+/// Saves `nightly` in `exp` for `tester`, delivered by
+/// `delivery_source_id`, and runs it once at 1.5 s.
+async fn scheduled_export(svc: &SekaiServiceImpl, delivery_source_id: &str) {
     let digest = export_fixture(svc, 2, "row").await;
     svc.grant_namespace_export(with_named_principal(
         GrantNamespaceExportRequest {
@@ -37394,6 +37413,7 @@ async fn scheduled_export_artifact(svc: &SekaiServiceImpl) -> DeliverableExportA
                     format: "csv".into(),
                     ..export_request(&digest)
                 }),
+                delivery_source_id: delivery_source_id.into(),
                 ..Default::default()
             }),
         },
@@ -37407,19 +37427,6 @@ async fn scheduled_export_artifact(svc: &SekaiServiceImpl) -> DeliverableExportA
     ))
     .await
     .unwrap();
-    let mut listed = svc
-        .list_deliverable_export_artifacts(with_named_principal(
-            ListDeliverableExportArtifactsRequest {
-                namespace: "exp".into(),
-            },
-            "tester",
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .artifacts;
-    assert_eq!(listed.len(), 1);
-    listed.remove(0)
 }
 
 fn claim_delivery(work_id: &str) -> ClaimWorkRequest {
@@ -37720,3 +37727,6 @@ async fn an_export_delivered_through_the_old_rpcs_leaves_no_work() {
 
 #[path = "pending_decisions_tests.rs"]
 mod pending_decisions_tests;
+
+#[path = "export_delivery_source_tests.rs"]
+mod export_delivery_source_tests;
