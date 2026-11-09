@@ -215,6 +215,7 @@ const ONTOLOGY_HEALTH_SCHEDULES_SCHEMA: &str =
     include_str!("postgres/0149_ontology_health_schedules.sql");
 const PENDING_DECISION_INDEXES_SCHEMA: &str =
     include_str!("postgres/0150_pending_decision_indexes.sql");
+const SOURCES_SCHEMA: &str = include_str!("postgres/0151_sources.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1086,6 +1087,7 @@ const MIGRATIONS: &[Migration] = &[
         PENDING_DECISION_INDEXES_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(150, "sources", SOURCES_SCHEMA, MigrationOwner::Sekai),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
