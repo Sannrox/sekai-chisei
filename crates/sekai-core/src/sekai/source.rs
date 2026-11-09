@@ -959,7 +959,68 @@ impl PostgresDb {
     }
 }
 
+/// The labels a runtime registered in a namespace (`RegisterTransformRuntime`);
+/// placement matches against them for every kind (ADR 0129).
+const RUNTIME_LABELS_SQL: &str =
+    "SELECT labels_json FROM sekai_transform_runtime WHERE namespace = $1 AND runtime_id = $2";
+
+fn decode_labels(json: Option<String>) -> Result<BTreeMap<String, String>, String> {
+    json.map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+impl SekaiDb {
+    pub fn registered_runtime_labels(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        use rusqlite::OptionalExtension;
+        let json = self
+            .conn()
+            .query_row(
+                RUNTIME_LABELS_SQL,
+                rusqlite::params![namespace, runtime_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        decode_labels(json)
+    }
+}
+
+impl PostgresDb {
+    pub fn registered_runtime_labels(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let json = self
+            .connection()?
+            .query_opt(RUNTIME_LABELS_SQL, &[&namespace, &runtime_id])
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        decode_labels(json)
+    }
+}
+
 impl RuntimeDb {
+    /// The labels `runtime_id` registered in `namespace`; none when it never
+    /// registered.
+    pub fn registered_runtime_labels(
+        &self,
+        namespace: &str,
+        runtime_id: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        match self {
+            Self::Sqlite(db) => db.registered_runtime_labels(namespace, runtime_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.registered_runtime_labels(namespace, runtime_id)
+            }),
+        }
+    }
+
     /// Ticks the Sources of `namespace`, or of every namespace when empty.
     pub fn tick_source_syncs(&self, namespace: &str, now_ms: i64) -> Result<u64, String> {
         match self {

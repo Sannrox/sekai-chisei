@@ -118,6 +118,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.DeleteOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.GetSourceHealth` | `sekai.object-sync` | yes | cli | `experimental` |
+| `SekaiService.PutSource` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.GetSource` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.ListSources` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.DisableSource` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |

@@ -1368,6 +1368,19 @@ enum WorkKind {
   // id. Callers need what ListDeliverableExportArtifacts needs: the run's
   // initiating actor or a namespace administrator.
   WORK_KIND_EXPORT_DELIVERY = 4;
+  // A Source's due sync (ADR 0148). Its work_id is the source_id; the
+  // request's namespace names the Source's namespace. Listing and claiming
+  // offer it only to a runtime whose registered labels (see
+  // RegisterTransformRuntime) satisfy the Source's placement.
+  WORK_KIND_SOURCE_SYNC = 5;
+}
+// A claimed Source sync: the Source as the claim granted it.
+message SourceSyncWork {
+  ConnectorSource source = 1;
+  string claim_owner = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  int64 claim_expires_at_ms = 5;
 }
 // A claimed saved-export artifact: a reference, not bytes. Fetch them with
 // FetchExportArtifact under this claim, then acknowledge with AckWork.
@@ -1402,6 +1415,7 @@ message ClaimableWork {
     ActionEffect action = 2;
     AgentTurn agent_turn = 3;
     DeliverableExportArtifact export_delivery = 4;
+    ConnectorSource source_sync = 5;
   }
 }
 message ListClaimableWorkResponse {
@@ -1429,16 +1443,19 @@ message ClaimWorkResponse {
     ClaimActionWorkResponse action = 2;
     ClaimAgentTurnResponse agent_turn = 3;
     ExportDeliveryWork export_delivery = 4;
+    SourceSyncWork source_sync = 5;
   }
 }
 message HeartbeatWorkClaimRequest {
   WorkKind kind = 1;
-  // run_id, effect_id, turn_id or receipt_id.
+  // run_id, effect_id, turn_id, receipt_id or source_id.
   string work_id = 2;
   string runtime_id = 3;
   int64 claim_generation = 4;
   string fencing_token = 5;
   int64 ttl_ms = 6;
+  // Source sync: the Source's namespace.
+  string namespace = 7;
 }
 message HeartbeatWorkClaimResponse {
   oneof payload {
@@ -1446,6 +1463,7 @@ message HeartbeatWorkClaimResponse {
     HeartbeatActionClaimResponse action = 2;
     HeartbeatAgentTurnClaimResponse agent_turn = 3;
     ExportDeliveryWork export_delivery = 4;
+    SourceSyncWork source_sync = 5;
   }
 }
 // Action-work fields of an acknowledge; see AckActionWorkRequest.
@@ -1469,15 +1487,20 @@ message ExportDeliveryAckOptions {
 // its output.
 message AckWorkRequest {
   WorkKind kind = 1;
-  // effect_id, turn_id or receipt_id.
+  // effect_id, turn_id, receipt_id or source_id.
   string work_id = 2;
   string runtime_id = 3;
   int64 claim_generation = 4;
   string fencing_token = 5;
   // completed, failed or parked. Export delivery takes completed only; the
-  // acknowledge deletes the artifact's bytes.
+  // acknowledge deletes the artifact's bytes. Source sync takes completed,
+  // or failed with the failure class as reason: unavailable, unreachable,
+  // auth_failed, permission_missing, invalid or unsupported. A failed sync
+  // waits for the next interval.
   string outcome = 6;
   string reason = 7;
+  // Source sync: the Source's namespace.
+  string namespace = 8;
   oneof options {
     ActionAckOptions action = 10;
     AgentTurnAckOptions agent_turn = 11;
@@ -1489,6 +1512,7 @@ message AckWorkResponse {
     AckActionWorkResponse action = 1;
     AckAgentTurnResponse agent_turn = 2;
     AcknowledgeExportDeliveryResponse export_delivery = 3;
+    ConnectorSource source_sync = 4;
   }
 }
 // Experimental (#1968). Live (not forgotten) working memory of one site
@@ -4974,6 +4998,103 @@ message SourceHealth {
 message GetSourceHealthResponse {
   SourceHealth health = 1;
 }
+// Experimental (ADR 0148). One configuration value of a Source.
+message SourceConfigValue {
+  oneof value {
+    string text = 1;
+    int64 integer = 2;
+    bool boolean = 3;
+  }
+}
+// What a namespace administrator puts. The plane stores credential_ref, a
+// handle the operator issued to the connector runtime, and never a
+// credential: configuration that looks like one is refused.
+message ConnectorSourceSpec {
+  // A connector type the plane knows, such as github or relational.
+  string connector_type = 1;
+  string connector_version = 2;
+  map<string, SourceConfigValue> config = 3;
+  string credential_ref = 4;
+  // host or host:port rules; the runtime connects only to these.
+  repeated string egress = 5;
+  // Labels a connector runtime must carry to claim this Source's work.
+  map<string, string> placement = 6;
+  // Sync interval on the transform schedule graph; 0 for none, otherwise
+  // at least 60000.
+  int64 every_ms = 7;
+  string owner = 8;
+  repeated string markings = 9;
+  string certification_id = 10;
+}
+// Where a Source's sync stands, from the plane's own records.
+message ConnectorSourceSync {
+  int64 last_success_at_ms = 1;
+  int64 last_failure_at_ms = 2;
+  // The failure class of the last failed sync; empty for none.
+  string last_failure = 3;
+  // The runtime that finished the last sync.
+  string last_runtime = 4;
+  // The runtime holding the current claim, and when its lease ends; empty
+  // and 0 when none holds one.
+  string claim_owner = 5;
+  int64 claim_expires_at_ms = 6;
+  // Whether a sync is due and not finished.
+  bool due = 7;
+}
+// Experimental (ADR 0148). A Source: the governed record of one
+// integration. source and source_instance are the tokens its batches carry;
+// they never change after create.
+message ConnectorSource {
+  string namespace = 1;
+  string source_id = 2;
+  string source = 3;
+  string source_instance = 4;
+  ConnectorSourceSpec spec = 5;
+  // active or disabled.
+  string status = 6;
+  // Bumped by every put and disable.
+  int64 revision = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+  ConnectorSourceSync sync = 10;
+}
+message PutSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+  string source = 3;
+  string source_instance = 4;
+  ConnectorSourceSpec spec = 5;
+  // 0 creates the Source; otherwise the revision the caller read. A put
+  // re-enables a disabled Source.
+  int64 expected_revision = 6;
+}
+message PutSourceResponse {
+  ConnectorSource source = 1;
+}
+message GetSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+}
+message GetSourceResponse {
+  ConnectorSource source = 1;
+}
+message ListSourcesRequest {
+  string namespace = 1;
+  // The last source_id of the previous page; empty for the first.
+  string page_token = 2;
+  int32 limit = 3;
+}
+message ListSourcesResponse {
+  repeated ConnectorSource sources = 1;
+  string next_page_token = 2;
+}
+message DisableSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+}
+message DisableSourceResponse {
+  ConnectorSource source = 1;
+}
 message DefinitionPropertyRef {
   string object_type = 1;
   string property = 2;
@@ -5300,6 +5421,13 @@ service SekaiService {
   rpc DeleteOntologyHealthSchedule(DeleteOntologyHealthScheduleRequest)
       returns (DeleteOntologyHealthScheduleResponse);
   rpc GetSourceHealth(GetSourceHealthRequest) returns (GetSourceHealthResponse);
+  // Experimental (ADR 0148): Sources, sekai.source/v1. Put and disable need
+  // a namespace administrator; get and list need namespace read access.
+  // Disabling raises the generation of the Source's live claims.
+  rpc PutSource(PutSourceRequest) returns (PutSourceResponse);
+  rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  rpc DisableSource(DisableSourceRequest) returns (DisableSourceResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

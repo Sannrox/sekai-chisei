@@ -4,7 +4,9 @@
 //! binding and claim engine, so a claim taken through either family is the
 //! same claim to both. Export delivery has no claim RPCs of its own: it
 //! runs the saved-export delivery checks, and its deprecated list, fetch
-//! and acknowledge honor the claims taken here.
+//! and acknowledge honor the claims taken here. Source sync has none
+//! either; it names its namespace on every call, since a Source id is only
+//! unique inside one.
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
@@ -79,6 +81,19 @@ impl SekaiServiceImpl {
                     .into_iter()
                     .map(claimable_work::Payload::ExportDelivery)
                     .collect()
+            }
+            Kind::SourceSync => {
+                refuse_turn_options(turn)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                self.list_claimable_source_syncs(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    inner.limit,
+                )?
+                .into_iter()
+                .map(claimable_work::Payload::SourceSync)
+                .collect()
             }
             _ => return Err(unserved(kind)),
         };
@@ -164,6 +179,18 @@ impl SekaiServiceImpl {
                     inner.ttl_ms,
                 )?)
             }
+            Kind::SourceSync => {
+                refuse_turn_options(turn)?;
+                refuse_request_id(&inner.request_id)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                claim_work_response::Payload::SourceSync(self.claim_source_sync(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    &inner.work_id,
+                    inner.ttl_ms,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(ClaimWorkResponse {
@@ -238,6 +265,21 @@ impl SekaiServiceImpl {
                 heartbeat_work_claim_response::Payload::ExportDelivery(
                     self.heartbeat_export_delivery(&req, &inner.work_id, fence, inner.ttl_ms)?,
                 )
+            }
+            Kind::SourceSync => {
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                heartbeat_work_claim_response::Payload::SourceSync(self.heartbeat_source_sync(
+                    &req,
+                    &inner.namespace,
+                    &inner.work_id,
+                    fence,
+                    inner.ttl_ms,
+                )?)
             }
             _ => return Err(unserved(kind)),
         };
@@ -332,6 +374,25 @@ impl SekaiServiceImpl {
                     &options.content_digest,
                 )?)
             }
+            Kind::SourceSync => {
+                if inner.options.is_some() {
+                    return Err(mismatched());
+                }
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                ack_work_response::Payload::SourceSync(self.ack_source_sync(
+                    &req,
+                    &inner.namespace,
+                    &inner.work_id,
+                    fence,
+                    &inner.outcome,
+                    &inner.reason,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(AckWorkResponse {
@@ -349,9 +410,10 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         Ok(WorkKind::Action) => Kind::Action,
         Ok(WorkKind::AgentTurn) => Kind::AgentTurn,
         Ok(WorkKind::ExportDelivery) => Kind::ExportDelivery,
+        Ok(WorkKind::SourceSync) => Kind::SourceSync,
         Ok(WorkKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument(
-                "kind must be transform, action, agent_turn or export_delivery",
+                "kind must be transform, action, agent_turn, export_delivery or source_sync",
             ));
         }
     };
@@ -371,7 +433,7 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         .metadata()
         .get(crate::grpc::AUTH_SOURCE_HEADER)
         .is_some_and(|source| source == "enterprise");
-    if kind == Kind::Transform && enterprise_scoped {
+    if matches!(kind, Kind::Transform | Kind::SourceSync) && enterprise_scoped {
         return Err(Status::permission_denied(
             "RPC is not available to enterprise-scoped credentials",
         ));

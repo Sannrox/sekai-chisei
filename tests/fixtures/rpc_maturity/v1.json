@@ -366,6 +366,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "PutSource",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSource",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListSources",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DisableSource",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GenerateDefinitionChangeBundle",
       "storage_path": "sekai.definition-branch, sekai.graph",
       "real_backend": "yes",

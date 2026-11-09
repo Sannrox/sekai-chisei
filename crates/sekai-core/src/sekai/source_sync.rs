@@ -275,6 +275,34 @@ pub fn claim(
     Ok(source)
 }
 
+/// Claims the first Source in `namespace` a runtime with `labels` may take.
+/// A Source lost to a concurrent claimer, or failed at the lease limit, is
+/// skipped.
+pub fn claim_next(
+    db: &RuntimeDb,
+    namespace: &str,
+    owner: &str,
+    labels: &BTreeMap<String, String>,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> Result<Source, SyncError> {
+    for source in list_claimable(db, namespace, labels, now_ms, MAX_LIST_SOURCES)? {
+        match claim(
+            db,
+            namespace,
+            &source.source_id,
+            owner,
+            labels,
+            ttl_ms,
+            now_ms,
+        ) {
+            Err(SyncError::Claim(_)) => continue,
+            claimed => return claimed,
+        }
+    }
+    Err(SyncError::NotFound)
+}
+
 /// Extends the live claim `fence`.
 pub fn heartbeat(
     db: &RuntimeDb,
