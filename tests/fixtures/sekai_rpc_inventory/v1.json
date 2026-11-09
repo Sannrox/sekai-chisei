@@ -456,7 +456,8 @@
       "durable_dependencies": [
         "sekai.definition-branch",
         "sekai.graph",
-        "sekai.datasets"
+        "sekai.datasets",
+        "sekai.object-sync"
       ],
       "product_tier": "advanced"
     },
@@ -474,7 +475,8 @@
       "durable_dependencies": [
         "sekai.definition-branch",
         "sekai.graph",
-        "sekai.datasets"
+        "sekai.datasets",
+        "sekai.object-sync"
       ],
       "product_tier": "advanced"
     },
@@ -491,7 +493,8 @@
         "sekai.ontology-definitions",
         "sekai.definition-branch",
         "sekai.graph",
-        "sekai.datasets"
+        "sekai.datasets",
+        "sekai.object-sync"
       ],
       "product_tier": "advanced"
     },
@@ -524,6 +527,20 @@
       ],
       "durable_dependencies": [
         "sekai.ontology-definitions"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetSourceHealth",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source_health.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/source-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
       ],
       "product_tier": "advanced"
     },

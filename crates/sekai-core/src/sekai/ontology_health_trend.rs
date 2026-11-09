@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
-use crate::sekai::ontology_health::{PART_FRESHNESS, PART_QUALITY, Part};
+use crate::sekai::ontology_health::{PART_FRESHNESS, PART_QUALITY, PART_SOURCE, Part};
+use crate::sekai::source_health::HEALTH_CONTRACT;
 
 pub const EVENT_BELOW_THRESHOLD: &str = "below_threshold";
 /// The shortest window a record may use.
@@ -28,11 +29,39 @@ pub struct PartScore {
     pub score: Option<u8>,
     /// False when the inputs were capped: the score may be too high.
     pub complete: bool,
-    /// The datasets a dataset part (freshness, quality) was scored from.
-    /// Never returned: a reader sees the part only while they may read
-    /// every one of them.
+    /// The datasets a dataset part (freshness, quality) was scored from;
+    /// for the source part, the source contract and then its sources (see
+    /// [`PartScore::source_inputs`]). Never returned: a reader sees the part
+    /// only while they may read every one of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<String>,
+}
+
+impl PartScore {
+    /// The sources (`ontology_health::source_subject`) a source part was
+    /// scored from. The inputs start with the source contract, which names
+    /// no dataset: a binary that reads every input as a dataset, as those
+    /// before the source part do, hides the part and the events it fed.
+    /// `None` when they do not start with it, so a reader fails closed.
+    pub fn source_inputs(&self) -> Option<&[String]> {
+        match self.inputs.split_first() {
+            Some((contract, sources)) if contract == HEALTH_CONTRACT => Some(sources),
+            _ => None,
+        }
+    }
+}
+
+/// What one scoring's parts were scored from, stored with its snapshot so
+/// each reader can be re-authorized. Never returned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScoreInputs {
+    /// The datasets of the freshness and quality parts.
+    pub datasets: Vec<String>,
+    /// The sources (`ontology_health::source_subject`) of the source part.
+    pub sources: Vec<String>,
+    /// The published definition revision of the contract and lint parts;
+    /// empty when none was published.
+    pub definition_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,14 +169,12 @@ pub fn window_start(now_ms: i64, window_ms: i64) -> i64 {
     now_ms - now_ms.rem_euclid(window_ms)
 }
 
-/// Records `parts`, scored from `datasets` and `definition_revision`, for
-/// the window holding `now_ms`.
+/// Records `parts`, scored from `inputs`, for the window holding `now_ms`.
 pub fn record(
     db: &crate::db::runtime_db::RuntimeDb,
     request: &RecordRequest<'_>,
     parts: &[Part],
-    datasets: &[String],
-    definition_revision: &str,
+    inputs: &ScoreInputs,
 ) -> Result<Recorded, TrendError> {
     let threshold = validate(
         request.namespace,
@@ -163,24 +190,30 @@ pub fn record(
         recorded_at_ms: request.now_ms,
         recorded_by: request.recorded_by.into(),
         threshold,
-        definition_revision: definition_revision.into(),
+        definition_revision: inputs.definition_revision.clone(),
         parts: parts
             .iter()
             .map(|part| PartScore {
                 part: part.part.into(),
                 score: part.score,
                 complete: part.complete,
-                inputs: if matches!(part.part, PART_FRESHNESS | PART_QUALITY) {
-                    let mut inputs = datasets.to_vec();
-                    inputs.sort();
-                    inputs
-                } else {
-                    Vec::new()
+                inputs: match part.part {
+                    PART_FRESHNESS | PART_QUALITY => sorted(&inputs.datasets),
+                    PART_SOURCE => std::iter::once(HEALTH_CONTRACT.to_owned())
+                        .chain(sorted(&inputs.sources))
+                        .collect(),
+                    _ => Vec::new(),
                 },
             })
             .collect(),
     };
     Ok(db.record_ontology_health_snapshot(&snapshot, window_start_ms - request.retention_ms)?)
+}
+
+fn sorted(ids: &[String]) -> Vec<String> {
+    let mut ids = ids.to_vec();
+    ids.sort();
+    ids
 }
 
 /// The event `snapshot` writes after `previous` (the latest earlier
@@ -502,8 +535,11 @@ mod tests {
                 now_ms,
             },
             &[part(PART_FRESHNESS, 90), part(PART_LINT, lint)],
-            &["orders".to_owned()],
-            "sha256:revision",
+            &ScoreInputs {
+                datasets: vec!["orders".to_owned()],
+                sources: Vec::new(),
+                definition_revision: "sha256:revision".into(),
+            },
         )
         .unwrap()
     }
@@ -637,9 +673,51 @@ mod tests {
             request(HOUR, HOUR, 101),
         ] {
             assert!(matches!(
-                record(&db, &bad, &[], &[], ""),
+                record(&db, &bad, &[], &ScoreInputs::default()),
                 Err(TrendError::Invalid(_))
             ));
         }
+    }
+
+    /// The source contract leads a source part's inputs even when it scored
+    /// no source, so a binary that reads every input as a dataset always
+    /// hides it.
+    #[test]
+    fn a_source_part_stores_the_source_contract_before_its_sources() {
+        let db = RuntimeDb::memory();
+        let stored = |ns: &str, sources: &[&str]| {
+            let recorded = record(
+                &db,
+                &RecordRequest {
+                    namespace: ns,
+                    window_ms: HOUR,
+                    retention_ms: HOUR,
+                    threshold: 0,
+                    recorded_by: "ops",
+                    now_ms: HOUR,
+                },
+                &[part(PART_SOURCE, 50)],
+                &ScoreInputs {
+                    sources: sources.iter().map(|source| (*source).to_owned()).collect(),
+                    ..Default::default()
+                },
+            );
+            let Ok(Recorded::Fresh { snapshot, .. }) = recorded else {
+                panic!("{recorded:?}");
+            };
+            snapshot.parts[0].clone()
+        };
+        let part = stored("acme", &["web@sha256:t", "ops@sha256:t"]);
+        assert_eq!(part.inputs[0], HEALTH_CONTRACT);
+        assert_eq!(
+            part.source_inputs(),
+            Some(&["ops@sha256:t".to_owned(), "web@sha256:t".to_owned()][..])
+        );
+        assert_eq!(stored("empty", &[]).inputs, [HEALTH_CONTRACT]);
+        let unknown = PartScore {
+            inputs: vec!["sekai.source-health/v2".into()],
+            ..part
+        };
+        assert_eq!(unknown.source_inputs(), None);
     }
 }

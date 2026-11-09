@@ -34296,6 +34296,166 @@ async fn ontology_health_snapshots_are_recorded_once_per_window_and_read_by_what
     );
 }
 
+/// #2193: the source part scores the namespace's sources with the bounded
+/// health projector, the trend shows a source degrading, and
+/// `GetSourceHealth` reports a hidden source as an unknown one.
+#[tokio::test]
+async fn the_source_part_and_get_source_health_read_the_namespace_sources() {
+    const DAY: i64 = 86_400_000;
+    let svc = service();
+    let ns = "srch";
+    let producer = "connector/github-primary";
+    seed_definition_parent(&svc, ns);
+    grant_source_namespace(&svc, ns, "root", security::Role::Admin);
+    grant_source_namespace(&svc, ns, producer, security::Role::Editor);
+    let db = svc.db.runtime();
+    // Applies a first page of `instance` whose checkpoint advanced at `at_ms`.
+    let bind = |instance: &str, at_ms: i64| {
+        let mut page =
+            from_proto_source_batch(source_batch(ns, producer, "", "cursor:1", instance)).unwrap();
+        page.source_instance = instance.into();
+        page.records[0].source_instance = instance.into();
+        page.batch_digest = page.canonical_digest().unwrap();
+        db.apply_source_batch(&page, producer, at_ms).unwrap();
+    };
+    let source_part = |snapshot: &OntologyHealthSnapshot| {
+        snapshot
+            .parts
+            .iter()
+            .find(|part| part.part == "source")
+            .and_then(|part| part.score)
+    };
+    let tick = |now_ms| {
+        svc.tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms },
+            "local",
+        ))
+    };
+
+    // A healthy source, then a second one whose last success is long past.
+    bind("acme/ops", now_millis());
+    svc.put_ontology_health_schedule(with_named_principal(
+        PutOntologyHealthScheduleRequest {
+            schedule: Some(OntologyHealthSchedule {
+                namespace: ns.into(),
+                window_ms: DAY,
+                retention_ms: 7 * DAY,
+                ..Default::default()
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    tick(10 * DAY + 5).await.unwrap();
+    bind("acme/web", 100);
+    tick(11 * DAY + 5).await.unwrap();
+
+    // The trend shows the source part degrading, from the existing tables.
+    let trend = svc
+        .list_ontology_health_trend(with_named_principal(
+            ListOntologyHealthTrendRequest {
+                namespace: ns.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let scores: Vec<_> = trend.snapshots.iter().map(source_part).collect();
+    assert_eq!(scores, [Some(100), Some(50)]);
+    // A binary from before the source part reads every part input as a
+    // dataset and shows a part only while all of them are readable ones. The
+    // stored source part leads with an input that names no dataset, so that
+    // binary hides it, and the events it fed, during a rolling deploy.
+    let (stored, _) = db.list_ontology_health_trend(ns).unwrap();
+    for snapshot in &stored {
+        let part = snapshot
+            .parts
+            .iter()
+            .find(|part| part.part == "source")
+            .unwrap();
+        assert!(
+            part.inputs
+                .iter()
+                .any(|input| db.get_dataset(input).unwrap().is_none()),
+            "{:?}",
+            part.inputs
+        );
+    }
+
+    let health = svc
+        .get_ontology_health(with_named_principal(
+            GetOntologyHealthRequest {
+                namespace: ns.into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let part = health.namespaces[0]
+        .parts
+        .iter()
+        .find(|part| part.part == "source")
+        .unwrap();
+    assert_eq!(part.score, 50);
+    let web = format!("acme/web@{SOURCE_TYPE_DIGEST}");
+    assert_eq!(
+        part.problems,
+        [OntologyHealthProblem {
+            subject_kind: "source".into(),
+            subject_id: web,
+            code: "delayed".into(),
+        }]
+    );
+
+    let source_health = |principal: &'static str, instance: &'static str| {
+        svc.get_source_health(with_named_principal(
+            GetSourceHealthRequest {
+                namespace: ns.into(),
+                source_instance: instance.into(),
+                type_digest: SOURCE_TYPE_DIGEST.into(),
+                delayed_after_ms: None,
+            },
+            principal,
+        ))
+    };
+    let delayed = source_health("root", "acme/web")
+        .await
+        .unwrap()
+        .into_inner()
+        .health
+        .unwrap();
+    assert_eq!(delayed.health_class, "delayed");
+    assert_eq!(delayed.last_success_at_ms, Some(100));
+    // A caller who may not read the namespace learns nothing a caller asking
+    // for a source that does not exist would not.
+    let shape = |mut health: SourceHealth| {
+        health.source_instance.clear();
+        health.observed_at_ms = 0;
+        health
+    };
+    let hidden = source_health("tester", "acme/web")
+        .await
+        .unwrap()
+        .into_inner();
+    let unknown = source_health("root", "ghost/repo")
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(hidden.health.clone().map(shape), unknown.health.map(shape));
+    assert_eq!(hidden.health.unwrap().health_class, "unavailable");
+    let audited = db
+        .list_decisions(&audit::DecisionFilter {
+            action: Some("source.health".into()),
+            target_id: Some(ns.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(audited.iter().any(|decision| decision.actor == "tester"));
+}
+
 #[tokio::test]
 async fn a_put_health_schedule_fills_the_trend_from_the_tick_and_halts_on_a_revoked_recorder() {
     const DAY: i64 = 86_400_000;
@@ -35165,6 +35325,15 @@ async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
             namespace: ns(),
             source_instance: "acme/ops".into(),
             type_digest: crate::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+        }))
+    );
+    probe!(
+        "GetSourceHealth",
+        svc.get_source_health(with_tenant_context(GetSourceHealthRequest {
+            namespace: ns(),
+            source_instance: "acme/ops".into(),
+            type_digest: crate::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+            delayed_after_ms: None,
         }))
     );
     probe!(

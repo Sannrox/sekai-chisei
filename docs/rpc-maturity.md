@@ -112,11 +112,12 @@ Edit the fixture, then regenerate with
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | mcp, example | `stable` |
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | mcp, example | `stable` |
 | `SekaiService.GetOntologyLintReport` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
-| `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets, sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RecordOntologyHealthSnapshot` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.ListOntologyHealthTrend` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.PutOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.DeleteOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.GetSourceHealth` | `sekai.object-sync` | yes | cli | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |

@@ -582,6 +582,13 @@ impl SekaiService for SekaiServiceImpl {
         ontology_health_rpc::delete_ontology_health_schedule(self, req).await
     }
 
+    async fn get_source_health(
+        &self,
+        req: Request<GetSourceHealthRequest>,
+    ) -> Result<Response<GetSourceHealthResponse>, Status> {
+        ontology_health_rpc::get_source_health(self, req).await
+    }
+
     async fn dry_run_definition_change_bundle(
         &self,
         req: Request<DryRunDefinitionChangeBundleRequest>,

@@ -129,6 +129,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_source_identities(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_source_identities(namespace, limit),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_source_identities(namespace, limit))
+            }
+        }
+    }
+
     pub fn get_source_type_descriptor(
         &self,
         namespace: &str,

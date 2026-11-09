@@ -4735,15 +4735,17 @@ message GetOntologyHealthRequest {
 }
 message OntologyHealthProblem {
   // dataset | binding | grant | object_type | link_type | object | marking |
-  // action_type
+  // action_type | source
   string subject_kind = 1;
+  // For a source, `source_instance@type_digest`.
   string subject_id = 2;
   // What is wrong: stale, check_failed, member_removed, property_removed,
-  // unverifiable, expired, unreviewed, or a lint rule.
+  // unverifiable, expired, unreviewed, a lint rule, or a source's health
+  // class (delayed, blocked, unavailable).
   string code = 3;
 }
 message OntologyHealthPart {
-  // freshness | quality | contract | lint | trust | access
+  // freshness | quality | contract | lint | trust | access | source
   string part = 1;
   // False when the server cannot compute the part or the caller may not see
   // it; unavailable_reason says which, and the part leaves the total.
@@ -4784,7 +4786,7 @@ message RecordOntologyHealthSnapshotRequest {
   uint32 threshold = 4;
 }
 message OntologyHealthPartScore {
-  // freshness | quality | contract | lint | trust | access
+  // freshness | quality | contract | lint | trust | access | source
   string part = 1;
   // Absent when the part was unavailable when recorded.
   optional uint32 score = 2;
@@ -4865,6 +4867,40 @@ message DeleteOntologyHealthScheduleRequest {
 }
 message DeleteOntologyHealthScheduleResponse {
   bool deleted = 1;
+}
+// Bounded health of one source (ADR 0046, #2193): a sekai.source-health/v1
+// projection of its sync state, authorized as GetSourceSyncState. It never
+// writes or contacts the source. A source the caller may not see reports
+// exactly as an unknown one. Each call is audited as source.health.
+message GetSourceHealthRequest {
+  string namespace = 1;
+  string source_instance = 2;
+  string type_digest = 3;
+  // A last success older than this is delayed. Absent: fifteen minutes.
+  // Must be positive.
+  optional int64 delayed_after_ms = 4;
+}
+message SourceHealth {
+  // sekai.source-health/v1
+  string contract_version = 1;
+  string namespace = 2;
+  string source_instance = 3;
+  string type_digest = 4;
+  // healthy | delayed | blocked | unavailable
+  string health_class = 5;
+  // none | open_transaction | aborted | quarantined | recovery_required |
+  // invalid_checkpoint | unknown_version | foreign_identity |
+  // ambiguous_lifecycle | absent (unknown, or not visible to the caller)
+  string failure_class = 6;
+  // success | denial | unavailable | partial | unknown
+  string outcome = 7;
+  optional int64 checkpoint_age_ms = 8;
+  optional int64 lag = 9;
+  optional int64 last_success_at_ms = 10;
+  int64 observed_at_ms = 11;
+}
+message GetSourceHealthResponse {
+  SourceHealth health = 1;
 }
 message DefinitionPropertyRef {
   string object_type = 1;
@@ -5191,6 +5227,7 @@ service SekaiService {
       returns (PutOntologyHealthScheduleResponse);
   rpc DeleteOntologyHealthSchedule(DeleteOntologyHealthScheduleRequest)
       returns (DeleteOntologyHealthScheduleResponse);
+  rpc GetSourceHealth(GetSourceHealthRequest) returns (GetSourceHealthResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

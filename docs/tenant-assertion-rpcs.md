@@ -61,6 +61,15 @@ checks the allowlist and the space actions, and
 `admitted_tenant_rpcs_refuse_another_tenants_namespace` checks the tenant
 refusal of each one, with a successful call on the tenant's own namespace.
 
+## Added in #2193
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `GetSourceHealth` | request | read |
+
+Within the tenant, a namespace the caller may not read reports as an
+unknown source rather than a refusal (see [source health](source-health.md)).
+
 ## Added in #1770
 
 | RPC | Namespace from | Space action |

@@ -4,7 +4,7 @@
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::object_sync::SourceBatch;
-use crate::sekai::source_health::{self, report_source_health};
+use crate::sekai::source_health;
 use crate::sekai::source_quarantine::{
     self, apply_corrected_source_batch, inspect_latest_quarantine, preview_source_batch,
 };
@@ -15,7 +15,7 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>] [--delayed-after-ms <n>]\n  sekaictl admin sync inspect-quarantine --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>]\n  sekaictl admin sync preview-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync apply-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync register-descriptor --namespace <ns> --descriptor <file> [--actor <principal>]\n  sekaictl admin sync inspect-descriptor --namespace <ns> --digest <digest> [--actor <principal>]\n  sekaictl admin sync retire-descriptor --namespace <ns> --digest <digest> [--actor <principal>]"
+    "sekaictl admin sync pin-webhook-key --namespace <ns> --source-instance <owner/repo> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin sync list-webhook-keys [--namespace <ns>] [--source-instance <owner/repo>]\n  sekaictl admin sync admit-webhook --bundle <file> [--actor <principal>]\n  sekaictl admin sync health --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--delayed-after-ms <n>] [--target <url-or-socket>]\n  sekaictl admin sync inspect-quarantine --namespace <ns> --source-instance <owner/repo> --type-digest <digest> [--actor <principal>]\n  sekaictl admin sync preview-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync apply-batch --batch <file> [--actor <principal>]\n  sekaictl admin sync register-descriptor --namespace <ns> --descriptor <file> [--actor <principal>]\n  sekaictl admin sync inspect-descriptor --namespace <ns> --digest <digest> [--actor <principal>]\n  sekaictl admin sync retire-descriptor --namespace <ns> --digest <digest> [--actor <principal>]"
 }
 
 pub async fn run_sync_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -200,26 +200,42 @@ struct HealthConfig {
     source_instance: String,
     type_digest: String,
     delayed_after_ms: Option<i64>,
-    actor: String,
+    target: String,
 }
 
+/// Reads one source's health through `GetSourceHealth` as the caller's
+/// credential, and prints the `sekai.source-health/v1` report.
 async fn health(config: HealthConfig) -> Result<(), BoxErr> {
-    let db = open_db().await?;
-    let query = source_health::parse_source_health_query(
-        &config.namespace,
-        &config.source_instance,
-        &config.type_digest,
-        config.delayed_after_ms,
-        None,
-    )
-    .map_err(std::io::Error::other)?;
-    let report = report_source_health(
-        db.as_ref(),
-        &config.actor,
-        &query,
-        Utc::now().timestamp_millis(),
-    )
-    .map_err(std::io::Error::other)?;
+    use crate::grpc::pb::sekai::{
+        GetSourceHealthRequest, sekai_service_client::SekaiServiceClient,
+    };
+    let channel = crate::grpc::client::connect_sekai(&config.target).await?;
+    let health = SekaiServiceClient::new(channel)
+        .get_source_health(GetSourceHealthRequest {
+            namespace: config.namespace,
+            source_instance: config.source_instance,
+            type_digest: config.type_digest,
+            delayed_after_ms: config.delayed_after_ms,
+        })
+        .await?
+        .into_inner()
+        .health
+        .ok_or_else(|| std::io::Error::other("source health missing from the response"))?;
+    let report = source_health::SourceHealth {
+        contract_version: health.contract_version,
+        namespace: health.namespace,
+        source_instance: health.source_instance,
+        type_digest: health.type_digest,
+        class: health.health_class,
+        failure_class: health.failure_class,
+        outcome: health.outcome,
+        checkpoint_age_ms: health.checkpoint_age_ms,
+        lag: health.lag,
+        last_success_at_ms: health.last_success_at_ms,
+        observed_at_ms: health.observed_at_ms,
+        write_authority: false,
+        permit_authority: false,
+    };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -229,7 +245,9 @@ fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
     let mut source_instance = None;
     let mut type_digest = None;
     let mut delayed_after_ms = None;
-    let mut actor = "operator".to_string();
+    let mut target = std::env::var("CHISEI_GRPC_URL")
+        .or_else(|_| std::env::var("SEKAI_SOCKET"))
+        .unwrap_or_else(|_| "./data/sekai.sock".into());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -245,16 +263,22 @@ fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
                 type_digest = Some(require_value(args, i, "--type-digest")?);
                 i += 2;
             }
+            "--target" => {
+                target = require_value(args, i, "--target")?;
+                i += 2;
+            }
+            // The plane audits the caller's credential; an actor is not chosen.
+            "--actor" => {
+                return Err(
+                    "health --actor is retired: the plane records the caller's credential".into(),
+                );
+            }
             "--delayed-after-ms" => {
                 delayed_after_ms = Some(
                     require_value(args, i, "--delayed-after-ms")?
                         .parse::<i64>()
                         .map_err(|_| "--delayed-after-ms must be an integer".to_string())?,
                 );
-                i += 2;
-            }
-            "--actor" => {
-                actor = require_value(args, i, "--actor")?;
                 i += 2;
             }
             other => return Err(format!("unknown health option {other}")),
@@ -265,7 +289,7 @@ fn parse_health(args: &[String]) -> Result<HealthConfig, String> {
         source_instance: source_instance.ok_or("--source-instance is required")?,
         type_digest: type_digest.ok_or("--type-digest is required")?,
         delayed_after_ms,
-        actor,
+        target,
     })
 }
 
@@ -518,4 +542,34 @@ fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, St
     args.get(index + 1)
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_reads_through_a_target_and_refuses_a_chosen_actor() {
+        let args = |extra: &[&str]| {
+            [
+                "--namespace",
+                "acme",
+                "--source-instance",
+                "owner/repo",
+                "--type-digest",
+                "sha256:t",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|arg| (*arg).to_owned())
+            .collect::<Vec<_>>()
+        };
+        let config = parse_health(&args(&["--target", "./plane.sock"])).unwrap();
+        assert_eq!(config.target, "./plane.sock");
+        assert!(
+            parse_health(&args(&["--actor", "root"]))
+                .err()
+                .is_some_and(|error| error.contains("retired"))
+        );
+    }
 }
