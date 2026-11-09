@@ -18,6 +18,10 @@
 //! Every put and every disable bumps `revision`. A put names the revision
 //! it read (0 to create), so two administrators cannot overwrite each other.
 //! A put re-enables a disabled Source; a disable is idempotent.
+//!
+//! The row also carries the Source's sync claim and outcome
+//! ([`crate::sekai::source_sync`]). A disable raises the claim generation
+//! and ends the claim; a put that changes `every_ms` restarts the schedule.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+use crate::sekai::source_sync::{SyncError, SyncState};
+use crate::sekai::work_claim::ClaimRecord;
 
 pub const SOURCE_VERSION: &str = "sekai.source/v1";
 pub const MAX_SOURCE_ID_BYTES: usize = 128;
@@ -77,6 +83,8 @@ pub struct Source {
     pub revision: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The sync claim and outcome; a put never writes it.
+    pub sync: SyncState,
 }
 
 /// What an administrator may change with a put. Stored as JSON, so a later
@@ -296,34 +304,134 @@ CREATE TABLE IF NOT EXISTS sekai_sources (
 );
 ";
 
-const COLUMNS: &str = "namespace, source_id, source, source_instance, status, revision, \
-    created_at_ms, updated_at_ms, record_json";
+// SQLite numbers `$n` placeholders in order of first appearance, so every
+// statement here uses them in ascending order.
+
+/// Every column a [`Row`] reads, in order.
+macro_rules! columns {
+    () => {
+        "namespace, source_id, source, source_instance, status, revision, \
+         created_at_ms, updated_at_ms, record_json, sync_due_bucket, sync_claimed_bucket, \
+         sync_done_bucket, sync_claim_owner, sync_claim_generation, sync_fencing_token, \
+         sync_claim_expires_at_ms, sync_lease_expiries, sync_last_success_at_ms, \
+         sync_last_failure_at_ms, sync_last_failure, sync_last_runtime"
+    };
+}
+
+const COLUMNS: &str = columns!();
+
+/// The sync columns, added after the table (ADR 0149 claim record).
+const SYNC_COLUMNS: [(&str, &str); 13] = [
+    ("sync_every_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_due_bucket", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_claimed_bucket", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_done_bucket", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_claim_owner", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_fencing_token", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_claim_expires_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_lease_expiries", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_last_success_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_last_failure_at_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("sync_last_failure", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_last_runtime", "TEXT NOT NULL DEFAULT ''"),
+];
 
 /// Writes nothing when the id or the tokens are taken.
-const INSERT_SQL: &str = "
-INSERT INTO sekai_sources
+const INSERT_SQL: &str = concat!(
+    "INSERT INTO sekai_sources
     (namespace, source_id, source, source_instance, status, revision,
-     created_at_ms, updated_at_ms, record_json)
-VALUES ($1, $2, $3, $4, 'active', 1, $5, $5, $6)
+     created_at_ms, updated_at_ms, record_json, sync_every_ms)
+VALUES ($1, $2, $3, $4, 'active', 1, $5, $5, $6, $7)
 ON CONFLICT DO NOTHING
-RETURNING namespace, source_id, source, source_instance, status, revision,
-    created_at_ms, updated_at_ms, record_json";
+RETURNING ",
+    columns!()
+);
 
-/// Fenced by the revision read; the tokens must match.
-const UPDATE_SQL: &str = "
-UPDATE sekai_sources
-SET status = 'active', revision = revision + 1, updated_at_ms = $1, record_json = $2
-WHERE namespace = $3 AND source_id = $4 AND revision = $5
-  AND source = $6 AND source_instance = $7
-RETURNING namespace, source_id, source, source_instance, status, revision,
-    created_at_ms, updated_at_ms, record_json";
+/// Fenced by the revision read; the tokens must match. A changed interval
+/// restarts the schedule: buckets of the old interval mean nothing in the
+/// new one, so the restart also ends a live claim under a raised
+/// generation. Every SET reads the row as it was.
+const UPDATE_SQL: &str = concat!(
+    "UPDATE sekai_sources
+SET status = 'active', revision = revision + 1, updated_at_ms = $1, record_json = $2,
+    sync_due_bucket = CASE WHEN sync_every_ms = $3 THEN sync_due_bucket ELSE 0 END,
+    sync_claimed_bucket = CASE WHEN sync_every_ms = $3 THEN sync_claimed_bucket ELSE 0 END,
+    sync_done_bucket = CASE WHEN sync_every_ms = $3 THEN sync_done_bucket ELSE 0 END,
+    sync_claim_generation = CASE WHEN sync_every_ms = $3
+        THEN sync_claim_generation ELSE sync_claim_generation + 1 END,
+    sync_claim_owner = CASE WHEN sync_every_ms = $3 THEN sync_claim_owner ELSE '' END,
+    sync_fencing_token = CASE WHEN sync_every_ms = $3 THEN sync_fencing_token ELSE '' END,
+    sync_claim_expires_at_ms = CASE WHEN sync_every_ms = $3
+        THEN sync_claim_expires_at_ms ELSE 0 END,
+    sync_lease_expiries = CASE WHEN sync_every_ms = $3 THEN sync_lease_expiries ELSE 0 END,
+    sync_every_ms = $3
+WHERE namespace = $4 AND source_id = $5 AND revision = $6
+  AND source = $7 AND source_instance = $8
+RETURNING ",
+    columns!()
+);
 
-const DISABLE_SQL: &str = "
-UPDATE sekai_sources
-SET status = 'disabled', revision = revision + 1, updated_at_ms = $1
+/// Raises the claim generation and ends the claim, so no earlier fence
+/// holds (ADR 0148).
+const DISABLE_SQL: &str = concat!(
+    "UPDATE sekai_sources
+SET status = 'disabled', revision = revision + 1, updated_at_ms = $1,
+    sync_claim_generation = sync_claim_generation + 1, sync_claim_owner = '',
+    sync_fencing_token = '', sync_claim_expires_at_ms = 0
 WHERE namespace = $2 AND source_id = $3 AND status = 'active'
-RETURNING namespace, source_id, source, source_instance, status, revision,
-    created_at_ms, updated_at_ms, record_json";
+RETURNING ",
+    columns!()
+);
+
+/// Moves every scheduled, active Source's due bucket forward, in one
+/// namespace or (`$2` empty) all; idempotent. `NULLIF` keeps an
+/// unscheduled row from dividing by zero whatever order the store
+/// evaluates the conditions in.
+const TICK_SQL: &str = "
+UPDATE sekai_sources SET sync_due_bucket = $1 / NULLIF(sync_every_ms, 0)
+WHERE status = 'active' AND sync_due_bucket < $1 / NULLIF(sync_every_ms, 0)
+  AND ($2 = '' OR namespace = $2)";
+
+/// A plane without the sync columns writes `record_json` but not
+/// `sync_every_ms`, on insert and on update. Each tick first takes the
+/// interval from the spec where the two differ, and restarts the schedule
+/// as a put that changes the interval does.
+const SQLITE_HEAL_SQL: &str = "
+UPDATE sekai_sources
+SET sync_every_ms = COALESCE(json_extract(record_json, '$.every_ms'), 0),
+    sync_due_bucket = 0, sync_claimed_bucket = 0, sync_done_bucket = 0,
+    sync_claim_generation = sync_claim_generation + 1, sync_claim_owner = '',
+    sync_fencing_token = '', sync_claim_expires_at_ms = 0, sync_lease_expiries = 0
+WHERE sync_every_ms <> COALESCE(json_extract(record_json, '$.every_ms'), 0)";
+const POSTGRES_HEAL_SQL: &str = "
+UPDATE sekai_sources
+SET sync_every_ms = COALESCE((record_json::jsonb ->> 'every_ms')::bigint, 0),
+    sync_due_bucket = 0, sync_claimed_bucket = 0, sync_done_bucket = 0,
+    sync_claim_generation = sync_claim_generation + 1, sync_claim_owner = '',
+    sync_fencing_token = '', sync_claim_expires_at_ms = 0, sync_lease_expiries = 0
+WHERE sync_every_ms <> COALESCE((record_json::jsonb ->> 'every_ms')::bigint, 0)";
+
+/// Open or lapsed sync work in a namespace after a source id, by id.
+const DUE_SQL: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM sekai_sources
+WHERE namespace = $1 AND source_id > $2 AND status = 'active'
+  AND ((sync_claim_expires_at_ms = 0 AND sync_due_bucket > sync_done_bucket)
+    OR (sync_claim_expires_at_ms > 0 AND sync_claim_expires_at_ms <= $3))
+ORDER BY source_id LIMIT $4"
+);
+
+/// Writes back what [`SyncState`] holds.
+const SYNC_UPDATE_SQL: &str = "
+UPDATE sekai_sources
+SET sync_due_bucket = $1, sync_claimed_bucket = $2, sync_done_bucket = $3,
+    sync_claim_owner = $4, sync_claim_generation = $5, sync_fencing_token = $6,
+    sync_claim_expires_at_ms = $7, sync_lease_expiries = $8,
+    sync_last_success_at_ms = $9, sync_last_failure_at_ms = $10,
+    sync_last_failure = $11, sync_last_runtime = $12
+WHERE namespace = $13 AND source_id = $14";
 
 struct Row {
     namespace: String,
@@ -335,6 +443,7 @@ struct Row {
     created_at_ms: i64,
     updated_at_ms: i64,
     record_json: String,
+    sync: SyncState,
 }
 
 impl Row {
@@ -350,6 +459,7 @@ impl Row {
             revision: self.revision,
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
+            sync: self.sync,
         })
     }
 }
@@ -365,6 +475,22 @@ fn sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         created_at_ms: row.get(6)?,
         updated_at_ms: row.get(7)?,
         record_json: row.get(8)?,
+        sync: SyncState {
+            due_bucket: row.get(9)?,
+            claimed_bucket: row.get(10)?,
+            done_bucket: row.get(11)?,
+            claim: ClaimRecord {
+                owner: row.get(12)?,
+                generation: row.get(13)?,
+                fencing_token: row.get(14)?,
+                expires_at_ms: row.get(15)?,
+                lease_expiries: row.get(16)?,
+            },
+            last_success_at_ms: row.get(17)?,
+            last_failure_at_ms: row.get(18)?,
+            last_failure: row.get(19)?,
+            last_runtime: row.get(20)?,
+        },
     })
 }
 
@@ -379,6 +505,22 @@ fn postgres_row(row: &postgres::Row) -> Row {
         created_at_ms: row.get(6),
         updated_at_ms: row.get(7),
         record_json: row.get(8),
+        sync: SyncState {
+            due_bucket: row.get(9),
+            claimed_bucket: row.get(10),
+            done_bucket: row.get(11),
+            claim: ClaimRecord {
+                owner: row.get(12),
+                generation: row.get(13),
+                fencing_token: row.get(14),
+                expires_at_ms: row.get(15),
+                lease_expiries: row.get(16),
+            },
+            last_success_at_ms: row.get(17),
+            last_failure_at_ms: row.get(18),
+            last_failure: row.get(19),
+            last_runtime: row.get(20),
+        },
     }
 }
 
@@ -392,9 +534,26 @@ fn list_sql(placeholder_after: &str, placeholder_limit: &str) -> String {
 
 impl SekaiDb {
     pub fn migrate_sources(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(CREATE_SQLITE)
-            .map_err(|error| error.to_string())
+        let conn = self.conn();
+        conn.execute_batch(CREATE_SQLITE)
+            .map_err(|error| error.to_string())?;
+        let present = conn
+            .prepare("PRAGMA table_info(sekai_sources)")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(|error| error.to_string())?;
+        for (column, definition) in SYNC_COLUMNS {
+            if !present.iter().any(|name| name == column) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE sekai_sources ADD COLUMN {column} {definition}"
+                ))
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     fn sqlite_source(
@@ -425,6 +584,7 @@ impl SekaiDb {
                 request.source_instance,
                 request.now_ms,
                 record_json,
+                request.spec.every_ms,
             ],
         )
     }
@@ -439,6 +599,7 @@ impl SekaiDb {
             rusqlite::params![
                 request.now_ms,
                 record_json,
+                request.spec.every_ms,
                 request.namespace,
                 request.source_id,
                 request.expected_revision,
@@ -510,6 +671,7 @@ impl PostgresDb {
                 &request.source_instance,
                 &request.now_ms,
                 &record_json,
+                &request.spec.every_ms,
             ],
         )
     }
@@ -524,6 +686,7 @@ impl PostgresDb {
             &[
                 &request.now_ms,
                 &record_json,
+                &request.spec.every_ms,
                 &request.namespace,
                 &request.source_id,
                 &request.expected_revision,
@@ -631,13 +794,220 @@ impl RuntimeDb {
     }
 }
 
+fn sync_error(error: impl std::fmt::Display) -> SyncError {
+    SyncError::Store(error.to_string())
+}
+
+impl SekaiDb {
+    pub fn tick_source_syncs(&self, namespace: &str, now_ms: i64) -> Result<u64, String> {
+        let conn = self.conn();
+        conn.execute(SQLITE_HEAL_SQL, [])
+            .map_err(|error| error.to_string())?;
+        conn.execute(TICK_SQL, rusqlite::params![now_ms, namespace])
+            .map(|count| count as u64)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_due_source_syncs(
+        &self,
+        namespace: &str,
+        after: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Source>, String> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(DUE_SQL).map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit.min(MAX_LIST_SOURCES)).unwrap_or(0);
+        let rows = statement
+            .query_map(
+                rusqlite::params![namespace, after, now_ms, limit],
+                sqlite_row,
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string())?.decode())
+            .collect()
+    }
+
+    /// Reads the Source, lets `change` edit its sync state and writes that
+    /// back, in one immediate transaction. An error writes nothing.
+    pub fn edit_source_sync(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        change: impl FnOnce(&mut Source) -> Result<(), SyncError>,
+    ) -> Result<Source, SyncError> {
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sync_error)?;
+        let mut source = transaction
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"
+                ),
+                rusqlite::params![namespace, source_id],
+                sqlite_row,
+            )
+            .optional()
+            .map_err(sync_error)?
+            .ok_or(SyncError::NotFound)?
+            .decode()?;
+        change(&mut source)?;
+        let sync = &source.sync;
+        transaction
+            .execute(
+                SYNC_UPDATE_SQL,
+                rusqlite::params![
+                    sync.due_bucket,
+                    sync.claimed_bucket,
+                    sync.done_bucket,
+                    sync.claim.owner,
+                    sync.claim.generation,
+                    sync.claim.fencing_token,
+                    sync.claim.expires_at_ms,
+                    sync.claim.lease_expiries,
+                    sync.last_success_at_ms,
+                    sync.last_failure_at_ms,
+                    sync.last_failure,
+                    sync.last_runtime,
+                    namespace,
+                    source_id,
+                ],
+            )
+            .map_err(sync_error)?;
+        transaction.commit().map_err(sync_error)?;
+        Ok(source)
+    }
+}
+
+impl PostgresDb {
+    pub fn tick_source_syncs(&self, namespace: &str, now_ms: i64) -> Result<u64, String> {
+        let mut connection = self.connection()?;
+        connection
+            .execute(POSTGRES_HEAL_SQL, &[])
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(TICK_SQL, &[&now_ms, &namespace])
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_due_source_syncs(
+        &self,
+        namespace: &str,
+        after: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Source>, String> {
+        let limit = i64::try_from(limit.min(MAX_LIST_SOURCES)).unwrap_or(0);
+        self.connection()?
+            .query(DUE_SQL, &[&namespace, &after, &now_ms, &limit])
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| postgres_row(row).decode())
+            .collect()
+    }
+
+    /// Reads the Source under a row lock, lets `change` edit its sync state
+    /// and writes that back, in one transaction. An error writes nothing.
+    pub fn edit_source_sync(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        change: impl FnOnce(&mut Source) -> Result<(), SyncError>,
+    ) -> Result<Source, SyncError> {
+        let mut connection = self.connection().map_err(SyncError::Store)?;
+        let mut transaction = connection.transaction().map_err(sync_error)?;
+        let mut source = transaction
+            .query_opt(
+                &format!(
+                    "SELECT {COLUMNS} FROM sekai_sources
+                     WHERE namespace = $1 AND source_id = $2 FOR UPDATE"
+                ),
+                &[&namespace, &source_id],
+            )
+            .map_err(sync_error)?
+            .as_ref()
+            .map(postgres_row)
+            .ok_or(SyncError::NotFound)?
+            .decode()?;
+        change(&mut source)?;
+        let sync = &source.sync;
+        transaction
+            .execute(
+                SYNC_UPDATE_SQL,
+                &[
+                    &sync.due_bucket,
+                    &sync.claimed_bucket,
+                    &sync.done_bucket,
+                    &sync.claim.owner,
+                    &sync.claim.generation,
+                    &sync.claim.fencing_token,
+                    &sync.claim.expires_at_ms,
+                    &sync.claim.lease_expiries,
+                    &sync.last_success_at_ms,
+                    &sync.last_failure_at_ms,
+                    &sync.last_failure,
+                    &sync.last_runtime,
+                    &namespace,
+                    &source_id,
+                ],
+            )
+            .map_err(sync_error)?;
+        transaction.commit().map_err(sync_error)?;
+        Ok(source)
+    }
+}
+
+impl RuntimeDb {
+    /// Ticks the Sources of `namespace`, or of every namespace when empty.
+    pub fn tick_source_syncs(&self, namespace: &str, now_ms: i64) -> Result<u64, String> {
+        match self {
+            Self::Sqlite(db) => db.tick_source_syncs(namespace, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.tick_source_syncs(namespace, now_ms))
+            }
+        }
+    }
+
+    /// Open or lapsed sync work in `namespace` after `after`, by id.
+    pub fn list_due_source_syncs(
+        &self,
+        namespace: &str,
+        after: &str,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<Source>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_due_source_syncs(namespace, after, now_ms, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_due_source_syncs(namespace, after, now_ms, limit)
+            }),
+        }
+    }
+
+    pub fn edit_source_sync(
+        &self,
+        namespace: &str,
+        source_id: &str,
+        change: impl FnOnce(&mut Source) -> Result<(), SyncError>,
+    ) -> Result<Source, SyncError> {
+        match self {
+            Self::Sqlite(db) => db.edit_source_sync(namespace, source_id, change),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.edit_source_sync(namespace, source_id, change)
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sekai_source_sdk::ConfigValue;
     use std::sync::Arc;
 
-    fn github(ns: &str, id: &str, repo: &str) -> PutSource {
+    pub(crate) fn github(ns: &str, id: &str, repo: &str) -> PutSource {
         PutSource {
             namespace: ns.into(),
             source_id: id.into(),

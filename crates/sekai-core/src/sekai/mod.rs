@@ -159,6 +159,7 @@ pub mod skillextract;
 pub mod source;
 pub mod source_health;
 pub mod source_quarantine;
+pub mod source_sync;
 pub mod source_type_descriptor;
 pub mod source_webhook;
 pub mod transform_engine;
