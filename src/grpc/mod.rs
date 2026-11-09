@@ -1795,6 +1795,7 @@ fn spawn_service_background_tasks(
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
         spawn_consumer_violation_sweeper(db.clone());
+        spawn_criticality_outbox_sweeper(db.clone());
         spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
@@ -1958,6 +1959,33 @@ fn spawn_consumer_violation_sweeper(db: Arc<RuntimeDb>) {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::error!(%error, "consumer violation sweep failed"),
                 Err(error) => tracing::error!(%error, "consumer violation sweep task failed"),
+            }
+        }
+    });
+}
+
+/// About once a minute, append criticality outbox events a catalog write
+/// left missing, then delete superseded events past retention, keeping each
+/// entry's latest (#2196). Safe on every instance at once.
+fn spawn_criticality_outbox_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = chrono::Utc::now().timestamp_millis();
+                let reconciled = crate::sekai::catalog_criticality::reconcile_outbox(&db, now)
+                    .map_err(|error| format!("{error:?}"));
+                let swept = db.sweep_catalog_criticality_outbox(now);
+                reconciled.and(swept)
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "criticality outbox sweep failed"),
+                Err(error) => tracing::error!(%error, "criticality outbox sweep task failed"),
             }
         }
     });
