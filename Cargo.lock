@@ -2912,6 +2912,7 @@ name = "sekai-connector-runtime"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "reqwest 0.12.28",
  "sekai-client",
  "sekai-source-sdk",
  "serde",

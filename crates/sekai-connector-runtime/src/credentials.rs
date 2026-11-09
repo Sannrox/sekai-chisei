@@ -44,7 +44,7 @@ pub struct CredentialBindings(BTreeMap<String, CredentialBinding>);
 
 /// A resolved value. Debug output never shows it.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
+pub struct Secret(pub(crate) String);
 
 impl Secret {
     pub fn expose(&self) -> &str {

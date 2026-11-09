@@ -11,7 +11,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use sekai_client::ClientConfig;
-use sekai_connector_runtime::{Connectors, CredentialBindings, Runtime, RuntimeOptions};
+use sekai_connector_runtime::{Connectors, CredentialBindings, Runtime, RuntimeOptions, github};
+use sekai_source_sdk::GITHUB_CONNECTOR;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -70,7 +71,7 @@ async fn serve() -> Result<(), String> {
             lease: Duration::from_millis(config.lease_ms),
         },
         config.credentials,
-        Connectors::default(),
+        Connectors::default().with(&GITHUB_CONNECTOR, github::open),
     )
     .await
     .map_err(|error| error.to_string())?;

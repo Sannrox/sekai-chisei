@@ -21,7 +21,7 @@ use sekai_source_sdk::ExportArtifact;
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{LIST_LIMIT, Ran, Runtime};
-use crate::sync::{SyncFailure, prepare};
+use crate::sync::{SyncFailure, blocking, prepare};
 
 impl Runtime {
     /// The Source `source_id` in the namespace at `index`, when this
@@ -183,7 +183,7 @@ impl Runtime {
                                 },
                             )
                         };
-                        match self.heartbeated(&claims, &fence, job).await {
+                        match self.heartbeated(&claims, &fence, blocking(job)).await {
                             Some(outcome) => outcome,
                             None => return Ok(Ran::DeliveryLost { receipt_id }),
                         }

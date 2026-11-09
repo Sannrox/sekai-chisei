@@ -152,9 +152,8 @@ impl Runtime {
         let outcome = match prepare(&source, &self.bindings) {
             Err(failure) => Err(failure),
             Ok(prepared) => {
-                let connectors = self.connectors.clone();
                 match self
-                    .heartbeated(&claims, &fence, move || connectors.sync(&prepared))
+                    .heartbeated(&claims, &fence, self.sync(index, &source, prepared))
                     .await
                 {
                     Some(outcome) => outcome,
@@ -175,21 +174,28 @@ impl Runtime {
         }
     }
 
-    /// Runs `job` on the blocking pool, heartbeating `fence` every third of
-    /// the lease. `None` when the fence is lost: the job's result is then
-    /// dropped, the job ends on its own, and the new holder runs again.
-    pub(crate) async fn heartbeated(
+    /// Runs `work`, heartbeating `fence` first and then every third of the
+    /// lease. `None` when the fence is lost: `work` is then dropped, a blocking job in it
+    /// ends on its own, and the new holder runs again.
+    pub(crate) async fn heartbeated<T>(
         &self,
         claims: &RuntimeClaimClient<'_>,
         fence: &WorkFence,
-        job: impl FnOnce() -> Result<(), SyncFailure> + Send + 'static,
-    ) -> Option<Result<(), SyncFailure>> {
-        let mut job = tokio::task::spawn_blocking(job);
+        work: impl Future<Output = Result<T, SyncFailure>>,
+    ) -> Option<Result<T, SyncFailure>> {
+        // A fence that lapsed before the work starts stops it here, so a
+        // stale holder reads and writes nothing.
+        if let Err(RuntimeClaimError::FenceLost) =
+            claims.heartbeat_work(fence, self.options.lease).await
+        {
+            return None;
+        }
+        let mut work = std::pin::pin!(work);
         let mut beat = tokio::time::interval(self.options.lease / 3);
         beat.tick().await;
         loop {
             tokio::select! {
-                joined = &mut job => return Some(joined.unwrap_or(Err(SyncFailure::Invalid))),
+                done = &mut work => return Some(done),
                 _ = beat.tick() => match claims.heartbeat_work(fence, self.options.lease).await {
                     Ok(_) => {}
                     Err(RuntimeClaimError::FenceLost) => return None,
