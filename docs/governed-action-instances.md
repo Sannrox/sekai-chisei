@@ -113,6 +113,13 @@ reviewed as one bundle, not one Action at a time.
 - The same decision again replays (`replay`); the other decision is
   `plan_review_already_decided`. The first decision of two concurrent ones
   wins.
+- The transaction that records a decision also writes one audit row
+  (action `plan_review.decide`, target the plan id, with the namespace,
+  simulation, digest and decision as evidence) and one receipt (operation
+  `plan-review:<namespace>:<plan id>`, class `plan_review.decide`) whose
+  `approval_decided` event names the decider, decision, reason, plan and
+  digest. Policy, routing and budget stay uncovered on it: each step decides
+  them at execution. A replay or a losing decision writes neither.
 - `GetPlan` returns the review with the plan. Routing can depend on
   parameters, so the review names only the queues of steps the reader may
   see.

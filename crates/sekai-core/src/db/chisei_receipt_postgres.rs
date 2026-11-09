@@ -132,7 +132,7 @@ impl PostgresDb {
         Ok(FencedAdmissionWrite::Applied(()))
     }
 
-    fn upsert_operation_receipt_on<C: GenericClient>(
+    pub(crate) fn upsert_operation_receipt_on<C: GenericClient>(
         &self,
         client: &mut C,
         receipt: &OperationReceipt,
