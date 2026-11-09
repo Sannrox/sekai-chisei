@@ -55,6 +55,8 @@ pub fn migrate_dataset_branches(conn: &rusqlite::Connection) -> Result<(), Strin
         );
         CREATE INDEX IF NOT EXISTS idx_sekai_dataset_branch_proposals_branch
             ON sekai_dataset_branch_proposals(dataset_id, branch, status);
+        CREATE INDEX IF NOT EXISTS idx_sekai_dataset_branch_proposals_open
+            ON sekai_dataset_branch_proposals(tenant, status, created_at_ms DESC, id DESC);
         CREATE TABLE IF NOT EXISTS sekai_transform_replays (
             id TEXT PRIMARY KEY,
             namespace TEXT NOT NULL,
@@ -489,6 +491,48 @@ impl SekaiDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         load_proposal(&tx, dataset_id, id)
+    }
+
+    /// Open proposals of `tenant`, newest first, each with whether an open
+    /// definition proposal attaches it, so it merges only through that
+    /// proposal (#2203).
+    pub fn list_open_dataset_branch_proposals(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(DatasetBranchProposal, bool)>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let keys = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT dataset_id, id FROM sekai_dataset_branch_proposals
+                     WHERE tenant = ?1 AND status = ?2
+                     ORDER BY created_at_ms DESC, id DESC LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|error| error.to_string())?;
+            stmt.query_map(
+                params![
+                    tenant,
+                    dataset_branch::STATUS_OPEN,
+                    limit as i64,
+                    offset as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        keys.iter()
+            .map(|(dataset_id, id)| {
+                Ok((
+                    load_proposal(&tx, dataset_id, id)?,
+                    attached_to_open_definition_proposal(&tx, dataset_id, id)?,
+                ))
+            })
+            .collect()
     }
 
     /// Merge a proposal as exactly one new parent version with a receipt. A

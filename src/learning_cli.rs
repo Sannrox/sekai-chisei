@@ -153,6 +153,16 @@ async fn list_changes(namespace: Option<String>) -> Result<(), BoxErr> {
     Ok(())
 }
 
+/// The `proposed` learning changes of `namespace` in the local Chisei store,
+/// read as `list` reads them; `sekaictl inbox` shows them (#2203).
+pub fn proposed_changes(namespace: &str) -> Result<Vec<learning_change::LearningChange>, BoxErr> {
+    let stores = open_stores()?;
+    let mut records = learning_change::list_changes(&stores.chisei, Some(namespace))
+        .map_err(std::io::Error::other)?;
+    records.retain(|record| record.status == "proposed");
+    Ok(records)
+}
+
 fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
     args.get(index + 1)
         .cloned()

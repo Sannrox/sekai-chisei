@@ -2305,6 +2305,86 @@ fn live_values(db: &dyn DatasetBackend, dataset_id: &str) -> Vec<String> {
 
 /// Attached dataset branch proposals (#2199) merge with their definition
 /// proposal in one transaction, or nothing is written.
+/// The open-proposal listings behind `ListPendingDecisions` (#2203). Each
+/// store has them inherently; the backend traits do not.
+trait OpenProposalListings: DefinitionBranchBackend + DatasetBackend {
+    fn open_definition_proposals(&self, namespace: &str) -> Vec<String>;
+    /// Sorted `(proposal id, attached)` pairs of `tenant`.
+    fn open_dataset_proposals(&self, tenant: &str) -> Vec<(String, bool)>;
+}
+
+macro_rules! open_proposal_listings {
+    ($target:ty) => {
+        impl OpenProposalListings for $target {
+            fn open_definition_proposals(&self, namespace: &str) -> Vec<String> {
+                self.list_open_definition_proposals(namespace, 100, 0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|proposal| proposal.proposal_id)
+                    .collect()
+            }
+
+            fn open_dataset_proposals(&self, tenant: &str) -> Vec<(String, bool)> {
+                let mut open: Vec<_> = self
+                    .list_open_dataset_branch_proposals(tenant, 100, 0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(proposal, attached)| (proposal.id, attached))
+                    .collect();
+                open.sort();
+                open
+            }
+        }
+    };
+}
+open_proposal_listings!(SekaiDb);
+open_proposal_listings!(PostgresDb);
+
+/// Open proposals are listed until they merge, per namespace and tenant; a
+/// dataset proposal an open definition proposal attaches says so.
+fn exercise_open_proposal_listings(db: &impl OpenProposalListings, prefix: &str) {
+    let namespace = format!("{prefix}-open");
+    let tenant = format!("{prefix}-tenant");
+    let standalone = proposed_dataset_branch(db, &tenant, "fix");
+    let attached = proposed_dataset_branch(db, &tenant, "fix");
+    let both = |attached_flag: bool| {
+        let mut expected = vec![
+            (standalone.id.clone(), false),
+            (attached.id.clone(), attached_flag),
+        ];
+        expected.sort();
+        expected
+    };
+    assert_eq!(db.open_dataset_proposals(&tenant), both(false));
+    assert!(db.open_definition_proposals(&namespace).is_empty());
+    let base = open_attached_proposal(db, &namespace, attach(&[&attached]), &tenant).unwrap();
+    assert_eq!(db.open_definition_proposals(&namespace), ["cs"]);
+    assert!(
+        db.open_definition_proposals(&format!("{namespace}-other"))
+            .is_empty()
+    );
+    assert_eq!(db.open_dataset_proposals(&tenant), both(true));
+    assert!(
+        db.open_dataset_proposals(&format!("{tenant}-other"))
+            .is_empty()
+    );
+    db.merge_dataset_branch(&MergeDatasetBranch {
+        dataset_id: standalone.dataset_id.clone(),
+        proposal_id: standalone.id.clone(),
+        actor: "reviewer".into(),
+        tenant: tenant.clone(),
+        reason: String::new(),
+    })
+    .unwrap();
+    assert_eq!(
+        db.open_dataset_proposals(&tenant),
+        [(attached.id.clone(), true)]
+    );
+    merge_attached(db, &namespace, &base, "merge").unwrap();
+    assert!(db.open_definition_proposals(&namespace).is_empty());
+    assert!(db.open_dataset_proposals(&tenant).is_empty());
+}
+
 fn exercise_dataset_attachments(
     db: &(impl DefinitionBranchBackend + DatasetBackend),
     prefix: &str,
@@ -2600,6 +2680,7 @@ fn sqlite_definition_branch_backend_conformance() {
         });
     }
     exercise_dataset_attachments(&SekaiDb::new(":memory:").unwrap(), "sqlite-datasets");
+    exercise_open_proposal_listings(&SekaiDb::new(":memory:").unwrap(), "sqlite-open");
     exercise_concurrent_attached_append(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-datasets-race",
@@ -2652,6 +2733,7 @@ fn postgres_definition_branch_backend_conformance() {
         });
     }
     exercise_dataset_attachments(db.as_ref(), &format!("{prefix}-datasets"));
+    exercise_open_proposal_listings(db.as_ref(), &format!("{prefix}-open"));
     exercise_concurrent_attached_append(db.clone(), &format!("{prefix}-datasets-race"));
     exercise_concurrent_stale_head(db.clone(), &format!("{prefix}-concurrent"));
     exercise_concurrent_genesis_seed(db, &format!("{prefix}-genesis"));

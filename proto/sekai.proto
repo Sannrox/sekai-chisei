@@ -3400,6 +3400,60 @@ message ListActionInstancesRequest {
 }
 message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
 
+// Experimental (#2203): what waits on the caller's decision, across the four
+// review kinds. Rows stay in each kind's own store, and deciding still goes
+// through that kind's RPC.
+enum PendingDecisionKind {
+  PENDING_DECISION_KIND_UNSPECIFIED = 0;
+  // A parked Action instance, decided with DecideActionInstance.
+  PENDING_DECISION_KIND_ACTION_INSTANCE = 1;
+  // A submitted plan review, decided with DecidePlanReview.
+  PENDING_DECISION_KIND_PLAN_REVIEW = 2;
+  // An open definition proposal, approved with ApproveDefinitionProposal.
+  PENDING_DECISION_KIND_DEFINITION_PROPOSAL = 3;
+  // An open dataset branch proposal, merged with MergeDatasetBranch.
+  PENDING_DECISION_KIND_DATASET_BRANCH_PROPOSAL = 4;
+}
+// Each kind is filtered by the check its decide RPC applies, so the caller
+// sees only what that RPC would accept from them and nothing else; a caller
+// who may decide nothing gets an empty list. Freshness preconditions (a
+// moved branch base, a changed target object) are not checked here; the
+// decide RPC reports them.
+message ListPendingDecisionsRequest {
+  string namespace = 1;
+  // Empty: every kind.
+  repeated PendingDecisionKind kinds = 2;
+  // Default 100, at most 500.
+  uint32 limit = 3;
+  // next_page_token of the previous page.
+  string page_token = 4;
+}
+message PendingDecision {
+  PendingDecisionKind kind = 1;
+  string namespace = 2;
+  // Action instance id, plan id, definition proposal id, or dataset branch
+  // proposal id.
+  string subject_id = 3;
+  // What the decision binds: the instance request digest, the plan's
+  // simulation digest, the proposal digest, or the branch digest.
+  string subject_digest = 4;
+  string requested_by = 5;
+  int64 requested_at_ms = 6;
+  // Review SLA deadline of a parked Action; 0 when none.
+  int64 deadline_ms = 7;
+  // Review queue of a parked Action, or the first of a plan's step queues;
+  // empty when none.
+  string queue_id = 8;
+  // Set for a dataset branch proposal: MergeDatasetBranch names it.
+  string dataset_id = 9;
+}
+// Kinds in enum order, newest first within a kind.
+message ListPendingDecisionsResponse {
+  repeated PendingDecision decisions = 1;
+  // Empty on the last page. A full page may be followed by an empty one.
+  string next_page_token = 2;
+}
+
 // Typed ActionInstance effects (#398). Children of admitted instances.
 message ActionEffect {
   string effect_id = 1;
@@ -5460,6 +5514,8 @@ service SekaiService {
   rpc ExecuteActionPlan(ExecuteActionPlanRequest) returns (ExecuteActionPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
+  // Experimental: decisions the caller may make across review kinds (#2203).
+  rpc ListPendingDecisions(ListPendingDecisionsRequest) returns (ListPendingDecisionsResponse);
   // Typed effects on admitted ActionInstances (#398).
   rpc GetActionEffect(GetActionEffectRequest) returns (GetActionEffectResponse);
   rpc ListActionEffects(ListActionEffectsRequest) returns (ListActionEffectsResponse);

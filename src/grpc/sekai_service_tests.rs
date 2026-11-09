@@ -37448,3 +37448,6 @@ async fn an_export_delivered_through_the_old_rpcs_leaves_no_work() {
         tonic::Code::FailedPrecondition
     );
 }
+
+#[path = "pending_decisions_tests.rs"]
+mod pending_decisions_tests;

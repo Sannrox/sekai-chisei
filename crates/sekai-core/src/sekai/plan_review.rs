@@ -251,6 +251,32 @@ pub fn submit_review(
     Ok(stored)
 }
 
+/// Whether `decider` may decide `plan`'s review: never its planner, and
+/// `may_decide` accepts every step; otherwise the first step it refuses.
+/// [`decide_review`] applies it, and the pending-decision listing (#2203)
+/// lists a review only when it passes.
+pub fn check_decider(
+    plan: &ProposedPlan,
+    decider: &str,
+    may_decide: &dyn Fn(&ProposedPlan, &PlanStep) -> bool,
+) -> Result<(), ReviewError> {
+    if decider == plan.planner {
+        return Err(ReviewError::AccessDenied);
+    }
+    match plan
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| !may_decide(plan, step))
+    {
+        Some((index, step)) => Err(ReviewError::StepNotDecidable {
+            index,
+            type_id: step.type_id.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 pub struct ReviewDecision<'a> {
     pub simulation_digest: &'a str,
     pub decision: &'a str,
@@ -285,20 +311,7 @@ pub fn decide_review(
     let plan = db
         .get_plan(namespace, plan_id)?
         .ok_or(ReviewError::AccessDenied)?;
-    if decider == plan.planner {
-        return Err(ReviewError::AccessDenied);
-    }
-    if let Some((index, step)) = plan
-        .steps
-        .iter()
-        .enumerate()
-        .find(|(_, step)| !may_decide(&plan, step))
-    {
-        return Err(ReviewError::StepNotDecidable {
-            index,
-            type_id: step.type_id.clone(),
-        });
-    }
+    check_decider(&plan, decider, may_decide)?;
     if request.simulation_digest != review.simulation_digest {
         return Err(ReviewError::DigestMismatch);
     }
@@ -352,6 +365,17 @@ mod tests {
             ..review.clone()
         };
         assert_eq!(db.put_plan_review(&other).unwrap(), review);
+        // Open reviews are pending (#2203), scoped to their namespace.
+        assert_eq!(
+            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            std::slice::from_ref(&review)
+        );
+        assert!(db.list_pending_plan_reviews(ns, 10, 1).unwrap().is_empty());
+        assert!(
+            db.list_pending_plan_reviews(&format!("{ns}-other"), 10, 0)
+                .unwrap()
+                .is_empty()
+        );
         let granted = PlanReview {
             decision: DECISION_GRANT.into(),
             decided_by: "alice".into(),
@@ -376,6 +400,11 @@ mod tests {
             ..review
         };
         db.put_plan_review(&second).unwrap();
+        // Decided reviews leave the pending list.
+        assert_eq!(
+            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            std::slice::from_ref(&second)
+        );
         assert!(
             db.decide_plan_review(&PlanReview {
                 decision: DECISION_DENY.into(),

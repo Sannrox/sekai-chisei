@@ -43,6 +43,7 @@ pub mod gunshi_cli;
 pub mod harness;
 pub mod http_codegen;
 pub mod http_projection;
+pub mod inbox_cli;
 pub mod launch;
 pub mod learning_cli;
 pub mod lookup_gate_cli;

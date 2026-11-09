@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS sekai_plan_reviews (
     submitted_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, plan_id)
 );
+CREATE INDEX IF NOT EXISTS idx_sekai_plan_reviews_pending
+    ON sekai_plan_reviews (namespace, decision, submitted_at_ms DESC, plan_id DESC);
 CREATE TABLE IF NOT EXISTS sekai_plan_executions (
     namespace TEXT NOT NULL,
     plan_id TEXT NOT NULL,
@@ -230,6 +232,31 @@ impl SekaiDb {
         )?
         .map(|json| decode(&json))
         .transpose()
+    }
+
+    /// Undecided reviews of `namespace`, newest first.
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT body_json FROM sekai_plan_reviews
+                 WHERE namespace = ?1 AND decision = ''
+                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![namespace, limit as i64, offset as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| decode(&row.map_err(|error| error.to_string())?))
+            .collect()
     }
 
     /// Records the decision only while the review is undecided, with its
@@ -541,6 +568,25 @@ impl PostgresDb {
         .transpose()
     }
 
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_plan_reviews
+                 WHERE namespace = $1 AND decision = ''
+                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT $2 OFFSET $3",
+                &[&namespace, &(limit as i64), &(offset as i64)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| decode(row.get(0)))
+            .collect()
+    }
+
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
         let (audit, receipt) = review.decision_records();
         let mut connection = self.connection()?;
@@ -761,6 +807,16 @@ impl crate::db::runtime_db::RuntimeDb {
         plan_id: &str,
     ) -> Result<Option<PlanReview>, String> {
         dispatch!(self, db => db.get_plan_review(namespace, plan_id))
+    }
+
+    /// Undecided reviews of `namespace`, newest first (#2203).
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
+        dispatch!(self, db => db.list_pending_plan_reviews(namespace, limit, offset))
     }
 
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {

@@ -410,6 +410,41 @@ impl PostgresDb {
         load_proposal(&mut tx, dataset_id, id, false)
     }
 
+    /// See `SekaiDb::list_open_dataset_branch_proposals`.
+    pub fn list_open_dataset_branch_proposals(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(DatasetBranchProposal, bool)>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = read_snapshot(&mut connection)?;
+        let keys = tx
+            .query(
+                "SELECT dataset_id, id FROM sekai_dataset_branch_proposals
+                 WHERE tenant = $1 AND status = $2
+                 ORDER BY created_at_ms DESC, id DESC LIMIT $3 OFFSET $4",
+                &[
+                    &tenant,
+                    &dataset_branch::STATUS_OPEN,
+                    &(limit as i64),
+                    &(offset as i64),
+                ],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect::<Vec<_>>();
+        keys.iter()
+            .map(|(dataset_id, id)| {
+                Ok((
+                    load_proposal(&mut tx, dataset_id, id, false)?,
+                    attached_to_open_definition_proposal(&mut tx, dataset_id, id)?,
+                ))
+            })
+            .collect()
+    }
+
     pub fn merge_dataset_branch(
         &self,
         request: &MergeDatasetBranch,

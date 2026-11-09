@@ -57,6 +57,8 @@ mod object_set_query;
 mod ontology_changelog_rpc;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
+#[path = "pending_decisions_rpc.rs"]
+mod pending_decisions_rpc;
 #[path = "schema_definition_lifecycle.rs"]
 mod schema_definition_lifecycle;
 #[path = "scored_knowledge_admission.rs"]
@@ -1231,6 +1233,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListActionInstancesRequest>,
     ) -> Result<Response<ListActionInstancesResponse>, Status> {
         rpc_actions::list_action_instances(self, req).await
+    }
+
+    async fn list_pending_decisions(
+        &self,
+        req: Request<ListPendingDecisionsRequest>,
+    ) -> Result<Response<ListPendingDecisionsResponse>, Status> {
+        pending_decisions_rpc::list_pending_decisions(self, req).await
     }
 
     async fn get_action_effect(

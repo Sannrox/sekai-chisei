@@ -313,6 +313,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ExecuteActionPlan` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
+| `SekaiService.ListPendingDecisions` | `sekai.audit` | yes | cli | `experimental` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionEffects` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListClaimableActionWork` | `sekai.audit` | yes | none | `experimental` |

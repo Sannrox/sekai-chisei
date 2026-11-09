@@ -426,6 +426,8 @@ impl SekaiDb {
                     ON sekai_definition_proposals(namespace, branch_id, created_at_ms, proposal_id);
                 CREATE INDEX IF NOT EXISTS idx_definition_proposal_merged_history
                     ON sekai_definition_proposals(namespace, status, updated_at_ms, proposal_id);
+                CREATE INDEX IF NOT EXISTS idx_definition_proposal_open
+                    ON sekai_definition_proposals(namespace, status, created_at_ms DESC, proposal_id DESC);
 
                 CREATE TABLE IF NOT EXISTS sekai_agent_definition_certifications (
                     namespace TEXT NOT NULL,
@@ -789,6 +791,32 @@ impl SekaiDb {
         proposal_id: &str,
     ) -> Result<Option<DefinitionProposal>, String> {
         load_proposal_sqlite(&self.conn(), namespace, proposal_id)
+    }
+
+    /// Open proposals of `namespace`, newest first (#2203).
+    pub fn list_open_definition_proposals(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DefinitionProposal>, String> {
+        let connection = self.conn();
+        let mut statement = connection
+            .prepare(
+                "SELECT body_json FROM sekai_definition_proposals
+                 WHERE namespace = ?1 AND status = ?2
+                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT ?3 OFFSET ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let bodies = statement
+            .query_map(
+                params![namespace, STATUS_OPEN, limit as i64, offset as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        bodies.iter().map(|body| decode_proposal(body)).collect()
     }
 
     /// Namespaces that have a published definition revision, sorted.
@@ -1945,13 +1973,16 @@ fn load_proposal_sqlite(
         )
         .optional()
         .map_err(|error| error.to_string())?
-        .map(|body| {
-            let proposal: DefinitionProposal = serde_json::from_str(&body)
-                .map_err(|error| format!("corrupt definition proposal: {error}"))?;
-            proposal.verify()?;
-            Ok(proposal)
-        })
+        .map(|body| decode_proposal(&body))
         .transpose()
+}
+
+/// A stored proposal body, verified against its digest.
+pub(crate) fn decode_proposal(body: &str) -> Result<DefinitionProposal, String> {
+    let proposal: DefinitionProposal = serde_json::from_str(body)
+        .map_err(|error| format!("corrupt definition proposal: {error}"))?;
+    proposal.verify()?;
+    Ok(proposal)
 }
 
 /// Opens a branch on the published head whose candidate holds exactly
