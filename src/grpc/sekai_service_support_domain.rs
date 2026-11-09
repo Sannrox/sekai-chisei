@@ -1085,10 +1085,40 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         Status::internal("definition write unavailable")
     }
 }
+/// `proposal` as the caller may read it: an attached dataset branch proposal
+/// the caller cannot read shows only that it exists, after the readable ones
+/// so its position reveals nothing either (#2222).
 pub(super) fn to_proto_definition_proposal(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
     proposal: &definition_proposal_domain::DefinitionProposal,
-) -> DefinitionProposal {
-    DefinitionProposal {
+) -> Result<DefinitionProposal, Status> {
+    let mut dataset_proposals = Vec::with_capacity(proposal.dataset_proposals.len());
+    let mut hidden = 0;
+    for attachment in &proposal.dataset_proposals {
+        if super::rpc_data::attached_dataset_proposal_readable(
+            service, principals, context, attachment,
+        )? {
+            dataset_proposals.push(DefinitionProposalDatasetAttachment {
+                hidden: false,
+                dataset_id: attachment.dataset_id.clone(),
+                proposal_id: attachment.proposal_id.clone(),
+                parent_version_id: attachment.parent_version_id.clone(),
+                branch_digest: attachment.branch_digest.clone(),
+            });
+        } else {
+            hidden += 1;
+        }
+    }
+    dataset_proposals.extend(std::iter::repeat_n(
+        DefinitionProposalDatasetAttachment {
+            hidden: true,
+            ..Default::default()
+        },
+        hidden,
+    ));
+    Ok(DefinitionProposal {
         contract_version: proposal.contract_version.clone(),
         namespace: proposal.namespace.clone(),
         branch_id: proposal.branch_id.clone(),
@@ -1117,7 +1147,8 @@ pub(super) fn to_proto_definition_proposal(
         major_revision: proposal.major_revision,
         source_package_digest: proposal.source_package_digest.clone(),
         source_commit: proposal.source_commit.clone(),
-    }
+        dataset_proposals,
+    })
 }
 pub(super) fn authorize_proposal_member_writes(
     service: &SekaiServiceImpl,

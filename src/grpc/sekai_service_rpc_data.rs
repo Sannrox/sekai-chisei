@@ -5284,6 +5284,41 @@ pub(super) fn context_tenant(context: Option<&RequestEnterpriseContext>) -> Stri
         .unwrap_or_default()
 }
 
+/// Whether the caller may read `attachment`, a dataset branch proposal
+/// attached to a definition proposal (#2222): the read check of every dataset
+/// branch read, in the tenant the proposal was pinned in. A refusal or a
+/// missing dataset hides it; a store failure stays an error.
+pub(super) fn attached_dataset_proposal_readable(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    attachment: &definition_proposal_domain::DatasetProposalAttachment,
+) -> Result<bool, Status> {
+    if attachment.tenant != context_tenant(context) {
+        return Ok(false);
+    }
+    let Some(dataset) = service
+        .db
+        .runtime()
+        .get_dataset(&attachment.dataset_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(false);
+    };
+    match authorize_dataset(service, principals, context, &dataset, false) {
+        Ok(()) => Ok(true),
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::Internal | tonic::Code::Unavailable
+            ) =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 /// The caller's tenant once it may write every dataset in `dataset_ids`:
 /// attaching a dataset branch proposal to a definition proposal, or merging
 /// one that attaches it (#2199). A missing dataset reads as unavailable.

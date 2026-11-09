@@ -1645,7 +1645,15 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(merged.proposal.unwrap().status, "merged");
+    let proposal = merged.proposal.unwrap();
+    assert_eq!(proposal.status, "merged");
+    // A v1 proposal has no attachments and serializes as before (#2222).
+    assert!(proposal.dataset_proposals.is_empty());
+    assert!(
+        !serde_json::to_string(&proposal)
+            .unwrap()
+            .contains("datasetProposals")
+    );
 }
 
 #[tokio::test]
@@ -28654,6 +28662,205 @@ async fn an_attached_dataset_branch_merges_only_with_its_definition_proposal() {
         .unwrap();
     assert_eq!(landed.status, "merged");
     assert_eq!(landed.merged_by, "definition-proposal:with-data-cs");
+}
+
+/// Opens a dataset branch merge proposal on a new dataset, as root. A
+/// non-empty `object_id` binds the dataset to an object only root may access.
+async fn open_dataset_branch_proposal(
+    svc: &SekaiServiceImpl,
+    dataset_id: &str,
+    object_id: &str,
+) -> DatasetBranchProposal {
+    if !object_id.is_empty() {
+        seed_lineage_object(svc, object_id, "guarded");
+        let grant = security::Grant {
+            id: format!("{object_id}-root"),
+            object_id: object_id.into(),
+            principal: "root".into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+    }
+    svc.create_dataset(with_named_principal(
+        CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: dataset_id.into(),
+                name: dataset_id.into(),
+                columns: vec![ColumnDef {
+                    name: "kind".into(),
+                    r#type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: object_id.into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.create_dataset_branch(with_named_principal(
+        CreateDatasetBranchRequest {
+            dataset_id: dataset_id.into(),
+            name: "dev".into(),
+            from_version_id: String::new(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .write_dataset_branch_rows(
+            dataset_id,
+            "dev",
+            &[[("kind".to_string(), "v2".to_string())].into()],
+            false,
+        )
+        .unwrap();
+    svc.propose_dataset_branch_merge(with_named_principal(
+        ProposeDatasetBranchMergeRequest {
+            dataset_id: dataset_id.into(),
+            name: "dev".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap()
+    .into_inner()
+    .proposal
+    .unwrap()
+}
+
+/// A definition proposal shows its attached dataset branch proposals (#2222)
+/// on get and approve: each one the reader may read in full, and one it may
+/// not only as hidden, after the readable ones.
+#[tokio::test]
+async fn definition_proposal_shows_only_attachments_the_reader_may_read() {
+    let svc = service();
+    let namespace = "shown-data";
+    let guarded = open_dataset_branch_proposal(&svc, "a-guarded", "a-guarded-object").await;
+    let open = open_dataset_branch_proposal(&svc, "b-open", "").await;
+    let parent = seed_definition_parent(&svc, namespace).revision_digest;
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "with-data".into(),
+            parent_revision_digest: parent.clone(),
+            idempotency_key: "with-data-create".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "with-data".into(),
+                expected_head_digest: parent.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["kind"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "with-data-edit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "with-data".into(),
+            proposal_id: "with-data-cs".into(),
+            base_digest: parent,
+            candidate_digest: candidate,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "with-data-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+            dataset_proposals: [&guarded, &open]
+                .map(|proposal| DatasetProposalRef {
+                    dataset_id: proposal.dataset_id.clone(),
+                    proposal_id: proposal.id.clone(),
+                })
+                .into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let shown = |proposal: &DatasetBranchProposal| DefinitionProposalDatasetAttachment {
+        hidden: false,
+        dataset_id: proposal.dataset_id.clone(),
+        proposal_id: proposal.id.clone(),
+        parent_version_id: proposal.parent_version_id.clone(),
+        branch_digest: proposal.branch_digest.clone(),
+    };
+    let get = |principal: &str| {
+        svc.get_definition_proposal(with_named_principal(
+            GetDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "with-data-cs".into(),
+            },
+            principal,
+        ))
+    };
+    let for_root = get("root").await.unwrap().into_inner().proposal.unwrap();
+    assert_eq!(for_root.dataset_proposals, [shown(&guarded), shown(&open)]);
+
+    let hidden = DefinitionProposalDatasetAttachment {
+        hidden: true,
+        ..Default::default()
+    };
+    let for_reviewer = get("reviewer")
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(
+        for_reviewer.dataset_proposals,
+        [shown(&open), hidden.clone()]
+    );
+    let approver = security::Grant {
+        id: "shown-data-approver".into(),
+        object_id: schema_object_id("Ticket"),
+        principal: "reviewer".into(),
+        role: security::Role::Admin,
+        created: 1,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&approver).unwrap();
+    svc.security.add_grant(&approver);
+    let approved = svc
+        .approve_definition_proposal(with_named_principal(
+            ApproveDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "with-data-cs".into(),
+                idempotency_key: "with-data-approve".into(),
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(approved.dataset_proposals, [shown(&open), hidden]);
 }
 
 fn gate_binding(namespace: &str, blocking: bool) -> domain::Object {
