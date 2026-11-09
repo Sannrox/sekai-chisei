@@ -121,6 +121,48 @@ object they all hang off.
    kinds. All of it is read from the plane's own records, never from a live
    probe (ADR 0046).
 
+## Amendment 2026-11-09
+
+The first implementation (#2185) differs from the decision above in these
+ways.
+
+- **Types and claims.** Connector types are data in `sekai-source-sdk`; a
+  runtime matches its implementations to them by name and version. A
+  Source's sync claim lives in the Source row, held by the one claim engine
+  of ADR 0149, not in a table of its own. A runtime's placement labels are
+  the ones it registers as a transform runtime. A runtime lists only
+  Sources of the types it implements, and delivery work only for types
+  that deliver, so an older runtime leaves a newer type's work to one that
+  has it.
+- **Batches.** During a rolling deploy, a batch that names no Source is
+  still admitted for an active Source's tokens. Refusing batches on
+  disable is best effort: a batch admitted just before the disable commits
+  can still apply.
+- **Delivery.** A saved-export definition names its delivery Source, read
+  from the definition at delivery time. The unfenced fetch and
+  acknowledge refuse a Source-bound artifact whether or not it is
+  claimed, not only while a claim is live as the Consequences say. An
+  artifact without a delivery Source keeps the old behaviour. Disabling
+  or re-placing the Source ends a delivery claim already taken: its
+  heartbeat and fenced fetch are refused. A failed delivery keeps its
+  claim until it lapses, so it is tried again a lease later.
+- **Runtime.** A runtime heartbeats a claim before it starts the work, so
+  a holder whose fence has lapsed reads and writes nothing. A sync that
+  finds a batch another producer left open fails as `unavailable`.
+- **GitHub.** The runtime writes its own cursor format. A cursor the
+  standalone adapter committed restarts the scan; records read again keep
+  their ids and versions. The runtime must authenticate as the producer
+  the adapter used, because the binding keeps its producer.
+- **Relational.** The type checks reachability and delivers into a
+  delivery table, idempotent per receipt. Page reads need a registered
+  type descriptor (ADR 0100) and are not built; a relational Source's
+  syncs fail as `unsupported`.
+- **Not yet built.** `external_mutate` routing to a Source, GitHub
+  writeback through `apply`, and `external_effect` work and its health.
+  The Validation item for a writeback effect stays open until they land.
+- **Unchanged.** The saved-export RPCs still refuse a tenant or machine
+  caller context, as they did before this ADR.
+
 ## Alternatives considered
 
 - **Keep one process per integration.** Each new integration keeps paying
