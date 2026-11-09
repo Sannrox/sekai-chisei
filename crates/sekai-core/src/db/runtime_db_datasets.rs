@@ -504,6 +504,41 @@ impl RuntimeDb {
         }
     }
 
+    pub fn drifted_catalog_criticality_entries(
+        &self,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.drifted_catalog_criticality_entries(after, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.drifted_catalog_criticality_entries(after, limit)
+            }),
+        }
+    }
+
+    /// Deletes every criticality outbox event older than
+    /// `EVENT_RETENTION_MS` (#2196) except each entry's latest, one batch per
+    /// transaction, and returns how many it deleted. Safe on every instance
+    /// at once.
+    pub fn sweep_catalog_criticality_outbox(&self, now_ms: i64) -> Result<usize, String> {
+        use crate::sekai::catalog_criticality::{EVENT_RETENTION_MS, SWEEP_BATCH};
+        let cutoff_ms = now_ms.saturating_sub(EVENT_RETENTION_MS);
+        let mut deleted = 0;
+        loop {
+            let batch = match self {
+                Self::Sqlite(db) => db.delete_superseded_catalog_criticality_events(cutoff_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.delete_superseded_catalog_criticality_events(cutoff_ms)
+                }),
+            }?;
+            deleted += batch;
+            if (batch as i64) < SWEEP_BATCH {
+                return Ok(deleted);
+            }
+        }
+    }
+
     pub fn latest_catalog_criticality_event(
         &self,
         entry_id: &str,

@@ -103,3 +103,15 @@ Each change to declared, derived or effective appends one outbox event
 (`sekai.catalog-criticality/v1`) with a content digest and no markings.
 `ListCatalogCriticalityOutbox` is Discover on the namespace and omits events
 for entries the caller cannot read.
+
+Consumers dedupe on `event_id`, which is `{entry_id}:{seq}`. For each entry
+`seq` starts at 1, rises by one per event and is never reused, so
+`(entry_id, seq)` is monotonic. A list page may repeat an event already
+seen.
+
+An event is appended right after the catalog write. If that append fails
+or the process stops first, every Sekai-serving instance appends the
+missing event from the stored entry within about a minute. The latest event
+always catches up to the stored entry; changes in between may be folded
+into one event. Each minute the same pass deletes events older than 30 days, except
+each entry's latest event, which is kept so the next `seq` follows it.
