@@ -1398,14 +1398,27 @@ message AgentTurnWorkOptions {
   // neither listed nor claimed.
   bool accepts_continuation = 1;
 }
+// A connector type by name and version (ADR 0148).
+message ConnectorTypeRef {
+  string name = 1;
+  string version = 2;
+}
+// Options of a list of Source sync work.
+message SourceSyncWorkOptions {
+  // Lists only Sources of these types, the ones the runtime implements, so
+  // Sources of other types never fill its page. Empty lists every type.
+  repeated ConnectorTypeRef connector_types = 1;
+}
 message ListClaimableWorkRequest {
   WorkKind kind = 1;
   string namespace = 2;
-  // Transform and Action work: lists only work this runtime may take.
+  // Transform, Action and Source sync work: lists only work this runtime
+  // may take.
   string runtime_id = 3;
   int32 limit = 4;
   oneof options {
     AgentTurnWorkOptions agent_turn = 10;
+    SourceSyncWorkOptions source_sync = 11;
   }
 }
 // One claimable item; the set field names its kind.

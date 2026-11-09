@@ -44,6 +44,7 @@ mod compatibility_matrix_adr;
 mod concurrent_source_ingestion;
 mod connector_certification_adr;
 mod connector_certification_backend_conformance;
+mod connector_runtime;
 mod connector_template;
 mod coordination_backend_conformance;
 mod data_dir_store_layout;

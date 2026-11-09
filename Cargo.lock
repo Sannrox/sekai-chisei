@@ -2858,6 +2858,7 @@ dependencies = [
  "same-file",
  "sekai-admin-client",
  "sekai-client",
+ "sekai-connector-runtime",
  "sekai-connector-template",
  "sekai-core",
  "sekai-domain",
@@ -2904,6 +2905,18 @@ dependencies = [
  "tonic-prost",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "sekai-connector-runtime"
+version = "0.1.0"
+dependencies = [
+ "sekai-client",
+ "sekai-source-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ members = [
     "crates/chisei-gateway",
     "crates/sekai-adapters",
     "crates/sekai-admin-client",
+    "crates/sekai-connector-runtime",
     "crates/sekai-connector-template",
     "crates/sekai-client",
     "crates/sekai-core",
@@ -127,6 +128,7 @@ futures = "0.3"
 chisei-core = { version = "2.0.0", path = "crates/chisei-core", features = ["gateway-test-support"] }
 sekai-core = { version = "3.0.0", path = "crates/sekai-core", features = ["gateway-test-support"] }
 sekai-client = { path = "crates/sekai-client" }
+sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.40", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
