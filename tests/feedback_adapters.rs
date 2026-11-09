@@ -1,4 +1,5 @@
-//! Feedback runtimes outside the plane: investigation and GitHub publication
+//! Feedback runtimes outside the plane: the signed observation receiver,
+//! investigation, and GitHub publication
 //! through public RPCs against an in-process plane. The analyzer and GitHub
 //! are scripted; the plane, claims, bindings, permits, and Action writes are
 //! real.
@@ -14,6 +15,16 @@ mod source_writeback;
 #[allow(dead_code)]
 #[path = "../adapters/feedback_github_issues.rs"]
 mod feedback_github_issues;
+
+#[allow(dead_code)]
+#[path = "../adapters/sdk.rs"]
+mod sdk;
+
+#[path = "../adapters/feedback_observation_webhook.rs"]
+mod feedback_observation_webhook;
+
+#[path = "feedback_adapters/observation_webhook.rs"]
+mod observation_webhook;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;

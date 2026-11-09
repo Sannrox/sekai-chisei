@@ -12,6 +12,22 @@ the Sekai core:
 - `evidence_github_check_webhook` accepts one GitHub `check_run` webhook payload
   on stdin. Collection and webhook authentication remain the responsibility of
   the surrounding webhook receiver.
+- `feedback_observation_webhook.rs` receives one signed Tenkai
+  `feedback.observation` webhook delivery (raw body plus headers). It checks
+  `X-Tenkai-Signature` (HMAC-SHA256 over the raw body, constant-time) before
+  parsing, validates the body against the vendored
+  `fixtures/tenkai-feedback-observation-v1.schema.json` (SHA-256 pinned), and
+  records it with `SubmitEvidence` through the SDK outbox and
+  `SubmitActionInstance` for `feedback.observation.record`, both keyed on
+  `X-Tenkai-Idempotency-Key`. A redelivery lands on the same evidence and
+  observation, and `replay_pending` finishes a delivery a crash left between
+  the two calls. The webhook secret and the receiver's producer principal stay
+  in the receiver. Register that principal as the evidence producer for
+  source type `tenkai_feedback_webhook`, evidence type `feedback.observation`,
+  and target kind `feedback_observation`, with Write on the namespace.
+  Webhook bodies carry no tenant, so the observation scope is the
+  environment. Hosting it behind HTTP is a deployment decision; tests drive it
+  in-process (`tests/feedback_adapters/observation_webhook.rs`).
 - `evidence_http_health_poll` performs one bounded HTTP GET against a health
   endpoint and translates the response into expiring operational-health
   evidence.
