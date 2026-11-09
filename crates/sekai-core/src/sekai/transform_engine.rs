@@ -250,7 +250,7 @@ pub fn execute_sql_until(
     if Instant::now() >= deadline {
         return Err(TransformError::Quarantined(BUDGET_TIME.into()));
     }
-    let conn = Connection::open_in_memory().map_err(|error| {
+    let mut conn = Connection::open_in_memory().map_err(|error| {
         TransformError::InvalidArgument(format!("analytical engine unavailable: {error}"))
     })?;
     apply_memory_bound(&conn, memory)?;
