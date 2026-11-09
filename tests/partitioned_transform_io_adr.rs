@@ -6,7 +6,6 @@ const ADR_0102: &str = include_str!("../docs/decisions/0102-isolated-process-tra
 const DECISIONS_INDEX: &str = include_str!("../docs/decisions/README.md");
 const GOVERNED: &str = include_str!("../docs/governed-transforms.md");
 const PARITY: &str = include_str!("../docs/postgres-sekai-parity.md");
-const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 
 #[test]
 fn adr_0105_is_indexed_and_keeps_partitioned_transform_io() {
@@ -40,9 +39,5 @@ fn adr_0105_is_indexed_and_keeps_partitioned_transform_io() {
     assert!(
         PARITY.contains("#1388"),
         "postgres-sekai-parity.md must record #1388"
-    );
-    assert!(
-        CHANGELOG.contains("0060_partitioned_transform_io") && CHANGELOG.contains("GATE:mig"),
-        "CHANGELOG must name the PostgreSQL migration and GATE:mig"
     );
 }

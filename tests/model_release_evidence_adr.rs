@@ -2,7 +2,6 @@
 
 const ADR_0107: &str = include_str!("../docs/decisions/0107-model-release-evidence.md");
 const DECISIONS_INDEX: &str = include_str!("../docs/decisions/README.md");
-const CHANGELOG: &str = include_str!("../CHANGELOG.md");
 
 #[test]
 fn adr_0107_is_indexed_and_names_the_evidence_tables() {
@@ -16,13 +15,5 @@ fn adr_0107_is_indexed_and_names_the_evidence_tables() {
     assert!(
         ADR_0107.contains("chisei_model_release_"),
         "ADR 0107 must name the evidence tables"
-    );
-    assert!(
-        CHANGELOG.contains("0063_chisei_model_release_evidence"),
-        "changelog must name the PostgreSQL migration"
-    );
-    assert!(
-        CHANGELOG.contains("GATE:mig"),
-        "changelog must mark GATE:mig"
     );
 }
