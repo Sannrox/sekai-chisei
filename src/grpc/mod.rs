@@ -855,6 +855,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetOntologyHealth"
             | "RecordOntologyHealthSnapshot"
             | "ListOntologyHealthTrend"
+            | "PutOntologyHealthSchedule"
+            | "DeleteOntologyHealthSchedule"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
@@ -2691,6 +2693,10 @@ mod tests {
             (SpaceRole::Viewer, "ListOntologyHealthTrend", true),
             (SpaceRole::Viewer, "RecordOntologyHealthSnapshot", false),
             (SpaceRole::Editor, "RecordOntologyHealthSnapshot", true),
+            (SpaceRole::Viewer, "PutOntologyHealthSchedule", false),
+            (SpaceRole::Editor, "PutOntologyHealthSchedule", true),
+            (SpaceRole::Viewer, "DeleteOntologyHealthSchedule", false),
+            (SpaceRole::Editor, "DeleteOntologyHealthSchedule", true),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),

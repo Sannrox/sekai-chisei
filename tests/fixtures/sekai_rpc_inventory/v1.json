@@ -496,6 +496,38 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PutOntologyHealthSchedule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_health_schedule.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.ontology-definitions"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "DeleteOntologyHealthSchedule",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.ontology-definitions"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/ontology_health_schedule.rs",
+        "src/grpc/ontology_health_rpc.rs",
+        "docs/ontology-health.md"
+      ],
+      "durable_dependencies": [
+        "sekai.ontology-definitions"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GenerateDefinitionChangeBundle",
       "kind": "query",
       "surfaces": [],

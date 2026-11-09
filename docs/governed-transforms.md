@@ -102,6 +102,22 @@ mixed deploy, each side sees the other's run, and a check runs at most once
 per bucket. As with every schedule member, a run late in one bucket and a run
 early in the next are both on time.
 
+A namespace's ontology health schedule is a member of the same graph (#2192,
+[ontology-health.md](ontology-health.md)). `TickGovernedTransforms` records
+the window holding the tick's time once for each schedule that has not
+finished that window. The snapshot store keeps one snapshot per namespace and
+window, so two planes ticking at once, or a tick racing an on-demand
+`RecordOntologyHealthSnapshot`, store a window once. Each schedule keeps a
+cursor, `last_window_start_ms`, that moves forward only after the window is
+stored. A crash before the cursor moves leaves the window due, and the retry
+replays the stored snapshot. A recorder refused at tick time halts the
+schedule with `last_error`. A put bumps the schedule's generation, and the
+tick moves the cursor or halts only the generation it read. The health
+members run last, and both always run, so one failing member fails the tick
+without holding back the other or the rest of the tick. Planes from before
+#2192 do not read schedules. In a mixed deploy, only upgraded planes record
+from them, and every plane can still record on demand.
+
 An isolated-process definition may declare `requires`, placement labels as
 key and value pairs, part of its definition digest when non-empty (#1733,
 ADR 0129). A worker registers its labels for its runtime id in a namespace

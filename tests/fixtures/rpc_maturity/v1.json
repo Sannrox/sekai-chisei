@@ -339,6 +339,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "PutOntologyHealthSchedule",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteOntologyHealthSchedule",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GenerateDefinitionChangeBundle",
       "storage_path": "sekai.definition-branch, sekai.graph",
       "real_backend": "yes",

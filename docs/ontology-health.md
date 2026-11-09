@@ -42,16 +42,30 @@ past that.
 ## Trends and threshold events
 
 `RecordOntologyHealthSnapshot` stores the part scores of one namespace for
-the window holding the current time. The plane runs no scheduler: an
-external periodic caller drives it and carries the schedule in each call
-(`window_ms`, at least one minute; `retention_ms`, at least one window;
-`threshold`, 0-100). Only the namespace's administrator records, so a
-snapshot scores what the namespace holds. Problems are not stored.
+the window holding the current time. Each call carries the window
+(`window_ms`, at least one minute), the retention (`retention_ms`, at least
+one window) and the threshold (`threshold`, 0-100). Only the namespace's
+administrator records, so a snapshot scores what the namespace holds.
+Problems are not stored.
+
+A stored schedule records with no caller outside the plane (#2192).
+`PutOntologyHealthSchedule` saves one schedule per namespace with the same
+window, retention and threshold. Only the namespace's administrator may put
+it, outside a tenant assertion, and snapshots record as that administrator.
+`DeleteOntologyHealthSchedule` stops it and keeps the trend.
+`ListOntologyHealthTrend` returns the schedule to the namespace's
+administrator. The schedule is a member of the transform schedule graph:
+`TickGovernedTransforms` records each due window, scored and authorized as
+the recorder at that moment (see [governed-transforms.md](governed-transforms.md)).
+If the recorder is refused, for example because their administration was
+revoked, the tick fails with `FAILED_PRECONDITION`. The schedule then halts
+with `last_error` and is not tried again until a put replaces it. On-demand
+calls still work alongside the schedule.
 
 - Recording is idempotent per (namespace, window): the window's first
   record is kept, and every later or concurrent call, including a retry
-  after a crash past commit, returns it with `replay: true` and writes
-  nothing.
+  after a crash past commit or a tick racing an on-demand call, returns it
+  with `replay: true` and writes nothing.
 - A window older than the latest recorded one is refused
   (`FAILED_PRECONDITION`), so the trend stays ordered.
 - When the total falls below the threshold, a `below_threshold` event is

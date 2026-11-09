@@ -537,7 +537,8 @@ async fn score_as_caller(
 
 /// `RecordOntologyHealthSnapshot` (#1694): scores the namespace as its
 /// administrator and stores the part scores for the current window, with
-/// what they were scored from. A periodic caller drives it. The response
+/// what they were scored from. The on-demand call; a stored schedule records
+/// from the transform schedule tick (#2192). The response
 /// shows the caller what they may see of the stored snapshot, a replayed one
 /// included.
 pub(super) async fn record_ontology_health_snapshot(
@@ -549,16 +550,7 @@ pub(super) async fn record_ontology_health_snapshot(
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let (metadata, extensions, input) = req.into_parts();
-    authorize_source_sync_namespace(
-        service,
-        &principals,
-        tenant_context.as_ref(),
-        &input.namespace,
-        true,
-    )?;
-    let recorded_by =
-        authorize_source_type_namespace_admin(service, &principals, &input.namespace)?;
-    let scored = score_as_caller(
+    let (recorded_by, scored) = score_as_recorder(
         service,
         &principals,
         tenant_context.as_ref(),
@@ -609,6 +601,122 @@ pub(super) async fn record_ontology_health_snapshot(
     }))
 }
 
+/// Scores `namespace` for a record: only its administrator records, so a
+/// snapshot scores what the namespace holds. Returns the recorder.
+async fn score_as_recorder(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    metadata: tonic::metadata::MetadataMap,
+    extensions: tonic::Extensions,
+    namespace: &str,
+) -> Result<(String, Scored), Status> {
+    authorize_source_sync_namespace(service, principals, tenant_context, namespace, true)?;
+    let recorded_by = authorize_source_type_namespace_admin(service, principals, namespace)?;
+    let scored = score_as_caller(
+        service,
+        principals,
+        tenant_context,
+        metadata,
+        extensions,
+        namespace,
+    )
+    .await?;
+    Ok((recorded_by, scored))
+}
+
+/// The ontology health member of the transform schedule tick (#2192):
+/// records the due window of every stored schedule, scored and authorized as
+/// the administrator that put it, outside any tenant assertion. Schedules
+/// record one at a time and each on its own. A recorder refused now (revoked,
+/// say) halts its schedule with the reason, so later ticks skip it until a
+/// put replaces it; a store failure leaves the window due for the next tick.
+/// Either way the first error is returned after every schedule was tried.
+/// Returns the number of windows this tick wrote.
+pub(super) async fn tick_ontology_health_schedules(
+    service: &SekaiServiceImpl,
+    now_ms: i64,
+) -> Result<usize, Status> {
+    use crate::sekai::ontology_health_schedule::{self as schedules, HealthSchedule};
+    use crate::sekai::ontology_health_trend::{Recorded, TrendError};
+    let db = service.db.runtime();
+    let due =
+        schedules::due(db, now_ms).map_err(|_| Status::internal("health schedules unavailable"))?;
+    // None when the halt was fenced off: a put replaced the schedule, or
+    // another plane finished the window, so this tick has nothing to report.
+    let halt = |schedule: &HealthSchedule, reason: &str| -> Option<Status> {
+        match schedules::halt(db, schedule, now_ms, reason) {
+            Ok(true) => Some(Status::failed_precondition(format!(
+                "ontology health schedule of {} halted: {reason}",
+                schedule.namespace
+            ))),
+            Ok(false) => None,
+            Err(_) => Some(Status::internal("health schedules unavailable")),
+        }
+    };
+    let mut written = 0;
+    let mut first_error = None;
+    for schedule in due {
+        let principals = vec![schedule.recorded_by.clone()];
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        let Ok(principal) = tonic::metadata::MetadataValue::try_from(schedule.recorded_by.as_str())
+        else {
+            if let Some(error) = halt(&schedule, "recorder is not a principal") {
+                first_error.get_or_insert(error);
+            }
+            continue;
+        };
+        metadata.insert("x-principal", principal);
+        let scored = score_as_recorder(
+            service,
+            &principals,
+            None,
+            metadata,
+            tonic::Extensions::default(),
+            &schedule.namespace,
+        )
+        .await;
+        let error = match scored {
+            Ok((_, scored)) => match schedules::record_due(
+                db,
+                &schedule,
+                now_ms,
+                &scored.parts,
+                &scored.datasets,
+                scored.definition_revision.as_deref().unwrap_or_default(),
+            ) {
+                Ok(recorded) => {
+                    written += usize::from(matches!(recorded, Recorded::Fresh { .. }));
+                    continue;
+                }
+                Err(TrendError::Invalid(message)) => halt(&schedule, &message),
+                Err(TrendError::Store(_)) => Some(Status::internal("health trend unavailable")),
+            },
+            Err(status) if refuses_recorder(status.code()) => halt(&schedule, status.message()),
+            Err(status) => Some(status),
+        };
+        let Some(error) = error else {
+            continue;
+        };
+        tracing::warn!(namespace = %schedule.namespace, error = %error.message(), "ontology health schedule failed");
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(written), Err)
+}
+
+/// A refusal that a retry would get again, until someone changes a grant or
+/// the schedule; anything else may pass on the next tick.
+fn refuses_recorder(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+            | tonic::Code::NotFound
+            | tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+    )
+}
+
 /// `ListOntologyHealthTrend` (#1694): the namespace's stored snapshots and
 /// threshold events for a reader of the namespace, each snapshot showing only
 /// the parts the reader may see now, and an event only when the reader may
@@ -654,7 +762,20 @@ pub(super) async fn list_ontology_health_trend(
         .filter(|snapshot| projection.whole(snapshot))
         .map(|snapshot| snapshot.window_start_ms)
         .collect();
+    // The schedule names its recorder and why it halted: administrators only.
+    let schedule =
+        if authorize_source_type_namespace_admin(service, &principals, &input.namespace).is_ok() {
+            service
+                .db
+                .runtime()
+                .get_ontology_health_schedule(&input.namespace)
+                .map_err(|_| Status::internal("health schedule unavailable"))?
+                .map(schedule_to_proto)
+        } else {
+            None
+        };
     Ok(Response::new(ListOntologyHealthTrendResponse {
+        schedule,
         snapshots: snapshots
             .iter()
             .map(|snapshot| projection.snapshot(snapshot))
@@ -665,6 +786,93 @@ pub(super) async fn list_ontology_health_trend(
             .map(event_to_proto)
             .collect(),
     }))
+}
+
+/// The caller and namespace a schedule put or delete is for: the namespace's
+/// administrator, outside a tenant assertion, since the tick records with no
+/// tenant context (as saved exports run).
+fn schedule_admin<T: std::any::Any>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    namespace: &str,
+) -> Result<String, Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    if request_tenant_context(service.db.runtime(), req)?.is_some() {
+        return Err(Status::failed_precondition(
+            "ontology health schedules are for principals outside a tenant assertion",
+        ));
+    }
+    authorize_source_sync_namespace(service, &principals, None, namespace, true)?;
+    authorize_source_type_namespace_admin(service, &principals, namespace)
+}
+
+/// `PutOntologyHealthSchedule` (#2192): creates or replaces the namespace's
+/// schedule, recording as the caller. A replace clears a halt.
+pub(super) async fn put_ontology_health_schedule(
+    service: &SekaiServiceImpl,
+    req: Request<PutOntologyHealthScheduleRequest>,
+) -> Result<Response<PutOntologyHealthScheduleResponse>, Status> {
+    use crate::sekai::ontology_health_schedule::{self as schedules, PutSchedule};
+    use crate::sekai::ontology_health_trend::TrendError;
+    let namespace = req
+        .get_ref()
+        .schedule
+        .as_ref()
+        .map(|schedule| schedule.namespace.clone())
+        .ok_or_else(|| Status::invalid_argument("schedule is required"))?;
+    let recorded_by = schedule_admin(service, &req, &namespace)?;
+    let input = req.into_inner().schedule.unwrap_or_default();
+    let schedule = schedules::put(
+        service.db.runtime(),
+        &PutSchedule {
+            namespace: &namespace,
+            window_ms: input.window_ms,
+            retention_ms: input.retention_ms,
+            threshold: input.threshold,
+            recorded_by: &recorded_by,
+            now_ms: now_millis(),
+        },
+    )
+    .map_err(|error| match error {
+        TrendError::Invalid(message) => Status::invalid_argument(message),
+        TrendError::Store(_) => Status::internal("health schedule unavailable"),
+    })?;
+    Ok(Response::new(PutOntologyHealthScheduleResponse {
+        schedule: Some(schedule_to_proto(schedule)),
+    }))
+}
+
+/// `DeleteOntologyHealthSchedule` (#2192): stops the schedule; the trend stays.
+pub(super) async fn delete_ontology_health_schedule(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteOntologyHealthScheduleRequest>,
+) -> Result<Response<DeleteOntologyHealthScheduleResponse>, Status> {
+    let namespace = req.get_ref().namespace.clone();
+    schedule_admin(service, &req, &namespace)?;
+    let deleted = service
+        .db
+        .runtime()
+        .delete_ontology_health_schedule(&namespace)
+        .map_err(|_| Status::internal("health schedule unavailable"))?;
+    Ok(Response::new(DeleteOntologyHealthScheduleResponse {
+        deleted,
+    }))
+}
+
+fn schedule_to_proto(
+    schedule: crate::sekai::ontology_health_schedule::HealthSchedule,
+) -> OntologyHealthSchedule {
+    OntologyHealthSchedule {
+        namespace: schedule.namespace,
+        window_ms: schedule.window_ms,
+        retention_ms: schedule.retention_ms,
+        threshold: u32::from(schedule.threshold),
+        recorded_by: schedule.recorded_by,
+        updated_at_ms: schedule.updated_at_ms,
+        last_window_start_ms: schedule.last_window_start_ms,
+        last_error: schedule.last_error,
+    }
 }
 
 fn event_to_proto(event: crate::sekai::ontology_health_trend::HealthEvent) -> OntologyHealthEvent {
