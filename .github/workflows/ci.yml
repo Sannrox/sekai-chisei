@@ -120,10 +120,22 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
-        with:
-          version: 1.75.0
-          setup_only: true
+      # Install buf with retries: one release-download 504 must not fail the
+      # job before buf runs (#2174). The pinned checksum fixes the binary.
+      - name: Install buf
+        env:
+          BUF_VERSION: 1.75.0
+          BUF_SHA256: fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/buf/bin"
+          mkdir -p "$bin"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            -o "$bin/buf" "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "${BUF_SHA256}  $bin/buf" | sha256sum -c -
+          chmod +x "$bin/buf"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/buf" --version
       - name: buf breaking
         env:
           GH_TOKEN: ${{ github.token }}
