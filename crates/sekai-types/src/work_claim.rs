@@ -18,14 +18,17 @@ pub enum WorkKind {
     AgentTurn,
     /// A saved-export artifact awaiting delivery (ADR 0148).
     ExportDelivery,
+    /// A Source's due sync bucket (ADR 0148).
+    SourceSync,
 }
 
 impl WorkKind {
-    pub const ALL: [WorkKind; 4] = [
+    pub const ALL: [WorkKind; 5] = [
         WorkKind::Transform,
         WorkKind::Action,
         WorkKind::AgentTurn,
         WorkKind::ExportDelivery,
+        WorkKind::SourceSync,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -34,6 +37,7 @@ impl WorkKind {
             WorkKind::Action => "action",
             WorkKind::AgentTurn => "agent_turn",
             WorkKind::ExportDelivery => "export_delivery",
+            WorkKind::SourceSync => "source_sync",
         }
     }
 
@@ -274,7 +278,7 @@ mod tests {
         for kind in WorkKind::ALL {
             assert_eq!(WorkKind::from_wire_name(kind.wire_name()), Some(kind));
         }
-        assert_eq!(WorkKind::from_wire_name("source_sync"), None);
+        assert_eq!(WorkKind::from_wire_name("external_effect"), None);
     }
 
     #[test]

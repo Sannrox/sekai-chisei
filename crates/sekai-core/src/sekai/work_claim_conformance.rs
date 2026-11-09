@@ -3,8 +3,9 @@
 //! a stale token refused on write-back, and failure after the lease-expiry
 //! limit. Each kind is driven through its own store entry points.
 //! Export delivery has no lease-expiry limit: retention bounds it.
+//! Source sync fails the due bucket at the limit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action_effect::{EFFECT_STATUS_DEAD_LETTERED, plan_effects_for_admit};
@@ -17,6 +18,7 @@ use crate::sekai::governed_transform::{
     TRANSFORM_WORK_FAILED, WriteTransformRunCommand,
 };
 use crate::sekai::site_agent_instance;
+use crate::sekai::source_sync::{self, SyncError, SyncOutcome};
 use crate::sekai::work_claim::{ClaimError, Fence, WorkKind};
 
 /// The claim a test holds.
@@ -98,6 +100,23 @@ impl Subject<'_> {
                     Err(error) => panic!("export delivery claim failed: {error}"),
                 }
             }
+            WorkKind::SourceSync => match source_sync::claim(
+                self.db,
+                &self.namespace,
+                &self.id,
+                owner,
+                &source_labels(),
+                TTL_MS,
+                now_ms,
+            ) {
+                Ok(source) => Some(Held {
+                    owner: source.sync.claim.owner,
+                    generation: source.sync.claim.generation,
+                    token: source.sync.claim.fencing_token,
+                }),
+                Err(SyncError::Claim(ClaimError::Held | ClaimError::LeaseLimit)) => None,
+                Err(error) => panic!("source sync claim failed: {error}"),
+            },
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -144,6 +163,15 @@ impl Subject<'_> {
                 export_delivery::heartbeat(self.db, &self.receipt(), held.fence(), TTL_MS, now_ms)
                     .is_ok()
             }
+            WorkKind::SourceSync => source_sync::heartbeat(
+                self.db,
+                &self.namespace,
+                &self.id,
+                held.fence(),
+                TTL_MS,
+                now_ms,
+            )
+            .is_ok(),
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -213,6 +241,18 @@ impl Subject<'_> {
                 .unwrap_err()
                     == DeliveryError::Claim(ClaimError::FenceLost)
             }
+            WorkKind::SourceSync => {
+                source_sync::acknowledge(
+                    self.db,
+                    &self.namespace,
+                    &self.id,
+                    held.fence(),
+                    SyncOutcome::Completed,
+                    now_ms,
+                )
+                .unwrap_err()
+                    == SyncError::Claim(ClaimError::FenceLost)
+            }
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -234,6 +274,15 @@ impl Subject<'_> {
             }
             WorkKind::AgentTurn => {
                 agent_turn::get(self.db, &self.id).unwrap().unwrap().status == "failed"
+            }
+            WorkKind::SourceSync => {
+                let sync = self
+                    .db
+                    .get_source(&self.namespace, &self.id)
+                    .unwrap()
+                    .unwrap()
+                    .sync;
+                sync.last_failure == "lease_expired" && sync.done_bucket == sync.due_bucket
             }
             _ => unreachable!("not a kind under test"),
         }
@@ -269,6 +318,15 @@ fn admit<'a>(db: &'a RuntimeDb, kind: WorkKind, prefix: &str) -> Subject<'a> {
         WorkKind::AgentTurn => admit_turn(db, &namespace),
         WorkKind::ExportDelivery => {
             export_delivery::tests::completed_artifact(db, &namespace).operation_id
+        }
+        WorkKind::SourceSync => {
+            crate::sekai::source::put(
+                db,
+                &crate::sekai::source::tests::github(&namespace, "repo", "acme/repo"),
+            )
+            .unwrap();
+            db.tick_source_syncs(&namespace, 10 * 300_000).unwrap();
+            "repo".into()
         }
         _ => unreachable!("not a kind under test"),
     };
@@ -360,6 +418,11 @@ fn admit_turn(db: &RuntimeDb, namespace: &str) -> String {
     )
     .unwrap()
     .turn_id
+}
+
+/// Labels that satisfy the test Source's placement.
+fn source_labels() -> BTreeMap<String, String> {
+    BTreeMap::from([("zone".into(), "eu".into())])
 }
 
 /// The claim contract for `kind` on `db`.
@@ -456,6 +519,11 @@ fn sqlite_export_delivery_claim_conformance() {
 }
 
 #[test]
+fn sqlite_source_sync_claim_conformance() {
+    claim_contract(&RuntimeDb::memory(), WorkKind::SourceSync, "sqlite");
+}
+
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
 fn postgres_transform_claim_conformance() {
     claim_contract(
@@ -491,6 +559,16 @@ fn postgres_export_delivery_claim_conformance() {
     claim_contract(
         &postgres(),
         WorkKind::ExportDelivery,
+        &format!("pg{}", std::process::id()),
+    );
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_source_sync_claim_conformance() {
+    claim_contract(
+        &postgres(),
+        WorkKind::SourceSync,
         &format!("pg{}", std::process::id()),
     );
 }

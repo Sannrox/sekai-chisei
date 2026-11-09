@@ -118,6 +118,16 @@ without holding back the other or the rest of the tick. Planes from before
 #2192 do not read schedules. In a mixed deploy, only upgraded planes record
 from them, and every plane can still record on demand.
 
+A Source with `every_ms` greater than zero is a member of the same graph
+(ADR 0148, #2185). `TickGovernedTransforms` moves each active Source's due
+bucket to `now / every_ms` in one conditional update, so planes ticking at
+once raise it once. An unfinished due bucket is `source_sync` work for a
+connector runtime whose labels satisfy the Source's placement. The claim
+covers the newest due bucket, so a runtime that fell behind syncs once. A
+failed bucket waits for the next one instead of retrying. Disabling the
+Source raises its claim generation, and a put that changes `every_ms`
+restarts the schedule.
+
 An isolated-process definition may declare `requires`, placement labels as
 key and value pairs, part of its definition digest when non-empty (#1733,
 ADR 0129). A worker registers its labels for its runtime id in a namespace
