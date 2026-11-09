@@ -3438,6 +3438,7 @@ fn source_batch(
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     }
 }
 
@@ -3445,6 +3446,66 @@ fn redigest_source_batch(batch: &mut SourceBatch) {
     let mut domain = from_proto_source_batch(batch.clone()).unwrap();
     domain.batch_digest.clear();
     batch.batch_digest = domain.canonical_digest().unwrap();
+}
+
+#[tokio::test]
+async fn a_batch_naming_a_source_applies_only_for_its_tokens_until_it_is_disabled() {
+    use crate::sekai::source::{self, PutSource, SourceSpec};
+    let svc = service();
+    let namespace = "sync-named";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    source::put(
+        svc.db.runtime(),
+        &PutSource {
+            namespace: namespace.into(),
+            source_id: "ops".into(),
+            source: "github".into(),
+            source_instance: "acme/ops".into(),
+            spec: SourceSpec {
+                connector_type: "github".into(),
+                connector_version: "1".into(),
+                config: sekai_source_sdk::SourceConfig::from([(
+                    "api_url".into(),
+                    sekai_source_sdk::ConfigValue::Text("https://api.github.com".into()),
+                )]),
+                credential_ref: "ops/github-bot".into(),
+                egress: vec!["api.github.com".into()],
+                placement: Default::default(),
+                every_ms: 0,
+                owner: "team".into(),
+                markings: Vec::new(),
+                certification_id: String::new(),
+            },
+            expected_revision: 0,
+            now_ms: 1,
+        },
+    )
+    .unwrap();
+    let apply = |handle: &str, current: &str, next: &str| {
+        let mut batch = source_batch(namespace, producer, current, next, next);
+        batch.source_id = handle.into();
+        svc.apply_source_batch(with_named_principal(
+            ApplySourceBatchRequest { batch: Some(batch) },
+            producer,
+        ))
+    };
+    apply("ops", "", "cursor:1").await.unwrap();
+    let foreign = apply("other", "cursor:1", "cursor:2").await.unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        foreign.message(),
+        "the named source does not own this source_instance"
+    );
+
+    source::disable(svc.db.runtime(), namespace, "ops", 2).unwrap();
+    for handle in ["ops", ""] {
+        let refused = apply(handle, "cursor:1", "cursor:2").await.unwrap_err();
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (tonic::Code::FailedPrecondition, "source is disabled")
+        );
+    }
 }
 
 #[tokio::test]

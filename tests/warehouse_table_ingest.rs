@@ -83,6 +83,7 @@ fn to_proto(batch: sekai_chisei::sekai::object_sync::SourceBatch) -> SourceBatch
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     }
 }
 

@@ -242,6 +242,16 @@ fn apply_source_batch_blocking(
     }
     crate::sekai::write_freeze::refuse_if_frozen_any(service.db.runtime(), &checks)
         .map_err(crate::grpc::write_freeze_status)?;
+    if !proto.source_id.is_empty() {
+        crate::sekai::source::admit_batch(
+            service.db.runtime(),
+            &proto.namespace,
+            &proto.source,
+            &proto.source_instance,
+            &proto.source_id,
+        )
+        .map_err(map_source_sync_apply_error)?;
+    }
     let mut batch = from_proto_source_batch(proto)?;
     batch.producer_identity = principal.clone();
     let authorized_objects = authorize_source_batch_object_policy(

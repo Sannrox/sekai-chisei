@@ -4082,6 +4082,10 @@ message SourceBatch {
   // Rebound to the single authenticated transport principal by the server.
   string producer_identity = 3;
   string source = 4;
+  // Free-form with `source`, deprecated as the way to name where a batch
+  // comes from: name the Source with `source_id` (ADR 0148). Object ids
+  // still derive from `source`, `source_instance` and each record's
+  // external id, so naming a Source changes no identity.
   string source_instance = 5;
   string family = 6;
   string adapter_id = 7;
@@ -4094,6 +4098,12 @@ message SourceBatch {
   int64 collected_at_ms = 14;
   repeated SourceRecord records = 15;
   SourceDeliveryWindow delivery = 16;
+  // The Source (ADR 0148) this batch syncs. When set, that Source must own
+  // `source` and `source_instance`. Empty keeps the deprecated free-form
+  // path, open for unowned tokens and active Sources alike; a disabled
+  // Source refuses every batch for its tokens either way. Not part of the
+  // batch digest.
+  string source_id = 17;
 }
 
 message SourceBinding {
