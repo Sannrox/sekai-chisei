@@ -301,10 +301,7 @@ fn execute_sql_inner(
     let mut stmt = conn
         .prepare(sql.trim().trim_end_matches(';'))
         .map_err(map_engine_error)?;
-    let names: Vec<String> = stmt
-        .column_names()
-        .map(|name| name.to_string())
-        .collect();
+    let names: Vec<String> = stmt.column_names().map(|name| name.to_string()).collect();
     let mut unique = BTreeSet::new();
     for name in &names {
         if !unique.insert(name.as_str()) {
