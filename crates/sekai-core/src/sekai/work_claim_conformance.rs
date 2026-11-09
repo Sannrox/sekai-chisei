@@ -2,25 +2,38 @@
 //! (ADR 0149): claim, heartbeat, expiry, reclaim under a higher generation,
 //! a stale token refused on write-back, and failure after the lease-expiry
 //! limit. Each kind is driven through its own store entry points.
+//! Export delivery has no lease-expiry limit: retention bounds it.
 
 use std::collections::HashMap;
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action_effect::{EFFECT_STATUS_DEAD_LETTERED, plan_effects_for_admit};
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
+use crate::sekai::data_export::export_receipt;
 use crate::sekai::dataset::{ColumnDef, Dataset};
+use crate::sekai::export_delivery::{self, DeliveryError};
 use crate::sekai::governed_transform::{
     CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, STALE_TRANSFORM_CLAIM,
     TRANSFORM_WORK_FAILED, WriteTransformRunCommand,
 };
 use crate::sekai::site_agent_instance;
-use crate::sekai::work_claim::WorkKind;
+use crate::sekai::work_claim::{ClaimError, Fence, WorkKind};
 
 /// The claim a test holds.
 struct Held {
     owner: String,
     generation: i64,
     token: String,
+}
+
+impl Held {
+    fn fence(&self) -> Fence<'_> {
+        Fence {
+            owner: &self.owner,
+            generation: self.generation,
+            token: &self.token,
+        }
+    }
 }
 
 /// One piece of work of one kind, driven through that kind's store calls.
@@ -74,8 +87,23 @@ impl Subject<'_> {
                     Err(error) => panic!("agent turn claim failed: {error}"),
                 }
             }
+            WorkKind::ExportDelivery => {
+                match export_delivery::claim(self.db, &self.receipt(), owner, TTL_MS, now_ms) {
+                    Ok(artifact) => Some(Held {
+                        owner: artifact.claim.owner,
+                        generation: artifact.claim.generation,
+                        token: artifact.claim.fencing_token,
+                    }),
+                    Err(DeliveryError::Claim(ClaimError::Held)) => None,
+                    Err(error) => panic!("export delivery claim failed: {error}"),
+                }
+            }
             _ => unreachable!("not a kind under test"),
         }
+    }
+
+    fn receipt(&self) -> sekai_domain::receipt::OperationReceipt {
+        export_receipt(self.db, &self.id).unwrap().unwrap()
     }
 
     fn heartbeat(&self, held: &Held, now_ms: i64) -> bool {
@@ -112,6 +140,10 @@ impl Subject<'_> {
                 now_ms,
             )
             .is_ok(),
+            WorkKind::ExportDelivery => {
+                export_delivery::heartbeat(self.db, &self.receipt(), held.fence(), TTL_MS, now_ms)
+                    .is_ok()
+            }
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -169,6 +201,18 @@ impl Subject<'_> {
                 .unwrap_err()
                     == TurnError::StaleClaim
             }
+            WorkKind::ExportDelivery => {
+                let digest = crate::sekai::data_export::completed_digest(&self.receipt()).unwrap();
+                export_delivery::acknowledge_export_delivery(
+                    self.db,
+                    &self.id,
+                    &digest,
+                    Some(held.fence()),
+                    now_ms,
+                )
+                .unwrap_err()
+                    == DeliveryError::Claim(ClaimError::FenceLost)
+            }
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -223,6 +267,9 @@ fn admit<'a>(db: &'a RuntimeDb, kind: WorkKind, prefix: &str) -> Subject<'a> {
             effect.effect_id
         }
         WorkKind::AgentTurn => admit_turn(db, &namespace),
+        WorkKind::ExportDelivery => {
+            export_delivery::tests::completed_artifact(db, &namespace).operation_id
+        }
         _ => unreachable!("not a kind under test"),
     };
     Subject {
@@ -352,6 +399,15 @@ fn claim_contract(db: &RuntimeDb, kind: WorkKind, prefix: &str) {
         "{kind}: the current claim still holds"
     );
 
+    if kind == WorkKind::ExportDelivery {
+        // No lease-expiry limit: retention bounds the reclaims.
+        let third = work
+            .claim("c", 5_000)
+            .expect("a second lapse is reclaimable");
+        let fourth = work.claim("d", 8_000).expect("and a third");
+        assert!(fourth.generation > third.generation);
+        return;
+    }
     // The second lapse is counted at this claim, the third fails the work.
     work.claim("c", 5_000)
         .expect("a second lapse is reclaimable");
@@ -365,7 +421,7 @@ fn claim_contract(db: &RuntimeDb, kind: WorkKind, prefix: &str) {
     );
 }
 
-fn postgres() -> RuntimeDb {
+pub(crate) fn postgres() -> RuntimeDb {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
     let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
@@ -395,6 +451,11 @@ fn sqlite_agent_turn_claim_conformance() {
 }
 
 #[test]
+fn sqlite_export_delivery_claim_conformance() {
+    claim_contract(&RuntimeDb::memory(), WorkKind::ExportDelivery, "sqlite");
+}
+
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
 fn postgres_transform_claim_conformance() {
     claim_contract(
@@ -420,6 +481,16 @@ fn postgres_agent_turn_claim_conformance() {
     claim_contract(
         &postgres(),
         WorkKind::AgentTurn,
+        &format!("pg{}", std::process::id()),
+    );
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_export_delivery_claim_conformance() {
+    claim_contract(
+        &postgres(),
+        WorkKind::ExportDelivery,
         &format!("pg{}", std::process::id()),
     );
 }

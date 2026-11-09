@@ -758,7 +758,9 @@ message RunExportDefinitionResponse {
   int64 row_count = 2;
   string content_digest = 3;
 }
-// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts.
+// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts
+// no live export_delivery claim holds. Deprecated: claim them as
+// WORK_KIND_EXPORT_DELIVERY through ListClaimableWork and ClaimWork.
 message ListDeliverableExportArtifactsRequest {
   string namespace = 1;
 }
@@ -773,13 +775,26 @@ message DeliverableExportArtifact {
 message ListDeliverableExportArtifactsResponse {
   repeated DeliverableExportArtifact artifacts = 1;
 }
+// The export_delivery claim (ADR 0149) its holder presents to fetch or
+// acknowledge a claimed artifact. Without one, a claimed artifact is
+// refused while the claim is live.
+message ExportDeliveryFence {
+  string runtime_id = 1;
+  int64 claim_generation = 2;
+  string fencing_token = 3;
+}
 message FetchExportArtifactRequest {
   string receipt_id = 1;
+  // Required while a live claim holds the artifact.
+  ExportDeliveryFence claim = 2;
 }
+// Deprecated: acknowledge claimed work with AckWork.
 message AcknowledgeExportDeliveryRequest {
   // The digest the adapter verified over the fetched bytes.
   string receipt_id = 1;
   string content_digest = 2;
+  // Required while a live claim holds the artifact.
+  ExportDeliveryFence claim = 3;
 }
 message AcknowledgeExportDeliveryResponse {
   bool acknowledged = 1;
@@ -1349,6 +1364,20 @@ enum WorkKind {
   WORK_KIND_TRANSFORM = 1;
   WORK_KIND_ACTION = 2;
   WORK_KIND_AGENT_TURN = 3;
+  // A saved-export artifact awaiting delivery. Its work_id is the receipt
+  // id. Callers need what ListDeliverableExportArtifacts needs: the run's
+  // initiating actor or a namespace administrator.
+  WORK_KIND_EXPORT_DELIVERY = 4;
+}
+// A claimed saved-export artifact: a reference, not bytes. Fetch them with
+// FetchExportArtifact under this claim, then acknowledge with AckWork.
+message ExportDeliveryWork {
+  DeliverableExportArtifact artifact = 1;
+  string claim_owner = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  // Never later than the artifact's expires_at_ms.
+  int64 claim_expires_at_ms = 5;
 }
 // Options of a list or claim of agent turns.
 message AgentTurnWorkOptions {
@@ -1372,6 +1401,7 @@ message ClaimableWork {
     TransformWork transform = 1;
     ActionEffect action = 2;
     AgentTurn agent_turn = 3;
+    DeliverableExportArtifact export_delivery = 4;
   }
 }
 message ListClaimableWorkResponse {
@@ -1382,8 +1412,8 @@ message ClaimWorkRequest {
   // Transform work and agent turns. Action work is named by work_id alone.
   string namespace = 2;
   string runtime_id = 3;
-  // run_id, effect_id or turn_id. Empty claims the next due item, for
-  // transform work and agent turns.
+  // run_id, effect_id, turn_id or receipt_id. Empty claims the next due
+  // item, for every kind but Action work.
   string work_id = 4;
   int64 ttl_ms = 5;
   // Action work: the idempotency key of this claim. Required for it.
@@ -1398,11 +1428,12 @@ message ClaimWorkResponse {
     ClaimTransformWorkResponse transform = 1;
     ClaimActionWorkResponse action = 2;
     ClaimAgentTurnResponse agent_turn = 3;
+    ExportDeliveryWork export_delivery = 4;
   }
 }
 message HeartbeatWorkClaimRequest {
   WorkKind kind = 1;
-  // run_id, effect_id or turn_id.
+  // run_id, effect_id, turn_id or receipt_id.
   string work_id = 2;
   string runtime_id = 3;
   int64 claim_generation = 4;
@@ -1414,6 +1445,7 @@ message HeartbeatWorkClaimResponse {
     HeartbeatTransformClaimResponse transform = 1;
     HeartbeatActionClaimResponse action = 2;
     HeartbeatAgentTurnClaimResponse agent_turn = 3;
+    ExportDeliveryWork export_delivery = 4;
   }
 }
 // Action-work fields of an acknowledge; see AckActionWorkRequest.
@@ -1428,27 +1460,35 @@ message ActionAckOptions {
 message AgentTurnAckOptions {
   string parked_action_instance_id = 1;
 }
-// Action work and agent turns only. Transform work is acknowledged by
-// WriteTransformRunResult, which carries its output.
+// Export-delivery fields of an acknowledge; required for that kind.
+message ExportDeliveryAckOptions {
+  // The digest the runtime verified over the fetched bytes.
+  string content_digest = 1;
+}
+// Transform work is acknowledged by WriteTransformRunResult, which carries
+// its output.
 message AckWorkRequest {
   WorkKind kind = 1;
-  // effect_id or turn_id.
+  // effect_id, turn_id or receipt_id.
   string work_id = 2;
   string runtime_id = 3;
   int64 claim_generation = 4;
   string fencing_token = 5;
-  // completed, failed or parked.
+  // completed, failed or parked. Export delivery takes completed only; the
+  // acknowledge deletes the artifact's bytes.
   string outcome = 6;
   string reason = 7;
   oneof options {
     ActionAckOptions action = 10;
     AgentTurnAckOptions agent_turn = 11;
+    ExportDeliveryAckOptions export_delivery = 12;
   }
 }
 message AckWorkResponse {
   oneof payload {
     AckActionWorkResponse action = 1;
     AckAgentTurnResponse agent_turn = 2;
+    AcknowledgeExportDeliveryResponse export_delivery = 3;
   }
 }
 // Experimental (#1968). Live (not forgotten) working memory of one site
@@ -5142,9 +5182,17 @@ service SekaiService {
   rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
   rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
   rpc RunExportDefinition(RunExportDefinitionRequest) returns (RunExportDefinitionResponse);
-  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse);
+  // Deprecated (ADR 0148): list and claim WORK_KIND_EXPORT_DELIVERY through
+  // ListClaimableWork and ClaimWork. Kept, unfenced for unclaimed
+  // artifacts, until the next major.
+  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse) {
+    option deprecated = true;
+  }
   rpc FetchExportArtifact(FetchExportArtifactRequest) returns (stream ExportObjectSetChunk);
-  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse);
+  // Deprecated (ADR 0148): acknowledge claimed work with AckWork.
+  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse) {
+    option deprecated = true;
+  }
   rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
@@ -5170,7 +5218,9 @@ service SekaiService {
   rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
   rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
   // Experimental (ADR 0149). One claim family over every work kind; each
-  // call runs the kind's own RPC above, so both families see one claim.
+  // call runs the kind's own claim path, so both families see one claim.
+  // Export delivery has no claim RPCs of its own; its old delivery RPCs
+  // above honor these claims.
   rpc ListClaimableWork(ListClaimableWorkRequest) returns (ListClaimableWorkResponse);
   rpc ClaimWork(ClaimWorkRequest) returns (ClaimWorkResponse);
   rpc HeartbeatWorkClaim(HeartbeatWorkClaimRequest) returns (HeartbeatWorkClaimResponse);

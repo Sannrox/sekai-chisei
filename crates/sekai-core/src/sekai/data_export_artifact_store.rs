@@ -6,11 +6,18 @@
 //! run begins and filled chunk by chunk. Whether it is complete, and its
 //! digest, are the receipt's: an artifact is whole exactly when its receipt
 //! completed. Every artifact expires and is unreadable once expired; any
-//! instance may sweep expired ones.
+//! instance may sweep expired ones, claimed or not.
+//!
+//! The row also holds the artifact's `export_delivery` claim (ADR 0149) in
+//! nullable columns; a row no claim ever touched reads as unclaimed. The
+//! rules for who may read or acknowledge it live in
+//! [`crate::sekai::export_delivery`].
 
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+use crate::sekai::export_delivery::DeliveryError;
+use crate::sekai::work_claim::{ClaimRecord, Fence};
 
 /// How long an artifact is kept at most, delivered or not.
 pub const ARTIFACT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -24,13 +31,61 @@ pub struct StoredArtifact {
     pub bytes: Vec<u8>,
 }
 
-/// An unacked artifact still within its retention bound.
+/// An artifact row without its bytes: retention, acknowledgement and the
+/// `export_delivery` claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactMeta {
     pub receipt_id: String,
     pub namespace: String,
     pub definition_id: String,
     pub created_at_ms: i64,
     pub expires_at_ms: i64,
+    pub acked_at_ms: Option<i64>,
+    pub claim: ClaimRecord,
+}
+
+const ARTIFACT_COLUMNS: &str = "receipt_id, namespace, definition_id, created_at_ms, \
+     expires_at_ms, acked_at_ms, claim_owner, claim_generation, fencing_token, \
+     claim_expires_at_ms, lease_expiries";
+
+fn sqlite_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactMeta> {
+    Ok(ArtifactMeta {
+        receipt_id: row.get(0)?,
+        namespace: row.get(1)?,
+        definition_id: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        expires_at_ms: row.get(4)?,
+        acked_at_ms: row.get(5)?,
+        claim: ClaimRecord {
+            owner: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            generation: row.get::<_, Option<i64>>(7)?.unwrap_or_default(),
+            fencing_token: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            expires_at_ms: row.get::<_, Option<i64>>(9)?.unwrap_or_default(),
+            lease_expiries: row.get::<_, Option<i64>>(10)?.unwrap_or_default(),
+        },
+    })
+}
+
+fn pg_artifact(row: &postgres::Row) -> ArtifactMeta {
+    ArtifactMeta {
+        receipt_id: row.get(0),
+        namespace: row.get(1),
+        definition_id: row.get(2),
+        created_at_ms: row.get(3),
+        expires_at_ms: row.get(4),
+        acked_at_ms: row.get(5),
+        claim: ClaimRecord {
+            owner: row.get::<_, Option<String>>(6).unwrap_or_default(),
+            generation: row.get::<_, Option<i64>>(7).unwrap_or_default(),
+            fencing_token: row.get::<_, Option<String>>(8).unwrap_or_default(),
+            expires_at_ms: row.get::<_, Option<i64>>(9).unwrap_or_default(),
+            lease_expiries: row.get::<_, Option<i64>>(10).unwrap_or_default(),
+        },
+    }
+}
+
+fn store_error(error: impl std::fmt::Display) -> DeliveryError {
+    DeliveryError::Store(error.to_string())
 }
 
 /// A saved export whose schedule bucket this tick claimed.
@@ -239,67 +294,85 @@ impl SekaiDb {
     ) -> Result<Vec<ArtifactMeta>, String> {
         let conn = self.conn();
         let mut statement = conn
-            .prepare(
-                "SELECT receipt_id, namespace, definition_id, created_at_ms, expires_at_ms
-                 FROM sekai_export_artifacts
+            .prepare(&format!(
+                "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
                  WHERE namespace = ?1 AND acked_at_ms IS NULL AND expires_at_ms >= ?2
-                 ORDER BY created_at_ms",
-            )
+                 ORDER BY created_at_ms"
+            ))
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(rusqlite::params![namespace, now_ms], |row| {
-                Ok(ArtifactMeta {
-                    receipt_id: row.get(0)?,
-                    namespace: row.get(1)?,
-                    definition_id: row.get(2)?,
-                    created_at_ms: row.get(3)?,
-                    expires_at_ms: row.get(4)?,
-                })
-            })
+            .query_map(rusqlite::params![namespace, now_ms], sqlite_artifact)
             .map_err(|error| error.to_string())?;
         rows.map(|row| row.map_err(|error| error.to_string()))
             .collect()
     }
 
-    /// Records delivery: drops the bytes and keeps the ack so a retry is a
-    /// no-op. True when this call or an earlier one acknowledged it.
-    pub fn acknowledge_export_artifact(
+    pub fn export_artifact(&self, receipt_id: &str) -> Result<Option<ArtifactMeta>, String> {
+        use rusqlite::OptionalExtension;
+        self.conn()
+            .query_row(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts WHERE receipt_id = ?1"
+                ),
+                rusqlite::params![receipt_id],
+                sqlite_artifact,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Loads, edits and persists one artifact row in one write transaction.
+    /// A newly acknowledged artifact loses its bytes in the same commit.
+    pub fn edit_export_artifact(
         &self,
         receipt_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
+        change: impl FnOnce(&mut ArtifactMeta) -> Result<(), DeliveryError>,
+    ) -> Result<ArtifactMeta, DeliveryError> {
         use rusqlite::OptionalExtension;
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
-        let updated = transaction
-            .execute(
-                "UPDATE sekai_export_artifacts SET acked_at_ms = ?2
-                 WHERE receipt_id = ?1 AND acked_at_ms IS NULL AND expires_at_ms >= ?2",
-                rusqlite::params![receipt_id, now_ms],
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let mut artifact = transaction
+            .query_row(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts WHERE receipt_id = ?1"
+                ),
+                rusqlite::params![receipt_id],
+                sqlite_artifact,
             )
-            .map_err(|error| error.to_string())?;
-        if updated == 1 {
+            .optional()
+            .map_err(store_error)?
+            .ok_or(DeliveryError::Unavailable)?;
+        let was_acked = artifact.acked_at_ms.is_some();
+        change(&mut artifact)?;
+        transaction
+            .execute(
+                "UPDATE sekai_export_artifacts SET acked_at_ms = ?2, claim_owner = ?3,
+                     claim_generation = ?4, fencing_token = ?5, claim_expires_at_ms = ?6,
+                     lease_expiries = ?7
+                 WHERE receipt_id = ?1",
+                rusqlite::params![
+                    receipt_id,
+                    artifact.acked_at_ms,
+                    artifact.claim.owner,
+                    artifact.claim.generation,
+                    artifact.claim.fencing_token,
+                    artifact.claim.expires_at_ms,
+                    artifact.claim.lease_expiries,
+                ],
+            )
+            .map_err(store_error)?;
+        if !was_acked && artifact.acked_at_ms.is_some() {
             transaction
                 .execute(
                     "DELETE FROM sekai_export_artifact_chunks WHERE receipt_id = ?1",
                     rusqlite::params![receipt_id],
                 )
-                .map_err(|error| error.to_string())?;
-            transaction.commit().map_err(|error| error.to_string())?;
-            return Ok(true);
+                .map_err(store_error)?;
         }
-        let already = transaction
-            .query_row(
-                "SELECT 1 FROM sekai_export_artifacts
-                 WHERE receipt_id = ?1 AND acked_at_ms IS NOT NULL",
-                rusqlite::params![receipt_id],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .is_some();
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(already)
+        transaction.commit().map_err(store_error)?;
+        Ok(artifact)
     }
 
     /// Claims at most one due bucket. The cursor write is the admission
@@ -368,50 +441,46 @@ impl SekaiDb {
         Ok(due)
     }
 
-    pub fn export_artifact_is_deliverable(
-        &self,
-        receipt_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
-        use rusqlite::OptionalExtension;
-        self.conn()
-            .query_row(
-                "SELECT 1 FROM sekai_export_artifacts
-                 WHERE receipt_id = ?1 AND expires_at_ms >= ?2 AND acked_at_ms IS NULL",
-                rusqlite::params![receipt_id, now_ms],
-                |_| Ok(()),
-            )
-            .optional()
-            .map(|row| row.is_some())
-            .map_err(|error| error.to_string())
-    }
-
+    /// The chunks after `after_seq`, read in the same transaction as the
+    /// check that `fence` (or, without one, any caller) may still read them.
     pub fn export_artifact_chunks_after(
         &self,
         receipt_id: &str,
         after_seq: i64,
         limit: i64,
+        fence: Option<Fence<'_>>,
         now_ms: i64,
     ) -> Result<Vec<(i64, Vec<u8>)>, String> {
-        let conn = self.conn();
-        let mut statement = conn
+        use rusqlite::OptionalExtension;
+        let mut conn = self.conn();
+        // A read transaction under WAL reads the row and the chunks from one
+        // snapshot, so a claim that commits meanwhile orders after this page
+        // and stops the next one, as `FOR SHARE` does on PostgreSQL.
+        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        let admitted = transaction
+            .query_row(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts WHERE receipt_id = ?1"
+                ),
+                rusqlite::params![receipt_id],
+                sqlite_artifact,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .is_some_and(|artifact| artifact.admits(fence, now_ms));
+        if !admitted {
+            return Ok(Vec::new());
+        }
+        let mut statement = transaction
             .prepare(
-                "SELECT c.seq, c.data FROM sekai_export_artifact_chunks c
-                 WHERE c.receipt_id = ?1 AND c.seq > ?2
-                   AND EXISTS (
-                     SELECT 1 FROM sekai_export_artifacts a
-                     WHERE a.receipt_id = c.receipt_id
-                       AND a.acked_at_ms IS NULL
-                       AND a.expires_at_ms >= ?3
-                   )
-                 ORDER BY c.seq LIMIT ?4",
+                "SELECT seq, data FROM sekai_export_artifact_chunks
+                 WHERE receipt_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(
-                rusqlite::params![receipt_id, after_seq, now_ms, limit],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_map(rusqlite::params![receipt_id, after_seq, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .map_err(|error| error.to_string())?;
         rows.map(|row| row.map_err(|error| error.to_string()))
             .collect()
@@ -605,60 +674,83 @@ impl PostgresDb {
         Ok(self
             .connection()?
             .query(
-                "SELECT receipt_id, namespace, definition_id, created_at_ms, expires_at_ms
-                 FROM sekai_export_artifacts
-                 WHERE namespace = $1 AND acked_at_ms IS NULL AND expires_at_ms >= $2
-                 ORDER BY created_at_ms",
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
+                     WHERE namespace = $1 AND acked_at_ms IS NULL AND expires_at_ms >= $2
+                     ORDER BY created_at_ms"
+                ),
                 &[&namespace, &now_ms],
             )
             .map_err(|error| error.to_string())?
             .iter()
-            .map(|row| ArtifactMeta {
-                receipt_id: row.get(0),
-                namespace: row.get(1),
-                definition_id: row.get(2),
-                created_at_ms: row.get(3),
-                expires_at_ms: row.get(4),
-            })
+            .map(pg_artifact)
             .collect())
     }
 
-    pub fn acknowledge_export_artifact(
+    pub fn export_artifact(&self, receipt_id: &str) -> Result<Option<ArtifactMeta>, String> {
+        Ok(self
+            .connection()?
+            .query_opt(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts WHERE receipt_id = $1"
+                ),
+                &[&receipt_id],
+            )
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .map(pg_artifact))
+    }
+
+    /// Loads, edits and persists one artifact row under a row lock. A newly
+    /// acknowledged artifact loses its bytes in the same commit.
+    pub fn edit_export_artifact(
         &self,
         receipt_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
-        let mut connection = self.connection()?;
-        let mut transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let updated = transaction
-            .execute(
-                "UPDATE sekai_export_artifacts SET acked_at_ms = $2
-                 WHERE receipt_id = $1 AND acked_at_ms IS NULL AND expires_at_ms >= $2",
-                &[&receipt_id, &now_ms],
+        change: impl FnOnce(&mut ArtifactMeta) -> Result<(), DeliveryError>,
+    ) -> Result<ArtifactMeta, DeliveryError> {
+        let mut connection = self.connection().map_err(DeliveryError::Store)?;
+        let mut transaction = connection.transaction().map_err(store_error)?;
+        let mut artifact = transaction
+            .query_opt(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
+                     WHERE receipt_id = $1 FOR UPDATE"
+                ),
+                &[&receipt_id],
             )
-            .map_err(|error| error.to_string())?;
-        if updated == 1 {
+            .map_err(store_error)?
+            .as_ref()
+            .map(pg_artifact)
+            .ok_or(DeliveryError::Unavailable)?;
+        let was_acked = artifact.acked_at_ms.is_some();
+        change(&mut artifact)?;
+        transaction
+            .execute(
+                "UPDATE sekai_export_artifacts SET acked_at_ms = $2, claim_owner = $3,
+                     claim_generation = $4, fencing_token = $5, claim_expires_at_ms = $6,
+                     lease_expiries = $7
+                 WHERE receipt_id = $1",
+                &[
+                    &receipt_id,
+                    &artifact.acked_at_ms,
+                    &artifact.claim.owner,
+                    &artifact.claim.generation,
+                    &artifact.claim.fencing_token,
+                    &artifact.claim.expires_at_ms,
+                    &artifact.claim.lease_expiries,
+                ],
+            )
+            .map_err(store_error)?;
+        if !was_acked && artifact.acked_at_ms.is_some() {
             transaction
                 .execute(
                     "DELETE FROM sekai_export_artifact_chunks WHERE receipt_id = $1",
                     &[&receipt_id],
                 )
-                .map_err(|error| error.to_string())?;
-            transaction.commit().map_err(|error| error.to_string())?;
-            return Ok(true);
+                .map_err(store_error)?;
         }
-        let already = transaction
-            .query_opt(
-                "SELECT 1 FROM sekai_export_artifacts
-                 WHERE receipt_id = $1 AND acked_at_ms IS NOT NULL",
-                &[&receipt_id],
-            )
-            .map_err(|error| error.to_string())?
-            .is_some();
-        transaction.commit().map_err(|error| error.to_string())?;
-        Ok(already)
+        transaction.commit().map_err(store_error)?;
+        Ok(artifact)
     }
 
     pub fn claim_due_export_schedules(
@@ -720,47 +812,46 @@ impl PostgresDb {
         Ok(due)
     }
 
-    pub fn export_artifact_is_deliverable(
-        &self,
-        receipt_id: &str,
-        now_ms: i64,
-    ) -> Result<bool, String> {
-        Ok(self
-            .connection()?
-            .query_opt(
-                "SELECT 1 FROM sekai_export_artifacts
-                 WHERE receipt_id = $1 AND expires_at_ms >= $2 AND acked_at_ms IS NULL",
-                &[&receipt_id, &now_ms],
-            )
-            .map_err(|error| error.to_string())?
-            .is_some())
-    }
-
+    /// The chunks after `after_seq`, read in the same transaction as the
+    /// check that `fence` (or, without one, any caller) may still read them.
+    /// The shared row lock keeps a claim from landing between the two.
     pub fn export_artifact_chunks_after(
         &self,
         receipt_id: &str,
         after_seq: i64,
         limit: i64,
+        fence: Option<Fence<'_>>,
         now_ms: i64,
     ) -> Result<Vec<(i64, Vec<u8>)>, String> {
-        Ok(self
-            .connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let admitted = transaction
+            .query_opt(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
+                     WHERE receipt_id = $1 FOR SHARE"
+                ),
+                &[&receipt_id],
+            )
+            .map_err(|error| error.to_string())?
+            .is_some_and(|row| pg_artifact(&row).admits(fence, now_ms));
+        if !admitted {
+            return Ok(Vec::new());
+        }
+        let chunks = transaction
             .query(
-                "SELECT c.seq, c.data FROM sekai_export_artifact_chunks c
-                 WHERE c.receipt_id = $1 AND c.seq > $2
-                   AND EXISTS (
-                     SELECT 1 FROM sekai_export_artifacts a
-                     WHERE a.receipt_id = c.receipt_id
-                       AND a.acked_at_ms IS NULL
-                       AND a.expires_at_ms >= $3
-                   )
-                 ORDER BY c.seq LIMIT $4",
-                &[&receipt_id, &after_seq, &now_ms, &limit],
+                "SELECT seq, data FROM sekai_export_artifact_chunks
+                 WHERE receipt_id = $1 AND seq > $2 ORDER BY seq LIMIT $3",
+                &[&receipt_id, &after_seq, &limit],
             )
             .map_err(|error| error.to_string())?
             .iter()
             .map(|row| (row.get(0), row.get(1)))
-            .collect())
+            .collect();
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(chunks)
     }
 }
 
@@ -847,12 +938,31 @@ impl RuntimeDb {
         dispatch!(self, db => db.list_unacked_export_artifacts(namespace, now_ms))
     }
 
+    /// One artifact row, whatever its state.
+    pub fn export_artifact(&self, receipt_id: &str) -> Result<Option<ArtifactMeta>, String> {
+        dispatch!(self, db => db.export_artifact(receipt_id))
+    }
+
+    /// Edits one artifact row under a write lock; see
+    /// [`crate::sekai::export_delivery`] for the edits.
+    pub fn edit_export_artifact(
+        &self,
+        receipt_id: &str,
+        change: impl FnOnce(&mut ArtifactMeta) -> Result<(), DeliveryError>,
+    ) -> Result<ArtifactMeta, DeliveryError> {
+        dispatch!(self, db => db.edit_export_artifact(receipt_id, change))
+    }
+
+    /// Records delivery under `fence`, or unfenced while no live claim holds
+    /// the artifact: drops the bytes and keeps the ack, so a retry succeeds.
     pub fn acknowledge_export_artifact(
         &self,
         receipt_id: &str,
+        fence: Option<Fence<'_>>,
         now_ms: i64,
-    ) -> Result<bool, String> {
-        dispatch!(self, db => db.acknowledge_export_artifact(receipt_id, now_ms))
+    ) -> Result<(), DeliveryError> {
+        self.edit_export_artifact(receipt_id, |artifact| artifact.acknowledge(fence, now_ms))
+            .map(|_| ())
     }
 
     pub fn claim_due_export_schedules(
@@ -862,12 +972,16 @@ impl RuntimeDb {
         dispatch!(self, db => db.claim_due_export_schedules(now_ms))
     }
 
+    /// Whether `fence`, or without one any caller, may read the artifact now.
     pub fn export_artifact_is_deliverable(
         &self,
         receipt_id: &str,
+        fence: Option<Fence<'_>>,
         now_ms: i64,
     ) -> Result<bool, String> {
-        dispatch!(self, db => db.export_artifact_is_deliverable(receipt_id, now_ms))
+        Ok(self
+            .export_artifact(receipt_id)?
+            .is_some_and(|artifact| artifact.admits(fence, now_ms)))
     }
 
     pub fn export_artifact_chunks_after(
@@ -875,8 +989,9 @@ impl RuntimeDb {
         receipt_id: &str,
         after_seq: i64,
         limit: i64,
+        fence: Option<Fence<'_>>,
         now_ms: i64,
     ) -> Result<Vec<(i64, Vec<u8>)>, String> {
-        dispatch!(self, db => db.export_artifact_chunks_after(receipt_id, after_seq, limit, now_ms))
+        dispatch!(self, db => db.export_artifact_chunks_after(receipt_id, after_seq, limit, fence, now_ms))
     }
 }

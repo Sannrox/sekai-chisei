@@ -1305,7 +1305,11 @@ async fn a_runtime_token_reaches_only_its_own_kind_on_the_work_family() {
     let plane = plane();
     let claimed = claim(&plane, "a").await;
     let effect = claimed.effect.unwrap();
-    for kind in [WorkKind::AgentTurn, WorkKind::Transform] {
+    for kind in [
+        WorkKind::AgentTurn,
+        WorkKind::Transform,
+        WorkKind::ExportDelivery,
+    ] {
         let status = plane
             .service
             .heartbeat_work_claim(with_token(

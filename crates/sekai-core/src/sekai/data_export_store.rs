@@ -44,7 +44,12 @@ CREATE TABLE IF NOT EXISTS sekai_export_artifacts (
     definition_id TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
     expires_at_ms INTEGER NOT NULL,
-    acked_at_ms INTEGER
+    acked_at_ms INTEGER,
+    claim_owner TEXT,
+    claim_generation INTEGER,
+    fencing_token TEXT,
+    claim_expires_at_ms INTEGER,
+    lease_expiries INTEGER
 );
 CREATE TABLE IF NOT EXISTS sekai_export_artifact_chunks (
     receipt_id TEXT NOT NULL,
@@ -89,10 +94,21 @@ impl SekaiDb {
         let conn = self.conn();
         conn.execute_batch(CREATE_SQLITE)
             .map_err(|error| error.to_string())?;
-        let _ = conn.execute(
-            "ALTER TABLE sekai_export_artifacts ADD COLUMN acked_at_ms INTEGER",
-            [],
-        );
+        // Added to tables created before each column; an existing column
+        // refuses the ALTER, which is the no-op.
+        for column in [
+            "acked_at_ms INTEGER",
+            "claim_owner TEXT",
+            "claim_generation INTEGER",
+            "fencing_token TEXT",
+            "claim_expires_at_ms INTEGER",
+            "lease_expiries INTEGER",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE sekai_export_artifacts ADD COLUMN {column}"),
+                [],
+            );
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_sekai_export_artifacts_deliverable
              ON sekai_export_artifacts (namespace, acked_at_ms, expires_at_ms)",

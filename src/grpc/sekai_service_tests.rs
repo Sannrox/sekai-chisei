@@ -34737,6 +34737,7 @@ async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_ack
         .fetch_export_artifact(with_named_principal(
             FetchExportArtifactRequest {
                 receipt_id: receipt_id.clone(),
+                claim: None,
             },
             "tester",
         ))
@@ -34754,6 +34755,7 @@ async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_ack
             AcknowledgeExportDeliveryRequest {
                 receipt_id: receipt_id.clone(),
                 content_digest: "sha256:deadbeef".into(),
+                claim: None,
             },
             "tester",
         ))
@@ -34767,6 +34769,7 @@ async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_ack
             AcknowledgeExportDeliveryRequest {
                 receipt_id: receipt_id.clone(),
                 content_digest: digest.clone(),
+                claim: None,
             },
             "tester",
         ))
@@ -34780,6 +34783,7 @@ async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_ack
             AcknowledgeExportDeliveryRequest {
                 receipt_id: receipt_id.clone(),
                 content_digest: digest,
+                claim: None,
             },
             "tester",
         ))
@@ -34792,6 +34796,7 @@ async fn a_scheduled_export_runs_once_per_bucket_and_an_adapter_fetches_then_ack
         svc.fetch_export_artifact(with_named_principal(
             FetchExportArtifactRequest {
                 receipt_id: receipt_id.clone(),
+                claim: None,
             },
             "tester",
         ))
@@ -34957,6 +34962,7 @@ async fn a_reused_export_definition_id_does_not_deliver_another_owners_artifact(
         svc.fetch_export_artifact(with_named_principal(
             FetchExportArtifactRequest {
                 receipt_id: ran.receipt_id,
+                claim: None,
             },
             "bob",
         ))
@@ -36811,5 +36817,355 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
             .unwrap()
             .is_some(),
         "the receipt stays"
+    );
+}
+
+// Saved-export delivery as the export_delivery work kind (ADR 0148, 0149):
+// a claim taken through ClaimWork binds the deprecated fetch and acknowledge
+// to its fence, and a delivery through the deprecated path closes the work.
+
+/// One completed scheduled artifact in `exp`, initiated by `tester`.
+async fn scheduled_export_artifact(svc: &SekaiServiceImpl) -> DeliverableExportArtifact {
+    let digest = export_fixture(svc, 2, "row").await;
+    svc.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                every_ms: 1_000,
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    svc.tick_governed_transforms(with_named_principal(
+        TickGovernedTransformsRequest { now_ms: 1_500 },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut listed = svc
+        .list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts;
+    assert_eq!(listed.len(), 1);
+    listed.remove(0)
+}
+
+fn claim_delivery(work_id: &str) -> ClaimWorkRequest {
+    ClaimWorkRequest {
+        kind: WorkKind::ExportDelivery.into(),
+        namespace: "exp".into(),
+        runtime_id: "adapter-a".into(),
+        work_id: work_id.into(),
+        ttl_ms: 60_000,
+        ..Default::default()
+    }
+}
+
+fn delivery_fence_of(work: &ExportDeliveryWork) -> ExportDeliveryFence {
+    ExportDeliveryFence {
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+    }
+}
+
+async fn claim_export_work(svc: &SekaiServiceImpl, work_id: &str) -> ExportDeliveryWork {
+    let Some(claim_work_response::Payload::ExportDelivery(work)) = svc
+        .claim_work(with_named_principal(claim_delivery(work_id), "tester"))
+        .await
+        .unwrap()
+        .into_inner()
+        .payload
+    else {
+        panic!("an export-delivery claim");
+    };
+    work
+}
+
+async fn fetch_delivery(
+    svc: &SekaiServiceImpl,
+    receipt_id: &str,
+    claim: Option<ExportDeliveryFence>,
+) -> Result<Vec<u8>, tonic::Status> {
+    use futures_util::StreamExt;
+    let mut stream = svc
+        .fetch_export_artifact(with_named_principal(
+            FetchExportArtifactRequest {
+                receipt_id: receipt_id.into(),
+                claim,
+            },
+            "tester",
+        ))
+        .await?
+        .into_inner();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        bytes.extend(chunk?.data);
+    }
+    Ok(bytes)
+}
+
+fn ack_delivery(work: &ExportDeliveryWork, digest: &str) -> AckWorkRequest {
+    AckWorkRequest {
+        kind: WorkKind::ExportDelivery.into(),
+        work_id: work.artifact.as_ref().unwrap().receipt_id.clone(),
+        runtime_id: work.claim_owner.clone(),
+        claim_generation: work.claim_generation,
+        fencing_token: work.fencing_token.clone(),
+        outcome: "completed".into(),
+        options: Some(ack_work_request::Options::ExportDelivery(
+            ExportDeliveryAckOptions {
+                content_digest: digest.into(),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn an_export_delivery_claimed_as_work_is_fetched_and_acked_only_by_its_holder() {
+    let svc = service();
+    let artifact = scheduled_export_artifact(&svc).await;
+    let receipt_id = artifact.receipt_id.clone();
+
+    let listed = svc
+        .list_claimable_work(with_named_principal(
+            ListClaimableWorkRequest {
+                kind: WorkKind::ExportDelivery.into(),
+                namespace: "exp".into(),
+                ..Default::default()
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        svc.claim_work(with_named_principal(claim_delivery(""), "bob"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound,
+        "neither the initiating actor nor an admin"
+    );
+    assert_eq!(
+        svc.claim_work(with_named_principal(claim_delivery(&receipt_id), "bob"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    let work = claim_export_work(&svc, "").await;
+    assert_eq!(work.artifact.as_ref().unwrap().receipt_id, receipt_id);
+    let fence = delivery_fence_of(&work);
+
+    // The claim hides the artifact from every caller without its fence.
+    assert!(
+        svc.list_deliverable_export_artifacts(with_named_principal(
+            ListDeliverableExportArtifactsRequest {
+                namespace: "exp".into(),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .artifacts
+        .is_empty()
+    );
+    assert_eq!(
+        fetch_delivery(&svc, &receipt_id, None)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: artifact.content_digest.clone(),
+                claim: None,
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        svc.claim_work(with_named_principal(claim_delivery(&receipt_id), "tester"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    let Some(heartbeat_work_claim_response::Payload::ExportDelivery(renewed)) = svc
+        .heartbeat_work_claim(with_named_principal(
+            HeartbeatWorkClaimRequest {
+                kind: WorkKind::ExportDelivery.into(),
+                work_id: receipt_id.clone(),
+                runtime_id: fence.runtime_id.clone(),
+                claim_generation: fence.claim_generation,
+                fencing_token: fence.fencing_token.clone(),
+                ttl_ms: 60_000,
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .payload
+    else {
+        panic!("an export-delivery heartbeat");
+    };
+    assert_eq!(renewed.claim_generation, work.claim_generation);
+    assert!(renewed.claim_expires_at_ms >= work.claim_expires_at_ms);
+
+    // The holder fetches through the old RPC with its fence.
+    let bytes = fetch_delivery(&svc, &receipt_id, Some(fence.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("sha256:{:x}", sha2::Sha256::digest(&bytes)),
+        artifact.content_digest
+    );
+    let stale = ExportDeliveryFence {
+        fencing_token: "stale".into(),
+        ..fence.clone()
+    };
+    assert_eq!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: artifact.content_digest.clone(),
+                claim: Some(stale),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        svc.ack_work(with_named_principal(
+            ack_delivery(&work, "sha256:deadbeef"),
+            "tester"
+        ))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::InvalidArgument
+    );
+    let Some(ack_work_response::Payload::ExportDelivery(acked)) = svc
+        .ack_work(with_named_principal(
+            ack_delivery(&work, &artifact.content_digest),
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .payload
+    else {
+        panic!("an export-delivery acknowledge");
+    };
+    assert!(acked.acknowledged);
+    // The holder's replay through the old RPC is the same acknowledge.
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: artifact.content_digest.clone(),
+                claim: Some(fence),
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert_eq!(
+        svc.claim_work(with_named_principal(claim_delivery(""), "tester"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+}
+
+#[tokio::test]
+async fn an_export_delivered_through_the_old_rpcs_leaves_no_work() {
+    let svc = service();
+    let artifact = scheduled_export_artifact(&svc).await;
+    let receipt_id = artifact.receipt_id.clone();
+    let bytes = fetch_delivery(&svc, &receipt_id, None).await.unwrap();
+    assert!(!bytes.is_empty());
+    assert!(
+        svc.acknowledge_export_delivery(with_named_principal(
+            AcknowledgeExportDeliveryRequest {
+                receipt_id: receipt_id.clone(),
+                content_digest: artifact.content_digest.clone(),
+                claim: None,
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .acknowledged
+    );
+    assert!(
+        svc.list_claimable_work(with_named_principal(
+            ListClaimableWorkRequest {
+                kind: WorkKind::ExportDelivery.into(),
+                namespace: "exp".into(),
+                ..Default::default()
+            },
+            "tester",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .is_empty()
+    );
+    assert_eq!(
+        svc.claim_work(with_named_principal(claim_delivery(&receipt_id), "tester"))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
     );
 }

@@ -1,5 +1,5 @@
-//! Versioned runtime-claim client for Action, isolated-process transform and
-//! agent-turn work.
+//! Versioned runtime-claim client for Action, isolated-process transform,
+//! agent-turn and export-delivery work.
 //!
 //! Lives in `sekai-client` so Shikigami and kako pin one crate with
 //! `sekai-proto`. The plane remains authoritative; this module maps wire
@@ -10,7 +10,8 @@
 //! (`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim`, `AckWork`);
 //! the per-kind methods narrow its `oneof` payloads. On a plane that does
 //! not serve that family, each call falls back to the per-kind RPC, so
-//! planes and workers upgrade in either order.
+//! planes and workers upgrade in either order. Export delivery has no
+//! per-kind claim RPCs, so it needs a plane that serves the family.
 //!
 //! `SdkError` does not retain arbitrary server status text. Allowlisted
 //! `delegator_*` tokens are kept as `reason_code` so claim and owned-claim
@@ -532,7 +533,9 @@ impl<'a> RuntimeClaimClient<'a> {
             Ok(ListClaimableWorkResponse { work }) => {
                 Ok(work.into_iter().filter_map(|work| work.payload).collect())
             }
-            Err(error) if unserved(&error) => self.list_per_kind(request).await,
+            Err(error) if unserved(&error) && has_per_kind_rpcs(kind) => {
+                self.list_per_kind(request).await
+            }
             Err(error) => Err(error),
         }
         .map_err(RuntimeClaimError::from_list)
@@ -565,7 +568,9 @@ impl<'a> RuntimeClaimClient<'a> {
         };
         let claimed = match self.call(CLAIM_WORK, request.clone(), false).await {
             Ok(ClaimWorkResponse { payload }) => payload.ok_or_else(missing_payload),
-            Err(error) if unserved(&error) => self.claim_per_kind(request.clone()).await,
+            Err(error) if unserved(&error) && has_per_kind_rpcs(kind) => {
+                self.claim_per_kind(request.clone()).await
+            }
             Err(error) => Err(error),
         };
         match claimed {
@@ -590,7 +595,9 @@ impl<'a> RuntimeClaimClient<'a> {
         };
         match self.call(HEARTBEAT_WORK, request.clone(), false).await {
             Ok(HeartbeatWorkClaimResponse { payload }) => payload.ok_or_else(missing_payload),
-            Err(error) if unserved(&error) => self.heartbeat_per_kind(request).await,
+            Err(error) if unserved(&error) && has_per_kind_rpcs(fence.kind) => {
+                self.heartbeat_per_kind(request).await
+            }
             Err(error) => Err(error),
         }
         .map_err(|error| RuntimeClaimError::from_sdk(error, true))
@@ -598,7 +605,8 @@ impl<'a> RuntimeClaimClient<'a> {
 
     /// Ends the held claim `fence` with `outcome` (`completed`, `failed` or
     /// `parked`). Transform work is acknowledged by its write-back instead.
-    /// Agent-turn acknowledges replay their receipt, so only they retry.
+    /// Agent-turn and export-delivery acknowledges replay, so only they
+    /// retry.
     pub async fn ack_work(
         &self,
         fence: &WorkFence,
@@ -616,10 +624,12 @@ impl<'a> RuntimeClaimClient<'a> {
             reason,
             options,
         };
-        let retryable = fence.kind == WorkKind::AgentTurn;
+        let retryable = matches!(fence.kind, WorkKind::AgentTurn | WorkKind::ExportDelivery);
         match self.call(ACK_WORK, request.clone(), retryable).await {
             Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
-            Err(error) if unserved(&error) => self.ack_per_kind(request).await,
+            Err(error) if unserved(&error) && has_per_kind_rpcs(fence.kind) => {
+                self.ack_per_kind(request).await
+            }
             Err(error) => Err(error),
         }
         .map_err(|error| RuntimeClaimError::from_sdk(error, true))
@@ -691,7 +701,9 @@ impl<'a> RuntimeClaimClient<'a> {
                     .await?;
                 listed.turns.into_iter().map(Payload::AgentTurn).collect()
             }
-            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+                return Err(SdkError::invalid_argument());
+            }
         })
     }
 
@@ -755,7 +767,9 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+                return Err(SdkError::invalid_argument());
+            }
         })
     }
 
@@ -816,7 +830,9 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified => return Err(SdkError::invalid_argument()),
+            WorkKind::Unspecified | WorkKind::ExportDelivery => {
+                return Err(SdkError::invalid_argument());
+            }
         })
     }
 
@@ -1304,6 +1320,15 @@ impl<'a> RuntimeClaimClient<'a> {
 /// first with `PermissionDenied`: runtime tokens on heartbeat and acknowledge,
 /// enterprise-scoped credentials on every call. The per-kind RPC runs its own
 /// auth, so a real denial still comes back denied, one call later.
+/// Whether `kind` predates the work family and has its own claim RPCs to
+/// fall back to. Export delivery is claimable only through the family.
+fn has_per_kind_rpcs(kind: WorkKind) -> bool {
+    matches!(
+        kind,
+        WorkKind::Action | WorkKind::Transform | WorkKind::AgentTurn
+    )
+}
+
 fn unserved(error: &SdkError) -> bool {
     matches!(
         error.code,
