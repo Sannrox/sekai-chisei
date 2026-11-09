@@ -3255,6 +3255,21 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListPendingDecisions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_instance.rs",
+        "crates/sekai-core/src/sekai/action_plan_store.rs",
+        "crates/sekai-core/src/db/definition_branch.rs",
+        "crates/sekai-core/src/db/dataset_branch.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetActionEffect",
       "kind": "persistent",
       "surfaces": [

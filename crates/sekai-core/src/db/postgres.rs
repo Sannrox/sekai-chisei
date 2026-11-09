@@ -213,6 +213,8 @@ const CATALOG_CRITICALITY_OUTBOX_CREATED_INDEX_SCHEMA: &str =
 const EXPORT_DELIVERY_CLAIM_SCHEMA: &str = include_str!("postgres/0148_export_delivery_claim.sql");
 const ONTOLOGY_HEALTH_SCHEDULES_SCHEMA: &str =
     include_str!("postgres/0149_ontology_health_schedules.sql");
+const PENDING_DECISION_INDEXES_SCHEMA: &str =
+    include_str!("postgres/0150_pending_decision_indexes.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1076,6 +1078,12 @@ const MIGRATIONS: &[Migration] = &[
         148,
         "ontology_health_schedules",
         ONTOLOGY_HEALTH_SCHEDULES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        149,
+        "pending_decision_indexes",
+        PENDING_DECISION_INDEXES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

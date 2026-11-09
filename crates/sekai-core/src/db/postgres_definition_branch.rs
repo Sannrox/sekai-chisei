@@ -315,6 +315,26 @@ impl PostgresDb {
         load_proposal_postgres(&mut *self.connection()?, namespace, proposal_id)
     }
 
+    /// Open proposals of `namespace`, newest first (#2203).
+    pub fn list_open_definition_proposals(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DefinitionProposal>, String> {
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_definition_proposals
+                 WHERE namespace = $1 AND status = $2
+                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT $3 OFFSET $4",
+                &[&namespace, &STATUS_OPEN, &(limit as i64), &(offset as i64)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| crate::db::definition_branch::decode_proposal(row.get(0)))
+            .collect()
+    }
+
     pub fn propose_definition_import(
         &self,
         request: &ProposeDefinitionImport,
@@ -1350,13 +1370,7 @@ fn load_proposal_postgres(
             &[&namespace, &proposal_id],
         )
         .map_err(|error| error.to_string())?
-        .map(|row| {
-            let body: String = row.get(0);
-            let proposal: DefinitionProposal = serde_json::from_str(&body)
-                .map_err(|error| format!("corrupt definition proposal: {error}"))?;
-            proposal.verify()?;
-            Ok(proposal)
-        })
+        .map(|row| crate::db::definition_branch::decode_proposal(row.get(0)))
         .transpose()
 }
 

@@ -818,47 +818,29 @@ pub(super) async fn list_action_instances(
 }
 
 /// The parked instances the caller may decide (#1771), by the checks
-/// `DecideActionInstance` applies: a credentialed decider, space approval
-/// and the namespace tenant for the request, then per instance marking
-/// clearance and `may_decide`. A caller who could decide nothing gets an
-/// empty list, so an instance's existence is never revealed.
+/// `DecideActionInstance` applies (see [`namespace_decider`] and
+/// [`visit_decidable_action_instances`]). A caller who could decide nothing
+/// gets an empty list, so an instance's existence is never revealed.
 fn list_decidable_action_instances(
     service: &SekaiServiceImpl,
     req: Request<ListActionInstancesRequest>,
 ) -> Result<Response<ListActionInstancesResponse>, Status> {
-    let none = || Ok(Response::new(ListActionInstancesResponse::default()));
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     if req.get_ref().namespace.trim().is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
-    if tenant_context
-        .as_ref()
-        .is_some_and(|context| context.authorize_space_approval().is_err())
-    {
-        return none();
-    }
-    let Some(decider) = credentialed_decider(&req, &principals) else {
-        return none();
+    let Some(decider) = namespace_decider(
+        service,
+        &req,
+        &principals,
+        tenant_context.as_ref(),
+        &req.get_ref().namespace,
+    ) else {
+        return Ok(Response::new(ListActionInstancesResponse::default()));
     };
     let inner = req.into_inner();
-    if enforce_namespace_tenant_context(
-        service.db.runtime(),
-        tenant_context.as_ref(),
-        &inner.namespace,
-        false,
-    )
-    .is_err()
-    {
-        return none();
-    }
-    let runtime = service.db.runtime();
-    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(runtime, None)
-        .escalate_due(&inner.namespace, now_millis());
-    let deciders = vec![decider.clone()];
-    let decider_is_namespace_admin =
-        authorize_source_type_namespace_admin(service, &deciders, &inner.namespace).is_ok();
     let type_id = Some(inner.type_id.as_str()).filter(|type_id| !type_id.trim().is_empty());
     let limit = (if inner.limit == 0 {
         100
@@ -866,13 +848,58 @@ fn list_decidable_action_instances(
         inner.limit as usize
     })
     .clamp(1, 500);
+    let mut instances = Vec::new();
+    visit_decidable_action_instances(service, &decider, &inner.namespace, type_id, |instance| {
+        instances.push(to_proto_action_instance(instance));
+        instances.len() < limit
+    })?;
+    Ok(Response::new(ListActionInstancesResponse { instances }))
+}
+
+/// The one subject that may decide in `namespace` under the request gates
+/// `DecideActionInstance` and `DecidePlanReview` apply: a space approval
+/// role, a credentialed decider, and the namespace's tenant. `None` when
+/// the caller may decide nothing there. Used by the decision listings
+/// (#1771, #2203), which answer such a caller with an empty list.
+pub(super) fn namespace_decider<T>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+) -> Option<String> {
+    if tenant_context.is_some_and(|context| context.authorize_space_approval().is_err()) {
+        return None;
+    }
+    let decider = credentialed_decider(req, principals)?;
+    enforce_namespace_tenant_context(service.db.runtime(), tenant_context, namespace, false)
+        .ok()?;
+    Some(decider)
+}
+
+/// Visits, newest first, the parked instances of `namespace` (of `type_id`
+/// when given) that `decider`, past [`namespace_decider`], may decide: the
+/// per-instance checks of `DecideActionInstance`, marking clearance and
+/// `may_decide`. Stops when `visit` returns false.
+pub(super) fn visit_decidable_action_instances(
+    service: &SekaiServiceImpl,
+    decider: &str,
+    namespace: &str,
+    type_id: Option<&str>,
+    mut visit: impl FnMut(&crate::sekai::action_instance::ActionInstance) -> bool,
+) -> Result<(), Status> {
+    let runtime = service.db.runtime();
+    let _ = crate::sekai::action_instance_admission::ActionInstanceAdmission::new(runtime, None)
+        .escalate_due(namespace, now_millis());
+    let deciders = vec![decider.to_string()];
+    let decider_is_namespace_admin =
+        authorize_source_type_namespace_admin(service, &deciders, namespace).is_ok();
     let mut types = HashMap::new();
     let mut offset = 0;
-    let mut instances = Vec::new();
     loop {
         let stored = runtime
             .list_action_instances_page(
-                &inner.namespace,
+                namespace,
                 type_id,
                 Some(crate::sekai::action_instance::STATUS_PARKED),
                 100,
@@ -897,22 +924,19 @@ fn list_decidable_action_instances(
                     type_def,
                     &instance.principal,
                     &instance.review,
-                    &decider,
+                    decider,
                     &deciders,
                     decider_is_namespace_admin,
                 )
+                && !visit(instance)
             {
-                instances.push(to_proto_action_instance(instance));
-                if instances.len() == limit {
-                    break;
-                }
+                return Ok(());
             }
         }
-        if exhausted || instances.len() == limit {
-            break;
+        if exhausted {
+            return Ok(());
         }
     }
-    Ok(Response::new(ListActionInstancesResponse { instances }))
 }
 
 /// Whether `principals` are cleared for `instance`'s marking; unmarked
@@ -2134,21 +2158,14 @@ pub(super) async fn decide_plan_review(
     )
     .map_err(|_| access_denied())?;
     let now = now_millis();
-    let decider_check = plan_step_decider(
+    let may_decide = plan_review_step_decider(
         service,
         &decider,
         &deciders,
         tenant_context.as_ref(),
         &policy_context,
-        true,
         now,
     );
-    // At decision time a check that cannot complete refuses; the decider
-    // retries.
-    let may_decide = |plan: &crate::sekai::action_plan::ProposedPlan,
-                      step: &crate::sekai::action_plan::PlanStep| {
-        decider_check(plan, step).unwrap_or(false)
-    };
     let (review, replay) = crate::sekai::plan_review::decide_review(
         service.db.runtime(),
         &inner.namespace,
@@ -2171,6 +2188,31 @@ pub(super) async fn decide_plan_review(
         review: Some(plan_review_to_proto(review, |_| false)),
         replay,
     }))
+}
+
+/// Whether `decider`, deciding a plan review with their own request, may
+/// decide a step: [`plan_step_decider`], where a check that cannot complete
+/// refuses and the decider retries. `DecidePlanReview` and the
+/// pending-decision listing (#2203) apply it.
+pub(super) fn plan_review_step_decider<'a>(
+    service: &'a SekaiServiceImpl,
+    decider: &'a str,
+    deciders: &'a [String],
+    tenant_context: Option<&'a RequestEnterpriseContext>,
+    policy_context: &'a crate::sekai::object_security::PrincipalPolicyContext,
+    now: i64,
+) -> impl Fn(&crate::sekai::action_plan::ProposedPlan, &crate::sekai::action_plan::PlanStep) -> bool + 'a
+{
+    let check = plan_step_decider(
+        service,
+        decider,
+        deciders,
+        tenant_context,
+        policy_context,
+        true,
+        now,
+    );
+    move |plan, step| check(plan, step).unwrap_or(false)
 }
 
 /// Refused (`Ok(false)`) or not determinable (`Err`, a dependency failed):

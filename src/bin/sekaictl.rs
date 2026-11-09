@@ -228,6 +228,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "memory" => {
             sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
         }
+        "inbox" => {
+            sekai_chisei::launch::load_local_env();
+            sekai_chisei::inbox_cli::run_inbox_command(args.into_iter().skip(1).collect()).await
+        }
         "models" => {
             let config =
                 sekai_chisei::models_cli::ModelsListConfig::from_args(args.into_iter().skip(1))
@@ -676,7 +680,7 @@ async fn run_gateway_command(
 
 fn print_root_usage() {
     println!(
-        "Usage: sekaictl [--version] <ontology|launch|doctor|smoke|models|estimate|receipt|report|admin> ...\n"
+        "Usage: sekaictl [--version] <ontology|launch|doctor|smoke|models|estimate|receipt|report|inbox|admin> ...\n"
     );
     println!("Product loop (ontology-first):");
     println!("  {}", sekai_chisei::ontology_product_cli::usage());
@@ -694,6 +698,10 @@ fn print_root_usage() {
     println!(
         "\nOperation report:\n  {}",
         sekai_chisei::report_cli::usage()
+    );
+    println!(
+        "\nDecisions waiting on you:\n  {}",
+        sekai_chisei::inbox_cli::usage()
     );
     println!("\nModel commands:\n  {}", sekai_chisei::models_cli::USAGE);
     println!("\nExpert administration:\n  sekaictl admin --help");
@@ -810,6 +818,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "action" => Some(sekai_chisei::action_cli::usage().to_string()),
         "budget" => Some(sekai_chisei::budget_cli::usage().to_string()),
         "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
+        "inbox" => Some(sekai_chisei::inbox_cli::usage().to_string()),
         "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
         "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
         "evaluation-plan" => Some(sekai_chisei::evaluation_plan_cli::usage().to_string()),

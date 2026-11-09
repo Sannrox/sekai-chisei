@@ -828,18 +828,7 @@ pub(super) async fn approve_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
-    let actor = principals
-        .first()
-        .ok_or_else(|| Status::unauthenticated("principal required"))?;
-    refuse_proposal_creator(&proposal, actor, "approve")?;
-    authorize_proposal_revision_reads(service, &principals, &proposal)?;
-    authorize_proposal_member_writes(
-        service,
-        &principals,
-        &proposal.namespace,
-        &proposal.base_digest,
-        &proposal.candidate_digest,
-    )?;
+    let actor = authorize_definition_proposal_approval(service, &principals, &proposal)?;
     let result = service
         .db
         .runtime()
@@ -853,6 +842,30 @@ pub(super) async fn approve_definition_proposal(
         proposal: Some(to_proto_definition_proposal(&proposal)),
     }))
 }
+/// The checks `ApproveDefinitionProposal` applies to a loaded proposal,
+/// after the namespace write check: the actor did not create it, and may
+/// read both revisions and write the changed members. Returns the acting
+/// principal. The pending-decision listing (#2203) applies it too.
+pub(super) fn authorize_definition_proposal_approval<'a>(
+    service: &SekaiServiceImpl,
+    principals: &'a [String],
+    proposal: &definition_proposal_domain::DefinitionProposal,
+) -> Result<&'a str, Status> {
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    refuse_proposal_creator(proposal, actor, "approve")?;
+    authorize_proposal_revision_reads(service, principals, proposal)?;
+    authorize_proposal_member_writes(
+        service,
+        principals,
+        &proposal.namespace,
+        &proposal.base_digest,
+        &proposal.candidate_digest,
+    )?;
+    Ok(actor)
+}
+
 /// The checks before a proposal's revision is published (merge, or the last
 /// step of a change bundle apply): the actor did not create it, may read both
 /// revisions and write the changed members, an approval is still current, and

@@ -5277,7 +5277,7 @@ pub(super) fn branch_status(error: String) -> Status {
     }
 }
 
-fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
+pub(super) fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
     context
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.clone())
@@ -5486,17 +5486,12 @@ pub(super) async fn merge_dataset_branch(
     let dataset_id = req.get_ref().dataset_id.clone();
     let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
     let inner = req.into_inner();
-    // A bundle branch merges only through its approved definition proposal,
-    // which checks the bundle's column rules at the merge.
     if let Ok(proposal) = service
         .db
         .runtime()
         .get_dataset_branch_proposal(&dataset_id, &inner.proposal_id)
-        && proposal.branch.starts_with(BUNDLE_BRANCH_PREFIX)
     {
-        return Err(Status::failed_precondition(
-            "definition change bundle branches merge only through ApplyDefinitionChangeBundle",
-        ));
+        refuse_bundle_branch_merge(&proposal)?;
     }
     let proposal = service
         .db
@@ -5512,6 +5507,75 @@ pub(super) async fn merge_dataset_branch(
     Ok(Response::new(MergeDatasetBranchResponse {
         proposal: Some(to_proto_proposal(proposal)),
     }))
+}
+
+/// A bundle branch merges only through its approved definition proposal,
+/// which checks the bundle's column rules at the merge.
+fn refuse_bundle_branch_merge(
+    proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+) -> Result<(), Status> {
+    if proposal.branch.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::failed_precondition(
+            "definition change bundle branches merge only through ApplyDefinitionChangeBundle",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `principals` may merge the open `proposal` of a dataset bound in
+/// `namespace` through `MergeDatasetBranch`, by its checks before freshness:
+/// write access to the dataset, not a change-bundle branch, not `attached`
+/// to an open definition proposal, and [`check_mergeable`] (another
+/// principal, the same tenant). A refusal is `false`; a store failure is an
+/// error. Used by the pending-decision listing (#2203).
+///
+/// [`check_mergeable`]: crate::db::dataset_branch::check_mergeable
+pub(super) fn may_merge_dataset_proposal(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+    attached: bool,
+) -> Result<bool, Status> {
+    let Some(actor) = principals.first() else {
+        return Ok(false);
+    };
+    if attached || refuse_bundle_branch_merge(proposal).is_err() {
+        return Ok(false);
+    }
+    let request = crate::sekai::dataset_branch::MergeDatasetBranch {
+        dataset_id: proposal.dataset_id.clone(),
+        proposal_id: proposal.id.clone(),
+        actor: actor.clone(),
+        tenant: context_tenant(context),
+        reason: String::new(),
+    };
+    if crate::db::dataset_branch::check_mergeable(proposal, &request).is_err() {
+        return Ok(false);
+    }
+    let Some(dataset) = service
+        .db
+        .runtime()
+        .get_dataset(&proposal.dataset_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(false);
+    };
+    match authorize_dataset_access(service, principals, context, &dataset, true) {
+        Ok(access) => Ok(access
+            .binding
+            .is_some_and(|binding| binding.namespace == namespace)),
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::Internal | tonic::Code::Unavailable
+            ) =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Admitted like a parent run (credential admin, namespace tenant, transform

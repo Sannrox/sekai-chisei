@@ -433,6 +433,37 @@ pub(crate) fn record_discovery(
     })
 }
 
+/// The space role and credential scope `method` needs. The interceptor
+/// applies it to every call; the pending-decision listing (#2203) applies it
+/// with each kind's decide method, so it lists only what that RPC admits.
+pub(crate) fn authorize_rpc_space(
+    context: &crate::enterprise::AuthenticatedContext,
+    method: &str,
+) -> Result<(), Status> {
+    // Deciding a parked Action or a whole plan is approval, not write.
+    if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
+        context
+            .authorize_space_approval()
+            .map_err(|_| Status::permission_denied("space approval denied"))?;
+        return context
+            .authorize_credential_scope(crate::enterprise::NamespaceAction::Read)
+            .map_err(|_| Status::permission_denied("space read denied"));
+    }
+    let action = rpc_namespace_action(method);
+    if action != crate::enterprise::NamespaceAction::Discover {
+        context.authorize_space(action).map_err(|_| {
+            if action == crate::enterprise::NamespaceAction::Write {
+                Status::permission_denied("space write denied")
+            } else {
+                Status::permission_denied("space read denied")
+            }
+        })?;
+    }
+    context
+        .authorize_credential_scope(action)
+        .map_err(|_| Status::permission_denied("credential scope denied"))
+}
+
 fn finish_authenticated(
     mut req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
@@ -456,29 +487,7 @@ fn finish_authenticated(
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
-        // Deciding a parked Action or a whole plan is approval, not write.
-        if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
-            authenticated_context
-                .authorize_space_approval()
-                .map_err(|_| Status::permission_denied("space approval denied"))?;
-            authenticated_context
-                .authorize_credential_scope(crate::enterprise::NamespaceAction::Read)
-                .map_err(|_| Status::permission_denied("space read denied"))?;
-        } else {
-            let action = rpc_namespace_action(method);
-            if action != crate::enterprise::NamespaceAction::Discover {
-                authenticated_context.authorize_space(action).map_err(|_| {
-                    if action == crate::enterprise::NamespaceAction::Write {
-                        Status::permission_denied("space write denied")
-                    } else {
-                        Status::permission_denied("space read denied")
-                    }
-                })?;
-            }
-            authenticated_context
-                .authorize_credential_scope(action)
-                .map_err(|_| Status::permission_denied("credential scope denied"))?;
-        }
+        authorize_rpc_space(&authenticated_context, method)?;
     } else if authenticated_context.space.is_some() {
         return Err(Status::permission_denied(
             "space-scoped RPC identity required",
@@ -899,6 +908,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExecuteActionPlan"
             | "GetActionInstance"
             | "ListActionInstances"
+            | "ListPendingDecisions"
             | "GetActionEffect"
             | "ListActionEffects"
             | "ListClaimableActionWork"
@@ -2710,6 +2720,10 @@ mod tests {
             (SpaceRole::Editor, "SubmitPlanReview", true),
             (SpaceRole::Viewer, "ExecuteActionPlan", false),
             (SpaceRole::Editor, "ExecuteActionPlan", true),
+            // #2203: the inbox is a read; each kind applies its decide gate.
+            (SpaceRole::Discoverer, "ListPendingDecisions", false),
+            (SpaceRole::Viewer, "ListPendingDecisions", true),
+            (SpaceRole::Approver, "ListPendingDecisions", true),
             (SpaceRole::Approver, "CreateObject", false),
             (SpaceRole::Administrator, "CreateObject", true),
         ] {
@@ -3109,6 +3123,15 @@ mod tests {
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
+        // #2203: the decision inbox is a read on the request's namespace.
+        assert!(enterprise_namespace_rpc(
+            "sekai.SekaiService",
+            "ListPendingDecisions"
+        ));
+        assert_eq!(
+            rpc_namespace_action("ListPendingDecisions"),
+            crate::enterprise::NamespaceAction::Read
+        );
         // #1770: Chisei reads, admitted only on their own service.
         for method in ["GetOperationReceipt", "GetQualityTrend"] {
             assert!(enterprise_namespace_rpc("chisei.ChiseiService", method));
