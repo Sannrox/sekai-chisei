@@ -1197,7 +1197,16 @@ mod tests {
             ("west", "no_allowance")
         );
         assert!(response.noise.is_empty());
-        let encoded = format!("{response:?}");
+        // The random query id and digest can contain any short digit run, so
+        // blank them before matching raw values; both are checked below.
+        let encoded = format!(
+            "{:?}",
+            FederatedAggregateResponse {
+                query_id: String::new(),
+                query_digest: String::new(),
+                ..response.clone()
+            }
+        );
         for leaked in ["n-1", "s-1", "Shipment:", "secret", "\"us\"", "100"] {
             assert!(!encoded.contains(leaked), "{leaked} in {encoded}");
         }
