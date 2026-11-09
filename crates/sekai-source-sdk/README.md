@@ -4,6 +4,13 @@ Versioned crate for out-of-process source adapters. It exposes the
 `sekai.source-batch` builder, durable outbox, snapshot and change-feed
 runners, `check`/`discover`, and the offline conformance kit.
 
+`connector` holds the connector type contract (ADR 0148): the operations a
+type supports (`check`, `discover`, `read_page`, `read_changes`, `deliver`,
+`apply`), its configuration schema and its credential slots. The plane
+validates a Source's configuration against the type and refuses anything that
+looks like a credential; the connector runtime checks every configured
+destination against the Source's egress allowlist before it connects.
+
 The control plane re-exports the contract types. Adapters outside this
 repository depend on this crate only. New connectors start from
 `../sekai-connector-template` (`sekaictl admin connectors new`), which the
