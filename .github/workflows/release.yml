@@ -387,7 +387,10 @@ jobs:
             echo "must not produce a latest image tag" >&2
             exit 1
           fi
-          digest="$(docker buildx imagetools inspect "$image" | awk '/^Digest:/{print $2; exit}')"
+          # Structured read, no pipe: an awk that exits on the Digest line can
+          # end the producer early under pipefail (#2085). A bare
+          # `{{.Manifest.Digest}}` falls back to the full text output, so printf.
+          digest="$(docker buildx imagetools inspect "$image" --format '{{printf "%s" .Manifest.Digest}}')"
           [[ "$digest" == sha256:* ]] || { echo "missing digest for ${image}" >&2; exit 1; }
           mkdir -p dist
           gh release download "$TAG" --dir dist --pattern sekai-chisei-release.json
