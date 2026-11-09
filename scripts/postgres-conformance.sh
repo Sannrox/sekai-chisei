@@ -152,4 +152,7 @@ SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked -p chisei-core --lib -- --ignored --test-threads=1 postgres || status=$?
+# The connector runtime's relational type delivers into a table of its own.
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+  cargo test --locked -p sekai-connector-runtime --lib -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

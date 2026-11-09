@@ -193,6 +193,16 @@ deliver. The plane holds no destination credentials.
   fetches under the fence, verifies the digest, and delivers through the
   Source with the credential bound in the runtime. The Source is read from the definition as
   it stands at delivery time.
+- A `relational` Source delivers into its `delivery_table` (`table` or
+  `schema.table`, folded to lower case as unquoted names are) in
+  PostgreSQL, over TLS that verifies the server against
+  the system roots and the runtime's optional `relational_ca_file`. Each
+  artifact is one row: `receipt_id` (unique text), `namespace`,
+  `definition_id`, `content_digest` (text) and `content` (bytea), inserted
+  with `ON CONFLICT (receipt_id) DO NOTHING`. A redelivery after a crash or
+  takeover is a replay. A row already there with another digest fails the
+  delivery as `invalid` and is not overwritten. A Source without a
+  `delivery_table` fails deliveries as `invalid`.
 - `AckWork` with outcome `failed` and a failure class as `reason`
   (`unavailable`, `unreachable`, `auth_failed`, `permission_missing`,
   `invalid` or `unsupported`) records a failed delivery under a live fence.

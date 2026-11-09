@@ -9,13 +9,14 @@
 //!
 //! A sync applies the Source's snapshot pages as source batches
 //! ([`pages`]). The runtime also delivers saved exports whose definition
-//! names a Source of a type it implements ([`delivery`]). [`github`] is
-//! the first connector type.
+//! names a Source of a type it implements ([`delivery`]). The connector
+//! types are [`github`] (sync) and [`relational`] (delivery).
 
 pub mod credentials;
 pub mod delivery;
 pub mod github;
 pub mod pages;
+pub mod relational;
 pub mod runtime;
 pub mod sync;
 

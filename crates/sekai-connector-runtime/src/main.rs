@@ -3,16 +3,20 @@
 //!
 //! The configuration names the plane, this runtime's id, principal,
 //! namespaces and placement labels, and the operator's credential
-//! bindings. The plane bearer comes from `SEKAI_CREDENTIAL`, never from
-//! the file.
+//! bindings, and optionally a CA file relational Sources trust. The plane
+//! bearer comes from `SEKAI_CREDENTIAL`, never from the file.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use sekai_client::ClientConfig;
-use sekai_connector_runtime::{Connectors, CredentialBindings, Runtime, RuntimeOptions, github};
-use sekai_source_sdk::GITHUB_CONNECTOR;
+use std::path::PathBuf;
+
+use sekai_connector_runtime::{
+    Connectors, CredentialBindings, Runtime, RuntimeOptions, github, relational,
+};
+use sekai_source_sdk::{GITHUB_CONNECTOR, RELATIONAL_CONNECTOR};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -30,6 +34,10 @@ struct Config {
     poll_ms: u64,
     #[serde(default)]
     credentials: CredentialBindings,
+    /// A PEM CA certificate relational Sources trust next to the system
+    /// roots, for a database behind a private CA.
+    #[serde(default)]
+    relational_ca_file: Option<PathBuf>,
 }
 
 fn default_lease_ms() -> u64 {
@@ -62,6 +70,18 @@ async fn serve() -> Result<(), String> {
     if let Ok(token) = std::env::var("SEKAI_CREDENTIAL") {
         plane = plane.with_token(token).map_err(|error| error.to_string())?;
     }
+    let ca = config
+        .relational_ca_file
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()
+        .map_err(|error| format!("read relational CA file: {error}"))?;
+    let tls = relational::tls(ca.as_deref())?;
+    let connectors = Connectors::default()
+        .with(&GITHUB_CONNECTOR, github::open)
+        .with(&RELATIONAL_CONNECTOR, move |prepared| {
+            relational::open(prepared, &tls)
+        });
     let runtime = Runtime::connect(
         plane,
         &config.namespaces,
@@ -71,7 +91,7 @@ async fn serve() -> Result<(), String> {
             lease: Duration::from_millis(config.lease_ms),
         },
         config.credentials,
-        Connectors::default().with(&GITHUB_CONNECTOR, github::open),
+        connectors,
     )
     .await
     .map_err(|error| error.to_string())?;
