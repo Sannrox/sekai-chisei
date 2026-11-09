@@ -429,6 +429,20 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut tx, &request.dataset_id)?;
+        // Under the rows lock, which an attaching definition merge also takes.
+        // A definition proposal created meanwhile may still attach this one;
+        // its merge then fails as stale, writing nothing. Only an open
+        // proposal is held; a merged one still replays.
+        if load_proposal(&mut tx, &request.dataset_id, &request.proposal_id, false)
+            .is_ok_and(|proposal| proposal.status == dataset_branch::STATUS_OPEN)
+            && attached_to_open_definition_proposal(
+                &mut tx,
+                &request.dataset_id,
+                &request.proposal_id,
+            )?
+        {
+            return Err(dataset_branch::PROPOSAL_ATTACHED.into());
+        }
         let proposal = merge_dataset_branch_pg(&mut tx, request, check)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
@@ -530,6 +544,29 @@ pub fn merge_dataset_branch_pg(
     .map_err(|error| error.to_string())?;
     drop_branch(tx, &request.dataset_id, &proposal.branch)?;
     Ok(proposal)
+}
+
+/// Whether an open definition proposal attaches this dataset proposal
+/// (#2199); see the SQLite twin.
+fn attached_to_open_definition_proposal(
+    tx: &mut Transaction<'_>,
+    dataset_id: &str,
+    proposal_id: &str,
+) -> Result<bool, String> {
+    let bodies = tx
+        .query(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE status = $1 AND strpos(body_json, $2) > 0",
+            &[
+                &crate::sekai::definition_proposal::STATUS_OPEN,
+                &proposal_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    crate::sekai::definition_proposal::any_attaches(&bodies, dataset_id, proposal_id)
 }
 
 pub fn create_branch_pg(
@@ -993,7 +1030,7 @@ fn drop_branch(tx: &mut Transaction<'_>, dataset_id: &str, name: &str) -> Result
     .map_err(|error| error.to_string())
 }
 
-fn load_proposal(
+pub(crate) fn load_proposal(
     tx: &mut Transaction<'_>,
     dataset_id: &str,
     id: &str,

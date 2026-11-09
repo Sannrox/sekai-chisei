@@ -1354,6 +1354,7 @@ async fn definition_fact_migration_hides_unauthorized_revisions() {
             idempotency_key: "propose-1".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -1524,6 +1525,7 @@ async fn definition_proposal_close_rechecks_member_admin() {
             idempotency_key: "propose-1".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -1605,6 +1607,7 @@ async fn definition_proposal_merge_accepts_one_live_approval() {
             idempotency_key: "propose-1".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -1693,6 +1696,7 @@ async fn definition_proposal_rpc_publishes_or_rejects_without_partial_head_move(
             idempotency_key: "propose-1".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -1872,6 +1876,7 @@ async fn propose_and_merge_definition(
             idempotency_key: format!("{branch_id}-propose"),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -3268,6 +3273,7 @@ async fn list_published_definition_revisions_chains_filters_and_paginates() {
             idempotency_key: "hist-drop-class-propose".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -19011,6 +19017,7 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
         idempotency_key: "publish-proposal".into(),
         major_revision: false,
         migration_plan_digest: String::new(),
+        dataset_proposals: Vec::new(),
     };
     read_only.nonce = uuid::Uuid::new_v4().to_string();
     let mut foreign_proposal = propose.clone();
@@ -27303,6 +27310,7 @@ async fn agent_shadow_blocks_merge_when_the_namespace_requires_a_report() {
             idempotency_key: format!("propose-{namespace}"),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -27420,6 +27428,7 @@ async fn agent_shadow_merge_without_eval_runs_table_is_not_required() {
             idempotency_key: format!("propose-{namespace}"),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -28494,6 +28503,159 @@ async fn dataset_branch_rpcs_isolate_then_merge_once_by_another_principal() {
     assert_eq!(missing.code(), tonic::Code::NotFound);
 }
 
+/// A definition proposal with an attached dataset branch proposal (#2199):
+/// the dataset proposal no longer merges on its own, and the definition
+/// merge lands both, recording the definition proposal as the merger.
+#[tokio::test]
+async fn an_attached_dataset_branch_merges_only_with_its_definition_proposal() {
+    let svc = service();
+    let namespace = "attached-data";
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "attached".into(),
+            name: "attached".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.create_dataset_branch(with_principal(CreateDatasetBranchRequest {
+        dataset_id: "attached".into(),
+        name: "dev".into(),
+        from_version_id: String::new(),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .write_dataset_branch_rows(
+            "attached",
+            "dev",
+            &[[("kind".to_string(), "v2".to_string())].into()],
+            false,
+        )
+        .unwrap();
+    let dataset_proposal = svc
+        .propose_dataset_branch_merge(with_principal(ProposeDatasetBranchMergeRequest {
+            dataset_id: "attached".into(),
+            name: "dev".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    let parent = seed_definition_parent(&svc, namespace).revision_digest;
+    svc.create_definition_branch(with_named_principal(
+        CreateDefinitionBranchRequest {
+            namespace: namespace.into(),
+            branch_id: "with-data".into(),
+            parent_revision_digest: parent.clone(),
+            idempotency_key: "with-data-create".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let candidate = svc
+        .apply_definition_branch_edit(with_named_principal(
+            ApplyDefinitionBranchEditRequest {
+                namespace: namespace.into(),
+                branch_id: "with-data".into(),
+                expected_head_digest: parent.clone(),
+                upserts: vec![DefinitionMemberInput {
+                    member_kind: "object_type".into(),
+                    member_id: "Ticket".into(),
+                    definition_json: r#"{"name":"Ticket","properties":["kind"]}"#.into(),
+                    member_digest: String::new(),
+                }],
+                removals: Vec::new(),
+                idempotency_key: "with-data-edit".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .revision
+        .unwrap()
+        .revision_digest;
+    svc.create_definition_proposal(with_named_principal(
+        CreateDefinitionProposalRequest {
+            namespace: namespace.into(),
+            branch_id: "with-data".into(),
+            proposal_id: "with-data-cs".into(),
+            base_digest: parent.clone(),
+            candidate_digest: candidate.clone(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "with-data-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+            dataset_proposals: vec![DatasetProposalRef {
+                dataset_id: "attached".into(),
+                proposal_id: dataset_proposal.id.clone(),
+            }],
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let standalone = svc
+        .merge_dataset_branch(with_named_principal(
+            MergeDatasetBranchRequest {
+                dataset_id: "attached".into(),
+                proposal_id: dataset_proposal.id.clone(),
+                reason: String::new(),
+            },
+            "reviewer",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(standalone.code(), tonic::Code::FailedPrecondition);
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.into(),
+            proposal_id: "with-data-cs".into(),
+            idempotency_key: "with-data-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = svc
+        .merge_definition_proposal(with_named_principal(
+            MergeDefinitionProposalRequest {
+                namespace: namespace.into(),
+                proposal_id: "with-data-cs".into(),
+                expected_published_digest: parent,
+                idempotency_key: "with-data-merge".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        merged.published_revision.unwrap().revision_digest,
+        candidate
+    );
+    let landed = svc
+        .db
+        .runtime()
+        .get_dataset_branch_proposal("attached", &dataset_proposal.id)
+        .unwrap();
+    assert_eq!(landed.status, "merged");
+    assert_eq!(landed.merged_by, "definition-proposal:with-data-cs");
+}
+
 fn gate_binding(namespace: &str, blocking: bool) -> domain::Object {
     use crate::sekai::definition_consumer_impact::{
         BINDING_CONTRACT, BINDING_KIND, DefinitionConsumerBinding, binding_digest,
@@ -28605,6 +28767,7 @@ async fn try_publish(
             idempotency_key: format!("{proposal_id}-propose"),
             major_revision,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))
@@ -29530,6 +29693,7 @@ async fn publishing_an_object_type_registers_and_retires_its_catalog_entry() {
                         idempotency_key: "cat-2-propose".into(),
                         major_revision: true,
                         migration_plan_digest: String::new(),
+                        dataset_proposals: Vec::new(),
                     },
                     "root",
                 ))
@@ -31295,6 +31459,7 @@ async fn open_approved_ticket_proposal(
             idempotency_key: format!("{proposal_id}-propose"),
             major_revision: false,
             migration_plan_digest: bundle_digest,
+            dataset_proposals: Vec::new(),
         },
         "root",
     ))

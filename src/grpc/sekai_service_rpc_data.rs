@@ -5263,6 +5263,7 @@ pub(super) fn branch_status(error: String) -> Status {
         branch::PROPOSAL_NOT_OPEN
         | branch::PROPOSAL_STALE_PARENT
         | branch::PROPOSAL_STALE_BRANCH
+        | branch::PROPOSAL_ATTACHED
         | branch::BRANCH_RUN_ISOLATED
         | branch::BRANCH_RUN_RAISES_MARKING => Status::failed_precondition(error),
         _ if error.starts_with("branch run") => Status::failed_precondition(error),
@@ -5275,6 +5276,27 @@ fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.clone())
         .unwrap_or_default()
+}
+
+/// The caller's tenant once it may write every dataset in `dataset_ids`:
+/// attaching a dataset branch proposal to a definition proposal, or merging
+/// one that attaches it (#2199). A missing dataset reads as unavailable.
+pub(super) fn authorize_attached_datasets<'a>(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    dataset_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<String, Status> {
+    for dataset_id in dataset_ids {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_dataset(service, principals, context, &dataset, true)?;
+    }
+    Ok(context_tenant(context))
 }
 
 /// The caller, its tenant, and the dataset after the read or write check.

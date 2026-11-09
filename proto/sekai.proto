@@ -4420,6 +4420,18 @@ message CreateDefinitionProposalRequest {
   // The change bundle digest this proposal migrates by (#1693). Part of the
   // approved proposal digest: ApplyDefinitionChangeBundle runs only it.
   string migration_plan_digest = 10;
+  // Dataset branch merge proposals that merge with this proposal, in one
+  // transaction, or not at all (#2199). Each must be open, in the caller's
+  // tenant, writable by the caller, and not a change bundle branch. Their
+  // pinned parent version and branch digest are part of the approved
+  // proposal digest. Cannot be combined with migration_plan_digest.
+  repeated DatasetProposalRef dataset_proposals = 11;
+}
+
+// One dataset branch merge proposal, as ProposeDatasetBranchMerge returned it.
+message DatasetProposalRef {
+  string dataset_id = 1;
+  string proposal_id = 2;
 }
 
 message CreateDefinitionProposalResponse {

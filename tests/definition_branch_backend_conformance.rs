@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
 
+use sekai_chisei::db::dataset::DatasetBackend;
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::agent_promotion::{
     AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REGRESSION,
     REFUSAL_REVOKE_UNDO, REFUSAL_STALE, STATUS_FAIL, STATUS_PASS,
+};
+use sekai_chisei::sekai::dataset::{ColumnDef, Dataset};
+use sekai_chisei::sekai::dataset_branch::{
+    self as dataset_branch, CreateDatasetBranch, DatasetBranchProposal, MergeDatasetBranch,
+    ProposeDatasetBranch,
 };
 use sekai_chisei::sekai::definition_branch::{
     ApplyDefinitionBranchEdit, CreateDefinitionBranch, DefinitionMemberInput, DefinitionMemberRef,
@@ -17,9 +23,11 @@ use sekai_chisei::sekai::definition_diff::{
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
-    CreateDefinitionProposal, DefinitionMergePath, MERGE_REQUIRES_BUNDLE_APPLY,
-    MergeDefinitionProposal, ProposeDefinitionImport, ProposeDefinitionRollback, STATUS_CLOSED,
-    STATUS_MERGED, STATUS_OPEN,
+    CreateDefinitionProposal, DATASET_PROPOSAL_NOT_FOUND, DATASET_PROPOSAL_REFUSED,
+    DatasetProposalRef, DefinitionMergePath, MERGE_DATASET_PROPOSAL_STALE,
+    MERGE_REQUIRES_BUNDLE_APPLY, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
+    PROPOSAL_CONTRACT_VERSION_V2, ProposeDefinitionImport, ProposeDefinitionRollback,
+    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, merge_receipt_id,
 };
 
 fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
@@ -258,6 +266,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         idempotency_key: "propose-1".into(),
         major_revision: false,
         migration_plan_digest: String::new(),
+        dataset_proposals: Vec::new(),
+        tenant: String::new(),
     };
     let created = db
         .create_definition_proposal(&propose, "author", 4)
@@ -389,6 +399,8 @@ fn exercise_proposal_publish(db: &dyn DefinitionBranchBackend, namespace: &str) 
         idempotency_key: "propose-2".into(),
         major_revision: false,
         migration_plan_digest: String::new(),
+        dataset_proposals: Vec::new(),
+        tenant: String::new(),
     };
     db.create_definition_proposal(&second_propose, "author", 13)
         .unwrap();
@@ -971,6 +983,8 @@ fn exercise_coordinated_artifact_merge(db: &dyn DefinitionBranchBackend, namespa
             idempotency_key: "propose-four".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         },
         "author",
         4,
@@ -1054,6 +1068,8 @@ fn exercise_named_compatibility_gate_refusal(db: &dyn DefinitionBranchBackend, n
             idempotency_key: "propose-gate".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         },
         "author",
         4,
@@ -1174,6 +1190,8 @@ fn exercise_agent_draft(db: &dyn DefinitionBranchBackend, namespace: &str) {
             idempotency_key: "agent-propose".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         },
         "author",
         7,
@@ -1764,6 +1782,8 @@ fn publish_revision(
             idempotency_key: format!("{branch_id}-propose"),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         },
         "author",
         t + 2,
@@ -1858,6 +1878,8 @@ fn exercise_bundle_proposal_merge_path(
             idempotency_key: "bundle-propose".into(),
             major_revision: false,
             migration_plan_digest: digest('b'),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         },
         "author",
         4,
@@ -2085,6 +2107,470 @@ fn exercise_published_revision_history(db: &dyn DefinitionBranchBackend, namespa
     );
 }
 
+fn row(id: &str, value: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("id".to_string(), id.to_string()),
+        ("value".to_string(), value.to_string()),
+    ])
+}
+
+/// A dataset with one live row and an open merge proposal of branch `name`,
+/// proposed by `dev` in `tenant`.
+fn proposed_dataset_branch(
+    db: &dyn DatasetBackend,
+    tenant: &str,
+    name: &str,
+) -> DatasetBranchProposal {
+    let id = format!("ds-{}", uuid::Uuid::new_v4().simple());
+    db.create_dataset(&Dataset {
+        id: id.clone(),
+        name: id.clone(),
+        columns: ["id", "value"]
+            .map(|name| ColumnDef {
+                name: name.into(),
+                col_type: "string".into(),
+                classification: "internal".into(),
+            })
+            .to_vec(),
+        object_id: String::new(),
+        created: 0,
+        partition_keys: Vec::new(),
+    })
+    .unwrap();
+    db.append_rows(&id, &[row("1", "live")]).unwrap();
+    db.create_dataset_branch(&CreateDatasetBranch {
+        dataset_id: id.clone(),
+        name: name.into(),
+        actor: "dev".into(),
+        tenant: tenant.into(),
+        ..Default::default()
+    })
+    .unwrap();
+    db.write_dataset_branch_rows(&id, name, &[row("1", "fixed"), row("2", "new")], true)
+        .unwrap();
+    db.propose_dataset_branch(&ProposeDatasetBranch {
+        expected_incarnation: None,
+        dataset_id: id,
+        branch: name.into(),
+        actor: "dev".into(),
+        tenant: tenant.into(),
+    })
+    .unwrap()
+}
+
+fn attach(proposals: &[&DatasetBranchProposal]) -> Vec<DatasetProposalRef> {
+    proposals
+        .iter()
+        .map(|proposal| DatasetProposalRef {
+            dataset_id: proposal.dataset_id.clone(),
+            proposal_id: proposal.id.clone(),
+        })
+        .collect()
+}
+
+/// Seeds `namespace`, edits branch `feature`, and opens proposal `cs` with
+/// `attachments` as a caller in `tenant`, approved by `approver`. Returns the
+/// published base digest, or the create refusal.
+fn open_attached_proposal(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+    attachments: Vec<DatasetProposalRef>,
+    tenant: &str,
+) -> Result<String, String> {
+    let base = seed_ticket(db, namespace, r#"{"name":"Ticket"}"#);
+    db.create_definition_branch(
+        &CreateDefinitionBranch {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            parent_revision_digest: base.clone(),
+            idempotency_key: "feature-create".into(),
+        },
+        "author",
+        2,
+    )
+    .unwrap();
+    let DefinitionWriteResult::ApplyEdit { result } = db
+        .apply_definition_branch_edit(
+            &ApplyDefinitionBranchEdit {
+                namespace: namespace.into(),
+                branch_id: "feature".into(),
+                expected_head_digest: base.clone(),
+                upserts: vec![member(
+                    namespace,
+                    "Ticket",
+                    r#"{"name":"Ticket","properties":["value"]}"#,
+                )],
+                removals: Vec::new(),
+                idempotency_key: "feature-edit".into(),
+            },
+            "author",
+            3,
+        )
+        .unwrap()
+    else {
+        panic!("expected branch edit");
+    };
+    db.create_definition_proposal(
+        &CreateDefinitionProposal {
+            namespace: namespace.into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs".into(),
+            base_digest: base.clone(),
+            candidate_digest: result.revision.revision_digest,
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "feature-propose".into(),
+            major_revision: false,
+            migration_plan_digest: String::new(),
+            dataset_proposals: attachments,
+            tenant: tenant.into(),
+        },
+        "author",
+        4,
+    )?;
+    db.approve_definition_proposal(
+        &ApproveDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "cs".into(),
+            idempotency_key: "feature-approve".into(),
+        },
+        "approver",
+        5,
+    )
+    .unwrap();
+    Ok(base)
+}
+
+fn merge_attached(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+    expected: &str,
+    key: &str,
+) -> Result<DefinitionWriteResult, String> {
+    db.merge_definition_proposal(
+        &MergeDefinitionProposal {
+            namespace: namespace.into(),
+            proposal_id: "cs".into(),
+            expected_published_digest: expected.into(),
+            idempotency_key: key.into(),
+            expected_dataset_versions: Vec::new(),
+            expected_datasources: Vec::new(),
+        },
+        "merger",
+        6,
+    )
+}
+
+/// Nothing moved: the head is `head`, the proposal is open, and each dataset
+/// proposal is unmerged with its dataset's live rows untouched.
+fn assert_nothing_written(
+    db: &(impl DefinitionBranchBackend + DatasetBackend),
+    namespace: &str,
+    head: &str,
+    datasets: &[&DatasetBranchProposal],
+) {
+    assert_eq!(
+        db.get_published_definition_revision(namespace)
+            .unwrap()
+            .unwrap()
+            .revision_digest,
+        head
+    );
+    assert_eq!(
+        db.get_definition_proposal(namespace, "cs")
+            .unwrap()
+            .unwrap()
+            .status,
+        STATUS_OPEN
+    );
+    for dataset in datasets {
+        let stored = db
+            .get_dataset_branch_proposal(&dataset.dataset_id, &dataset.id)
+            .unwrap();
+        assert!(stored.merged_by.is_empty(), "{stored:?}");
+        assert_ne!(stored.status, dataset_branch::STATUS_MERGED);
+    }
+}
+
+fn live_values(db: &dyn DatasetBackend, dataset_id: &str) -> Vec<String> {
+    let mut values = db
+        .query_rows(dataset_id, &Default::default())
+        .unwrap()
+        .into_iter()
+        .map(|row| row["value"].clone())
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+/// Attached dataset branch proposals (#2199) merge with their definition
+/// proposal in one transaction, or nothing is written.
+fn exercise_dataset_attachments(
+    db: &(impl DefinitionBranchBackend + DatasetBackend),
+    prefix: &str,
+) {
+    // The happy path: pinned at create, refused standalone, landed by the
+    // merge, covered by its receipt, and replayed exactly.
+    {
+        let namespace = format!("{prefix}-attach");
+        let dataset = proposed_dataset_branch(db, "t1", "fix");
+        let base = open_attached_proposal(db, &namespace, attach(&[&dataset]), "t1").unwrap();
+        // A second open attacher must not block replay once the first lands.
+        open_attached_proposal(
+            db,
+            &format!("{namespace}-second"),
+            attach(&[&dataset]),
+            "t1",
+        )
+        .unwrap();
+        let stored = db
+            .get_definition_proposal(&namespace, "cs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.contract_version, PROPOSAL_CONTRACT_VERSION_V2);
+        let [pin] = stored.dataset_proposals.as_slice() else {
+            panic!("expected one attachment");
+        };
+        assert_eq!(pin.parent_version_id, dataset.parent_version_id);
+        assert_eq!(pin.branch_digest, dataset.branch_digest);
+        // An old binary drops the unknown field and refuses the contract.
+        let mut old_view = stored.clone();
+        old_view.dataset_proposals.clear();
+        assert_ne!(old_view.contract_version, PROPOSAL_CONTRACT_VERSION);
+        assert!(old_view.verify().is_err());
+        let standalone = MergeDatasetBranch {
+            dataset_id: dataset.dataset_id.clone(),
+            proposal_id: dataset.id.clone(),
+            actor: "reviewer".into(),
+            tenant: "t1".into(),
+            reason: String::new(),
+        };
+        assert_eq!(
+            db.merge_dataset_branch(&standalone).unwrap_err(),
+            dataset_branch::PROPOSAL_ATTACHED
+        );
+        let versions = db.list_dataset_versions(&dataset.dataset_id).unwrap().len();
+        let merged = merge_attached(db, &namespace, &base, "merge").unwrap();
+        let DefinitionWriteResult::MergeProposal { result } = &merged else {
+            panic!("expected merge");
+        };
+        let landed = db
+            .get_dataset_branch_proposal(&dataset.dataset_id, &dataset.id)
+            .unwrap();
+        assert_eq!(landed.status, dataset_branch::STATUS_MERGED);
+        assert_eq!(landed.merged_by, "definition-proposal:cs");
+        assert_eq!(live_values(db, &dataset.dataset_id), ["fixed", "new"]);
+        assert_eq!(
+            db.list_dataset_versions(&dataset.dataset_id).unwrap().len(),
+            versions + 1
+        );
+        assert_eq!(
+            result.receipt_id,
+            merge_receipt_id(&stored, &base, std::slice::from_ref(&landed.receipt_id)).unwrap()
+        );
+        assert_ne!(
+            result.receipt_id,
+            merge_receipt_id(&stored, &base, &[]).unwrap()
+        );
+        assert_eq!(
+            merge_attached(db, &namespace, &base, "merge").unwrap(),
+            merged
+        );
+        assert_eq!(
+            db.list_dataset_versions(&dataset.dataset_id).unwrap().len(),
+            versions + 1
+        );
+        assert_eq!(db.merge_dataset_branch(&standalone).unwrap(), landed);
+    }
+    // A moved dataset parent fails the whole merge, including the
+    // attachment that did not move.
+    {
+        let namespace = format!("{prefix}-parent-moved");
+        let still = proposed_dataset_branch(db, "t1", "fix");
+        let moved = proposed_dataset_branch(db, "t1", "fix");
+        let base = open_attached_proposal(db, &namespace, attach(&[&still, &moved]), "t1").unwrap();
+        db.append_rows(&moved.dataset_id, &[row("9", "late")])
+            .unwrap();
+        let error = merge_attached(db, &namespace, &base, "merge").unwrap_err();
+        assert!(error.starts_with(MERGE_DATASET_PROPOSAL_STALE), "{error}");
+        assert_nothing_written(db, &namespace, &base, &[&still, &moved]);
+        assert_eq!(live_values(db, &still.dataset_id), ["live"]);
+    }
+    // Deleting an attached branch closes its proposal: the merge is stale.
+    {
+        let namespace = format!("{prefix}-branch-deleted");
+        let dataset = proposed_dataset_branch(db, "t1", "fix");
+        let base = open_attached_proposal(db, &namespace, attach(&[&dataset]), "t1").unwrap();
+        db.delete_dataset_branch(&dataset.dataset_id, "fix", "t1")
+            .unwrap();
+        let error = merge_attached(db, &namespace, &base, "merge").unwrap_err();
+        assert!(error.starts_with(MERGE_DATASET_PROPOSAL_STALE), "{error}");
+        assert_nothing_written(db, &namespace, &base, &[&dataset]);
+    }
+    // A moved published head fails the whole merge.
+    {
+        let namespace = format!("{prefix}-head-moved");
+        let dataset = proposed_dataset_branch(db, "t1", "fix");
+        let base = open_attached_proposal(db, &namespace, attach(&[&dataset]), "t1").unwrap();
+        let (moved, _) = publish_revision(
+            db,
+            &namespace,
+            &base,
+            "other",
+            "other-cs",
+            vec![member(
+                &namespace,
+                "Ticket",
+                r#"{"name":"Ticket","properties":["owner"]}"#,
+            )],
+            10,
+        );
+        for (key, expected) in [("merge-base", &base), ("merge-moved", &moved)] {
+            let error = merge_attached(db, &namespace, expected, key).unwrap_err();
+            assert!(
+                error.starts_with("stale_published_definition_head"),
+                "{error}"
+            );
+        }
+        assert_nothing_written(db, &namespace, &moved, &[&dataset]);
+        assert_eq!(live_values(db, &dataset.dataset_id), ["live"]);
+    }
+    // Another tenant's dataset proposal, or a missing one, reads as not found
+    // and opens nothing.
+    {
+        let dataset = proposed_dataset_branch(db, "t1", "fix");
+        let mut missing = attach(&[&dataset]);
+        missing[0].proposal_id = "absent".into();
+        for (suffix, attachments, tenant) in [
+            ("tenant", attach(&[&dataset]), "t2"),
+            ("missing", missing, "t1"),
+        ] {
+            let namespace = format!("{prefix}-not-found-{suffix}");
+            let error = open_attached_proposal(db, &namespace, attachments, tenant).unwrap_err();
+            assert!(error.starts_with(DATASET_PROPOSAL_NOT_FOUND), "{error}");
+            assert!(
+                db.get_definition_proposal(&namespace, "cs")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    // A change bundle branch never attaches, and attachments never combine
+    // with a change bundle digest.
+    {
+        let bundle = proposed_dataset_branch(db, "t1", "bundle-dry-run");
+        let namespace = format!("{prefix}-bundle");
+        let error = open_attached_proposal(db, &namespace, attach(&[&bundle]), "t1").unwrap_err();
+        assert!(error.starts_with(DATASET_PROPOSAL_REFUSED), "{error}");
+        let error = CreateDefinitionProposal {
+            namespace: namespace.clone(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-bundle".into(),
+            base_digest: digest('a'),
+            candidate_digest: digest('b'),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            idempotency_key: "bundle-propose".into(),
+            major_revision: false,
+            migration_plan_digest: digest('c'),
+            dataset_proposals: attach(&[&bundle]),
+            tenant: "t1".into(),
+        }
+        .prepare()
+        .unwrap_err();
+        assert!(error.starts_with(DATASET_PROPOSAL_REFUSED), "{error}");
+    }
+    // Closing the definition proposal releases its attachment.
+    {
+        let namespace = format!("{prefix}-closed");
+        let dataset = proposed_dataset_branch(db, "t1", "fix");
+        open_attached_proposal(db, &namespace, attach(&[&dataset]), "t1").unwrap();
+        db.close_definition_proposal(
+            &CloseDefinitionProposal {
+                namespace: namespace.clone(),
+                proposal_id: "cs".into(),
+                reason_code: CLOSE_REASON_SUPERSEDED.into(),
+                idempotency_key: "close".into(),
+            },
+            "author",
+            6,
+        )
+        .unwrap();
+        let merged = db
+            .merge_dataset_branch(&MergeDatasetBranch {
+                dataset_id: dataset.dataset_id.clone(),
+                proposal_id: dataset.id.clone(),
+                actor: "reviewer".into(),
+                tenant: "t1".into(),
+                reason: String::new(),
+            })
+            .unwrap();
+        assert_eq!(merged.status, dataset_branch::STATUS_MERGED);
+    }
+}
+
+/// A dataset append races the definition merge that lands that dataset.
+/// Either the merge wins and the append lands after it, or the append wins
+/// and the merge fails as stale, writing nothing.
+fn exercise_concurrent_attached_append<D: DefinitionBranchBackend + DatasetBackend + 'static>(
+    db: Arc<D>,
+    namespace: &str,
+) {
+    let dataset = proposed_dataset_branch(db.as_ref(), "t1", "fix");
+    let base = open_attached_proposal(db.as_ref(), namespace, attach(&[&dataset]), "t1").unwrap();
+    let barrier = Arc::new(Barrier::new(3));
+    let append = {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let dataset_id = dataset.dataset_id.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            db.append_rows(&dataset_id, &[row("9", "late")])
+        })
+    };
+    let merge = {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        let namespace = namespace.to_string();
+        let base = base.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            merge_attached(db.as_ref(), &namespace, &base, "merge")
+        })
+    };
+    barrier.wait();
+    append.join().unwrap().unwrap();
+    let merged = merge.join().unwrap();
+    let landed = db
+        .get_dataset_branch_proposal(&dataset.dataset_id, &dataset.id)
+        .unwrap();
+    match merged {
+        Ok(DefinitionWriteResult::MergeProposal { result }) => {
+            assert_eq!(landed.status, dataset_branch::STATUS_MERGED);
+            assert_eq!(
+                db.get_published_definition_revision(namespace)
+                    .unwrap()
+                    .unwrap()
+                    .revision_digest,
+                result.published_revision.revision_digest
+            );
+            assert_eq!(
+                live_values(db.as_ref(), &dataset.dataset_id),
+                ["fixed", "late", "new"]
+            );
+        }
+        Ok(other) => panic!("unexpected merge result {other:?}"),
+        Err(error) => {
+            assert!(error.starts_with(MERGE_DATASET_PROPOSAL_STALE), "{error}");
+            assert_nothing_written(db.as_ref(), namespace, &base, &[&dataset]);
+            assert_eq!(
+                live_values(db.as_ref(), &dataset.dataset_id),
+                ["late", "live"]
+            );
+        }
+    }
+}
+
 #[test]
 fn sqlite_definition_branch_backend_conformance() {
     exercise_agent_draft(&SekaiDb::new(":memory:").unwrap(), "sqlite-agent");
@@ -2113,6 +2599,11 @@ fn sqlite_definition_branch_backend_conformance() {
                 .unwrap();
         });
     }
+    exercise_dataset_attachments(&SekaiDb::new(":memory:").unwrap(), "sqlite-datasets");
+    exercise_concurrent_attached_append(
+        Arc::new(SekaiDb::new(":memory:").unwrap()),
+        "sqlite-datasets-race",
+    );
     exercise_concurrent_stale_head(
         Arc::new(SekaiDb::new(":memory:").unwrap()),
         "sqlite-definition-concurrent",
@@ -2160,6 +2651,8 @@ fn postgres_definition_branch_backend_conformance() {
                 .unwrap();
         });
     }
+    exercise_dataset_attachments(db.as_ref(), &format!("{prefix}-datasets"));
+    exercise_concurrent_attached_append(db.clone(), &format!("{prefix}-datasets-race"));
     exercise_concurrent_stale_head(db.clone(), &format!("{prefix}-concurrent"));
     exercise_concurrent_genesis_seed(db, &format!("{prefix}-genesis"));
 }

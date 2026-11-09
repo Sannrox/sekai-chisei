@@ -185,6 +185,7 @@ async fn publish_object_type(
                 idempotency_key: "orders-propose".into(),
                 major_revision: false,
                 migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
             },
             SCHEMA_ADMIN,
         ))

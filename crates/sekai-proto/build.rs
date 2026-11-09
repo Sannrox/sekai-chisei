@@ -40,6 +40,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[serde(default)]",
         )
         .field_attribute(
+            "sekai.CreateDefinitionProposalRequest.dataset_proposals",
+            "#[serde(default)]",
+        )
+        .field_attribute(
             "sekai.DefinitionConsumerImpactPath.blocking",
             "#[serde(default)]",
         )
