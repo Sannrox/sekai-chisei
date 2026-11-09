@@ -313,7 +313,7 @@
     {
       "service": "SekaiService",
       "rpc": "GetOntologyHealth",
-      "storage_path": "sekai.definition-branch, sekai.graph, sekai.datasets",
+      "storage_path": "sekai.definition-branch, sekai.graph, sekai.datasets, sekai.object-sync",
       "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
@@ -352,6 +352,15 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSourceHealth",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
       "classification": "experimental",
       "product_tier": "advanced"
     },

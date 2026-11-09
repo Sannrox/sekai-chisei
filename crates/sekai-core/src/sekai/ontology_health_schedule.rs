@@ -21,7 +21,7 @@ use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::ontology_health::Part;
-use crate::sekai::ontology_health_trend::{self, RecordRequest, Recorded, TrendError};
+use crate::sekai::ontology_health_trend::{self, RecordRequest, Recorded, ScoreInputs, TrendError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSchedule {
@@ -98,8 +98,7 @@ pub fn record_due(
     schedule: &HealthSchedule,
     now_ms: i64,
     parts: &[Part],
-    datasets: &[String],
-    definition_revision: &str,
+    inputs: &ScoreInputs,
 ) -> Result<Recorded, TrendError> {
     let recorded = ontology_health_trend::record(
         db,
@@ -112,8 +111,7 @@ pub fn record_due(
             now_ms,
         },
         parts,
-        datasets,
-        definition_revision,
+        inputs,
     )?;
     finish(db, schedule, now_ms, "")?;
     Ok(recorded)
@@ -480,7 +478,9 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|schedule| schedule.namespace == ns)
-            .map(|schedule| record_due(db, schedule, now_ms, &lint(80), &[], "").unwrap())
+            .map(|schedule| {
+                record_due(db, schedule, now_ms, &lint(80), &ScoreInputs::default()).unwrap()
+            })
             .filter(|recorded| matches!(recorded, Recorded::Fresh { .. }))
             .count()
     }
@@ -527,12 +527,18 @@ mod tests {
                 now_ms: window,
             },
             &lint(80),
-            &[],
-            "",
+            &ScoreInputs::default(),
         )
         .unwrap();
         assert!(matches!(
-            record_due(&db, schedule, window + 1, &lint(10), &[], "").unwrap(),
+            record_due(
+                &db,
+                schedule,
+                window + 1,
+                &lint(10),
+                &ScoreInputs::default()
+            )
+            .unwrap(),
             Recorded::Replay(_)
         ));
         assert_eq!(tick(&db, ns, window + 2), 0);

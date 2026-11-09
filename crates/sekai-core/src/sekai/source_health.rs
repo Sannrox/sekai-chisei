@@ -114,20 +114,28 @@ pub fn report_source_health(
     query: &SourceHealthQuery,
     now_ms: i64,
 ) -> Result<SourceHealth, String> {
-    if actor.trim().is_empty() {
-        return Err("source_health_invalid: actor is required".into());
-    }
-    if now_ms < 0 {
-        return Err("source_health_invalid: observation time must be non-negative".into());
-    }
-    if !principal_can_access_namespace(db, actor, &query.namespace)? {
-        let report = undisclosed(query, now_ms);
-        audit_health(db, actor, &report)?;
-        return Ok(report);
-    }
-    let state = db
-        .get_source_sync_state(&query.namespace, &query.source_instance, &query.type_digest)
-        .map_err(|_| "source health identity is unavailable".to_string())?;
+    validate_observation(actor, now_ms)?;
+    let authorized = principal_can_access_namespace(db, actor, &query.namespace)?;
+    report_authorized_source_health(db, actor, query, now_ms, authorized)
+}
+
+/// As [`report_source_health`], with namespace authority decided by the
+/// caller: `GetSourceHealth` authorizes as `GetSourceSyncState` does. An
+/// unauthorized source reports exactly as an unknown one, and is audited.
+pub fn report_authorized_source_health(
+    db: &RuntimeDb,
+    actor: &str,
+    query: &SourceHealthQuery,
+    now_ms: i64,
+    authorized: bool,
+) -> Result<SourceHealth, String> {
+    validate_observation(actor, now_ms)?;
+    let state = if authorized {
+        db.get_source_sync_state(&query.namespace, &query.source_instance, &query.type_digest)
+            .map_err(|_| "source health identity is unavailable".to_string())?
+    } else {
+        None
+    };
     let report = match state {
         Some(state) => project_source_health(&state, query, now_ms),
         None => undisclosed(query, now_ms),
@@ -447,6 +455,16 @@ fn report(
         write_authority: false,
         permit_authority: false,
     }
+}
+
+fn validate_observation(actor: &str, now_ms: i64) -> Result<(), String> {
+    if actor.trim().is_empty() {
+        return Err("source_health_invalid: actor is required".into());
+    }
+    if now_ms < 0 {
+        return Err("source_health_invalid: observation time must be non-negative".into());
+    }
+    Ok(())
 }
 
 fn audit_health(db: &RuntimeDb, actor: &str, report: &SourceHealth) -> Result<(), String> {
@@ -946,5 +964,60 @@ mod tests {
         assert_eq!(blocked.class, CLASS_BLOCKED);
         assert_eq!(blocked.failure_class, FAILURE_RECOVERY_REQUIRED);
         assert_eq!(blocked.last_success_at_ms, Some(200));
+    }
+
+    /// The sources a namespace's health part reads, on either backend: each
+    /// bound identity once, and only the namespace's. A shared PostgreSQL
+    /// database keeps earlier runs' sources, so each run names its own.
+    fn source_identities_contract(db: &RuntimeDb, namespace: &str, source_instance: &str) {
+        assert!(db.list_source_identities(namespace, 10).unwrap().is_empty());
+        for (current, next, key) in [
+            ("", "cursor:1", "batch-1"),
+            ("cursor:1", "cursor:2", "batch-2"),
+        ] {
+            let mut page = batch(current, next, key);
+            page.namespace = namespace.into();
+            page.source_instance = source_instance.into();
+            page.records[0].source_instance = source_instance.into();
+            page.batch_digest = page.canonical_digest().unwrap();
+            db.apply_source_batch(&page, PRODUCER, 100).unwrap();
+        }
+        let identity = (
+            source_instance.to_owned(),
+            GITHUB_OBJECT_SYNC_TYPE_DIGEST.to_owned(),
+        );
+        assert_eq!(
+            db.list_source_identities(namespace, 10).unwrap(),
+            [identity]
+        );
+        assert!(db.list_source_identities(namespace, 0).unwrap().is_empty());
+        assert!(
+            db.list_source_identities(&format!("{namespace}-other"), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sqlite_lists_each_bound_source_once() {
+        source_identities_contract(&RuntimeDb::memory(), "acme", "acme/ops");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_lists_each_bound_source_once() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 4),
+        };
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
+        let run = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        source_identities_contract(&db, &format!("sources-{run}"), &format!("acme/ops-{run}"));
     }
 }
