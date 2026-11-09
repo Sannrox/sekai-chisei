@@ -1794,6 +1794,7 @@ fn spawn_service_background_tasks(
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
+        spawn_consumer_violation_sweeper(db.clone());
         spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
@@ -1935,6 +1936,28 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::error!(%error, "export sweep failed"),
                 Err(error) => tracing::error!(%error, "export sweep task failed"),
+            }
+        }
+    });
+}
+
+/// Delete consumer violation deliveries past their retention bound (#2195)
+/// about once a minute. Safe on every instance at once: each batch deletes
+/// only rows no other sweep holds.
+fn spawn_consumer_violation_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db.sweep_consumer_violation_deliveries(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "consumer violation sweep failed"),
+                Err(error) => tracing::error!(%error, "consumer violation sweep task failed"),
             }
         }
     });

@@ -470,6 +470,27 @@ impl RuntimeDb {
         }
     }
 
+    /// Deletes every consumer violation delivery older than
+    /// `DELIVERY_RETENTION_MS` (#2195), one batch per transaction, and
+    /// returns how many it deleted. Safe on every instance at once.
+    pub fn sweep_consumer_violation_deliveries(&self, now_ms: i64) -> Result<usize, String> {
+        use crate::sekai::consumer_violation::{DELIVERY_RETENTION_MS, SWEEP_BATCH};
+        let cutoff_ms = now_ms.saturating_sub(DELIVERY_RETENTION_MS);
+        let mut deleted = 0;
+        loop {
+            let batch = match self {
+                Self::Sqlite(db) => db.delete_expired_consumer_violations(cutoff_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.delete_expired_consumer_violations(cutoff_ms)
+                }),
+            }?;
+            deleted += batch;
+            if (batch as i64) < SWEEP_BATCH {
+                return Ok(deleted);
+            }
+        }
+    }
+
     pub fn insert_catalog_criticality_event(
         &self,
         event: &crate::sekai::catalog_criticality::CriticalityEvent,

@@ -206,6 +206,8 @@ const SITE_AGENT_MEMORY_INSTANCE_INDEX_SCHEMA: &str =
 const WRITER_MEMORY_OBJECT_INDEXES_SCHEMA: &str =
     include_str!("postgres/0143_writer_memory_object_indexes.sql");
 const DROP_EZU_STATE_SCHEMA: &str = include_str!("postgres/0145_drop_ezu_state.sql");
+const CONSUMER_VIOLATION_CREATED_INDEX_SCHEMA: &str =
+    include_str!("postgres/0146_consumer_violation_created_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1045,6 +1047,12 @@ const MIGRATIONS: &[Migration] = &[
         144,
         "drop_ezu_state",
         DROP_EZU_STATE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        145,
+        "consumer_violation_created_index",
+        CONSUMER_VIOLATION_CREATED_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
