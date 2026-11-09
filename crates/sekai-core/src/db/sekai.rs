@@ -410,6 +410,7 @@ impl SekaiDb {
         self.migrate_agent_wake_cursors()?;
         self.migrate_ontology_health_trends()?;
         self.migrate_ontology_health_schedules()?;
+        self.migrate_sources()?;
         self.migrate_catalog_criticality_outbox()?;
         Ok(())
     }

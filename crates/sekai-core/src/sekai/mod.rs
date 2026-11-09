@@ -156,6 +156,7 @@ pub mod synthetic_game;
 pub mod synthetic_shape;
 pub use sekai_types::service_principal;
 pub mod skillextract;
+pub mod source;
 pub mod source_health;
 pub mod source_quarantine;
 pub mod source_type_descriptor;
