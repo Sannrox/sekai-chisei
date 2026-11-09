@@ -3,8 +3,8 @@
 //! [`prepare`] checks everything that fails closed before a connection:
 //! the connector type, the configuration against its schema, every
 //! destination against the Source's egress allowlist, and the credential
-//! handle against the runtime's binding. [`Connectors::sync`] then opens
-//! the type's implementation and runs it.
+//! handle against the runtime's binding. [`Connectors`] then opens the
+//! type's implementation and runs one operation.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, ExportArtifact,
-    Operation, SourceConfig, connector_type,
+    Operation, SnapshotRead, SourceConfig, connector_type,
 };
 
 use crate::credentials::{CredentialBindings, Credentials};
@@ -63,6 +63,8 @@ impl From<ConnectorFailure> for SyncFailure {
 #[derive(Debug)]
 pub struct Prepared {
     pub connector: &'static ConnectorType,
+    /// The Source's instance token, such as a GitHub `owner/repository`.
+    pub source_instance: String,
     pub config: SourceConfig,
     pub credentials: Credentials,
 }
@@ -106,9 +108,19 @@ pub fn prepare(
         .map_err(|_| SyncFailure::Unavailable)?;
     Ok(Prepared {
         connector,
+        source_instance: source.source_instance.clone(),
         config,
         credentials,
     })
+}
+
+/// Runs `job` on the blocking pool; a job that panics is `Invalid`.
+pub(crate) async fn blocking<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, SyncFailure> + Send + 'static,
+) -> Result<T, SyncFailure> {
+    tokio::task::spawn_blocking(job)
+        .await
+        .unwrap_or(Err(SyncFailure::Invalid))
 }
 
 /// Opens one type's implementation for a prepared Source.
@@ -177,10 +189,26 @@ impl Connectors {
         Ok(open(prepared)?)
     }
 
-    /// Runs one sync of a prepared Source. Blocking.
-    pub fn sync(&self, prepared: &Prepared) -> Result<(), SyncFailure> {
+    /// Checks a prepared Source can be reached. Blocking.
+    pub fn check(&self, prepared: &Prepared) -> Result<(), SyncFailure> {
         self.open(prepared)?.check()?;
         Ok(())
+    }
+
+    /// Reads one snapshot page of a prepared Source after
+    /// `committed_cursor`. Blocking.
+    pub fn read_page(
+        &self,
+        prepared: &Prepared,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<SnapshotRead, SyncFailure> {
+        if !prepared.connector.supports(Operation::ReadPage) {
+            return Err(SyncFailure::Unsupported);
+        }
+        Ok(self
+            .open(prepared)?
+            .read_page(committed_cursor, max_records)?)
     }
 
     /// Delivers one verified saved-export artifact through a prepared
@@ -282,13 +310,13 @@ mod tests {
         let prepared = prepare(&github, &bindings).unwrap();
         assert!(!Connectors::default().implements(&github));
         assert_eq!(
-            Connectors::default().sync(&prepared),
+            Connectors::default().check(&prepared),
             Err(SyncFailure::Unsupported)
         );
         let connectors = Connectors::default().with(&GITHUB_CONNECTOR, |_| {
             Ok(Box::new(Checked(Err(ConnectorFailure::AuthFailed))))
         });
         assert!(connectors.implements(&github));
-        assert_eq!(connectors.sync(&prepared), Err(SyncFailure::AuthFailed));
+        assert_eq!(connectors.check(&prepared), Err(SyncFailure::AuthFailed));
     }
 }

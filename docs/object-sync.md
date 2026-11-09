@@ -205,6 +205,25 @@ the Source before the batch transaction: a batch admitted just before a disable
 commits can still apply, and a retry of a batch that applied before the disable
 is refused rather than replayed.
 
+To move a GitHub repository synced by a standalone adapter under a Source,
+put a `github` Source with `source` `github` and the repository as
+`source_instance`, then stop the adapter. The connector runtime syncs it
+from the same binding, so object ids, versions and history stay. The
+binding keeps its producer: the runtime must authenticate as the principal
+the adapter used, or every batch is refused as a producer conflict and the
+sync fails as `permission_missing`. Its cursor
+is its own: a cursor the adapter committed restarts the runtime's scan, and
+records it reads again change nothing. The runtime pages issues and pull
+requests by update time, oldest first: each page starts at the newest
+update the previous one saw, so an item updated mid-scan is read again
+later rather than skipped, and later syncs read only what changed. The
+items at the newest update time are read again by each sync until that
+time is five minutes old, so an update in the same second is not lost. Each
+page is one batch naming the Source. A title the GitHub profile refuses,
+such as secret-like text, is synced as `#number`.
+Relational Sources do not read pages yet: their syncs fail as
+`unsupported`.
+
 The GitHub object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;

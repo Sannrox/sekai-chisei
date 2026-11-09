@@ -1,6 +1,7 @@
 //! The connector runtime against a serving plane (ADR 0148): crash
 //! mid-claim, takeover after lease expiry, a stale fence refused, two
-//! runtime versions side by side, and an unresolved credential.
+//! runtime versions side by side, an unresolved credential, and a GitHub
+//! repository moved under a Source with its object ids unchanged.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,10 +17,12 @@ use sekai_chisei::sekai::security::Role;
 use sekai_chisei::sekai::source::{self, PutSource, SourceSpec};
 use sekai_client::ClientConfig;
 use sekai_connector_runtime::{
-    Connectors, CredentialBindings, Ran, Runtime, RuntimeOptions, SyncFailure,
+    Connectors, CredentialBindings, Ran, Runtime, RuntimeOptions, SyncFailure, github,
 };
 use sekai_source_sdk::{
-    ConfigValue, Connector, ConnectorFailure, GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, SourceConfig,
+    ConfigValue, Connector, ConnectorFailure, GITHUB_CONNECTOR, GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+    GitHubObjectFixture, RELATIONAL_CONNECTOR, SnapshotPage, SnapshotRead, SourceAdapterConfig,
+    SourceConfig, build_source_batch, object_id_for, translate_github_fixture,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -171,13 +174,38 @@ fn bindings(dir: &std::path::Path) -> CredentialBindings {
     .unwrap()
 }
 
-/// A connector whose check counts its runs.
-struct Counted(Arc<AtomicUsize>);
+/// A connector that counts its syncs: each reads one complete page with
+/// one issue of the Source's repository.
+struct Counted(Arc<AtomicUsize>, String);
 
 impl Connector for Counted {
-    fn check(&mut self) -> Result<(), ConnectorFailure> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn read_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        _max_records: usize,
+    ) -> Result<SnapshotRead, ConnectorFailure> {
+        let run = self.0.fetch_add(1, Ordering::SeqCst);
+        let issue = translate_github_fixture(
+            GitHubObjectFixture {
+                repository: self.1.clone(),
+                kind: "Issue".into(),
+                number: 1,
+                revision: format!("r{run}"),
+                title: "one".into(),
+                state: "open".into(),
+                deleted: false,
+                observed_at_ms: 1,
+                properties: BTreeMap::new(),
+            },
+            &self.1,
+        )
+        .unwrap();
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: vec![issue],
+            proposed_next_cursor: format!("{}-{run}", committed_cursor.unwrap_or("run")),
+            collected_at_ms: 1,
+            complete: true,
+        }))
     }
 }
 
@@ -185,7 +213,12 @@ fn counted(types: &[&'static sekai_source_sdk::ConnectorType]) -> (Connectors, A
     let runs = Arc::new(AtomicUsize::new(0));
     let connectors = types.iter().fold(Connectors::default(), |connectors, ty| {
         let runs = runs.clone();
-        connectors.with(ty, move |_| Ok(Box::new(Counted(runs.clone()))))
+        connectors.with(ty, move |prepared| {
+            Ok(Box::new(Counted(
+                runs.clone(),
+                prepared.source_instance.clone(),
+            )))
+        })
     });
     (connectors, runs)
 }
@@ -250,19 +283,15 @@ async fn a_crashed_runtime_is_taken_over_and_its_fence_refused() {
     );
     assert!(generation > held.claim_generation);
 
-    // A comes back with its stale fence: its acknowledge is refused, so
-    // nothing is recorded twice.
+    // A comes back with its stale fence: it is refused before it reads or
+    // applies anything, so nothing is recorded twice.
     assert_eq!(
         a.run(0, held).await.unwrap(),
         Ran::Lost {
             source_id: "repo".into()
         }
     );
-    assert_eq!(
-        runs.load(Ordering::SeqCst),
-        2,
-        "A ran, but its result is dropped"
-    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "A never ran");
     assert_eq!(plane.sync_of("repo").0, "runtime-b");
 }
 
@@ -284,11 +313,16 @@ async fn two_runtime_versions_split_the_work_during_a_rolling_deploy() {
     let (old_ran, new_ran) = tokio::join!(old.pass(), new.pass());
     let (old_ran, new_ran) = (old_ran.unwrap(), new_ran.unwrap());
     assert_eq!(old_ran.len() + new_ran.len(), 4, "each Source syncs once");
+    // Relational Sources do not read pages yet, so only GitHub reads ran.
     assert_eq!(
         old_runs.load(Ordering::SeqCst) + new_runs.load(Ordering::SeqCst),
-        4
+        3
     );
-    assert_eq!(plane.sync_of("orders").0, "runtime-new");
+    let (runtime, failure, _) = plane.sync_of("orders");
+    assert_eq!(
+        (runtime.as_str(), failure.as_str()),
+        ("runtime-new", "unsupported")
+    );
     assert!(
         old_ran
             .iter()
@@ -341,4 +375,140 @@ async fn an_unresolved_credential_fails_once_as_unavailable() {
     assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing connected");
     assert_eq!(plane.sync_of("repo").1, "unavailable");
     assert!(runtime.pass().await.unwrap().is_empty(), "no retry loop");
+}
+
+/// Serves a GitHub REST API stand-in on an ephemeral port that lists
+/// `items` for every issues request.
+fn fake_github(items: serde_json::Value) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::from("start");
+            while !line.trim().is_empty() {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+            }
+            let body = items.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+fn issue(number: u64, revision: &str) -> GitHubObjectFixture {
+    GitHubObjectFixture {
+        repository: "acme/repo".into(),
+        kind: "Issue".into(),
+        number,
+        revision: revision.into(),
+        title: format!("issue {number}"),
+        state: "open".into(),
+        deleted: false,
+        observed_at_ms: 1,
+        properties: BTreeMap::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_github_repository_moves_under_a_source_with_its_object_ids() {
+    const SYNCED: &str = "2026-01-01T00:00:00Z";
+    let plane = plane().await;
+    let dir = tempfile::tempdir().unwrap();
+    // Before: a standalone adapter synced issue 1 under its own cursor.
+    let legacy = build_source_batch(
+        &SourceAdapterConfig {
+            namespace: NS.into(),
+            producer_identity: PRINCIPAL.into(),
+            source_instance: "acme/repo".into(),
+            type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+        },
+        "",
+        "adapter-cursor-1",
+        1,
+        vec![translate_github_fixture(issue(1, SYNCED), "acme/repo").unwrap()],
+    )
+    .unwrap();
+    plane.db.apply_source_batch(&legacy, PRINCIPAL, 1).unwrap();
+    let id = |number: u64| {
+        object_id_for(
+            GITHUB_OBJECT_SYNC_TYPE_DIGEST,
+            &format!("github:acme/repo#{number}"),
+        )
+    };
+    let before = plane.db.get_object(&id(1)).unwrap().unwrap();
+
+    // The repository becomes a Source; its runtime reads issue 1 unchanged
+    // and issue 2 new.
+    let api = fake_github(serde_json::json!([
+        { "number": 1, "title": "issue 1", "state": "open", "updated_at": SYNCED },
+        { "number": 2, "title": "issue 2", "state": "open", "updated_at": "2026-01-02T00:00:00Z" },
+    ]));
+    plane.put(
+        "repo",
+        SourceSpec {
+            connector_type: "github".into(),
+            connector_version: "1".into(),
+            config: SourceConfig::from([("api_url".into(), ConfigValue::Text(api))]),
+            credential_ref: "ops/github-local".into(),
+            egress: vec!["127.0.0.1".into()],
+            placement: BTreeMap::new(),
+            every_ms: 60_000,
+            owner: "team".into(),
+            markings: Vec::new(),
+            certification_id: String::new(),
+        },
+        "github",
+        "acme/repo",
+    );
+    plane.tick();
+    let token = dir.path().join("token");
+    std::fs::write(&token, "t").unwrap();
+    let bindings = serde_json::from_value(serde_json::json!({
+        "ops/github-local": {
+            "namespaces": [NS],
+            "destinations": ["127.0.0.1"],
+            "slots": { "token": { "file": token } }
+        }
+    }))
+    .unwrap();
+    let runtime = runtime(
+        &plane,
+        "runtime-a",
+        bindings,
+        Connectors::default().with(&GITHUB_CONNECTOR, github::open),
+    )
+    .await;
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+
+    let after = plane.db.get_object(&id(1)).unwrap().unwrap();
+    // Same object, same payload and version; only the observation is newer.
+    assert_eq!(
+        (&after.name, &after.properties, after.created),
+        (&before.name, &before.properties, before.created)
+    );
+    assert_eq!(
+        plane.db.get_object(&id(2)).unwrap().unwrap().external_id,
+        "github:acme/repo#2"
+    );
+    let (last_runtime, last_failure, _) = plane.sync_of("repo");
+    assert_eq!(
+        (last_runtime.as_str(), last_failure.as_str()),
+        ("runtime-a", "")
+    );
 }
