@@ -1038,7 +1038,7 @@ fn validate_registered_batch_envelope(
     Ok(())
 }
 
-fn require_registered_record_token(
+pub(crate) fn require_registered_record_token(
     label: &str,
     value: &str,
     allow_slash: bool,
@@ -1059,7 +1059,7 @@ fn require_registered_record_token(
     Ok(())
 }
 
-fn validate_github_repository(value: &str) -> Result<(), SourceBatchValidationError> {
+pub(crate) fn validate_github_repository(value: &str) -> Result<(), SourceBatchValidationError> {
     let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
     let repository = parts.next().unwrap_or_default();
@@ -1100,7 +1100,10 @@ fn validate_github_number(value: &str) -> Result<(), SourceBatchValidationError>
     Ok(())
 }
 
-fn require_bounded_identifier(label: &str, value: &str) -> Result<(), SourceBatchValidationError> {
+pub(crate) fn require_bounded_identifier(
+    label: &str,
+    value: &str,
+) -> Result<(), SourceBatchValidationError> {
     if value.is_empty()
         || value.len() > MAX_SOURCE_IDENTIFIER_BYTES
         || value.trim() != value

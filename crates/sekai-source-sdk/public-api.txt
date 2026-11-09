@@ -5,6 +5,7 @@ ADAPTER_REGISTERED_OBJECT_SYNC
 ADAPTER_REGISTERED_OBJECT_SYNC_VERSION
 ApplySourceBatchReply
 CHANGE_CAPTURE_CONFORMANCE_VERSION
+CONNECTOR_TYPES
 CaptureEvent
 CaptureSummary
 CapturedChange
@@ -14,19 +15,31 @@ ChangeFeedSource
 ChangeFeedSourceFailure
 ChangeOperation
 ColumnProfileHint
+ConfigError
+ConfigField
+ConfigFieldKind
+ConfigValue
 ConnectionFailure
+Connector
+ConnectorFailure
+ConnectorType
+CredentialSlot
 DEFAULT_MAX_ENTRY_BYTES
 DEFAULT_MAX_PENDING_FILES
 DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN
 DescriptorDraft
+Destination
 DirectFeedCapability
 DiscoveredColumn
 DiscoveredRecordKind
 DriftHandling
+EgressAllowlist
+ExportArtifact
 FAMILY_OBJECT_SYNC
 FlushDisposition
 FlushEntry
 FlushReport
+GITHUB_CONNECTOR
 GITHUB_OBJECT_SYNC_RECORD_TYPES
 GITHUB_OBJECT_SYNC_TYPE_DIGEST
 GITHUB_OBJECT_SYNC_TYPE_REVISION
@@ -47,8 +60,11 @@ LifecycleObservation
 LifecycleProjection
 LifecycleStage
 LineageNode
+MAX_CONFIG_FIELDS
+MAX_CONFIG_VALUE_BYTES
 MAX_DISCOVERED_COLUMNS
 MAX_DISCOVERED_RECORD_KINDS
+MAX_EGRESS_RULES
 MAX_GITHUB_FIXTURE_BYTES
 MAX_QUARANTINE_REASON_BYTES
 MAX_SOURCE_BATCH_RECORDS
@@ -62,10 +78,13 @@ MAX_SOURCE_RECORD_PROPERTIES
 OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION
 OUTBOX_FORMAT_VERSION
 ObjectLineage
+Operation
 OperationOutcome
 OutboxLimits
 PROFILE_RATIO_SCALE
 PositionFamily
+RELATIONAL_CONNECTOR
+RecordChange
 ReplayDisposition
 SDK_VERSION: &str
 SOURCE_BATCH_V2_VERSION
@@ -90,6 +109,7 @@ SourceBatchTransaction
 SourceBatchValidationError
 SourceBinding
 SourceCheckpoint
+SourceConfig
 SourceDeliveryMode
 SourceDeliveryWindow
 SourceDiscovery
@@ -217,6 +237,97 @@ conformance::run_check_conformance<S,F>(&mut S,F) -> Result<Result<(),Connection
 conformance::run_lifecycle_fixture<F>(&str,F) -> Result<LifecycleConformanceReport,String> where F:FnMut(&LifecycleObservation) -> Result<SourceRecord,String>
 conformance::run_restart_and_commit<T:SourceSyncTransport>(&Path,&SourceBatch,&mut T,&mut T) -> Result<(),String>
 conformance_suite_digest() -> String
+connector::CONNECTOR_TYPES: &[ConnectorType]
+connector::ConfigError
+connector::ConfigError::EgressDenied(&str)
+connector::ConfigError::InvalidDestination(&str)
+connector::ConfigError::InvalidEgressRule
+connector::ConfigError::InvalidSourceTokens
+connector::ConfigError::InvalidValue(&str)
+connector::ConfigError::MissingField(&str)
+connector::ConfigError::SecretLike(&str)
+connector::ConfigError::TooManyEgressRules
+connector::ConfigError::TooManyFields
+connector::ConfigError::UnknownField
+connector::ConfigError::WrongKind(&str)
+connector::ConfigField
+connector::ConfigField.kind: ConfigFieldKind
+connector::ConfigField.name: &str
+connector::ConfigField.required: bool
+connector::ConfigFieldKind
+connector::ConfigFieldKind::Boolean
+connector::ConfigFieldKind::Destination
+connector::ConfigFieldKind::Integer
+connector::ConfigFieldKind::Text
+connector::ConfigValue
+connector::ConfigValue::Boolean(bool)
+connector::ConfigValue::Integer(i64)
+connector::ConfigValue::Text(String)
+connector::Connector
+connector::Connector::apply(&mut self,&RecordChange) -> Result<String,ConnectorFailure>
+connector::Connector::check(&mut self) -> Result<(),ConnectorFailure>
+connector::Connector::deliver(&mut self,&ExportArtifact<'_>) -> Result<(),ConnectorFailure>
+connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFailure>
+connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
+connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
+connector::ConnectorFailure
+connector::ConnectorFailure::AuthFailed
+connector::ConnectorFailure::Conflict
+connector::ConnectorFailure::Invalid
+connector::ConnectorFailure::PermissionMissing
+connector::ConnectorFailure::Unreachable
+connector::ConnectorFailure::Unsupported
+connector::ConnectorType
+connector::ConnectorType.config: &[ConfigField]
+connector::ConnectorType.credential_slots: &[CredentialSlot]
+connector::ConnectorType.fixed_source: Option<&str>
+connector::ConnectorType.name: &str
+connector::ConnectorType.operations: &[Operation]
+connector::ConnectorType.version: &str
+connector::ConnectorType::destinations(&self,&SourceConfig) -> Vec<(&str,Destination)>
+connector::ConnectorType::require_egress(&self,&SourceConfig,&EgressAllowlist) -> Result<(),ConfigError>
+connector::ConnectorType::supports(&self,Operation) -> bool
+connector::ConnectorType::validate_config(&self,&SourceConfig) -> Result<(),ConfigError>
+connector::ConnectorType::validate_tokens(&self,&str,&str) -> Result<(),ConfigError>
+connector::CredentialSlot
+connector::CredentialSlot.name: &str
+connector::CredentialSlot.required: bool
+connector::Destination
+connector::Destination.host: String
+connector::Destination.port: Option<u16>
+connector::Destination::parse(&str) -> Option<Self>
+connector::EgressAllowlist
+connector::EgressAllowlist::parse<S:AsRef<str>>(&[S]) -> Result<Self,ConfigError>
+connector::EgressAllowlist::permits(&self,&Destination) -> bool
+connector::EgressAllowlist::rules(&self) -> Vec<String>
+connector::ExportArtifact
+connector::ExportArtifact.bytes: &[u8]
+connector::ExportArtifact.content_digest: &str
+connector::ExportArtifact.definition_id: &str
+connector::ExportArtifact.namespace: &str
+connector::ExportArtifact.receipt_id: &str
+connector::GITHUB_CONNECTOR: ConnectorType
+connector::MAX_CONFIG_FIELDS: usize
+connector::MAX_CONFIG_VALUE_BYTES: usize
+connector::MAX_EGRESS_RULES: usize
+connector::Operation
+connector::Operation::Apply
+connector::Operation::Check
+connector::Operation::Deliver
+connector::Operation::Discover
+connector::Operation::ReadChanges
+connector::Operation::ReadPage
+connector::Operation::from_wire_name(&str) -> Option<Self>
+connector::Operation::wire_name(self) -> &str
+connector::RELATIONAL_CONNECTOR: ConnectorType
+connector::RecordChange
+connector::RecordChange.change: BTreeMap<String,String>
+connector::RecordChange.expected_version: String
+connector::RecordChange.idempotency_key: String
+connector::RecordChange.key: String
+connector::SourceConfig = BTreeMap<String,ConfigValue>
+connector::connector_type(&str,&str) -> Option<&ConnectorType>
+connector_type
 contains_secret_like_text
 contract::ADAPTER_GITHUB_OBJECT_SYNC: &str
 contract::ADAPTER_GITHUB_OBJECT_SYNC_VERSION: &str
@@ -639,3 +750,4 @@ snapshot::run_snapshot<T:SourceSyncTransport,S:SnapshotPageSource>(&SourceAdapte
 source_id
 sync_github_record
 translate_github_fixture
+
