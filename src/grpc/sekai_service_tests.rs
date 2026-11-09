@@ -32530,6 +32530,82 @@ async fn a_denied_plan_records_the_decision_and_runs_nothing() {
     );
 }
 
+/// A parked Action and a plan step weigh the decider's whole principal set
+/// by one rule: an approver among them entitles, the submitter among them
+/// refuses.
+#[tokio::test]
+async fn a_multi_principal_decider_gets_one_answer_for_a_parked_action_and_a_plan_step() {
+    let svc = service();
+    let steps = plan_review_fixture(&svc);
+    simulated_plan(&svc, "plan-m", "sim-1", steps).await;
+    grant_object_role(&svc, "cust-plan", "mallory", security::Role::Viewer);
+    let db = svc.db.runtime();
+    let plan = db.get_plan("acme", "plan-m").unwrap().unwrap();
+    // plan.a: alice or bob decide, no review queue.
+    let step = &plan.steps[0];
+    let mut require_approval = action_policy::ActionPolicy::allow_all("agent:tester");
+    require_approval.action_overrides.insert(
+        crate::sekai::action_instance::SUBMIT_POLICY_ACTION.into(),
+        action_policy::ActionDecision::RequireApproval,
+    );
+    db.upsert_action_policy(&require_approval).unwrap();
+    let submitted = svc
+        .submit_action_instance(with_principal(SubmitActionInstanceRequest {
+            namespace: "acme".into(),
+            type_id: step.type_id.clone(),
+            version: step.version.clone(),
+            parameters_json: step.parameters_json.clone(),
+            idempotency_key: "multi-principal".into(),
+            evidence_submission_ids: vec![],
+            request_id: "req-multi-principal".into(),
+            ontology_digest: String::new(),
+            offline: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let instance = db
+        .get_action_instance(&submitted.instance.unwrap().instance_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        instance.status,
+        crate::sekai::action_instance::STATUS_PARKED
+    );
+    assert_eq!(instance.principal, plan.planner);
+    let type_def = db
+        .get_governed_action_type("acme", &step.type_id, &step.version)
+        .unwrap()
+        .unwrap();
+    let policy_context = crate::sekai::object_security::PrincipalPolicyContext::default();
+    for (presented, expected) in [
+        (["mallory", "bob"], true),
+        (["mallory", "carol"], false),
+        (["bob", "tester"], false),
+    ] {
+        let principals: Vec<String> = presented.into_iter().map(String::from).collect();
+        let parked = crate::sekai::action_instance_admission::may_decide(
+            &type_def,
+            &instance.principal,
+            &instance.review,
+            "mallory",
+            &principals,
+            false,
+        );
+        let planned = super::rpc_actions::plan_step_decider(
+            &svc,
+            "mallory",
+            &principals,
+            None,
+            &policy_context,
+            true,
+            1,
+        )(&plan, step)
+        .unwrap();
+        assert_eq!((parked, planned), (expected, expected), "{presented:?}");
+    }
+}
+
 #[tokio::test]
 async fn conversation_draft_traces_each_member_to_its_turn_and_lints_unpublished() {
     let svc = service();

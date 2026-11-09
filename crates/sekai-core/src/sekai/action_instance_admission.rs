@@ -1132,7 +1132,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             .ok_or_else(access_denied)?;
         if !may_decide(
             &type_def,
-            &instance,
+            &instance.principal,
+            &instance.review,
             decider,
             &request.decider_principals,
             request.decider_is_namespace_admin,
@@ -2870,42 +2871,40 @@ fn target_object_id(parameters_json: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether `decider`, presenting `principals`, may decide `instance` of
-/// `type_def`: not its submitter, entitled (a named approver, else a
-/// namespace administrator), and allowed by its review-queue placement. The
-/// one rule a decision applies and an approver inbox lists by (#1771).
+/// Whether `decider`, presenting `principals`, may decide an Action of
+/// `type_def` that `submitter` submitted and that has `review` as its
+/// review-queue placement: no presented principal is the submitter, one is
+/// entitled (a named approver, else a namespace administrator), and the
+/// placement lets `decider` decide. The one rule a parked Action's decision,
+/// an approver inbox (#1771) and every plan step (#1678, #1679) apply.
+/// `principals` must be the decider's authenticated identities, never a
+/// self-asserted list: every caller passes only the credentialed decider.
 pub fn may_decide(
     type_def: &crate::sekai::governed_action_type::GovernedActionType,
-    instance: &ActionInstance,
+    submitter: &str,
+    review: &crate::sekai::review_queue::ReviewPlacement,
     decider: &str,
     principals: &[String],
     decider_is_namespace_admin: bool,
 ) -> bool {
-    let is_submitter = decider == instance.principal
-        || principals
-            .iter()
-            .any(|principal| principal == &instance.principal);
+    let mut presented = principals
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(decider));
+    let is_submitter = presented.clone().any(|principal| principal == submitter);
     let entitled = if type_def.approvers.is_empty() {
         decider_is_namespace_admin
     } else {
-        principals
-            .iter()
-            .map(String::as_str)
-            .chain(std::iter::once(decider))
-            .any(|principal| {
-                type_def
-                    .approvers
-                    .iter()
-                    .any(|approver| approver == principal)
-            })
+        presented.any(|principal| {
+            type_def
+                .approvers
+                .iter()
+                .any(|approver| approver == principal)
+        })
     };
     !is_submitter
         && entitled
-        && crate::sekai::review_queue::reviewer_may_decide(
-            &type_def.review_queue,
-            &instance.review,
-            decider,
-        )
+        && crate::sekai::review_queue::reviewer_may_decide(&type_def.review_queue, review, decider)
 }
 
 fn object_changed() -> ActionInstanceAdmissionError {
