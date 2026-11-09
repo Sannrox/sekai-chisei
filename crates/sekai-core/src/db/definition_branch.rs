@@ -12,15 +12,16 @@ use crate::sekai::definition_branch::{
 };
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    DefinitionMergePath, DefinitionProposal, DefinitionProposalApproval,
-    DefinitionProposalMergeResult, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
-    PreparedProposalDigestInput, ProposeDefinitionImport, ProposeDefinitionRollback,
-    PublishedDefinitionHistoryStore, PublishedDefinitionRevisionHistoryEntry, ReplacementProposal,
-    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, dataset_column_names,
-    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
-    object_property_keys, proposal_content_digest, reject_foreign_member_grants,
-    require_descendant_candidate, require_rollback_migration_plan,
-    rollback_may_drop_live_object_type_properties, rollback_member_edits,
+    DATASET_PROPOSAL_NOT_FOUND, DatasetProposalAttachment, DefinitionMergePath, DefinitionProposal,
+    DefinitionProposalApproval, DefinitionProposalMergeResult, MergeDefinitionProposal,
+    PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput, ProposeDefinitionImport,
+    ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
+    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
+    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
+    list_published_definition_history, merge_receipt_id, object_property_keys,
+    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
+    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
+    rollback_member_edits,
 };
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
@@ -993,8 +994,8 @@ impl SekaiDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
-        let (eval_plan_digests, named_foreign_digests, proposal_digest, request_digest) =
-            request.prepare()?;
+        let prepared = request.prepare()?;
+        let request_digest = prepared.request_digest;
         validate_write_context(actor, now_ms)?;
         let mut connection = self.conn();
         let transaction = connection
@@ -1039,17 +1040,30 @@ impl SekaiDb {
                 .ok_or_else(|| {
                     "definition_revision_not_found: candidate revision is unavailable".to_string()
                 })?;
-        reject_foreign_member_grants(&candidate, &named_foreign_digests)?;
-        let proposal = DefinitionProposal {
-            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+        reject_foreign_member_grants(&candidate, &prepared.named_foreign_digests)?;
+        let dataset_proposals = prepared
+            .dataset_proposals
+            .iter()
+            .map(|reference| {
+                let proposal = crate::db::dataset_branch::load_proposal(
+                    &transaction,
+                    &reference.dataset_id,
+                    &reference.proposal_id,
+                )
+                .map_err(not_found_as_unattachable)?;
+                DatasetProposalAttachment::pin(&proposal, &request.tenant)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut proposal = DefinitionProposal {
+            contract_version: DefinitionProposal::contract_version_for(&dataset_proposals).into(),
             namespace: request.namespace.clone(),
             branch_id: request.branch_id.clone(),
             proposal_id: request.proposal_id.clone(),
             base_digest: request.base_digest.clone(),
             candidate_digest: request.candidate_digest.clone(),
-            proposal_digest,
-            eval_plan_digests,
-            named_foreign_digests,
+            proposal_digest: String::new(),
+            eval_plan_digests: prepared.eval_plan_digests,
+            named_foreign_digests: prepared.named_foreign_digests,
             approvals: Vec::new(),
             status: STATUS_OPEN.into(),
             created_by: actor.into(),
@@ -1062,7 +1076,9 @@ impl SekaiDb {
             major_revision: request.major_revision,
             source_package_digest: String::new(),
             source_commit: String::new(),
+            dataset_proposals,
         };
+        proposal.proposal_digest = proposal.content_digest()?;
         insert_proposal_sqlite(&transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
             proposal: proposal.clone(),
@@ -1299,6 +1315,17 @@ impl SekaiDb {
                 ));
             }
         }
+        // Attached dataset proposals (#2199): the write lock holds their
+        // writers off until the publish commits.
+        for attachment in &proposal.dataset_proposals {
+            let dataset_proposal = crate::db::dataset_branch::load_proposal(
+                &transaction,
+                &attachment.dataset_id,
+                &attachment.proposal_id,
+            )
+            .map_err(|error| attachment.stale_or(error))?;
+            attachment.recheck(&dataset_proposal, actor)?;
+        }
         let candidate = load_revision_sqlite(
             &transaction,
             &proposal.namespace,
@@ -1391,15 +1418,19 @@ impl SekaiDb {
             baseline.as_ref(),
             now_ms,
         )?;
-        let receipt_id = merge_receipt_id(
-            &proposal.namespace,
-            &proposal.proposal_id,
-            &proposal.proposal_digest,
-            &proposal.base_digest,
-            &proposal.candidate_digest,
-            &published,
-            &proposal.restored_from_digest,
-        )?;
+        // Every gate passed: land the attached data, then publish. Any error
+        // rolls the whole transaction back.
+        let mut dataset_receipt_ids = Vec::with_capacity(proposal.dataset_proposals.len());
+        for attachment in &proposal.dataset_proposals {
+            let merged = crate::db::dataset_branch::merge_dataset_branch_tx(
+                &transaction,
+                &attached_dataset_merge(&proposal, attachment),
+                &|_| Ok(()),
+            )
+            .map_err(|error| attachment.stale_or(error))?;
+            dataset_receipt_ids.push(merged.receipt_id);
+        }
+        let receipt_id = merge_receipt_id(&proposal, &published, &dataset_receipt_ids)?;
         let published_revision = mark_revision_published_sqlite(&transaction, &candidate, now_ms)?;
         write_published_head_sqlite(
             &transaction,
@@ -1499,6 +1530,29 @@ impl SekaiDb {
         )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
+    }
+}
+
+/// A missing dataset proposal reads like one in another tenant.
+pub(crate) fn not_found_as_unattachable(error: String) -> String {
+    if error == crate::sekai::dataset_branch::PROPOSAL_NOT_FOUND {
+        format!("{DATASET_PROPOSAL_NOT_FOUND}: dataset branch proposal is unavailable")
+    } else {
+        error
+    }
+}
+
+/// The dataset branch merge an attached proposal lands with `proposal`.
+pub(crate) fn attached_dataset_merge(
+    proposal: &DefinitionProposal,
+    attachment: &DatasetProposalAttachment,
+) -> crate::sekai::dataset_branch::MergeDatasetBranch {
+    crate::sekai::dataset_branch::MergeDatasetBranch {
+        dataset_id: attachment.dataset_id.clone(),
+        proposal_id: attachment.proposal_id.clone(),
+        actor: proposal.dataset_merge_actor(),
+        tenant: attachment.tenant.clone(),
+        reason: format!("definition-proposal-merge:{}", proposal.proposal_id),
     }
 }
 
@@ -1980,6 +2034,7 @@ fn open_replacement_proposal_sqlite(
         major_revision: false,
         source_package_digest: replacement.source_package_digest,
         source_commit: replacement.source_commit,
+        dataset_proposals: &[],
     })?;
     let proposal = DefinitionProposal {
         contract_version: PROPOSAL_CONTRACT_VERSION.into(),
@@ -2003,6 +2058,7 @@ fn open_replacement_proposal_sqlite(
         major_revision: false,
         source_package_digest: replacement.source_package_digest.into(),
         source_commit: replacement.source_commit.into(),
+        dataset_proposals: Vec::new(),
     };
     insert_proposal_sqlite(transaction, &proposal)?;
     Ok(proposal)
@@ -2805,6 +2861,8 @@ mod tests {
                 idempotency_key: "propose-foreign".into(),
                 major_revision: false,
                 migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
+                tenant: String::new(),
             },
             "author",
             4,
@@ -2880,6 +2938,8 @@ mod tests {
                 idempotency_key: "propose-1".into(),
                 major_revision: false,
                 migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
+                tenant: String::new(),
             },
             "author",
             4,

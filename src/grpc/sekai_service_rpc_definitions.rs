@@ -611,7 +611,7 @@ pub(super) async fn create_definition_proposal(
         &input.namespace,
         true,
     )?;
-    let request = definition_proposal_domain::CreateDefinitionProposal {
+    let mut request = definition_proposal_domain::CreateDefinitionProposal {
         namespace: input.namespace,
         branch_id: input.branch_id,
         proposal_id: input.proposal_id,
@@ -622,8 +622,26 @@ pub(super) async fn create_definition_proposal(
         idempotency_key: input.idempotency_key,
         major_revision: input.major_revision,
         migration_plan_digest: input.migration_plan_digest,
+        dataset_proposals: input
+            .dataset_proposals
+            .into_iter()
+            .map(|reference| definition_proposal_domain::DatasetProposalRef {
+                dataset_id: reference.dataset_id,
+                proposal_id: reference.proposal_id,
+            })
+            .collect(),
+        tenant: String::new(),
     };
-    request.prepare().map_err(Status::invalid_argument)?;
+    let prepared = request.prepare().map_err(Status::invalid_argument)?;
+    request.tenant = super::rpc_data::authorize_attached_datasets(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        prepared
+            .dataset_proposals
+            .iter()
+            .map(|reference| reference.dataset_id.as_str()),
+    )?;
     authorize_definition_revision(
         service,
         &principals,
@@ -925,6 +943,26 @@ pub(super) async fn merge_definition_proposal(
         &proposal,
     )?;
     let actor = actor.as_str();
+    // The merger lands the attached data too, so it must be able to write it
+    // from the tenant the data was pinned in (#2199).
+    if !proposal.dataset_proposals.is_empty() {
+        let tenant = super::rpc_data::authorize_attached_datasets(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            proposal
+                .dataset_proposals
+                .iter()
+                .map(|attachment| attachment.dataset_id.as_str()),
+        )?;
+        if proposal
+            .dataset_proposals
+            .iter()
+            .any(|attachment| attachment.tenant != tenant)
+        {
+            return Err(Status::not_found("definition resource unavailable"));
+        }
+    }
     let result = service
         .db
         .runtime()

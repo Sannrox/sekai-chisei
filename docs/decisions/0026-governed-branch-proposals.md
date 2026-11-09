@@ -8,6 +8,7 @@
 - Supersedes: none
 - Superseded by: none
 - Related: ADR 0024, Discussion 726, Issues #669, #683, #731, #733
+- Amended by: attached dataset branch proposals (#2199), section 7
 
 ## Context
 
@@ -51,6 +52,10 @@ published head.
 7. Unchanged resources remain on the published head. Evaluation plans may be
    referenced by digest as frozen dependencies; they are not a second merge
    protocol. Objects, datasets, and source records are not members.
+   Amended (#2199): a proposal may attach open dataset branch merge
+   proposals as merge preconditions. Datasets stay non-members. Merge lands
+   the attached dataset merges and the published head in one transaction,
+   or none of them.
 8. Merge rechecks live grants, expected published head, ancestry, and
    approvals, then compare-and-swaps the published head in one namespace
    transaction bound to a receipt. Interrupted merge reconstructs from that

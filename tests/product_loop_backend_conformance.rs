@@ -312,6 +312,7 @@ async fn exercise_product_loop(server: &LoopServer) {
             idempotency_key: "loop-propose".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         })
         .await
         .unwrap_or_else(|error| panic!("propose: {error}\n{}", logs()));

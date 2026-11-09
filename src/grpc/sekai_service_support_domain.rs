@@ -1025,6 +1025,8 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
     if error.starts_with("definition_publish_blocked")
         || error.starts_with(crate::sekai::transform_shadow::REFUSAL_TRANSFORM_SHADOW)
         || error.starts_with(crate::sekai::definition_proposal::MERGE_REQUIRES_BUNDLE_APPLY)
+        || error.starts_with(crate::sekai::definition_proposal::MERGE_DATASET_PROPOSAL_STALE)
+        || error.starts_with(crate::sekai::definition_proposal::DATASET_PROPOSAL_REFUSED)
     {
         return Status::failed_precondition(error);
     }
@@ -1032,6 +1034,7 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("definition_branch_not_found")
         || error.starts_with("definition_member_not_found")
         || error.starts_with("definition_proposal_not_found")
+        || error.starts_with(crate::sekai::definition_proposal::DATASET_PROPOSAL_NOT_FOUND)
         || error.starts_with("fact_migration_not_found")
     {
         Status::not_found("definition resource unavailable")

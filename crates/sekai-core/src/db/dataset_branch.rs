@@ -509,6 +509,13 @@ impl SekaiDb {
     ) -> Result<DatasetBranchProposal, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // Only an open proposal is held; a merged one still replays.
+        if load_proposal(&tx, &request.dataset_id, &request.proposal_id)
+            .is_ok_and(|proposal| proposal.status == dataset_branch::STATUS_OPEN)
+            && attached_to_open_definition_proposal(&tx, &request.dataset_id, &request.proposal_id)?
+        {
+            return Err(dataset_branch::PROPOSAL_ATTACHED.into());
+        }
         let proposal = merge_dataset_branch_tx(&tx, request, check)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
@@ -603,6 +610,31 @@ pub fn merge_dataset_branch_tx(
     .map_err(|error| error.to_string())?;
     drop_branch(tx, &request.dataset_id, &proposal.branch)?;
     Ok(proposal)
+}
+
+/// Whether an open definition proposal attaches this dataset proposal
+/// (#2199). Attachments live in the proposal body, so this narrows open
+/// proposals by the id's text and then checks the parsed attachments.
+fn attached_to_open_definition_proposal(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    proposal_id: &str,
+) -> Result<bool, String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE status = ?1 AND instr(body_json, ?2) > 0",
+        )
+        .map_err(|error| error.to_string())?;
+    let bodies = stmt
+        .query_map(
+            params![crate::sekai::definition_proposal::STATUS_OPEN, proposal_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    crate::sekai::definition_proposal::any_attaches(&bodies, dataset_id, proposal_id)
 }
 
 pub fn create_branch_tx(
@@ -1132,7 +1164,7 @@ fn drop_branch(tx: &Transaction<'_>, dataset_id: &str, name: &str) -> Result<(),
     Ok(())
 }
 
-fn load_proposal(
+pub(crate) fn load_proposal(
     tx: &Transaction<'_>,
     dataset_id: &str,
     id: &str,
