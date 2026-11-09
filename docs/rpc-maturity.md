@@ -60,6 +60,40 @@ HTTP/JSON is a generated projection of the same `stable` unary RPCs
 on `SEKAI_HTTP_PORT`. Authorization, cursors, and hidden-row rules match gRPC.
 Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 
+## Promotion criteria
+
+An `experimental` RPC moves to `stable` only when it meets the
+`stable` class above and all of these (#2089):
+
+1. **Wire compatibility.** The server trait has a default stub, and request
+   and response messages grow through `..Default::default()` (#2035). A
+   public enum or trait that will gain variants or methods is
+   `#[non_exhaustive]` or has default methods. Request semantics such as
+   paging are final, because changing them after promotion breaks callers.
+2. **Authorization.** The caller's namespace grant, tenant context, and team
+   namespace are checked. Results are filtered by namespace, marking, and
+   object policy before ranking and before the limit, so hidden rows never
+   take a slot. A test covers restricted objects.
+3. **Restartable lifecycle.** Index rebuilds, spec changes, and backfills keep
+   their state in the database, are idempotent, and resume or redo after a
+   crash. Writes from several instances are fenced. A crash test covers this.
+4. **Both backends.** Behavior and RPC-level tests run on SQLite and on
+   PostgreSQL through `scripts/postgres-conformance.sh`.
+5. **Bounded cost.** List and query RPCs page, and the upper limits on input,
+   results, and index size are enforced and documented.
+
+Status of the experimental Search, embedding-spec, and governed-document
+RPCs against these criteria:
+
+| RPCs | Status | Blocked by |
+| --- | --- | --- |
+| `SekaiService.Search`, `SekaiService.GetSearchIndexStatus` | `experimental` | #2243: no fencing across instances, rebuild inside requests, offset page token, unbounded query cost, no PostgreSQL RPC tests |
+| `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2244: rebuild cursor held in memory, no limits, no paging on `ListEmbeddingSpecs`, no PostgreSQL RPC tests |
+| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: no namespace or tenant authorization, classification model undecided, admission takes the stored record |
+
+When a blocking Issue closes, its RPCs move to `stable` in
+`tests/fixtures/rpc_maturity/v1.json` and leave this table.
+
 ## Table
 
 **Real backend** is `yes` when the RPC runs on both community runtimes,
