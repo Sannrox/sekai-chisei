@@ -73,8 +73,9 @@ and does not embed credentials or provider routing.
 ### One claim family (experimental, ADR 0149)
 
 `ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim` and `AckWork` take a
-`kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`) and
-a `work_id` (the run, effect or turn id). Each call runs that kind's RPC
+`kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`,
+`WORK_KIND_EXPORT_DELIVERY`) and a `work_id` (the run, effect, turn or
+receipt id). Each call runs that kind's RPC
 above, with the same authorization, runtime-token binding and errors, and
 returns that RPC's response in a `oneof`. A claim taken through one family is
 heartbeated or acknowledged through the other, so a rolling deploy can mix
@@ -85,9 +86,16 @@ no `AckWork`; `WriteTransformRunResult` carries its output and acknowledges
 it. A runtime token reaches only its own kind on `HeartbeatWorkClaim` and
 `AckWork`, and transform work stays closed to enterprise-scoped credentials.
 
+Export delivery has no claim RPCs of its own. Its claim, renewal and
+acknowledge (`ExportDeliveryAckOptions` with the digest, outcome
+`completed`) run the saved-export delivery checks of
+[governed export](governed-export.md#saved-exports), runtime tokens are
+refused for it, and `sekai-client` has no per-kind fallback for it.
+
 ## Lease rules (v1)
 
-Action work, transform work and agent turns share one claim engine
+Action work, transform work, agent turns and export deliveries share one
+claim engine
 (`sekai_types::work_claim`, ADR 0149): claiming, counting a lapsed lease,
 reclaiming under a higher generation, heartbeat and the fence check are the
 same code for every kind and on both stores. Each kind keeps its own row,

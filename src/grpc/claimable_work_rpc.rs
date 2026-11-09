@@ -2,11 +2,13 @@
 //! `ClaimWork`, `HeartbeatWorkClaim` and `AckWork`. Each call names a kind
 //! and runs that kind's own RPC path, with its authorization, runtime-token
 //! binding and claim engine, so a claim taken through either family is the
-//! same claim to both.
+//! same claim to both. Export delivery has no claim RPCs of its own: it
+//! runs the saved-export delivery checks, and its deprecated list, fetch
+//! and acknowledge honor the claims taken here.
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
-use crate::sekai::work_claim::WorkKind as Kind;
+use crate::sekai::work_claim::{Fence, WorkKind as Kind};
 
 impl SekaiServiceImpl {
     pub(super) async fn list_claimable_work_rpc(
@@ -68,6 +70,14 @@ impl SekaiServiceImpl {
                     .turns
                     .into_iter()
                     .map(claimable_work::Payload::AgentTurn)
+                    .collect()
+            }
+            Kind::ExportDelivery => {
+                refuse_turn_options(turn)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                self.list_claimable_export_deliveries(&req, &inner.namespace, inner.limit)?
+                    .into_iter()
+                    .map(claimable_work::Payload::ExportDelivery)
                     .collect()
             }
             _ => return Err(unserved(kind)),
@@ -142,6 +152,18 @@ impl SekaiServiceImpl {
                         .into_inner(),
                 )
             }
+            Kind::ExportDelivery => {
+                refuse_turn_options(turn)?;
+                refuse_request_id(&inner.request_id)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                claim_work_response::Payload::ExportDelivery(self.claim_export_delivery(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    &inner.work_id,
+                    inner.ttl_ms,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(ClaimWorkResponse {
@@ -204,6 +226,17 @@ impl SekaiServiceImpl {
                     ))
                     .await?
                     .into_inner(),
+                )
+            }
+            Kind::ExportDelivery => {
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                heartbeat_work_claim_response::Payload::ExportDelivery(
+                    self.heartbeat_export_delivery(&req, &inner.work_id, fence, inner.ttl_ms)?,
                 )
             }
             _ => return Err(unserved(kind)),
@@ -275,6 +308,30 @@ impl SekaiServiceImpl {
                         .into_inner(),
                 )
             }
+            Kind::ExportDelivery => {
+                let Some(ack_work_request::Options::ExportDelivery(options)) = inner.options else {
+                    return Err(Status::invalid_argument(
+                        "export delivery needs ExportDeliveryAckOptions with the digest",
+                    ));
+                };
+                if inner.outcome != "completed" {
+                    return Err(Status::invalid_argument(
+                        "export delivery is acknowledged as completed",
+                    ));
+                }
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                ack_work_response::Payload::ExportDelivery(self.ack_export_delivery(
+                    &req,
+                    &inner.work_id,
+                    fence,
+                    &options.content_digest,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(AckWorkResponse {
@@ -291,9 +348,10 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         Ok(WorkKind::Transform) => Kind::Transform,
         Ok(WorkKind::Action) => Kind::Action,
         Ok(WorkKind::AgentTurn) => Kind::AgentTurn,
+        Ok(WorkKind::ExportDelivery) => Kind::ExportDelivery,
         Ok(WorkKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument(
-                "kind must be transform, action or agent_turn",
+                "kind must be transform, action, agent_turn or export_delivery",
             ));
         }
     };

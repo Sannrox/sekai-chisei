@@ -210,6 +210,7 @@ const CONSUMER_VIOLATION_CREATED_INDEX_SCHEMA: &str =
     include_str!("postgres/0146_consumer_violation_created_index.sql");
 const CATALOG_CRITICALITY_OUTBOX_CREATED_INDEX_SCHEMA: &str =
     include_str!("postgres/0147_catalog_criticality_outbox_created_index.sql");
+const EXPORT_DELIVERY_CLAIM_SCHEMA: &str = include_str!("postgres/0148_export_delivery_claim.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1061,6 +1062,12 @@ const MIGRATIONS: &[Migration] = &[
         146,
         "catalog_criticality_outbox_created_index",
         CATALOG_CRITICALITY_OUTBOX_CREATED_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        147,
+        "export_delivery_claim",
+        EXPORT_DELIVERY_CLAIM_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

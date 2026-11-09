@@ -40,6 +40,7 @@ pub mod data_export_artifact_store;
 pub mod data_export_store;
 pub mod dataset;
 pub mod dataset_health;
+pub mod export_delivery;
 pub mod export_fingerprint;
 pub use sekai_types::dataset_branch;
 pub use sekai_types::dataset_version;

@@ -16,16 +16,24 @@ pub enum WorkKind {
     Transform,
     Action,
     AgentTurn,
+    /// A saved-export artifact awaiting delivery (ADR 0148).
+    ExportDelivery,
 }
 
 impl WorkKind {
-    pub const ALL: [WorkKind; 3] = [WorkKind::Transform, WorkKind::Action, WorkKind::AgentTurn];
+    pub const ALL: [WorkKind; 4] = [
+        WorkKind::Transform,
+        WorkKind::Action,
+        WorkKind::AgentTurn,
+        WorkKind::ExportDelivery,
+    ];
 
     pub const fn wire_name(self) -> &'static str {
         match self {
             WorkKind::Transform => "transform",
             WorkKind::Action => "action",
             WorkKind::AgentTurn => "agent_turn",
+            WorkKind::ExportDelivery => "export_delivery",
         }
     }
 
