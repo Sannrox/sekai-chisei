@@ -2894,7 +2894,8 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 recorded_at_ms,
             ),
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
-                db.put_operation_receipt_with_kioku_holdouts(
+                super::postgres_kioku::put_operation_receipt_with_kioku_holdouts(
+                    db,
                     receipt,
                     holdouts,
                     actor,
