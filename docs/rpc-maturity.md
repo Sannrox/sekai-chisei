@@ -87,7 +87,7 @@ RPCs against these criteria:
 
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
-| `SekaiService.Search`, `SekaiService.GetSearchIndexStatus` | `experimental` | #2243: no fencing across instances, rebuild inside requests, offset page token, unbounded query cost, no PostgreSQL RPC tests |
+| `SekaiService.Search`, `SekaiService.GetSearchIndexStatus` | `experimental` | #2243: unbounded query cost, no PostgreSQL RPC tests |
 | `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2244: rebuild cursor held in memory, no limits, no paging on `ListEmbeddingSpecs`, no PostgreSQL RPC tests |
 | `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: no namespace or tenant authorization, classification model undecided, admission takes the stored record |
 
