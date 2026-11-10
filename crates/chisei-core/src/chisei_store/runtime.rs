@@ -2887,8 +2887,20 @@ impl ChiseiRuntimeDb for RuntimeDb {
         recorded_at_ms: i64,
     ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.put_operation_receipt_with_kioku_holdouts(receipt, holdouts, actor, recorded_at_ms),
-            Self::Postgres(_) => Err("put_operation_receipt_with_kioku_holdouts is unavailable on the PostgreSQL community runtime".into()),
+            Self::Sqlite(db) => db.put_operation_receipt_with_kioku_holdouts(
+                receipt,
+                holdouts,
+                actor,
+                recorded_at_ms,
+            ),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.put_operation_receipt_with_kioku_holdouts(
+                    receipt,
+                    holdouts,
+                    actor,
+                    recorded_at_ms,
+                )
+            }),
         }
     }
 
