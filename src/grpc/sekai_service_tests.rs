@@ -37730,3 +37730,161 @@ mod pending_decisions_tests;
 
 #[path = "export_delivery_source_tests.rs"]
 mod export_delivery_source_tests;
+
+/// Document RPCs run the namespace authorization object writes use (#2248):
+/// a non-member of a team-managed namespace is refused on all seven RPCs,
+/// and a viewer may read but not write.
+#[tokio::test]
+async fn governed_document_rpcs_require_namespace_membership() {
+    let svc = service();
+    for (principal, role) in [("alice", "viewer"), ("carol", "editor")] {
+        svc.ensure_team_namespace(with_named_principal(
+            EnsureTeamNamespaceRequest {
+                namespace: "acme".into(),
+                principal: principal.into(),
+                role: role.into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap();
+    }
+    let document = |owner: &str| GovernedDocument {
+        contract_version: "sekai.governed-document/v1".into(),
+        document_id: "doc:brief".into(),
+        namespace: "acme".into(),
+        owner: owner.into(),
+        type_revision: "v1".into(),
+        purpose: "case-review".into(),
+        classification: "public".into(),
+        title: "Brief".into(),
+        content_ref: Some(ContentReference {
+            scheme: "digest".into(),
+            digest: format!("sha256:01{}", "ab".repeat(31)),
+            media_type: "application/pdf".into(),
+            byte_length: 128,
+        }),
+        ..Default::default()
+    };
+    svc.admit_governed_document(with_named_principal(
+        AdmitGovernedDocumentRequest {
+            document: Some(document("carol")),
+        },
+        "carol",
+    ))
+    .await
+    .unwrap();
+
+    let denied = |label: &str, result: Result<(), Status>| {
+        let status = result.expect_err(label);
+        assert_eq!(
+            status.code(),
+            tonic::Code::PermissionDenied,
+            "{label}: {status}"
+        );
+        assert_eq!(status.message(), "namespace access denied", "{label}");
+    };
+    let target = || ("acme".to_string(), "doc:brief".to_string());
+    for principal in ["bob", "alice"] {
+        let (namespace, document_id) = target();
+        denied(
+            "admit",
+            svc.admit_governed_document(with_named_principal(
+                AdmitGovernedDocumentRequest {
+                    document: Some(GovernedDocument {
+                        document_id: format!("doc:{principal}"),
+                        ..document(principal)
+                    }),
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+        denied(
+            "attach",
+            svc.attach_governed_document_rendition(with_named_principal(
+                AttachGovernedDocumentRenditionRequest {
+                    rendition: Some(DocumentRendition {
+                        namespace: namespace.clone(),
+                        document_id: document_id.clone(),
+                        rendition_id: "text".into(),
+                        ..Default::default()
+                    }),
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+        denied(
+            "hold",
+            svc.hold_governed_document(with_named_principal(
+                HoldGovernedDocumentRequest {
+                    namespace: namespace.clone(),
+                    document_id: document_id.clone(),
+                    hold_id: "legal".into(),
+                    reason: "review".into(),
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+        denied(
+            "release",
+            svc.release_governed_document_hold(with_named_principal(
+                ReleaseGovernedDocumentHoldRequest {
+                    namespace: namespace.clone(),
+                    document_id: document_id.clone(),
+                    hold_id: "legal".into(),
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+        denied(
+            "expire",
+            svc.expire_governed_document(with_named_principal(
+                ExpireGovernedDocumentRequest {
+                    namespace: namespace.clone(),
+                    document_id: document_id.clone(),
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+        denied(
+            "delete",
+            svc.delete_governed_document(with_named_principal(
+                DeleteGovernedDocumentRequest {
+                    namespace,
+                    document_id,
+                },
+                principal,
+            ))
+            .await
+            .map(drop),
+        );
+    }
+
+    let get = |principal: &'static str| {
+        let (namespace, document_id) = target();
+        svc.get_governed_document(with_named_principal(
+            GetGovernedDocumentRequest {
+                namespace,
+                document_id,
+                purpose: "case-review".into(),
+                ..Default::default()
+            },
+            principal,
+        ))
+    };
+    denied("non-member get", get("bob").await.map(drop));
+    // The viewer passes the namespace check and meets the owner-only read.
+    let viewer = get("alice").await.expect_err("viewer is not the owner");
+    assert_eq!(viewer.code(), tonic::Code::NotFound, "{viewer}");
+    get("carol").await.expect("owner and editor reads");
+}
