@@ -17,6 +17,8 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "DeleteObject" },
   { service: "sekai.SekaiService", rpc: "ListObjects" },
   { service: "sekai.SekaiService", rpc: "EvaluateObjectSet" },
+  { service: "sekai.SekaiService", rpc: "Search" },
+  { service: "sekai.SekaiService", rpc: "GetSearchIndexStatus" },
   { service: "sekai.SekaiService", rpc: "ReadObjectChangeSubscription" },
   { service: "sekai.SekaiService", rpc: "PutObjectSecurityPolicyRevision" },
   { service: "sekai.SekaiService", rpc: "ActivateObjectSecurityPolicies" },

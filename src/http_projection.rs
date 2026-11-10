@@ -230,6 +230,18 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "Search") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::search(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetSearchIndexStatus") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_search_index_status(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "GetPublishedDefinitionRevision") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_published_definition_revision(&*svc, req).await
@@ -1202,6 +1214,26 @@ mod tests {
             "ReportDefinitionConsumerImpact",
             "CreateDefinitionProposal",
         ] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promoted_search_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in ["Search", "GetSearchIndexStatus"] {
             let path = format!("/sekai.SekaiService/{rpc}");
             let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");

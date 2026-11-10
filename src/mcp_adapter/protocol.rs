@@ -27,7 +27,7 @@ pub const DIFF_DEFINITIONS_TOOL: &str = "sekai.definitions.diff";
 pub const IMPACT_DEFINITIONS_TOOL: &str = "sekai.definitions.impact";
 pub const CREATE_DEFINITION_PROPOSAL_TOOL: &str = "sekai.definitions.proposal.create";
 /// Hybrid search (#1683): object references under the Search RPC's read
-/// policy and fusion profile, never vectors. The backing RPC is experimental.
+/// policy and fusion profile, never vectors. The backing RPC is stable (#2243).
 pub const SEARCH_TOOL: &str = "sekai.search.query";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[

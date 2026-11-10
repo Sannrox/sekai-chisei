@@ -1,14 +1,13 @@
 # Permission-aware search
 
-`Search` and `GetSearchIndexStatus` are experimental RPCs over the derived
+`Search` and `GetSearchIndexStatus` are stable RPCs over the derived
 search index ([ADR 0108](decisions/0108-permission-aware-search-index.md)).
 The index is not authority. Every response carries `authority: false` and the
 current namespace lag.
 
 Capability discovery of `sekai.search.query` or `sekai.search.status` is not a
-grant. Both RPCs stay classified `experimental`
-([rpc-maturity.md](rpc-maturity.md)) and are rejected unless
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+grant. Both RPCs are classified `stable` ([rpc-maturity.md](rpc-maturity.md),
+#2243) and are served without `SEKAI_EXPERIMENTAL_RPCS`.
 
 ## Search
 
