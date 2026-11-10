@@ -31,6 +31,7 @@ count. When the cap is reached, `count_is_lower_bound` is true. Property
 equality filters are applied on the live projection after a bounded
 policy-scoped candidate scan; if that scan is full and a filter is present,
 the count is a lower bound because the index has no candidate cursor.
+[Query bounds](#query-bounds) gives the numbers.
 
 An ungranted property filter or facet fails closed. Dataset metadata
 (name and column names) is searchable at the discover level, the way
@@ -63,19 +64,74 @@ dropped when the live projection hides one of its source properties, or
 when the object's kind or source text changed since it was embedded: a stale
 vector may carry a value the caller can no longer read. Hidden objects
 therefore never use up the cap, recall is 1.0 over what the caller may
-read, and a filled cap marks the count as a lower bound. A vector hit that
-does not match the text has no highlights. `vector_lag_ms` is the age of the
-oldest object change the searched vectors have not consumed.
+read among each spec's 10,000 nearest objects, and a filled cap marks the
+count as a lower bound. A vector hit that does not match the text has no
+highlights. `vector_lag_ms` is the age of the oldest object change the
+searched vectors have not consumed.
 
 Agents reach hybrid search through the MCP tool `sekai.search.query`
 ([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
 returns object references, never vectors. Each hybrid hit carries its fused
 `score`; text-mode hits carry 0.
 
-Agents reach hybrid search through the MCP tool `sekai.search.query`
-([capability-catalog.md](capability-catalog.md#hybrid-search-tool)), which
-returns object references, never vectors. Each hybrid hit carries its fused
-`score`; text-mode hits carry 0.
+## Query bounds
+
+One `Search` request keeps bounded memory and does bounded work after the
+read policy, whatever the index holds (#2252). Every bound counts only
+entries the store's read policy admits, so a cut never depends on entries
+the caller cannot read. SQLite and PostgreSQL apply the same bounds in the
+same order.
+
+| Bound | Value | Applies to |
+| --- | --- | --- |
+| Text scan | 10,000 admitted documents | each source (`object`, `dataset`) |
+| Vector ranking | 10,000 nearest admitted objects | each searched embedding spec |
+| Candidate cap | 256 visible hits | text list and vector list, before paging |
+| Page size | 100 hits (default 20) | each response |
+
+- **Text.** Each source is scanned on its own, so one source reaching its
+  bound never hides the other. A scan reads the matching index entries of
+  the requested kinds in id order, a page at a time. An entry is one
+  property, dataset name, or column whose text holds every query token; one
+  holding only some of them is never read. PostgreSQL splits a long text
+  into several indexed chunks and requires the tokens across the property's
+  chunks, as SQLite does within its one row. As each document's entries
+  arrive, the stored ACL, purpose, and marking filters and the grant and
+  compiled-policy checks decide it; the scan stops once 10,000 documents
+  were admitted and one more was found, so the entries it reads, and their
+  policy checks, grow with the matching entries the caller may not read
+  ahead of that point. A token longer than a
+  PostgreSQL lexeme (2,047 bytes) is in no index: that query reads the
+  stored text of every property of the requested kinds, or every dataset
+  field, page by page and matches it in the server, so its read cost grows
+  with the namespace's text. The live recheck then runs until 256 hits are
+  visible.
+- **Vectors.** A spec's chunks are read in pages, not loaded: memory holds
+  one page and the 10,000 best-scoring admitted objects so far. Each object
+  passes the per-object read policy once, before it may enter those 10,000.
+  The live recheck then picks up to 256 of them, best first. Scoring still
+  visits every chunk of the spec.
+- **Truncation.** When a text scan stops at its bound, more visible hits
+  may exist and `count_is_lower_bound` is true. A text scan that stops
+  without yielding any hit the caller receives does not set it, whatever
+  filters the request carries, so the count never reveals hidden matches;
+  such a search reports an exact zero even if its filters dropped hits it
+  could have read. A vector list sets it only when it fills 256 live,
+  visible hits. A vector ranking that drops admitted objects past its
+  10,000 does not set it, because that cut runs before the source-value
+  checks; recall is then 1.0 only over the 10,000 nearest.
+
+The maximum supported index size is 10^6 vectors per embedding spec, the
+latency budget of [ADR 0117](decisions/0117-governed-embedding-index.md):
+exact vector scoring over 10^6 vectors must finish within 2 s
+(`exact_vector_latency_budget_at_one_million_vectors`, run in release). Text
+search has no benchmarked size limit: the scan bound keeps the plane's
+memory and post-policy work independent of index size, but each page asks
+the database for the next matches in id order, which it finds by matching
+and ordering every entry for the query, so text read cost grows with the
+number of matching entries times the pages read. A larger index needs an approximate
+nearest-neighbour index behind `SearchIndex::vector_candidates`, as ADR 0117
+records.
 
 ## Index catch-up
 

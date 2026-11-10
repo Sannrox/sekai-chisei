@@ -1,8 +1,10 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_object_security::load_active_policy_postgres;
 use crate::db::search_index::{
-    CheckpointFields, DocumentWrite, PENDING_PAGE, SearchMaintenance, SearchPosition,
-    catch_up_namespace, lock_search_maintenance, rebuild_namespace_fenced, search_status,
+    CheckpointFields, DatasetMatch, DocumentWrite, ObjectMatch, PENDING_PAGE, SearchMaintenance,
+    SearchPosition, SearchReadPolicy, catch_up_namespace, lock_search_maintenance,
+    ranked_vector_candidates, rebuild_namespace_fenced, scan_dataset_candidates,
+    scan_object_candidates, search_status,
 };
 use crate::domain::Object;
 use crate::sekai::classification_lattice::ClassificationLattice;
@@ -12,13 +14,13 @@ use crate::sekai::markings::{
     namespace_deny_unmarked, object_is_unmarked, object_marking_token, unmarked_access_decision,
 };
 use crate::sekai::search_index::{
-    ANALYZER_VERSION, SEARCH_CHECKPOINT_CONFLICT, SearchCandidate, SearchCandidateQuery,
-    SearchCatchUpReport, SearchCheckpoint, SearchDatasetDump, SearchDocument, SearchDocumentKey,
-    SearchIndex, SearchIndexDump, SearchIndexError, SearchIndexStatus, SearchObjectDump,
-    SearchQueryMode, SearchRebuildReport, SearchSourceKind, VectorCandidate, VectorCandidateQuery,
-    acl_allows, dataset_classification_allows, dataset_content_digest, exact_vector_candidates,
-    live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
-    policy_marking_allows, purpose_allows, search_tokens, text_matches_query,
+    ANALYZER_VERSION, BoundedCandidates, SEARCH_CHECKPOINT_CONFLICT, SearchCandidate,
+    SearchCandidateQuery, SearchCatchUpReport, SearchCheckpoint, SearchDatasetDump, SearchDocument,
+    SearchDocumentKey, SearchIndex, SearchIndexDump, SearchIndexError, SearchIndexStatus,
+    SearchObjectDump, SearchQueryMode, SearchRebuildReport, SearchSourceKind, VectorCandidate,
+    VectorCandidateQuery, acl_allows, dataset_content_digest, live_object_match_fields,
+    object_content_digest, object_text_properties, policy_attributes, policy_marking_allows,
+    purpose_allows, search_tokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -51,16 +53,23 @@ fn lattice_marking_allows(
     policy_marking_allows(marking, &query.policy, lattice)
 }
 
-fn postgres_tsquery(text: &str) -> Result<String, SearchIndexError> {
-    let tokens = search_tokens(text);
+/// The query's distinct tokens. A long field is indexed as several tsvector
+/// chunks, so a token may sit in any chunk: the scans select chunks matching
+/// any token (`tokens.join(" | ")`, which the GIN index serves) and keep a
+/// field once its chunks together hold every token, before their bound.
+/// That is the unit and the AND SQLite's full-text match applies.
+fn postgres_query_tokens(text: &str) -> Result<Vec<String>, SearchIndexError> {
+    let mut seen = BTreeSet::new();
+    let tokens = search_tokens(text)
+        .into_iter()
+        .filter(|token| seen.insert(token.clone()))
+        .collect::<Vec<_>>();
     if tokens.is_empty() {
         return Err(SearchIndexError::InvalidArgument(
             "search text required".into(),
         ));
     }
-    // OR lets a token in any overflow chunk surface the property. Live
-    // AND matching restores the same candidate set as a single tsvector.
-    Ok(tokens.join(" | "))
+    Ok(tokens)
 }
 
 const MAX_TSVECTOR_CHUNK_BYTES: usize = 32_000;
@@ -795,7 +804,7 @@ impl PostgresDb {
     fn query_search_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
         if query.mode != SearchQueryMode::Text {
             return Err(SearchIndexError::InvalidArgument(
                 "only text search is implemented".into(),
@@ -807,338 +816,180 @@ impl PostgresDb {
             ));
         }
         if !query.policy.namespace_authorized {
-            return Ok(Vec::new());
+            return Ok(BoundedCandidates::default());
         }
-        let match_query = postgres_tsquery(&query.text)?;
+        let tokens = postgres_query_tokens(&query.text)?;
         let limit = if query.limit == 0 { 32 } else { query.limit };
-        let mut hits = Vec::new();
-        if query.source.unwrap_or(SearchSourceKind::Object) == SearchSourceKind::Object
-            || query.source.is_none()
-        {
-            hits.extend(self.query_object_candidates(query, &match_query, limit)?);
+        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
+        // Each source keeps its own bound, so one never hides the other.
+        let mut found = BoundedCandidates::default();
+        if query.source != Some(SearchSourceKind::Dataset) {
+            found = self.query_object_candidates(query, &tokens, lattice.as_ref(), limit)?;
         }
-        if (query.source == Some(SearchSourceKind::Dataset) || query.source.is_none())
-            && hits.len() < limit
-        {
-            hits.extend(self.query_dataset_candidates(query, &match_query, limit - hits.len())?);
+        if query.source != Some(SearchSourceKind::Object) {
+            let datasets =
+                self.query_dataset_candidates(query, &tokens, lattice.as_ref(), limit)?;
+            found.candidates.extend(datasets.candidates);
+            found.truncated |= datasets.truncated;
         }
-        Ok(hits)
+        Ok(found)
     }
 
+    /// Object properties matching every query token, a page at a time. A
+    /// token longer than a lexeme is in no tsvector, so such a query reads
+    /// stored text instead (chunk 0 holds a property's whole text) and
+    /// matches it while admitting; that fallback reads every property of the
+    /// namespace's requested kinds up to the cut. The requested kinds narrow
+    /// both reads in SQL, so other kinds' matches are never read.
     fn query_object_candidates(
         &self,
         query: &SearchCandidateQuery,
-        match_query: &str,
+        tokens: &[String],
+        lattice: Option<&ClassificationLattice>,
         limit: usize,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
-        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
-        let rows = self
-            .connection()?
-            .query(
-                "SELECT f.object_id, f.property, o.kind, o.access_marking, o.policy_attributes
-                 FROM sekai_search_object_text_v2 f
-                 JOIN sekai_search_object_v2 o
-                   ON o.namespace = f.namespace AND o.object_id = f.object_id
-                 WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
-                 ORDER BY f.object_id, f.property",
-                &[&query.policy.namespace, &match_query],
-            )
-            .map_err(|error| error.to_string())?;
-        type ObjectHit = (String, BTreeSet<String>, String, BTreeMap<String, String>);
-        let mut grouped: BTreeMap<String, ObjectHit> = BTreeMap::new();
-        for row in rows {
-            let object_id: String = row.get(0);
-            let property: String = row.get(1);
-            let kind: String = row.get(2);
-            let marking: String = row.get(3);
-            let attributes: String = row.get(4);
-            if !query.policy.kinds.is_empty()
-                && !query.policy.kinds.iter().any(|item| item == &kind)
-            {
-                continue;
-            }
-            match &query.policy.visible_property_names {
-                Some(allowed) if allowed.is_empty() => continue,
-                Some(allowed) if !allowed.iter().any(|item| item == &property) => continue,
-                _ => {}
-            }
-            if !lattice_marking_allows(&marking, query, lattice.as_ref()) {
-                continue;
-            }
-            let parsed: BTreeMap<String, String> =
-                serde_json::from_str(&attributes).unwrap_or_default();
-            if !acl_allows(&parsed, &query.policy.subjects) {
-                continue;
-            }
-            if !purpose_allows(
-                &parsed,
-                query.policy.purpose.as_deref(),
-                query.policy.purpose_authorized,
-            ) {
-                continue;
-            }
-            grouped
-                .entry(object_id)
-                .or_insert_with(|| (kind, BTreeSet::new(), marking, parsed))
-                .1
-                .insert(property);
-        }
-        if query_uses_oversize_lexeme(&query.text) {
-            for row in self
-                .connection()?
-                .query(
-                    "SELECT f.object_id, f.property, o.kind, o.access_marking,
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+        let stored_text = query_uses_oversize_lexeme(&query.text);
+        let any_token = tokens.join(" | ");
+        scan_object_candidates(
+            self,
+            query,
+            lattice,
+            limit,
+            |after_id, after_property, page| {
+                let rows = if stored_text {
+                    self.connection()?.query(
+                        "SELECT f.object_id, f.property, o.kind, o.access_marking,
                             o.policy_attributes, f.text
                      FROM sekai_search_object_text_v2 f
                      JOIN sekai_search_object_v2 o
                        ON o.namespace = f.namespace AND o.object_id = f.object_id
-                     WHERE f.namespace = $1 AND f.chunk = 0",
-                    &[&query.policy.namespace],
-                )
-                .map_err(|error| error.to_string())?
-            {
-                let object_id: String = row.get(0);
-                let property: String = row.get(1);
-                let kind: String = row.get(2);
-                let marking: String = row.get(3);
-                let attributes: String = row.get(4);
-                let stored: String = row.get(5);
-                if !text_matches_query(&stored, &query.text) {
-                    continue;
-                }
-                if !query.policy.kinds.is_empty()
-                    && !query.policy.kinds.iter().any(|item| item == &kind)
-                {
-                    continue;
-                }
-                match &query.policy.visible_property_names {
-                    Some(allowed) if allowed.is_empty() => continue,
-                    Some(allowed) if !allowed.iter().any(|item| item == &property) => continue,
-                    _ => {}
-                }
-                if !lattice_marking_allows(&marking, query, lattice.as_ref()) {
-                    continue;
-                }
-                let parsed: BTreeMap<String, String> =
-                    serde_json::from_str(&attributes).unwrap_or_default();
-                if !acl_allows(&parsed, &query.policy.subjects) {
-                    continue;
-                }
-                if !purpose_allows(
-                    &parsed,
-                    query.policy.purpose.as_deref(),
-                    query.policy.purpose_authorized,
-                ) {
-                    continue;
-                }
-                grouped
-                    .entry(object_id)
-                    .or_insert_with(|| (kind, BTreeSet::new(), marking, parsed))
-                    .1
-                    .insert(property);
-            }
-        }
-        let mut hits = Vec::new();
-        for (id, (kind, fields, _, _)) in grouped {
-            if !self.grant_allows(&id, &query.policy.subjects)? {
-                continue;
-            }
-            let Some((kind, fields)) = self.compiled_object_security_allows(
-                &query.policy.namespace,
-                &id,
-                &kind,
-                &fields,
-                query,
-            )?
-            else {
-                continue;
-            };
-            hits.push(SearchCandidate {
-                source: SearchSourceKind::Object,
-                id,
-                kind,
-                matched_fields: fields.into_iter().collect(),
-                authority: false,
-            });
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        Ok(hits)
+                     WHERE f.namespace = $1 AND f.chunk = 0
+                       AND (f.object_id, f.property) > ($2, $3)
+                       AND (cardinality($5::text[]) = 0 OR o.kind = ANY($5::text[]))
+                     ORDER BY f.object_id, f.property
+                     LIMIT $4",
+                        &[
+                            &query.policy.namespace,
+                            &after_id,
+                            &after_property,
+                            &page,
+                            &query.policy.kinds,
+                        ],
+                    )
+                } else {
+                    self.connection()?.query(
+                        "SELECT f.object_id, f.property, o.kind, o.access_marking,
+                            o.policy_attributes, NULL::text
+                     FROM sekai_search_object_text_v2 f
+                     JOIN sekai_search_object_v2 o
+                       ON o.namespace = f.namespace AND o.object_id = f.object_id
+                     CROSS JOIN unnest($5::text[]) AS q(token)
+                     WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
+                       AND f.tsv @@ to_tsquery('simple', q.token)
+                       AND (cardinality($4::text[]) = 0 OR o.kind = ANY($4::text[]))
+                       AND (f.object_id, f.property) > ($6, $7)
+                     GROUP BY f.object_id, f.property, o.kind, o.access_marking,
+                              o.policy_attributes
+                     HAVING count(DISTINCT q.token) = cardinality($5::text[])
+                     ORDER BY f.object_id, f.property
+                     LIMIT $3",
+                        &[
+                            &query.policy.namespace,
+                            &any_token,
+                            &page,
+                            &query.policy.kinds,
+                            &tokens,
+                            &after_id,
+                            &after_property,
+                        ],
+                    )
+                };
+                Ok(rows
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|row| ObjectMatch {
+                        object_id: row.get(0),
+                        property: row.get(1),
+                        kind: row.get(2),
+                        marking: row.get(3),
+                        attributes: row.get(4),
+                        text: row.get(5),
+                    })
+                    .collect())
+            },
+        )
     }
 
+    /// Dataset fields matching every query token, a page at a time; the
+    /// long-token fallback as for objects.
     fn query_dataset_candidates(
         &self,
         query: &SearchCandidateQuery,
-        match_query: &str,
+        tokens: &[String],
+        lattice: Option<&ClassificationLattice>,
         limit: usize,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
-        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
-        if !query.policy.kinds.is_empty()
-            && !query.policy.kinds.iter().any(|kind| kind == "dataset")
-        {
-            return Ok(Vec::new());
-        }
-        let rows = self
-            .connection()?
-            .query(
-                "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
-                        d.bound_policy_attributes, d.bound_object_id
-                 FROM sekai_search_dataset_text_v2 f
-                 JOIN sekai_search_dataset_v2 d
-                   ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
-                 WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
-                 ORDER BY f.dataset_id, f.field",
-                &[&query.policy.namespace, &match_query],
-            )
-            .map_err(|error| error.to_string())?;
-        let mut grouped: BTreeMap<String, (BTreeSet<String>, String)> = BTreeMap::new();
-        for row in rows {
-            let dataset_id: String = row.get(0);
-            let field: String = row.get(1);
-            let classification: String = row.get(2);
-            let bound_marking: String = row.get(3);
-            let bound_attributes: String = row.get(4);
-            let bound_object_id: String = row.get(5);
-            if !lattice_marking_allows(&bound_marking, query, lattice.as_ref()) {
-                continue;
-            }
-            let parsed: BTreeMap<String, String> =
-                serde_json::from_str(&bound_attributes).unwrap_or_default();
-            if !acl_allows(&parsed, &query.policy.subjects) {
-                continue;
-            }
-            if !purpose_allows(
-                &parsed,
-                query.policy.purpose.as_deref(),
-                query.policy.purpose_authorized,
-            ) {
-                continue;
-            }
-            if !dataset_classification_allows(&classification, query.policy.clearance.as_deref())
-                && !classification.is_empty()
-            {
-                continue;
-            }
-            grouped
-                .entry(dataset_id)
-                .or_insert_with(|| (BTreeSet::new(), bound_object_id))
-                .0
-                .insert(field);
-        }
-        if query_uses_oversize_lexeme(&query.text) {
-            for row in self
-                .connection()?
-                .query(
-                    "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
-                            d.bound_policy_attributes, d.bound_object_id, f.text
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+        let stored_text = query_uses_oversize_lexeme(&query.text);
+        let any_token = tokens.join(" | ");
+        scan_dataset_candidates(
+            self,
+            query,
+            lattice,
+            limit,
+            |after_id, after_field, page| {
+                let rows = if stored_text {
+                    self.connection()?.query(
+                        "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
+                            d.bound_policy_attributes, f.text
                      FROM sekai_search_dataset_text_v2 f
                      JOIN sekai_search_dataset_v2 d
                        ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
-                     WHERE f.namespace = $1 AND f.chunk = 0",
-                    &[&query.policy.namespace],
-                )
-                .map_err(|error| error.to_string())?
-            {
-                let dataset_id: String = row.get(0);
-                let field: String = row.get(1);
-                let classification: String = row.get(2);
-                let bound_marking: String = row.get(3);
-                let bound_attributes: String = row.get(4);
-                let bound_object_id: String = row.get(5);
-                let stored: String = row.get(6);
-                if !text_matches_query(&stored, &query.text) {
-                    continue;
-                }
-                if !lattice_marking_allows(&bound_marking, query, lattice.as_ref()) {
-                    continue;
-                }
-                let parsed: BTreeMap<String, String> =
-                    serde_json::from_str(&bound_attributes).unwrap_or_default();
-                if !acl_allows(&parsed, &query.policy.subjects) {
-                    continue;
-                }
-                if !purpose_allows(
-                    &parsed,
-                    query.policy.purpose.as_deref(),
-                    query.policy.purpose_authorized,
-                ) {
-                    continue;
-                }
-                if !dataset_classification_allows(
-                    &classification,
-                    query.policy.clearance.as_deref(),
-                ) && !classification.is_empty()
-                {
-                    continue;
-                }
-                grouped
-                    .entry(dataset_id)
-                    .or_insert_with(|| (BTreeSet::new(), bound_object_id))
-                    .0
-                    .insert(field);
-            }
-        }
-        let mut hits = Vec::new();
-        for (id, _) in grouped {
-            let Some(dataset) = self.get_dataset(&id)? else {
-                continue;
-            };
-            if dataset.object_id.is_empty() {
-                if self.subjects_include_team_principal(&query.policy.subjects)? {
-                    continue;
-                }
-            } else {
-                if !self.grant_allows(&dataset.object_id, &query.policy.subjects)? {
-                    continue;
-                }
-                let Some(bound) = self.get_object(&dataset.object_id)? else {
-                    continue;
+                     WHERE f.namespace = $1 AND f.chunk = 0
+                       AND (f.dataset_id, f.field) > ($2, $3)
+                     ORDER BY f.dataset_id, f.field
+                     LIMIT $4",
+                        &[&query.policy.namespace, &after_id, &after_field, &page],
+                    )
+                } else {
+                    self.connection()?.query(
+                        "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
+                            d.bound_policy_attributes, NULL::text
+                     FROM sekai_search_dataset_text_v2 f
+                     JOIN sekai_search_dataset_v2 d
+                       ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
+                     CROSS JOIN unnest($4::text[]) AS q(token)
+                     WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
+                       AND f.tsv @@ to_tsquery('simple', q.token)
+                       AND (f.dataset_id, f.field) > ($5, $6)
+                     GROUP BY f.dataset_id, f.field, f.classification, d.bound_access_marking,
+                              d.bound_policy_attributes
+                     HAVING count(DISTINCT q.token) = cardinality($4::text[])
+                     ORDER BY f.dataset_id, f.field
+                     LIMIT $3",
+                        &[
+                            &query.policy.namespace,
+                            &any_token,
+                            &page,
+                            &tokens,
+                            &after_id,
+                            &after_field,
+                        ],
+                    )
                 };
-                if self
-                    .compiled_object_security_allows(
-                        &query.policy.namespace,
-                        &dataset.object_id,
-                        &bound.kind,
-                        &BTreeSet::new(),
-                        query,
-                    )?
-                    .is_none()
-                {
-                    continue;
-                }
-            }
-            let mut fields = BTreeSet::new();
-            if text_matches_query(&dataset.name, &query.text) {
-                fields.insert("name".into());
-            }
-            for column in &dataset.columns {
-                if !text_matches_query(&column.name, &query.text) {
-                    continue;
-                }
-                if !dataset_classification_allows(
-                    &column.classification,
-                    query.policy.clearance.as_deref(),
-                ) {
-                    continue;
-                }
-                fields.insert(format!("column:{}", column.name));
-            }
-            if fields.is_empty() {
-                continue;
-            }
-            hits.push(SearchCandidate {
-                source: SearchSourceKind::Dataset,
-                id,
-                kind: "dataset".into(),
-                matched_fields: fields.into_iter().collect(),
-                authority: false,
-            });
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        Ok(hits)
+                Ok(rows
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|row| DatasetMatch {
+                        dataset_id: row.get(0),
+                        field: row.get(1),
+                        classification: row.get(2),
+                        bound_marking: row.get(3),
+                        bound_attributes: row.get(4),
+                        text: row.get(5),
+                    })
+                    .collect())
+            },
+        )
     }
 
     #[cfg(any(test, feature = "gateway-test-support"))]
@@ -1368,7 +1219,7 @@ impl SearchIndex for PostgresDb {
     fn query_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
         self.query_search_candidates(query)
     }
 
@@ -1388,21 +1239,44 @@ impl SearchIndex for PostgresDb {
         &self,
         query: &VectorCandidateQuery,
         keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
-    ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
-        use crate::sekai::embedding_index::EmbeddingStore;
+    ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError> {
         // Exact over the chunk table, as on SQLite.
         let namespace = &query.policy.namespace;
-        let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
         let lattice = self.get_classification_lattice(namespace)?;
-        let policy = query.policy_query();
-        exact_vector_candidates(chunks, query, lattice.as_ref(), |candidate| {
-            let id = candidate.object_id.as_str();
-            Ok(self.grant_allows(id, &query.policy.subjects)?
-                && self
-                    .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
-                    .is_some()
-                && keep(candidate)?)
-        })
+        ranked_vector_candidates(
+            self,
+            query,
+            lattice.as_ref(),
+            |after_id, after_chunk, page| {
+                self.embedding_chunk_page(namespace, &query.spec_id, after_id, after_chunk, page)
+            },
+            keep,
+        )
+    }
+}
+
+impl SearchReadPolicy for PostgresDb {
+    fn grant_allows(&self, object_id: &str, subjects: &[String]) -> Result<bool, String> {
+        PostgresDb::grant_allows(self, object_id, subjects)
+    }
+
+    fn compiled_object_security_allows(
+        &self,
+        namespace: &str,
+        object_id: &str,
+        kind: &str,
+        fields: &BTreeSet<String>,
+        query: &SearchCandidateQuery,
+    ) -> Result<Option<(String, BTreeSet<String>)>, String> {
+        PostgresDb::compiled_object_security_allows(self, namespace, object_id, kind, fields, query)
+    }
+
+    fn subjects_include_team_principal(&self, subjects: &[String]) -> Result<bool, String> {
+        PostgresDb::subjects_include_team_principal(self, subjects)
+    }
+
+    fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
+        PostgresDb::get_dataset(self, id)
     }
 }
 

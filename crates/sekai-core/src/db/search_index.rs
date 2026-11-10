@@ -3,19 +3,21 @@ use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
 use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::Dataset;
+use crate::sekai::embedding_index::EmbeddingChunk;
 use crate::sekai::markings::{
     MarkingDecision, deny_unmarked_enabled, env_deny_unmarked, is_trusted_service_principal,
     namespace_deny_unmarked, object_is_unmarked, object_marking_token, unmarked_access_decision,
 };
 use crate::sekai::search_index::{
-    ANALYZER_VERSION, SEARCH_CHECKPOINT_CONFLICT, SEARCH_REBUILD_IN_PROGRESS, SearchCandidate,
-    SearchCandidateQuery, SearchCatchUpReport, SearchCheckpoint, SearchDatasetDump, SearchDocument,
-    SearchDocumentKey, SearchIndex, SearchIndexDump, SearchIndexError, SearchIndexStatus,
-    SearchObjectDump, SearchQueryMode, SearchRebuildReport, SearchSourceKind, VectorCandidate,
-    VectorCandidateQuery, acl_allows, dataset_catalog_digest, dataset_classification_allows,
-    dataset_content_digest, exact_vector_candidates, fts_query, indexed_search_text,
-    live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
-    policy_marking_allows, purpose_allows, text_matches_query,
+    ANALYZER_VERSION, BoundedCandidates, SEARCH_CHECKPOINT_CONFLICT, SEARCH_OVERSCAN,
+    SEARCH_REBUILD_IN_PROGRESS, SearchCandidate, SearchCandidateQuery, SearchCatchUpReport,
+    SearchCheckpoint, SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex,
+    SearchIndexDump, SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode,
+    SearchRebuildReport, SearchSourceKind, VectorCandidate, VectorCandidateQuery, VectorRanking,
+    acl_allows, dataset_catalog_digest, dataset_classification_allows, dataset_content_digest,
+    fts_query, indexed_search_text, live_object_match_fields, object_content_digest,
+    object_text_properties, policy_attributes, policy_marking_allows, purpose_allows,
+    text_matches_query,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1028,7 +1030,7 @@ impl SekaiDb {
     fn query_search_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
         if query.mode != SearchQueryMode::Text {
             return Err(SearchIndexError::InvalidArgument(
                 "only text search is implemented".into(),
@@ -1040,252 +1042,161 @@ impl SekaiDb {
             ));
         }
         if !query.policy.namespace_authorized {
-            return Ok(Vec::new());
+            return Ok(BoundedCandidates::default());
         }
         let match_query = format!("text : ({})", fts_query(&query.text)?);
         let limit = if query.limit == 0 { 32 } else { query.limit };
-        let mut hits = Vec::new();
-        if query.source.unwrap_or(SearchSourceKind::Object) == SearchSourceKind::Object
-            || query.source.is_none()
-        {
-            hits.extend(self.query_object_candidates(query, &match_query, limit)?);
+        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
+        // Each source keeps its own bound, so one never hides the other.
+        let mut found = BoundedCandidates::default();
+        if query.source != Some(SearchSourceKind::Dataset) {
+            found = self.query_object_candidates(query, &match_query, lattice.as_ref(), limit)?;
         }
-        if (query.source == Some(SearchSourceKind::Dataset) || query.source.is_none())
-            && hits.len() < limit
-        {
-            hits.extend(self.query_dataset_candidates(query, &match_query, limit - hits.len())?);
+        if query.source != Some(SearchSourceKind::Object) {
+            let datasets =
+                self.query_dataset_candidates(query, &match_query, lattice.as_ref(), limit)?;
+            found.candidates.extend(datasets.candidates);
+            found.truncated |= datasets.truncated;
         }
-        Ok(hits)
+        Ok(found)
     }
 
     fn query_object_candidates(
         &self,
         query: &SearchCandidateQuery,
         match_query: &str,
+        lattice: Option<&ClassificationLattice>,
         limit: usize,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
-        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
-        let conn = self.conn();
-        let sql = "
-            SELECT f.object_id, f.property, o.kind, o.access_marking, o.policy_attributes
-            FROM sekai_search_object_v2_fts fts
-            JOIN sekai_search_object_text_v2 f ON f.id = fts.rowid
-            JOIN sekai_search_object_v2 o
-              ON o.namespace = f.namespace AND o.object_id = f.object_id
-            WHERE f.namespace = ?1 AND sekai_search_object_v2_fts MATCH ?2
-            ORDER BY f.object_id, f.property";
-        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map(params![query.policy.namespace, match_query], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        type ObjectHit = (String, BTreeSet<String>, String, BTreeMap<String, String>);
-        let mut grouped: BTreeMap<String, ObjectHit> = BTreeMap::new();
-        for row in rows {
-            let (object_id, property, kind, marking, attributes) =
-                row.map_err(|error| error.to_string())?;
-            if !query.policy.kinds.is_empty()
-                && !query.policy.kinds.iter().any(|item| item == &kind)
-            {
-                continue;
-            }
-            match &query.policy.visible_property_names {
-                Some(allowed) if allowed.is_empty() => continue,
-                Some(allowed) if !allowed.iter().any(|item| item == &property) => continue,
-                _ => {}
-            }
-            if !lattice_marking_allows(&marking, query, lattice.as_ref()) {
-                continue;
-            }
-            let parsed: BTreeMap<String, String> =
-                serde_json::from_str(&attributes).unwrap_or_default();
-            if !acl_allows(&parsed, &query.policy.subjects) {
-                continue;
-            }
-            if !purpose_allows(
-                &parsed,
-                query.policy.purpose.as_deref(),
-                query.policy.purpose_authorized,
-            ) {
-                continue;
-            }
-            grouped
-                .entry(object_id)
-                .or_insert_with(|| (kind, BTreeSet::new(), marking, parsed))
-                .1
-                .insert(property);
-        }
-        drop(stmt);
-        drop(conn);
-        let mut hits = Vec::new();
-        for (id, (kind, fields, _, _)) in grouped {
-            if !self.grant_allows(&id, &query.policy.subjects)? {
-                continue;
-            }
-            let Some((kind, fields)) = self.compiled_object_security_allows(
-                &query.policy.namespace,
-                &id,
-                &kind,
-                &fields,
-                query,
-            )?
-            else {
-                continue;
-            };
-            hits.push(SearchCandidate {
-                source: SearchSourceKind::Object,
-                id,
-                kind,
-                matched_fields: fields.into_iter().collect(),
-                authority: false,
-            });
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        Ok(hits)
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+        // The requested kinds narrow the scan in SQL, so other kinds'
+        // matches are never read.
+        let kinds =
+            serde_json::to_string(&query.policy.kinds).map_err(|error| error.to_string())?;
+        scan_object_candidates(
+            self,
+            query,
+            lattice,
+            limit,
+            |after_id, after_property, page| {
+                let conn = self.conn();
+                let mut stmt = conn
+                .prepare(
+                    "SELECT f.object_id, f.property, o.kind, o.access_marking, o.policy_attributes
+                     FROM sekai_search_object_v2_fts fts
+                     JOIN sekai_search_object_text_v2 f ON f.id = fts.rowid
+                     JOIN sekai_search_object_v2 o
+                       ON o.namespace = f.namespace AND o.object_id = f.object_id
+                     WHERE f.namespace = ?1 AND sekai_search_object_v2_fts MATCH ?2
+                       AND (?3 = '[]' OR o.kind IN (SELECT value FROM json_each(?3)))
+                       AND (f.object_id, f.property) > (?4, ?5)
+                     ORDER BY f.object_id, f.property
+                     LIMIT ?6",
+                )
+                .map_err(|error| error.to_string())?;
+                stmt.query_map(
+                    params![
+                        query.policy.namespace,
+                        match_query,
+                        kinds,
+                        after_id,
+                        after_property,
+                        page
+                    ],
+                    |row| {
+                        Ok(ObjectMatch {
+                            object_id: row.get(0)?,
+                            property: row.get(1)?,
+                            kind: row.get(2)?,
+                            marking: row.get(3)?,
+                            attributes: row.get(4)?,
+                            text: None,
+                        })
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())
+            },
+        )
     }
 
     fn query_dataset_candidates(
         &self,
         query: &SearchCandidateQuery,
         match_query: &str,
+        lattice: Option<&ClassificationLattice>,
         limit: usize,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
-        if !query.policy.kinds.is_empty()
-            && !query.policy.kinds.iter().any(|kind| kind == "dataset")
-        {
-            return Ok(Vec::new());
-        }
-        let lattice = self.get_classification_lattice(&query.policy.namespace)?;
-        let conn = self.conn();
-        let sql = "
-            SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
-                   d.bound_policy_attributes, d.bound_object_id
-            FROM sekai_search_dataset_v2_fts fts
-            JOIN sekai_search_dataset_text_v2 f ON f.id = fts.rowid
-            JOIN sekai_search_dataset_v2 d
-              ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
-            WHERE f.namespace = ?1 AND sekai_search_dataset_v2_fts MATCH ?2
-            ORDER BY f.dataset_id, f.field";
-        let mut stmt = conn.prepare(sql).map_err(|error| error.to_string())?;
-        let rows = stmt
-            .query_map(params![query.policy.namespace, match_query], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
-            .map_err(|error| error.to_string())?;
-        let mut grouped: BTreeMap<String, (BTreeSet<String>, String)> = BTreeMap::new();
-        for row in rows {
-            let (
-                dataset_id,
-                field,
-                classification,
-                bound_marking,
-                bound_attributes,
-                bound_object_id,
-            ) = row.map_err(|error| error.to_string())?;
-            if !lattice_marking_allows(&bound_marking, query, lattice.as_ref()) {
-                continue;
-            }
-            let parsed: BTreeMap<String, String> =
-                serde_json::from_str(&bound_attributes).unwrap_or_default();
-            if !acl_allows(&parsed, &query.policy.subjects) {
-                continue;
-            }
-            if !purpose_allows(
-                &parsed,
-                query.policy.purpose.as_deref(),
-                query.policy.purpose_authorized,
-            ) {
-                continue;
-            }
-            if !dataset_classification_allows(&classification, query.policy.clearance.as_deref())
-                && !classification.is_empty()
-            {
-                continue;
-            }
-            grouped
-                .entry(dataset_id)
-                .or_insert_with(|| (BTreeSet::new(), bound_object_id))
-                .0
-                .insert(field);
-        }
-        drop(stmt);
-        drop(conn);
-        let mut hits = Vec::new();
-        for (id, _) in grouped {
-            let Some(dataset) = self.get_dataset(&id)? else {
-                continue;
-            };
-            if dataset.object_id.is_empty() {
-                if self.subjects_include_team_principal(&query.policy.subjects)? {
-                    continue;
-                }
-            } else {
-                if !self.grant_allows(&dataset.object_id, &query.policy.subjects)? {
-                    continue;
-                }
-                let Some(bound) = self.get_object(&dataset.object_id)? else {
-                    continue;
-                };
-                if self
-                    .compiled_object_security_allows(
-                        &query.policy.namespace,
-                        &dataset.object_id,
-                        &bound.kind,
-                        &BTreeSet::new(),
-                        query,
-                    )?
-                    .is_none()
-                {
-                    continue;
-                }
-            }
-            let mut fields = BTreeSet::new();
-            if text_matches_query(&dataset.name, &query.text) {
-                fields.insert("name".into());
-            }
-            for column in &dataset.columns {
-                if !text_matches_query(&column.name, &query.text) {
-                    continue;
-                }
-                if !dataset_classification_allows(
-                    &column.classification,
-                    query.policy.clearance.as_deref(),
-                ) {
-                    continue;
-                }
-                fields.insert(format!("column:{}", column.name));
-            }
-            if fields.is_empty() {
-                continue;
-            }
-            hits.push(SearchCandidate {
-                source: SearchSourceKind::Dataset,
-                id,
-                kind: "dataset".into(),
-                matched_fields: fields.into_iter().collect(),
-                authority: false,
-            });
-            if hits.len() >= limit {
-                break;
-            }
-        }
-        Ok(hits)
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+        scan_dataset_candidates(
+            self,
+            query,
+            lattice,
+            limit,
+            |after_id, after_field, page| {
+                let conn = self.conn();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
+                            d.bound_policy_attributes
+                     FROM sekai_search_dataset_v2_fts fts
+                     JOIN sekai_search_dataset_text_v2 f ON f.id = fts.rowid
+                     JOIN sekai_search_dataset_v2 d
+                       ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
+                     WHERE f.namespace = ?1 AND sekai_search_dataset_v2_fts MATCH ?2
+                       AND (f.dataset_id, f.field) > (?3, ?4)
+                     ORDER BY f.dataset_id, f.field
+                     LIMIT ?5",
+                    )
+                    .map_err(|error| error.to_string())?;
+                stmt.query_map(
+                    params![
+                        query.policy.namespace,
+                        match_query,
+                        after_id,
+                        after_field,
+                        page
+                    ],
+                    |row| {
+                        Ok(DatasetMatch {
+                            dataset_id: row.get(0)?,
+                            field: row.get(1)?,
+                            classification: row.get(2)?,
+                            bound_marking: row.get(3)?,
+                            bound_attributes: row.get(4)?,
+                            text: None,
+                        })
+                    },
+                )
+                .map_err(|error| error.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())
+            },
+        )
+    }
+}
+
+impl SearchReadPolicy for SekaiDb {
+    fn grant_allows(&self, object_id: &str, subjects: &[String]) -> Result<bool, String> {
+        SekaiDb::grant_allows(self, object_id, subjects)
+    }
+
+    fn compiled_object_security_allows(
+        &self,
+        namespace: &str,
+        object_id: &str,
+        kind: &str,
+        fields: &BTreeSet<String>,
+        query: &SearchCandidateQuery,
+    ) -> Result<Option<(String, BTreeSet<String>)>, String> {
+        SekaiDb::compiled_object_security_allows(self, namespace, object_id, kind, fields, query)
+    }
+
+    fn subjects_include_team_principal(&self, subjects: &[String]) -> Result<bool, String> {
+        SekaiDb::subjects_include_team_principal(self, subjects)
+    }
+
+    fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String> {
+        SekaiDb::get_dataset(self, id)
     }
 }
 
@@ -1493,7 +1404,7 @@ impl SearchIndex for SekaiDb {
     fn query_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
         self.query_search_candidates(query)
     }
 
@@ -1513,20 +1424,18 @@ impl SearchIndex for SekaiDb {
         &self,
         query: &VectorCandidateQuery,
         keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
-    ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
-        use crate::sekai::embedding_index::EmbeddingStore;
+    ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError> {
         let namespace = &query.policy.namespace;
-        let chunks = self.embedding_chunks(namespace, &query.spec_id)?;
         let lattice = self.get_classification_lattice(namespace)?;
-        let policy = query.policy_query();
-        exact_vector_candidates(chunks, query, lattice.as_ref(), |candidate| {
-            let id = candidate.object_id.as_str();
-            Ok(self.grant_allows(id, &query.policy.subjects)?
-                && self
-                    .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
-                    .is_some()
-                && keep(candidate)?)
-        })
+        ranked_vector_candidates(
+            self,
+            query,
+            lattice.as_ref(),
+            |after_id, after_chunk, page| {
+                self.embedding_chunk_page(namespace, &query.spec_id, after_id, after_chunk, page)
+            },
+            keep,
+        )
     }
 }
 
@@ -1548,7 +1457,7 @@ impl SearchIndex for RuntimeDb {
     fn query_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.query_candidates(query),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.query_candidates(query)),
@@ -1579,7 +1488,7 @@ impl SearchIndex for RuntimeDb {
         &self,
         query: &VectorCandidateQuery,
         keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
-    ) -> Result<Vec<VectorCandidate>, SearchIndexError> {
+    ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError> {
         match self {
             Self::Sqlite(db) => db.vector_candidates(query, keep),
             Self::Postgres(db) => {
@@ -1827,6 +1736,338 @@ pub(crate) fn lock_search_maintenance<S: SearchMaintenance + ?Sized>(
         .search_maintenance()
         .lock()
         .map_err(|_| SearchIndexError::Unavailable("search maintenance lock was poisoned".into()))
+}
+
+/// The store reads behind a candidate's read policy, which both backends'
+/// scans share (#2252).
+pub(crate) trait SearchReadPolicy: SearchMaintenance {
+    fn grant_allows(&self, object_id: &str, subjects: &[String]) -> Result<bool, String>;
+    /// The live kind and the `fields` the compiled object policy lets the
+    /// query see; none when it denies the object.
+    fn compiled_object_security_allows(
+        &self,
+        namespace: &str,
+        object_id: &str,
+        kind: &str,
+        fields: &BTreeSet<String>,
+        query: &SearchCandidateQuery,
+    ) -> Result<Option<(String, BTreeSet<String>)>, String>;
+    fn subjects_include_team_principal(&self, subjects: &[String]) -> Result<bool, String>;
+    fn get_dataset(&self, id: &str) -> Result<Option<Dataset>, String>;
+}
+
+/// The most rows one text scan page reads.
+const SCAN_PAGE_ROWS: usize = 1024;
+/// The most chunks one vector ranking page reads.
+const VECTOR_PAGE_CHUNKS: i64 = 1024;
+
+/// One indexed object property a text scan matched. `text` is set when the
+/// scan read stored text it has yet to match against the query (the
+/// PostgreSQL long-token fallback).
+pub(crate) struct ObjectMatch {
+    pub object_id: String,
+    pub property: String,
+    pub kind: String,
+    pub marking: String,
+    pub attributes: String,
+    pub text: Option<String>,
+}
+
+/// One indexed dataset field a text scan matched; `text` as in
+/// [`ObjectMatch`].
+pub(crate) struct DatasetMatch {
+    pub dataset_id: String,
+    pub field: String,
+    pub classification: String,
+    pub bound_marking: String,
+    pub bound_attributes: String,
+    pub text: Option<String>,
+}
+
+/// A scan row's position: document id, then property or field.
+pub(crate) trait ScanRow {
+    fn key(&self) -> (&str, &str);
+}
+
+impl ScanRow for ObjectMatch {
+    fn key(&self) -> (&str, &str) {
+        (&self.object_id, &self.property)
+    }
+}
+
+impl ScanRow for DatasetMatch {
+    fn key(&self) -> (&str, &str) {
+        (&self.dataset_id, &self.field)
+    }
+}
+
+/// The first `limit` documents `admit` accepts from a text scan, by id
+/// (#2252). `read(after_id, after_field, page)` returns at most `page` rows
+/// past that key, in key order; the scan reads page after page, hands each
+/// complete document's rows to `admit`, and stops at the first admitted
+/// document past `limit`, reporting truncation. Only admitted documents
+/// count, so the cut never depends on entries the caller cannot read; rows
+/// read grow with the matching entries before the cut. Reads release the
+/// store before `admit` runs, so `admit` may query it.
+fn scan_admitted<R: ScanRow, C>(
+    limit: usize,
+    mut read: impl FnMut(&str, &str, i64) -> Result<Vec<R>, String>,
+    mut admit: impl FnMut(Vec<R>) -> Result<Option<C>, SearchIndexError>,
+) -> Result<BoundedCandidates<C>, SearchIndexError> {
+    let page = limit.saturating_add(1).min(SCAN_PAGE_ROWS);
+    let page_rows = i64::try_from(page).map_err(|error| error.to_string())?;
+    let mut found = BoundedCandidates::default();
+    let mut document: Vec<R> = Vec::new();
+    let mut take = |document: Vec<R>, found: &mut BoundedCandidates<C>| {
+        if let Some(candidate) = admit(document)? {
+            if found.candidates.len() == limit {
+                found.truncated = true;
+            } else {
+                found.candidates.push(candidate);
+            }
+        }
+        Ok::<_, SearchIndexError>(found.truncated)
+    };
+    let (mut after_id, mut after_field) = (String::new(), String::new());
+    loop {
+        let rows = read(&after_id, &after_field, page_rows)?;
+        let more = rows.len() == page;
+        if let Some((id, field)) = rows.last().map(ScanRow::key) {
+            (after_id, after_field) = (id.to_owned(), field.to_owned());
+        }
+        for row in rows {
+            if document
+                .first()
+                .is_some_and(|first| first.key().0 != row.key().0)
+                && take(std::mem::take(&mut document), &mut found)?
+            {
+                return Ok(found);
+            }
+            document.push(row);
+        }
+        if !more {
+            break;
+        }
+    }
+    if !document.is_empty() {
+        take(document, &mut found)?;
+    }
+    Ok(found)
+}
+
+/// [`scan_admitted`] over object properties, admitting objects under the
+/// index's read policy.
+pub(crate) fn scan_object_candidates<S: SearchReadPolicy + ?Sized>(
+    store: &S,
+    query: &SearchCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    limit: usize,
+    read: impl FnMut(&str, &str, i64) -> Result<Vec<ObjectMatch>, String>,
+) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+    scan_admitted(limit, read, |rows| {
+        admit_object(store, query, lattice, rows)
+    })
+}
+
+fn admit_object<S: SearchReadPolicy + ?Sized>(
+    store: &S,
+    query: &SearchCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    rows: Vec<ObjectMatch>,
+) -> Result<Option<SearchCandidate>, SearchIndexError> {
+    let Some(id) = rows.first().map(|row| row.object_id.clone()) else {
+        return Ok(None);
+    };
+    let mut kind = None;
+    let mut fields = BTreeSet::new();
+    for row in rows {
+        match &query.policy.visible_property_names {
+            Some(allowed) if !allowed.iter().any(|item| item == &row.property) => continue,
+            _ => {}
+        }
+        if row
+            .text
+            .as_deref()
+            .is_some_and(|text| !text_matches_query(text, &query.text))
+        {
+            continue;
+        }
+        if !policy_marking_allows(&row.marking, &query.policy, lattice) {
+            continue;
+        }
+        let parsed: BTreeMap<String, String> =
+            serde_json::from_str(&row.attributes).unwrap_or_default();
+        if !acl_allows(&parsed, &query.policy.subjects)
+            || !purpose_allows(
+                &parsed,
+                query.policy.purpose.as_deref(),
+                query.policy.purpose_authorized,
+            )
+        {
+            continue;
+        }
+        kind.get_or_insert(row.kind);
+        fields.insert(row.property);
+    }
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
+    if !store.grant_allows(&id, &query.policy.subjects)? {
+        return Ok(None);
+    }
+    let Some((kind, fields)) = store.compiled_object_security_allows(
+        &query.policy.namespace,
+        &id,
+        &kind,
+        &fields,
+        query,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SearchCandidate {
+        source: SearchSourceKind::Object,
+        id,
+        kind,
+        matched_fields: fields.into_iter().collect(),
+        authority: false,
+    }))
+}
+
+/// [`scan_admitted`] over dataset fields, admitting datasets under the
+/// index's read policy and their live fields.
+pub(crate) fn scan_dataset_candidates<S: SearchReadPolicy + ?Sized>(
+    store: &S,
+    query: &SearchCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    limit: usize,
+    read: impl FnMut(&str, &str, i64) -> Result<Vec<DatasetMatch>, String>,
+) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError> {
+    if !query.policy.kinds.is_empty() && !query.policy.kinds.iter().any(|kind| kind == "dataset") {
+        return Ok(BoundedCandidates::default());
+    }
+    scan_admitted(limit, read, |rows| {
+        admit_dataset(store, query, lattice, rows)
+    })
+}
+
+fn admit_dataset<S: SearchReadPolicy + ?Sized>(
+    store: &S,
+    query: &SearchCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    rows: Vec<DatasetMatch>,
+) -> Result<Option<SearchCandidate>, SearchIndexError> {
+    let clearance = query.policy.clearance.as_deref();
+    let readable = rows.iter().find(|row| {
+        if row
+            .text
+            .as_deref()
+            .is_some_and(|text| !text_matches_query(text, &query.text))
+        {
+            return false;
+        }
+        if !policy_marking_allows(&row.bound_marking, &query.policy, lattice) {
+            return false;
+        }
+        let parsed: BTreeMap<String, String> =
+            serde_json::from_str(&row.bound_attributes).unwrap_or_default();
+        acl_allows(&parsed, &query.policy.subjects)
+            && purpose_allows(
+                &parsed,
+                query.policy.purpose.as_deref(),
+                query.policy.purpose_authorized,
+            )
+            && (row.classification.is_empty()
+                || dataset_classification_allows(&row.classification, clearance))
+    });
+    let Some(id) = readable.map(|row| row.dataset_id.clone()) else {
+        return Ok(None);
+    };
+    let Some(dataset) = store.get_dataset(&id)? else {
+        return Ok(None);
+    };
+    if dataset.object_id.is_empty() {
+        if store.subjects_include_team_principal(&query.policy.subjects)? {
+            return Ok(None);
+        }
+    } else {
+        if !store.grant_allows(&dataset.object_id, &query.policy.subjects)? {
+            return Ok(None);
+        }
+        let Some(bound) = store.get_object(&dataset.object_id)? else {
+            return Ok(None);
+        };
+        if store
+            .compiled_object_security_allows(
+                &query.policy.namespace,
+                &dataset.object_id,
+                &bound.kind,
+                &BTreeSet::new(),
+                query,
+            )?
+            .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    let mut fields = BTreeSet::new();
+    if text_matches_query(&dataset.name, &query.text) {
+        fields.insert("name".into());
+    }
+    for column in &dataset.columns {
+        if text_matches_query(&column.name, &query.text)
+            && dataset_classification_allows(&column.classification, clearance)
+        {
+            fields.insert(format!("column:{}", column.name));
+        }
+    }
+    if fields.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(SearchCandidate {
+        source: SearchSourceKind::Dataset,
+        id,
+        kind: "dataset".into(),
+        matched_fields: fields.into_iter().collect(),
+        authority: false,
+    }))
+}
+
+/// Exact vector candidates over a spec's chunks (#2252): `read(after_id,
+/// after_chunk, page)` returns at most `page` chunks past that key, ordered
+/// by object id then chunk index. Each object passes the index's read
+/// policy once, before it may enter the [`SEARCH_OVERSCAN`] nearest kept;
+/// reads release the store before that check runs.
+pub(crate) fn ranked_vector_candidates<S: SearchReadPolicy + ?Sized>(
+    store: &S,
+    query: &VectorCandidateQuery,
+    lattice: Option<&ClassificationLattice>,
+    mut read: impl FnMut(&str, i64, i64) -> Result<Vec<EmbeddingChunk>, String>,
+    keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
+) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError> {
+    let policy = query.policy_query();
+    let namespace = &query.policy.namespace;
+    let mut ranking = VectorRanking::new(query, lattice, SEARCH_OVERSCAN, |id: &str| {
+        Ok(store.grant_allows(id, &query.policy.subjects)?
+            && store
+                .compiled_object_security_allows(namespace, id, "", &BTreeSet::new(), &policy)?
+                .is_some())
+    });
+    let (mut after_id, mut after_chunk) = (String::new(), -1);
+    loop {
+        let chunks = read(&after_id, after_chunk, VECTOR_PAGE_CHUNKS)?;
+        let more = i64::try_from(chunks.len()).is_ok_and(|read| read == VECTOR_PAGE_CHUNKS);
+        if let Some(last) = chunks.last() {
+            (after_id, after_chunk) = (last.object_id.clone(), i64::from(last.chunk_index));
+        }
+        for chunk in chunks {
+            ranking.push(chunk)?;
+        }
+        if !more {
+            break;
+        }
+    }
+    ranking.select(keep)
 }
 
 fn require_namespace(namespace: &str) -> Result<(), SearchIndexError> {

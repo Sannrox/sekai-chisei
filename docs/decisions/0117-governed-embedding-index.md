@@ -82,3 +82,10 @@ the compiled read policy before the candidate cap, so recall is 1.0. The
 was rejected for now (no measured need), and so were PostgreSQL-only vectors
 (they leave SQLite without vector search). See
 [search.md](../search.md#hybrid-search).
+
+Amended by #2252: the exact search reads a spec's chunks in pages and keeps
+only its 10,000 nearest objects the read policy admits, so recall is 1.0
+over those. Dropping admitted objects past them does not mark the count a
+lower bound, since that cut precedes the source-value checks. The 10^6-vector budget is the
+maximum supported index size per spec. See
+[search.md](../search.md#query-bounds).

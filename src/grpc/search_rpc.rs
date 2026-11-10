@@ -5,9 +5,10 @@ use crate::sekai::embedding_index::{
     EmbeddingError, EmbeddingSpec, EmbeddingStore, StoredEmbeddingSpec, sha_hex, source_text,
 };
 use crate::sekai::search_index::{
-    FUSION_PROFILE, POLICY_ATTRIBUTE_KEYS, SearchCandidate, SearchCandidateQuery, SearchIndex,
-    SearchIndexError, SearchPolicyFilter, SearchQueryMode, SearchSourceKind, VectorCandidateQuery,
-    dataset_classification_allows, live_object_match_fields, rrf_fuse, text_matches_query,
+    FUSION_PROFILE, POLICY_ATTRIBUTE_KEYS, SEARCH_OVERSCAN, SearchCandidate, SearchCandidateQuery,
+    SearchIndex, SearchIndexError, SearchPolicyFilter, SearchQueryMode, SearchSourceKind,
+    VectorCandidateQuery, dataset_classification_allows, live_object_match_fields, rrf_fuse,
+    text_matches_query,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,7 +17,6 @@ pub(crate) const SEARCH_STATUS_CAPABILITY: &str = "sekai.search.status";
 pub(super) const DEFAULT_PAGE_SIZE: i32 = 20;
 pub(crate) const MAX_PAGE_SIZE: i32 = 100;
 pub(crate) const CANDIDATE_CAP: usize = 256;
-const INDEX_OVERSCAN: usize = 10_000;
 
 pub(super) async fn search(
     service: &SekaiServiceImpl,
@@ -117,6 +117,7 @@ pub(super) async fn search(
             .collect::<Vec<_>>()
     };
     let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut source_exhausted = true;
     for kinds in kind_scopes {
         let purpose_authorized =
@@ -134,14 +135,11 @@ pub(super) async fn search(
         if !exhausted {
             source_exhausted = false;
         }
-        for candidate in batch {
-            if candidates.iter().any(|existing: &SearchCandidate| {
-                existing.source == candidate.source && existing.id == candidate.id
-            }) {
-                continue;
-            }
-            candidates.push(candidate);
-        }
+        candidates.extend(
+            batch
+                .into_iter()
+                .filter(|candidate| seen.insert((candidate.source, candidate.id.clone()))),
+        );
     }
     let mut visible = Vec::new();
     for candidate in candidates {
@@ -178,7 +176,7 @@ pub(super) async fn search(
         }
     }
     let mut capped = visible.len() >= CANDIDATE_CAP
-        || (!source_exhausted && (!visible.is_empty() || !input.property_filters.is_empty()));
+        || scan_cut_is_visible(!source_exhausted, !visible.is_empty());
     let mut vector_lag_ms = 0;
     let mut vector_hits = Vec::new();
     let mut vector_capped = false;
@@ -262,8 +260,11 @@ pub(super) async fn search(
                     "embedding index changed during search; retry",
                 ));
             }
-            vector_capped |= kept.len() >= CANDIDATE_CAP;
-            ranked.extend(kept.into_iter().filter_map(|candidate| {
+            // Only live-checked hits bound the vector count. The ranking's
+            // own cut runs before the source-value checks, so reporting it
+            // could reveal values the caller may not read.
+            vector_capped |= kept.candidates.len() >= CANDIDATE_CAP;
+            ranked.extend(kept.candidates.into_iter().filter_map(|candidate| {
                 hits.remove(&candidate.object_id)
                     .map(|hit| (candidate.score, candidate.object_id, hit))
             }));
@@ -478,6 +479,15 @@ fn embedding_status(error: EmbeddingError) -> Status {
     }
 }
 
+/// Whether a scan that stopped at its bound may report a lower-bound count.
+/// Only when it yielded a hit the caller receives, after every access check
+/// and filter: the cut is made before authorization, so reporting it
+/// otherwise would reveal that the index holds hidden matches. The cost is
+/// that a cut search whose filters drop every hit reports an exact zero.
+fn scan_cut_is_visible(cut: bool, any_returned: bool) -> bool {
+    cut && any_returned
+}
+
 fn normalize_page_size(page_size: i32) -> usize {
     if page_size <= 0 {
         DEFAULT_PAGE_SIZE as usize
@@ -595,6 +605,9 @@ fn purpose_is_authorized(
     Ok(false)
 }
 
+/// Policy-scoped text candidates from each searched source, each read
+/// bounded at [`SEARCH_OVERSCAN`] policy-admitted candidates; false when a read
+/// stopped at its bound.
 fn query_search_candidates(
     db: &RuntimeDb,
     text: &str,
@@ -614,13 +627,11 @@ fn query_search_candidates(
                 text: text.to_string(),
                 source: Some(kind),
                 policy: policy.clone(),
-                limit: INDEX_OVERSCAN,
+                limit: SEARCH_OVERSCAN,
             })
             .map_err(search_status)?;
-        if batch.len() >= INDEX_OVERSCAN {
-            exhausted = false;
-        }
-        hits.extend(batch);
+        exhausted &= !batch.truncated;
+        hits.extend(batch.candidates);
     }
     Ok((hits, exhausted))
 }
@@ -1239,6 +1250,68 @@ mod tests {
         assert!(!empty.count_is_lower_bound);
     }
 
+    /// #2252: more restricted matches than the cap, all ahead of the
+    /// visible ones in index order, use up neither the cap nor the count.
+    async fn exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones(
+        db: RuntimeDb,
+    ) {
+        for index in 0..CANDIDATE_CAP + 44 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("a-hidden-{index:03}"),
+                    "acme",
+                    "hidden",
+                    &[("body", "shared token"), ("owner", "alice")],
+                ),
+                "alice",
+            )
+            .unwrap();
+        }
+        for index in 0..3 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("z-visible-{index}"),
+                    "acme",
+                    "visible",
+                    &[("body", "shared token")],
+                ),
+                "tester",
+            )
+            .unwrap();
+        }
+        let svc = service_from(db);
+        let response = search(&svc, with_named_principal(search_req("shared"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            hit_ids(&response),
+            vec!["z-visible-0", "z-visible-1", "z-visible-2"]
+        );
+        assert_eq!(response.count, 3);
+        assert!(!response.count_is_lower_bound);
+        let owner = search(&svc, with_named_principal(search_req("shared"), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(owner.count, CANDIDATE_CAP as i64);
+        assert!(owner.count_is_lower_bound);
+    }
+
+    #[tokio::test]
+    async fn restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones() {
+        exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones(
+            RuntimeDb::memory(),
+        )
+        .await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones() {
+        on_postgres(exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones);
+    }
+
     #[tokio::test]
     async fn ungranted_property_filter_fails_closed() {
         let db = RuntimeDb::memory();
@@ -1626,6 +1699,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_scan_cut_with_nothing_returned_reports_an_exact_count() {
+        assert!(!scan_cut_is_visible(true, false));
+        assert!(scan_cut_is_visible(true, true));
+        assert!(!scan_cut_is_visible(false, true));
+    }
+
     #[tokio::test]
     async fn unauthenticated_search_is_rejected() {
         let svc = service_from(RuntimeDb::memory());
@@ -1726,9 +1806,33 @@ mod tests {
         response.hits.iter().map(|hit| hit.id.as_str()).collect()
     }
 
+    /// Run a Search test on a scratch PostgreSQL database, on a multi-thread
+    /// runtime because the PostgreSQL store blocks in place. The store is
+    /// dropped after the runtime: closing its pool blocks.
+    fn on_postgres<F: std::future::Future<Output = ()>>(test: impl FnOnce(RuntimeDb) -> F) {
+        let scratch = crate::db::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(test(db.clone()));
+        drop(db);
+    }
+
     #[tokio::test]
     async fn hybrid_search_fuses_vector_hits_the_caller_may_read() {
-        let svc = hybrid_service(RuntimeDb::memory()).await;
+        exercise_hybrid_search_fuses_vector_hits_the_caller_may_read(RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_hybrid_search_fuses_vector_hits_the_caller_may_read() {
+        on_postgres(exercise_hybrid_search_fuses_vector_hits_the_caller_may_read);
+    }
+
+    async fn exercise_hybrid_search_fuses_vector_hits_the_caller_may_read(db: RuntimeDb) {
+        let svc = hybrid_service(db).await;
         let text = search(&svc, with_named_principal(search_req("cat"), "tester"))
             .await
             .unwrap()
@@ -1940,7 +2044,16 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_vector_candidates_do_not_use_up_the_cap() {
-        let db = RuntimeDb::memory();
+        exercise_hidden_vector_candidates_do_not_use_up_the_cap(RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_hidden_vector_candidates_do_not_use_up_the_cap() {
+        on_postgres(exercise_hidden_vector_candidates_do_not_use_up_the_cap);
+    }
+
+    async fn exercise_hidden_vector_candidates_do_not_use_up_the_cap(db: RuntimeDb) {
         let stale = CANDIDATE_CAP + 4;
         for index in 0..stale {
             db.create_object_with_audit(
