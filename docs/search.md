@@ -14,6 +14,13 @@ grant. Both RPCs stay classified `experimental`
 
 `Search` takes text plus optional kind, source (`object`, `dataset`, or empty
 for both), property equality filters, requested facets, and a page size.
+`next_page_token` is opaque and bound to the request that produced it: the
+namespace, text, kinds, source, filters, mode, weights, and page size. Send it
+back with the same request to get the next page. A token from a different
+request, or one that does not decode, fails with `INVALID_ARGUMENT`. Tokens
+are not signed: an edited offset only moves within results the caller may
+already read, because every hit is rechecked on the live authorized
+projection.
 Candidates are selected under the caller's compiled read policy. Each
 candidate is rechecked on the live authorized projection. Highlights and
 facet values come from that projection, never from indexed text.

@@ -63,7 +63,8 @@ pub(super) async fn search(
         source => source,
     };
     let page_size = normalize_page_size(input.page_size);
-    let offset = parse_page_offset(&input.page_token)?;
+    let query_binding = page_query_binding(namespace, &input, page_size);
+    let offset = decode_page_token(&input.page_token, &query_binding)?;
     let weights = parse_hybrid_weights(&input)?;
     require_granted_search_properties(
         service.db.runtime(),
@@ -292,7 +293,7 @@ pub(super) async fn search(
         .collect::<Vec<_>>();
     let next_offset = offset.saturating_add(page.len());
     let next_page_token = if next_offset < visible.len() {
-        next_offset.to_string()
+        encode_page_token(next_offset, query_binding)?
     } else {
         String::new()
     };
@@ -485,13 +486,62 @@ fn normalize_page_size(page_size: i32) -> usize {
     }
 }
 
-fn parse_page_offset(token: &str) -> Result<usize, Status> {
-    if token.trim().is_empty() {
+/// Continuation state for `Search` (#2251): opaque to clients, and bound to
+/// the query so a token reused with another query is refused instead of
+/// silently paging a different result set. Not signed, like the other page
+/// tokens: an edited offset only moves within results the caller may read.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchPageToken {
+    offset: usize,
+    query: String,
+}
+
+/// Digest of every request field that shapes the ranked result list or the
+/// page boundaries. Facets only summarize, so they stay out.
+fn page_query_binding(namespace: &str, input: &SearchRequest, page_size: usize) -> String {
+    let filters = input
+        .property_filters
+        .iter()
+        .map(|filter| (filter.property.as_str(), filter.value.as_str()))
+        .collect::<Vec<_>>();
+    let shape = serde_json::json!([
+        namespace,
+        input.text,
+        input.kinds,
+        filters,
+        input.source,
+        input.mode,
+        input.text_weight,
+        input.vector_weight,
+        page_size,
+    ]);
+    sha_hex(&shape.to_string())
+}
+
+fn encode_page_token(offset: usize, query: String) -> Result<String, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    serde_json::to_vec(&SearchPageToken { offset, query })
+        .map(|json| URL_SAFE_NO_PAD.encode(json))
+        .map_err(|_| Status::internal("page token unavailable"))
+}
+
+/// The offset a token resumes at; an empty token starts at the first page.
+fn decode_page_token(token: &str, query_binding: &str) -> Result<usize, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    if token.is_empty() {
         return Ok(0);
     }
-    token.parse::<usize>().map_err(|_| {
-        Status::invalid_argument("page_token must be an offset from a previous Search response")
-    })
+    let token: SearchPageToken = URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .ok_or_else(|| Status::invalid_argument("page_token is not a Search page token"))?;
+    if token.query != query_binding {
+        return Err(Status::invalid_argument(
+            "page_token belongs to a different Search query",
+        ));
+    }
+    Ok(token.offset)
 }
 
 fn purpose_is_authorized(
@@ -1515,7 +1565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_page_does_not_repeat_a_continuation_token() {
+    async fn page_tokens_page_through_one_query_only() {
         let db = RuntimeDb::memory();
         db.create_object_with_audit(
             &object("note-1", "acme", "alpha", &[("body", "shared token")]),
@@ -1535,21 +1585,45 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(first.hits.len(), 1);
-        assert_eq!(first.next_page_token, "1");
+        assert!(first.next_page_token.parse::<usize>().is_err());
+
+        let mut other_query = search_req("token");
+        other_query.page_size = 1;
+        other_query.page_token = first.next_page_token.clone();
+        let reused = search(&svc, with_named_principal(other_query, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(reused.code(), tonic::Code::InvalidArgument);
+
+        let mut other_size = req.clone();
+        other_size.page_size = 2;
+        other_size.page_token = first.next_page_token.clone();
+        let resized = search(&svc, with_named_principal(other_size, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(resized.code(), tonic::Code::InvalidArgument);
+
         req.page_token = first.next_page_token;
         let second = search(&svc, with_named_principal(req.clone(), "tester"))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(second.hits.len(), 1);
+        assert_ne!(second.hits[0].id, first.hits[0].id);
         assert!(second.next_page_token.is_empty());
-        req.page_token = "2".into();
-        let empty = search(&svc, with_named_principal(req, "tester"))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(empty.hits.is_empty());
-        assert!(empty.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_page_token_is_refused() {
+        let svc = service_from(RuntimeDb::memory());
+        for token in ["1", "not base64!", "e30"] {
+            let mut req = search_req("shared");
+            req.page_token = token.into();
+            let error = search(&svc, with_named_principal(req, "tester"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{token}");
+        }
     }
 
     #[tokio::test]
