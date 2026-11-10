@@ -47,9 +47,11 @@ temporary worktree, then for each store backend:
 - On PostgreSQL, a running N-1 server and the current server share the store
   while the current one migrates it. Each writes and reads the other's writes.
 
-Servers run outside any source checkout, as the released image does. On
-PostgreSQL, governed operations and receipts are skipped until #2263 lands;
-the gate prints a `skipped` line for them.
+Servers run outside any source checkout, as the released image does.
+Releases before #2265 cannot record governed receipts on PostgreSQL. When N-1
+refuses with that error, the gate skips only the checks that need an N-1
+receipt and prints a `skipped` line; governed operations the current server
+records still run and verify.
 
 `release.yml` runs the gate for every release tag, and the release is not
 published unless it passes. Pull requests that change the gate run it through
