@@ -420,7 +420,7 @@ jobs:
   # draft that a re-run for the same tag can resume.
   publish:
     name: Publish GitHub Release
-    needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest]
+    needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest, n1-upgrade]
     if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
@@ -460,6 +460,17 @@ jobs:
           fi
           echo "Published GitHub Release ${TAG} from CHANGELOG"
           echo "Image tags: version only, never latest"
+
+  # The previous final release against the tagged commit: N-1 stores open,
+  # N-1 clients work, and both versions share PostgreSQL during the upgrade.
+  # Publish waits for it, so a failed gate leaves a resumable draft.
+  n1-upgrade:
+    name: N-1 upgrade gate
+    needs: verify-tag
+    if: needs.verify-tag.outputs.tag != ''
+    uses: ./.github/workflows/n1-upgrade.yml
+    with:
+      sha: ${{ needs.verify-tag.outputs.sha }}
 
   compatibility-matrix:
     name: Upload compatibility matrix

@@ -1,0 +1,63 @@
+name: N-1 upgrade
+
+# The previous final release (N-1) against this tree (#2172): N-1 creates and
+# seeds SQLite and PostgreSQL stores, the current server opens them, N-1
+# sekaictl talks to the current server, and both versions share PostgreSQL
+# during the upgrade. release.yml calls this for every release tag and
+# publishes only when it passes; pull requests run it when the gate changes.
+on:
+  pull_request:
+    paths:
+      - "scripts/n1-upgrade.sh"
+      - "scripts/postgres-conformance.sh"
+      - ".github/workflows/n1-upgrade.yml"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      sha:
+        description: Commit to test as the current tree
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Two full debug builds share one runner disk.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  n1-upgrade:
+    name: N-1 upgrade gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.sha || '' }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Check the tested commit
+        if: inputs.sha != ''
+        env:
+          SHA: ${{ inputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SHA"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Resolve N-1
+        id: n1
+        run: |
+          echo "tag=$(bash scripts/n1-upgrade.sh --resolve)" >>"$GITHUB_OUTPUT"
+          echo "target=${RUNNER_TEMP}/n1-target" >>"$GITHUB_OUTPUT"
+      # N-1's sources never change, so its build cache is keyed by tag alone.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.n1.outputs.target }}
+          key: n1-target-${{ runner.os }}-${{ steps.n1.outputs.tag }}
+      - name: Run the gate (SQLite and PostgreSQL)
+        env:
+          N1_TAG: ${{ steps.n1.outputs.tag }}
+          N1_TARGET_DIR: ${{ steps.n1.outputs.target }}
+        run: bash scripts/postgres-conformance.sh bash scripts/n1-upgrade.sh
