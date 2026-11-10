@@ -327,12 +327,13 @@ mod tests {
     fn postgres_spec_rpcs_authorize_bound_and_page() {
         let scratch = crate::db::ScratchDatabase::create();
         let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
-        // The PostgreSQL store blocks in place, so a multi-thread runtime;
-        // the scratch database drops after it.
+        // The PostgreSQL store blocks in place, so a multi-thread runtime.
+        // The store drops after the runtime: closing its pool blocks.
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(exercise_spec_rpcs(db));
+            .block_on(exercise_spec_rpcs(db.clone()));
+        drop(db);
     }
 }
