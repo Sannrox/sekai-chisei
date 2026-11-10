@@ -16,6 +16,8 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("sekai.SekaiService", "DeleteObject"),
         ("sekai.SekaiService", "ListObjects"),
         ("sekai.SekaiService", "EvaluateObjectSet"),
+        ("sekai.SekaiService", "Search"),
+        ("sekai.SekaiService", "GetSearchIndexStatus"),
         ("sekai.SekaiService", "ReadObjectChangeSubscription"),
         ("sekai.SekaiService", "PutObjectSecurityPolicyRevision"),
         ("sekai.SekaiService", "ActivateObjectSecurityPolicies"),

@@ -87,9 +87,8 @@ RPCs against these criteria:
 
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
-| `SekaiService.Search`, `SekaiService.GetSearchIndexStatus` | `experimental` | #2243: unbounded query cost, no PostgreSQL RPC tests |
 | `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2244: rebuild cursor held in memory, no limits, no paging on `ListEmbeddingSpecs`, no PostgreSQL RPC tests |
-| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: no namespace or tenant authorization, classification model undecided, admission takes the stored record |
+| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: classification model undecided, admission takes the stored record |
 
 When a blocking Issue closes, its RPCs move to `stable` in
 `tests/fixtures/rpc_maturity/v1.json` and leave this table.
@@ -191,8 +190,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.Search` | `sekai.graph` | yes | none | `experimental` |
-| `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.Search` | `sekai.graph` | yes | mcp | `stable` |
+| `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.PutEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |

@@ -224,8 +224,9 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
         "sekai.definitions.impact",
         "sekai.definitions.proposal.create",
     ];
-    // Search stays experimental in its own catalog section. Definition-branch
-    // tools are stable and listed in both the allowlist and their own section.
+    // Search is stable but documented in its own catalog section (#2243).
+    // Definition-branch tools are listed in both the allowlist and their own
+    // section.
     let search_tool = "sekai.search.query";
     for tool in &projected {
         if *tool == search_tool {
@@ -243,8 +244,8 @@ fn capability_catalog_mcp_reason_matches_stable_evaluation_maturity() {
         .expect("hybrid search tool heading");
     assert!(projected.contains(&search_tool));
     assert!(
-        !capability_is_stable(search_tool),
-        "Search stays experimental"
+        capability_is_stable(search_tool),
+        "Search is stable (#2243)"
     );
     assert!(search.contains(search_tool) && search.contains("`Search`"));
 

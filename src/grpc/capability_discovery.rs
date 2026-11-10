@@ -52,9 +52,10 @@ impl SekaiServiceImpl {
         entries.push(retrieve_context_capability(entailment));
         entries.push(explain_derivation_capability(entailment));
         entries.push(kioku_candidates_capability());
+        // Search is stable (#2243), so discovery reports it active.
+        entries.push(search_query_capability());
+        entries.push(search_status_capability());
         let experimental = crate::rpc_maturity::experimental_rpcs_enabled();
-        entries.push(search_query_capability(experimental));
-        entries.push(search_status_capability(experimental));
         entries.push(neighborhood_capability(experimental));
         entries.push(paths_capability(experimental));
         entries.push(experimental_rpc_capability(experimental));
@@ -858,7 +859,7 @@ fn kioku_candidates_capability() -> CapabilityEntry {
     entry
 }
 
-fn search_query_capability(enabled: bool) -> CapabilityEntry {
+fn search_query_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         super::search_rpc::SEARCH_CAPABILITY.into(),
         "Permission-aware text and hybrid (text plus vector) search over objects and dataset metadata. Discovery is not a grant.".into(),
@@ -874,7 +875,7 @@ fn search_query_capability(enabled: bool) -> CapabilityEntry {
         "property_grant".into(),
         "row_filter".into(),
     ];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry.limits = vec![
         CapabilityLimit {
             name: "max_page".into(),
@@ -888,7 +889,7 @@ fn search_query_capability(enabled: bool) -> CapabilityEntry {
     entry
 }
 
-fn search_status_capability(enabled: bool) -> CapabilityEntry {
+fn search_status_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         super::search_rpc::SEARCH_STATUS_CAPABILITY.into(),
         "Per-namespace search index lag and analyzer identity. Not authority.".into(),
@@ -898,7 +899,7 @@ fn search_status_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into()];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry
 }
 
@@ -1055,15 +1056,12 @@ mod tests {
     }
 
     #[test]
-    fn search_capabilities_are_disabled_when_experimental_rpcs_are_off() {
-        let off = search_query_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
-        assert_eq!(off.name, "sekai.search.query");
-        assert_eq!(off.product_tier, "experimental");
-        let on = search_query_capability(true);
-        assert_eq!(on.lifecycle_state, "active");
-        let status = search_status_capability(false);
-        assert_eq!(status.lifecycle_state, "disabled");
+    fn search_capabilities_are_active_without_the_experimental_flag() {
+        let query = search_query_capability();
+        assert_eq!(query.lifecycle_state, "active");
+        assert_eq!(query.name, "sekai.search.query");
+        let status = search_status_capability();
+        assert_eq!(status.lifecycle_state, "active");
         assert_eq!(status.name, "sekai.search.status");
     }
 }
