@@ -174,6 +174,53 @@ impl SekaiDb {
     }
 }
 
+impl SekaiDb {
+    /// At most `page` of a spec's chunks past `(after_id, after_chunk)`,
+    /// ordered by object id then chunk index (#2252).
+    pub(crate) fn embedding_chunk_page(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        after_id: &str,
+        after_chunk: i64,
+        page: i64,
+    ) -> Result<Vec<EmbeddingChunk>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT object_id, chunk_index, chunk_digest, vector, source_digest, model,
+                        model_version, marking, classifications, embedded_at_ms
+                 FROM sekai_embedding_chunks
+                 WHERE namespace = ?1 AND spec_id = ?2 AND (object_id, chunk_index) > (?3, ?4)
+                 ORDER BY object_id, chunk_index
+                 LIMIT ?5",
+            )
+            .map_err(|error| error.to_string())?;
+        stmt.query_map(
+            params![namespace, spec_id, after_id, after_chunk, page],
+            |row| {
+                Ok(EmbeddingChunk {
+                    object_id: row.get(0)?,
+                    chunk_index: row.get::<_, i64>(1)? as u32,
+                    chunk_digest: row.get(2)?,
+                    vector: vector_from_bytes(&row.get::<_, Vec<u8>>(3)?),
+                    source: EmbeddingSource {
+                        source_digest: row.get(4)?,
+                        model: row.get(5)?,
+                        model_version: row.get(6)?,
+                        marking: row.get(7)?,
+                        classifications: split_classifications(&row.get::<_, String>(8)?),
+                    },
+                    embedded_at_ms: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl EmbeddingStore for SekaiDb {
     fn embedding_checkpoint(
         &self,
@@ -414,34 +461,7 @@ impl EmbeddingStore for SekaiDb {
         namespace: &str,
         spec_id: &str,
     ) -> Result<Vec<EmbeddingChunk>, String> {
-        let conn = self.conn();
-        let mut stmt = conn
-            .prepare(
-                "SELECT object_id, chunk_index, chunk_digest, vector, source_digest, model,
-                        model_version, marking, classifications, embedded_at_ms
-                 FROM sekai_embedding_chunks WHERE namespace = ?1 AND spec_id = ?2
-                 ORDER BY object_id, chunk_index",
-            )
-            .map_err(|error| error.to_string())?;
-        stmt.query_map(params![namespace, spec_id], |row| {
-            Ok(EmbeddingChunk {
-                object_id: row.get(0)?,
-                chunk_index: row.get::<_, i64>(1)? as u32,
-                chunk_digest: row.get(2)?,
-                vector: vector_from_bytes(&row.get::<_, Vec<u8>>(3)?),
-                source: EmbeddingSource {
-                    source_digest: row.get(4)?,
-                    model: row.get(5)?,
-                    model_version: row.get(6)?,
-                    marking: row.get(7)?,
-                    classifications: split_classifications(&row.get::<_, String>(8)?),
-                },
-                embedded_at_ms: row.get(9)?,
-            })
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())
+        self.embedding_chunk_page(namespace, spec_id, "", -1, i64::MAX)
     }
 
     fn embedding_rebuilds(
