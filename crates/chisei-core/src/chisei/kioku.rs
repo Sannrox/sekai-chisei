@@ -3207,10 +3207,7 @@ mod tests {
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_receipt_and_holdout_assignments_are_atomic() {
         let scratch = sekai_core::db::postgres::ScratchDatabase::create();
-        let db = crate::chisei_store::postgres_with_chisei_schema(scratch.connect());
-        receipt_and_holdouts_are_atomic(&ChiseiStore::from_shared_runtime(std::sync::Arc::new(
-            sekai_core::db::runtime_db::RuntimeDb::Postgres(std::sync::Arc::new(db)),
-        )));
+        receipt_and_holdouts_are_atomic(&ChiseiStore::postgres(scratch.connect()));
     }
 
     fn receipt_and_holdouts_are_atomic(db: &ChiseiStore) {

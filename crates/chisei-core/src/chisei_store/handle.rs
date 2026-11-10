@@ -75,6 +75,13 @@ impl ChiseiStore {
         Self::from_shared_runtime(Arc::new(RuntimeDb::memory()))
     }
 
+    /// Test fixture over one PostgreSQL database, so Chisei modules need not
+    /// name `RuntimeDb`.
+    #[cfg(test)]
+    pub fn postgres(db: sekai_core::db::postgres::PostgresDb) -> Self {
+        Self::from_shared_runtime(Arc::new(RuntimeDb::Postgres(Arc::new(db))))
+    }
+
     pub fn open_sqlite(path: &str) -> Self {
         Self::from_shared_runtime(Arc::new(RuntimeDb::Sqlite(Arc::new(
             sekai_core::db::sekai::SekaiDb::new_for_plane(
