@@ -132,6 +132,40 @@ number of matching entries times the pages read. A larger index needs an approxi
 nearest-neighbour index behind `SearchIndex::vector_candidates`, as ADR 0117
 records.
 
+## Embedding spec limits
+
+`PutEmbeddingSpec` refuses a spec past these limits with `INVALID_ARGUMENT`,
+and a new spec in a full namespace with `RESOURCE_EXHAUSTED` (#2244).
+Catch-up checks the same spec limits and refuses, before any model call, an
+object whose chunks would take its spec past the vector limit; the spec is
+reported as failing until it is changed. A refusal makes no model call, and
+growth waits until the deletes and shrinks in the same page of changes have
+released their vectors. A spec stored before these limits that exceeds one
+keeps its vectors but is refused on the next catch-up.
+
+The limit counts stored vectors, which can include those of objects deleted
+or shrunk in changes the catch-up has not reached yet. A spec that stays
+refused although its objects now fit recovers when an operator deletes and
+puts it again (`DeleteEmbeddingSpec`, then `PutEmbeddingSpec`): the next pass
+rebuilds it from the current objects.
+
+| Limit | Value |
+| --- | --- |
+| `dimension` | 4,096 |
+| `chunk_chars` | 8,192 |
+| `batch_size` | 256 texts per model call |
+| Source properties | 32 per spec |
+| Specs | 16 per namespace |
+| Vectors | 1,000,000 per spec |
+
+Exact vector scoring costs vectors times dimension; the 2 s latency budget in
+[Query bounds](#query-bounds) was measured at 64 dimensions.
+
+`ListEmbeddingSpecs` pages by spec id: `page_size` is at most 100 (0 means
+100), and a non-empty `next_page_token` is sent back as `page_token` for the
+next page. A client that sends neither receives up to 100 specs, more than a
+namespace may hold.
+
 ## Index catch-up
 
 `Search` and `GetSearchIndexStatus` only read the index. The one write

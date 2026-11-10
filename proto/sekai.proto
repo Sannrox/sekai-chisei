@@ -1904,7 +1904,9 @@ message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 // What embedding catch-up embeds in a namespace, and the hosted catalog
-// model route (`hosted.<name>/<model>`) that embeds it (#1609).
+// model route (`hosted.<name>/<model>`) that embeds it (#1609). Put refuses
+// dimension above 4096, chunk_chars above 8192, batch_size above 256, more
+// than 32 properties, and a 17th spec in a namespace (#2244).
 message EmbeddingSpecDefinition {
   string namespace = 1;
   string spec_id = 2;
@@ -1919,8 +1921,18 @@ message EmbeddingSpecDefinition {
 }
 message PutEmbeddingSpecRequest { EmbeddingSpecDefinition spec = 1; }
 message PutEmbeddingSpecResponse { EmbeddingSpecDefinition spec = 1; }
-message ListEmbeddingSpecsRequest { string namespace = 1; }
-message ListEmbeddingSpecsResponse { repeated EmbeddingSpecDefinition specs = 1; }
+message ListEmbeddingSpecsRequest {
+  string namespace = 1;
+  // At most 100; 0 means 100.
+  int32 page_size = 2;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 3;
+}
+message ListEmbeddingSpecsResponse {
+  repeated EmbeddingSpecDefinition specs = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message DeleteEmbeddingSpecRequest {
   string namespace = 1;
   string spec_id = 2;

@@ -9,8 +9,8 @@ use crate::domain::Object;
 use crate::sekai::classification_lattice::{ClassificationLattice, union_input_marking_tokens};
 use crate::sekai::embedding_index::{
     CHANGE_PAGE, EmbeddingCatchUpReport, EmbeddingCheckpoint, EmbeddingError, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec,
-    chunk_text, sha_hex, source_text,
+    EmbeddingSource, EmbeddingSpec, EmbeddingStore, MAX_VECTORS_PER_SPEC, ObjectEmbeddings,
+    RebuildCursor, StoredEmbeddingSpec, chunk_text, sha_hex, source_text,
 };
 use crate::sekai::markings::object_marking_token;
 use crate::sekai::object_change_subscription::CommittedObjectMutation;
@@ -98,8 +98,18 @@ pub async fn catch_up_from(
             let revision = previous
                 .as_ref()
                 .map_or(0, |checkpoint| checkpoint.revision);
-            let from = previous.map(|checkpoint| checkpoint.spec_digest);
-            return rebuild(db, spec, embedder, &digest, from, revision, now_ms).await;
+            // An interrupted rebuild toward this digest resumes; any other
+            // starts over from an empty index.
+            let start = match previous {
+                Some(EmbeddingCheckpoint {
+                    rebuild: Some(cursor),
+                    ..
+                }) if cursor.to_digest == digest => RebuildStart::Resume(cursor),
+                previous => RebuildStart::Fresh {
+                    from: previous.map(|checkpoint| checkpoint.spec_digest),
+                },
+            };
+            return rebuild(db, spec, embedder, &digest, start, revision, now_ms).await;
         }
     };
     // Generation before the feed: mutations after this read are in the feed
@@ -151,7 +161,9 @@ pub async fn catch_up_from(
             spec,
             embedder,
             &digest,
-            Some(digest.clone()),
+            RebuildStart::Fresh {
+                from: Some(digest.clone()),
+            },
             checkpoint.revision,
             now_ms,
         )
@@ -168,6 +180,11 @@ pub async fn catch_up_from(
         ..Default::default()
     };
     let mut revision = checkpoint.revision;
+    let mut vectors = if pending.is_empty() {
+        0
+    } else {
+        db.embedding_vector_count(namespace, &spec.id)?
+    };
     let mut seen = BTreeSet::new();
     let mut last_rowid = checkpoint.last_change_rowid;
     let schema = db.get_object_type(&spec.object_kind)?;
@@ -176,6 +193,11 @@ pub async fn catch_up_from(
         schema: schema.as_ref(),
         lattice: lattice.as_ref(),
     };
+    // Growth that would pass the vector limit waits until the rest of the
+    // page, deletes and shrinks included, has released what it releases;
+    // otherwise an add ahead of a delete in the feed would be refused on
+    // every retry although the source fits.
+    let mut deferred = Vec::new();
     for mutation in &pending {
         let object_id = &mutation.change.object_id;
         last_rowid = last_rowid.max(mutation.seq);
@@ -184,6 +206,14 @@ pub async fn catch_up_from(
         }
         match db.get_object(object_id)? {
             Some(object) if object.namespace == namespace && object.kind == spec.object_kind => {
+                let stored = db
+                    .embedding_chunk_digests(namespace, &spec.id, object_id)?
+                    .len() as i64;
+                let chunks = chunk_text(&source_text(spec, &object), spec.chunk_chars).len() as i64;
+                if vectors + chunks - stored > MAX_VECTORS_PER_SPEC {
+                    deferred.push(object);
+                    continue;
+                }
                 report.chunks_embedded += embed_object(
                     db,
                     spec,
@@ -191,6 +221,7 @@ pub async fn catch_up_from(
                     &governance,
                     &object,
                     &mut revision,
+                    &mut vectors,
                     &|| now_ms,
                     false,
                 )
@@ -198,10 +229,31 @@ pub async fn catch_up_from(
                 report.objects += 1;
             }
             _ => {
+                let removed = db
+                    .embedding_chunk_digests(namespace, &spec.id, object_id)?
+                    .len() as i64;
                 revision =
-                    db.delete_embedding_object(namespace, &spec.id, object_id, revision, now_ms)?
+                    db.delete_embedding_object(namespace, &spec.id, object_id, revision, now_ms)?;
+                vectors -= removed;
             }
         }
+    }
+    // Still over the limit now means the source is: refused before the
+    // model call, with the checkpoint left for the next pass.
+    for object in &deferred {
+        report.chunks_embedded += embed_object(
+            db,
+            spec,
+            embedder,
+            &governance,
+            object,
+            &mut revision,
+            &mut vectors,
+            &|| now_ms,
+            false,
+        )
+        .await?;
+        report.objects += 1;
     }
     db.store_embedding_checkpoint(
         namespace,
@@ -211,7 +263,7 @@ pub async fn catch_up_from(
             last_change_rowid: last_rowid,
             last_generation: acknowledged,
             revision,
-            updated_at_ms: 0,
+            ..Default::default()
         },
         now_ms,
     )?;
@@ -357,26 +409,63 @@ where
     }
 }
 
+/// How a rebuild begins: over an empty index, or where an interrupted one
+/// toward the same digest saved its cursor.
+enum RebuildStart {
+    Fresh { from: Option<String> },
+    Resume(RebuildCursor),
+}
+
 async fn rebuild(
     db: &RuntimeDb,
     spec: &EmbeddingSpec,
     embedder: &dyn Embedder,
     digest: &str,
-    from: Option<String>,
+    start: RebuildStart,
     revision: i64,
     now_ms: i64,
 ) -> Result<EmbeddingCatchUpReport, EmbeddingError> {
     let namespace = spec.namespace.as_str();
-    // Generation before position: a mutation between the two reads is then
-    // replayed from the feed but never credited twice, so coverage can only
-    // be undercounted, which at worst causes an extra rebuild. Changes landing
-    // during the rebuild are replayed after it.
-    let generation = db.namespace_object_generation(namespace)?;
-    let watermark = db.object_change_watermark(namespace)?;
     // Writes are stamped with elapsed time, so each one renews the lease.
     let started = std::time::Instant::now();
     let clock = move || now_ms.saturating_add(started.elapsed().as_millis() as i64);
-    let mut revision = db.reset_embedding_spec(namespace, &spec.id, revision, now_ms)?;
+    let (mut cursor, mut revision) = match start {
+        RebuildStart::Resume(cursor) => {
+            // Take the lease with a fenced write before any model call, so
+            // instances that saw the same interrupted rebuild do not all pay
+            // for its next objects: the losers fail here. The same write
+            // drops vectors of objects deleted since they were embedded, so they
+            // cannot hold the spec at its vector limit.
+            let revision = db.resume_embedding_rebuild(
+                namespace,
+                &spec.id,
+                &spec.object_kind,
+                &cursor,
+                revision,
+                now_ms,
+            )?;
+            (cursor, revision)
+        }
+        RebuildStart::Fresh { from } => {
+            // Generation before position: a mutation between the two reads
+            // is then replayed from the feed but never credited twice, so
+            // coverage can only be undercounted, which at worst causes an
+            // extra rebuild. Changes landing during the rebuild, however
+            // often it resumes, are replayed after it.
+            let cursor = RebuildCursor {
+                from_digest: from.unwrap_or_default(),
+                to_digest: digest.to_string(),
+                after_id: String::new(),
+                generation: db.namespace_object_generation(namespace)?,
+                watermark: db.object_change_watermark(namespace)?,
+                objects: 0,
+            };
+            let revision =
+                db.reset_embedding_spec(namespace, &spec.id, &cursor, revision, now_ms)?;
+            (cursor, revision)
+        }
+    };
+    let mut vectors = db.embedding_vector_count(namespace, &spec.id)?;
     let schema = db.get_object_type(&spec.object_kind)?;
     let lattice = db.get_classification_lattice(namespace)?;
     let governance = Governance {
@@ -388,10 +477,11 @@ async fn rebuild(
         ..Default::default()
     };
     // Keyset pages by id: a deletion during the rebuild cannot shift an
-    // unchanged object out of the walk.
-    let mut after = String::new();
+    // unchanged object out of the walk, and the last id of a finished page
+    // is where a crash resumes.
     loop {
-        let ids = db.embedding_source_ids(namespace, &spec.object_kind, &after, REBUILD_PAGE)?;
+        let ids =
+            db.embedding_source_ids(namespace, &spec.object_kind, &cursor.after_id, REBUILD_PAGE)?;
         for id in &ids {
             // Recheck namespace and kind: the object may have changed since
             // the id page was read, and its schema decides egress.
@@ -406,15 +496,26 @@ async fn rebuild(
                     &governance,
                     &object,
                     &mut revision,
+                    &mut vectors,
                     &clock,
                     true,
                 )
                 .await?;
                 report.objects += 1;
+                cursor.objects += 1;
             }
         }
         match ids.last() {
-            Some(last) if ids.len() as i64 == REBUILD_PAGE => after = last.clone(),
+            Some(last) if ids.len() as i64 == REBUILD_PAGE => {
+                cursor.after_id = last.clone();
+                revision = db.store_embedding_rebuild_cursor(
+                    namespace,
+                    &spec.id,
+                    &cursor,
+                    revision,
+                    clock(),
+                )?;
+            }
             _ => break,
         }
     }
@@ -422,17 +523,17 @@ async fn rebuild(
         namespace,
         &spec.id,
         &EmbeddingRebuild {
-            from_digest: from.unwrap_or_default(),
+            from_digest: cursor.from_digest,
             to_digest: digest.to_string(),
-            objects: report.objects,
+            objects: cursor.objects,
             rebuilt_at_ms: now_ms,
         },
         &EmbeddingCheckpoint {
             spec_digest: digest.to_string(),
-            last_change_rowid: watermark,
-            last_generation: generation,
+            last_change_rowid: cursor.watermark,
+            last_generation: cursor.generation,
             revision,
-            updated_at_ms: 0,
+            ..Default::default()
         },
         now_ms,
     )?;
@@ -440,7 +541,9 @@ async fn rebuild(
 }
 
 /// Embed the chunks of `object` whose text changed. Returns how many were
-/// sent to the model.
+/// sent to the model. `vectors` is the spec's stored vector count, kept up
+/// to date; an object that would take it past [`MAX_VECTORS_PER_SPEC`] is
+/// refused before any model call.
 #[allow(clippy::too_many_arguments)]
 async fn embed_object(
     db: &RuntimeDb,
@@ -449,6 +552,7 @@ async fn embed_object(
     governance: &Governance<'_>,
     object: &Object,
     revision: &mut i64,
+    vectors: &mut i64,
     clock: &(dyn Fn() -> i64 + Sync),
     renew_lease: bool,
 ) -> Result<i64, EmbeddingError> {
@@ -486,6 +590,13 @@ async fn embed_object(
     let text = source_text(spec, object);
     let chunks = chunk_text(&text, spec.chunk_chars);
     let stored = db.embedding_chunk_digests(&spec.namespace, &spec.id, &object.id)?;
+    let grown = chunks.len() as i64 - stored.len() as i64;
+    if *vectors + grown > MAX_VECTORS_PER_SPEC {
+        return Err(EmbeddingError::Refused(format!(
+            "embedding spec {} would exceed {MAX_VECTORS_PER_SPEC} vectors",
+            spec.id
+        )));
+    }
     let changed: Vec<(u32, String, String)> = chunks
         .iter()
         .enumerate()
@@ -561,6 +672,7 @@ async fn embed_object(
         *revision,
         clock(),
     )?;
+    *vectors += grown;
     Ok(embedded.len() as i64)
 }
 
@@ -881,7 +993,11 @@ mod tests {
             .unwrap();
         // A v2 rebuild resets the index and dies before finishing.
         let current = db.embedding_checkpoint(NS, &spec.id).unwrap().unwrap();
-        db.reset_embedding_spec(NS, &spec.id, current.revision, 2_000)
+        let v2 = RebuildCursor {
+            to_digest: spec.digest("embed-test", "v2"),
+            ..Default::default()
+        };
+        db.reset_embedding_spec(NS, &spec.id, &v2, current.revision, 2_000)
             .unwrap();
         // A v1 worker must not trust the empty index.
         let report = catch_up_embeddings(db, &spec, &v1, &admit_all, 3_000)
@@ -926,6 +1042,119 @@ mod tests {
         );
     }
 
+    /// Fails every call once it has embedded `left` texts.
+    struct Dying {
+        inner: HashEmbedder,
+        left: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Embedder for Dying {
+        fn model(&self) -> &str {
+            self.inner.model()
+        }
+        fn model_version(&self) -> &str {
+            self.inner.model_version()
+        }
+        fn external(&self) -> bool {
+            false
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(texts.len())
+                })
+                .map_err(|_| "process died".to_string())?;
+            self.inner.embed(texts).await
+        }
+    }
+
+    /// #2244: a rebuild that dies past its first page resumes from the
+    /// stored cursor instead of re-embedding from scratch, and still
+    /// replays changes made to already-embedded objects while it was down.
+    async fn exercise_interrupted_rebuild_resumes(db: &RuntimeDb) {
+        let spec = spec();
+        let count = REBUILD_PAGE as usize + 100;
+        for index in 0..count {
+            db.create_object_with_audit(&note(&format!("k{index:04}"), "x", "y"), "test")
+                .unwrap();
+        }
+        // Each object is two chunks: the process dies 50 objects into the
+        // second page.
+        let dying = Dying {
+            inner: HashEmbedder::new("embed-test", "v1", 4),
+            left: AtomicUsize::new((REBUILD_PAGE as usize + 50) * 2),
+        };
+        let died = catch_up_embeddings(db, &spec, &dying, &admit_all, 1_000).await;
+        assert!(matches!(died, Err(EmbeddingError::Model(_))), "{died:?}");
+        let cursor = db
+            .embedding_checkpoint(NS, &spec.id)
+            .unwrap()
+            .unwrap()
+            .rebuild
+            .unwrap();
+        assert_eq!(cursor.after_id, format!("k{:04}", REBUILD_PAGE - 1));
+        assert_eq!(cursor.objects, REBUILD_PAGE);
+        retitle(db, "k0001", "edited while down");
+        db.delete_object_with_audit("k0002", "test").unwrap();
+
+        let restarted = Counting::new("v1", false);
+        let report = catch_up_embeddings(db, &spec, &restarted, &admit_all, 2_000)
+            .await
+            .unwrap();
+        assert!(report.rebuilt);
+        assert_eq!(report.objects, 100);
+        // Objects embedded past the cursor before the crash keep their
+        // vectors; only the 50 never reached are sent again.
+        assert_eq!(restarted.calls.load(Ordering::SeqCst), 50 * 2);
+        let rebuilds = db.embedding_rebuilds(NS, &spec.id).unwrap();
+        assert_eq!(rebuilds.len(), 1);
+        assert_eq!(rebuilds[0].objects, count as i64);
+        // The object deleted behind the cursor lost its vectors on resume.
+        let chunks = db.embedding_chunks(NS, &spec.id).unwrap();
+        assert_eq!(chunks.len(), (count - 1) * 2);
+        assert!(chunks.iter().all(|chunk| chunk.object_id != "k0002"));
+        assert!(
+            db.embedding_checkpoint(NS, &spec.id)
+                .unwrap()
+                .unwrap()
+                .rebuild
+                .is_none()
+        );
+        // The edit made while the rebuild was down is replayed from the feed.
+        let replay = catch_up_embeddings(db, &spec, &restarted, &admit_all, 3_000)
+            .await
+            .unwrap();
+        assert!(!replay.rebuilt);
+        assert_eq!(replay.objects, 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_rebuild_resumes_from_its_cursor() {
+        exercise_interrupted_rebuild_resumes(&RuntimeDb::memory()).await;
+    }
+
+    #[tokio::test]
+    async fn a_spec_past_its_vector_limit_is_refused_before_the_model_call() {
+        let db = RuntimeDb::memory();
+        let spec = EmbeddingSpec {
+            chunk_chars: 1,
+            ..spec()
+        };
+        let mut object = note("big", "", "");
+        object
+            .properties
+            .insert("body".into(), "x".repeat(MAX_VECTORS_PER_SPEC as usize + 1));
+        db.create_object_with_audit(&object, "test").unwrap();
+        let counting = Counting::new("v1", false);
+        let refused = catch_up_embeddings(&db, &spec, &counting, &admit_all, 1_000).await;
+        assert!(
+            matches!(refused, Err(EmbeddingError::Refused(_))),
+            "{refused:?}"
+        );
+        assert_eq!(counting.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn interrupted_rebuild_is_redone() {
         exercise_interrupted_rebuild_is_redone(&RuntimeDb::memory()).await;
@@ -960,6 +1189,19 @@ mod tests {
             exercise_rebuild_survives_deletes(&db).await;
             exercise_interrupted_rebuild_is_redone(&db).await;
         });
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_interrupted_rebuild_resumes_from_its_cursor() {
+        // Its own scratch database: the exercise counts every object and
+        // rebuild of the namespace.
+        let (_scratch, db) = postgres_runtime();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_interrupted_rebuild_resumes(&db));
     }
 
     #[tokio::test]
@@ -1132,8 +1374,14 @@ mod tests {
         // A rebuild another instance is running holds off scheduled
         // catch-up until its lease lapses; then this instance takes over.
         let current = db.embedding_checkpoint(NS, "notes").unwrap().unwrap();
-        db.reset_embedding_spec(NS, "notes", current.revision, 50_000)
-            .unwrap();
+        db.reset_embedding_spec(
+            NS,
+            "notes",
+            &RebuildCursor::default(),
+            current.revision,
+            50_000,
+        )
+        .unwrap();
         let listed = db.list_embedding_specs(Some(NS)).unwrap().remove(0);
         let scheduled = |now_ms| {
             catch_up_from(

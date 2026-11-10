@@ -2020,7 +2020,7 @@ mod tests {
                 .embedding_checkpoint("acme", "notes")?
                 .map_or(0, |checkpoint| checkpoint.revision);
             self.0
-                .reset_embedding_spec("acme", "notes", revision, 2_000)?;
+                .reset_embedding_spec("acme", "notes", &Default::default(), revision, 2_000)?;
             Topic.embed(texts).await
         }
     }
