@@ -1710,8 +1710,29 @@ message DocumentView {
   bool has_metadata = 15;
   bool has_renditions = 16;
 }
+// What a caller submits to admit a document. Field numbers match
+// GovernedDocument; the server sets the reserved ones: the owner is the
+// caller, and the admission and deletion fields are its own. content_digest,
+// when set, must match the digest of content_ref.
+message GovernedDocumentAdmission {
+  reserved 4, 15, 16, 17;
+  reserved "owner", "admitted_by", "admitted_at_ms", "deleted_at_ms";
+  string contract_version = 1;
+  string document_id = 2;
+  string namespace = 3;
+  string type_revision = 5;
+  string purpose = 6;
+  string classification = 7;
+  string title = 8;
+  map<string, string> metadata = 9;
+  ContentReference content_ref = 10;
+  string content_digest = 11;
+  int64 expires_at_ms = 12;
+  string hold_id = 13;
+  string hold_reason = 14;
+}
 message AdmitGovernedDocumentRequest {
-  GovernedDocument document = 1;
+  GovernedDocumentAdmission document = 1;
 }
 message AdmitGovernedDocumentResponse {
   GovernedDocument document = 1;

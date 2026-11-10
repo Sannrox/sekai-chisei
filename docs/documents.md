@@ -53,9 +53,25 @@ sekaictl admin documents delete --namespace records --document-id doc:brief \
   --actor analyst
 ```
 
-The admitting and retrieving actor must be the registered owner. A retrieve
-must present the document purpose. `--classification-ceiling` can only
-restrict a sealed principal profile. It cannot raise clearance.
+The admitting actor becomes the owner, and only the owner retrieves or
+changes the document. The `--document` file is the admission input: the
+contract fields above plus an optional `content_digest`, which must match the
+content reference. It has no `owner`, `admitted_by`, `admitted_at_ms`, or
+`deleted_at_ms`; the server sets those, and a file that carries them is
+refused. A retrieve must present the document purpose.
+`--classification-ceiling` can only restrict a sealed principal profile. It
+cannot raise clearance.
+
+## Classification
+
+Classification follows the namespace lattice, as Search does
+([ADR 0039](decisions/0039-governed-documents.md#amendment-2026-11-10)). A
+namespace with an activated lattice admits only its tokens, and a read needs
+the caller's sealed ceiling to dominate the marking. A namespace without one
+uses `public`, `internal`, `confidential`, and `restricted`; `public` is
+visible to the owner without a ceiling. A marking the namespace's rule does
+not name is never visible, so keep the fixed tokens your documents use when
+you activate a lattice.
 
 Hold blocks expiry and deletion. Deleted or expired documents are
 observationally identical to missing documents. Deletion is terminal: the
@@ -65,7 +81,7 @@ same `(namespace, document_id)` cannot be re-admitted.
 
 | Condition | Result |
 | --- | --- |
-| Unknown document, foreign owner, mismatched purpose, hidden or unauthorized field | `governed document is unavailable` |
+| Unknown document, foreign owner, mismatched purpose, marking above the ceiling or unknown to the namespace, hidden or unauthorized field | `governed document is unavailable` |
 | Active hold during expire or delete | `governed document is held` |
 | Unknown media type | `governed document format is unsupported` |
 | Unknown type revision or rendition class | `governed document revision is unsupported` |

@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::markings::{
-    PRINCIPAL_PROFILE_KIND, PRINCIPAL_PROFILE_SEALED_PROPERTY, PrincipalAuthority,
+    MarkingDecision, PRINCIPAL_PROFILE_KIND, PRINCIPAL_PROFILE_SEALED_PROPERTY, PrincipalAuthority,
     parse_classification, principal_authority_from_profile, principal_profile_external_id,
     trusted_service_authority,
 };
@@ -78,6 +79,33 @@ pub struct GovernedDocument {
     pub admitted_at_ms: i64,
     #[serde(default)]
     pub deleted_at_ms: i64,
+}
+
+/// What a caller submits to admit a document. The server sets the rest of
+/// the stored record: the owner is the caller, and the content digest and
+/// admission fields are computed. `content_digest`, when set, must match the
+/// digest of `content_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentAdmission {
+    pub contract_version: String,
+    pub document_id: String,
+    pub namespace: String,
+    pub type_revision: String,
+    pub purpose: String,
+    pub classification: String,
+    pub title: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    pub content_ref: ContentReference,
+    #[serde(default)]
+    pub content_digest: String,
+    #[serde(default)]
+    pub expires_at_ms: i64,
+    #[serde(default)]
+    pub hold_id: String,
+    #[serde(default)]
+    pub hold_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,17 +192,21 @@ pub fn content_digest_for(reference: &ContentReference) -> Result<String, String
     ))
 }
 
+/// Admits a document owned by `actor`. The classification must be a marking
+/// of the namespace's activated lattice, or a fixed marking when it has none.
 pub fn admit_document(
     db: &RuntimeDb,
     actor: &str,
-    document: &GovernedDocument,
+    admission: &DocumentAdmission,
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
     required("actor", actor)?;
     if now_ms < 0 {
         return Err("admit timestamp must be non-negative".into());
     }
-    let validated = validate_document(document, actor, now_ms)?;
+    let validated = validate_document(admission, actor, now_ms)?;
+    let lattice = db.get_classification_lattice(&validated.namespace)?;
+    check_marking(lattice.as_ref(), &validated.classification)?;
     // Insert-or-read in one step: under concurrency the first definition wins
     // and every other admission is compared against it (#1776).
     let Some(existing) = db.insert_governed_document(&validated)? else {
@@ -244,8 +276,18 @@ pub fn retrieve_document(
     }
     let document = live_document(db, &query.namespace, &query.document_id, actor, now_ms)?;
     let fields = requested_fields(&query.fields)?;
-    let authority = retrieve_authority(db, actor, query)?;
-    if !classification_visible(&document.classification, &authority) {
+    let lattice = db.get_classification_lattice(&document.namespace)?;
+    let ceiling = query.classification_ceiling.as_deref();
+    if let Some(ceiling) = ceiling {
+        check_marking(lattice.as_ref(), ceiling)?;
+    }
+    let authority = retrieve_authority(db, actor)?;
+    if !classification_visible(
+        &document.classification,
+        &authority,
+        ceiling,
+        lattice.as_ref(),
+    ) {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
     if query.purpose.as_deref() != Some(document.purpose.as_str()) {
@@ -454,7 +496,7 @@ fn check_owner(document: &GovernedDocument, actor: &str) -> Result<(), String> {
 }
 
 fn validate_document(
-    document: &GovernedDocument,
+    document: &DocumentAdmission,
     actor: &str,
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
@@ -464,13 +506,9 @@ fn validate_document(
     }
     required("document id", &document.document_id)?;
     required("namespace", &document.namespace)?;
-    required("owner", &document.owner)?;
     required("purpose", &document.purpose)?;
     required("title", &document.title)?;
-    if document.owner != actor {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    parse_classification(&document.classification)?;
+    required("classification", &document.classification)?;
     if document.expires_at_ms < 0 {
         return Err("document expiry must be non-negative".into());
     }
@@ -483,15 +521,24 @@ fn validate_document(
     if !document.content_digest.is_empty() && document.content_digest != digest {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    if document.deleted_at_ms != 0 {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
     Ok(GovernedDocument {
+        contract_version: document.contract_version.clone(),
+        document_id: document.document_id.clone(),
+        namespace: document.namespace.clone(),
+        owner: actor.into(),
+        type_revision: document.type_revision.clone(),
+        purpose: document.purpose.clone(),
+        classification: document.classification.clone(),
+        title: document.title.clone(),
+        metadata: document.metadata.clone(),
+        content_ref: document.content_ref.clone(),
         content_digest: digest,
+        expires_at_ms: document.expires_at_ms,
+        hold_id: document.hold_id.clone(),
+        hold_reason: document.hold_reason.clone(),
         admitted_by: actor.into(),
         admitted_at_ms: now_ms,
         deleted_at_ms: 0,
-        ..document.clone()
     })
 }
 
@@ -580,13 +627,9 @@ fn requested_fields(fields: &[String]) -> Result<BTreeSet<&str>, String> {
     Ok(requested)
 }
 
-fn retrieve_authority(
-    db: &RuntimeDb,
-    actor: &str,
-    query: &DocumentRetrieve,
-) -> Result<PrincipalAuthority, String> {
-    let mut authority = if let Some(trusted) = trusted_service_authority(actor) {
-        trusted
+fn retrieve_authority(db: &RuntimeDb, actor: &str) -> Result<PrincipalAuthority, String> {
+    if let Some(trusted) = trusted_service_authority(actor) {
+        Ok(trusted)
     } else {
         let candidates = db.find_all_by_external_id(&principal_profile_external_id(actor))?;
         let mut sealed = Vec::new();
@@ -612,31 +655,46 @@ fn retrieve_authority(
         if sealed.len() > 1 {
             return Err(DOCUMENT_UNAVAILABLE.into());
         }
-        principal_authority_from_profile(actor, sealed.first().copied())?
-    };
-    if let Some(requested) = query.classification_ceiling.as_deref() {
-        let requested = parse_classification(requested)?;
-        if authority
-            .classification_ceiling
-            .is_some_and(|existing| requested < existing)
-        {
-            authority.classification_ceiling = Some(requested);
-            authority.classification_token = Some(requested.as_str().into());
-        }
+        principal_authority_from_profile(actor, sealed.first().copied())
     }
-    Ok(authority)
 }
 
-fn classification_visible(classification: &str, authority: &PrincipalAuthority) -> bool {
-    let Ok(marking) = parse_classification(classification) else {
-        return false;
-    };
-    if marking == EvidenceClassification::Public {
-        return true;
+/// Checks that `token` is a marking of the namespace's activated lattice
+/// (ADR 0032), or one of the fixed markings when it has none (ADR 0007).
+fn check_marking(lattice: Option<&ClassificationLattice>, token: &str) -> Result<(), String> {
+    match lattice {
+        Some(lattice) if lattice.contains(token.trim()) => Ok(()),
+        Some(_) => Err("classification marking is unknown to the activated lattice".into()),
+        None => parse_classification(token).map(drop),
     }
-    authority
-        .classification_ceiling
-        .is_some_and(|ceiling| ceiling >= marking)
+}
+
+/// Whether `authority` may see a document marked `classification`, evaluated
+/// as Search does: under the namespace's activated lattice, else the fixed
+/// markings, where `public` stays visible without a ceiling. A requested
+/// `ceiling` only restricts: it must also dominate the marking. A marking
+/// unknown to the rule is never visible, trusted principals included.
+fn classification_visible(
+    classification: &str,
+    authority: &PrincipalAuthority,
+    ceiling: Option<&str>,
+    lattice: Option<&ClassificationLattice>,
+) -> bool {
+    let marking = classification.trim();
+    if check_marking(lattice, marking).is_err() {
+        return false;
+    }
+    let held = (lattice.is_none()
+        && parse_classification(marking) == Ok(EvidenceClassification::Public))
+        || evaluate_lattice_access("governed-document", Some(marking), authority, lattice).decision
+            == MarkingDecision::Allow;
+    held && ceiling.is_none_or(|ceiling| match lattice {
+        Some(lattice) => lattice.dominates(ceiling.trim(), marking) == Ok(true),
+        None => matches!(
+            (parse_classification(ceiling), parse_classification(marking)),
+            (Ok(ceiling), Ok(marking)) if ceiling >= marking
+        ),
+    })
 }
 
 fn supported_media_type(media_type: &str, class: Option<&str>) -> bool {
@@ -765,13 +823,12 @@ mod tests {
         }
     }
 
-    fn document() -> GovernedDocument {
+    fn document() -> DocumentAdmission {
         let content_ref = content_ref(MEDIA_PDF);
-        GovernedDocument {
+        DocumentAdmission {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:brief".into(),
             namespace: "records".into(),
-            owner: "analyst".into(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),
@@ -782,9 +839,6 @@ mod tests {
             expires_at_ms: 10_000,
             hold_id: String::new(),
             hold_reason: String::new(),
-            admitted_by: String::new(),
-            admitted_at_ms: 0,
-            deleted_at_ms: 0,
         }
     }
 
@@ -1004,7 +1058,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("hidden".into(), serde_json::json!("nope"));
-        assert!(serde_json::from_value::<GovernedDocument>(unknown).is_err());
+        assert!(serde_json::from_value::<DocumentAdmission>(unknown).is_err());
     }
 
     #[test]
@@ -1162,7 +1216,6 @@ mod tests {
         pin_ceiling(&runtime, "counsel", "internal");
         let mut other = document();
         other.namespace = "legal".into();
-        other.owner = "counsel".into();
         admit_document(&runtime, "analyst", &document(), 1_000).unwrap();
         admit_document(&runtime, "counsel", &other, 1_000).unwrap();
         attach_rendition(&runtime, "analyst", &rendition(), 1_500).unwrap();
@@ -1198,12 +1251,171 @@ mod tests {
         );
     }
 
+    /// Documents follow the namespace lattice as Search does (#2245): fixed
+    /// markings work until a lattice is activated, after which only its
+    /// tokens are visible, and an unknown marking is never visible.
+    fn exercise_documents_follow_the_namespace_lattice(runtime: &RuntimeDb, suffix: &str) {
+        use crate::sekai::classification_lattice::CLASSIFICATION_LATTICE_VERSION;
+
+        let namespace = format!("records-{suffix}");
+        let analyst = format!("analyst-{suffix}");
+        let counsel = format!("counsel-{suffix}");
+        pin_ceiling(runtime, &analyst, "internal");
+        pin_ceiling(runtime, &counsel, "acme-secret");
+        let admission = |id: &str, classification: &str| DocumentAdmission {
+            document_id: id.into(),
+            namespace: namespace.clone(),
+            classification: classification.into(),
+            ..document()
+        };
+        let visible = |actor: &str, id: &str, ceiling: Option<&str>| {
+            retrieve_document(
+                runtime,
+                actor,
+                &DocumentRetrieve {
+                    namespace: namespace.clone(),
+                    document_id: id.into(),
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: ceiling.map(str::to_string),
+                },
+                2_000,
+            )
+            .is_ok()
+        };
+
+        // Without a lattice the fixed markings apply, case-insensitively.
+        admit_document(
+            runtime,
+            &analyst,
+            &admission("doc:fixed", "Internal"),
+            1_000,
+        )
+        .unwrap();
+        admit_document(runtime, &analyst, &admission("doc:public", "public"), 1_000).unwrap();
+        assert!(visible(&analyst, "doc:fixed", None));
+        assert!(visible(&analyst, "doc:public", None));
+        assert!(!visible(&analyst, "doc:fixed", Some("public")));
+        assert!(
+            admit_document(runtime, &analyst, &admission("doc:x", "acme-secret"), 1_000).is_err()
+        );
+        // A stored marking no rule knows is never visible, not even to a
+        // trusted principal.
+        let unknown =
+            validate_document(&admission("doc:unknown", "mystery"), "root", 1_000).unwrap();
+        assert!(
+            runtime
+                .insert_governed_document(&unknown)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!visible("root", "doc:unknown", None));
+
+        runtime
+            .put_classification_lattice(
+                &ClassificationLattice {
+                    contract_version: CLASSIFICATION_LATTICE_VERSION.into(),
+                    namespace: namespace.clone(),
+                    tokens: vec!["internal".into(), "acme-secret".into()],
+                    parents: BTreeMap::from([("internal".into(), vec!["acme-secret".into()])]),
+                    incomparable: Vec::new(),
+                },
+                "root",
+                1_500,
+            )
+            .unwrap();
+
+        // The activated lattice governs: its tokens are exact, and a fixed
+        // marking it does not name fails closed.
+        admit_document(
+            runtime,
+            &counsel,
+            &admission("doc:secret", "acme-secret"),
+            1_600,
+        )
+        .unwrap();
+        admit_document(
+            runtime,
+            &analyst,
+            &admission("doc:internal", "internal"),
+            1_600,
+        )
+        .unwrap();
+        assert!(visible(&counsel, "doc:secret", None));
+        assert!(!visible(&counsel, "doc:secret", Some("internal")));
+        assert!(visible(&analyst, "doc:internal", None));
+        assert!(!visible(&analyst, "doc:fixed", None));
+        assert!(!visible(&analyst, "doc:public", None));
+        assert!(!visible("root", "doc:unknown", None));
+        assert!(
+            admit_document(
+                runtime,
+                &analyst,
+                &admission("doc:y", "confidential"),
+                1_600
+            )
+            .is_err()
+        );
+        assert!(
+            retrieve_document(
+                runtime,
+                &analyst,
+                &DocumentRetrieve {
+                    namespace: namespace.clone(),
+                    document_id: "doc:internal".into(),
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: Some("public".into()),
+                },
+                2_000,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn documents_follow_the_namespace_lattice() {
+        exercise_documents_follow_the_namespace_lattice(&db(), "sqlite");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_documents_follow_the_namespace_lattice() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        exercise_documents_follow_the_namespace_lattice(&postgres_runtime(), &suffix);
+    }
+
+    #[test]
+    fn the_server_sets_owner_and_admission_fields() {
+        let runtime = db();
+        let admitted = admit(&runtime);
+        assert_eq!(
+            (
+                admitted.owner.as_str(),
+                admitted.admitted_by.as_str(),
+                admitted.admitted_at_ms,
+                admitted.deleted_at_ms,
+            ),
+            ("analyst", "analyst", 1_000, 0)
+        );
+        assert_eq!(
+            admitted.content_digest,
+            content_digest_for(&admitted.content_ref).unwrap()
+        );
+        let mut stored = serde_json::to_value(document()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .insert("admitted_by".into(), serde_json::json!("someone-else"));
+        assert!(serde_json::from_value::<DocumentAdmission>(stored).is_err());
+    }
+
     /// Concurrent admissions of one id with different titles: exactly one
     /// succeeds and the stored definition is the one it returned (#1776).
     fn concurrent_conflicting_admissions_keep_one(
         runtime: &RuntimeDb,
         principal: &str,
-        document: &GovernedDocument,
+        document: &DocumentAdmission,
     ) {
         const ADMISSIONS: usize = 8;
         let barrier = std::sync::Barrier::new(ADMISSIONS);
@@ -1281,10 +1493,9 @@ mod tests {
         RuntimeDb::Postgres(Arc::new(db))
     }
 
-    fn unique_case(suffix: &str) -> (String, GovernedDocument, DocumentRendition) {
+    fn unique_case(suffix: &str) -> (String, DocumentAdmission, DocumentRendition) {
         let principal = format!("analyst-{suffix}");
         let mut document = document();
-        document.owner = principal.clone();
         document.namespace = format!("records-{suffix}");
         document.document_id = format!("doc:brief-{suffix}");
         let mut rendition = rendition();

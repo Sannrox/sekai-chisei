@@ -39,7 +39,7 @@ use sekai_chisei::grpc::pb::sekai::{
     DeleteGovernedDocumentRequest, DocumentRendition, EnsureTeamNamespaceRequest,
     ExpireGovernedDocumentRequest, GetActionInstanceRequest, GetGovernedDocumentRequest,
     GetLeaseRequest, GetLinkedObjectsRequest, GetObjectRequest, GovernedActionType,
-    GovernedDocument, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
+    GovernedDocumentAdmission, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
     ListFilter, ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
     ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, RunActionBindingRequest,
     SubmitActionInstanceRequest, TraverseRequest, UpdateObjectRequest,
@@ -1950,12 +1950,11 @@ fn smoke_content_ref(tag: u8, media: &str, bytes: u64) -> ContentReference {
     }
 }
 
-fn smoke_document(namespace: &str, document_id: &str) -> GovernedDocument {
-    GovernedDocument {
+fn smoke_document(namespace: &str, document_id: &str) -> GovernedDocumentAdmission {
+    GovernedDocumentAdmission {
         contract_version: "sekai.governed-document/v1".into(),
         document_id: document_id.into(),
         namespace: namespace.into(),
-        owner: "local".into(),
         type_revision: "v1".into(),
         purpose: "case-review".into(),
         classification: "internal".into(),

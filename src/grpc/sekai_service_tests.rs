@@ -37685,11 +37685,10 @@ async fn governed_document_rpcs_require_namespace_membership() {
         .await
         .unwrap();
     }
-    let document = |owner: &str| GovernedDocument {
+    let document = || GovernedDocumentAdmission {
         contract_version: "sekai.governed-document/v1".into(),
         document_id: "doc:brief".into(),
         namespace: "acme".into(),
-        owner: owner.into(),
         type_revision: "v1".into(),
         purpose: "case-review".into(),
         classification: "public".into(),
@@ -37702,14 +37701,26 @@ async fn governed_document_rpcs_require_namespace_membership() {
         }),
         ..Default::default()
     };
-    svc.admit_governed_document(with_named_principal(
-        AdmitGovernedDocumentRequest {
-            document: Some(document("carol")),
-        },
-        "carol",
-    ))
-    .await
-    .unwrap();
+    let admitted = svc
+        .admit_governed_document(with_named_principal(
+            AdmitGovernedDocumentRequest {
+                document: Some(document()),
+            },
+            "carol",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .document
+        .unwrap();
+    // The admission input has no owner or admission fields: the server sets
+    // them from the caller (#2245).
+    assert_eq!(
+        (admitted.owner.as_str(), admitted.admitted_by.as_str()),
+        ("carol", "carol")
+    );
+    assert!(admitted.admitted_at_ms > 0);
+    assert_eq!(admitted.deleted_at_ms, 0);
 
     let denied = |label: &str, result: Result<(), Status>| {
         let status = result.expect_err(label);
@@ -37727,9 +37738,9 @@ async fn governed_document_rpcs_require_namespace_membership() {
             "admit",
             svc.admit_governed_document(with_named_principal(
                 AdmitGovernedDocumentRequest {
-                    document: Some(GovernedDocument {
+                    document: Some(GovernedDocumentAdmission {
                         document_id: format!("doc:{principal}"),
-                        ..document(principal)
+                        ..document()
                     }),
                 },
                 principal,

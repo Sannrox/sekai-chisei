@@ -47,6 +47,39 @@ community PostgreSQL and exposes those operations as experimental
 `SekaiService` RPCs. managed media sets keep bytes and extractors in the
 platform; this plane records digest-addressed references only.
 
+## Amendment 2026-11-10
+
+#2245 moves document classification onto the namespace classification
+lattice, the rule Search and the embedding index already use
+([ADR 0032](0032-hierarchical-classifications.md)). This is the move
+[ADR 0007](0007-provisional-classification-markings.md) expects for its
+provisional markings.
+
+- A namespace with an activated lattice admits only its tokens, matched
+  exactly. A read needs the caller's sealed ceiling to dominate the marking
+  in that lattice. Trusted service principals stay the exception.
+- A namespace without a lattice keeps the fixed markings
+  `public < internal < confidential < restricted`, matched without regard to
+  case. `public` stays visible to the owner without a ceiling. The default
+  lattice names the same four tokens in the same order, so no stored value
+  changes and no data migration runs on SQLite or PostgreSQL.
+- A stored fixed marking that an activated lattice does not name is
+  unknown, and an unknown marking is never visible, trusted principals
+  included. Operators who activate a lattice keep the fixed tokens their
+  documents use, or re-admit them under a new identity.
+- A requested `classification_ceiling` must be a token of the same rule and
+  only restricts: the read also needs it to dominate the marking.
+
+Until every instance runs this version, an older instance still compares a
+fixed marking by the fixed order in an activated namespace, and hides a
+custom token, which it cannot parse.
+
+Admission takes `GovernedDocumentAdmission`, not the stored record. It has
+no owner, `admitted_by`, `admitted_at_ms`, or `deleted_at_ms`: the server
+sets the owner and `admitted_by` to the caller and stamps the time. Its
+field numbers match `GovernedDocument`, so a request encoded by an older
+client still decodes. The server ignores the stored-record fields it carries.
+
 ## Alternatives considered
 
 Treating documents as blobs with sidecar metadata was rejected because
