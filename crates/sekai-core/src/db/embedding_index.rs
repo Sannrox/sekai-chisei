@@ -3,9 +3,9 @@
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::embedding_index::{
-    EMBEDDING_REVISION_CONFLICT, EmbeddingCheckpoint, EmbeddingChunk, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingSpec, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec,
-    vector_bytes, vector_from_bytes,
+    EMBEDDING_REVISION_CONFLICT, EMBEDDING_SPEC_LIMIT, EmbeddingCheckpoint, EmbeddingChunk,
+    EmbeddingRebuild, EmbeddingSource, EmbeddingSpec, EmbeddingStore, MAX_SPECS_PER_NAMESPACE,
+    ObjectEmbeddings, RebuildCursor, StoredEmbeddingSpec, vector_bytes, vector_from_bytes,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -58,6 +58,49 @@ CREATE TABLE IF NOT EXISTS sekai_embedding_rebuilds (
     rebuilt_at_ms INTEGER NOT NULL
 );
 ";
+
+/// Rebuild cursor columns (#2244), added to checkpoints created before them.
+/// `rebuild_revision` is the revision the cursor is valid at: this plane's
+/// fenced writes carry it forward with the revision, so any write that does
+/// not (an older plane's, a put, a delete) leaves it behind and voids the
+/// cursor. -1 means no cursor.
+const REBUILD_CURSOR_COLUMNS: [&str; 7] = [
+    "rebuild_from TEXT NOT NULL DEFAULT ''",
+    "rebuild_to TEXT NOT NULL DEFAULT ''",
+    "rebuild_after TEXT NOT NULL DEFAULT ''",
+    "rebuild_watermark INTEGER NOT NULL DEFAULT 0",
+    "rebuild_generation INTEGER NOT NULL DEFAULT 0",
+    "rebuild_objects INTEGER NOT NULL DEFAULT 0",
+    "rebuild_revision INTEGER NOT NULL DEFAULT -1",
+];
+
+/// Checkpoint columns as [`checkpoint_from_row`] reads them.
+pub const CHECKPOINT_COLUMNS: &str = "spec_digest, last_change_rowid, last_generation, revision,
+     updated_at_ms, rebuild_from, rebuild_to, rebuild_after, rebuild_watermark,
+     rebuild_generation, rebuild_objects, rebuild_revision";
+
+/// A checkpoint from its [`CHECKPOINT_COLUMNS`] values, with the cursor only
+/// while it is valid at the current revision.
+#[allow(clippy::too_many_arguments)]
+pub fn checkpoint_from_row(
+    spec_digest: String,
+    last_change_rowid: i64,
+    last_generation: i64,
+    revision: i64,
+    updated_at_ms: i64,
+    cursor: RebuildCursor,
+    cursor_revision: i64,
+) -> EmbeddingCheckpoint {
+    let valid = !cursor.to_digest.is_empty() && cursor_revision == revision;
+    EmbeddingCheckpoint {
+        spec_digest,
+        last_change_rowid: last_change_rowid.max(0) as u64,
+        last_generation: last_generation.max(0) as u64,
+        revision,
+        updated_at_ms,
+        rebuild: valid.then_some(cursor),
+    }
+}
 
 /// Put moves the spec's checkpoint revision on (creating the row), so a
 /// catch-up that listed the spec earlier is fenced out; see
@@ -125,9 +168,31 @@ pub fn split_classifications(stored: &str) -> Vec<String> {
 
 impl SekaiDb {
     pub fn migrate_embedding_index(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(SCHEMA)
-            .map_err(|error| error.to_string())
+        let mut conn = self.conn();
+        // One immediate transaction, so two planes upgrading one file
+        // cannot both see a column missing and both add it.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute_batch(SCHEMA)
+            .map_err(|error| error.to_string())?;
+        for column in REBUILD_CURSOR_COLUMNS {
+            let name = column.split(' ').next().unwrap_or_default();
+            let present = tx
+                .prepare(
+                    "SELECT 1 FROM pragma_table_info('sekai_embedding_checkpoints') WHERE name = ?1",
+                )
+                .and_then(|mut stmt| stmt.exists(params![name]))
+                .map_err(|error| error.to_string())?;
+            if !present {
+                tx.execute(
+                    &format!("ALTER TABLE sekai_embedding_checkpoints ADD COLUMN {column}"),
+                    [],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Run `write` in an immediate transaction after a compare-and-bump of the
@@ -147,7 +212,9 @@ impl SekaiDb {
         let bumped = tx
             .execute(
                 "UPDATE sekai_embedding_checkpoints
-                 SET revision = revision + 1, updated_at_ms = ?4
+                 SET revision = revision + 1, updated_at_ms = ?4,
+                     rebuild_revision = CASE WHEN rebuild_revision = revision
+                                        THEN revision + 1 ELSE rebuild_revision END
                  WHERE namespace = ?1 AND spec_id = ?2 AND revision = ?3",
                 params![namespace, spec_id, revision, now_ms],
             )
@@ -172,6 +239,35 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(revision + 1)
     }
+}
+
+/// Save `cursor` valid at `revision`, the one the enclosing fenced write
+/// moves the checkpoint to.
+fn save_cursor(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    spec_id: &str,
+    cursor: &RebuildCursor,
+    revision: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE sekai_embedding_checkpoints
+         SET rebuild_from = ?3, rebuild_to = ?4, rebuild_after = ?5, rebuild_watermark = ?6,
+             rebuild_generation = ?7, rebuild_objects = ?8, rebuild_revision = ?9
+         WHERE namespace = ?1 AND spec_id = ?2",
+        params![
+            namespace,
+            spec_id,
+            cursor.from_digest,
+            cursor.to_digest,
+            cursor.after_id,
+            cursor.watermark as i64,
+            cursor.generation as i64,
+            cursor.objects,
+            revision
+        ],
+    )
+    .map(|_| ())
 }
 
 impl SekaiDb {
@@ -229,17 +325,28 @@ impl EmbeddingStore for SekaiDb {
     ) -> Result<Option<EmbeddingCheckpoint>, String> {
         self.conn()
             .query_row(
-                "SELECT spec_digest, last_change_rowid, last_generation, revision, updated_at_ms
-                 FROM sekai_embedding_checkpoints WHERE namespace = ?1 AND spec_id = ?2",
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS} FROM sekai_embedding_checkpoints
+                     WHERE namespace = ?1 AND spec_id = ?2"
+                ),
                 params![namespace, spec_id],
                 |row| {
-                    Ok(EmbeddingCheckpoint {
-                        spec_digest: row.get(0)?,
-                        last_change_rowid: row.get::<_, i64>(1)?.max(0) as u64,
-                        last_generation: row.get::<_, i64>(2)?.max(0) as u64,
-                        revision: row.get(3)?,
-                        updated_at_ms: row.get(4)?,
-                    })
+                    Ok(checkpoint_from_row(
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        RebuildCursor {
+                            from_digest: row.get(5)?,
+                            to_digest: row.get(6)?,
+                            after_id: row.get(7)?,
+                            watermark: row.get::<_, i64>(8)?.max(0) as u64,
+                            generation: row.get::<_, i64>(9)?.max(0) as u64,
+                            objects: row.get(10)?,
+                        },
+                        row.get(11)?,
+                    ))
                 },
             )
             .optional()
@@ -380,6 +487,7 @@ impl EmbeddingStore for SekaiDb {
         &self,
         namespace: &str,
         spec_id: &str,
+        cursor: &RebuildCursor,
         revision: i64,
         now_ms: i64,
     ) -> Result<i64, String> {
@@ -389,12 +497,58 @@ impl EmbeddingStore for SekaiDb {
                  WHERE namespace = ?1 AND spec_id = ?2",
                 params![namespace, spec_id],
             )?;
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)?;
             tx.execute(
                 "DELETE FROM sekai_embedding_chunks WHERE namespace = ?1 AND spec_id = ?2",
                 params![namespace, spec_id],
             )
             .map(|_| ())
         })
+    }
+
+    fn store_embedding_rebuild_cursor(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        self.fenced_embedding_write(namespace, spec_id, revision, now_ms, |tx| {
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)
+        })
+    }
+
+    fn resume_embedding_rebuild(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        kind: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        self.fenced_embedding_write(namespace, spec_id, revision, now_ms, |tx| {
+            tx.execute(
+                "DELETE FROM sekai_embedding_chunks
+                 WHERE namespace = ?1 AND spec_id = ?2
+                   AND NOT EXISTS (SELECT 1 FROM sekai_objects o
+                                   WHERE o.id = sekai_embedding_chunks.object_id
+                                     AND o.namespace = ?1 AND o.kind = ?3)",
+                params![namespace, spec_id, kind],
+            )?;
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)
+        })
+    }
+
+    fn embedding_vector_count(&self, namespace: &str, spec_id: &str) -> Result<i64, String> {
+        self.conn()
+            .query_row(
+                "SELECT count(*) FROM sekai_embedding_chunks WHERE namespace = ?1 AND spec_id = ?2",
+                params![namespace, spec_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn complete_embedding_rebuild(
@@ -421,7 +575,8 @@ impl EmbeddingStore for SekaiDb {
             )?;
             tx.execute(
                 "UPDATE sekai_embedding_checkpoints
-                 SET spec_digest = ?3, last_change_rowid = ?4, last_generation = ?5
+                 SET spec_digest = ?3, last_change_rowid = ?4, last_generation = ?5,
+                     rebuild_to = '', rebuild_revision = -1
                  WHERE namespace = ?1 AND spec_id = ?2",
                 params![
                     namespace,
@@ -496,6 +651,19 @@ impl EmbeddingStore for SekaiDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        // Only a new spec counts toward the limit, so a namespace stored
+        // over it before the limit can still replace its specs.
+        let (specs, exists): (i64, i64) = tx
+            .query_row(
+                "SELECT count(*), coalesce(sum(spec_id = ?2), 0)
+                 FROM sekai_embedding_specs WHERE namespace = ?1",
+                params![spec.namespace, spec.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        if exists == 0 && specs >= MAX_SPECS_PER_NAMESPACE as i64 {
+            return Err(EMBEDDING_SPEC_LIMIT.into());
+        }
         tx.execute(
             BUMP_SPEC_CHECKPOINT_SQLITE,
             params![spec.namespace, spec.id],
@@ -686,10 +854,42 @@ impl EmbeddingStore for RuntimeDb {
         &self,
         namespace: &str,
         spec_id: &str,
+        cursor: &RebuildCursor,
         revision: i64,
         now_ms: i64,
     ) -> Result<i64, String> {
-        dispatch!(self, db => db.reset_embedding_spec(namespace, spec_id, revision, now_ms))
+        dispatch!(self, db => db.reset_embedding_spec(namespace, spec_id, cursor, revision, now_ms))
+    }
+
+    fn store_embedding_rebuild_cursor(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        dispatch!(self, db => db.store_embedding_rebuild_cursor(
+            namespace, spec_id, cursor, revision, now_ms
+        ))
+    }
+
+    fn resume_embedding_rebuild(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        kind: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        dispatch!(self, db => db.resume_embedding_rebuild(
+            namespace, spec_id, kind, cursor, revision, now_ms
+        ))
+    }
+
+    fn embedding_vector_count(&self, namespace: &str, spec_id: &str) -> Result<i64, String> {
+        dispatch!(self, db => db.embedding_vector_count(namespace, spec_id))
     }
 
     fn complete_embedding_rebuild(
@@ -744,5 +944,74 @@ impl EmbeddingStore for RuntimeDb {
 
     fn delete_embedding_spec(&self, namespace: &str, spec_id: &str) -> Result<bool, String> {
         dispatch!(self, db => db.delete_embedding_spec(namespace, spec_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cursor() -> RebuildCursor {
+        RebuildCursor {
+            to_digest: "v2".into(),
+            after_id: "k0499".into(),
+            ..Default::default()
+        }
+    }
+
+    /// #2244: the cursor survives this plane's own writes, and any write
+    /// that does not carry it forward (here an older plane's fenced write)
+    /// voids it, so a resume never skips objects whose vectors were reset.
+    #[test]
+    fn rebuild_cursor_is_voided_by_a_write_that_does_not_carry_it() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let revision = db.reset_embedding_spec("ns", "s", &cursor(), 0, 1).unwrap();
+        let revision = db
+            .store_embedding_checkpoint(
+                "ns",
+                "s",
+                &EmbeddingCheckpoint {
+                    revision,
+                    ..Default::default()
+                },
+                2,
+            )
+            .unwrap();
+        let read = db.embedding_checkpoint("ns", "s").unwrap().unwrap();
+        assert_eq!((read.revision, read.rebuild), (revision, Some(cursor())));
+
+        // What a plane from before the cursor runs for every fenced write.
+        db.conn()
+            .execute(
+                "UPDATE sekai_embedding_checkpoints SET revision = revision + 1
+                 WHERE namespace = 'ns' AND spec_id = 's'",
+                [],
+            )
+            .unwrap();
+        let read = db.embedding_checkpoint("ns", "s").unwrap().unwrap();
+        assert_eq!(read.rebuild, None);
+    }
+
+    #[test]
+    fn checkpoints_from_before_the_cursor_gain_its_columns() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TABLE sekai_embedding_checkpoints;
+                 CREATE TABLE sekai_embedding_checkpoints (
+                    namespace TEXT NOT NULL, spec_id TEXT NOT NULL, spec_digest TEXT NOT NULL,
+                    last_change_rowid INTEGER NOT NULL, last_generation INTEGER NOT NULL,
+                    revision INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, spec_id));
+                 INSERT INTO sekai_embedding_checkpoints VALUES ('ns', 's', 'd', 7, 3, 4, 0);",
+            )
+            .unwrap();
+        db.migrate_embedding_index().unwrap();
+        db.migrate_embedding_index().unwrap();
+        let read = db.embedding_checkpoint("ns", "s").unwrap().unwrap();
+        assert_eq!(
+            (read.spec_digest.as_str(), read.revision, read.rebuild),
+            ("d", 4, None)
+        );
     }
 }

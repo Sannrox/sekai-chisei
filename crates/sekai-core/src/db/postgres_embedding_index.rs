@@ -1,17 +1,47 @@
 //! PostgreSQL storage for the embedding index (migrations 0086 and 0095).
 
 use crate::db::embedding_index::{
-    join_classifications, join_properties, split_classifications, stored_spec,
+    CHECKPOINT_COLUMNS, checkpoint_from_row, join_classifications, join_properties,
+    split_classifications, stored_spec,
 };
 use crate::db::postgres::PostgresDb;
 use crate::sekai::embedding_index::{
-    EMBEDDING_REVISION_CONFLICT, EmbeddingCheckpoint, EmbeddingChunk, EmbeddingRebuild,
-    EmbeddingSource, EmbeddingStore, ObjectEmbeddings, StoredEmbeddingSpec, vector_bytes,
-    vector_from_bytes,
+    EMBEDDING_REVISION_CONFLICT, EMBEDDING_SPEC_LIMIT, EmbeddingCheckpoint, EmbeddingChunk,
+    EmbeddingRebuild, EmbeddingSource, EmbeddingStore, MAX_SPECS_PER_NAMESPACE, ObjectEmbeddings,
+    RebuildCursor, StoredEmbeddingSpec, vector_bytes, vector_from_bytes,
 };
 
 fn pg_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// Save `cursor` valid at `revision`, the one the enclosing fenced write
+/// moves the checkpoint to.
+fn save_cursor(
+    tx: &mut postgres::Transaction<'_>,
+    namespace: &str,
+    spec_id: &str,
+    cursor: &RebuildCursor,
+    revision: i64,
+) -> Result<(), postgres::Error> {
+    tx.execute(
+        "UPDATE sekai_embedding_checkpoints
+         SET rebuild_from = $3, rebuild_to = $4, rebuild_after = $5, rebuild_watermark = $6,
+             rebuild_generation = $7, rebuild_objects = $8, rebuild_revision = $9
+         WHERE namespace = $1 AND spec_id = $2",
+        &[
+            &namespace,
+            &spec_id,
+            &cursor.from_digest,
+            &cursor.to_digest,
+            &cursor.after_id,
+            &(cursor.watermark as i64),
+            &(cursor.generation as i64),
+            &cursor.objects,
+            &revision,
+        ],
+    )
+    .map(|_| ())
 }
 
 impl PostgresDb {
@@ -70,7 +100,9 @@ impl PostgresDb {
         let bumped = tx
             .execute(
                 "UPDATE sekai_embedding_checkpoints
-                 SET revision = revision + 1, updated_at_ms = $4
+                 SET revision = revision + 1, updated_at_ms = $4,
+                     rebuild_revision = CASE WHEN rebuild_revision = revision
+                                        THEN revision + 1 ELSE rebuild_revision END
                  WHERE namespace = $1 AND spec_id = $2 AND revision = $3",
                 &[&namespace, &spec_id, &revision, &now_ms],
             )
@@ -106,17 +138,30 @@ impl EmbeddingStore for PostgresDb {
         Ok(self
             .connection()?
             .query_opt(
-                "SELECT spec_digest, last_change_rowid, last_generation, revision, updated_at_ms
-                 FROM sekai_embedding_checkpoints WHERE namespace = $1 AND spec_id = $2",
+                &format!(
+                    "SELECT {CHECKPOINT_COLUMNS} FROM sekai_embedding_checkpoints
+                     WHERE namespace = $1 AND spec_id = $2"
+                ),
                 &[&namespace, &spec_id],
             )
             .map_err(pg_error)?
-            .map(|row| EmbeddingCheckpoint {
-                spec_digest: row.get(0),
-                last_change_rowid: row.get::<_, i64>(1).max(0) as u64,
-                last_generation: row.get::<_, i64>(2).max(0) as u64,
-                revision: row.get(3),
-                updated_at_ms: row.get(4),
+            .map(|row| {
+                checkpoint_from_row(
+                    row.get(0),
+                    row.get(1),
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                    RebuildCursor {
+                        from_digest: row.get(5),
+                        to_digest: row.get(6),
+                        after_id: row.get(7),
+                        watermark: row.get::<_, i64>(8).max(0) as u64,
+                        generation: row.get::<_, i64>(9).max(0) as u64,
+                        objects: row.get(10),
+                    },
+                    row.get(11),
+                )
             }))
     }
 
@@ -254,6 +299,7 @@ impl EmbeddingStore for PostgresDb {
         &self,
         namespace: &str,
         spec_id: &str,
+        cursor: &RebuildCursor,
         revision: i64,
         now_ms: i64,
     ) -> Result<i64, String> {
@@ -263,12 +309,59 @@ impl EmbeddingStore for PostgresDb {
                  WHERE namespace = $1 AND spec_id = $2",
                 &[&namespace, &spec_id],
             )?;
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)?;
             tx.execute(
                 "DELETE FROM sekai_embedding_chunks WHERE namespace = $1 AND spec_id = $2",
                 &[&namespace, &spec_id],
             )
             .map(|_| ())
         })
+    }
+
+    fn store_embedding_rebuild_cursor(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        self.fenced_embedding_write(namespace, spec_id, revision, now_ms, |tx| {
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)
+        })
+    }
+
+    fn resume_embedding_rebuild(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        kind: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String> {
+        self.fenced_embedding_write(namespace, spec_id, revision, now_ms, |tx| {
+            tx.execute(
+                "DELETE FROM sekai_embedding_chunks c
+                 WHERE c.namespace = $1 AND c.spec_id = $2
+                   AND NOT EXISTS (SELECT 1 FROM sekai_objects o
+                                   WHERE o.id = c.object_id
+                                     AND o.namespace = $1 AND o.kind = $3)",
+                &[&namespace, &spec_id, &kind],
+            )?;
+            save_cursor(tx, namespace, spec_id, cursor, revision + 1)
+        })
+    }
+
+    fn embedding_vector_count(&self, namespace: &str, spec_id: &str) -> Result<i64, String> {
+        Ok(self
+            .connection()?
+            .query_one(
+                "SELECT count(*) FROM sekai_embedding_chunks WHERE namespace = $1 AND spec_id = $2",
+                &[&namespace, &spec_id],
+            )
+            .map_err(pg_error)?
+            .get(0))
     }
 
     fn complete_embedding_rebuild(
@@ -295,7 +388,8 @@ impl EmbeddingStore for PostgresDb {
             )?;
             tx.execute(
                 "UPDATE sekai_embedding_checkpoints
-                 SET spec_digest = $3, last_change_rowid = $4, last_generation = $5
+                 SET spec_digest = $3, last_change_rowid = $4, last_generation = $5,
+                     rebuild_to = '', rebuild_revision = -1
                  WHERE namespace = $1 AND spec_id = $2",
                 &[
                     &namespace,
@@ -366,6 +460,26 @@ impl EmbeddingStore for PostgresDb {
         let spec = &stored.spec;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(pg_error)?;
+        // Puts into one namespace take turns, so two cannot both pass the
+        // spec limit.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('sekai_embedding_specs:' || $1, 0))",
+            &[&spec.namespace],
+        )
+        .map_err(pg_error)?;
+        // Only a new spec counts toward the limit, so a namespace stored
+        // over it before the limit can still replace its specs.
+        let row = tx
+            .query_one(
+                "SELECT count(*), count(*) FILTER (WHERE spec_id = $2)
+                 FROM sekai_embedding_specs WHERE namespace = $1",
+                &[&spec.namespace, &spec.id],
+            )
+            .map_err(pg_error)?;
+        let (specs, exists): (i64, i64) = (row.get(0), row.get(1));
+        if exists == 0 && specs >= MAX_SPECS_PER_NAMESPACE as i64 {
+            return Err(EMBEDDING_SPEC_LIMIT.into());
+        }
         // Moves the revision on (creating the row), fencing out a catch-up
         // that listed the spec earlier, and ends any rebuild lease. The
         // checkpoint row is locked first, in the order delete and fenced

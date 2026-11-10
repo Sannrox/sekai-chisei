@@ -87,7 +87,7 @@ RPCs against these criteria:
 
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
-| `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2244: rebuild cursor held in memory, no limits, no paging on `ListEmbeddingSpecs`, no PostgreSQL RPC tests |
+| `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2089 gaps closed by #2244; no SDK, host, or example consumer yet, which `stable` requires ([ADR 0071](decisions/0071-rpc-maturity.md)) |
 | `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: classification model undecided, admission takes the stored record |
 
 When a blocking Issue closes, its RPCs move to `stable` in
