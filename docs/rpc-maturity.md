@@ -88,7 +88,7 @@ RPCs against these criteria:
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
 | `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2089 gaps closed by #2244; no SDK, host, or example consumer yet, which `stable` requires ([ADR 0071](decisions/0071-rpc-maturity.md)) |
-| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2245: classification model undecided, admission takes the stored record |
+| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2266: #2089 criterion 4, no RPC-level PostgreSQL tests; criterion 1: `AttachGovernedDocumentRendition` still takes the stored rendition, including the server-set `attached_by` and `attached_at_ms` |
 
 When a blocking Issue closes, its RPCs move to `stable` in
 `tests/fixtures/rpc_maturity/v1.json` and leave this table.

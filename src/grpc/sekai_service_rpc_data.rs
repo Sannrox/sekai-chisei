@@ -4995,18 +4995,17 @@ fn to_proto_content_ref(reference: &crate::sekai::document::ContentReference) ->
     }
 }
 
-fn from_proto_document(
-    proto: GovernedDocument,
-) -> Result<crate::sekai::document::GovernedDocument, Status> {
+fn from_proto_admission(
+    proto: GovernedDocumentAdmission,
+) -> Result<crate::sekai::document::DocumentAdmission, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::GovernedDocument {
+    Ok(crate::sekai::document::DocumentAdmission {
         contract_version: proto.contract_version,
         document_id: proto.document_id,
         namespace: proto.namespace,
-        owner: proto.owner,
         type_revision: proto.type_revision,
         purpose: proto.purpose,
         classification: proto.classification,
@@ -5017,9 +5016,6 @@ fn from_proto_document(
         expires_at_ms: proto.expires_at_ms,
         hold_id: proto.hold_id,
         hold_reason: proto.hold_reason,
-        admitted_by: proto.admitted_by,
-        admitted_at_ms: proto.admitted_at_ms,
-        deleted_at_ms: proto.deleted_at_ms,
     })
 }
 
@@ -5143,11 +5139,11 @@ pub(super) async fn admit_governed_document(
         .into_inner()
         .document
         .ok_or_else(|| Status::invalid_argument("document required"))?;
-    let document = from_proto_document(proto)?;
+    let admission = from_proto_admission(proto)?;
     let admitted = crate::sekai::document::admit_document(
         service.db.runtime(),
         actor,
-        &document,
+        &admission,
         now_millis(),
     )
     .map_err(map_document_error)?;

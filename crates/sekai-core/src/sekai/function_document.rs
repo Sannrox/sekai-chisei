@@ -644,8 +644,8 @@ mod tests {
     use super::*;
     use crate::sekai::action_policy::ActionPolicy;
     use crate::sekai::document::{
-        CONTENT_SCHEME_DIGEST, ContentReference, DOCUMENT_CONTRACT, DocumentRendition,
-        GovernedDocument, TYPE_REVISION_V1, admit_document, attach_rendition,
+        CONTENT_SCHEME_DIGEST, ContentReference, DOCUMENT_CONTRACT, DocumentAdmission,
+        DocumentRendition, TYPE_REVISION_V1, admit_document, attach_rendition,
     };
     use crate::sekai::function::{FuncParam, FunctionBudget, FunctionHost, LlmStep, PipelineStep};
     use crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY;
@@ -738,11 +738,10 @@ mod tests {
             "application/pdf",
             128,
         );
-        let document = GovernedDocument {
+        let document = DocumentAdmission {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:invoice".into(),
             namespace: "records".into(),
-            owner: owner.into(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),
@@ -753,9 +752,6 @@ mod tests {
             expires_at_ms: 0,
             hold_id: String::new(),
             hold_reason: String::new(),
-            admitted_by: String::new(),
-            admitted_at_ms: 0,
-            deleted_at_ms: 0,
         };
         let admitted = admit_document(runtime, owner, &document, 1_000).unwrap();
         let text_digest = digest_bytes(EXTRACTED.as_bytes());

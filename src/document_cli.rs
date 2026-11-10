@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
-use crate::sekai::document::{self, DocumentRendition, DocumentRetrieve, GovernedDocument};
+use crate::sekai::document::{self, DocumentAdmission, DocumentRendition, DocumentRetrieve};
 use chrono::Utc;
 use std::path::PathBuf;
 
@@ -38,12 +38,12 @@ struct FileActor {
 
 async fn admit(config: FileActor) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let document: GovernedDocument =
+    let admission: DocumentAdmission =
         serde_json::from_slice(&std::fs::read(&config.path)?).map_err(std::io::Error::other)?;
     let admitted = document::admit_document(
         db.as_ref(),
         &config.actor,
-        &document,
+        &admission,
         Utc::now().timestamp_millis(),
     )
     .map_err(std::io::Error::other)?;
