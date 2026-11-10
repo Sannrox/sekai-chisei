@@ -6,6 +6,7 @@ use crate::chisei::kioku::{
     MemoryLifecycleState, MemoryValidation, namespace_classification_ceiling,
 };
 use crate::chisei::sekai_principal::principal_grants;
+use crate::chisei_store::ext::{PostgresChiseiReceiptsPostgresDbExt, ReceiptChainPostgresDbExt};
 use sekai_core::db::postgres::PostgresDb;
 use sekai_core::sekai::evidence::{EvidenceClassification, EvidenceLifecycleState};
 use sekai_types::principal::PrincipalContext;
@@ -761,6 +762,58 @@ impl PostgresKiokuPostgresDbExt for PostgresDb {
         }
         Ok(())
     }
+}
+
+/// Writes a governed run's receipt, its chain entry, and a `held_out`
+/// lifecycle event per memory in one transaction. Every holdout must name an
+/// active memory version, or nothing is written.
+pub(crate) fn put_operation_receipt_with_kioku_holdouts(
+    db: &PostgresDb,
+    receipt: &sekai_domain::receipt::OperationReceipt,
+    holdouts: &[(String, u32)],
+    actor: &str,
+    recorded_at_ms: i64,
+) -> Result<(), String> {
+    if actor.trim().is_empty() {
+        return Err("holdout actor is required".into());
+    }
+    let mut connection = db.connection()?;
+    let mut tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    for (memory_id, memory_version) in holdouts {
+        // The row lock keeps the memory active until this commits.
+        let state: String = tx
+            .query_opt(
+                "SELECT state FROM chisei_kioku_memories
+                 WHERE id=$1 AND version=$2 FOR UPDATE",
+                &[memory_id, &i64::from(*memory_version)],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "memory version not found".to_string())?
+            .get(0);
+        if state != MemoryLifecycleState::Active.as_str() {
+            return Err("only active memories can be assigned to holdout".into());
+        }
+    }
+    PostgresChiseiReceiptsPostgresDbExt::upsert_operation_receipt_on(db, &mut tx, receipt)?;
+    db.append_operation_receipt_chain(&mut tx, receipt)?;
+    for (memory_id, memory_version) in holdouts {
+        insert_lifecycle_event(
+            &mut tx,
+            &MemoryLifecycleEvent {
+                memory_id: memory_id.clone(),
+                memory_version: *memory_version,
+                action: "held_out".into(),
+                from_state: Some(MemoryLifecycleState::Active.as_str().into()),
+                to_state: MemoryLifecycleState::Active.as_str().into(),
+                actor: actor.trim().into(),
+                reason: format!("pipeline operation {}", receipt.operation_id),
+                recorded_at_ms,
+            },
+        )?;
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 
 fn insert_lifecycle_event(

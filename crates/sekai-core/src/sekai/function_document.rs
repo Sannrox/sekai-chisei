@@ -645,7 +645,7 @@ mod tests {
     use crate::sekai::action_policy::ActionPolicy;
     use crate::sekai::document::{
         CONTENT_SCHEME_DIGEST, ContentReference, DOCUMENT_CONTRACT, DocumentAdmission,
-        DocumentRendition, TYPE_REVISION_V1, admit_document, attach_rendition,
+        RenditionAttachment, TYPE_REVISION_V1, admit_document, attach_rendition,
     };
     use crate::sekai::function::{FuncParam, FunctionBudget, FunctionHost, LlmStep, PipelineStep};
     use crate::sekai::governed_action_type::EFFECT_KIND_NOTIFY;
@@ -758,7 +758,7 @@ mod tests {
         attach_rendition(
             runtime,
             owner,
-            &DocumentRendition {
+            &RenditionAttachment {
                 namespace: "records".into(),
                 document_id: "doc:invoice".into(),
                 rendition_id: "rend:text".into(),
@@ -769,8 +769,6 @@ mod tests {
                 extractor_profile_digest:
                     "sha256:2222222222222222222222222222222222222222222222222222222222222222"
                         .into(),
-                attached_by: String::new(),
-                attached_at_ms: 0,
             },
             1_500,
         )

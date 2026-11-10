@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
-use crate::sekai::document::{self, DocumentAdmission, DocumentRendition, DocumentRetrieve};
+use crate::sekai::document::{self, DocumentAdmission, DocumentRetrieve, RenditionAttachment};
 use chrono::Utc;
 use std::path::PathBuf;
 
@@ -53,12 +53,12 @@ async fn admit(config: FileActor) -> Result<(), BoxErr> {
 
 async fn attach(config: FileActor) -> Result<(), BoxErr> {
     let db = open_db().await?;
-    let rendition: DocumentRendition =
+    let attachment: RenditionAttachment =
         serde_json::from_slice(&std::fs::read(&config.path)?).map_err(std::io::Error::other)?;
     let attached = document::attach_rendition(
         db.as_ref(),
         &config.actor,
-        &rendition,
+        &attachment,
         Utc::now().timestamp_millis(),
     )
     .map_err(std::io::Error::other)?;

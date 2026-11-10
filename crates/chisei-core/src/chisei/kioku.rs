@@ -3200,7 +3200,17 @@ mod tests {
 
     #[test]
     fn receipt_and_holdout_assignments_are_atomic() {
-        let db = ChiseiStore::memory();
+        receipt_and_holdouts_are_atomic(&ChiseiStore::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_receipt_and_holdout_assignments_are_atomic() {
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        receipt_and_holdouts_are_atomic(&ChiseiStore::postgres(scratch.connect()));
+    }
+
+    fn receipt_and_holdouts_are_atomic(db: &ChiseiStore) {
         let mut memory = candidate();
         memory.confidence_bps = 10_000;
         db.insert_kioku_memory(&memory, &[candidate_evidence(&memory)])
@@ -3234,6 +3244,21 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|event| event.action != "held_out")
+        );
+
+        db.put_operation_receipt_with_kioku_holdouts(
+            &receipt,
+            &[(memory.id.clone(), memory.version)],
+            "agent:test",
+            130,
+        )
+        .unwrap();
+        assert!(db.get_operation_receipt("atomic-plan").unwrap().is_some());
+        assert!(
+            db.list_kioku_lifecycle_events(&memory.id, memory.version)
+                .unwrap()
+                .iter()
+                .any(|event| event.action == "held_out")
         );
     }
 

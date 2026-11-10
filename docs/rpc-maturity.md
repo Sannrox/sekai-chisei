@@ -82,13 +82,12 @@ An `experimental` RPC moves to `stable` only when it meets the
 5. **Bounded cost.** List and query RPCs page, and the upper limits on input,
    results, and index size are enforced and documented.
 
-Status of the experimental Search, embedding-spec, and governed-document
-RPCs against these criteria:
+Search (#2243) and the governed-document RPCs (#2266) met these criteria
+and are `stable`. Status of the remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
 | `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2089 gaps closed by #2244; no SDK, host, or example consumer yet, which `stable` requires ([ADR 0071](decisions/0071-rpc-maturity.md)) |
-| `SekaiService.AdmitGovernedDocument`, `SekaiService.AttachGovernedDocumentRendition`, `SekaiService.GetGovernedDocument`, `SekaiService.HoldGovernedDocument`, `SekaiService.ReleaseGovernedDocumentHold`, `SekaiService.ExpireGovernedDocument`, `SekaiService.DeleteGovernedDocument` | `experimental` | #2266: #2089 criterion 4, no RPC-level PostgreSQL tests; criterion 1: `AttachGovernedDocumentRendition` still takes the stored rendition, including the server-set `attached_by` and `attached_at_ms` |
 
 When a blocking Issue closes, its RPCs move to `stable` in
 `tests/fixtures/rpc_maturity/v1.json` and leave this table.
@@ -224,13 +223,13 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |

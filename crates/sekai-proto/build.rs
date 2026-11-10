@@ -22,6 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .generate_default_stubs(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        // Nested inputs of stable RPCs on the HTTP/JSON projection: proto3
+        // JSON may omit any default-valued field, and the projection only
+        // fills defaults for the top-level request (#2266).
+        .type_attribute("sekai.GovernedDocumentAdmission", "#[serde(default)]")
+        .type_attribute("sekai.DocumentRenditionAttachment", "#[serde(default)]")
+        .type_attribute("sekai.ContentReference", "#[serde(default)]")
         // Generated messages may gain fields. Downstream constructs them with
         // `..Default::default()` so a new field stays additive.
         //

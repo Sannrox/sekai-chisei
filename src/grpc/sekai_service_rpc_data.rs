@@ -5041,14 +5041,14 @@ fn to_proto_document(document: &crate::sekai::document::GovernedDocument) -> Gov
     }
 }
 
-fn from_proto_rendition(
-    proto: DocumentRendition,
-) -> Result<crate::sekai::document::DocumentRendition, Status> {
+fn from_proto_attachment(
+    proto: DocumentRenditionAttachment,
+) -> Result<crate::sekai::document::RenditionAttachment, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::DocumentRendition {
+    Ok(crate::sekai::document::RenditionAttachment {
         namespace: proto.namespace,
         document_id: proto.document_id,
         rendition_id: proto.rendition_id,
@@ -5057,8 +5057,6 @@ fn from_proto_rendition(
         content_ref,
         extractor_id: proto.extractor_id,
         extractor_profile_digest: proto.extractor_profile_digest,
-        attached_by: proto.attached_by,
-        attached_at_ms: proto.attached_at_ms,
     })
 }
 
@@ -5170,11 +5168,11 @@ pub(super) async fn attach_governed_document_rendition(
         .into_inner()
         .rendition
         .ok_or_else(|| Status::invalid_argument("rendition required"))?;
-    let rendition = from_proto_rendition(proto)?;
+    let attachment = from_proto_attachment(proto)?;
     let attached = crate::sekai::document::attach_rendition(
         service.db.runtime(),
         actor,
-        &rendition,
+        &attachment,
         now_millis(),
     )
     .map_err(map_document_error)?;

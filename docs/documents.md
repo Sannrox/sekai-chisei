@@ -58,7 +58,11 @@ changes the document. The `--document` file is the admission input: the
 contract fields above plus an optional `content_digest`, which must match the
 content reference. It has no `owner`, `admitted_by`, `admitted_at_ms`, or
 `deleted_at_ms`; the server sets those, and a file that carries them is
-refused. A retrieve must present the document purpose.
+refused. The `--rendition` file is the attachment input: the rendition
+fields without `attached_by` or `attached_at_ms`, which the server sets to the
+caller and the attach time. Attaching the same rendition again returns the
+stored one; a different rendition under the same id is refused. A retrieve
+must present the document purpose.
 `--classification-ceiling` can only restrict a sealed principal profile. It
 cannot raise clearance.
 
@@ -90,9 +94,21 @@ Unrequested classified fields are omitted. Requesting them fails before any
 disclosure. Re-admission of the same live document and content digest is
 idempotent. Partial output is discarded.
 
-SQLite and community PostgreSQL store documents and renditions. Experimental
-RPCs (`AdmitGovernedDocument`, `AttachGovernedDocumentRendition`,
+A document holds at most 32 metadata keys in 8 KiB of encoded metadata and
+16 renditions. A content reference names at most 32 MiB.
+
+## RPCs
+
+SQLite and community PostgreSQL store documents and renditions. The stable
+RPCs `AdmitGovernedDocument`, `AttachGovernedDocumentRendition`,
 `GetGovernedDocument`, `HoldGovernedDocument`, `ReleaseGovernedDocumentHold`,
-`ExpireGovernedDocument`, `DeleteGovernedDocument`) mirror the CLI. Enable
-them with `SEKAI_EXPERIMENTAL_RPCS=1`. The plane still stores no bytes and
+`ExpireGovernedDocument`, and `DeleteGovernedDocument` mirror the CLI over
+gRPC and the HTTP/JSON projection, with the same failure table
+(`NOT_FOUND` for unavailable, `FAILED_PRECONDITION` for held, format, and
+revision). Each authorizes the namespace before the store: the tenant
+context and service-principal scope, shared space, and team-namespace
+membership. `GetGovernedDocument` needs read access; the other six need
+write access. `AdmitGovernedDocument` takes `GovernedDocumentAdmission` and
+`AttachGovernedDocumentRendition` takes `DocumentRenditionAttachment`; both
+leave out the fields the server sets. The plane still stores no bytes and
 runs no extractor.
