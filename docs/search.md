@@ -70,10 +70,42 @@ Agents reach hybrid search through the MCP tool `sekai.search.query`
 returns object references, never vectors. Each hybrid hit carries its fused
 `score`; text-mode hits carry 0.
 
+## Index catch-up
+
+`Search` and `GetSearchIndexStatus` only read the index. The one write
+they make is an empty checkpoint for an authorized namespace the index does
+not follow yet, such as one whose only content is unbound datasets, so the
+worker finds it. A scheduled worker on every Sekai plane keeps the index
+current: every 10 seconds it visits up to 64 namespaces (those with object
+history or an index checkpoint), continuing after the last one on the next
+pass. Each visit consumes one page of the
+object-change feed and re-reads the dataset catalog when its digest changed.
+A namespace rebuilds when its index is not complete for the current
+analyzer or the feed lost changes it had not consumed.
+
+Several instances may run the worker at once. Every index write is fenced
+on a revision in the namespace checkpoint: a writer whose revision moved
+stops, and its namespace is retried on a later pass. A rebuild clears the
+checkpoint's analyzer version until it completes and renews a five-minute
+lease with every write. Other instances leave the namespace alone while
+the lease holds and take the rebuild over once it lapses, so a rebuild that
+died part-way is redone instead of reported current.
+
+This index lives in its own `sekai_search_*_v2` tables. Planes from before
+the scheduled worker keep reading and writing the unsuffixed
+`sekai_search_*` tables, so during a rolling upgrade or after a rollback the
+two versions never write each other's index; both follow the object-change
+feed and the dataset catalog, which stay the source of truth. The upgrade
+creates the new tables once and seeds them from the old ones, so search
+starts warm; a namespace whose old index was stale or mid-rebuild is caught
+up or rebuilt by the worker. The unsuffixed tables are retired and are
+dropped in a later release.
+
 ## Status
 
 `GetSearchIndexStatus` is a namespace read. It returns analyzer version,
-lag, and index counts. Those counts are not a grant and are not a filtered
-hit list.
+lag, and index counts from durable state. The analyzer version is empty
+before the first build and while a rebuild is in progress. Those counts are
+not a grant and are not a filtered hit list.
 
 See [ADR 0108](decisions/0108-permission-aware-search-index.md).

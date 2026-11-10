@@ -827,6 +827,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // Text candidates come from the search index the worker keeps.
+        for (_, outcome) in
+            crate::db::search_index::catch_up_search_pass(&surface.db, "", usize::MAX, &|| 1_000)
+                .unwrap()
+        {
+            outcome.unwrap();
+        }
         surface
     }
 

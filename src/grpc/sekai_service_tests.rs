@@ -30736,7 +30736,13 @@ async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
     assert_eq!(entry().properties["description"], "curated orders");
     assert_eq!(entry().properties["tags"], "finance,ledger");
 
-    // Search sees the edit once the index catches up.
+    // Search sees the edit once the scheduled worker catches the index up.
+    for (namespace, outcome) in
+        crate::db::search_index::catch_up_search_pass(svc.db.runtime(), "", usize::MAX, &now_millis)
+            .unwrap()
+    {
+        outcome.unwrap_or_else(|error| panic!("{namespace}: {error}"));
+    }
     let hits = svc
         .search(with_named_principal(
             SearchRequest {

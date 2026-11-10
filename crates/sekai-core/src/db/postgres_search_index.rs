@@ -1,5 +1,9 @@
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_object_security::load_active_policy_postgres;
+use crate::db::search_index::{
+    CheckpointFields, DocumentWrite, PENDING_PAGE, SearchMaintenance, SearchPosition,
+    catch_up_namespace, lock_search_maintenance, rebuild_namespace_fenced, search_status,
+};
 use crate::domain::Object;
 use crate::sekai::classification_lattice::ClassificationLattice;
 use crate::sekai::dataset::Dataset;
@@ -8,18 +12,30 @@ use crate::sekai::markings::{
     namespace_deny_unmarked, object_is_unmarked, object_marking_token, unmarked_access_decision,
 };
 use crate::sekai::search_index::{
-    ANALYZER_VERSION, SearchCandidate, SearchCandidateQuery, SearchCatchUpReport,
-    SearchDatasetDump, SearchDocument, SearchDocumentKey, SearchIndex, SearchIndexDump,
-    SearchIndexError, SearchIndexStatus, SearchObjectDump, SearchQueryMode, SearchRebuildReport,
-    SearchSourceKind, VectorCandidate, VectorCandidateQuery, acl_allows, dataset_catalog_digest,
-    dataset_classification_allows, dataset_content_digest, exact_vector_candidates,
+    ANALYZER_VERSION, SEARCH_CHECKPOINT_CONFLICT, SearchCandidate, SearchCandidateQuery,
+    SearchCatchUpReport, SearchCheckpoint, SearchDatasetDump, SearchDocument, SearchDocumentKey,
+    SearchIndex, SearchIndexDump, SearchIndexError, SearchIndexStatus, SearchObjectDump,
+    SearchQueryMode, SearchRebuildReport, SearchSourceKind, VectorCandidate, VectorCandidateQuery,
+    acl_allows, dataset_classification_allows, dataset_content_digest, exact_vector_candidates,
     live_object_match_fields, object_content_digest, object_text_properties, policy_attributes,
     policy_marking_allows, purpose_allows, search_tokens, text_matches_query,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::MutexGuard;
+use std::sync::Mutex;
 
 const PG_MAX_LEXEME_BYTES: usize = 2047;
+
+/// Index table, its text table, and key column per source.
+const OBJECT_ROWS: [&str; 3] = [
+    "sekai_search_object_v2",
+    "sekai_search_object_text_v2",
+    "object_id",
+];
+const DATASET_ROWS: [&str; 3] = [
+    "sekai_search_dataset_v2",
+    "sekai_search_dataset_text_v2",
+    "dataset_id",
+];
 
 fn query_uses_oversize_lexeme(text: &str) -> bool {
     search_tokens(text)
@@ -33,22 +49,6 @@ fn lattice_marking_allows(
     lattice: Option<&ClassificationLattice>,
 ) -> bool {
     policy_marking_allows(marking, &query.policy, lattice)
-}
-
-fn feed_covers_generation(
-    last_generation: u64,
-    generation: u64,
-    pending: &[(String, u64, i64)],
-) -> bool {
-    if generation <= last_generation {
-        return true;
-    }
-    let covered = pending
-        .iter()
-        .map(|(object_id, _, timestamp)| (object_id.as_str(), *timestamp))
-        .collect::<BTreeSet<_>>()
-        .len() as u64;
-    covered >= generation.saturating_sub(last_generation)
 }
 
 fn postgres_tsquery(text: &str) -> Result<String, SearchIndexError> {
@@ -181,67 +181,144 @@ fn insert_chunked_tsvector(
 }
 
 impl PostgresDb {
-    fn lock_search_maintenance(&self) -> Result<MutexGuard<'_, ()>, SearchIndexError> {
-        self.search_maintenance.lock().map_err(|_| {
-            SearchIndexError::Unavailable("search maintenance lock was poisoned".into())
-        })
-    }
-
-    fn search_checkpoint(
-        &self,
-        namespace: &str,
-    ) -> Result<Option<(u64, u64, String, i64)>, String> {
+    fn read_search_checkpoint(&self, namespace: &str) -> Result<Option<SearchCheckpoint>, String> {
         Ok(self
             .connection()?
             .query_opt(
-                "SELECT last_change_rowid, last_generation, dataset_catalog_digest, indexed_at_ms
-                 FROM sekai_search_checkpoint WHERE namespace = $1",
+                "SELECT analyzer_version, last_change_rowid, last_generation,
+                        dataset_catalog_digest, indexed_at_ms, revision
+                 FROM sekai_search_checkpoint_v2 WHERE namespace = $1",
                 &[&namespace],
             )
             .map_err(|error| error.to_string())?
-            .map(|row| {
-                (
-                    row.get::<_, i64>(0).max(0) as u64,
-                    row.get::<_, i64>(1).max(0) as u64,
-                    row.get(2),
-                    row.get(3),
-                )
+            .map(|row| SearchCheckpoint {
+                analyzer_version: row.get(0),
+                last_change_rowid: row.get::<_, i64>(1).max(0) as u64,
+                last_generation: row.get::<_, i64>(2).max(0) as u64,
+                dataset_catalog_digest: row.get(3),
+                indexed_at_ms: row.get(4),
+                revision: row.get(5),
             }))
     }
 
-    fn store_search_checkpoint(
+    /// Run `write` in a transaction after a compare-and-bump of the
+    /// namespace checkpoint revision (the row lock serializes writers) that
+    /// also sets `fields` and stamps `indexed_at_ms` (the rebuild lease).
+    /// Returns the new revision.
+    fn fenced_search_write(
         &self,
         namespace: &str,
-        last_change_rowid: u64,
-        last_generation: u64,
-        dataset_catalog_digest: &str,
-        indexed_at_ms: i64,
-    ) -> Result<(), String> {
-        let rowid = i64::try_from(last_change_rowid).map_err(|error| error.to_string())?;
-        let generation = i64::try_from(last_generation).map_err(|error| error.to_string())?;
-        self.connection()?
+        revision: i64,
+        now_ms: i64,
+        fields: &CheckpointFields<'_>,
+        write: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<(), String>,
+    ) -> Result<i64, SearchIndexError> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        let bumped = tx
             .execute(
-                "INSERT INTO sekai_search_checkpoint
-             (namespace, analyzer_version, last_change_rowid, last_generation,
-              dataset_catalog_digest, indexed_at_ms)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (namespace) DO UPDATE SET
-                analyzer_version = EXCLUDED.analyzer_version,
-                last_change_rowid = EXCLUDED.last_change_rowid,
-                last_generation = EXCLUDED.last_generation,
-                dataset_catalog_digest = EXCLUDED.dataset_catalog_digest,
-                indexed_at_ms = EXCLUDED.indexed_at_ms",
+                "UPDATE sekai_search_checkpoint_v2
+                 SET revision = revision + 1, indexed_at_ms = $3,
+                     analyzer_version = COALESCE($4::TEXT, analyzer_version),
+                     last_change_rowid = COALESCE($5::BIGINT, last_change_rowid),
+                     last_generation = COALESCE($6::BIGINT, last_generation),
+                     dataset_catalog_digest = COALESCE($7::TEXT, dataset_catalog_digest)
+                 WHERE namespace = $1 AND revision = $2",
                 &[
                     &namespace,
-                    &ANALYZER_VERSION,
-                    &rowid,
-                    &generation,
-                    &dataset_catalog_digest,
-                    &indexed_at_ms,
+                    &revision,
+                    &now_ms,
+                    &fields.analyzer_version,
+                    &fields.last_change_rowid,
+                    &fields.last_generation,
+                    &fields.dataset_catalog_digest,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let created = bumped == 0
+            && revision == 0
+            && tx
+                .execute(
+                    "INSERT INTO sekai_search_checkpoint_v2
+                     (namespace, analyzer_version, last_change_rowid, last_generation,
+                      dataset_catalog_digest, revision, indexed_at_ms)
+                     VALUES ($1, COALESCE($3::TEXT, ''), COALESCE($4::BIGINT, 0),
+                             COALESCE($5::BIGINT, 0), COALESCE($6::TEXT, ''), 1, $2)
+                     ON CONFLICT (namespace) DO NOTHING",
+                    &[
+                        &namespace,
+                        &now_ms,
+                        &fields.analyzer_version,
+                        &fields.last_change_rowid,
+                        &fields.last_generation,
+                        &fields.dataset_catalog_digest,
+                    ],
+                )
+                .map_err(|error| error.to_string())?
+                == 1;
+        if bumped != 1 && !created {
+            return Err(SearchIndexError::Unavailable(
+                SEARCH_CHECKPOINT_CONFLICT.into(),
+            ));
+        }
+        write(&mut tx)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(revision + 1)
+    }
+
+    /// An unfenced index write for the [`SearchIndex`] document methods.
+    fn search_write(
+        &self,
+        write: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<(), String>,
+    ) -> Result<(), SearchIndexError> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        write(&mut tx)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// See [`crate::db::runtime_db::RuntimeDb::ensure_search_checkpoint`].
+    pub fn ensure_search_checkpoint(&self, namespace: &str) -> Result<(), String> {
+        let mut conn = self.connection()?;
+        let exists: bool = conn
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM sekai_search_checkpoint_v2 WHERE namespace = $1)",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if !exists {
+            conn.execute(
+                "INSERT INTO sekai_search_checkpoint_v2 (namespace, analyzer_version)
+                 VALUES ($1, '') ON CONFLICT (namespace) DO NOTHING",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// See [`crate::db::runtime_db::RuntimeDb::search_index_namespaces`].
+    pub fn search_index_namespaces(
+        &self,
+        after: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT namespace FROM sekai_namespace_object_generation WHERE namespace > $1
+                 UNION
+                 SELECT namespace FROM sekai_search_checkpoint_v2 WHERE namespace > $1
+                 ORDER BY namespace LIMIT $2",
+                &[&after, &limit],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
     }
 
     fn replace_object_text(
@@ -251,14 +328,14 @@ impl PostgresDb {
         properties: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         tx.execute(
-            "DELETE FROM sekai_search_object_text WHERE namespace = $1 AND object_id = $2",
+            "DELETE FROM sekai_search_object_text_v2 WHERE namespace = $1 AND object_id = $2",
             &[&namespace, &object_id],
         )
         .map_err(|error| error.to_string())?;
         for (property, text) in properties {
             insert_chunked_tsvector(tx, text, |tx, chunk, stored, source| {
                 tx.execute(
-                    "INSERT INTO sekai_search_object_text
+                    "INSERT INTO sekai_search_object_text_v2
                      (namespace, object_id, property, chunk, text, tsv)
                      VALUES ($1, $2, $3, $4, $5, to_tsvector('simple', $6))",
                     &[&namespace, &object_id, &property, &chunk, &stored, &source],
@@ -275,7 +352,7 @@ impl PostgresDb {
         dataset: &Dataset,
     ) -> Result<(), String> {
         tx.execute(
-            "DELETE FROM sekai_search_dataset_text WHERE namespace = $1 AND dataset_id = $2",
+            "DELETE FROM sekai_search_dataset_text_v2 WHERE namespace = $1 AND dataset_id = $2",
             &[&namespace, &dataset.id],
         )
         .map_err(|error| error.to_string())?;
@@ -290,7 +367,7 @@ impl PostgresDb {
         for (field, classification, text) in fields {
             insert_chunked_tsvector(tx, &text, |tx, chunk, stored, source| {
                 tx.execute(
-                    "INSERT INTO sekai_search_dataset_text
+                    "INSERT INTO sekai_search_dataset_text_v2
                      (namespace, dataset_id, field, chunk, classification, text, tsv)
                      VALUES ($1, $2, $3, $4, $5, $6, to_tsvector('simple', $7))",
                     &[
@@ -322,17 +399,16 @@ impl PostgresDb {
         }
     }
 
-    fn index_object_document(&self, object: &Object, now_ms: i64) -> Result<(), SearchIndexError> {
+    /// Upsert one object's index row and text; unchanged content is left.
+    fn index_object_on(
+        tx: &mut postgres::Transaction<'_>,
+        object: &Object,
+        now_ms: i64,
+    ) -> Result<(), String> {
         let digest = object_content_digest(object);
-        let attributes =
-            serde_json::to_string(&policy_attributes(object)).map_err(|error| error.to_string())?;
-        let properties = object_text_properties(object);
-        let marking = object_marking_token(object).unwrap_or_default();
-        let mut conn = self.connection().map_err(SearchIndexError::from)?;
-        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let existing: Option<String> = tx
             .query_opt(
-                "SELECT content_digest FROM sekai_search_object
+                "SELECT content_digest FROM sekai_search_object_v2
                  WHERE namespace = $1 AND object_id = $2",
                 &[&object.namespace, &object.id],
             )
@@ -341,8 +417,11 @@ impl PostgresDb {
         if existing.as_deref() == Some(digest.as_str()) {
             return Ok(());
         }
+        let attributes =
+            serde_json::to_string(&policy_attributes(object)).map_err(|error| error.to_string())?;
+        let marking = object_marking_token(object).unwrap_or_default();
         tx.execute(
-            "INSERT INTO sekai_search_object
+            "INSERT INTO sekai_search_object_v2
              (namespace, object_id, kind, access_marking, policy_attributes, content_digest, indexed_at_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (namespace, object_id) DO UPDATE SET
@@ -362,19 +441,48 @@ impl PostgresDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        Self::replace_object_text(&mut tx, &object.namespace, &object.id, &properties)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Self::replace_object_text(
+            tx,
+            &object.namespace,
+            &object.id,
+            &object_text_properties(object),
+        )
     }
 
-    fn index_dataset_document(
-        &self,
+    /// Upsert one dataset's metadata row and text. `bound` is the bound
+    /// object's marking and policy attributes, read before the transaction.
+    fn index_dataset_on(
+        tx: &mut postgres::Transaction<'_>,
         namespace: &str,
         dataset: &Dataset,
+        (bound_marking, bound_attributes): &(String, String),
         now_ms: i64,
-    ) -> Result<(), SearchIndexError> {
+    ) -> Result<(), String> {
         let digest = dataset_content_digest(dataset);
-        let (bound_marking, bound_attributes) = self.bound_dataset_policy(dataset)?;
+        let existing: Option<String> = tx
+            .query_opt(
+                "SELECT content_digest FROM sekai_search_dataset_v2
+                 WHERE namespace = $1 AND dataset_id = $2",
+                &[&namespace, &dataset.id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get(0));
+        if existing.as_deref() == Some(digest.as_str()) {
+            tx.execute(
+                "UPDATE sekai_search_dataset_v2
+                 SET bound_access_marking = $3, bound_policy_attributes = $4, indexed_at_ms = $5
+                 WHERE namespace = $1 AND dataset_id = $2",
+                &[
+                    &namespace,
+                    &dataset.id,
+                    bound_marking,
+                    bound_attributes,
+                    &now_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
         let columns = serde_json::to_string(
             &dataset
                 .columns
@@ -383,35 +491,8 @@ impl PostgresDb {
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| error.to_string())?;
-        let mut conn = self.connection().map_err(SearchIndexError::from)?;
-        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
-        let existing: Option<String> = tx
-            .query_opt(
-                "SELECT content_digest FROM sekai_search_dataset
-                 WHERE namespace = $1 AND dataset_id = $2",
-                &[&namespace, &dataset.id],
-            )
-            .map_err(|error| error.to_string())?
-            .map(|row| row.get(0));
-        if existing.as_deref() == Some(digest.as_str()) {
-            tx.execute(
-                "UPDATE sekai_search_dataset
-                 SET bound_access_marking = $3, bound_policy_attributes = $4, indexed_at_ms = $5
-                 WHERE namespace = $1 AND dataset_id = $2",
-                &[
-                    &namespace,
-                    &dataset.id,
-                    &bound_marking,
-                    &bound_attributes,
-                    &now_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            tx.commit().map_err(|error| error.to_string())?;
-            return Ok(());
-        }
         tx.execute(
-            "INSERT INTO sekai_search_dataset
+            "INSERT INTO sekai_search_dataset_v2
              (namespace, dataset_id, name, bound_object_id, bound_access_marking,
               bound_policy_attributes, columns, content_digest, indexed_at_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -428,214 +509,39 @@ impl PostgresDb {
                 &dataset.id,
                 &dataset.name,
                 &dataset.object_id,
-                &bound_marking,
-                &bound_attributes,
+                bound_marking,
+                bound_attributes,
                 &columns,
                 &digest,
                 &now_ms,
             ],
         )
         .map_err(|error| error.to_string())?;
-        Self::replace_dataset_text(&mut tx, namespace, dataset)?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Self::replace_dataset_text(tx, namespace, dataset)
     }
 
-    fn delete_object_document(
-        &self,
+    /// Delete index rows of `table` and its text table for one key, or for
+    /// the whole namespace when `key` is none.
+    fn delete_rows_on(
+        tx: &mut postgres::Transaction<'_>,
+        [table, text_table, column]: [&str; 3],
         namespace: &str,
-        object_id: &str,
-    ) -> Result<(), SearchIndexError> {
-        let mut conn = self.connection().map_err(SearchIndexError::from)?;
-        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_search_object_text WHERE namespace = $1 AND object_id = $2",
-            &[&namespace, &object_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_search_object WHERE namespace = $1 AND object_id = $2",
-            &[&namespace, &object_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    fn delete_dataset_document(
-        &self,
-        namespace: &str,
-        dataset_id: &str,
-    ) -> Result<(), SearchIndexError> {
-        let mut conn = self.connection().map_err(SearchIndexError::from)?;
-        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_search_dataset_text WHERE namespace = $1 AND dataset_id = $2",
-            &[&namespace, &dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_search_dataset WHERE namespace = $1 AND dataset_id = $2",
-            &[&namespace, &dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    fn search_object_ids(&self, namespace: &str) -> Result<Vec<String>, String> {
-        Ok(self
-            .connection()?
-            .query(
-                "SELECT object_id FROM sekai_search_object WHERE namespace = $1 ORDER BY object_id",
-                &[&namespace],
-            )
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect())
-    }
-
-    fn search_dataset_ids(&self, namespace: &str) -> Result<Vec<String>, String> {
-        Ok(self
-            .connection()?
-            .query(
-                "SELECT dataset_id FROM sekai_search_dataset WHERE namespace = $1 ORDER BY dataset_id",
-                &[&namespace],
-            )
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.get(0))
-            .collect())
-    }
-
-    fn clear_namespace_index(&self, namespace: &str) -> Result<(), SearchIndexError> {
-        for object_id in self.search_object_ids(namespace)? {
-            self.delete_object_document(namespace, &object_id)?;
-        }
-        for dataset_id in self.search_dataset_ids(namespace)? {
-            self.delete_dataset_document(namespace, &dataset_id)?;
+        key: Option<&str>,
+    ) -> Result<(), String> {
+        for table in [text_table, table] {
+            match key {
+                Some(key) => tx.execute(
+                    &format!("DELETE FROM {table} WHERE namespace = $1 AND {column} = $2"),
+                    &[&namespace, &key],
+                ),
+                None => tx.execute(
+                    &format!("DELETE FROM {table} WHERE namespace = $1"),
+                    &[&namespace],
+                ),
+            }
+            .map_err(|error| error.to_string())?;
         }
         Ok(())
-    }
-
-    fn pending_search_changes(
-        &self,
-        namespace: &str,
-        after_rowid: u64,
-    ) -> Result<Vec<(String, u64, i64)>, String> {
-        self.list_committed_object_mutations_after(namespace, after_rowid, 10_000)
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|(change, seq, _, _)| (change.object_id, seq, change.timestamp))
-                    .collect()
-            })
-    }
-
-    fn namespace_datasets(&self, namespace: &str) -> Result<Vec<Dataset>, String> {
-        let mut datasets = Vec::new();
-        for dataset in self.list_datasets()? {
-            if dataset.object_id.is_empty() {
-                datasets.push(dataset);
-                continue;
-            }
-            let bound = self.get_object(&dataset.object_id)?;
-            if bound.is_some_and(|object| object.namespace == namespace) {
-                datasets.push(dataset);
-            }
-        }
-        datasets.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(datasets)
-    }
-
-    fn list_namespace_objects(&self, namespace: &str) -> Result<Vec<Object>, String> {
-        let ids = self
-            .connection()?
-            .query(
-                "SELECT id FROM sekai_objects WHERE namespace = $1 ORDER BY id",
-                &[&namespace],
-            )
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>();
-        let mut objects = Vec::new();
-        for id in ids {
-            if let Some(object) = self.get_object(&id)?
-                && object.namespace == namespace
-            {
-                objects.push(object);
-            }
-        }
-        Ok(objects)
-    }
-
-    fn search_counts(&self, namespace: &str) -> Result<(i64, i64), String> {
-        let objects = self
-            .connection()?
-            .query_one(
-                "SELECT COUNT(*) FROM sekai_search_object WHERE namespace = $1",
-                &[&namespace],
-            )
-            .map_err(|error| error.to_string())?
-            .get::<_, i64>(0);
-        let datasets = self
-            .connection()?
-            .query_one(
-                "SELECT COUNT(*) FROM sekai_search_dataset WHERE namespace = $1",
-                &[&namespace],
-            )
-            .map_err(|error| error.to_string())?
-            .get::<_, i64>(0);
-        Ok((objects, datasets))
-    }
-
-    fn search_lag_ms(&self, namespace: &str, now_ms: i64) -> Result<(i64, i64, u64), String> {
-        let checkpoint = self.search_checkpoint(namespace)?;
-        let after = checkpoint
-            .as_ref()
-            .map(|(rowid, _, _, _)| *rowid)
-            .unwrap_or(0);
-        let pending = self.pending_search_changes(namespace, after)?;
-        let generation = self.namespace_object_generation(namespace)?;
-        let checkpoint_generation = checkpoint
-            .as_ref()
-            .map(|(_, generation, _, _)| *generation)
-            .unwrap_or(0);
-        let oldest = pending.iter().map(|(_, _, timestamp)| *timestamp).min();
-        let lag = if let Some(timestamp) = oldest {
-            now_ms.saturating_sub(timestamp).max(0)
-        } else if generation > checkpoint_generation {
-            checkpoint
-                .as_ref()
-                .map(|(_, _, _, indexed_at)| now_ms.saturating_sub(*indexed_at).max(1))
-                .unwrap_or(now_ms.max(1))
-        } else {
-            0
-        };
-        Ok((lag, pending.len() as i64, generation))
-    }
-
-    fn publish_search_lag(&self, namespace: &str, now_ms: i64) -> Result<i64, String> {
-        let (lag, _, _) = self.search_lag_ms(namespace, now_ms)?;
-        let mut maximum = lag.max(0) as u64;
-        let namespaces = self
-            .connection()?
-            .query("SELECT namespace FROM sekai_search_checkpoint", &[])
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<Vec<_>>();
-        let mut seen = BTreeSet::from([namespace.to_string()]);
-        for other in namespaces {
-            if !seen.insert(other.clone()) {
-                continue;
-            }
-            let (other_lag, _, _) = self.search_lag_ms(&other, now_ms)?;
-            maximum = maximum.max(other_lag.max(0) as u64);
-        }
-        crate::obs::metrics::set_search_index_lag_ms(maximum);
-        Ok(lag)
     }
 
     fn grant_allows(&self, object_id: &str, subjects: &[String]) -> Result<bool, String> {
@@ -816,141 +722,13 @@ impl PostgresDb {
         Ok(Some((live_kind, visible)))
     }
 
-    fn rebuild_search_namespace(
-        &self,
-        namespace: &str,
-        now_ms: i64,
-    ) -> Result<SearchRebuildReport, SearchIndexError> {
-        if namespace.trim().is_empty() {
-            return Err(SearchIndexError::InvalidArgument(
-                "namespace required".into(),
-            ));
-        }
-        let watermark = self.object_change_watermark(namespace)?;
-        let generation = self.namespace_object_generation(namespace)?;
-        self.store_search_checkpoint(namespace, 0, 0, "", 0)?;
-        self.clear_namespace_index(namespace)?;
-        let objects = self.list_namespace_objects(namespace)?;
-        for object in &objects {
-            self.index_object_document(object, now_ms)?;
-        }
-        let datasets = self.namespace_datasets(namespace)?;
-        for dataset in &datasets {
-            self.index_dataset_document(namespace, dataset, now_ms)?;
-        }
-        self.store_search_checkpoint(
-            namespace,
-            watermark,
-            generation,
-            &dataset_catalog_digest(&datasets),
-            now_ms,
-        )?;
-        self.publish_search_lag(namespace, now_ms)?;
-        Ok(SearchRebuildReport {
-            namespace: namespace.into(),
-            objects: objects.len() as i64,
-            datasets: datasets.len() as i64,
-            rebuilt: true,
-        })
-    }
-
+    /// One catch-up of the namespace; see [`catch_up_namespace`].
     pub fn catch_up_search_namespace(
         &self,
         namespace: &str,
         now_ms: i64,
     ) -> Result<SearchCatchUpReport, SearchIndexError> {
-        if namespace.trim().is_empty() {
-            return Err(SearchIndexError::InvalidArgument(
-                "namespace required".into(),
-            ));
-        }
-        let _guard = self.lock_search_maintenance()?;
-        let checkpoint = self.search_checkpoint(namespace)?;
-        let after = checkpoint
-            .as_ref()
-            .map(|(rowid, _, _, _)| *rowid)
-            .unwrap_or(0);
-        let last_generation = checkpoint
-            .as_ref()
-            .map(|(_, generation, _, _)| *generation)
-            .unwrap_or(0);
-        let pending = self.pending_search_changes(namespace, after)?;
-        let generation = self.namespace_object_generation(namespace)?;
-        if pending.is_empty() && !feed_covers_generation(last_generation, generation, &pending) {
-            let rebuilt = self.rebuild_search_namespace(namespace, now_ms)?;
-            return Ok(SearchCatchUpReport {
-                namespace: rebuilt.namespace,
-                objects: rebuilt.objects,
-                datasets: rebuilt.datasets,
-                rebuilt: true,
-                consumed_changes: 0,
-            });
-        }
-        let mut object_ids = Vec::new();
-        let mut seen = BTreeSet::new();
-        let mut last_rowid = after;
-        for (object_id, seq, _) in &pending {
-            last_rowid = last_rowid.max(*seq);
-            if seen.insert(object_id.clone()) {
-                object_ids.push(object_id.clone());
-            }
-        }
-        for object_id in &object_ids {
-            match self.get_object(object_id)? {
-                Some(object) if object.namespace == namespace => {
-                    self.index_object_document(&object, now_ms)?;
-                }
-                _ => self.delete_object_document(namespace, object_id)?,
-            }
-        }
-        let datasets = self.namespace_datasets(namespace)?;
-        for dataset in &datasets {
-            if object_ids.iter().any(|id| id == &dataset.object_id) {
-                self.index_dataset_document(namespace, dataset, now_ms)?;
-            }
-        }
-        let digest = dataset_catalog_digest(&datasets);
-        let previous_digest = checkpoint
-            .as_ref()
-            .map(|(_, _, digest, _)| digest.clone())
-            .unwrap_or_default();
-        if digest != previous_digest {
-            let current: BTreeSet<String> =
-                datasets.iter().map(|dataset| dataset.id.clone()).collect();
-            for dataset_id in self.search_dataset_ids(namespace)? {
-                if !current.contains(&dataset_id) {
-                    self.delete_dataset_document(namespace, &dataset_id)?;
-                }
-            }
-            for dataset in &datasets {
-                self.index_dataset_document(namespace, dataset, now_ms)?;
-            }
-        }
-        if last_rowid == 0 {
-            last_rowid = self.object_change_watermark(namespace)?;
-        }
-        let acknowledged_generation =
-            if feed_covers_generation(last_generation, generation, &pending) {
-                generation
-            } else {
-                last_generation
-            };
-        self.store_search_checkpoint(
-            namespace,
-            last_rowid,
-            acknowledged_generation,
-            &digest,
-            now_ms,
-        )?;
-        self.publish_search_lag(namespace, now_ms)?;
-        let (objects, dataset_count) = self.search_counts(namespace)?;
-        Ok(SearchCatchUpReport {
-            namespace: namespace.into(),
-            objects,
-            datasets: dataset_count,
-            rebuilt: false,
-            consumed_changes: pending.len() as i64,
-        })
+        catch_up_namespace(self, namespace, now_ms)
     }
 
     pub fn search_index_dump(&self, namespace: &str) -> Result<SearchIndexDump, String> {
@@ -958,7 +736,7 @@ impl PostgresDb {
         let object_rows = conn
             .query(
                 "SELECT object_id, kind, access_marking, policy_attributes
-                 FROM sekai_search_object WHERE namespace = $1",
+                 FROM sekai_search_object_v2 WHERE namespace = $1",
                 &[&namespace],
             )
             .map_err(|error| error.to_string())?;
@@ -971,7 +749,7 @@ impl PostgresDb {
             let mut properties = BTreeMap::new();
             for text in conn
                 .query(
-                    "SELECT property, text FROM sekai_search_object_text
+                    "SELECT property, text FROM sekai_search_object_text_v2
                      WHERE namespace = $1 AND object_id = $2 AND chunk = 0",
                     &[&namespace, &object_id],
                 )
@@ -993,7 +771,7 @@ impl PostgresDb {
         for row in conn
             .query(
                 "SELECT dataset_id, name, bound_object_id, columns
-                 FROM sekai_search_dataset WHERE namespace = $1",
+                 FROM sekai_search_dataset_v2 WHERE namespace = $1",
                 &[&namespace],
             )
             .map_err(|error| error.to_string())?
@@ -1058,8 +836,8 @@ impl PostgresDb {
             .connection()?
             .query(
                 "SELECT f.object_id, f.property, o.kind, o.access_marking, o.policy_attributes
-                 FROM sekai_search_object_text f
-                 JOIN sekai_search_object o
+                 FROM sekai_search_object_text_v2 f
+                 JOIN sekai_search_object_v2 o
                    ON o.namespace = f.namespace AND o.object_id = f.object_id
                  WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
                  ORDER BY f.object_id, f.property",
@@ -1111,8 +889,8 @@ impl PostgresDb {
                 .query(
                     "SELECT f.object_id, f.property, o.kind, o.access_marking,
                             o.policy_attributes, f.text
-                     FROM sekai_search_object_text f
-                     JOIN sekai_search_object o
+                     FROM sekai_search_object_text_v2 f
+                     JOIN sekai_search_object_v2 o
                        ON o.namespace = f.namespace AND o.object_id = f.object_id
                      WHERE f.namespace = $1 AND f.chunk = 0",
                     &[&query.policy.namespace],
@@ -1206,8 +984,8 @@ impl PostgresDb {
             .query(
                 "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
                         d.bound_policy_attributes, d.bound_object_id
-                 FROM sekai_search_dataset_text f
-                 JOIN sekai_search_dataset d
+                 FROM sekai_search_dataset_text_v2 f
+                 JOIN sekai_search_dataset_v2 d
                    ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
                  WHERE f.namespace = $1 AND f.tsv @@ to_tsquery('simple', $2)
                  ORDER BY f.dataset_id, f.field",
@@ -1254,8 +1032,8 @@ impl PostgresDb {
                 .query(
                     "SELECT f.dataset_id, f.field, f.classification, d.bound_access_marking,
                             d.bound_policy_attributes, d.bound_object_id, f.text
-                     FROM sekai_search_dataset_text f
-                     JOIN sekai_search_dataset d
+                     FROM sekai_search_dataset_text_v2 f
+                     JOIN sekai_search_dataset_v2 d
                        ON d.namespace = f.namespace AND d.dataset_id = f.dataset_id
                      WHERE f.namespace = $1 AND f.chunk = 0",
                     &[&query.policy.namespace],
@@ -1363,46 +1141,6 @@ impl PostgresDb {
         Ok(hits)
     }
 
-    fn search_status(
-        &self,
-        namespace: &str,
-        now_ms: i64,
-    ) -> Result<SearchIndexStatus, SearchIndexError> {
-        if namespace.trim().is_empty() {
-            return Err(SearchIndexError::InvalidArgument(
-                "namespace required".into(),
-            ));
-        }
-        let (lag, pending, generation) = self.search_lag_ms(namespace, now_ms)?;
-        let (objects, datasets) = self.search_counts(namespace)?;
-        let checkpoint = self.search_checkpoint(namespace)?;
-        self.publish_search_lag(namespace, now_ms)?;
-        Ok(SearchIndexStatus {
-            namespace: namespace.into(),
-            analyzer_version: ANALYZER_VERSION.into(),
-            last_change_rowid: checkpoint
-                .as_ref()
-                .map(|(rowid, _, _, _)| *rowid)
-                .unwrap_or(0),
-            last_generation: checkpoint
-                .as_ref()
-                .map(|(_, stored, _, _)| *stored)
-                .unwrap_or(generation),
-            dataset_catalog_digest: checkpoint
-                .as_ref()
-                .map(|(_, _, digest, _)| digest.clone())
-                .unwrap_or_default(),
-            indexed_at_ms: checkpoint
-                .as_ref()
-                .map(|(_, _, _, indexed)| *indexed)
-                .unwrap_or(0),
-            object_count: objects,
-            dataset_count: datasets,
-            lag_ms: lag,
-            pending_changes: pending,
-        })
-    }
-
     #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn purge_object_changes_for_test(&self) -> Result<(), String> {
         self.connection()?
@@ -1423,28 +1161,207 @@ impl PostgresDb {
     }
 }
 
+impl SearchMaintenance for PostgresDb {
+    fn search_maintenance(&self) -> &Mutex<()> {
+        &self.search_maintenance
+    }
+
+    fn read_search_checkpoint(&self, namespace: &str) -> Result<Option<SearchCheckpoint>, String> {
+        PostgresDb::read_search_checkpoint(self, namespace)
+    }
+
+    fn search_checkpoint_namespaces(&self) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query("SELECT namespace FROM sekai_search_checkpoint_v2", &[])
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    fn pending_search_changes(
+        &self,
+        namespace: &str,
+        after_rowid: u64,
+    ) -> Result<Vec<(String, u64, i64)>, String> {
+        self.list_committed_object_mutations_after(namespace, after_rowid, PENDING_PAGE)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(change, seq, _, _)| (change.object_id, seq, change.timestamp))
+                    .collect()
+            })
+    }
+
+    fn namespace_object_generation(&self, namespace: &str) -> Result<u64, String> {
+        PostgresDb::namespace_object_generation(self, namespace)
+    }
+
+    fn object_change_watermark(&self, namespace: &str) -> Result<u64, String> {
+        PostgresDb::object_change_watermark(self, namespace)
+    }
+
+    fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
+        PostgresDb::get_object(self, id)
+    }
+
+    fn namespace_datasets(&self, namespace: &str) -> Result<Vec<Dataset>, String> {
+        let mut datasets = Vec::new();
+        for dataset in self.list_datasets()? {
+            if dataset.object_id.is_empty() {
+                datasets.push(dataset);
+                continue;
+            }
+            let bound = PostgresDb::get_object(self, &dataset.object_id)?;
+            if bound.is_some_and(|object| object.namespace == namespace) {
+                datasets.push(dataset);
+            }
+        }
+        datasets.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(datasets)
+    }
+
+    fn namespace_object_ids(&self, namespace: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT id FROM sekai_objects WHERE namespace = $1 ORDER BY id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    fn search_dataset_ids(&self, namespace: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT dataset_id FROM sekai_search_dataset_v2 WHERE namespace = $1 ORDER BY dataset_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    fn search_counts(&self, namespace: &str) -> Result<(i64, i64), String> {
+        let row = self
+            .connection()?
+            .query_one(
+                "SELECT (SELECT COUNT(*) FROM sekai_search_object_v2 WHERE namespace = $1),
+                        (SELECT COUNT(*) FROM sekai_search_dataset_v2 WHERE namespace = $1)",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((row.get(0), row.get(1)))
+    }
+
+    fn start_search_rebuild(
+        &self,
+        namespace: &str,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, SearchIndexError> {
+        self.fenced_search_write(
+            namespace,
+            revision,
+            now_ms,
+            &CheckpointFields::REBUILD_START,
+            |tx| {
+                Self::delete_rows_on(tx, OBJECT_ROWS, namespace, None)?;
+                Self::delete_rows_on(tx, DATASET_ROWS, namespace, None)
+            },
+        )
+    }
+
+    fn write_search_document(
+        &self,
+        namespace: &str,
+        write: DocumentWrite<'_>,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, SearchIndexError> {
+        match write {
+            DocumentWrite::IndexObject(object) => self.fenced_search_write(
+                namespace,
+                revision,
+                now_ms,
+                &CheckpointFields::default(),
+                |tx| Self::index_object_on(tx, object, now_ms),
+            ),
+            DocumentWrite::DeleteObject(object_id) => self.fenced_search_write(
+                namespace,
+                revision,
+                now_ms,
+                &CheckpointFields::default(),
+                |tx| Self::delete_rows_on(tx, OBJECT_ROWS, namespace, Some(object_id)),
+            ),
+            DocumentWrite::IndexDataset(dataset) => {
+                let bound = self.bound_dataset_policy(dataset)?;
+                self.fenced_search_write(
+                    namespace,
+                    revision,
+                    now_ms,
+                    &CheckpointFields::default(),
+                    |tx| Self::index_dataset_on(tx, namespace, dataset, &bound, now_ms),
+                )
+            }
+            DocumentWrite::DeleteDataset(dataset_id) => self.fenced_search_write(
+                namespace,
+                revision,
+                now_ms,
+                &CheckpointFields::default(),
+                |tx| Self::delete_rows_on(tx, DATASET_ROWS, namespace, Some(dataset_id)),
+            ),
+        }
+    }
+
+    fn advance_search_checkpoint(
+        &self,
+        namespace: &str,
+        position: &SearchPosition,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, SearchIndexError> {
+        let fields = CheckpointFields::published(position)?;
+        self.fenced_search_write(namespace, revision, now_ms, &fields, |_| Ok(()))
+    }
+}
+
 impl SearchIndex for PostgresDb {
     fn index(&self, document: &SearchDocument, now_ms: i64) -> Result<(), SearchIndexError> {
-        let _guard = self.lock_search_maintenance()?;
+        let _guard = lock_search_maintenance(self)?;
         match document {
-            SearchDocument::Object(object) => self.index_object_document(object, now_ms),
+            SearchDocument::Object(object) => {
+                self.search_write(|tx| Self::index_object_on(tx, object, now_ms))
+            }
             SearchDocument::Dataset { namespace, dataset } => {
-                self.index_dataset_document(namespace, dataset, now_ms)
+                let bound = self.bound_dataset_policy(dataset)?;
+                self.search_write(|tx| {
+                    Self::index_dataset_on(tx, namespace, dataset, &bound, now_ms)
+                })
             }
         }
     }
 
     fn delete(&self, key: &SearchDocumentKey) -> Result<(), SearchIndexError> {
-        let _guard = self.lock_search_maintenance()?;
+        let _guard = lock_search_maintenance(self)?;
         match key {
             SearchDocumentKey::Object {
                 namespace,
                 object_id,
-            } => self.delete_object_document(namespace, object_id),
+            } => self.search_write(|tx| {
+                Self::delete_rows_on(tx, OBJECT_ROWS, namespace, Some(object_id))
+            }),
             SearchDocumentKey::Dataset {
                 namespace,
                 dataset_id,
-            } => self.delete_dataset_document(namespace, dataset_id),
+            } => self.search_write(|tx| {
+                Self::delete_rows_on(tx, DATASET_ROWS, namespace, Some(dataset_id))
+            }),
         }
     }
 
@@ -1460,12 +1377,11 @@ impl SearchIndex for PostgresDb {
         namespace: &str,
         now_ms: i64,
     ) -> Result<SearchRebuildReport, SearchIndexError> {
-        let _guard = self.lock_search_maintenance()?;
-        self.rebuild_search_namespace(namespace, now_ms)
+        rebuild_namespace_fenced(self, namespace, now_ms)
     }
 
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError> {
-        self.search_status(namespace, now_ms)
+        search_status(self, namespace, now_ms)
     }
 
     fn vector_candidates(

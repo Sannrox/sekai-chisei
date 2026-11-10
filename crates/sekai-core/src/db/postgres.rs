@@ -218,6 +218,7 @@ const PENDING_DECISION_INDEXES_SCHEMA: &str =
 const SOURCES_SCHEMA: &str = include_str!("postgres/0151_sources.sql");
 const SOURCE_SYNC_SCHEMA: &str = include_str!("postgres/0152_source_sync.sql");
 const SOURCE_DELIVERY_SCHEMA: &str = include_str!("postgres/0153_source_delivery.sql");
+const SEARCH_INDEX_V2_SCHEMA: &str = include_str!("postgres/0154_search_index_v2.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1100,6 +1101,12 @@ const MIGRATIONS: &[Migration] = &[
         152,
         "source_delivery",
         SOURCE_DELIVERY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        153,
+        "search_index_v2",
+        SEARCH_INDEX_V2_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2376,6 +2383,39 @@ mod tests {
             assert_eq!(preserved, marker);
             assert_eq!(migration_rows(&db), shared_history());
         }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn search_index_upgrade_seeds_the_new_index_from_the_legacy_one() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        let before = MIGRATIONS
+            .iter()
+            .position(|migration| migration.name == "search_index_v2")
+            .unwrap();
+        db.migrate_with(&MIGRATIONS[..before]).unwrap();
+        let runtime = crate::db::runtime_db::RuntimeDb::Postgres(Arc::new(db));
+        let note = crate::domain::Object {
+            id: "note-a".into(),
+            kind: "note".into(),
+            name: "alpha".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: [("body".to_string(), "join customers".to_string())].into(),
+            created: 1,
+            updated: 1,
+        };
+        runtime.create_object_with_audit(&note, "editor").unwrap();
+        crate::sekai::search_index::tests::index_into_legacy_tables(&runtime, &note);
+        let crate::db::runtime_db::RuntimeDb::Postgres(db) = &runtime else {
+            unreachable!()
+        };
+        db.migrate().unwrap();
+        crate::sekai::search_index::tests::assert_seeded_hit_is_served_without_a_rebuild(&runtime);
     }
 
     #[test]

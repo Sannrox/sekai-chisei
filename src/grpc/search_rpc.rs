@@ -1,7 +1,6 @@
 //! Experimental permission-aware Search and GetSearchIndexStatus RPCs.
 
 use super::*;
-use crate::db::search_index::SearchIndexStore;
 use crate::sekai::embedding_index::{
     EmbeddingError, EmbeddingSpec, EmbeddingStore, StoredEmbeddingSpec, sha_hex, source_text,
 };
@@ -39,6 +38,7 @@ pub(super) async fn search(
         crate::enterprise::NamespaceAction::Discover,
     )?;
     check_team_namespace(service.db.runtime(), &principals, namespace, false)?;
+    ensure_followed(service, namespace)?;
     let namespace_read = enforce_collaboration_namespace(
         service.db.runtime(),
         tenant_context.as_ref(),
@@ -75,12 +75,8 @@ pub(super) async fn search(
             .map(|filter| filter.property.as_str())
             .chain(input.facets.iter().map(String::as_str)),
     )?;
+    // Read only: the scheduled worker keeps the index current (#2250).
     let now_ms = now_millis();
-    service
-        .db
-        .runtime()
-        .catch_up_search_namespace(namespace, now_ms)
-        .map_err(search_status)?;
     let status = service
         .db
         .runtime()
@@ -318,6 +314,18 @@ pub(super) async fn search(
     }))
 }
 
+/// Let the scheduled worker discover an authorized namespace it does not
+/// follow yet, such as one whose only content is unbound datasets (#2250).
+/// The only write Search and GetSearchIndexStatus make, and none once the
+/// namespace has a checkpoint.
+fn ensure_followed(service: &SekaiServiceImpl, namespace: &str) -> Result<(), Status> {
+    service
+        .db
+        .runtime()
+        .ensure_search_checkpoint(namespace)
+        .map_err(|error| search_status(error.into()))
+}
+
 pub(super) async fn get_search_index_status(
     service: &SekaiServiceImpl,
     req: Request<GetSearchIndexStatusRequest>,
@@ -337,12 +345,9 @@ pub(super) async fn get_search_index_status(
         false,
     )?;
     check_team_namespace(service.db.runtime(), &principals, namespace, false)?;
+    ensure_followed(service, namespace)?;
+    // Read only: the scheduled worker keeps the index current (#2250).
     let now_ms = now_millis();
-    service
-        .db
-        .runtime()
-        .catch_up_search_namespace(namespace, now_ms)
-        .map_err(search_status)?;
     let status = service
         .db
         .runtime()
@@ -984,6 +989,39 @@ mod tests {
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
 
+    /// One pass of the scheduled worker over every namespace, as a replica
+    /// would run it before the request.
+    fn catch_up(svc: &SekaiServiceImpl) {
+        for (namespace, outcome) in crate::db::search_index::catch_up_search_pass(
+            svc.db.runtime(),
+            "",
+            usize::MAX,
+            &now_millis,
+        )
+        .unwrap()
+        {
+            outcome.unwrap_or_else(|error| panic!("{namespace}: {error}"));
+        }
+    }
+
+    /// [`super::search`] after a worker pass: the RPC itself only reads.
+    async fn search(
+        svc: &SekaiServiceImpl,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        catch_up(svc);
+        super::search(svc, req).await
+    }
+
+    /// [`super::get_search_index_status`] after a worker pass.
+    async fn get_search_index_status(
+        svc: &SekaiServiceImpl,
+        req: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<GetSearchIndexStatusResponse>, Status> {
+        catch_up(svc);
+        super::get_search_index_status(svc, req).await
+    }
+
     fn service_from(db: RuntimeDb) -> SekaiServiceImpl {
         SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(Arc::new(
             db,
@@ -1277,6 +1315,82 @@ mod tests {
             .into_inner();
         assert_eq!(after_rebuild.hits.len(), 1);
         assert_eq!(after_rebuild.hits[0].id, after_edit.hits[0].id);
+    }
+
+    #[tokio::test]
+    async fn search_and_status_only_read_the_index() {
+        let db = RuntimeDb::memory();
+        db.create_object_with_audit(
+            &object("note-1", "acme", "alpha", &[("body", "join customers")]),
+            "tester",
+        )
+        .unwrap();
+        let svc = service_from(db);
+        let status_req = || {
+            with_named_principal(
+                GetSearchIndexStatusRequest {
+                    namespace: "acme".into(),
+                },
+                "tester",
+            )
+        };
+        let unindexed = super::search(
+            &svc,
+            with_named_principal(search_req("customers"), "tester"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(unindexed.hits.is_empty());
+        let status = super::get_search_index_status(&svc, status_req())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.analyzer_version, "");
+        assert_eq!(status.object_count, 0);
+        catch_up(&svc);
+        let indexed = super::search(
+            &svc,
+            with_named_principal(search_req("customers"), "tester"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(indexed.hits.len(), 1);
+        let status = super::get_search_index_status(&svc, status_req())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
+        assert_eq!(status.lag_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn a_namespace_with_only_unbound_datasets_is_indexed_after_a_search() {
+        let db = RuntimeDb::memory();
+        db.create_dataset(&dataset("ds-sales", "sales", "", &[("id", "public")]))
+            .unwrap();
+        let svc = service_from(db);
+        let dataset_search = || {
+            let mut req = search_req("sales");
+            req.source = "dataset".into();
+            with_named_principal(req, "tester")
+        };
+        // Nothing in the namespace has history yet, so the worker skips it.
+        catch_up(&svc);
+        let first = super::search(&svc, dataset_search())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.hits.is_empty());
+        // The search let the worker discover the namespace.
+        catch_up(&svc);
+        let found = super::search(&svc, dataset_search())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].id, "ds-sales");
     }
 
     #[tokio::test]

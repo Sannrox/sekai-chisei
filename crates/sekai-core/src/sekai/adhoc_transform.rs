@@ -210,10 +210,12 @@ pub(crate) const SWEEP_STATEMENTS: &[&str] = &[
     "DELETE FROM sekai_dataset_health_state WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_alerts WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_health_checks WHERE dataset_id = {dataset}",
-    "DELETE FROM sekai_search_dataset_text WHERE dataset_id = {dataset}",
-    "DELETE FROM sekai_search_dataset WHERE dataset_id = {dataset}",
-    "DELETE FROM sekai_search_object_text WHERE object_id = {object}",
-    "DELETE FROM sekai_search_object WHERE object_id = {object}",
+    // The search index this plane keeps; the retired legacy index is left
+    // to the older planes that still write it (#2250).
+    "DELETE FROM sekai_search_dataset_text_v2 WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_search_dataset_v2 WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_search_object_text_v2 WHERE object_id = {object}",
+    "DELETE FROM sekai_search_object_v2 WHERE object_id = {object}",
     "DELETE FROM sekai_embedding_chunks WHERE object_id = {object}",
     "DELETE FROM sekai_dataset_rows WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = {dataset}",
