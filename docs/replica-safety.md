@@ -30,7 +30,10 @@ or process-local IDs.
 ## Two-replica harness
 
 `TwoReplicaSqlite::open()` creates a temporary SQLite file and two independent
-`RuntimeDb::Sqlite` handles. `race_results` starts *N* workers (default patterns
+`RuntimeDb::Sqlite` handles. `TwoReplicaPostgres::open()` creates one isolated
+PostgreSQL database named with the process id plus a unique suffix and two
+independent `PostgresDb` pools against it (ignored without
+`SEKAI_TEST_POSTGRES_URL`). `race_results` starts *N* workers (default patterns
 use 2), synchronizes on a barrier, and returns each worker result. Pass/fail is
 **behavioral** (overspend, double winner, missing durable row)—not a wall-clock
 budget.
@@ -45,9 +48,27 @@ let pair = TwoReplicaSqlite::open()?;
 // pair.a and pair.b share durable state on disk
 ```
 
-PostgreSQL multi-replica races reuse the same inventory classes and should open
-two `PostgresDb` pools against one `SEKAI_TEST_POSTGRES_URL` when available
-(later slices; ignored without the URL).
+```rust
+use sekai_chisei::db::replica_safety::TwoReplicaPostgres;
+
+let pair = TwoReplicaPostgres::open()?;
+// pair.a and pair.b are independent pools on one isolated database
+```
+
+CI runs the PostgreSQL suite whenever `SEKAI_TEST_POSTGRES_URL` is set
+(`scripts/postgres-conformance.sh`, filter `postgres`). This is conformance
+evidence, not a production high-availability claim.
+
+### PostgreSQL two-replica inventory (#2087)
+
+| Class | Result | Evidence |
+| --- | --- | --- |
+| Lease fencing | pass | `tests/replica_safety_postgres.rs` concurrent acquire; replica-loss takeover |
+| Action admission and parked grants | pass | concurrent work admission; concurrent parked grant (one winner, one object write) |
+| Retention ticks | pass | concurrent ticks archive each content-event once; idle ticks with no policy skip the walk (#2028, #2029) |
+| Agent-turn claims | pass | concurrent `claim_next` has one winner (`SKIP LOCKED` / claim index, #2031) |
+| Crash takeover | pass | `pg_terminate_backend` of replica A's uncommitted object/Action mutation; B grants exactly once |
+| Object-then-Action lock order | pass | concurrent parked grants lock a real target object then the Action (#2036) |
 
 ## Non-goals
 
@@ -81,11 +102,13 @@ cargo test --test it replica_safety_leases
 cargo test --test it replica_safety_credentials
 cargo test --test it replica_safety_eval
 cargo test --test it replica_safety_closeout
+SEKAI_TEST_POSTGRES_URL=... cargo test --test it replica_safety_postgres -- --ignored
 ```
 
 `replica_safety_closeout` re-checks inventory completeness and a single
 two-replica smoke covering budget, lease, admission, credentials, recovery, and
-eval sharing.
+eval sharing. PostgreSQL two-replica evidence is `replica_safety_postgres`
+(ignored without `SEKAI_TEST_POSTGRES_URL`).
 
 ## Operator posture
 

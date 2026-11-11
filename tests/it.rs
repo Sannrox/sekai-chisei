@@ -128,6 +128,7 @@ mod replica_safety_credentials;
 mod replica_safety_eval;
 mod replica_safety_harness;
 mod replica_safety_leases;
+mod replica_safety_postgres;
 mod retention_dedup_backend_conformance;
 mod reusable_sekai_backend_conformance;
 mod rpc_maturity;

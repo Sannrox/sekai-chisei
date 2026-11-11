@@ -1,15 +1,22 @@
-//! Replica-safety inventory and two-replica race harness (#117 / #304).
+//! Replica-safety inventory and two-replica race harness (#117 / #304 / #2087).
 //!
 //! The inventory is fail-closed for unlisted surfaces that appear in
 //! `required_authoritative_surfaces`. The harness opens two independent
-//! community stores against one shared SQLite file so concurrent-replica
-//! tests do not rely on wall-clock budgets as the sole pass criterion.
+//! community stores against one shared SQLite file, or two PostgreSQL pools
+//! against one isolated database, so concurrent-replica tests do not rely on
+//! wall-clock budgets as the sole pass criterion.
 
+use crate::db::postgres::{PostgresDb, off_runtime};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+use native_tls::{Certificate, TlsConnector};
+use postgres::Config as PostgresConfig;
+use postgres::config::SslMode;
+use postgres_native_tls::MakeTlsConnector;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -180,29 +187,171 @@ impl TwoReplicaSqlite {
         T: Send + 'static,
         F: Fn(usize, Arc<RuntimeDb>) -> T + Send + Sync + 'static,
     {
-        assert!(workers >= 2, "replica race requires at least two workers");
-        let barrier = Arc::new(Barrier::new(workers));
-        let work = Arc::new(work);
-        let handles = (0..workers)
-            .map(|index| {
-                let db = if index % 2 == 0 {
-                    Arc::clone(&self.a)
-                } else {
-                    Arc::clone(&self.b)
-                };
-                let barrier = Arc::clone(&barrier);
-                let work = Arc::clone(&work);
-                thread::spawn(move || {
-                    barrier.wait();
-                    work(index, db)
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("replica worker panicked"))
-            .collect()
+        race_replica_handles(&self.a, &self.b, workers, work)
     }
+}
+
+/// Two independent PostgreSQL pools against one isolated database (#2087).
+///
+/// `open` creates a database named with this process id plus a unique suffix
+/// so parallel agents sharing `SEKAI_TEST_POSTGRES_URL` do not collide.
+/// Dropping this type drops that database.
+pub struct TwoReplicaPostgres {
+    pub a: Arc<RuntimeDb>,
+    pub b: Arc<RuntimeDb>,
+    _database: IsolatedPostgres,
+}
+
+impl TwoReplicaPostgres {
+    pub fn open() -> Result<Self, String> {
+        let database = IsolatedPostgres::create()?;
+        // Sequential open: the first pool applies migrations; the second must
+        // see that history rather than racing CREATE TABLE.
+        let a = Arc::new(RuntimeDb::Postgres(Arc::new(database.connect()?)));
+        let b = Arc::new(RuntimeDb::Postgres(Arc::new(database.connect()?)));
+        Ok(Self {
+            a,
+            b,
+            _database: database,
+        })
+    }
+
+    /// Close replica A's pool. Uncommitted work on A aborts. Replica B stays.
+    ///
+    /// Callers must not retain clones of `a` if the pool should actually close.
+    pub fn crash_a(&mut self) {
+        self.a = Arc::clone(&self.b);
+    }
+
+    /// Race `workers` threads, each receiving a clone of either replica in round-robin order.
+    pub fn race_results<T, F>(&self, workers: usize, work: F) -> Vec<T>
+    where
+        T: Send + 'static,
+        F: Fn(usize, Arc<RuntimeDb>) -> T + Send + Sync + 'static,
+    {
+        race_replica_handles(&self.a, &self.b, workers, work)
+    }
+}
+
+/// Throwaway PostgreSQL database on the server named by `SEKAI_TEST_POSTGRES_URL`.
+struct IsolatedPostgres {
+    admin_url: String,
+    ca_certificate: Option<Vec<u8>>,
+    name: String,
+    url: String,
+}
+
+impl IsolatedPostgres {
+    fn create() -> Result<Self, String> {
+        let admin_url = std::env::var("SEKAI_TEST_POSTGRES_URL").map_err(|_| {
+            "SEKAI_TEST_POSTGRES_URL must identify a PostgreSQL test server".to_string()
+        })?;
+        let ca_certificate = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => Some(
+                std::fs::read(&path)
+                    .map_err(|error| format!("read PostgreSQL test CA certificate: {error}"))?,
+            ),
+            Err(_) => None,
+        };
+        let name = format!(
+            "sekai_r{}_{}",
+            std::process::id(),
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let (base, query) = match admin_url.split_once('?') {
+            Some((base, query)) => (base, format!("?{query}")),
+            None => (admin_url.as_str(), String::new()),
+        };
+        let prefix = base
+            .rsplit_once('/')
+            .ok_or_else(|| "PostgreSQL URL is missing a database path".to_string())?
+            .0;
+        let url = format!("{prefix}/{name}{query}");
+        let database = Self {
+            admin_url,
+            ca_certificate,
+            name,
+            url,
+        };
+        database.admin(&format!("CREATE DATABASE {}", database.name))?;
+        Ok(database)
+    }
+
+    fn connect(&self) -> Result<PostgresDb, String> {
+        off_runtime(|| match &self.ca_certificate {
+            Some(pem) => PostgresDb::connect_with_ca_certificate(&self.url, 4, pem),
+            None => PostgresDb::connect(&self.url, 4),
+        })
+    }
+
+    fn admin(&self, statement: &str) -> Result<(), String> {
+        off_runtime(|| {
+            let mut builder = TlsConnector::builder();
+            if let Some(pem) = &self.ca_certificate {
+                builder.add_root_certificate(
+                    Certificate::from_pem(pem).map_err(|error| {
+                        format!("parse PostgreSQL test CA certificate: {error}")
+                    })?,
+                );
+            }
+            let tls = MakeTlsConnector::new(
+                builder
+                    .build()
+                    .map_err(|error| format!("build PostgreSQL TLS connector: {error}"))?,
+            );
+            let mut config = PostgresConfig::from_str(&self.admin_url)
+                .map_err(|error| format!("parse PostgreSQL admin URL: {error}"))?;
+            config.ssl_mode(SslMode::Require);
+            config
+                .connect(tls)
+                .map_err(|error| format!("connect PostgreSQL test server: {error}"))?
+                .batch_execute(statement)
+                .map_err(|error| format!("PostgreSQL admin statement: {error}"))
+        })
+    }
+}
+
+impl Drop for IsolatedPostgres {
+    fn drop(&mut self) {
+        let _ = self.admin(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
+}
+
+fn race_replica_handles<T, F>(
+    a: &Arc<RuntimeDb>,
+    b: &Arc<RuntimeDb>,
+    workers: usize,
+    work: F,
+) -> Vec<T>
+where
+    T: Send + 'static,
+    F: Fn(usize, Arc<RuntimeDb>) -> T + Send + Sync + 'static,
+{
+    assert!(workers >= 2, "replica race requires at least two workers");
+    let barrier = Arc::new(Barrier::new(workers));
+    let work = Arc::new(work);
+    let handles = (0..workers)
+        .map(|index| {
+            let db = if index % 2 == 0 {
+                Arc::clone(a)
+            } else {
+                Arc::clone(b)
+            };
+            let barrier = Arc::clone(&barrier);
+            let work = Arc::clone(&work);
+            thread::spawn(move || {
+                barrier.wait();
+                work(index, db)
+            })
+        })
+        .collect::<Vec<_>>();
+    handles
+        .into_iter()
+        .map(|handle| handle.join().expect("replica worker panicked"))
+        .collect()
 }
 
 impl Drop for TwoReplicaSqlite {
