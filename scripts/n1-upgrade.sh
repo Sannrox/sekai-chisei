@@ -250,7 +250,6 @@ JSON
 # operation, then its receipt by request id. Leaves <dir>/<name>.run and
 # <dir>/<name>.receipt.json.
 governed() {
-  [[ "$GOVERNED" == 1 ]] || return 0
   local bin="$1" socket="$2" dir="$3" object="$4" name="$5"
   ctl "$bin" "$socket" "$dir/$name.run" ontology run --namespace "$NAMESPACE" \
     --task-type "$RESOLVE_REF" --spec "{\"object_id\":\"$object\"}" || return 1
@@ -261,11 +260,22 @@ governed() {
   ctl "$bin" "$socket" "$dir/$name.receipt.json" receipt "$request" --request-id --json
 }
 
+# n1_governed <args of governed>: a governed operation that the N-1 server
+# records. Releases before #2265 cannot record receipts on PostgreSQL; that
+# refusal turns off the checks that need an N-1 receipt (N1_GOVERNED=0) instead
+# of failing. Any other failure fails.
+n1_governed() {
+  governed "$@" && return 0
+  grep -q 'unavailable on the PostgreSQL community runtime' "$3/$5.run" 2>/dev/null || return 1
+  N1_GOVERNED=0
+  GOV_SKIPPED=" (N-1 governed operation skipped)"
+  echo "skipped [$label] governed operations recorded by $N1_TAG: it cannot record receipts on this backend (#2263)"
+}
+
 # verify_receipt <socket> <dir> <name>: the current sekaictl exports the
 # receipt left by `governed ... <name>` as a signed attestation bundle and
 # verifies it.
 verify_receipt() {
-  [[ "$GOVERNED" == 1 ]] || return 0
   local socket="$1" dir="$2" name="$3" operation
   operation="$(json_field "$dir/$name.receipt.json" operation_id)" || return 1
   printf '%s\n' "$ATTEST_SEED" >"$WORK/attest.seed"
@@ -299,11 +309,8 @@ run_backend() {
   local n1_log="$dir/n1-server.log" cur_log="$dir/current-server.log"
   local n1_sock="$dir/n1.sock" cur_sock="$dir/cur.sock"
   local n1_pid cur_pid detail="$dir/detail"
-  local GOV_SKIPPED=""
-  if [[ "$GOVERNED" == 0 ]]; then
-    GOV_SKIPPED=" (governed operations and receipts skipped)"
-    echo "skipped [$label] governed operations and receipts: not implemented on this backend (#2263)"
-  fi
+  # Set by n1_governed when N-1 cannot record receipts on this backend.
+  local N1_GOVERNED=1 GOV_SKIPPED=""
 
   # N-1 creates the store and seeds it.
   if start_server "$N1_SERVER" "$N1_CWD" "$n1_sock" "$n1_log" "${store[@]}"; then
@@ -317,7 +324,7 @@ run_backend() {
   seed_doc "$dir/seed-a.json" a
   if ctl "$N1_CTL" "$n1_sock" "$detail" ontology apply --file "$WORK/domain.json" \
     && ctl "$N1_CTL" "$n1_sock" "$detail" ontology seed --file "$dir/seed-a.json" \
-    && governed "$N1_CTL" "$n1_sock" "$dir" inc-a n1-op \
+    && n1_governed "$N1_CTL" "$n1_sock" "$dir" inc-a n1-op \
     && ctl "$N1_CTL" "$n1_sock" "$dir/n1-before.expand" ontology expand --namespace "$NAMESPACE" --object inc-a \
     && expect_graph "$dir/n1-before.expand" a; then
     pass "[$label] N-1 seeds schema type, classes, relation, objects, link, and a governed operation${GOV_SKIPPED}"
@@ -353,9 +360,11 @@ run_backend() {
     else
       fail "[$label] mixed window: each server reads the other's writes" "$dir/mixed-n1.expand" "$n1_log" "$cur_log"
     fi
-    if governed "$N1_CTL" "$n1_sock" "$dir" inc-m2 mixed-n1-op \
+    if { [[ "$N1_GOVERNED" == 0 ]] \
+      || { governed "$N1_CTL" "$n1_sock" "$dir" inc-m2 mixed-n1-op \
+        && verify_receipt "$cur_sock" "$dir" mixed-n1-op; }; } \
       && governed "$CUR_CTL" "$cur_sock" "$dir" inc-m1 mixed-cur-op \
-      && verify_receipt "$cur_sock" "$dir" mixed-n1-op; then
+      && verify_receipt "$cur_sock" "$dir" mixed-cur-op; then
       pass "[$label] mixed window: governed operations on both servers; N-1's receipt verifies on current${GOV_SKIPPED}"
     else
       fail "[$label] mixed window: governed operations on both servers" "$detail" "$n1_log" "$cur_log"
@@ -381,7 +390,7 @@ run_backend() {
   else
     fail "[$label] seeded objects and link read back identically" "$detail" "$cur_log"
   fi
-  if [[ "$GOVERNED" == 0 ]]; then
+  if [[ "$N1_GOVERNED" == 0 ]]; then
     :
   elif governed "$CUR_CTL" "$cur_sock" "$dir" inc-a cur-reread \
     && [[ -n "$(run_content "$dir/n1-op.run")" ]] \
@@ -391,7 +400,7 @@ run_backend() {
     { echo "N-1:     $(run_content "$dir/n1-op.run")"; echo "current: $(run_content "$dir/cur-reread.run")"; } >"$detail"
     fail "[$label] seeded object properties resolve identically" "$detail" "$cur_log"
   fi
-  if [[ "$GOVERNED" == 0 ]]; then
+  if [[ "$N1_GOVERNED" == 0 ]]; then
     :
   elif ctl "$CUR_CTL" "$cur_sock" "$dir/n1-op.reread.json" receipt \
     "$(json_field "$dir/n1-op.receipt.json" operation_id)" --json \
@@ -410,7 +419,7 @@ run_backend() {
     && expect_graph "$dir/cur-b.expand" b \
     && governed "$CUR_CTL" "$cur_sock" "$dir" inc-b cur-op \
     && verify_receipt "$cur_sock" "$dir" cur-op; then
-    pass "[$label] current server writes objects, a link, and a governed operation whose receipt verifies${GOV_SKIPPED}"
+    pass "[$label] current server writes objects, a link, and a governed operation whose receipt verifies"
   else
     fail "[$label] current server writes on the upgraded store" "$detail" "$cur_log"
   fi
@@ -420,8 +429,7 @@ run_backend() {
   if ctl "$N1_CTL" "$cur_sock" "$detail" ontology expand --namespace "$NAMESPACE" --object inc-b \
     && expect_graph "$detail" b \
     && ctl "$N1_CTL" "$cur_sock" "$detail" ontology context --object svc-a --object svc-b \
-    && { [[ "$GOVERNED" == 0 ]] \
-      || ctl "$N1_CTL" "$cur_sock" "$detail" receipt "$(json_field "$dir/cur-op.receipt.json" operation_id)"; }; then
+    && ctl "$N1_CTL" "$cur_sock" "$detail" receipt "$(json_field "$dir/cur-op.receipt.json" operation_id)"; then
     pass "[$label] wire: N-1 sekaictl reads from the current server"
   else
     fail "[$label] wire: N-1 sekaictl reads from the current server" "$detail" "$cur_log"
@@ -431,7 +439,7 @@ run_backend() {
     && ctl "$CUR_CTL" "$cur_sock" "$dir/cur-c.expand" ontology expand --namespace "$NAMESPACE" --object inc-c \
     && expect_graph "$dir/cur-c.expand" c \
     && verify_receipt "$cur_sock" "$dir" wire-op; then
-    pass "[$label] wire: N-1 sekaictl writes to the current server (objects, link, governed operation)${GOV_SKIPPED}"
+    pass "[$label] wire: N-1 sekaictl writes to the current server (objects, link, governed operation)"
   else
     fail "[$label] wire: N-1 sekaictl writes to the current server" "$detail" "$cur_log"
   fi
@@ -439,7 +447,6 @@ run_backend() {
   stop_server "$cur_pid"
 }
 
-GOVERNED=1
 run_backend sqlite 0 SEKAI_DATA_DIR="$WORK/sqlite/data"
 
 if [[ -n "${SEKAI_DATABASE_URL:-}" && -n "${CHISEI_DATABASE_URL:-}" ]]; then
@@ -448,8 +455,6 @@ if [[ -n "${SEKAI_DATABASE_URL:-}" && -n "${CHISEI_DATABASE_URL:-}" ]]; then
   if [[ -n "${SEKAI_POSTGRES_CA_CERT:-}" ]]; then
     pg_store+=("SEKAI_POSTGRES_CA_CERT=$SEKAI_POSTGRES_CA_CERT")
   fi
-  # Governed operations cannot record receipts on PostgreSQL yet (#2263).
-  GOVERNED=0
   run_backend postgres 1 "${pg_store[@]}"
 else
   echo "skipped: no PostgreSQL (set SEKAI_DATABASE_URL and CHISEI_DATABASE_URL, or run through scripts/postgres-conformance.sh)"
