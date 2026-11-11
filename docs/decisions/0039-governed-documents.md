@@ -75,10 +75,13 @@ fixed marking by the fixed order in an activated namespace, and hides a
 custom token, which it cannot parse.
 
 Admission takes `GovernedDocumentAdmission`, not the stored record. It has
-no owner, `admitted_by`, `admitted_at_ms`, or `deleted_at_ms`: the server
-sets the owner and `admitted_by` to the caller and stamps the time. Its
-field numbers match `GovernedDocument`, so a request encoded by an older
-client still decodes. The server ignores the stored-record fields it carries.
+no `admitted_by`, `admitted_at_ms`, or `deleted_at_ms`: the server sets
+`admitted_by` to the caller and stamps the time. Its optional `owner` may be
+empty or name the caller; any other owner is refused, so admitting on behalf
+of someone else fails instead of silently admitting as the caller (#2271).
+Its field numbers match `GovernedDocument`, so a request encoded by an older
+client still decodes. The server ignores the other stored-record fields it
+carries.
 
 ## Amendment 2026-11-11
 

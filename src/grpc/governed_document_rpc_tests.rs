@@ -238,6 +238,26 @@ async fn exercise_document_lifecycle(db: RuntimeDb) {
         admit(&svc, &carol, admission(DOCUMENT_ID)).await.unwrap(),
         admitted
     );
+    // An owner may be omitted or name the caller; any other owner is
+    // refused, not rewritten to the caller.
+    let as_owner = |owner: &str| GovernedDocumentAdmission {
+        owner: owner.into(),
+        ..admission(DOCUMENT_ID)
+    };
+    assert_eq!(
+        admit(&svc, &carol, as_owner("carol")).await.unwrap(),
+        admitted
+    );
+    let other = GovernedDocumentAdmission {
+        document_id: "doc:other-owner".into(),
+        ..as_owner("dave")
+    };
+    assert_status(
+        "foreign owner admission",
+        &admit(&svc, &carol, other).await.unwrap_err(),
+        tonic::Code::NotFound,
+        unavailable,
+    );
 
     // An old client sends the stored rendition shape; the server-set fields
     // it carries decode as unknown fields and are dropped.
