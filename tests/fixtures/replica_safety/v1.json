@@ -55,7 +55,8 @@
       "evidence": [
         "crates/sekai-core/src/db/lease.rs",
         "tests/reusable_sekai_backend_conformance.rs",
-        "tests/replica_safety_leases.rs"
+        "tests/replica_safety_leases.rs",
+        "tests/replica_safety_postgres.rs"
       ]
     },
     {
@@ -64,7 +65,8 @@
       "notes": "Work admission and lifecycle transitions.",
       "evidence": [
         "crates/sekai-core/src/db/coordination.rs",
-        "tests/replica_safety_leases.rs"
+        "tests/replica_safety_leases.rs",
+        "tests/replica_safety_postgres.rs"
       ]
     },
     {
