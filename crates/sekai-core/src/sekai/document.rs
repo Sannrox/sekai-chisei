@@ -83,8 +83,9 @@ pub struct GovernedDocument {
 }
 
 /// What a caller submits to admit a document. The server sets the rest of
-/// the stored record: the owner is the caller, and the content digest and
-/// admission fields are computed. `content_digest`, when set, must match the
+/// the stored record: the content digest and admission fields are computed.
+/// The owner is always the caller; `owner` may be empty or name the caller,
+/// and any other owner is refused. `content_digest`, when set, must match the
 /// digest of `content_ref`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +93,8 @@ pub struct DocumentAdmission {
     pub contract_version: String,
     pub document_id: String,
     pub namespace: String,
+    #[serde(default)]
+    pub owner: String,
     pub type_revision: String,
     pub purpose: String,
     pub classification: String,
@@ -220,6 +223,10 @@ pub fn admit_document(
     required("actor", actor)?;
     if now_ms < 0 {
         return Err("admit timestamp must be non-negative".into());
+    }
+    // Admitting on behalf of someone else is refused, not rewritten.
+    if !admission.owner.is_empty() && admission.owner != actor {
+        return Err(DOCUMENT_UNAVAILABLE.into());
     }
     let validated = validate_document(admission, actor, now_ms)?;
     let lattice = db.get_classification_lattice(&validated.namespace)?;
@@ -852,6 +859,7 @@ mod tests {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:brief".into(),
             namespace: "records".into(),
+            owner: String::new(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),
@@ -863,6 +871,27 @@ mod tests {
             hold_id: String::new(),
             hold_reason: String::new(),
         }
+    }
+
+    #[test]
+    fn an_admission_naming_another_owner_is_refused() {
+        let db = db();
+        let refused = DocumentAdmission {
+            owner: "bob".into(),
+            ..document()
+        };
+        assert_eq!(
+            admit_document(&db, "alice", &refused, 1_000).unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        let named = DocumentAdmission {
+            owner: "alice".into(),
+            ..document()
+        };
+        assert_eq!(
+            admit_document(&db, "alice", &named, 1_000).unwrap().owner,
+            "alice"
+        );
     }
 
     fn rendition() -> RenditionAttachment {

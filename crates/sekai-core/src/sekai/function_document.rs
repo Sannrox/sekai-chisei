@@ -742,6 +742,7 @@ mod tests {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:invoice".into(),
             namespace: "records".into(),
+            owner: String::new(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),

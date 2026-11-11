@@ -1711,15 +1711,17 @@ message DocumentView {
   bool has_renditions = 16;
 }
 // What a caller submits to admit a document. Field numbers match
-// GovernedDocument; the server sets the reserved ones: the owner is the
-// caller, and the admission and deletion fields are its own. content_digest,
-// when set, must match the digest of content_ref.
+// GovernedDocument; the server sets the reserved ones: the admission and
+// deletion fields are its own. The owner is always the caller: an empty owner
+// means the caller, and any other owner is refused. content_digest, when set,
+// must match the digest of content_ref.
 message GovernedDocumentAdmission {
-  reserved 4, 15, 16, 17;
-  reserved "owner", "admitted_by", "admitted_at_ms", "deleted_at_ms";
+  reserved 15, 16, 17;
+  reserved "admitted_by", "admitted_at_ms", "deleted_at_ms";
   string contract_version = 1;
   string document_id = 2;
   string namespace = 3;
+  string owner = 4;
   string type_revision = 5;
   string purpose = 6;
   string classification = 7;

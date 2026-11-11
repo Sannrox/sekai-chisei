@@ -5006,6 +5006,7 @@ fn from_proto_admission(
         contract_version: proto.contract_version,
         document_id: proto.document_id,
         namespace: proto.namespace,
+        owner: proto.owner,
         type_revision: proto.type_revision,
         purpose: proto.purpose,
         classification: proto.classification,

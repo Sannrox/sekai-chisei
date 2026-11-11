@@ -56,8 +56,9 @@ sekaictl admin documents delete --namespace records --document-id doc:brief \
 The admitting actor becomes the owner, and only the owner retrieves or
 changes the document. The `--document` file is the admission input: the
 contract fields above plus an optional `content_digest`, which must match the
-content reference. It has no `owner`, `admitted_by`, `admitted_at_ms`, or
+content reference. It has no `admitted_by`, `admitted_at_ms`, or
 `deleted_at_ms`; the server sets those, and a file that carries them is
+refused. An optional `owner` may name the caller; any other owner is
 refused. The `--rendition` file is the attachment input: the rendition
 fields without `attached_by` or `attached_at_ms`, which the server sets to the
 caller and the attach time. Attaching the same rendition again returns the
