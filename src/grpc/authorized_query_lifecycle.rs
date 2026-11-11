@@ -64,10 +64,11 @@ impl SekaiServiceImpl {
         let (obj, marking) = match visibility {
             Ok(visible) => visible,
             Err(status) if status.code() == tonic::Code::PermissionDenied => {
-                // A site agent instance the caller may not read is
-                // indistinguishable from a missing one, activated policy or
-                // not (ADR 0136).
+                // A site agent instance or hosted session object the caller
+                // may not read is indistinguishable from a missing one,
+                // activated policy or not (ADR 0136, #2132).
                 let activated = crate::sekai::site_agent_memory::is_action_only_kind(&obj_kind)
+                    || crate::sekai::hosted_session::is_action_only_kind(&obj_kind)
                     || self
                         .db
                         .runtime()

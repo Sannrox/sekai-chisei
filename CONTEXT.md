@@ -223,6 +223,15 @@ their separate execution classes, external evaluators remain behind their
 registered adapter seam, and the canonical operation receipt remains the
 durable authority.
 
+## Hosted session
+
+The **Hosted session lifecycle** admits a capped set of identities into one
+durable session, applies each intent at the host clock, and persists that
+member's graph. Create, join, and intent are governed Actions
+(`sekai.hosted-session/v1`). Direct object writes of those kinds are refused.
+A read view returns the caller's graph only. Domain apply stays in the
+workload library; the host records the intent and the host clock.
+
 ## Object mutation
 
 The **Object mutation lifecycle** creates, updates, and deletes Objects through

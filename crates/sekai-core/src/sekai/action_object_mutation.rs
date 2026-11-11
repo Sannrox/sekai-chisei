@@ -163,6 +163,22 @@ pub fn plan(
         )
         .map(Some);
     }
+    let original_parameters_json = parameters_json;
+    let rewritten_parameters;
+    let parameters_json = if crate::sekai::hosted_session::is_action_only_kind(object_kind) {
+        rewritten_parameters = crate::sekai::hosted_session::rewrite_parameters(
+            db,
+            type_def,
+            namespace,
+            parameters_json,
+            submitter,
+            now_ms,
+        )
+        .map_err(ActionObjectMutationError::FailedPrecondition)?;
+        rewritten_parameters.as_str()
+    } else {
+        parameters_json
+    };
     if RESERVED_OBJECT_KINDS.contains(&object_kind) {
         return Err(ActionObjectMutationError::FailedPrecondition(format!(
             "object_kind {object_kind:?} is reserved"
@@ -233,7 +249,11 @@ pub fn plan(
             };
             inherit_marking(db, namespace, &mut planned, None, marking)?;
             validate_object_schema(db, &planned)?;
-            let references = package_references(db, &planned)?;
+            let mut references = package_references(db, &planned)?;
+            references.extend(
+                crate::sekai::hosted_session::plan_references(db, &planned, mutation)
+                    .map_err(ActionObjectMutationError::Internal)?,
+            );
             validate_object_write(db, &mut planned, submitter, now_ms)?;
             Ok(Some(PlannedObjectMutation::Create {
                 object: planned,
@@ -276,6 +296,14 @@ pub fn plan(
                 created: existing.created,
                 updated: existing.updated,
             };
+            if type_def.type_id == crate::sekai::hosted_session::ACTION_INTENT {
+                crate::sekai::hosted_session::stamp_intent(
+                    &mut planned,
+                    original_parameters_json,
+                    now_ms,
+                )
+                .map_err(ActionObjectMutationError::FailedPrecondition)?;
+            }
             inherit_marking(
                 db,
                 namespace,
@@ -284,7 +312,11 @@ pub fn plan(
                 marking,
             )?;
             validate_object_schema(db, &planned)?;
-            let references = package_references(db, &planned)?;
+            let mut references = package_references(db, &planned)?;
+            references.extend(
+                crate::sekai::hosted_session::plan_references(db, &planned, mutation)
+                    .map_err(ActionObjectMutationError::Internal)?,
+            );
             validate_object_write(db, &mut planned, submitter, now_ms)?;
             Ok(Some(PlannedObjectMutation::Update {
                 object: planned,
@@ -499,6 +531,8 @@ pub fn apply(
             ActionObjectMutationError::FailedPrecondition(format!(
                 "object {object_id} changed since the Action was planned; submit again"
             ))
+        } else if error.contains(" is at cap ") {
+            ActionObjectMutationError::FailedPrecondition(error)
         } else if error.ends_with("not found") {
             ActionObjectMutationError::FailedPrecondition(format!("object {object_id} not found"))
         } else {

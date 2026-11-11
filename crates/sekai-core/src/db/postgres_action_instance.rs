@@ -287,6 +287,11 @@ impl PostgresDb {
                 crate::sekai::action_instance::REFERENCE_CHANGED
             ));
         }
+        if let ParkedGrantWrite::Create(object) = write
+            && let Some(reason) = postgres_hosted_session_join_cap(&mut tx, object)?
+        {
+            return Err(reason);
+        }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
                 insert_created_object_in(&mut tx, object, actor, None, attribution)?;
@@ -658,6 +663,11 @@ impl PostgresDb {
             return Ok(ParkedGrantOutcome::Refused(reason));
         }
         if postgres_changed_reference(&mut transaction, references)?.is_some() {
+            return Ok(ParkedGrantOutcome::Stale);
+        }
+        if let Some(ParkedGrantWrite::Create(object)) = write
+            && postgres_hosted_session_join_cap(&mut transaction, object)?.is_some()
+        {
             return Ok(ParkedGrantOutcome::Stale);
         }
         let row = transaction
@@ -1320,6 +1330,57 @@ fn postgres_share_lock_object_ids(
         .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn postgres_hosted_session_join_cap(
+    tx: &mut postgres::Transaction<'_>,
+    object: &crate::domain::Object,
+) -> Result<Option<String>, String> {
+    use crate::sekai::hosted_session::{MEMBER_KIND, SESSION_KIND, join_cap_refusal};
+    if object.kind != MEMBER_KIND {
+        return Ok(None);
+    }
+    let Some(session_id) = object
+        .properties
+        .get("session_id")
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let session = match tx.query_opt(
+        &format!(
+            "SELECT {} FROM sekai_objects
+             WHERE id = $1 AND kind = $2 AND namespace = $3
+             FOR UPDATE NOWAIT",
+            crate::db::postgres_audit::OBJECT_COLUMNS
+        ),
+        &[&session_id, &SESSION_KIND, &object.namespace],
+    ) {
+        Ok(row) => row
+            .map(row_to_object)
+            .transpose()?
+            .ok_or_else(|| format!("hosted session {session_id} not found"))?,
+        Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+            return Err(format!(
+                "{}{session_id}",
+                crate::sekai::action_instance::REFERENCE_CHANGED
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let members: i64 = tx
+        .query_one(
+            "SELECT COUNT(*) FROM sekai_objects
+             WHERE kind = $1 AND namespace = $2
+               AND (properties::jsonb ->> 'session_id') = $3",
+            &[&MEMBER_KIND, &object.namespace, session_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    join_cap_refusal(
+        &session,
+        u32::try_from(members).map_err(|error| error.to_string())?,
+    )
 }
 
 /// The id of the first of `references` no longer as planning read it

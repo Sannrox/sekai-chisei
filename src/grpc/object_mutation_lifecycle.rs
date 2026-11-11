@@ -782,12 +782,13 @@ fn validate_written_access_marking(db: &RuntimeDb, object: &domain::Object) -> R
 }
 
 /// Kinds generic object writes never touch: site agent instances and their
-/// memory (ADR 0136), the security package's objects (ADR 0135), whose
-/// rules and stamped recorder (#1990) hold only on the Action path, and
-/// feedback package objects, whose publication trusts the investigation
-/// runtime recorder (#2053).
+/// memory (ADR 0136), hosted session objects (#2132), the security package's
+/// objects (ADR 0135), whose rules and stamped recorder (#1990) hold only on
+/// the Action path, and feedback package objects, whose publication trusts
+/// the investigation runtime recorder (#2053).
 fn governed_action_only(kind: &str) -> bool {
     crate::sekai::site_agent_memory::is_action_only_kind(kind)
+        || crate::sekai::hosted_session::is_action_only_kind(kind)
         || crate::sekai::security_package::is_package_kind(kind)
         || crate::sekai::feedback_package::is_package_kind(kind)
 }
