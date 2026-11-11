@@ -131,7 +131,7 @@ mod tests {
         assert!(quoted.contains(r#"path = "/src/a\"b\\c/crates/sekai-proto" }"#));
         let repository = manifest(template, &SdkSource::Repository);
         assert!(repository.contains(&format!(
-            r#"sekai-proto = {{ version = "2.0.0", git = "{REPOSITORY}" }}"#
+            r#"sekai-proto = {{ version = "3.0.0", git = "{REPOSITORY}" }}"#
         )));
         assert!(!repository.contains("path = "));
         assert!(repository.ends_with("[workspace]\n"));

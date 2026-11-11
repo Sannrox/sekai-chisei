@@ -6,6 +6,91 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 3.0.0
+
+Upgrade notes:
+
+- Rust library consumers must update `sekai-proto` to 3.0.0, `sekai-core` to 4.0.0, and `chisei-core` to 3.0.0. Removed modules, regenerated proto types, and new struct fields break exhaustive literals and matches. Server and protocol family version is 3.0.0. Tenkai products move to `chisei.admin-rpc` 1.1.0; `chisei.enterprise-rpc` stays 1.0.0.
+- Back up both stores before the first 3.0.0 boot. PostgreSQL applies migration files `0144_external_action_reclaim_index.sql` through `0155_embedding_rebuild_cursor.sql`, including the drop of the fence and geo feed tables (`0145`) and the search index copy (`0154`). SQLite applies the same changes on open. A binary or image rollback to 2.0.0 does not undo applied schema.
+- The search index migration copies the legacy index into new tables, so search index storage roughly doubles until a later release drops the legacy tables (#2254).
+- The in-plane fence binding and geo feed are gone. Their tables are dropped and stored bindings and feeds are not migrated. The experimental RPCs `PutFenceBinding`, `RunFenceBinding`, `PutEzuGeoFeed`, `RunEzuGeoFeed`, and `BackfillEzuGeoFeed` are removed, and `SEKAI_EZU_URL` and `EZU_TOKEN` are ignored (#2181).
+- The in-plane feedback workers are gone. Remove `SEKAI_FEEDBACK_GITHUB_*` and `SEKAI_FEEDBACK_QUALITY_*`; they are ignored. To keep investigating observations or publishing issues, run the reference adapters as an external runtime (#2177, #2178).
+- Feedback producers move to package v2 and emit `operation_id`, `observed_at_ms`, and a non-blank `scope`. Namespaces left on v1 keep their v1 types (#2179).
+- `AdmitGovernedDocument` takes `GovernedDocumentAdmission`, and `AttachGovernedDocumentRendition` takes `DocumentRenditionAttachment`. Regenerate clients from `proto/sekai.proto`. In `sekaictl admin documents admit --document` files, drop `admitted_by`, `admitted_at_ms`, and `deleted_at_ms`; `owner` is optional and must name the caller, or the admission is refused. In `attach-rendition --rendition` files, drop `attached_by` and `attached_at_ms` (#2267, #2268, #2272).
+- The seven governed-document RPCs, `Search`, and `GetSearchIndexStatus` are stable. They no longer need `SEKAI_EXPERIMENTAL_RPCS=1`, and the document RPCs are served over HTTP/JSON (#2258, #2268).
+- Operators who activate a namespace classification lattice must keep the tokens stored documents in that namespace use. A document whose marking the lattice does not name is invisible until the lattice includes it (#2267).
+- `Search` page tokens are opaque. Send back `next_page_token` with the same request; a numeric offset now returns `INVALID_ARGUMENT` (#2256).
+- `PutEmbeddingSpec` refuses specs over the new limits. A stored spec over a limit keeps its vectors but is refused on the next catch-up until it is changed (#2261).
+- `sekaictl admin sync health --actor` is retired. The command needs a running plane started with `SEKAI_EXPERIMENTAL_RPCS=1` (#2221).
+- During a rolling deploy from 2.0.0, old replicas keep their feedback workers until replaced, their fence and geo feed RPCs fail once the tables are gone, and they may still overwrite a conflicting rendition. Both versions read the same data.
+
+### Security
+
+- Governed-document RPCs authorize the namespace, tenant context, service-principal scope, shared space, and team-namespace membership before the store (#2249). Versions from 2.0.0 skipped these checks.
+- Move to rusqlite 0.41 for RUSTSEC-2026-0459 (#2237).
+
+### Breaking
+
+- Remove the in-plane feedback workers (#2178).
+- Count operations on observed time per scope in package v2 (#2179).
+- Remove the in-plane Ezu fence bindings and geo feed (#2181).
+- Share one decider check between parked Actions and plan steps (#2214).
+- Attach dataset branch proposals to a definition proposal and merge them atomically (#2215).
+- Claim saved-export deliveries as the export_delivery work kind (#2219).
+- Record ontology health snapshots from the transform schedule graph (#2220).
+- Source part in namespace health and a source health RPC (#2221).
+- Show attached dataset proposals on a definition proposal (#2224).
+- Source admin RPCs and source_sync on the work claim family (#2230).
+- Connector runtime that claims Source sync work (#2231).
+- Source batches name their Source (#2232).
+- Sources deliver saved exports through their runtime (#2233).
+- Sync GitHub Sources through the runtime (#2234).
+- Opaque query-bound page cursor for Search (#2256).
+- Bound Search query cost and add PostgreSQL RPC tests (#2257).
+- Resumable embedding rebuild, spec limits and ListEmbeddingSpecs paging (#2261).
+- Namespace lattice and admission input for governed documents (#2267).
+- Promote governed-document RPCs to stable (#2268).
+- Refuse a document admission that names another owner (#2272).
+
+### Upgrade
+
+- Index expired reserved authorization reclaim (#2171).
+- Fenced scheduled worker for search index catch-up (#2254).
+
+### Added
+
+- Run investigation and GitHub publication as adapters (#2177).
+- One claimable-work RPC family over every kind (#2210).
+- One claim client over the work family (#2211).
+- List pending decisions across review kinds (#2223).
+- Connector type contract (#2227).
+- Store Sources on SQLite and PostgreSQL (#2228).
+- Source sync as a claimable work kind (#2229).
+- Deliver saved exports into relational Sources (#2235).
+- Reference receiver for signed feedback observation webhooks (#2239).
+
+### Changed
+
+- Transaction-scoped dataset branch merge (#2208).
+- One claim engine for transform, action and agent-turn work (#2207).
+
+### Fixed
+
+- Publish only investigation-runtime findings (#2170).
+- Template public feedback issues (#2173).
+- Ignore foreign feedback mapping ids (#2175).
+- Report proto breaks already on the base as a notice (#2206).
+- Refuse self-approval of learning changes (#2205).
+- Refuse a direct merge of a change-bundle proposal (#2209).
+- Schedule dataset health checks on the transform schedule graph (#2213).
+- Bound retention of consumer violation notifications (#2217).
+- Record plan review decisions on the audit trail (#2216).
+- Make criticality outbox events durable and bounded (#2218).
+- Read image digest without an early-exit pipeline (#2240).
+- Report Search capabilities active without the experimental flag (#2258).
+- Boot on PostgreSQL without the source tree on disk (#2262).
+- Persist governed-run receipts with Kioku holdouts on PostgreSQL (#2265).
+
 ## 2.0.0
 
 Upgrade notes:
