@@ -26,7 +26,7 @@ const TRACKED_CRATES: &[&str] = &["sekai-client", "sekai-proto", "sekai-chisei"]
 /// id. The only source for these versions; RELEASING.md says which change
 /// moves which. `compatibility.json` lists the same map under `contracts`.
 pub const PROVIDED_CONTRACTS: &[(&str, &str)] = &[
-    ("chisei.admin-rpc", "1.0.0"),
+    ("chisei.admin-rpc", "1.1.0"),
     ("chisei.enterprise-rpc", "1.0.0"),
 ];
 
@@ -1169,9 +1169,10 @@ mod tests {
         fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), &product).unwrap();
         check_tenkai_products(root.path(), &matrix).unwrap();
 
+        let (name, version) = PROVIDED_CONTRACTS[0];
         let stale = product.replace(
-            "\"chisei.admin-rpc\" = \"1.0.0\"",
-            "\"chisei.admin-rpc\" = \"0.9.0\"",
+            &format!("\"{name}\" = \"{version}\""),
+            &format!("\"{name}\" = \"0.0.1\""),
         );
         fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), stale).unwrap();
         let error = check_tenkai_products(root.path(), &matrix).unwrap_err();
@@ -1494,11 +1495,12 @@ mod tests {
     #[test]
     fn generated_json_lists_provided_contracts_without_a_new_struct_field() {
         let json = sample_matrix().to_pretty_json().unwrap();
-        assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
-        assert!(
-            json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
-            "{json}"
-        );
+        for (name, version) in PROVIDED_CONTRACTS {
+            assert!(
+                json.contains(&format!("\"{name}\": \"{version}\"")),
+                "{json}"
+            );
+        }
         CompatibilityMatrix::from_json(&json).unwrap();
     }
 }
