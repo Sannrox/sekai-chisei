@@ -15,7 +15,9 @@ enabled. The caller must be a credential admin with the namespace grant
 
 A spec names the object kind, the source properties, `chunk_chars`,
 `dimension`, `batch_size`, and `model`: a hosted catalog route,
-`hosted.<profile>/<upstream model>`. Deleting a spec removes its vectors and
+`hosted.<profile>/<upstream model>`. Inputs, specs per namespace, and vectors
+per spec have upper limits, and `ListEmbeddingSpecs` pages; see
+[search.md](search.md#embedding-spec-limits). Deleting a spec removes its vectors and
 rebuild history and resets its checkpoint. Put and delete both move the
 spec's checkpoint revision on, never back, so a catch-up that listed the spec
 before the change writes nothing.
@@ -38,7 +40,10 @@ stop the others. Writes are fenced on the spec's revision, so instances never
 interleave. A rebuild holds a five-minute lease that it renews before every model
 call and with every object it writes, and a model call is cut off after
 two and a half minutes; other instances leave it alone until the lease lapses, then take it
-over.
+over. A rebuild saves its position in the database after every 500 objects,
+so one interrupted by a crash, a failed model call, or a lapsed lease resumes
+there instead of re-embedding every object; objects it embedded past that
+position are not sent to the model again.
 Split planes do not run catch-up: it needs the Sekai change feed and the
 Chisei route catalog in one process.
 

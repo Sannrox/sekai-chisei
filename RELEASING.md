@@ -25,8 +25,48 @@ The tag must equal the workspace version in the root `Cargo.toml`
 4. Run `python3 scripts/check-semver.py release`. It compares library crates
    to the previous final `v*` tag and fails when cargo-semver-checks requires
    a new major but the crate version did not major.
-5. Land the version-bump pull request. The workspace version, CHANGELOG
+5. Check the drafted notes: every `### Breaking` entry names the caller's
+   migration step (what a client, operator, or configuration changes, and
+   how). A breaking note without one is not ready to ship.
+6. Run the [N-1 upgrade gate](#n-1-upgrade-gate) locally, or dispatch the
+   `N-1 upgrade` workflow on the bump branch.
+7. Land the version-bump pull request. The workspace version, CHANGELOG
    heading, and Tenkai products move together.
+
+## N-1 upgrade gate
+
+`scripts/n1-upgrade.sh` tests the previous final `v*` tag (N-1) against the
+current tree. It builds N-1's server and `sekaictl` from the tag in a
+temporary worktree, then for each store backend:
+
+- N-1 creates the store and seeds a schema type, ontology classes and a
+  relation, objects, a link, and a governed operation with a receipt.
+- The current server opens that store. Migrations apply, the seeded data and
+  receipt read back unchanged, new writes succeed, and receipts verify.
+- N-1 `sekaictl` reads and writes against the current server.
+- On PostgreSQL, a running N-1 server and the current server share the store
+  while the current one migrates it. Each writes and reads the other's writes.
+
+Servers run outside any source checkout, as the released image does.
+Releases before #2265 cannot record governed receipts on PostgreSQL. When N-1
+refuses with that error, the gate skips only the checks that need an N-1
+receipt and prints a `skipped` line; governed operations the current server
+records still run and verify.
+
+`release.yml` runs the gate for every release tag, and the release is not
+published unless it passes. Pull requests that change the gate run it through
+`.github/workflows/n1-upgrade.yml`.
+
+Run it locally:
+
+```sh
+bash scripts/n1-upgrade.sh                                         # SQLite
+bash scripts/postgres-conformance.sh bash scripts/n1-upgrade.sh    # + PostgreSQL
+```
+
+`N1_TAG` overrides the resolved tag. `N1_KEEP=1` keeps the run directory with
+server logs; a failed run always keeps it. Without PostgreSQL URLs, the
+PostgreSQL part prints `skipped: no PostgreSQL`.
 
 ## Tag
 

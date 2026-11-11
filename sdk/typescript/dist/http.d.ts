@@ -43,6 +43,33 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "EvaluateObjectSet";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "Search";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetSearchIndexStatus";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "AdmitGovernedDocument";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "AttachGovernedDocumentRendition";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetGovernedDocument";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "HoldGovernedDocument";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ReleaseGovernedDocumentHold";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ExpireGovernedDocument";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "DeleteGovernedDocument";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "ReadObjectChangeSubscription";
 }, {
     readonly service: "sekai.SekaiService";

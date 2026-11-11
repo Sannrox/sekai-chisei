@@ -160,8 +160,28 @@ mod tests {
             .join(name)
     }
 
+    /// `HTTP_CODEGEN_UPDATE=1` rewrites the goldens and the SDK copies after a
+    /// stable-set change; review the diff before committing.
     #[test]
     fn generated_http_clients_match_goldens() {
+        if std::env::var_os("HTTP_CODEGEN_UPDATE").is_some() {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            for (path, body) in [
+                (fixture("client.v1.ts"), generate_typescript_client()),
+                (fixture("client.v1.py"), generate_python_client()),
+                (fixture("client.v1.rs"), generate_rust_client()),
+                (
+                    root.join("sdk/typescript/http.ts"),
+                    generate_typescript_client(),
+                ),
+                (
+                    root.join("sdk/python/sekai_http.py"),
+                    generate_python_client(),
+                ),
+            ] {
+                fs::write(path, body).unwrap();
+            }
+        }
         assert_eq!(
             generate_typescript_client(),
             fs::read_to_string(fixture("client.v1.ts")).unwrap()

@@ -9,9 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_lattice_access};
 use crate::sekai::evidence::EvidenceClassification;
 use crate::sekai::markings::{
-    PRINCIPAL_PROFILE_KIND, PRINCIPAL_PROFILE_SEALED_PROPERTY, PrincipalAuthority,
+    MarkingDecision, PRINCIPAL_PROFILE_KIND, PRINCIPAL_PROFILE_SEALED_PROPERTY, PrincipalAuthority,
     parse_classification, principal_authority_from_profile, principal_profile_external_id,
     trusted_service_authority,
 };
@@ -32,6 +33,7 @@ pub const RENDITION_THUMBNAIL: &str = "thumbnail";
 pub const MAX_METADATA_KEYS: usize = 32;
 pub const MAX_METADATA_BYTES: usize = 8 * 1024;
 pub const MAX_RENDITIONS: usize = 16;
+pub const RENDITIONS_OVERSIZED: &str = "governed document rendition list is oversized";
 pub const DOCUMENT_UNAVAILABLE: &str = "governed document is unavailable";
 pub const DOCUMENT_HELD: &str = "governed document is held";
 pub const REVISION_UNSUPPORTED: &str = "governed document revision is unsupported";
@@ -78,6 +80,52 @@ pub struct GovernedDocument {
     pub admitted_at_ms: i64,
     #[serde(default)]
     pub deleted_at_ms: i64,
+}
+
+/// What a caller submits to admit a document. The server sets the rest of
+/// the stored record: the content digest and admission fields are computed.
+/// The owner is always the caller; `owner` may be empty or name the caller,
+/// and any other owner is refused. `content_digest`, when set, must match the
+/// digest of `content_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentAdmission {
+    pub contract_version: String,
+    pub document_id: String,
+    pub namespace: String,
+    #[serde(default)]
+    pub owner: String,
+    pub type_revision: String,
+    pub purpose: String,
+    pub classification: String,
+    pub title: String,
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    pub content_ref: ContentReference,
+    #[serde(default)]
+    pub content_digest: String,
+    #[serde(default)]
+    pub expires_at_ms: i64,
+    #[serde(default)]
+    pub hold_id: String,
+    #[serde(default)]
+    pub hold_reason: String,
+}
+
+/// What a caller submits to attach a rendition. The server sets the rest of
+/// the stored rendition: `attached_by` is the caller and `attached_at_ms` the
+/// attach time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenditionAttachment {
+    pub namespace: String,
+    pub document_id: String,
+    pub rendition_id: String,
+    pub class: String,
+    pub parent_content_digest: String,
+    pub content_ref: ContentReference,
+    pub extractor_id: String,
+    pub extractor_profile_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,17 +212,25 @@ pub fn content_digest_for(reference: &ContentReference) -> Result<String, String
     ))
 }
 
+/// Admits a document owned by `actor`. The classification must be a marking
+/// of the namespace's activated lattice, or a fixed marking when it has none.
 pub fn admit_document(
     db: &RuntimeDb,
     actor: &str,
-    document: &GovernedDocument,
+    admission: &DocumentAdmission,
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
     required("actor", actor)?;
     if now_ms < 0 {
         return Err("admit timestamp must be non-negative".into());
     }
-    let validated = validate_document(document, actor, now_ms)?;
+    // Admitting on behalf of someone else is refused, not rewritten.
+    if !admission.owner.is_empty() && admission.owner != actor {
+        return Err(DOCUMENT_UNAVAILABLE.into());
+    }
+    let validated = validate_document(admission, actor, now_ms)?;
+    let lattice = db.get_classification_lattice(&validated.namespace)?;
+    check_marking(lattice.as_ref(), &validated.classification)?;
     // Insert-or-read in one step: under concurrency the first definition wins
     // and every other admission is compared against it (#1776).
     let Some(existing) = db.insert_governed_document(&validated)? else {
@@ -191,10 +247,13 @@ pub fn admit_document(
     Err(DOCUMENT_UNAVAILABLE.into())
 }
 
+/// Attaches a rendition to a live document owned by `actor`. Attaching the
+/// same rendition again returns the stored one, so a retry is idempotent; a
+/// different rendition under the same id is refused.
 pub fn attach_rendition(
     db: &RuntimeDb,
     actor: &str,
-    rendition: &DocumentRendition,
+    attachment: &RenditionAttachment,
     now_ms: i64,
 ) -> Result<DocumentRendition, String> {
     required("actor", actor)?;
@@ -203,31 +262,27 @@ pub fn attach_rendition(
     }
     let document = live_document(
         db,
-        &rendition.namespace,
-        &rendition.document_id,
+        &attachment.namespace,
+        &attachment.document_id,
         actor,
         now_ms,
     )?;
-    let validated = validate_rendition(&document, rendition, actor, now_ms)?;
-    let existing = db.list_governed_renditions(&document.namespace, &document.document_id)?;
-    if existing.len() >= MAX_RENDITIONS
-        && existing
-            .iter()
-            .all(|item| item.rendition_id != validated.rendition_id)
-    {
-        return Err("governed document rendition list is oversized".into());
+    let validated = validate_rendition(&document, attachment, actor, now_ms)?;
+    // Insert-or-read in one step: under concurrency the first attachment
+    // wins and every other one is compared against it.
+    let Some(prior) = db.insert_governed_rendition(&validated, MAX_RENDITIONS)? else {
+        return Ok(validated);
+    };
+    // A retry of the same attachment differs from the stored one by its
+    // attach time alone.
+    let retry = DocumentRendition {
+        attached_at_ms: prior.attached_at_ms,
+        ..validated
+    };
+    if prior == retry {
+        return Ok(prior);
     }
-    if let Some(prior) = existing
-        .iter()
-        .find(|item| item.rendition_id == validated.rendition_id)
-    {
-        if prior == &validated {
-            return Ok(prior.clone());
-        }
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    db.put_governed_rendition(&validated)?;
-    Ok(validated)
+    Err(DOCUMENT_UNAVAILABLE.into())
 }
 
 pub fn retrieve_document(
@@ -244,8 +299,18 @@ pub fn retrieve_document(
     }
     let document = live_document(db, &query.namespace, &query.document_id, actor, now_ms)?;
     let fields = requested_fields(&query.fields)?;
-    let authority = retrieve_authority(db, actor, query)?;
-    if !classification_visible(&document.classification, &authority) {
+    let lattice = db.get_classification_lattice(&document.namespace)?;
+    let ceiling = query.classification_ceiling.as_deref();
+    if let Some(ceiling) = ceiling {
+        check_marking(lattice.as_ref(), ceiling)?;
+    }
+    let authority = retrieve_authority(db, actor)?;
+    if !classification_visible(
+        &document.classification,
+        &authority,
+        ceiling,
+        lattice.as_ref(),
+    ) {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
     if query.purpose.as_deref() != Some(document.purpose.as_str()) {
@@ -454,7 +519,7 @@ fn check_owner(document: &GovernedDocument, actor: &str) -> Result<(), String> {
 }
 
 fn validate_document(
-    document: &GovernedDocument,
+    document: &DocumentAdmission,
     actor: &str,
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
@@ -464,13 +529,9 @@ fn validate_document(
     }
     required("document id", &document.document_id)?;
     required("namespace", &document.namespace)?;
-    required("owner", &document.owner)?;
     required("purpose", &document.purpose)?;
     required("title", &document.title)?;
-    if document.owner != actor {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    parse_classification(&document.classification)?;
+    required("classification", &document.classification)?;
     if document.expires_at_ms < 0 {
         return Err("document expiry must be non-negative".into());
     }
@@ -483,21 +544,30 @@ fn validate_document(
     if !document.content_digest.is_empty() && document.content_digest != digest {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    if document.deleted_at_ms != 0 {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
     Ok(GovernedDocument {
+        contract_version: document.contract_version.clone(),
+        document_id: document.document_id.clone(),
+        namespace: document.namespace.clone(),
+        owner: actor.into(),
+        type_revision: document.type_revision.clone(),
+        purpose: document.purpose.clone(),
+        classification: document.classification.clone(),
+        title: document.title.clone(),
+        metadata: document.metadata.clone(),
+        content_ref: document.content_ref.clone(),
         content_digest: digest,
+        expires_at_ms: document.expires_at_ms,
+        hold_id: document.hold_id.clone(),
+        hold_reason: document.hold_reason.clone(),
         admitted_by: actor.into(),
         admitted_at_ms: now_ms,
         deleted_at_ms: 0,
-        ..document.clone()
     })
 }
 
 fn validate_rendition(
     document: &GovernedDocument,
-    rendition: &DocumentRendition,
+    rendition: &RenditionAttachment,
     actor: &str,
     now_ms: i64,
 ) -> Result<DocumentRendition, String> {
@@ -522,9 +592,16 @@ fn validate_rendition(
     }
     validate_content_ref(&rendition.content_ref, Some(&rendition.class))?;
     Ok(DocumentRendition {
+        namespace: rendition.namespace.clone(),
+        document_id: rendition.document_id.clone(),
+        rendition_id: rendition.rendition_id.clone(),
+        class: rendition.class.clone(),
+        parent_content_digest: rendition.parent_content_digest.clone(),
+        content_ref: rendition.content_ref.clone(),
+        extractor_id: rendition.extractor_id.clone(),
+        extractor_profile_digest: rendition.extractor_profile_digest.clone(),
         attached_by: actor.into(),
         attached_at_ms: now_ms,
-        ..rendition.clone()
     })
 }
 
@@ -580,13 +657,9 @@ fn requested_fields(fields: &[String]) -> Result<BTreeSet<&str>, String> {
     Ok(requested)
 }
 
-fn retrieve_authority(
-    db: &RuntimeDb,
-    actor: &str,
-    query: &DocumentRetrieve,
-) -> Result<PrincipalAuthority, String> {
-    let mut authority = if let Some(trusted) = trusted_service_authority(actor) {
-        trusted
+fn retrieve_authority(db: &RuntimeDb, actor: &str) -> Result<PrincipalAuthority, String> {
+    if let Some(trusted) = trusted_service_authority(actor) {
+        Ok(trusted)
     } else {
         let candidates = db.find_all_by_external_id(&principal_profile_external_id(actor))?;
         let mut sealed = Vec::new();
@@ -612,31 +685,46 @@ fn retrieve_authority(
         if sealed.len() > 1 {
             return Err(DOCUMENT_UNAVAILABLE.into());
         }
-        principal_authority_from_profile(actor, sealed.first().copied())?
-    };
-    if let Some(requested) = query.classification_ceiling.as_deref() {
-        let requested = parse_classification(requested)?;
-        if authority
-            .classification_ceiling
-            .is_some_and(|existing| requested < existing)
-        {
-            authority.classification_ceiling = Some(requested);
-            authority.classification_token = Some(requested.as_str().into());
-        }
+        principal_authority_from_profile(actor, sealed.first().copied())
     }
-    Ok(authority)
 }
 
-fn classification_visible(classification: &str, authority: &PrincipalAuthority) -> bool {
-    let Ok(marking) = parse_classification(classification) else {
-        return false;
-    };
-    if marking == EvidenceClassification::Public {
-        return true;
+/// Checks that `token` is a marking of the namespace's activated lattice
+/// (ADR 0032), or one of the fixed markings when it has none (ADR 0007).
+fn check_marking(lattice: Option<&ClassificationLattice>, token: &str) -> Result<(), String> {
+    match lattice {
+        Some(lattice) if lattice.contains(token.trim()) => Ok(()),
+        Some(_) => Err("classification marking is unknown to the activated lattice".into()),
+        None => parse_classification(token).map(drop),
     }
-    authority
-        .classification_ceiling
-        .is_some_and(|ceiling| ceiling >= marking)
+}
+
+/// Whether `authority` may see a document marked `classification`, evaluated
+/// as Search does: under the namespace's activated lattice, else the fixed
+/// markings, where `public` stays visible without a ceiling. A requested
+/// `ceiling` only restricts: it must also dominate the marking. A marking
+/// unknown to the rule is never visible, trusted principals included.
+fn classification_visible(
+    classification: &str,
+    authority: &PrincipalAuthority,
+    ceiling: Option<&str>,
+    lattice: Option<&ClassificationLattice>,
+) -> bool {
+    let marking = classification.trim();
+    if check_marking(lattice, marking).is_err() {
+        return false;
+    }
+    let held = (lattice.is_none()
+        && parse_classification(marking) == Ok(EvidenceClassification::Public))
+        || evaluate_lattice_access("governed-document", Some(marking), authority, lattice).decision
+            == MarkingDecision::Allow;
+    held && ceiling.is_none_or(|ceiling| match lattice {
+        Some(lattice) => lattice.dominates(ceiling.trim(), marking) == Ok(true),
+        None => matches!(
+            (parse_classification(ceiling), parse_classification(marking)),
+            (Ok(ceiling), Ok(marking)) if ceiling >= marking
+        ),
+    })
 }
 
 fn supported_media_type(media_type: &str, class: Option<&str>) -> bool {
@@ -765,13 +853,13 @@ mod tests {
         }
     }
 
-    fn document() -> GovernedDocument {
+    fn document() -> DocumentAdmission {
         let content_ref = content_ref(MEDIA_PDF);
-        GovernedDocument {
+        DocumentAdmission {
             contract_version: DOCUMENT_CONTRACT.into(),
             document_id: "doc:brief".into(),
             namespace: "records".into(),
-            owner: "analyst".into(),
+            owner: String::new(),
             type_revision: TYPE_REVISION_V1.into(),
             purpose: "case-review".into(),
             classification: "internal".into(),
@@ -782,14 +870,32 @@ mod tests {
             expires_at_ms: 10_000,
             hold_id: String::new(),
             hold_reason: String::new(),
-            admitted_by: String::new(),
-            admitted_at_ms: 0,
-            deleted_at_ms: 0,
         }
     }
 
-    fn rendition() -> DocumentRendition {
-        DocumentRendition {
+    #[test]
+    fn an_admission_naming_another_owner_is_refused() {
+        let db = db();
+        let refused = DocumentAdmission {
+            owner: "bob".into(),
+            ..document()
+        };
+        assert_eq!(
+            admit_document(&db, "alice", &refused, 1_000).unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        let named = DocumentAdmission {
+            owner: "alice".into(),
+            ..document()
+        };
+        assert_eq!(
+            admit_document(&db, "alice", &named, 1_000).unwrap().owner,
+            "alice"
+        );
+    }
+
+    fn rendition() -> RenditionAttachment {
+        RenditionAttachment {
             namespace: "records".into(),
             document_id: "doc:brief".into(),
             rendition_id: "rend:text".into(),
@@ -803,8 +909,6 @@ mod tests {
             },
             extractor_id: "extractor:text".into(),
             extractor_profile_digest: digest(3),
-            attached_by: String::new(),
-            attached_at_ms: 0,
         }
     }
 
@@ -1004,7 +1108,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("hidden".into(), serde_json::json!("nope"));
-        assert!(serde_json::from_value::<GovernedDocument>(unknown).is_err());
+        assert!(serde_json::from_value::<DocumentAdmission>(unknown).is_err());
     }
 
     #[test]
@@ -1162,7 +1266,6 @@ mod tests {
         pin_ceiling(&runtime, "counsel", "internal");
         let mut other = document();
         other.namespace = "legal".into();
-        other.owner = "counsel".into();
         admit_document(&runtime, "analyst", &document(), 1_000).unwrap();
         admit_document(&runtime, "counsel", &other, 1_000).unwrap();
         attach_rendition(&runtime, "analyst", &rendition(), 1_500).unwrap();
@@ -1198,12 +1301,200 @@ mod tests {
         );
     }
 
+    /// Documents follow the namespace lattice as Search does (#2245): fixed
+    /// markings work until a lattice is activated, after which only its
+    /// tokens are visible, and an unknown marking is never visible.
+    fn exercise_documents_follow_the_namespace_lattice(runtime: &RuntimeDb, suffix: &str) {
+        use crate::sekai::classification_lattice::CLASSIFICATION_LATTICE_VERSION;
+
+        let namespace = format!("records-{suffix}");
+        let analyst = format!("analyst-{suffix}");
+        let counsel = format!("counsel-{suffix}");
+        pin_ceiling(runtime, &analyst, "internal");
+        pin_ceiling(runtime, &counsel, "acme-secret");
+        let admission = |id: &str, classification: &str| DocumentAdmission {
+            document_id: id.into(),
+            namespace: namespace.clone(),
+            classification: classification.into(),
+            ..document()
+        };
+        let visible = |actor: &str, id: &str, ceiling: Option<&str>| {
+            retrieve_document(
+                runtime,
+                actor,
+                &DocumentRetrieve {
+                    namespace: namespace.clone(),
+                    document_id: id.into(),
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: ceiling.map(str::to_string),
+                },
+                2_000,
+            )
+            .is_ok()
+        };
+
+        // Without a lattice the fixed markings apply, case-insensitively.
+        admit_document(
+            runtime,
+            &analyst,
+            &admission("doc:fixed", "Internal"),
+            1_000,
+        )
+        .unwrap();
+        admit_document(runtime, &analyst, &admission("doc:public", "public"), 1_000).unwrap();
+        assert!(visible(&analyst, "doc:fixed", None));
+        assert!(visible(&analyst, "doc:public", None));
+        assert!(!visible(&analyst, "doc:fixed", Some("public")));
+        assert!(
+            admit_document(runtime, &analyst, &admission("doc:x", "acme-secret"), 1_000).is_err()
+        );
+        // A stored marking no rule knows is never visible, not even to a
+        // trusted principal.
+        let unknown =
+            validate_document(&admission("doc:unknown", "mystery"), "root", 1_000).unwrap();
+        assert!(
+            runtime
+                .insert_governed_document(&unknown)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!visible("root", "doc:unknown", None));
+
+        runtime
+            .put_classification_lattice(
+                &ClassificationLattice {
+                    contract_version: CLASSIFICATION_LATTICE_VERSION.into(),
+                    namespace: namespace.clone(),
+                    tokens: vec!["internal".into(), "acme-secret".into()],
+                    parents: BTreeMap::from([("internal".into(), vec!["acme-secret".into()])]),
+                    incomparable: Vec::new(),
+                },
+                "root",
+                1_500,
+            )
+            .unwrap();
+
+        // The activated lattice governs: its tokens are exact, and a fixed
+        // marking it does not name fails closed.
+        admit_document(
+            runtime,
+            &counsel,
+            &admission("doc:secret", "acme-secret"),
+            1_600,
+        )
+        .unwrap();
+        admit_document(
+            runtime,
+            &analyst,
+            &admission("doc:internal", "internal"),
+            1_600,
+        )
+        .unwrap();
+        assert!(visible(&counsel, "doc:secret", None));
+        assert!(!visible(&counsel, "doc:secret", Some("internal")));
+        assert!(visible(&analyst, "doc:internal", None));
+        assert!(!visible(&analyst, "doc:fixed", None));
+        assert!(!visible(&analyst, "doc:public", None));
+        assert!(!visible("root", "doc:unknown", None));
+        assert!(
+            admit_document(
+                runtime,
+                &analyst,
+                &admission("doc:y", "confidential"),
+                1_600
+            )
+            .is_err()
+        );
+        assert!(
+            retrieve_document(
+                runtime,
+                &analyst,
+                &DocumentRetrieve {
+                    namespace: namespace.clone(),
+                    document_id: "doc:internal".into(),
+                    purpose: Some("case-review".into()),
+                    fields: Vec::new(),
+                    classification_ceiling: Some("public".into()),
+                },
+                2_000,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn documents_follow_the_namespace_lattice() {
+        exercise_documents_follow_the_namespace_lattice(&db(), "sqlite");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_documents_follow_the_namespace_lattice() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        exercise_documents_follow_the_namespace_lattice(&postgres_runtime(), &suffix);
+    }
+
+    #[test]
+    fn the_server_sets_owner_and_admission_fields() {
+        let runtime = db();
+        let admitted = admit(&runtime);
+        assert_eq!(
+            (
+                admitted.owner.as_str(),
+                admitted.admitted_by.as_str(),
+                admitted.admitted_at_ms,
+                admitted.deleted_at_ms,
+            ),
+            ("analyst", "analyst", 1_000, 0)
+        );
+        assert_eq!(
+            admitted.content_digest,
+            content_digest_for(&admitted.content_ref).unwrap()
+        );
+        let mut stored = serde_json::to_value(document()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .insert("admitted_by".into(), serde_json::json!("someone-else"));
+        assert!(serde_json::from_value::<DocumentAdmission>(stored).is_err());
+    }
+
+    /// The server sets `attached_by` and `attached_at_ms` (#2266), and a
+    /// retry of the same attachment later returns the stored rendition.
+    #[test]
+    fn the_server_sets_attachment_fields_and_a_retry_is_idempotent() {
+        let runtime = db();
+        admit(&runtime);
+        let attached = attach_rendition(&runtime, "analyst", &rendition(), 1_500).unwrap();
+        assert_eq!(
+            (attached.attached_by.as_str(), attached.attached_at_ms),
+            ("analyst", 1_500)
+        );
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &rendition(), 1_700).unwrap(),
+            attached
+        );
+        let mut changed = rendition();
+        changed.extractor_id = "extractor:other".into();
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &changed, 1_800).unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        let mut stored = serde_json::to_value(rendition()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .insert("attached_by".into(), serde_json::json!("someone-else"));
+        assert!(serde_json::from_value::<RenditionAttachment>(stored).is_err());
+    }
+
     /// Concurrent admissions of one id with different titles: exactly one
     /// succeeds and the stored definition is the one it returned (#1776).
     fn concurrent_conflicting_admissions_keep_one(
         runtime: &RuntimeDb,
         principal: &str,
-        document: &GovernedDocument,
+        document: &DocumentAdmission,
     ) {
         const ADMISSIONS: usize = 8;
         let barrier = std::sync::Barrier::new(ADMISSIONS);
@@ -1263,6 +1554,91 @@ mod tests {
         concurrent_conflicting_admissions_keep_one(&runtime, &principal, &document);
     }
 
+    /// The first attachment of a rendition id wins (#2266): a later write of
+    /// the same id keeps the stored record, overlapping identical attaches
+    /// all return it, and overlapping conflicting attaches leave exactly one.
+    fn first_attachment_wins(
+        runtime: &RuntimeDb,
+        principal: &str,
+        rendition: &RenditionAttachment,
+    ) {
+        let first = attach_rendition(runtime, principal, rendition, 1_500).unwrap();
+        let later = DocumentRendition {
+            attached_at_ms: 1_700,
+            ..first.clone()
+        };
+        assert_eq!(
+            runtime
+                .insert_governed_rendition(&later, MAX_RENDITIONS)
+                .unwrap(),
+            Some(first.clone())
+        );
+        let stored = || {
+            runtime
+                .list_governed_renditions(&rendition.namespace, &rendition.document_id)
+                .unwrap()
+        };
+        assert_eq!(stored(), vec![first.clone()]);
+
+        const ATTACHES: usize = 8;
+        let barrier = std::sync::Barrier::new(ATTACHES);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..ATTACHES)
+                .map(|n| {
+                    let barrier = &barrier;
+                    let mut variant = rendition.clone();
+                    // Even attaches differ by attach time alone; each odd
+                    // one conflicts with every other attach.
+                    variant.rendition_id = "rend:raced".into();
+                    if n % 2 == 1 {
+                        variant.extractor_id = format!("extractor:{n}");
+                    }
+                    scope.spawn(move || {
+                        barrier.wait();
+                        attach_rendition(runtime, principal, &variant, 2_000 + n as i64)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let raced: Vec<_> = stored()
+            .into_iter()
+            .filter(|item| item.rendition_id == "rend:raced")
+            .collect();
+        assert_eq!(raced.len(), 1);
+        for result in &results {
+            match result {
+                Ok(attached) => assert_eq!(attached, &raced[0], "{results:?}"),
+                Err(error) => assert_eq!(error, DOCUMENT_UNAVAILABLE, "{results:?}"),
+            }
+        }
+        assert!(results.iter().any(Result::is_ok), "{results:?}");
+    }
+
+    #[test]
+    fn the_first_attachment_of_a_rendition_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(dir.path().join("docs.db").to_str().unwrap()).unwrap(),
+        ));
+        admit(&runtime);
+        first_attachment_wins(&runtime, "analyst", &rendition());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_the_first_attachment_of_a_rendition_wins() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let runtime = postgres_runtime();
+        let (principal, document, rendition) = unique_case(&suffix);
+        pin_ceiling(&runtime, &principal, "internal");
+        admit_document(&runtime, &principal, &document, 1_000).unwrap();
+        first_attachment_wins(&runtime, &principal, &rendition);
+    }
+
     fn postgres_runtime() -> RuntimeDb {
         use crate::db::postgres::PostgresDb;
         use std::sync::Arc;
@@ -1281,10 +1657,9 @@ mod tests {
         RuntimeDb::Postgres(Arc::new(db))
     }
 
-    fn unique_case(suffix: &str) -> (String, GovernedDocument, DocumentRendition) {
+    fn unique_case(suffix: &str) -> (String, DocumentAdmission, RenditionAttachment) {
         let principal = format!("analyst-{suffix}");
         let mut document = document();
-        document.owner = principal.clone();
         document.namespace = format!("records-{suffix}");
         document.document_id = format!("doc:brief-{suffix}");
         let mut rendition = rendition();

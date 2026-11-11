@@ -18,6 +18,16 @@ pub const CHUNK_RULE: &str = "embed.chars/v1";
 /// Object changes one catch-up consumes; the rest wait for the next call.
 pub const CHANGE_PAGE: i32 = 1000;
 
+/// Upper limits on a spec and its index (#2244), so neither a put nor a
+/// catch-up can buy unbounded model calls, storage or scoring work. Search
+/// scores every vector of a spec, at a cost of vectors times dimension.
+pub const MAX_DIMENSION: usize = 4096;
+pub const MAX_CHUNK_CHARS: usize = 8192;
+pub const MAX_BATCH_SIZE: usize = 256;
+pub const MAX_SOURCE_PROPERTIES: usize = 32;
+pub const MAX_SPECS_PER_NAMESPACE: usize = 16;
+pub const MAX_VECTORS_PER_SPEC: i64 = 1_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmbeddingError {
     InvalidArgument(String),
@@ -33,6 +43,9 @@ pub enum EmbeddingError {
 
 /// Store error text for a stale revision; see [`EmbeddingStore`].
 pub const EMBEDDING_REVISION_CONFLICT: &str = "embedding index changed by another catch-up; retry";
+/// Store error text for a put past [`MAX_SPECS_PER_NAMESPACE`].
+pub const EMBEDDING_SPEC_LIMIT: &str =
+    "namespace already has the maximum number of embedding specs";
 
 impl std::fmt::Display for EmbeddingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,6 +96,21 @@ impl EmbeddingSpec {
         if self.chunk_chars == 0 || self.dimension == 0 || self.batch_size == 0 {
             return invalid("chunk_chars, dimension and batch_size must be positive");
         }
+        let limits = [
+            ("dimension", self.dimension, MAX_DIMENSION),
+            ("chunk_chars", self.chunk_chars, MAX_CHUNK_CHARS),
+            ("batch_size", self.batch_size, MAX_BATCH_SIZE),
+            (
+                "source properties",
+                self.properties.len(),
+                MAX_SOURCE_PROPERTIES,
+            ),
+        ];
+        if let Some((name, _, max)) = limits.iter().find(|(_, value, max)| value > max) {
+            return Err(EmbeddingError::InvalidArgument(format!(
+                "embedding spec {name} may be at most {max}"
+            )));
+        }
         Ok(())
     }
 
@@ -130,6 +158,25 @@ pub struct EmbeddingCheckpoint {
     /// Time of the last fenced write, read back only; 0 after a stored spec
     /// is put or deleted. A rebuild keeps it fresh as its lease.
     pub updated_at_ms: i64,
+    /// Progress of an unfinished rebuild, read back only. The store returns
+    /// it only while no write that does not carry it forward (an older
+    /// plane's, a put, a delete) has happened since it was saved.
+    pub rebuild: Option<RebuildCursor>,
+}
+
+/// Where an interrupted rebuild resumes (#2244): the objects up to `after_id`
+/// are already embedded under `to_digest`, and the feed position and
+/// generation were read when the rebuild started, so changes during it are
+/// replayed after it as in an uninterrupted one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RebuildCursor {
+    pub from_digest: String,
+    pub to_digest: String,
+    pub after_id: String,
+    pub watermark: u64,
+    pub generation: u64,
+    /// Objects embedded so far, for the recorded rebuild.
+    pub objects: i64,
 }
 
 /// Governance tags shared by every chunk of one object.
@@ -233,14 +280,40 @@ pub trait EmbeddingStore {
         now_ms: i64,
     ) -> Result<i64, String>;
     /// Drop every vector of the spec and clear the checkpoint digest, so no
-    /// catch-up trusts the half-built index.
+    /// catch-up trusts the half-built index, and save `cursor` as the start
+    /// of the rebuild.
     fn reset_embedding_spec(
         &self,
         namespace: &str,
         spec_id: &str,
+        cursor: &RebuildCursor,
         revision: i64,
         now_ms: i64,
     ) -> Result<i64, String>;
+    /// Save rebuild progress; a crash after it resumes from `cursor`.
+    fn store_embedding_rebuild_cursor(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String>;
+    /// Take over an interrupted rebuild: drop the vectors of objects that
+    /// are no longer `kind` objects in the namespace (the walk will not
+    /// visit them, and their deletes replay only after it), in one fenced
+    /// write that also renews the lease and keeps `cursor`.
+    fn resume_embedding_rebuild(
+        &self,
+        namespace: &str,
+        spec_id: &str,
+        kind: &str,
+        cursor: &RebuildCursor,
+        revision: i64,
+        now_ms: i64,
+    ) -> Result<i64, String>;
+    /// Stored vectors of the spec.
+    fn embedding_vector_count(&self, namespace: &str, spec_id: &str) -> Result<i64, String>;
     /// Record a finished rebuild and publish its checkpoint in one fenced
     /// write; `checkpoint.revision` is the expected revision. An interrupted
     /// or superseded rebuild records nothing.
@@ -272,6 +345,8 @@ pub trait EmbeddingStore {
         spec_id: &str,
     ) -> Result<Vec<EmbeddingRebuild>, String>;
     /// Insert or replace a stored spec and move its checkpoint revision on.
+    /// A new spec past [`MAX_SPECS_PER_NAMESPACE`] fails with
+    /// [`EMBEDDING_SPEC_LIMIT`].
     fn put_embedding_spec(&self, stored: &StoredEmbeddingSpec) -> Result<(), String>;
     /// Stored specs of one namespace, or of every namespace, by namespace and id.
     fn list_embedding_specs(

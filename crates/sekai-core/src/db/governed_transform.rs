@@ -696,7 +696,7 @@ impl SekaiDb {
             let indexed: bool = tx
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_master
-                     WHERE type = 'table' AND name = 'sekai_search_dataset_text')",
+                     WHERE type = 'table' AND name = 'sekai_search_dataset_text_v2')",
                     [],
                     |row| row.get(0),
                 )

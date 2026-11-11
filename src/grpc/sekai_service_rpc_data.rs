@@ -4995,14 +4995,14 @@ fn to_proto_content_ref(reference: &crate::sekai::document::ContentReference) ->
     }
 }
 
-fn from_proto_document(
-    proto: GovernedDocument,
-) -> Result<crate::sekai::document::GovernedDocument, Status> {
+fn from_proto_admission(
+    proto: GovernedDocumentAdmission,
+) -> Result<crate::sekai::document::DocumentAdmission, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::GovernedDocument {
+    Ok(crate::sekai::document::DocumentAdmission {
         contract_version: proto.contract_version,
         document_id: proto.document_id,
         namespace: proto.namespace,
@@ -5017,9 +5017,6 @@ fn from_proto_document(
         expires_at_ms: proto.expires_at_ms,
         hold_id: proto.hold_id,
         hold_reason: proto.hold_reason,
-        admitted_by: proto.admitted_by,
-        admitted_at_ms: proto.admitted_at_ms,
-        deleted_at_ms: proto.deleted_at_ms,
     })
 }
 
@@ -5045,14 +5042,14 @@ fn to_proto_document(document: &crate::sekai::document::GovernedDocument) -> Gov
     }
 }
 
-fn from_proto_rendition(
-    proto: DocumentRendition,
-) -> Result<crate::sekai::document::DocumentRendition, Status> {
+fn from_proto_attachment(
+    proto: DocumentRenditionAttachment,
+) -> Result<crate::sekai::document::RenditionAttachment, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::DocumentRendition {
+    Ok(crate::sekai::document::RenditionAttachment {
         namespace: proto.namespace,
         document_id: proto.document_id,
         rendition_id: proto.rendition_id,
@@ -5061,8 +5058,6 @@ fn from_proto_rendition(
         content_ref,
         extractor_id: proto.extractor_id,
         extractor_profile_digest: proto.extractor_profile_digest,
-        attached_by: proto.attached_by,
-        attached_at_ms: proto.attached_at_ms,
     })
 }
 
@@ -5109,21 +5104,45 @@ fn to_proto_document_view(view: crate::sekai::document::DocumentView) -> Documen
     }
 }
 
+/// Namespace authorization for a document RPC: the sequence object writes
+/// and `Search` run (tenant context and service-principal scope, shared
+/// space, then team-namespace membership), before the store is touched.
+fn authorize_document_namespace<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    principals: &[String],
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, req)?;
+    enforce_collaboration_namespace(db, tenant_context.as_ref(), namespace, write)?;
+    check_team_namespace(db, principals, namespace, write)
+}
+
 pub(super) async fn admit_governed_document(
     service: &SekaiServiceImpl,
     req: Request<AdmitGovernedDocumentRequest>,
 ) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .document
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("document required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .document
         .ok_or_else(|| Status::invalid_argument("document required"))?;
-    let document = from_proto_document(proto)?;
+    let admission = from_proto_admission(proto)?;
     let admitted = crate::sekai::document::admit_document(
         service.db.runtime(),
         actor,
-        &document,
+        &admission,
         now_millis(),
     )
     .map_err(map_document_error)?;
@@ -5138,15 +5157,23 @@ pub(super) async fn attach_governed_document_rendition(
 ) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .rendition
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("rendition required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .rendition
         .ok_or_else(|| Status::invalid_argument("rendition required"))?;
-    let rendition = from_proto_rendition(proto)?;
+    let attachment = from_proto_attachment(proto)?;
     let attached = crate::sekai::document::attach_rendition(
         service.db.runtime(),
         actor,
-        &rendition,
+        &attachment,
         now_millis(),
     )
     .map_err(map_document_error)?;
@@ -5161,6 +5188,7 @@ pub(super) async fn get_governed_document(
 ) -> Result<Response<GetGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, false)?;
     let input = req.into_inner();
     let view = crate::sekai::document::retrieve_document(
         service.db.runtime(),
@@ -5187,6 +5215,7 @@ pub(super) async fn hold_governed_document(
 ) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::place_hold(
         service.db.runtime(),
@@ -5209,6 +5238,7 @@ pub(super) async fn release_governed_document_hold(
 ) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::release_hold(
         service.db.runtime(),
@@ -5230,6 +5260,7 @@ pub(super) async fn expire_governed_document(
 ) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::expire_document(
         service.db.runtime(),
@@ -5250,6 +5281,7 @@ pub(super) async fn delete_governed_document(
 ) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::delete_document(
         service.db.runtime(),

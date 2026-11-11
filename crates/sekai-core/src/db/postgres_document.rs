@@ -3,7 +3,9 @@
 use postgres::Row;
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key};
-use crate::sekai::document::{DOCUMENT_UNAVAILABLE, DocumentRendition, GovernedDocument};
+use crate::sekai::document::{
+    DOCUMENT_UNAVAILABLE, DocumentRendition, GovernedDocument, RENDITIONS_OVERSIZED,
+};
 
 impl PostgresDb {
     /// Insert `document` unless its id is taken, under the document's advisory
@@ -138,7 +140,15 @@ impl PostgresDb {
             .transpose()
     }
 
-    pub fn put_governed_rendition(&self, rendition: &DocumentRendition) -> Result<(), String> {
+    /// Insert `rendition` unless its id is taken on the document, under the
+    /// document's advisory lock with the live-parent check and the `max`
+    /// rendition bound. Returns `None` when this call stored it, or the
+    /// rendition that already holds the id, untouched (#2266).
+    pub fn insert_governed_rendition(
+        &self,
+        rendition: &DocumentRendition,
+        max: usize,
+    ) -> Result<Option<DocumentRendition>, String> {
         let json = serde_json::to_string(rendition)
             .map_err(|error| format!("encode governed rendition: {error}"))?;
         let mut connection = self.connection()?;
@@ -167,28 +177,47 @@ impl PostgresDb {
         {
             return Err(DOCUMENT_UNAVAILABLE.into());
         }
-        let changed = tx
-            .execute(
-                "INSERT INTO sekai_governed_renditions
-                    (namespace, document_id, rendition_id, record_json)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (namespace, document_id, rendition_id) DO UPDATE SET
-                    record_json = EXCLUDED.record_json
-                 WHERE sekai_governed_renditions.namespace = EXCLUDED.namespace
-                   AND sekai_governed_renditions.document_id = EXCLUDED.document_id",
+        let existing = tx
+            .query_opt(
+                "SELECT record_json FROM sekai_governed_renditions
+                 WHERE namespace = $1 AND document_id = $2 AND rendition_id = $3",
                 &[
                     &rendition.namespace,
                     &rendition.document_id,
                     &rendition.rendition_id,
-                    &json,
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(DOCUMENT_UNAVAILABLE.into());
+        if let Some(existing) = existing {
+            return serde_json::from_str(&existing.get::<_, String>(0))
+                .map(Some)
+                .map_err(|error| format!("decode governed rendition: {error}"));
         }
+        let count: i64 = tx
+            .query_one(
+                "SELECT COUNT(*) FROM sekai_governed_renditions
+                 WHERE namespace = $1 AND document_id = $2",
+                &[&rendition.namespace, &rendition.document_id],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if count >= max as i64 {
+            return Err(RENDITIONS_OVERSIZED.into());
+        }
+        tx.execute(
+            "INSERT INTO sekai_governed_renditions
+                (namespace, document_id, rendition_id, record_json)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &rendition.namespace,
+                &rendition.document_id,
+                &rendition.rendition_id,
+                &json,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(None)
     }
 
     pub fn list_governed_renditions(

@@ -36,10 +36,10 @@ use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
     AcquireLeaseRequest, AdmitGovernedDocumentRequest, AttachGovernedDocumentRenditionRequest,
     ContentReference, CreateObjectRequest, DecideActionInstanceRequest,
-    DeleteGovernedDocumentRequest, DocumentRendition, EnsureTeamNamespaceRequest,
+    DeleteGovernedDocumentRequest, DocumentRenditionAttachment, EnsureTeamNamespaceRequest,
     ExpireGovernedDocumentRequest, GetActionInstanceRequest, GetGovernedDocumentRequest,
     GetLeaseRequest, GetLinkedObjectsRequest, GetObjectRequest, GovernedActionType,
-    GovernedDocument, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
+    GovernedDocumentAdmission, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
     ListFilter, ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
     ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, RunActionBindingRequest,
     SubmitActionInstanceRequest, TraverseRequest, UpdateObjectRequest,
@@ -1950,12 +1950,11 @@ fn smoke_content_ref(tag: u8, media: &str, bytes: u64) -> ContentReference {
     }
 }
 
-fn smoke_document(namespace: &str, document_id: &str) -> GovernedDocument {
-    GovernedDocument {
+fn smoke_document(namespace: &str, document_id: &str) -> GovernedDocumentAdmission {
+    GovernedDocumentAdmission {
         contract_version: "sekai.governed-document/v1".into(),
         document_id: document_id.into(),
         namespace: namespace.into(),
-        owner: "local".into(),
         type_revision: "v1".into(),
         purpose: "case-review".into(),
         classification: "internal".into(),
@@ -2102,19 +2101,19 @@ async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
         "unauthorized field",
     );
 
+    let attachment = DocumentRenditionAttachment {
+        namespace: namespace.clone(),
+        document_id: document_id.clone(),
+        rendition_id: format!("rend:text-{suffix}"),
+        class: "extracted_text".into(),
+        parent_content_digest: parent_digest,
+        content_ref: Some(smoke_content_ref(2, "text/plain", 32)),
+        extractor_id: "extractor:text".into(),
+        extractor_profile_digest: document_digest(3),
+    };
     let attached = sekai
         .attach_governed_document_rendition(AttachGovernedDocumentRenditionRequest {
-            rendition: Some(DocumentRendition {
-                namespace: namespace.clone(),
-                document_id: document_id.clone(),
-                rendition_id: format!("rend:text-{suffix}"),
-                class: "extracted_text".into(),
-                parent_content_digest: parent_digest,
-                content_ref: Some(smoke_content_ref(2, "text/plain", 32)),
-                extractor_id: "extractor:text".into(),
-                extractor_profile_digest: document_digest(3),
-                ..Default::default()
-            }),
+            rendition: Some(attachment.clone()),
         })
         .await
         .unwrap_or_else(|error| panic!("attach: {error}\n{}", server.logs()))
@@ -2122,8 +2121,11 @@ async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
         .rendition
         .expect("attached rendition");
     assert_eq!(attached.class, "extracted_text");
+    // The server sets the attachment fields from the caller (#2266).
+    assert_eq!(attached.attached_by, admitted.owner);
+    assert!(attached.attached_at_ms > 0);
 
-    let mut bad_class = attached.clone();
+    let mut bad_class = attachment;
     bad_class.rendition_id = format!("rend:ocr-{suffix}");
     bad_class.class = "ocr-box".into();
     let rendition_class = sekai

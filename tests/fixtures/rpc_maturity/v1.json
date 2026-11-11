@@ -720,8 +720,8 @@
       "rpc": "Search",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -730,7 +730,7 @@
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1027,7 +1027,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1036,7 +1036,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1045,7 +1045,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1054,7 +1054,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1063,7 +1063,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1072,7 +1072,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1081,7 +1081,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {

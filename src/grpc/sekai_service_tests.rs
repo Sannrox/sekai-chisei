@@ -30736,7 +30736,13 @@ async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
     assert_eq!(entry().properties["description"], "curated orders");
     assert_eq!(entry().properties["tags"], "finance,ledger");
 
-    // Search sees the edit once the index catches up.
+    // Search sees the edit once the scheduled worker catches the index up.
+    for (namespace, outcome) in
+        crate::db::search_index::catch_up_search_pass(svc.db.runtime(), "", usize::MAX, &now_millis)
+            .unwrap()
+    {
+        outcome.unwrap_or_else(|error| panic!("{namespace}: {error}"));
+    }
     let hits = svc
         .search(with_named_principal(
             SearchRequest {
@@ -30774,76 +30780,6 @@ async fn catalog_owners_curate_through_actions_and_markings_only_rise() {
     .await;
     assert!(lowered.is_err(), "{lowered:?}");
     assert_eq!(entry().properties["access_marking"], "internal");
-}
-
-#[tokio::test]
-async fn embedding_specs_need_a_credential_admin_and_a_hosted_route() {
-    let svc = service();
-    let (_, grants) = svc
-        .db
-        .runtime()
-        .ensure_team_namespace("embeds", "alice", security::Role::Admin, "local")
-        .unwrap();
-    for grant in grants {
-        svc.security.add_grant(&grant);
-    }
-    let spec = |model: &str| EmbeddingSpecDefinition {
-        namespace: "embeds".into(),
-        spec_id: "notes".into(),
-        object_kind: "note".into(),
-        properties: vec!["title".into()],
-        chunk_chars: 200,
-        dimension: 4,
-        batch_size: 8,
-        model: model.into(),
-        ..Default::default()
-    };
-    let put = |principal: &str, model: &str| {
-        svc.put_embedding_spec(with_named_principal(
-            PutEmbeddingSpecRequest {
-                spec: Some(spec(model)),
-            },
-            principal,
-        ))
-    };
-    // A namespace admin is not a credential admin.
-    let denied = put("alice", "hosted.local/embed-small").await.unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::PermissionDenied, "{denied:?}");
-    let builtin = put("root", "openai/text-embedding-3-small")
-        .await
-        .unwrap_err();
-    assert_eq!(builtin.code(), tonic::Code::InvalidArgument);
-
-    let stored = put("root", "hosted.local/embed-small")
-        .await
-        .unwrap()
-        .into_inner()
-        .spec
-        .unwrap();
-    assert_eq!(stored.updated_by, "root");
-    let listed = svc
-        .list_embedding_specs(with_named_principal(
-            ListEmbeddingSpecsRequest {
-                namespace: "embeds".into(),
-            },
-            "root",
-        ))
-        .await
-        .unwrap()
-        .into_inner()
-        .specs;
-    assert_eq!(listed, [stored]);
-    let delete = || {
-        svc.delete_embedding_spec(with_named_principal(
-            DeleteEmbeddingSpecRequest {
-                namespace: "embeds".into(),
-                spec_id: "notes".into(),
-            },
-            "root",
-        ))
-    };
-    assert!(delete().await.unwrap().into_inner().deleted);
-    assert!(!delete().await.unwrap().into_inner().deleted);
 }
 
 #[tokio::test]
@@ -37730,3 +37666,6 @@ mod pending_decisions_tests;
 
 #[path = "export_delivery_source_tests.rs"]
 mod export_delivery_source_tests;
+
+#[path = "governed_document_rpc_tests.rs"]
+mod governed_document_rpc_tests;

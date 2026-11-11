@@ -1812,6 +1812,7 @@ fn spawn_service_background_tasks(
         spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
+        spawn_search_catch_up(db.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
@@ -1860,6 +1861,64 @@ fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::Chis
                 }
                 if !more {
                     break;
+                }
+            }
+        }
+    });
+}
+
+/// Namespaces one scheduled search catch-up pass visits at most.
+const SEARCH_CATCH_UP_NAMESPACES_PER_PASS: usize = 64;
+
+/// Keep the search index current on a schedule (#2250); `Search` and
+/// `GetSearchIndexStatus` only read. Safe on every instance at once: each
+/// namespace's checkpoint writes are fenced and a rebuild holds a lease, so a
+/// namespace another instance holds is skipped quietly. A pass visits a
+/// bounded number of namespaces and the next continues after them.
+fn spawn_search_catch_up(db: Arc<RuntimeDb>) {
+    use crate::db::search_index::catch_up_search_pass;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut after = String::new();
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let cursor = after.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                catch_up_search_pass(&db, &cursor, SEARCH_CATCH_UP_NAMESPACES_PER_PASS, &|| {
+                    chrono::Utc::now().timestamp_millis()
+                })
+            })
+            .await;
+            let outcomes = match result {
+                Ok(Ok(outcomes)) => outcomes,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "search index namespaces unavailable");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "search catch-up task failed");
+                    continue;
+                }
+            };
+            after = if outcomes.len() < SEARCH_CATCH_UP_NAMESPACES_PER_PASS {
+                String::new()
+            } else {
+                outcomes
+                    .last()
+                    .map(|(namespace, _)| namespace.clone())
+                    .unwrap_or_default()
+            };
+            for (namespace, outcome) in outcomes {
+                match outcome {
+                    Ok(_) => {}
+                    Err(error) if error.is_conflict() => {}
+                    Err(error) => tracing::warn!(
+                        %namespace,
+                        %error,
+                        "search catch-up failed; retrying next pass"
+                    ),
                 }
             }
         }
@@ -2132,7 +2191,17 @@ fn evidence_reconcile_backoff(last_alert_count: usize) -> std::time::Duration {
     }
 }
 
+/// Raises missing-execution-evidence alerts on SQLite. On PostgreSQL the
+/// redemptions (Chisei) and evidence (Sekai) live in separate stores, so the
+/// reconciler does not run; boot says so once (docs/architecture.md).
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
+    if matches!(*db, RuntimeDb::Postgres(_)) {
+        tracing::warn!(
+            "missing execution evidence is not reconciled on PostgreSQL; \
+             external-action redemptions raise no missing-evidence alerts"
+        );
+        return;
+    }
     tokio::spawn(async move {
         let mut delay = std::time::Duration::ZERO;
         loop {
