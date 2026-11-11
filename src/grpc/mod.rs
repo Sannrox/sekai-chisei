@@ -433,6 +433,37 @@ pub(crate) fn record_discovery(
     })
 }
 
+/// The space role and credential scope `method` needs. The interceptor
+/// applies it to every call; the pending-decision listing (#2203) applies it
+/// with each kind's decide method, so it lists only what that RPC admits.
+pub(crate) fn authorize_rpc_space(
+    context: &crate::enterprise::AuthenticatedContext,
+    method: &str,
+) -> Result<(), Status> {
+    // Deciding a parked Action or a whole plan is approval, not write.
+    if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
+        context
+            .authorize_space_approval()
+            .map_err(|_| Status::permission_denied("space approval denied"))?;
+        return context
+            .authorize_credential_scope(crate::enterprise::NamespaceAction::Read)
+            .map_err(|_| Status::permission_denied("space read denied"));
+    }
+    let action = rpc_namespace_action(method);
+    if action != crate::enterprise::NamespaceAction::Discover {
+        context.authorize_space(action).map_err(|_| {
+            if action == crate::enterprise::NamespaceAction::Write {
+                Status::permission_denied("space write denied")
+            } else {
+                Status::permission_denied("space read denied")
+            }
+        })?;
+    }
+    context
+        .authorize_credential_scope(action)
+        .map_err(|_| Status::permission_denied("credential scope denied"))
+}
+
 fn finish_authenticated(
     mut req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
@@ -456,29 +487,7 @@ fn finish_authenticated(
         return Err(Status::permission_denied("enterprise authorization denied"));
     }
     if let Some((_, method)) = rpc_identity::request_rpc_method(&req) {
-        // Deciding a parked Action or a whole plan is approval, not write.
-        if matches!(method, "DecideActionInstance" | "DecidePlanReview") {
-            authenticated_context
-                .authorize_space_approval()
-                .map_err(|_| Status::permission_denied("space approval denied"))?;
-            authenticated_context
-                .authorize_credential_scope(crate::enterprise::NamespaceAction::Read)
-                .map_err(|_| Status::permission_denied("space read denied"))?;
-        } else {
-            let action = rpc_namespace_action(method);
-            if action != crate::enterprise::NamespaceAction::Discover {
-                authenticated_context.authorize_space(action).map_err(|_| {
-                    if action == crate::enterprise::NamespaceAction::Write {
-                        Status::permission_denied("space write denied")
-                    } else {
-                        Status::permission_denied("space read denied")
-                    }
-                })?;
-            }
-            authenticated_context
-                .authorize_credential_scope(action)
-                .map_err(|_| Status::permission_denied("credential scope denied"))?;
-        }
+        authorize_rpc_space(&authenticated_context, method)?;
     } else if authenticated_context.space.is_some() {
         return Err(Status::permission_denied(
             "space-scoped RPC identity required",
@@ -855,6 +864,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "GetOntologyHealth"
             | "RecordOntologyHealthSnapshot"
             | "ListOntologyHealthTrend"
+            | "PutOntologyHealthSchedule"
+            | "DeleteOntologyHealthSchedule"
+            | "GetSourceHealth"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
@@ -896,6 +908,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ExecuteActionPlan"
             | "GetActionInstance"
             | "ListActionInstances"
+            | "ListPendingDecisions"
             | "GetActionEffect"
             | "ListActionEffects"
             | "ListClaimableActionWork"
@@ -909,6 +922,12 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ClaimAgentTurn"
             | "HeartbeatAgentTurnClaim"
             | "AckAgentTurn"
+            // The claim family over every kind (ADR 0149) runs the kind's
+            // own handler; transform work stays refused to these credentials.
+            | "ListClaimableWork"
+            | "ClaimWork"
+            | "HeartbeatWorkClaim"
+            | "AckWork"
             // Dual-principal working-memory read (#1968): the handler
             // scopes it to the instance and, with a turn token, that turn.
             | "ListSiteAgentWorkingMemory"
@@ -1788,9 +1807,12 @@ fn spawn_service_background_tasks(
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
+        spawn_consumer_violation_sweeper(db.clone());
+        spawn_criticality_outbox_sweeper(db.clone());
         spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
+        spawn_search_catch_up(db.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
@@ -1839,6 +1861,64 @@ fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::Chis
                 }
                 if !more {
                     break;
+                }
+            }
+        }
+    });
+}
+
+/// Namespaces one scheduled search catch-up pass visits at most.
+const SEARCH_CATCH_UP_NAMESPACES_PER_PASS: usize = 64;
+
+/// Keep the search index current on a schedule (#2250); `Search` and
+/// `GetSearchIndexStatus` only read. Safe on every instance at once: each
+/// namespace's checkpoint writes are fenced and a rebuild holds a lease, so a
+/// namespace another instance holds is skipped quietly. A pass visits a
+/// bounded number of namespaces and the next continues after them.
+fn spawn_search_catch_up(db: Arc<RuntimeDb>) {
+    use crate::db::search_index::catch_up_search_pass;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut after = String::new();
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let cursor = after.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                catch_up_search_pass(&db, &cursor, SEARCH_CATCH_UP_NAMESPACES_PER_PASS, &|| {
+                    chrono::Utc::now().timestamp_millis()
+                })
+            })
+            .await;
+            let outcomes = match result {
+                Ok(Ok(outcomes)) => outcomes,
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "search index namespaces unavailable");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "search catch-up task failed");
+                    continue;
+                }
+            };
+            after = if outcomes.len() < SEARCH_CATCH_UP_NAMESPACES_PER_PASS {
+                String::new()
+            } else {
+                outcomes
+                    .last()
+                    .map(|(namespace, _)| namespace.clone())
+                    .unwrap_or_default()
+            };
+            for (namespace, outcome) in outcomes {
+                match outcome {
+                    Ok(_) => {}
+                    Err(error) if error.is_conflict() => {}
+                    Err(error) => tracing::warn!(
+                        %namespace,
+                        %error,
+                        "search catch-up failed; retrying next pass"
+                    ),
                 }
             }
         }
@@ -1929,6 +2009,55 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::error!(%error, "export sweep failed"),
                 Err(error) => tracing::error!(%error, "export sweep task failed"),
+            }
+        }
+    });
+}
+
+/// Delete consumer violation deliveries past their retention bound (#2195)
+/// about once a minute. Safe on every instance at once: each batch deletes
+/// only rows no other sweep holds.
+fn spawn_consumer_violation_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db.sweep_consumer_violation_deliveries(chrono::Utc::now().timestamp_millis())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "consumer violation sweep failed"),
+                Err(error) => tracing::error!(%error, "consumer violation sweep task failed"),
+            }
+        }
+    });
+}
+
+/// About once a minute, append criticality outbox events a catalog write
+/// left missing, then delete superseded events past retention, keeping each
+/// entry's latest (#2196). Safe on every instance at once.
+fn spawn_criticality_outbox_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let now = chrono::Utc::now().timestamp_millis();
+                let reconciled = crate::sekai::catalog_criticality::reconcile_outbox(&db, now)
+                    .map_err(|error| format!("{error:?}"));
+                let swept = db.sweep_catalog_criticality_outbox(now);
+                reconciled.and(swept)
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "criticality outbox sweep failed"),
+                Err(error) => tracing::error!(%error, "criticality outbox sweep task failed"),
             }
         }
     });
@@ -2062,7 +2191,17 @@ fn evidence_reconcile_backoff(last_alert_count: usize) -> std::time::Duration {
     }
 }
 
+/// Raises missing-execution-evidence alerts on SQLite. On PostgreSQL the
+/// redemptions (Chisei) and evidence (Sekai) live in separate stores, so the
+/// reconciler does not run; boot says so once (docs/architecture.md).
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
+    if matches!(*db, RuntimeDb::Postgres(_)) {
+        tracing::warn!(
+            "missing execution evidence is not reconciled on PostgreSQL; \
+             external-action redemptions raise no missing-evidence alerts"
+        );
+        return;
+    }
     tokio::spawn(async move {
         let mut delay = std::time::Duration::ZERO;
         loop {
@@ -2634,6 +2773,12 @@ mod tests {
             (SpaceRole::Viewer, "ListOntologyHealthTrend", true),
             (SpaceRole::Viewer, "RecordOntologyHealthSnapshot", false),
             (SpaceRole::Editor, "RecordOntologyHealthSnapshot", true),
+            (SpaceRole::Viewer, "PutOntologyHealthSchedule", false),
+            (SpaceRole::Editor, "PutOntologyHealthSchedule", true),
+            (SpaceRole::Viewer, "DeleteOntologyHealthSchedule", false),
+            (SpaceRole::Editor, "DeleteOntologyHealthSchedule", true),
+            (SpaceRole::Discoverer, "GetSourceHealth", false),
+            (SpaceRole::Viewer, "GetSourceHealth", true),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),
@@ -2644,6 +2789,10 @@ mod tests {
             (SpaceRole::Editor, "SubmitPlanReview", true),
             (SpaceRole::Viewer, "ExecuteActionPlan", false),
             (SpaceRole::Editor, "ExecuteActionPlan", true),
+            // #2203: the inbox is a read; each kind applies its decide gate.
+            (SpaceRole::Discoverer, "ListPendingDecisions", false),
+            (SpaceRole::Viewer, "ListPendingDecisions", true),
+            (SpaceRole::Approver, "ListPendingDecisions", true),
             (SpaceRole::Approver, "CreateObject", false),
             (SpaceRole::Administrator, "CreateObject", true),
         ] {
@@ -3043,6 +3192,15 @@ mod tests {
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
+        // #2203: the decision inbox is a read on the request's namespace.
+        assert!(enterprise_namespace_rpc(
+            "sekai.SekaiService",
+            "ListPendingDecisions"
+        ));
+        assert_eq!(
+            rpc_namespace_action("ListPendingDecisions"),
+            crate::enterprise::NamespaceAction::Read
+        );
         // #1770: Chisei reads, admitted only on their own service.
         for method in ["GetOperationReceipt", "GetQualityTrend"] {
             assert!(enterprise_namespace_rpc("chisei.ChiseiService", method));

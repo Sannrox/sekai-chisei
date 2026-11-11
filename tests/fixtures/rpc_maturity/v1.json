@@ -313,7 +313,7 @@
     {
       "service": "SekaiService",
       "rpc": "GetOntologyHealth",
-      "storage_path": "sekai.definition-branch, sekai.graph, sekai.datasets",
+      "storage_path": "sekai.definition-branch, sekai.graph, sekai.datasets, sekai.object-sync",
       "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
@@ -332,6 +332,69 @@
       "service": "SekaiService",
       "rpc": "ListOntologyHealthTrend",
       "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutOntologyHealthSchedule",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DeleteOntologyHealthSchedule",
+      "storage_path": "sekai.ontology-definitions",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSourceHealth",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "PutSource",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetSource",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListSources",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "DisableSource",
+      "storage_path": "sekai.object-sync",
       "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
@@ -657,8 +720,8 @@
       "rpc": "Search",
       "storage_path": "sekai.graph",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "mcp",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -667,7 +730,7 @@
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "none",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -843,6 +906,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ListClaimableWork",
+      "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ClaimWork",
+      "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "HeartbeatWorkClaim",
+      "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "AckWork",
+      "storage_path": "sekai.graph, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ListSiteAgentWorkingMemory",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",
@@ -928,7 +1027,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -937,7 +1036,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -946,7 +1045,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -955,7 +1054,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -964,7 +1063,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -973,7 +1072,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -982,7 +1081,7 @@
       "storage_path": "sekai.governed-document",
       "real_backend": "yes",
       "consumer": "cli, host",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -2054,6 +2153,15 @@
       "real_backend": "yes",
       "consumer": "host, example",
       "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListPendingDecisions",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
       "product_tier": "advanced"
     },
     {

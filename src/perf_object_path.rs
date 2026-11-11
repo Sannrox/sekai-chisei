@@ -1169,6 +1169,7 @@ fn source_batch_proto(
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     })
 }
 

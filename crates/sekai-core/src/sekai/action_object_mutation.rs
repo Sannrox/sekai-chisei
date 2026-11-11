@@ -679,8 +679,12 @@ fn validate_object_write(
 pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_ms: i64) {
     crate::sekai::feedback_package::complete_object_write(db, object, now_ms);
     let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
-    if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
-        let _ = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms);
+    // A failed append is not lost: every instance's outbox reconcile
+    // appends it from the stored entry (#2196).
+    if object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
+        && let Err(error) = crate::sekai::catalog_criticality::sync_outbox(db, object, now_ms)
+    {
+        tracing::warn!(entry_id = %object.id, ?error, "criticality outbox append deferred to reconcile");
     }
     crate::sekai::security_remediation::complete_object_write(db, object, actor, now_ms);
 }

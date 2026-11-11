@@ -71,7 +71,30 @@ frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
 enter the published member map. Optional `migration_plan_digest` names the
 [change bundle](definition-change-bundles.md#apply) the proposal migrates by;
 it is part of the approved proposal digest, so `ApplyDefinitionChangeBundle`
-runs only that bundle. Creating a proposal does not move the published head.
+runs only that bundle, and `MergeDefinitionProposal` refuses the proposal
+(`definition_proposal_requires_bundle_apply`): only apply publishes it.
+Creating a proposal does not move the published head.
+
+Optional `dataset_proposals` attach open dataset branch merge proposals, at
+most one per dataset and at most 16 (#2199). Each must be in the caller's
+tenant and dataset-writable by the caller, and may not be a change-bundle
+`bundle-` branch. A missing or foreign one reads as not found. Create pins
+each attachment's parent version and branch digest into the proposal and its
+`proposal_digest`; such proposals use contract `sekai.definition-proposal/v2`,
+which older binaries refuse to load. Proposals without attachments keep the
+v1 contract and digests. Attachments with a `migration_plan_digest` are
+refused. While an open definition proposal attaches it, a dataset proposal
+cannot merge on its own (`FailedPrecondition`); closing the definition
+proposal releases it. The dataset proposal's own self-merge rule applies to
+the definition merger.
+
+Every RPC that returns a definition proposal lists its attachments in
+`dataset_proposals` (#2222): dataset id, dataset proposal id, and the pinned
+parent version and branch digest. A reader sees an attachment only when it
+passes the dataset branch read check for that dataset in the tenant the
+attachment was pinned in. Otherwise the entry carries only `hidden`, and
+hidden entries follow the readable ones, so a reader learns that the data
+exists and nothing else. A proposal without attachments omits the field.
 
 `ApproveDefinitionProposal` records a live approval on an open proposal.
 An agent principal that created the proposal cannot approve or merge it,
@@ -90,7 +113,14 @@ refused gate leaves the published head unchanged. It then compare-and-swaps
 the namespace published head, stores a durable `receipt_id` on the merged
 proposal, and writes the receipt, audit, and idempotency record in the same
 transaction. Exact replay of the same idempotency key returns that receipt
-without moving the published head again. A stale expected digest or a
+without moving the published head again. With attachments, merge locks the
+attached datasets in dataset id order, rechecks every pin, merges each
+dataset proposal with `merged_by` `definition-proposal:<proposal_id>`, and
+then compare-and-swaps the published head, all in that one transaction. The
+merge receipt id covers the dataset merge receipt ids. A moved dataset parent,
+a changed or deleted branch, or a dataset proposal no longer open fails the
+whole merge as `definition_proposal_dataset_stale` and writes nothing.
+A stale expected digest or a
 candidate that is not a descendant of the pinned base fails closed as not
 mergeable. Interrupted merges leave the published head unchanged and store no
 receipt.

@@ -32,6 +32,17 @@ runtime's placement labels; a run whose `requires` those labels do not meet
 is neither listed nor claimable for it, and a targeted claim of one is
 contention (see [governed-transforms.md](governed-transforms.md)).
 
+The client lists, claims, heartbeats and acknowledges every kind through the
+one claim family below (`list_work`, `claim_work`, `heartbeat_work`,
+`ack_work`); the per-kind methods are thin wrappers over it with the same
+signatures. When a plane may not serve the family (`UNIMPLEMENTED`, the
+maturity gate's refusal of an RPC it does not know, or `PERMISSION_DENIED`
+from auth that runs before that gate), each call falls back to that kind's
+per-kind RPC, so planes and workers upgrade in either order. The per-kind
+RPC runs its own auth, so a real denial still surfaces.
+Older clients keep calling the per-kind RPCs, which stay until the next
+major.
+
 Typed errors keep fence loss, idle, contention, denial, and unavailability
 distinct. `SdkError` does not retain server status text, so the client maps
 by RPC role: list `FailedPrecondition` is unavailability (including the
@@ -59,9 +70,40 @@ and does not embed credentials or provider routing.
 | `AckActionWork` | `completed` / `failed`, or a durably idempotent intentional park under the matching fence |
 | `ReportActionClaimEvent` | Append a fenced, idempotent resume/fallback event without checkpoint content |
 
+### One claim family (experimental, ADR 0149)
+
+`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim` and `AckWork` take a
+`kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`,
+`WORK_KIND_EXPORT_DELIVERY`) and a `work_id` (the run, effect, turn or
+receipt id). Each call runs that kind's RPC
+above, with the same authorization, runtime-token binding and errors, and
+returns that RPC's response in a `oneof`. A claim taken through one family is
+heartbeated or acknowledged through the other, so a rolling deploy can mix
+them. Kind options travel in the request: `AgentTurnWorkOptions` for
+`accepts_continuation`, `request_id` for an Action claim, and
+`ActionAckOptions` or `AgentTurnAckOptions` on `AckWork`. Transform work has
+no `AckWork`; `WriteTransformRunResult` carries its output and acknowledges
+it. A runtime token reaches only its own kind on `HeartbeatWorkClaim` and
+`AckWork`, and transform work stays closed to enterprise-scoped credentials.
+
+Export delivery has no claim RPCs of its own. Its claim, renewal and
+acknowledge (`ExportDeliveryAckOptions` with the digest, outcome
+`completed`) run the saved-export delivery checks of
+[governed export](governed-export.md#saved-exports), runtime tokens are
+refused for it, and `sekai-client` has no per-kind fallback for it.
+
 ## Lease rules (v1)
 
+Action work, transform work, agent turns and export deliveries share one
+claim engine
+(`sekai_types::work_claim`, ADR 0149): claiming, counting a lapsed lease,
+reclaiming under a higher generation, heartbeat and the fence check are the
+same code for every kind and on both stores. Each kind keeps its own row,
+token format and admission rules.
+
 - Only `runtime_dispatch` is claimable.
+- The claim TTL defaults to 60 s and may not exceed 24 h, on SQLite and
+  PostgreSQL alike.
 - Claim is exclusive while the lease is unexpired.
 - On lease expiry, another runtime may reclaim (generation increments).
 - Same `runtime_id` + `request_id` is idempotent while the lease is live.
@@ -91,7 +133,8 @@ minutes, whichever is first. `HeartbeatActionClaim` returns a refreshed token
 for the extended claim; refreshes never outlive the claiming credential.
 
 The token authenticates only `HeartbeatActionClaim`, `AckActionWork` and
-`ReportActionClaimEvent` for that exact claim. It is refused at or after its
+`ReportActionClaimEvent`, and `HeartbeatWorkClaim` and `AckWork` for Action
+work, for that exact claim. It is refused at or after its
 expiry, for another effect, namespace, runtime or generation, and when the
 installed identity extension no longer places the namespace in the token's
 tenant. Without a signing key or a tenant the fields stay empty, and hosts keep
@@ -112,7 +155,8 @@ and change-driven turns; the claiming worker is a distinct `worker` claim.
 Follow-up checks that bind agent and requester use `act`, never the worker. The
 claiming worker's subject must not be the instance `principal_id` (ADR 0146).
 It authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn`,
-`SubmitActionInstance` and `ListSiteAgentWorkingMemory`, and only while the
+`HeartbeatWorkClaim` and `AckWork` for agent turns, `SubmitActionInstance`
+and `ListSiteAgentWorkingMemory`, and only while the
 turn is claimed at that generation and its lease holds. `GetObject` and
 `GetOperationReceipt` stay off the token; the worker reads those with its own
 credential. A submission with it must name the turn's namespace and is

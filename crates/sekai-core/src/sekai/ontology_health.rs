@@ -15,6 +15,7 @@ pub const PART_CONTRACT: &str = "contract";
 pub const PART_LINT: &str = "lint";
 pub const PART_TRUST: &str = "trust";
 pub const PART_ACCESS: &str = "access";
+pub const PART_SOURCE: &str = "source";
 
 /// Problems named per part, worst first; the score still counts them all.
 pub const MAX_PROBLEMS: usize = 10;
@@ -239,6 +240,36 @@ pub fn access(
     Part::ratio(PART_ACCESS, grants.len(), problems, complete)
 }
 
+/// A source's subject id in problems and snapshot inputs:
+/// `source_instance@type_digest`. A type digest holds no `@`, so
+/// [`parse_source_subject`] splits at the last one.
+pub fn source_subject(source_instance: &str, type_digest: &str) -> String {
+    format!("{source_instance}@{type_digest}")
+}
+
+/// `(source_instance, type_digest)` of a [`source_subject`].
+pub fn parse_source_subject(subject: &str) -> Option<(&str, &str)> {
+    subject.rsplit_once('@')
+}
+
+/// The share of visible sources whose bounded health (ADR 0046) is
+/// `healthy`; each other source is a problem named by its class: `delayed`,
+/// `blocked` or `unavailable`.
+pub fn source(reports: &[crate::sekai::source_health::SourceHealth], complete: bool) -> Part {
+    let problems = reports
+        .iter()
+        .filter(|report| report.class != crate::sekai::source_health::CLASS_HEALTHY)
+        .map(|report| {
+            Problem::new(
+                "source",
+                &source_subject(&report.source_instance, &report.type_digest),
+                &report.class,
+            )
+        })
+        .collect();
+    Part::ratio(PART_SOURCE, reports.len(), problems, complete)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +407,41 @@ mod tests {
         let part = access(&grants, true, 10, true);
         assert_eq!(part.score, Some(50));
         assert_eq!(part.problems[1].code, "unreviewed");
+    }
+
+    #[test]
+    fn every_source_not_healthy_is_a_problem_named_by_its_class() {
+        use crate::sekai::source_health::{CLASS_DELAYED, CLASS_HEALTHY, SourceHealth};
+        let report = |instance: &str, class: &str| SourceHealth {
+            contract_version: String::new(),
+            namespace: "health".into(),
+            source_instance: instance.into(),
+            type_digest: "sha256:t".into(),
+            class: class.into(),
+            failure_class: String::new(),
+            outcome: String::new(),
+            checkpoint_age_ms: None,
+            lag: None,
+            last_success_at_ms: None,
+            observed_at_ms: 0,
+            write_authority: false,
+            permit_authority: false,
+        };
+        let part = source(
+            &[
+                report("acme/ops", CLASS_HEALTHY),
+                report("acme/web", CLASS_DELAYED),
+            ],
+            true,
+        );
+        assert_eq!(part.score, Some(50));
+        assert_eq!(
+            part.problems,
+            [Problem::new("source", "acme/web@sha256:t", "delayed")]
+        );
+        assert_eq!(
+            parse_source_subject(&part.problems[0].subject_id),
+            Some(("acme/web", "sha256:t"))
+        );
     }
 }

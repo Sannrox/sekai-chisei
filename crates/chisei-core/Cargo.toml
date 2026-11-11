@@ -1,6 +1,6 @@
 [package]
 name = "chisei-core"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Chisei policy, budget, routing, evaluation, pipeline, and persistence."
@@ -31,8 +31,8 @@ postgres = { version = "0.19", default-features = false, features = [
     "with-serde_json-1",
     "with-uuid-1",
 ] }
-rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "limits"] }
-sekai-core = { version = "3.0.0", path = "../sekai-core" }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "hooks", "limits"] }
+sekai-core = { version = "4.0.0", path = "../sekai-core" }
 sekai-domain = { version = "1.1.0", path = "../sekai-domain" }
 sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
 sekai-types = { version = "2.0.0", path = "../sekai-types" }
@@ -50,8 +50,8 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 sekai-adapters = { path = "../sekai-adapters" }
-sekai-proto = { version = "2.0.0", path = "../sekai-proto" }
-sekai-core = { version = "3.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
+sekai-proto = { version = "3.0.0", path = "../sekai-proto" }
+sekai-core = { version = "4.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [
     "macros",

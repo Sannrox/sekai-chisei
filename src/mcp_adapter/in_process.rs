@@ -827,6 +827,13 @@ mod tests {
         )
         .await
         .unwrap();
+        // Text candidates come from the search index the worker keeps.
+        for (_, outcome) in
+            crate::db::search_index::catch_up_search_pass(&surface.db, "", usize::MAX, &|| 1_000)
+                .unwrap()
+        {
+            outcome.unwrap();
+        }
         surface
     }
 
@@ -914,7 +921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_tool_stays_off_while_experimental_rpcs_are_disabled() {
+    async fn search_tool_runs_while_experimental_rpcs_are_disabled() {
         let mut surface = indexed_surface().await;
         surface.experimental_rpcs = false;
         let called = handle_message(
@@ -931,10 +938,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            called["result"]["structuredContent"]["code"], "failed_precondition",
-            "{called}"
-        );
+        // Search is stable (#2243): the experimental gate no longer applies.
+        let output = call_output(called).unwrap()["output"].clone();
+        assert!(!output["references"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

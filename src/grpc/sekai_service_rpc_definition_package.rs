@@ -273,7 +273,12 @@ pub(super) fn import_definition_package_with(
         },
     )?;
     Ok(Response::new(ImportDefinitionPackageResponse {
-        proposal: Some(to_proto_definition_proposal(&opened.proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &opened.proposal,
+        )?),
         preview: Some(to_proto_definition_revision_diff(&opened.preview)),
         source_namespace: envelope.provenance.source_namespace,
         source_revision_digest: envelope.provenance.source_revision_digest,
@@ -542,7 +547,12 @@ pub(super) async fn import_definition_tree(
         &opened.proposal,
     )?;
     Ok(Response::new(ImportDefinitionTreeResponse {
-        proposal: Some(to_proto_definition_proposal(&opened.proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &opened.proposal,
+        )?),
         preview: Some(to_proto_definition_revision_diff(&opened.preview)),
         compatibility: Some(to_proto_definition_revision_compatibility(
             &opened.compatibility,

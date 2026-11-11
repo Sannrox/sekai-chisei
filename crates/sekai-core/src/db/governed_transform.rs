@@ -16,16 +16,17 @@ use crate::sekai::governed_transform::{
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
-    input_partition_receipts, is_preview_id, new_preview_id, normalize_transform_claim_ttl_ms,
-    partition_records, partition_value, placement_admits, prepare_partition_commit,
-    preview_output_schema_json, preview_result_from_writeback, preview_schema_from_rows,
-    preview_writeback_run, receipts_for_touched_partitions, redact_run_partition_receipts,
-    refuse_dependency_cycle, registered_transform_runtime, require_bound_output_for_markings,
-    rows_digest, schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
+    input_partition_receipts, is_preview_id, new_preview_id, partition_records, partition_value,
+    placement_admits, prepare_partition_commit, preview_output_schema_json,
+    preview_result_from_writeback, preview_schema_from_rows, preview_writeback_run,
+    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
+    registered_transform_runtime, require_bound_output_for_markings, rows_digest,
+    schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
     transform_completed_write_matches, transform_pool_depths, transform_quota_hold_status_allows,
     transform_runtime_decision, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
 use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+use crate::sekai::work_claim::{ClaimError, Takeable};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -695,7 +696,7 @@ impl SekaiDb {
             let indexed: bool = tx
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM sqlite_master
-                     WHERE type = 'table' AND name = 'sekai_search_dataset_text')",
+                     WHERE type = 'table' AND name = 'sekai_search_dataset_text_v2')",
                     [],
                     |row| row.get(0),
                 )
@@ -1262,16 +1263,8 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut work = load_transform_work(&tx, run_id)?.ok_or("transform work not found")?;
-        if !transform_claim_fence_matches(
-            &work,
-            runtime_id,
-            claim_generation,
-            fencing_token,
-            now_ms,
-        ) {
-            return Err(STALE_TRANSFORM_CLAIM.into());
-        }
-        work.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+        work.heartbeat_claim(runtime_id, claim_generation, fencing_token, ttl_ms, now_ms)
+            .map_err(|_| STALE_TRANSFORM_CLAIM.to_string())?;
         persist_transform_work(&tx, &work)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(work)
@@ -1404,19 +1397,13 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut work = load_transform_work(&tx, run_id)?.ok_or("transform work not found")?;
-        if !transform_claim_is_current(&work, runtime_id, claim_generation, fencing_token) {
-            return Err(STALE_TRANSFORM_CLAIM.into());
-        }
-        work.status = TRANSFORM_WORK_PENDING.into();
-        work.claim_owner = String::new();
-        if work.claim_generation <= 1 {
-            work.claim_generation = 0;
-        }
-        if restore_lease_expiry {
-            work.lease_expiries = work.lease_expiries.saturating_sub(1);
-        }
-        work.fencing_token = String::new();
-        work.claim_expires_at_ms = 0;
+        work.requeue_claim(
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            restore_lease_expiry,
+        )
+        .map_err(|_| STALE_TRANSFORM_CLAIM.to_string())?;
         persist_transform_work(&tx, &work)?;
         stamp_run_dispatch(&tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -2566,11 +2553,13 @@ fn claim_transform_work_tx(
         {
             continue;
         }
-        let counted_lease_expiry =
-            work.status == TRANSFORM_WORK_CLAIMED && work.claim_expires_at_ms <= now_ms;
-        if counted_lease_expiry {
-            work.lease_expiries = work.lease_expiries.saturating_add(1);
-            if work.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
+        let counted_lease_expiry = match work.count_lapse(now_ms) {
+            Ok(Takeable::Lapsed) => {
+                persist_transform_work(tx, &work)?;
+                true
+            }
+            Ok(_) => false,
+            Err(ClaimError::LeaseLimit) => {
                 work.status = TRANSFORM_WORK_FAILED.into();
                 persist_transform_work(tx, &work)?;
                 stamp_run_dispatch(tx, &work.run_id, TRANSFORM_WORK_FAILED)?;
@@ -2579,11 +2568,8 @@ fn claim_transform_work_tx(
                 failed_run_ids.push(work.run_id);
                 continue;
             }
-            persist_transform_work(tx, &work)?;
-        }
-        if !transform_work_is_claimable(&work, now_ms) {
-            continue;
-        }
+            Err(_) => continue,
+        };
         let transform = match load_admitted_transform(tx, &work) {
             Ok(transform) => transform,
             Err(error) if error == TRANSFORM_DEFINITION_CHANGED => {
@@ -2607,11 +2593,7 @@ fn claim_transform_work_tx(
             counted_lease_expiry: false,
         });
     };
-    work.status = TRANSFORM_WORK_CLAIMED.into();
-    work.claim_owner = runtime_id.to_string();
-    work.claim_generation = work.claim_generation.saturating_add(1);
-    work.fencing_token = Uuid::new_v4().to_string();
-    work.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+    work.grant_claim(runtime_id, ttl_ms, now_ms);
     persist_transform_work(tx, &work)?;
     carry_transform_quota_request_admission(tx, &work.run_id, work.claim_generation)?;
     stamp_run_dispatch(tx, &work.run_id, TRANSFORM_WORK_CLAIMED)?;

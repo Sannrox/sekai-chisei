@@ -10,15 +10,24 @@
 //! approval, and a denied plan can never execute. Authority is rechecked per
 //! step at execution.
 
+use std::collections::{BTreeMap, HashMap};
+
+use sekai_domain::receipt::{
+    OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    ReceiptSurface, UncoveredSurface,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::action_instance::{DECISION_DENY, DECISION_GRANT};
 use crate::sekai::action_plan::{PlanError, PlanStep, ProposedPlan};
+use crate::sekai::audit::Decision;
 
 pub const REVIEW_DIGEST_MISMATCH: &str = "plan_review_digest_mismatch";
 pub const REVIEW_ALREADY_DECIDED: &str = "plan_review_already_decided";
 pub const REVIEW_STEP_NOT_DECIDABLE: &str = "plan_review_step_not_decidable";
+/// The audit action and receipt operation class of a plan decision.
+pub const PLAN_REVIEW_DECIDED: &str = "plan_review.decide";
 const MAX_REASON: usize = 2048;
 
 /// The bundle item for one plan. `decision` is empty while it is pending.
@@ -61,6 +70,101 @@ impl PlanReview {
         queues.sort();
         queues.dedup();
         queues
+    }
+
+    /// The audit row and receipt a decided review leaves (#2200). The store
+    /// writes both in the transaction that records the decision, and only
+    /// when that decision lands, so a replay adds nothing.
+    pub fn decision_records(&self) -> (Decision, OperationReceipt) {
+        let operation_id = format!("plan-review:{}:{}", self.namespace, self.plan_id);
+        let audit = Decision {
+            id: operation_id.clone(),
+            timestamp: self.decided_at_ms,
+            actor: self.decided_by.clone(),
+            action: PLAN_REVIEW_DECIDED.into(),
+            reason: self.reason.clone(),
+            evidence: HashMap::from([
+                ("namespace".into(), self.namespace.clone()),
+                ("plan_id".into(), self.plan_id.clone()),
+                ("simulation_id".into(), self.simulation_id.clone()),
+                ("simulation_digest".into(), self.simulation_digest.clone()),
+                ("decision".into(), self.decision.clone()),
+            ]),
+            target_id: self.plan_id.clone(),
+            outcome: self.decision.clone(),
+        };
+        let event = |suffix: &str, parent: Option<&str>, kind: ReceiptEventKind, attributes| {
+            OperationReceiptEvent {
+                event_id: format!("{operation_id}:{suffix}"),
+                operation_id: operation_id.clone(),
+                parent_event_id: parent.map(|parent| format!("{operation_id}:{parent}")),
+                timestamp_ms: self.decided_at_ms,
+                surface: kind.surface(),
+                kind,
+                actor: self.decided_by.clone(),
+                references: Vec::new(),
+                attributes,
+            }
+        };
+        let plan = BTreeMap::from([
+            ("plan_id".into(), self.plan_id.clone()),
+            ("simulation_id".into(), self.simulation_id.clone()),
+            ("simulation_digest".into(), self.simulation_digest.clone()),
+        ]);
+        let mut approval = BTreeMap::from([
+            ("decision".into(), self.decision.clone()),
+            ("approver".into(), self.decided_by.clone()),
+            ("plan_id".into(), self.plan_id.clone()),
+            ("simulation_digest".into(), self.simulation_digest.clone()),
+        ]);
+        if !self.reason.trim().is_empty() {
+            approval.insert("reason".into(), self.reason.trim().into());
+        }
+        // A plan decision decides no policy, route or budget: each step is
+        // admitted and rechecked on its own at execution.
+        let not_decided = |surface| UncoveredSurface {
+            surface,
+            reason: "plan review decides the plan; each step is admitted at execution".into(),
+        };
+        let receipt = OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: operation_id.clone(),
+            parent_operation_id: None,
+            namespace: self.namespace.clone(),
+            operation_class: PLAN_REVIEW_DECIDED.into(),
+            initiating_actor: self.decided_by.clone(),
+            schema_version: "plan-review/v1".into(),
+            policy_version: "not_applicable".into(),
+            started_at_ms: self.decided_at_ms,
+            completed_at_ms: Some(self.decided_at_ms),
+            events: vec![
+                event("intent", None, ReceiptEventKind::IntentRecorded, plan),
+                event(
+                    "approval",
+                    Some("intent"),
+                    ReceiptEventKind::ApprovalDecided,
+                    approval,
+                ),
+                event(
+                    "outcome",
+                    Some("approval"),
+                    ReceiptEventKind::OutcomeRecorded,
+                    BTreeMap::from([("outcome".into(), self.decision.clone())]),
+                ),
+            ],
+            uncovered_surfaces: [
+                ReceiptSurface::Policy,
+                ReceiptSurface::Routing,
+                ReceiptSurface::Budget,
+            ]
+            .into_iter()
+            .map(not_decided)
+            .collect(),
+            reporter_grants: Vec::new(),
+            ontology_digest: None,
+            artifact: None,
+        };
+        (audit, receipt)
     }
 }
 
@@ -147,6 +251,32 @@ pub fn submit_review(
     Ok(stored)
 }
 
+/// Whether `decider` may decide `plan`'s review: never its planner, and
+/// `may_decide` accepts every step; otherwise the first step it refuses.
+/// [`decide_review`] applies it, and the pending-decision listing (#2203)
+/// lists a review only when it passes.
+pub fn check_decider(
+    plan: &ProposedPlan,
+    decider: &str,
+    may_decide: &dyn Fn(&ProposedPlan, &PlanStep) -> bool,
+) -> Result<(), ReviewError> {
+    if decider == plan.planner {
+        return Err(ReviewError::AccessDenied);
+    }
+    match plan
+        .steps
+        .iter()
+        .enumerate()
+        .find(|(_, step)| !may_decide(plan, step))
+    {
+        Some((index, step)) => Err(ReviewError::StepNotDecidable {
+            index,
+            type_id: step.type_id.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 pub struct ReviewDecision<'a> {
     pub simulation_digest: &'a str,
     pub decision: &'a str,
@@ -181,20 +311,7 @@ pub fn decide_review(
     let plan = db
         .get_plan(namespace, plan_id)?
         .ok_or(ReviewError::AccessDenied)?;
-    if decider == plan.planner {
-        return Err(ReviewError::AccessDenied);
-    }
-    if let Some((index, step)) = plan
-        .steps
-        .iter()
-        .enumerate()
-        .find(|(_, step)| !may_decide(&plan, step))
-    {
-        return Err(ReviewError::StepNotDecidable {
-            index,
-            type_id: step.type_id.clone(),
-        });
-    }
+    check_decider(&plan, decider, may_decide)?;
     if request.simulation_digest != review.simulation_digest {
         return Err(ReviewError::DigestMismatch);
     }
@@ -248,6 +365,17 @@ mod tests {
             ..review.clone()
         };
         assert_eq!(db.put_plan_review(&other).unwrap(), review);
+        // Open reviews are pending (#2203), scoped to their namespace.
+        assert_eq!(
+            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            std::slice::from_ref(&review)
+        );
+        assert!(db.list_pending_plan_reviews(ns, 10, 1).unwrap().is_empty());
+        assert!(
+            db.list_pending_plan_reviews(&format!("{ns}-other"), 10, 0)
+                .unwrap()
+                .is_empty()
+        );
         let granted = PlanReview {
             decision: DECISION_GRANT.into(),
             decided_by: "alice".into(),
@@ -258,11 +386,71 @@ mod tests {
         let denied = PlanReview {
             decision: DECISION_DENY.into(),
             decided_by: "bob".into(),
-            ..review
+            ..review.clone()
         };
         assert!(!db.decide_plan_review(&denied).unwrap());
+        // A replay of the landed decision writes nothing either.
+        assert!(!db.decide_plan_review(&granted).unwrap());
         assert_eq!(db.get_plan_review(ns, "plan-1").unwrap(), Some(granted));
         assert_eq!(db.get_plan_review(ns, "plan-2").unwrap(), None);
+        assert_decided_once(db, ns, "plan-1", "alice", DECISION_GRANT);
+
+        let second = PlanReview {
+            plan_id: "plan-2".into(),
+            ..review
+        };
+        db.put_plan_review(&second).unwrap();
+        // Decided reviews leave the pending list.
+        assert_eq!(
+            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            std::slice::from_ref(&second)
+        );
+        assert!(
+            db.decide_plan_review(&PlanReview {
+                decision: DECISION_DENY.into(),
+                decided_by: "bob".into(),
+                reason: "too broad".into(),
+                decided_at_ms: 3,
+                ..second
+            })
+            .unwrap()
+        );
+        assert_decided_once(db, ns, "plan-2", "bob", DECISION_DENY);
+    }
+
+    /// Exactly one audit row and one receipt name the plan's decision.
+    fn assert_decided_once(db: &RuntimeDb, ns: &str, plan_id: &str, decider: &str, decision: &str) {
+        let rows: Vec<_> = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some(PLAN_REVIEW_DECIDED.into()),
+                target_id: Some(plan_id.into()),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.evidence.get("namespace").map(String::as_str) == Some(ns))
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].actor, decider);
+        assert_eq!(rows[0].outcome, decision);
+        assert_eq!(rows[0].evidence["simulation_digest"], "sha256:one");
+        let receipt = db
+            .get_operation_receipt(&rows[0].id)
+            .unwrap()
+            .expect("decision receipt");
+        // Policy, routing and budget stay uncovered: steps decide them.
+        let completeness = receipt.completeness();
+        assert!(completeness.errors.is_empty(), "{completeness:?}");
+        let approvals: Vec<_> = receipt
+            .events
+            .iter()
+            .filter(|event| event.kind == ReceiptEventKind::ApprovalDecided)
+            .collect();
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].actor, decider);
+        assert_eq!(approvals[0].attributes["decision"], decision);
+        assert_eq!(approvals[0].attributes["plan_id"], plan_id);
     }
 
     #[test]

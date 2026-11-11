@@ -2,6 +2,7 @@ use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset::{ColumnDef, RowFilter, row_value_matches};
 use crate::sekai::dataset_version::{self, DatasetVersion};
 use rusqlite::{OptionalExtension, Transaction, params};
+use sekai_types::governed_transform::{schedule_bucket, schedule_due_bucket};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -112,6 +113,32 @@ pub struct DatasetAlert {
     pub reason: String,
     pub state: String,
     pub emitted_at_ms: i64,
+}
+
+/// Which checks one health run covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthRunScope {
+    /// `RunDatasetHealthChecks`: unscheduled checks plus due scheduled ones.
+    WithUnscheduled,
+    /// The schedule tick (`TickGovernedTransforms`): due scheduled checks only.
+    ScheduledOnly,
+}
+
+/// A scheduled check is due once per `every_ms` bucket, the bucket rule of
+/// the transform schedule graph (ADR 0103). `last_run_ms` is its cursor;
+/// zero means it never ran. Binaries before #2187 used
+/// `last_run_ms + every_ms <= now_ms`; both rules read the same write, so a
+/// mixed deploy still runs a check at most once per bucket.
+pub fn scheduled_check_due(last_run_ms: i64, every_ms: i64, now_ms: i64) -> bool {
+    let last_bucket = (last_run_ms > 0).then(|| schedule_bucket(every_ms, last_run_ms));
+    schedule_due_bucket(last_bucket, every_ms, now_ms).is_some()
+}
+
+/// A due run is late when a whole bucket passed without a run.
+pub fn scheduled_check_late(last_run_ms: i64, every_ms: i64, now_ms: i64) -> bool {
+    last_run_ms > 0
+        && schedule_bucket(every_ms, now_ms)
+            > schedule_bucket(every_ms, last_run_ms).saturating_add(1)
 }
 
 /// A scheduled run that did not evaluate every blocking check must not
@@ -370,14 +397,55 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    /// `RunDatasetHealthChecks`: runs every unscheduled check and the
+    /// scheduled checks due in this bucket.
     pub fn run_dataset_health_checks(
         &self,
         dataset_id: &str,
         now_ms: i64,
     ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.run_health_checks(dataset_id, now_ms, HealthRunScope::WithUnscheduled)
+    }
+
+    /// Datasets with at least one scheduled check, for the schedule tick.
+    pub fn list_scheduled_health_datasets(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT dataset_id FROM sekai_dataset_health_checks
+                 WHERE every_ms > 0 ORDER BY dataset_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let mapped = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// The schedule tick for one dataset: runs only its due scheduled checks.
+    pub fn tick_dataset_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
+        self.run_health_checks(dataset_id, now_ms, HealthRunScope::ScheduledOnly)
+    }
+
+    fn run_health_checks(
+        &self,
+        dataset_id: &str,
+        now_ms: i64,
+        scope: HealthRunScope,
+    ) -> Result<Vec<DatasetHealthResult>, String> {
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let results = run_health_checks_tx(&tx, dataset_id, now_ms)?;
+        // Immediate: take the write lock before reading `last_run_ms`, so a
+        // second plane on the same file waits instead of failing its upgrade.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let results = run_health_checks_tx(&tx, dataset_id, now_ms, scope)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(results)
     }
@@ -519,66 +587,43 @@ pub fn judge_after_write_sqlite(
     judge_version_tx(tx, dataset_id, version, now_ms, None)
 }
 
-/// Apply due scheduled checks for one dataset.
+/// Run the checks of one dataset that are due at `now_ms`.
 ///
-/// `every_ms` records the cadence; a caller invokes `RunDatasetHealthChecks`
-/// on that interval, the same way `TickGovernedTransforms` drives transform
-/// schedules. This crate does not start a background worker.
+/// A scheduled check (`every_ms > 0`) is claimed by a conditional update of
+/// `last_run_ms`, so two planes, or an old and a new binary, run it at most
+/// once per bucket. Claim, judgment, and alerts commit together: a crash
+/// rolls the claim back and the next tick retries the bucket.
 fn run_health_checks_tx(
     tx: &Transaction<'_>,
     dataset_id: &str,
     now_ms: i64,
+    scope: HealthRunScope,
 ) -> Result<Vec<DatasetHealthResult>, String> {
-    let checks = list_checks_conn(tx, dataset_id)?;
-    let mut due_ids = Vec::new();
-    let mut recover_ids = Vec::new();
-    for check in &checks {
-        if check.every_ms <= 0 {
-            due_ids.push(check.check_id.clone());
-            continue;
-        }
-        let due =
-            check.last_run_ms == 0 || check.last_run_ms.saturating_add(check.every_ms) <= now_ms;
-        let late =
-            check.last_run_ms > 0 && check.last_run_ms.saturating_add(check.every_ms) < now_ms;
-        if late {
-            emit_alert_tx(
-                tx,
-                ALERT_KIND_SCHEDULE,
-                &format!("{}/{}", check.dataset_id, check.check_id),
-                dataset_id,
-                &check.tenant,
-                &check.space,
-                ALERT_REASON_LATE,
-                ALERT_FIRING,
-                now_ms,
-            )?;
-        }
-        if due {
-            due_ids.push(check.check_id.clone());
-            if !late {
-                recover_ids.push(check.clone());
-            }
-        }
-    }
-    let version = latest_version_tx(tx, dataset_id)?;
-    let Some(version) = version else {
+    let Some(version) = latest_version_tx(tx, dataset_id)? else {
         return Ok(Vec::new());
     };
-    let results = if due_ids.is_empty() {
-        Vec::new()
-    } else {
-        judge_version_tx(tx, dataset_id, &version, now_ms, Some(&due_ids))?
-    };
-    for check_id in &due_ids {
-        tx.execute(
-            "UPDATE sekai_dataset_health_checks SET last_run_ms = ?1
-             WHERE dataset_id = ?2 AND check_id = ?3",
-            params![now_ms, dataset_id, check_id],
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    for check in &recover_ids {
+    let mut due_ids = Vec::new();
+    for check in list_checks_conn(tx, dataset_id)? {
+        if check.every_ms <= 0 {
+            if scope == HealthRunScope::WithUnscheduled {
+                due_ids.push(check.check_id);
+            }
+            continue;
+        }
+        if !scheduled_check_due(check.last_run_ms, check.every_ms, now_ms) {
+            continue;
+        }
+        let claimed = tx
+            .execute(
+                "UPDATE sekai_dataset_health_checks SET last_run_ms = ?1
+                 WHERE dataset_id = ?2 AND check_id = ?3 AND last_run_ms = ?4",
+                params![now_ms, dataset_id, check.check_id, check.last_run_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if claimed != 1 {
+            continue;
+        }
+        let late = scheduled_check_late(check.last_run_ms, check.every_ms, now_ms);
         emit_alert_tx(
             tx,
             ALERT_KIND_SCHEDULE,
@@ -587,11 +632,15 @@ fn run_health_checks_tx(
             &check.tenant,
             &check.space,
             ALERT_REASON_LATE,
-            ALERT_RESOLVED,
+            if late { ALERT_FIRING } else { ALERT_RESOLVED },
             now_ms,
         )?;
+        due_ids.push(check.check_id);
     }
-    Ok(results)
+    if due_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    judge_version_tx(tx, dataset_id, &version, now_ms, Some(&due_ids))
 }
 
 fn latest_version_tx(

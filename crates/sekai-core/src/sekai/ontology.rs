@@ -937,7 +937,7 @@ impl SekaiDb {
         deadline: Instant,
         limit: u32,
     ) -> Result<Vec<OntologyClass>, String> {
-        select_readable_classes(&self.conn(), principals, deadline, limit)
+        select_readable_classes(&mut self.conn(), principals, deadline, limit)
     }
 
     pub fn upsert_ontology_relation(&self, relation: &OntologyRelation) -> Result<(), String> {
@@ -1051,7 +1051,7 @@ impl SekaiDb {
         deadline: Instant,
         limit: u32,
     ) -> Result<Vec<OntologyRelation>, String> {
-        select_readable_relations(&self.conn(), principals, deadline, limit)
+        select_readable_relations(&mut self.conn(), principals, deadline, limit)
     }
 
     /// Load the durable ontology into an in-memory registry for validation and
@@ -1181,7 +1181,7 @@ fn select_classes(conn: &rusqlite::Connection) -> Result<Vec<OntologyClass>, Str
 }
 
 fn select_readable_classes(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     principals: &[String],
     deadline: Instant,
     limit: u32,
@@ -1301,7 +1301,7 @@ fn select_relations(conn: &rusqlite::Connection) -> Result<Vec<OntologyRelation>
 }
 
 fn select_readable_relations(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     principals: &[String],
     deadline: Instant,
     limit: u32,

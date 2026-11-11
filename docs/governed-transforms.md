@@ -85,6 +85,49 @@ window. Cycles are refused at Put. Failed upstream runs mark downstream
 outputs `blocked`; a later success unblocks them. Cancelling a run skips
 not-yet-started downstream work and records that on the receipts.
 
+A dataset health check with `every_ms` greater than zero is also a member of
+this schedule graph (#2187). `TickGovernedTransforms` runs it once per due
+bucket (`now / every_ms`), with no caller outside the plane. The check's
+stored `last_run_ms` is the schedule cursor: a run claims the bucket by a
+conditional update of `last_run_ms`, and that claim commits together with the
+judgment and the alerts. So two planes ticking at once run a due check once,
+and a crash before the commit leaves the bucket for the next tick. A run that
+starts after a whole bucket passed with no run fires the `late` schedule
+alert; the next on-time run resolves it. `RunDatasetHealthChecks` stays the
+on-demand call for one dataset. It runs every unscheduled check, and runs a
+scheduled check only through the same claim, so a cadence caller and the tick
+together still run each bucket once. Planes from before #2187 run a scheduled
+check when `last_run_ms + every_ms <= now` and write the same field. In a
+mixed deploy, each side sees the other's run, and a check runs at most once
+per bucket. As with every schedule member, a run late in one bucket and a run
+early in the next are both on time.
+
+A namespace's ontology health schedule is a member of the same graph (#2192,
+[ontology-health.md](ontology-health.md)). `TickGovernedTransforms` records
+the window holding the tick's time once for each schedule that has not
+finished that window. The snapshot store keeps one snapshot per namespace and
+window, so two planes ticking at once, or a tick racing an on-demand
+`RecordOntologyHealthSnapshot`, store a window once. Each schedule keeps a
+cursor, `last_window_start_ms`, that moves forward only after the window is
+stored. A crash before the cursor moves leaves the window due, and the retry
+replays the stored snapshot. A recorder refused at tick time halts the
+schedule with `last_error`. A put bumps the schedule's generation, and the
+tick moves the cursor or halts only the generation it read. The health
+members run last, and both always run, so one failing member fails the tick
+without holding back the other or the rest of the tick. Planes from before
+#2192 do not read schedules. In a mixed deploy, only upgraded planes record
+from them, and every plane can still record on demand.
+
+A Source with `every_ms` greater than zero is a member of the same graph
+(ADR 0148, #2185). `TickGovernedTransforms` moves each active Source's due
+bucket to `now / every_ms` in one conditional update, so planes ticking at
+once raise it once. An unfinished due bucket is `source_sync` work for a
+connector runtime whose labels satisfy the Source's placement. The claim
+covers the newest due bucket, so a runtime that fell behind syncs once. A
+failed bucket waits for the next one instead of retrying. Disabling the
+Source raises its claim generation, and a put that changes `every_ms`
+restarts the schedule.
+
 An isolated-process definition may declare `requires`, placement labels as
 key and value pairs, part of its definition digest when non-empty (#1733,
 ADR 0129). A worker registers its labels for its runtime id in a namespace

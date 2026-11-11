@@ -249,6 +249,22 @@ impl RuntimeDb {
         }
     }
 
+    /// Open dataset branch proposals of `tenant`, newest first, each with
+    /// whether an open definition proposal attaches it (#2203).
+    pub fn list_open_dataset_branch_proposals(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(crate::sekai::dataset_branch::DatasetBranchProposal, bool)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_open_dataset_branch_proposals(tenant, limit, offset),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_open_dataset_branch_proposals(tenant, limit, offset)
+            }),
+        }
+    }
+
     pub fn get_dataset_branch_proposal(
         &self,
         dataset_id: &str,
@@ -381,6 +397,38 @@ impl RuntimeDb {
         }
     }
 
+    /// Admits the due scheduled health checks of every dataset, as members of
+    /// the transform schedule graph (ADR 0103, #2187). Each dataset commits on
+    /// its own, so one failing dataset does not hold back the others; its
+    /// claim rolls back, the next tick retries it, and the first error is
+    /// returned after every dataset was tried. Returns the number of results.
+    pub fn tick_dataset_health_checks(&self, now_ms: i64) -> Result<usize, String> {
+        let datasets = match self {
+            Self::Sqlite(db) => db.list_scheduled_health_datasets()?,
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_scheduled_health_datasets())?
+            }
+        };
+        let mut judged = 0;
+        let mut first_error = None;
+        for dataset_id in datasets {
+            let ticked = match self {
+                Self::Sqlite(db) => db.tick_dataset_health_checks(&dataset_id, now_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.tick_dataset_health_checks(&dataset_id, now_ms)
+                }),
+            };
+            match ticked {
+                Ok(results) => judged += results.len(),
+                Err(error) => {
+                    tracing::warn!(%error, %dataset_id, "scheduled dataset health check failed");
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(judged), Err)
+    }
+
     pub fn emit_consumer_violation(
         &self,
         emit: &crate::sekai::consumer_violation::EmitViolation<'_>,
@@ -438,6 +486,27 @@ impl RuntimeDb {
         }
     }
 
+    /// Deletes every consumer violation delivery older than
+    /// `DELIVERY_RETENTION_MS` (#2195), one batch per transaction, and
+    /// returns how many it deleted. Safe on every instance at once.
+    pub fn sweep_consumer_violation_deliveries(&self, now_ms: i64) -> Result<usize, String> {
+        use crate::sekai::consumer_violation::{DELIVERY_RETENTION_MS, SWEEP_BATCH};
+        let cutoff_ms = now_ms.saturating_sub(DELIVERY_RETENTION_MS);
+        let mut deleted = 0;
+        loop {
+            let batch = match self {
+                Self::Sqlite(db) => db.delete_expired_consumer_violations(cutoff_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.delete_expired_consumer_violations(cutoff_ms)
+                }),
+            }?;
+            deleted += batch;
+            if (batch as i64) < SWEEP_BATCH {
+                return Ok(deleted);
+            }
+        }
+    }
+
     pub fn insert_catalog_criticality_event(
         &self,
         event: &crate::sekai::catalog_criticality::CriticalityEvent,
@@ -448,6 +517,41 @@ impl RuntimeDb {
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.insert_catalog_criticality_event(event, expected_updated)
             }),
+        }
+    }
+
+    pub fn drifted_catalog_criticality_entries(
+        &self,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.drifted_catalog_criticality_entries(after, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.drifted_catalog_criticality_entries(after, limit)
+            }),
+        }
+    }
+
+    /// Deletes every criticality outbox event older than
+    /// `EVENT_RETENTION_MS` (#2196) except each entry's latest, one batch per
+    /// transaction, and returns how many it deleted. Safe on every instance
+    /// at once.
+    pub fn sweep_catalog_criticality_outbox(&self, now_ms: i64) -> Result<usize, String> {
+        use crate::sekai::catalog_criticality::{EVENT_RETENTION_MS, SWEEP_BATCH};
+        let cutoff_ms = now_ms.saturating_sub(EVENT_RETENTION_MS);
+        let mut deleted = 0;
+        loop {
+            let batch = match self {
+                Self::Sqlite(db) => db.delete_superseded_catalog_criticality_events(cutoff_ms),
+                Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                    db.delete_superseded_catalog_criticality_events(cutoff_ms)
+                }),
+            }?;
+            deleted += batch;
+            if (batch as i64) < SWEEP_BATCH {
+                return Ok(deleted);
+            }
         }
     }
 

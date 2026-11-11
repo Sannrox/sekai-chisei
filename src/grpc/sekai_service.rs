@@ -15,6 +15,8 @@ mod capability_discovery;
 mod catalog_invocation;
 #[path = "catalog_rpc.rs"]
 mod catalog_rpc;
+#[path = "claimable_work_rpc.rs"]
+mod claimable_work_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
 #[path = "data_export_rpc.rs"]
@@ -55,6 +57,8 @@ mod object_set_query;
 mod ontology_changelog_rpc;
 #[path = "ontology_definition_lifecycle.rs"]
 mod ontology_definition_lifecycle;
+#[path = "pending_decisions_rpc.rs"]
+mod pending_decisions_rpc;
 #[path = "schema_definition_lifecycle.rs"]
 mod schema_definition_lifecycle;
 #[path = "scored_knowledge_admission.rs"]
@@ -75,6 +79,8 @@ mod db_work;
 mod ontology_health_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
+#[path = "source_rpc.rs"]
+mod source_rpc;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
 #[path = "trust_score_rpc.rs"]
@@ -253,6 +259,10 @@ impl SekaiService for SekaiServiceImpl {
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
+        list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
+        claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
+        heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
+        ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;
         list_site_agent_working_memory => list_site_agent_working_memory_rpc(ListSiteAgentWorkingMemoryRequest) -> ListSiteAgentWorkingMemoryResponse;
         grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;
         revoke_namespace_export => revoke_namespace_export_rpc(RevokeNamespaceExportRequest) -> RevokeNamespaceExportResponse;
@@ -560,6 +570,55 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListOntologyHealthTrendRequest>,
     ) -> Result<Response<ListOntologyHealthTrendResponse>, Status> {
         ontology_health_rpc::list_ontology_health_trend(self, req).await
+    }
+
+    async fn put_ontology_health_schedule(
+        &self,
+        req: Request<PutOntologyHealthScheduleRequest>,
+    ) -> Result<Response<PutOntologyHealthScheduleResponse>, Status> {
+        ontology_health_rpc::put_ontology_health_schedule(self, req).await
+    }
+
+    async fn delete_ontology_health_schedule(
+        &self,
+        req: Request<DeleteOntologyHealthScheduleRequest>,
+    ) -> Result<Response<DeleteOntologyHealthScheduleResponse>, Status> {
+        ontology_health_rpc::delete_ontology_health_schedule(self, req).await
+    }
+
+    async fn get_source_health(
+        &self,
+        req: Request<GetSourceHealthRequest>,
+    ) -> Result<Response<GetSourceHealthResponse>, Status> {
+        ontology_health_rpc::get_source_health(self, req).await
+    }
+
+    async fn put_source(
+        &self,
+        req: Request<PutSourceRequest>,
+    ) -> Result<Response<PutSourceResponse>, Status> {
+        source_rpc::put_source(self, req).await
+    }
+
+    async fn get_source(
+        &self,
+        req: Request<GetSourceRequest>,
+    ) -> Result<Response<GetSourceResponse>, Status> {
+        source_rpc::get_source(self, req).await
+    }
+
+    async fn list_sources(
+        &self,
+        req: Request<ListSourcesRequest>,
+    ) -> Result<Response<ListSourcesResponse>, Status> {
+        source_rpc::list_sources(self, req).await
+    }
+
+    async fn disable_source(
+        &self,
+        req: Request<DisableSourceRequest>,
+    ) -> Result<Response<DisableSourceResponse>, Status> {
+        source_rpc::disable_source(self, req).await
     }
 
     async fn dry_run_definition_change_bundle(
@@ -1204,6 +1263,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListActionInstancesRequest>,
     ) -> Result<Response<ListActionInstancesResponse>, Status> {
         rpc_actions::list_action_instances(self, req).await
+    }
+
+    async fn list_pending_decisions(
+        &self,
+        req: Request<ListPendingDecisionsRequest>,
+    ) -> Result<Response<ListPendingDecisionsResponse>, Status> {
+        pending_decisions_rpc::list_pending_decisions(self, req).await
     }
 
     async fn get_action_effect(
@@ -1887,3 +1953,7 @@ impl SekaiService for SekaiServiceImpl {
 #[cfg(test)]
 #[path = "sekai_service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "source_rpc_tests.rs"]
+mod source_rpc_tests;

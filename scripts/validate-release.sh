@@ -86,8 +86,8 @@ fi
   || fail "${workflow} every published-release guard must accept only a draft or release not found"
 grep -F 'gh release delete-asset "$TAG" "$name" --yes' "$workflow" >/dev/null \
   || fail "${workflow} must drop an earlier run's assets when it resumes a draft"
-grep -F "needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest]" "$workflow" >/dev/null \
-  || fail "${workflow} must publish only after every asset job, so a re-run can resume the draft"
+grep -F "needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest, n1-upgrade]" "$workflow" >/dev/null \
+  || fail "${workflow} must publish only after every asset job and the N-1 upgrade gate, so a re-run can resume the draft"
 grep -F "id-token: write" "$workflow" >/dev/null || fail "${workflow} must request id-token for provenance"
 grep -F "attestations: write" "$workflow" >/dev/null || fail "${workflow} must request attestations permission"
 grep -F "taiki-e/upload-rust-binary-action" "$workflow" >/dev/null || fail "${workflow} must keep the existing binary matrix"

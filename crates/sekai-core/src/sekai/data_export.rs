@@ -258,70 +258,12 @@ pub fn sweep_expired_artifacts(db: &RuntimeDb, now_ms: i64) -> Result<(), String
     db.sweep_export_artifacts(now_ms).map(|_| ())
 }
 
-/// A completed artifact the adapter may fetch and acknowledge.
-pub struct DeliverableExportArtifact {
-    pub receipt_id: String,
-    pub namespace: String,
-    pub definition_id: String,
-    pub initiating_actor: String,
-    pub content_digest: String,
-    pub created_at_ms: i64,
-    pub expires_at_ms: i64,
-}
-
 pub fn completed_digest(receipt: &OperationReceipt) -> Option<String> {
     receipt.events.iter().rev().find_map(|event| {
         (event.attributes.get("outcome").map(String::as_str) == Some("completed"))
             .then(|| event.attributes.get("content_digest").cloned())
             .flatten()
     })
-}
-
-/// Completed, unexpired, unacknowledged artifacts in `namespace`.
-pub fn list_deliverable_export_artifacts(
-    db: &RuntimeDb,
-    namespace: &str,
-    now_ms: i64,
-) -> Result<Vec<DeliverableExportArtifact>, String> {
-    let mut deliverable = Vec::new();
-    for artifact in db.list_unacked_export_artifacts(namespace, now_ms)? {
-        let Some(receipt) = export_receipt(db, &artifact.receipt_id)? else {
-            continue;
-        };
-        let Some(content_digest) = completed_digest(&receipt) else {
-            continue;
-        };
-        deliverable.push(DeliverableExportArtifact {
-            receipt_id: artifact.receipt_id,
-            namespace: artifact.namespace,
-            definition_id: artifact.definition_id,
-            initiating_actor: receipt.initiating_actor,
-            content_digest,
-            created_at_ms: artifact.created_at_ms,
-            expires_at_ms: artifact.expires_at_ms,
-        });
-    }
-    Ok(deliverable)
-}
-
-/// Acknowledges delivery of a completed artifact whose digest the adapter
-/// verified. Idempotent once acknowledged.
-pub fn acknowledge_export_delivery(
-    db: &RuntimeDb,
-    receipt_id: &str,
-    content_digest: &str,
-    now_ms: i64,
-) -> Result<bool, String> {
-    let Some(receipt) = export_receipt(db, receipt_id)? else {
-        return Ok(false);
-    };
-    let Some(digest) = completed_digest(&receipt) else {
-        return Err("export artifact is not complete".into());
-    };
-    if digest != content_digest {
-        return Err("export artifact digest mismatch".into());
-    }
-    db.acknowledge_export_artifact(receipt_id, now_ms)
 }
 
 /// Records an export refused for want of an export grant: a refusal, never
@@ -1060,22 +1002,22 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            db.export_artifact_chunks_after(&receipt_id, -1, 1, 2_000)
+            db.export_artifact_chunks_after(&receipt_id, -1, 1, None, 2_000)
                 .unwrap(),
             vec![(0, b"ab".to_vec())]
         );
         assert_eq!(
-            db.export_artifact_chunks_after(&receipt_id, 0, 8, 2_000)
+            db.export_artifact_chunks_after(&receipt_id, 0, 8, None, 2_000)
                 .unwrap(),
             vec![(1, b"cd".to_vec())]
         );
         assert!(
-            db.export_artifact_chunks_after(&receipt_id, 1, 8, 2_000)
+            db.export_artifact_chunks_after(&receipt_id, 1, 8, None, 2_000)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            db.export_artifact_is_deliverable(&receipt_id, 2_000)
+            db.export_artifact_is_deliverable(&receipt_id, None, 2_000)
                 .unwrap()
         );
         let artifact = db.get_export_artifact(&receipt_id, 2_000).unwrap().unwrap();
@@ -1087,15 +1029,18 @@ mod tests {
         db.open_export_artifact(&acked, ns, "nightly", 1_000)
             .unwrap();
         db.put_export_artifact_chunk(&acked, 0, b"ef").unwrap();
-        assert!(db.acknowledge_export_artifact(&acked, 2_000).unwrap());
+        db.acknowledge_export_artifact(&acked, None, 2_000).unwrap();
         assert!(db.get_export_artifact(&acked, 2_000).unwrap().is_none());
-        assert!(!db.export_artifact_is_deliverable(&acked, 2_000).unwrap());
         assert!(
-            db.export_artifact_chunks_after(&acked, -1, 8, 2_000)
+            !db.export_artifact_is_deliverable(&acked, None, 2_000)
+                .unwrap()
+        );
+        assert!(
+            db.export_artifact_chunks_after(&acked, -1, 8, None, 2_000)
                 .unwrap()
                 .is_empty()
         );
-        assert!(db.acknowledge_export_artifact(&acked, 2_000).unwrap());
+        db.acknowledge_export_artifact(&acked, None, 2_000).unwrap();
         db.put_export_definition(ns, "hourly", "alice", r#"{"everyMs":1000}"#)
             .unwrap();
         let due = db.claim_due_export_schedules(1_500).unwrap();
@@ -1189,7 +1134,8 @@ mod tests {
         let listed = db.list_unacked_export_artifacts("acme", 2_000).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].receipt_id, "old-run");
-        assert!(db.acknowledge_export_artifact("old-run", 2_000).unwrap());
+        db.acknowledge_export_artifact("old-run", None, 2_000)
+            .unwrap();
         assert!(db.get_export_artifact("old-run", 2_000).unwrap().is_none());
         drop(db);
         let _ = std::fs::remove_file(&path);

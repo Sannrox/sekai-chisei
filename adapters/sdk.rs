@@ -239,6 +239,36 @@ pub struct OutboxReceipt {
 }
 
 impl OutboxReceipt {
+    /// Keeps the delivered envelope as `<identity>.done` instead of deleting
+    /// it, so [`prepare_delivery_in`] returns the exact same envelope for a
+    /// later redelivery and the plane replays it by idempotency key. One small
+    /// file stays per delivery; prune `.done` entries past the producer's
+    /// retry horizon.
+    #[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+    pub fn complete(self) -> Result<(), String> {
+        let _fence = lock_entry(&self.path)?;
+        if self
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "done")
+        {
+            return Ok(());
+        }
+        let done = self.path.with_extension("done");
+        match fs::rename(&self.path, &done) {
+            Ok(()) => {}
+            // A concurrent worker completed the same entry first.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && done.exists() => {
+                return Ok(());
+            }
+            Err(error) => return Err(format!("failed to complete adapter outbox entry: {error}")),
+        }
+        sync_directory(
+            done.parent()
+                .ok_or_else(|| "adapter outbox entry has no parent directory".to_string())?,
+        )
+    }
+
     pub fn acknowledge(self) -> Result<(), String> {
         match fs::remove_file(&self.path) {
             Ok(()) => sync_directory(
@@ -279,6 +309,10 @@ pub fn prepare_delivery_in(
     if path.exists() {
         return load_delivery(path);
     }
+    let done = path.with_extension("done");
+    if done.exists() {
+        return load_delivery(done);
+    }
 
     let envelope = draft.into_envelope(config, collected_at_ms)?;
     let temporary = outbox.join(format!(".{stable_identity}.{}.tmp", uuid::Uuid::new_v4()));
@@ -314,6 +348,105 @@ pub fn prepare_delivery_in(
             Err(format!("failed to publish adapter outbox entry: {error}"))
         }
     }
+}
+
+/// Rebuilds a pending entry with a new collection time and replaces it in
+/// place. Only for an envelope the plane never admitted, such as one
+/// rejected as `replay_window_expired` after a long outage: the new
+/// envelope has a new idempotency key, so it must never replace one that was
+/// already admitted. `stale_key` is the idempotency key the caller saw
+/// rejected; when another worker already restamped or completed the entry,
+/// its envelope is returned unchanged instead.
+#[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+pub fn restamp_delivery(
+    receipt: &OutboxReceipt,
+    stale_key: &str,
+    config: &AdapterConfig,
+    draft: EvidenceDraft,
+    collected_at_ms: i64,
+) -> Result<EvidenceEnvelope, String> {
+    let outbox = receipt
+        .path
+        .parent()
+        .ok_or_else(|| "adapter outbox entry has no parent directory".to_string())?;
+    let _fence = lock_entry(&receipt.path)?;
+    let current = if receipt.path.exists() {
+        receipt.path.clone()
+    } else {
+        receipt.path.with_extension("done")
+    };
+    let (current, _) = load_delivery(current)?;
+    if current.idempotency_key != stale_key {
+        return Ok(current);
+    }
+    let envelope = draft.into_envelope(config, collected_at_ms)?;
+    let temporary = outbox.join(format!(".restamp.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("failed to create adapter outbox entry: {error}"))?;
+    if let Err(error) = file
+        .write_all(&envelope.encode_to_vec())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("failed to persist adapter outbox entry: {error}"));
+    }
+    if let Err(error) = fs::rename(&temporary, &receipt.path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("failed to replace adapter outbox entry: {error}"));
+    }
+    sync_directory(outbox)?;
+    Ok(envelope)
+}
+
+/// Holds an exclusive lock on `<identity>.lock` beside an outbox entry until
+/// dropped, so concurrent workers restamp or complete one entry in turn. The
+/// operating system releases it when a process dies; the empty lock file stays.
+fn lock_entry(entry: &Path) -> Result<fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(entry.with_extension("lock"))
+        .map_err(|error| format!("failed to open adapter outbox lock: {error}"))?;
+    file.lock()
+        .map_err(|error| format!("failed to lock adapter outbox entry: {error}"))?;
+    Ok(file)
+}
+
+/// One persisted delivery and the receipt that completes it.
+#[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+pub type PendingDelivery = (EvidenceEnvelope, OutboxReceipt);
+
+/// Every delivery persisted in `outbox` and not yet completed, in file name
+/// order. Adapters whose delivery spans more than `SubmitEvidence` use it to
+/// finish work a crash left behind. An unreadable entry yields its own error
+/// without hiding the others; one completed concurrently is skipped.
+#[allow(dead_code)] // compiled into per-adapter examples that do not all call every helper
+pub fn pending_deliveries(outbox: &Path) -> Result<Vec<Result<PendingDelivery, String>>, String> {
+    let entries = match fs::read_dir(outbox) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("failed to list adapter outbox: {error}")),
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to list adapter outbox: {error}"))?;
+    paths.retain(|path| path.extension().is_some_and(|extension| extension == "bin"));
+    paths.sort();
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| match load_delivery(path.clone()) {
+            Err(_) if !path.exists() => None,
+            loaded => Some(loaded),
+        })
+        .collect())
 }
 
 fn load_delivery(path: PathBuf) -> Result<(EvidenceEnvelope, OutboxReceipt), String> {

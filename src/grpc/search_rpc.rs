@@ -1,14 +1,14 @@
 //! Experimental permission-aware Search and GetSearchIndexStatus RPCs.
 
 use super::*;
-use crate::db::search_index::SearchIndexStore;
 use crate::sekai::embedding_index::{
     EmbeddingError, EmbeddingSpec, EmbeddingStore, StoredEmbeddingSpec, sha_hex, source_text,
 };
 use crate::sekai::search_index::{
-    FUSION_PROFILE, POLICY_ATTRIBUTE_KEYS, SearchCandidate, SearchCandidateQuery, SearchIndex,
-    SearchIndexError, SearchPolicyFilter, SearchQueryMode, SearchSourceKind, VectorCandidateQuery,
-    dataset_classification_allows, live_object_match_fields, rrf_fuse, text_matches_query,
+    FUSION_PROFILE, POLICY_ATTRIBUTE_KEYS, SEARCH_OVERSCAN, SearchCandidate, SearchCandidateQuery,
+    SearchIndex, SearchIndexError, SearchPolicyFilter, SearchQueryMode, SearchSourceKind,
+    VectorCandidateQuery, dataset_classification_allows, live_object_match_fields, rrf_fuse,
+    text_matches_query,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,7 +17,6 @@ pub(crate) const SEARCH_STATUS_CAPABILITY: &str = "sekai.search.status";
 pub(super) const DEFAULT_PAGE_SIZE: i32 = 20;
 pub(crate) const MAX_PAGE_SIZE: i32 = 100;
 pub(crate) const CANDIDATE_CAP: usize = 256;
-const INDEX_OVERSCAN: usize = 10_000;
 
 pub(super) async fn search(
     service: &SekaiServiceImpl,
@@ -39,6 +38,7 @@ pub(super) async fn search(
         crate::enterprise::NamespaceAction::Discover,
     )?;
     check_team_namespace(service.db.runtime(), &principals, namespace, false)?;
+    ensure_followed(service, namespace)?;
     let namespace_read = enforce_collaboration_namespace(
         service.db.runtime(),
         tenant_context.as_ref(),
@@ -63,7 +63,8 @@ pub(super) async fn search(
         source => source,
     };
     let page_size = normalize_page_size(input.page_size);
-    let offset = parse_page_offset(&input.page_token)?;
+    let query_binding = page_query_binding(namespace, &input, page_size);
+    let offset = decode_page_token(&input.page_token, &query_binding)?;
     let weights = parse_hybrid_weights(&input)?;
     require_granted_search_properties(
         service.db.runtime(),
@@ -75,12 +76,8 @@ pub(super) async fn search(
             .map(|filter| filter.property.as_str())
             .chain(input.facets.iter().map(String::as_str)),
     )?;
+    // Read only: the scheduled worker keeps the index current (#2250).
     let now_ms = now_millis();
-    service
-        .db
-        .runtime()
-        .catch_up_search_namespace(namespace, now_ms)
-        .map_err(search_status)?;
     let status = service
         .db
         .runtime()
@@ -120,6 +117,7 @@ pub(super) async fn search(
             .collect::<Vec<_>>()
     };
     let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut source_exhausted = true;
     for kinds in kind_scopes {
         let purpose_authorized =
@@ -137,14 +135,11 @@ pub(super) async fn search(
         if !exhausted {
             source_exhausted = false;
         }
-        for candidate in batch {
-            if candidates.iter().any(|existing: &SearchCandidate| {
-                existing.source == candidate.source && existing.id == candidate.id
-            }) {
-                continue;
-            }
-            candidates.push(candidate);
-        }
+        candidates.extend(
+            batch
+                .into_iter()
+                .filter(|candidate| seen.insert((candidate.source, candidate.id.clone()))),
+        );
     }
     let mut visible = Vec::new();
     for candidate in candidates {
@@ -181,7 +176,7 @@ pub(super) async fn search(
         }
     }
     let mut capped = visible.len() >= CANDIDATE_CAP
-        || (!source_exhausted && (!visible.is_empty() || !input.property_filters.is_empty()));
+        || scan_cut_is_visible(!source_exhausted, !visible.is_empty());
     let mut vector_lag_ms = 0;
     let mut vector_hits = Vec::new();
     let mut vector_capped = false;
@@ -265,8 +260,11 @@ pub(super) async fn search(
                     "embedding index changed during search; retry",
                 ));
             }
-            vector_capped |= kept.len() >= CANDIDATE_CAP;
-            ranked.extend(kept.into_iter().filter_map(|candidate| {
+            // Only live-checked hits bound the vector count. The ranking's
+            // own cut runs before the source-value checks, so reporting it
+            // could reveal values the caller may not read.
+            vector_capped |= kept.candidates.len() >= CANDIDATE_CAP;
+            ranked.extend(kept.candidates.into_iter().filter_map(|candidate| {
                 hits.remove(&candidate.object_id)
                     .map(|hit| (candidate.score, candidate.object_id, hit))
             }));
@@ -296,7 +294,7 @@ pub(super) async fn search(
         .collect::<Vec<_>>();
     let next_offset = offset.saturating_add(page.len());
     let next_page_token = if next_offset < visible.len() {
-        next_offset.to_string()
+        encode_page_token(next_offset, query_binding)?
     } else {
         String::new()
     };
@@ -318,6 +316,18 @@ pub(super) async fn search(
     }))
 }
 
+/// Let the scheduled worker discover an authorized namespace it does not
+/// follow yet, such as one whose only content is unbound datasets (#2250).
+/// The only write Search and GetSearchIndexStatus make, and none once the
+/// namespace has a checkpoint.
+fn ensure_followed(service: &SekaiServiceImpl, namespace: &str) -> Result<(), Status> {
+    service
+        .db
+        .runtime()
+        .ensure_search_checkpoint(namespace)
+        .map_err(|error| search_status(error.into()))
+}
+
 pub(super) async fn get_search_index_status(
     service: &SekaiServiceImpl,
     req: Request<GetSearchIndexStatusRequest>,
@@ -337,12 +347,9 @@ pub(super) async fn get_search_index_status(
         false,
     )?;
     check_team_namespace(service.db.runtime(), &principals, namespace, false)?;
+    ensure_followed(service, namespace)?;
+    // Read only: the scheduled worker keeps the index current (#2250).
     let now_ms = now_millis();
-    service
-        .db
-        .runtime()
-        .catch_up_search_namespace(namespace, now_ms)
-        .map_err(search_status)?;
     let status = service
         .db
         .runtime()
@@ -472,6 +479,15 @@ fn embedding_status(error: EmbeddingError) -> Status {
     }
 }
 
+/// Whether a scan that stopped at its bound may report a lower-bound count.
+/// Only when it yielded a hit the caller receives, after every access check
+/// and filter: the cut is made before authorization, so reporting it
+/// otherwise would reveal that the index holds hidden matches. The cost is
+/// that a cut search whose filters drop every hit reports an exact zero.
+fn scan_cut_is_visible(cut: bool, any_returned: bool) -> bool {
+    cut && any_returned
+}
+
 fn normalize_page_size(page_size: i32) -> usize {
     if page_size <= 0 {
         DEFAULT_PAGE_SIZE as usize
@@ -480,13 +496,62 @@ fn normalize_page_size(page_size: i32) -> usize {
     }
 }
 
-fn parse_page_offset(token: &str) -> Result<usize, Status> {
-    if token.trim().is_empty() {
+/// Continuation state for `Search` (#2251): opaque to clients, and bound to
+/// the query so a token reused with another query is refused instead of
+/// silently paging a different result set. Not signed, like the other page
+/// tokens: an edited offset only moves within results the caller may read.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SearchPageToken {
+    offset: usize,
+    query: String,
+}
+
+/// Digest of every request field that shapes the ranked result list or the
+/// page boundaries. Facets only summarize, so they stay out.
+fn page_query_binding(namespace: &str, input: &SearchRequest, page_size: usize) -> String {
+    let filters = input
+        .property_filters
+        .iter()
+        .map(|filter| (filter.property.as_str(), filter.value.as_str()))
+        .collect::<Vec<_>>();
+    let shape = serde_json::json!([
+        namespace,
+        input.text,
+        input.kinds,
+        filters,
+        input.source,
+        input.mode,
+        input.text_weight,
+        input.vector_weight,
+        page_size,
+    ]);
+    sha_hex(&shape.to_string())
+}
+
+fn encode_page_token(offset: usize, query: String) -> Result<String, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    serde_json::to_vec(&SearchPageToken { offset, query })
+        .map(|json| URL_SAFE_NO_PAD.encode(json))
+        .map_err(|_| Status::internal("page token unavailable"))
+}
+
+/// The offset a token resumes at; an empty token starts at the first page.
+fn decode_page_token(token: &str, query_binding: &str) -> Result<usize, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    if token.is_empty() {
         return Ok(0);
     }
-    token.parse::<usize>().map_err(|_| {
-        Status::invalid_argument("page_token must be an offset from a previous Search response")
-    })
+    let token: SearchPageToken = URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .ok_or_else(|| Status::invalid_argument("page_token is not a Search page token"))?;
+    if token.query != query_binding {
+        return Err(Status::invalid_argument(
+            "page_token belongs to a different Search query",
+        ));
+    }
+    Ok(token.offset)
 }
 
 fn purpose_is_authorized(
@@ -540,6 +605,9 @@ fn purpose_is_authorized(
     Ok(false)
 }
 
+/// Policy-scoped text candidates from each searched source, each read
+/// bounded at [`SEARCH_OVERSCAN`] policy-admitted candidates; false when a read
+/// stopped at its bound.
 fn query_search_candidates(
     db: &RuntimeDb,
     text: &str,
@@ -559,13 +627,11 @@ fn query_search_candidates(
                 text: text.to_string(),
                 source: Some(kind),
                 policy: policy.clone(),
-                limit: INDEX_OVERSCAN,
+                limit: SEARCH_OVERSCAN,
             })
             .map_err(search_status)?;
-        if batch.len() >= INDEX_OVERSCAN {
-            exhausted = false;
-        }
-        hits.extend(batch);
+        exhausted &= !batch.truncated;
+        hits.extend(batch.candidates);
     }
     Ok((hits, exhausted))
 }
@@ -984,6 +1050,39 @@ mod tests {
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
 
+    /// One pass of the scheduled worker over every namespace, as a replica
+    /// would run it before the request.
+    fn catch_up(svc: &SekaiServiceImpl) {
+        for (namespace, outcome) in crate::db::search_index::catch_up_search_pass(
+            svc.db.runtime(),
+            "",
+            usize::MAX,
+            &now_millis,
+        )
+        .unwrap()
+        {
+            outcome.unwrap_or_else(|error| panic!("{namespace}: {error}"));
+        }
+    }
+
+    /// [`super::search`] after a worker pass: the RPC itself only reads.
+    async fn search(
+        svc: &SekaiServiceImpl,
+        req: Request<SearchRequest>,
+    ) -> Result<Response<SearchResponse>, Status> {
+        catch_up(svc);
+        super::search(svc, req).await
+    }
+
+    /// [`super::get_search_index_status`] after a worker pass.
+    async fn get_search_index_status(
+        svc: &SekaiServiceImpl,
+        req: Request<GetSearchIndexStatusRequest>,
+    ) -> Result<Response<GetSearchIndexStatusResponse>, Status> {
+        catch_up(svc);
+        super::get_search_index_status(svc, req).await
+    }
+
     fn service_from(db: RuntimeDb) -> SekaiServiceImpl {
         SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(Arc::new(
             db,
@@ -1151,6 +1250,68 @@ mod tests {
         assert!(!empty.count_is_lower_bound);
     }
 
+    /// #2252: more restricted matches than the cap, all ahead of the
+    /// visible ones in index order, use up neither the cap nor the count.
+    async fn exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones(
+        db: RuntimeDb,
+    ) {
+        for index in 0..CANDIDATE_CAP + 44 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("a-hidden-{index:03}"),
+                    "acme",
+                    "hidden",
+                    &[("body", "shared token"), ("owner", "alice")],
+                ),
+                "alice",
+            )
+            .unwrap();
+        }
+        for index in 0..3 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("z-visible-{index}"),
+                    "acme",
+                    "visible",
+                    &[("body", "shared token")],
+                ),
+                "tester",
+            )
+            .unwrap();
+        }
+        let svc = service_from(db);
+        let response = search(&svc, with_named_principal(search_req("shared"), "tester"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            hit_ids(&response),
+            vec!["z-visible-0", "z-visible-1", "z-visible-2"]
+        );
+        assert_eq!(response.count, 3);
+        assert!(!response.count_is_lower_bound);
+        let owner = search(&svc, with_named_principal(search_req("shared"), "alice"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(owner.count, CANDIDATE_CAP as i64);
+        assert!(owner.count_is_lower_bound);
+    }
+
+    #[tokio::test]
+    async fn restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones() {
+        exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones(
+            RuntimeDb::memory(),
+        )
+        .await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones() {
+        on_postgres(exercise_restricted_text_matches_ahead_of_the_cap_do_not_hide_visible_ones);
+    }
+
     #[tokio::test]
     async fn ungranted_property_filter_fails_closed() {
         let db = RuntimeDb::memory();
@@ -1280,6 +1441,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_and_status_only_read_the_index() {
+        let db = RuntimeDb::memory();
+        db.create_object_with_audit(
+            &object("note-1", "acme", "alpha", &[("body", "join customers")]),
+            "tester",
+        )
+        .unwrap();
+        let svc = service_from(db);
+        let status_req = || {
+            with_named_principal(
+                GetSearchIndexStatusRequest {
+                    namespace: "acme".into(),
+                },
+                "tester",
+            )
+        };
+        let unindexed = super::search(
+            &svc,
+            with_named_principal(search_req("customers"), "tester"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(unindexed.hits.is_empty());
+        let status = super::get_search_index_status(&svc, status_req())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.analyzer_version, "");
+        assert_eq!(status.object_count, 0);
+        catch_up(&svc);
+        let indexed = super::search(
+            &svc,
+            with_named_principal(search_req("customers"), "tester"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(indexed.hits.len(), 1);
+        let status = super::get_search_index_status(&svc, status_req())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
+        assert_eq!(status.lag_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn a_namespace_with_only_unbound_datasets_is_indexed_after_a_search() {
+        let db = RuntimeDb::memory();
+        db.create_dataset(&dataset("ds-sales", "sales", "", &[("id", "public")]))
+            .unwrap();
+        let svc = service_from(db);
+        let dataset_search = || {
+            let mut req = search_req("sales");
+            req.source = "dataset".into();
+            with_named_principal(req, "tester")
+        };
+        // Nothing in the namespace has history yet, so the worker skips it.
+        catch_up(&svc);
+        let first = super::search(&svc, dataset_search())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.hits.is_empty());
+        // The search let the worker discover the namespace.
+        catch_up(&svc);
+        let found = super::search(&svc, dataset_search())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(found.hits.len(), 1);
+        assert_eq!(found.hits[0].id, "ds-sales");
+    }
+
+    #[tokio::test]
     async fn dataset_metadata_is_discoverable_without_row_contents() {
         let db = RuntimeDb::memory();
         db.create_object_with_audit(&object("owner", "acme", "owner", &[]), "tester")
@@ -1401,7 +1638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn last_page_does_not_repeat_a_continuation_token() {
+    async fn page_tokens_page_through_one_query_only() {
         let db = RuntimeDb::memory();
         db.create_object_with_audit(
             &object("note-1", "acme", "alpha", &[("body", "shared token")]),
@@ -1421,21 +1658,52 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(first.hits.len(), 1);
-        assert_eq!(first.next_page_token, "1");
+        assert!(first.next_page_token.parse::<usize>().is_err());
+
+        let mut other_query = search_req("token");
+        other_query.page_size = 1;
+        other_query.page_token = first.next_page_token.clone();
+        let reused = search(&svc, with_named_principal(other_query, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(reused.code(), tonic::Code::InvalidArgument);
+
+        let mut other_size = req.clone();
+        other_size.page_size = 2;
+        other_size.page_token = first.next_page_token.clone();
+        let resized = search(&svc, with_named_principal(other_size, "tester"))
+            .await
+            .unwrap_err();
+        assert_eq!(resized.code(), tonic::Code::InvalidArgument);
+
         req.page_token = first.next_page_token;
         let second = search(&svc, with_named_principal(req.clone(), "tester"))
             .await
             .unwrap()
             .into_inner();
         assert_eq!(second.hits.len(), 1);
+        assert_ne!(second.hits[0].id, first.hits[0].id);
         assert!(second.next_page_token.is_empty());
-        req.page_token = "2".into();
-        let empty = search(&svc, with_named_principal(req, "tester"))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(empty.hits.is_empty());
-        assert!(empty.next_page_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_page_token_is_refused() {
+        let svc = service_from(RuntimeDb::memory());
+        for token in ["1", "not base64!", "e30"] {
+            let mut req = search_req("shared");
+            req.page_token = token.into();
+            let error = search(&svc, with_named_principal(req, "tester"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{token}");
+        }
+    }
+
+    #[test]
+    fn a_scan_cut_with_nothing_returned_reports_an_exact_count() {
+        assert!(!scan_cut_is_visible(true, false));
+        assert!(scan_cut_is_visible(true, true));
+        assert!(!scan_cut_is_visible(false, true));
     }
 
     #[tokio::test]
@@ -1538,9 +1806,33 @@ mod tests {
         response.hits.iter().map(|hit| hit.id.as_str()).collect()
     }
 
+    /// Run a Search test on a scratch PostgreSQL database, on a multi-thread
+    /// runtime because the PostgreSQL store blocks in place. The store is
+    /// dropped after the runtime: closing its pool blocks.
+    fn on_postgres<F: std::future::Future<Output = ()>>(test: impl FnOnce(RuntimeDb) -> F) {
+        let scratch = crate::db::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(test(db.clone()));
+        drop(db);
+    }
+
     #[tokio::test]
     async fn hybrid_search_fuses_vector_hits_the_caller_may_read() {
-        let svc = hybrid_service(RuntimeDb::memory()).await;
+        exercise_hybrid_search_fuses_vector_hits_the_caller_may_read(RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_hybrid_search_fuses_vector_hits_the_caller_may_read() {
+        on_postgres(exercise_hybrid_search_fuses_vector_hits_the_caller_may_read);
+    }
+
+    async fn exercise_hybrid_search_fuses_vector_hits_the_caller_may_read(db: RuntimeDb) {
+        let svc = hybrid_service(db).await;
         let text = search(&svc, with_named_principal(search_req("cat"), "tester"))
             .await
             .unwrap()
@@ -1728,7 +2020,7 @@ mod tests {
                 .embedding_checkpoint("acme", "notes")?
                 .map_or(0, |checkpoint| checkpoint.revision);
             self.0
-                .reset_embedding_spec("acme", "notes", revision, 2_000)?;
+                .reset_embedding_spec("acme", "notes", &Default::default(), revision, 2_000)?;
             Topic.embed(texts).await
         }
     }
@@ -1752,7 +2044,16 @@ mod tests {
 
     #[tokio::test]
     async fn hidden_vector_candidates_do_not_use_up_the_cap() {
-        let db = RuntimeDb::memory();
+        exercise_hidden_vector_candidates_do_not_use_up_the_cap(RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_hidden_vector_candidates_do_not_use_up_the_cap() {
+        on_postgres(exercise_hidden_vector_candidates_do_not_use_up_the_cap);
+    }
+
+    async fn exercise_hidden_vector_candidates_do_not_use_up_the_cap(db: RuntimeDb) {
         let stale = CANDIDATE_CAP + 4;
         for index in 0..stale {
             db.create_object_with_audit(

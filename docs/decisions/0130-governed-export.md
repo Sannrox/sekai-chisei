@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-10-24
 - Issue: #1627
-- Related: #1443, #1628, #1695, #1696
+- Related: #1443, #1628, #1695, #1696, #2189, #2194
 
 ## Context
 
@@ -80,3 +80,13 @@ Rejected:
   most, never as a media object that namespace readers could see. The plane
   never holds destination credentials. An out-of-process adapter fetches and
   delivers.
+- Amended (#2194, after #2189): saved-export delivery is claimable work,
+  the `export_delivery` kind of ADR 0149. The rule that decides it: an item
+  exactly one consumer must act on, with an outside side effect worth
+  fencing, is work; a per-recipient read state is an inbox; an item with no
+  recipient is a feed. Two adapters polling one namespace could both
+  deliver an artifact, and the idempotent acknowledge hid that without
+  preventing it. The claim record lives on the artifact row, the claim
+  carries a reference rather than bytes, and the acknowledge is
+  digest-bound and fenced. Access is unchanged. The unfenced list and
+  acknowledge are deprecated and refuse an artifact while another holds it.

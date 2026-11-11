@@ -611,7 +611,7 @@ pub(super) async fn create_definition_proposal(
         &input.namespace,
         true,
     )?;
-    let request = definition_proposal_domain::CreateDefinitionProposal {
+    let mut request = definition_proposal_domain::CreateDefinitionProposal {
         namespace: input.namespace,
         branch_id: input.branch_id,
         proposal_id: input.proposal_id,
@@ -622,8 +622,26 @@ pub(super) async fn create_definition_proposal(
         idempotency_key: input.idempotency_key,
         major_revision: input.major_revision,
         migration_plan_digest: input.migration_plan_digest,
+        dataset_proposals: input
+            .dataset_proposals
+            .into_iter()
+            .map(|reference| definition_proposal_domain::DatasetProposalRef {
+                dataset_id: reference.dataset_id,
+                proposal_id: reference.proposal_id,
+            })
+            .collect(),
+        tenant: String::new(),
     };
-    request.prepare().map_err(Status::invalid_argument)?;
+    let prepared = request.prepare().map_err(Status::invalid_argument)?;
+    request.tenant = super::rpc_data::authorize_attached_datasets(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        prepared
+            .dataset_proposals
+            .iter()
+            .map(|reference| reference.dataset_id.as_str()),
+    )?;
     authorize_definition_revision(
         service,
         &principals,
@@ -658,7 +676,12 @@ pub(super) async fn create_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(CreateDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
 pub(super) async fn get_definition_proposal(
@@ -707,7 +730,12 @@ pub(super) async fn get_definition_proposal(
         &proposal,
     )?;
     Ok(Response::new(GetDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
         lint_findings,
         lint_complete,
     }))
@@ -810,18 +838,7 @@ pub(super) async fn approve_definition_proposal(
         .get_definition_proposal(&request.namespace, &request.proposal_id)
         .map_err(|_| Status::internal("definition proposal unavailable"))?
         .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
-    let actor = principals
-        .first()
-        .ok_or_else(|| Status::unauthenticated("principal required"))?;
-    refuse_proposal_creator(&proposal, actor, "approve")?;
-    authorize_proposal_revision_reads(service, &principals, &proposal)?;
-    authorize_proposal_member_writes(
-        service,
-        &principals,
-        &proposal.namespace,
-        &proposal.base_digest,
-        &proposal.candidate_digest,
-    )?;
+    let actor = authorize_definition_proposal_approval(service, &principals, &proposal)?;
     let result = service
         .db
         .runtime()
@@ -832,9 +849,38 @@ pub(super) async fn approve_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(ApproveDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
+/// The checks `ApproveDefinitionProposal` applies to a loaded proposal,
+/// after the namespace write check: the actor did not create it, and may
+/// read both revisions and write the changed members. Returns the acting
+/// principal. The pending-decision listing (#2203) applies it too.
+pub(super) fn authorize_definition_proposal_approval<'a>(
+    service: &SekaiServiceImpl,
+    principals: &'a [String],
+    proposal: &definition_proposal_domain::DefinitionProposal,
+) -> Result<&'a str, Status> {
+    let actor = principals
+        .first()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    refuse_proposal_creator(proposal, actor, "approve")?;
+    authorize_proposal_revision_reads(service, principals, proposal)?;
+    authorize_proposal_member_writes(
+        service,
+        principals,
+        &proposal.namespace,
+        &proposal.base_digest,
+        &proposal.candidate_digest,
+    )?;
+    Ok(actor)
+}
+
 /// The checks before a proposal's revision is published (merge, or the last
 /// step of a change bundle apply): the actor did not create it, may read both
 /// revisions and write the changed members, an approval is still current, and
@@ -925,6 +971,26 @@ pub(super) async fn merge_definition_proposal(
         &proposal,
     )?;
     let actor = actor.as_str();
+    // The merger lands the attached data too, so it must be able to write it
+    // from the tenant the data was pinned in (#2199).
+    if !proposal.dataset_proposals.is_empty() {
+        let tenant = super::rpc_data::authorize_attached_datasets(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            proposal
+                .dataset_proposals
+                .iter()
+                .map(|attachment| attachment.dataset_id.as_str()),
+        )?;
+        if proposal
+            .dataset_proposals
+            .iter()
+            .any(|attachment| attachment.tenant != tenant)
+        {
+            return Err(Status::not_found("definition resource unavailable"));
+        }
+    }
     let result = service
         .db
         .runtime()
@@ -934,7 +1000,12 @@ pub(super) async fn merge_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(MergeDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&result.proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &result.proposal,
+        )?),
         previous_published_digest: result.previous_published_digest,
         published_revision: Some(to_proto_definition_revision(&result.published_revision)),
         receipt_id: result.receipt_id,
@@ -988,7 +1059,12 @@ pub(super) async fn close_definition_proposal(
         return Err(Status::internal("definition replay result is invalid"));
     };
     Ok(Response::new(CloseDefinitionProposalResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
     }))
 }
 pub(super) async fn get_published_definition_revision(
@@ -1225,7 +1301,12 @@ pub(super) async fn propose_definition_rollback(
     )
     .map_err(map_definition_write_error)?;
     Ok(Response::new(ProposeDefinitionRollbackResponse {
-        proposal: Some(to_proto_definition_proposal(&proposal)),
+        proposal: Some(to_proto_definition_proposal(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &proposal,
+        )?),
         preview: Some(to_proto_definition_revision_diff(&preview)),
     }))
 }

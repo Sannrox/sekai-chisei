@@ -374,4 +374,109 @@ mod tests {
         let denied = svc.register_transform_runtime(req).await.unwrap_err();
         assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
+
+    /// The one claimable-work family (ADR 0149) sees the claim the transform
+    /// RPCs take, and the reverse: transform work has no `AckWork`, so a
+    /// claim through `ClaimWork` writes back through `WriteTransformRunResult`.
+    #[tokio::test]
+    async fn transform_work_crosses_between_the_claim_families() {
+        use crate::sekai::governed_transform::rows_digest;
+        let svc = service();
+        let run_id = admit(&svc, isolated("cross", Vec::new())).await;
+        let Some(claim_work_response::Payload::Transform(claimed)) = svc
+            .claim_work(as_admin(ClaimWorkRequest {
+                kind: WorkKind::Transform.into(),
+                namespace: "ops".into(),
+                runtime_id: "runner".into(),
+                work_id: run_id.clone(),
+                ttl_ms: 60_000,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .payload
+        else {
+            panic!("a transform claim");
+        };
+        let work = claimed.work.unwrap();
+        // Transform RPCs are not open to enterprise-scoped credentials; the
+        // family keeps that refusal.
+        let mut scoped = as_admin(ListClaimableWorkRequest {
+            kind: WorkKind::Transform.into(),
+            namespace: "ops".into(),
+            ..Default::default()
+        });
+        scoped.metadata_mut().insert(
+            crate::grpc::AUTH_SOURCE_HEADER,
+            MetadataValue::from_static("enterprise"),
+        );
+        assert_eq!(
+            svc.list_claimable_work(scoped).await.unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        let output: Vec<HashMap<String, String>> = Vec::new();
+        let written = svc
+            .write_transform_run_result(as_admin(WriteTransformRunResultRequest {
+                run_id: run_id.clone(),
+                runtime_id: work.claim_owner,
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token,
+                output_digest: rows_digest(&output),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .run
+            .unwrap();
+        assert_eq!(written.dispatch_status, "completed");
+
+        let run_id = admit(&svc, isolated("renew", Vec::new())).await;
+        let work = svc
+            .claim_transform_work(as_admin(ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner".into(),
+                run_id: run_id.clone(),
+                ttl_ms: 60_000,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .work
+            .unwrap();
+        let heartbeat = |claim_generation: i64| {
+            svc.heartbeat_work_claim(as_admin(HeartbeatWorkClaimRequest {
+                kind: WorkKind::Transform.into(),
+                work_id: run_id.clone(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                ttl_ms: 120_000,
+                namespace: String::new(),
+            }))
+        };
+        let Some(heartbeat_work_claim_response::Payload::Transform(renewed)) =
+            heartbeat(work.claim_generation)
+                .await
+                .unwrap()
+                .into_inner()
+                .payload
+        else {
+            panic!("a transform heartbeat");
+        };
+        assert!(renewed.work.unwrap().claim_expires_at_ms > work.claim_expires_at_ms);
+        assert!(heartbeat(work.claim_generation + 1).await.is_err());
+        assert_eq!(
+            svc.ack_work(as_admin(AckWorkRequest {
+                kind: WorkKind::Transform.into(),
+                work_id: run_id,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
 }

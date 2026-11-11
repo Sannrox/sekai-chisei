@@ -17,7 +17,12 @@ use crate::sekai::definition_branch::{
 use crate::sekai::definition_diff::DefinitionRevisionDiff;
 
 pub const PROPOSAL_CONTRACT_VERSION: &str = "sekai.definition-proposal/v1";
+/// The contract of a proposal with attached dataset branch proposals
+/// (#2199). An instance that knows only v1 refuses it on load, so it never
+/// publishes the definition without its data. Digests keep the v1 prefix.
+pub const PROPOSAL_CONTRACT_VERSION_V2: &str = "sekai.definition-proposal/v2";
 pub const MAX_PROPOSAL_DIGEST_REFS: usize = 32;
+pub const MAX_DATASET_PROPOSALS: usize = 16;
 
 pub const STATUS_OPEN: &str = "open";
 pub const STATUS_MERGED: &str = "merged";
@@ -32,6 +37,106 @@ const MAX_ANCESTRY_WALK: usize = 4_096;
 pub struct DefinitionProposalApproval {
     pub actor: String,
     pub approved_at_ms: i64,
+}
+
+/// A dataset branch merge proposal a caller asks to attach (#2199).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DatasetProposalRef {
+    pub dataset_id: String,
+    pub proposal_id: String,
+}
+
+/// An attached dataset branch proposal as pinned when the definition proposal
+/// was created. The pins are part of the proposal digest, so an approval
+/// covers the data; the merge lands it only while every pin still holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetProposalAttachment {
+    pub dataset_id: String,
+    pub proposal_id: String,
+    pub parent_version_id: String,
+    pub branch_digest: String,
+    /// The dataset proposal's tenant, which the merge must still match.
+    pub tenant: String,
+}
+
+impl DatasetProposalAttachment {
+    /// Pins `proposal` for a caller in `tenant`. Another tenant's proposal
+    /// reads as missing; only an open, non-bundle proposal attaches.
+    pub fn pin(
+        proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+        tenant: &str,
+    ) -> Result<Self, String> {
+        use crate::sekai::dataset_branch as branch;
+        if proposal.tenant != tenant {
+            return Err(format!(
+                "{DATASET_PROPOSAL_NOT_FOUND}: dataset branch proposal is unavailable"
+            ));
+        }
+        if proposal.status != branch::STATUS_OPEN {
+            return Err(format!(
+                "{DATASET_PROPOSAL_REFUSED}: dataset branch proposal is not open"
+            ));
+        }
+        if proposal.branch.starts_with(branch::BUNDLE_BRANCH_PREFIX) {
+            return Err(format!(
+                "{DATASET_PROPOSAL_REFUSED}: change bundle branches merge only through ApplyDefinitionChangeBundle"
+            ));
+        }
+        Ok(Self {
+            dataset_id: proposal.dataset_id.clone(),
+            proposal_id: proposal.id.clone(),
+            parent_version_id: proposal.parent_version_id.clone(),
+            branch_digest: proposal.branch_digest.clone(),
+            tenant: tenant.into(),
+        })
+    }
+
+    /// Rechecks the pin against `proposal` as read in the merge transaction.
+    /// A merged, closed (its branch was deleted), or re-pinned proposal is
+    /// stale. The dataset rule that another principal merges still holds for
+    /// `actor`, the principal merging the definition proposal.
+    pub fn recheck(
+        &self,
+        proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+        actor: &str,
+    ) -> Result<(), String> {
+        use crate::sekai::dataset_branch as branch;
+        if proposal.status != branch::STATUS_OPEN
+            || proposal.tenant != self.tenant
+            || proposal.parent_version_id != self.parent_version_id
+            || proposal.branch_digest != self.branch_digest
+        {
+            return Err(self.stale());
+        }
+        if proposal.proposer == actor {
+            return Err(format!(
+                "{DATASET_PROPOSAL_REFUSED}: {}",
+                branch::PROPOSAL_SELF_MERGE
+            ));
+        }
+        Ok(())
+    }
+
+    /// `error` from loading or merging the pinned dataset proposal, read as
+    /// staleness when it says the proposal or its dataset moved on.
+    pub fn stale_or(&self, error: String) -> String {
+        use crate::sekai::dataset_branch as branch;
+        match error.as_str() {
+            branch::PROPOSAL_NOT_FOUND
+            | branch::PROPOSAL_NOT_OPEN
+            | branch::PROPOSAL_STALE_PARENT
+            | branch::PROPOSAL_STALE_BRANCH => self.stale(),
+            _ => error,
+        }
+    }
+
+    /// The refusal for a dataset that moved since the pin.
+    pub fn stale(&self) -> String {
+        format!(
+            "{MERGE_DATASET_PROPOSAL_STALE}: dataset {} changed since the proposal pinned it",
+            self.dataset_id
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +175,10 @@ pub struct DefinitionProposal {
     /// Empty for proposals not created by a tree import.
     #[serde(default)]
     pub source_commit: String,
+    /// Dataset branch proposals merged with this one, in dataset-id order
+    /// (#2199). Omitted when empty, so v1 proposals stay byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dataset_proposals: Vec<DatasetProposalAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +197,23 @@ pub struct CreateDefinitionProposal {
     /// the approved proposal digest, so apply runs only that bundle.
     #[serde(default)]
     pub migration_plan_digest: String,
+    /// Dataset branch proposals to merge with this one (#2199).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dataset_proposals: Vec<DatasetProposalRef>,
+    /// The caller's tenant, which each attached dataset proposal must belong
+    /// to. Set by the server; outside the request digest.
+    #[serde(default, skip_serializing)]
+    pub tenant: String,
+}
+
+/// A validated `CreateDefinitionProposal`: canonical digest lists and
+/// dataset refs, and the digest that identifies the request for replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCreateDefinitionProposal {
+    pub eval_plan_digests: Vec<String>,
+    pub named_foreign_digests: Vec<String>,
+    pub dataset_proposals: Vec<DatasetProposalRef>,
+    pub request_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +246,31 @@ pub const MERGE_DATASOURCE_CHANGED: &str = "definition_bundle_apply_datasource_c
 
 /// Merge refusal: a dataset a change bundle migrated was written since.
 pub const MERGE_DATASET_MOVED: &str = "definition_bundle_apply_data_moved";
+
+/// Merge refusal: a change-bundle proposal publishes only through
+/// `ApplyDefinitionChangeBundle`, which migrates its data first.
+pub const MERGE_REQUIRES_BUNDLE_APPLY: &str = "definition_proposal_requires_bundle_apply";
+
+/// Merge refusal: an attached dataset branch proposal was merged, closed, or
+/// its dataset or branch moved since the proposal pinned it (#2199).
+pub const MERGE_DATASET_PROPOSAL_STALE: &str = "definition_proposal_dataset_stale";
+
+/// An attached dataset branch proposal is absent or in another tenant.
+pub const DATASET_PROPOSAL_NOT_FOUND: &str = "definition_proposal_dataset_not_found";
+
+/// A dataset branch proposal cannot be attached or merged by this caller.
+pub const DATASET_PROPOSAL_REFUSED: &str = "definition_proposal_dataset_refused";
+
+/// Who asks a store to merge a definition proposal. Internal to the server:
+/// no request field selects it, so a client can only merge `Direct`.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionMergePath {
+    /// `MergeDefinitionProposal` and every other caller.
+    Direct,
+    /// The publish step of `ApplyDefinitionChangeBundle`.
+    BundleApply,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseDefinitionProposal {
@@ -349,7 +500,7 @@ pub fn list_published_definition_history(
 }
 
 impl CreateDefinitionProposal {
-    pub fn prepare(&self) -> Result<(Vec<String>, Vec<String>, String, String), String> {
+    pub fn prepare(&self) -> Result<PreparedCreateDefinitionProposal, String> {
         validate_namespace(&self.namespace)?;
         validate_identifier("branch_id", &self.branch_id, MAX_DEFINITION_ID_BYTES)?;
         validate_identifier("proposal_id", &self.proposal_id, MAX_DEFINITION_ID_BYTES)?;
@@ -377,7 +528,13 @@ impl CreateDefinitionProposal {
                 "definition_proposal_conflict: eval and foreign digest lists overlap".into(),
             );
         }
-        let proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
+        let dataset_proposals = normalize_dataset_refs(&self.dataset_proposals)?;
+        if !dataset_proposals.is_empty() && !self.migration_plan_digest.is_empty() {
+            return Err(format!(
+                "{DATASET_PROPOSAL_REFUSED}: a change bundle proposal cannot attach dataset branch proposals"
+            ));
+        }
+        let input = PreparedProposalDigestInput {
             namespace: &self.namespace,
             branch_id: &self.branch_id,
             proposal_id: &self.proposal_id,
@@ -390,31 +547,46 @@ impl CreateDefinitionProposal {
             major_revision: self.major_revision,
             source_package_digest: "",
             source_commit: "",
-        })?;
-        let request_digest = canonical_digest(
-            "create_definition_proposal",
-            &PreparedProposalDigestInput {
-                namespace: &self.namespace,
-                branch_id: &self.branch_id,
-                proposal_id: &self.proposal_id,
-                base_digest: &self.base_digest,
-                candidate_digest: &self.candidate_digest,
-                eval_plan_digests: &eval_plan_digests,
-                named_foreign_digests: &named_foreign_digests,
-                restored_from_digest: "",
-                migration_plan_digest: &self.migration_plan_digest,
-                major_revision: self.major_revision,
-                source_package_digest: "",
-                source_commit: "",
-            },
-        )?;
-        Ok((
+            dataset_proposals: &[],
+        };
+        // Without attachments the request digest is the v1 one.
+        let request_digest = if dataset_proposals.is_empty() {
+            canonical_digest("create_definition_proposal", &input)?
+        } else {
+            canonical_digest("create_definition_proposal", &(input, &dataset_proposals))?
+        };
+        Ok(PreparedCreateDefinitionProposal {
             eval_plan_digests,
             named_foreign_digests,
-            proposal_digest,
+            dataset_proposals,
             request_digest,
-        ))
+        })
     }
+}
+
+/// Sorted by dataset id, at most one proposal per dataset: a second one on
+/// the same dataset could never merge after the first.
+fn normalize_dataset_refs(refs: &[DatasetProposalRef]) -> Result<Vec<DatasetProposalRef>, String> {
+    if refs.len() > MAX_DATASET_PROPOSALS {
+        return Err("dataset_proposals list exceeds the supported size".into());
+    }
+    let mut sorted = refs.to_vec();
+    sorted.sort();
+    for reference in &sorted {
+        validate_identifier("dataset_id", &reference.dataset_id, MAX_DEFINITION_ID_BYTES)?;
+        validate_identifier(
+            "dataset proposal_id",
+            &reference.proposal_id,
+            MAX_DEFINITION_ID_BYTES,
+        )?;
+    }
+    if sorted
+        .windows(2)
+        .any(|pair| pair[0].dataset_id == pair[1].dataset_id)
+    {
+        return Err("dataset_proposals list names a dataset twice".into());
+    }
+    Ok(sorted)
 }
 
 impl ApproveDefinitionProposal {
@@ -575,9 +747,60 @@ impl ProposeDefinitionRollback {
 }
 
 impl DefinitionProposal {
+    /// The contract version a proposal with these attachments carries.
+    pub fn contract_version_for(dataset_proposals: &[DatasetProposalAttachment]) -> &'static str {
+        if dataset_proposals.is_empty() {
+            PROPOSAL_CONTRACT_VERSION
+        } else {
+            PROPOSAL_CONTRACT_VERSION_V2
+        }
+    }
+
+    /// The digest an approval covers: everything the proposal pins.
+    pub fn content_digest(&self) -> Result<String, String> {
+        proposal_content_digest(&PreparedProposalDigestInput {
+            namespace: &self.namespace,
+            branch_id: &self.branch_id,
+            proposal_id: &self.proposal_id,
+            base_digest: &self.base_digest,
+            candidate_digest: &self.candidate_digest,
+            eval_plan_digests: &self.eval_plan_digests,
+            named_foreign_digests: &self.named_foreign_digests,
+            restored_from_digest: &self.restored_from_digest,
+            migration_plan_digest: &self.migration_plan_digest,
+            major_revision: self.major_revision,
+            source_package_digest: &self.source_package_digest,
+            source_commit: &self.source_commit,
+            dataset_proposals: &self.dataset_proposals,
+        })
+    }
+
+    /// The `merged_by` an attached dataset branch merge records.
+    pub fn dataset_merge_actor(&self) -> String {
+        format!("definition-proposal:{}", self.proposal_id)
+    }
+
     pub fn verify(&self) -> Result<(), String> {
-        if self.contract_version != PROPOSAL_CONTRACT_VERSION {
+        if self.contract_version != Self::contract_version_for(&self.dataset_proposals) {
             return Err("definition proposal contract version is unsupported".into());
+        }
+        if !self.dataset_proposals.is_empty() {
+            if !self.migration_plan_digest.is_empty() {
+                return Err(
+                    "definition proposal cannot attach datasets to a migration plan".into(),
+                );
+            }
+            let refs = self
+                .dataset_proposals
+                .iter()
+                .map(|attachment| DatasetProposalRef {
+                    dataset_id: attachment.dataset_id.clone(),
+                    proposal_id: attachment.proposal_id.clone(),
+                })
+                .collect::<Vec<_>>();
+            if normalize_dataset_refs(&refs)? != refs {
+                return Err("definition proposal dataset attachments are not canonical".into());
+            }
         }
         validate_namespace(&self.namespace)?;
         validate_identifier("branch_id", &self.branch_id, MAX_DEFINITION_ID_BYTES)?;
@@ -604,21 +827,7 @@ impl DefinitionProposal {
         if !self.source_commit.is_empty() {
             validate_source_commit(&self.source_commit)?;
         }
-        let expected = proposal_content_digest(&PreparedProposalDigestInput {
-            namespace: &self.namespace,
-            branch_id: &self.branch_id,
-            proposal_id: &self.proposal_id,
-            base_digest: &self.base_digest,
-            candidate_digest: &self.candidate_digest,
-            eval_plan_digests: &self.eval_plan_digests,
-            named_foreign_digests: &self.named_foreign_digests,
-            restored_from_digest: &self.restored_from_digest,
-            migration_plan_digest: &self.migration_plan_digest,
-            major_revision: self.major_revision,
-            source_package_digest: &self.source_package_digest,
-            source_commit: &self.source_commit,
-        })?;
-        if expected != self.proposal_digest {
+        if self.content_digest()? != self.proposal_digest {
             return Err("definition proposal content binding is invalid".into());
         }
         match self.status.as_str() {
@@ -671,6 +880,39 @@ impl DefinitionProposal {
         }
         Ok(())
     }
+
+    /// Refuses a direct merge of a proposal created for a change bundle
+    /// (#1693): only bundle apply migrates its data before the publish. A
+    /// rollback's `migration_plan_digest` pins a plan, not a bundle, and
+    /// merges directly; so does a proposal without one.
+    pub fn require_merge_path(&self, path: DefinitionMergePath) -> Result<(), String> {
+        let bundle = self.restored_from_digest.is_empty() && !self.migration_plan_digest.is_empty();
+        if bundle && path != DefinitionMergePath::BundleApply {
+            return Err(format!(
+                "{MERGE_REQUIRES_BUNDLE_APPLY}: publish this proposal with ApplyDefinitionChangeBundle"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether any stored proposal body in `bodies` attaches the dataset
+/// proposal. An unreadable body fails closed.
+pub fn any_attaches(
+    bodies: &[String],
+    dataset_id: &str,
+    proposal_id: &str,
+) -> Result<bool, String> {
+    for body in bodies {
+        let proposal: DefinitionProposal = serde_json::from_str(body)
+            .map_err(|error| format!("corrupt definition proposal: {error}"))?;
+        if proposal.dataset_proposals.iter().any(|attachment| {
+            attachment.dataset_id == dataset_id && attachment.proposal_id == proposal_id
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn changed_member_refs(
@@ -720,25 +962,24 @@ pub fn validate_close_reason_code(reason_code: &str) -> Result<(), String> {
     }
 }
 
+/// The receipt of merging `proposal` over `previous_published_digest`. It
+/// covers the receipts of the dataset branch merges it landed, if any.
 pub fn merge_receipt_id(
-    namespace: &str,
-    proposal_id: &str,
-    proposal_digest: &str,
-    base_digest: &str,
-    candidate_digest: &str,
+    proposal: &DefinitionProposal,
     previous_published_digest: &str,
-    restored_from_digest: &str,
+    dataset_receipt_ids: &[String],
 ) -> Result<String, String> {
     canonical_digest(
         "definition_proposal_merge_receipt",
         &MergeReceiptDigestInput {
-            namespace,
-            proposal_id,
-            proposal_digest,
-            base_digest,
-            candidate_digest,
+            namespace: &proposal.namespace,
+            proposal_id: &proposal.proposal_id,
+            proposal_digest: &proposal.proposal_digest,
+            base_digest: &proposal.base_digest,
+            candidate_digest: &proposal.candidate_digest,
             previous_published_digest,
-            restored_from_digest,
+            restored_from_digest: &proposal.restored_from_digest,
+            dataset_receipt_ids,
         },
     )
 }
@@ -948,6 +1189,8 @@ struct MergeReceiptDigestInput<'a> {
     previous_published_digest: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     restored_from_digest: &'a str,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    dataset_receipt_ids: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -972,6 +1215,9 @@ pub struct PreparedProposalDigestInput<'a> {
     /// Omitted when empty, so digests of earlier proposals are unchanged.
     #[serde(skip_serializing_if = "str::is_empty")]
     pub source_commit: &'a str,
+    /// Omitted when empty, so v1 proposal digests are unchanged.
+    #[serde(skip_serializing_if = "<[DatasetProposalAttachment]>::is_empty")]
+    pub dataset_proposals: &'a [DatasetProposalAttachment],
 }
 
 /// A Git object id: 7 to 64 lowercase hex digits (abbreviated, SHA-1 or SHA-256).
@@ -1021,6 +1267,8 @@ mod tests {
             idempotency_key: "propose-1".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
+            tenant: String::new(),
         }
     }
 
@@ -1032,8 +1280,8 @@ mod tests {
         ordered.eval_plan_digests = vec![digest('c'), digest('e')];
         let first = reversed.prepare().unwrap();
         let second = ordered.prepare().unwrap();
-        assert_eq!(first.2, second.2);
-        assert_eq!(first.0, vec![digest('c'), digest('e')]);
+        assert_eq!(first.request_digest, second.request_digest);
+        assert_eq!(first.eval_plan_digests, vec![digest('c'), digest('e')]);
     }
 
     #[test]
@@ -1102,6 +1350,7 @@ mod tests {
             major_revision: false,
             source_package_digest: String::new(),
             source_commit: String::new(),
+            dataset_proposals: Vec::new(),
         };
         proposal.proposal_digest = proposal_content_digest(&PreparedProposalDigestInput {
             namespace: &proposal.namespace,
@@ -1116,11 +1365,80 @@ mod tests {
             major_revision: false,
             source_package_digest: "",
             source_commit: "",
+            dataset_proposals: &[],
         })
         .unwrap();
         proposal.verify().unwrap();
         proposal.status = STATUS_CLOSED.into();
         proposal.verify().unwrap();
+    }
+
+    /// Attachments bump the contract to v2; without them the stored v1 body
+    /// and request digest are what older binaries already wrote.
+    #[test]
+    fn attachments_select_contract_v2_and_v1_stays_unchanged() {
+        // Pinned: the request digest a v1 binary computes for this request.
+        assert_eq!(
+            create_request().prepare().unwrap().request_digest,
+            "sha256:34902c5f002342da3fceb691b76d9800ecd991510e56efb8143f05435c148550"
+        );
+        let mut proposal = DefinitionProposal {
+            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            proposal_id: "cs-1".into(),
+            base_digest: digest('a'),
+            candidate_digest: digest('b'),
+            proposal_digest: String::new(),
+            eval_plan_digests: Vec::new(),
+            named_foreign_digests: Vec::new(),
+            approvals: Vec::new(),
+            status: STATUS_OPEN.into(),
+            created_by: "author".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            receipt_id: String::new(),
+            close_reason_code: String::new(),
+            restored_from_digest: String::new(),
+            migration_plan_digest: String::new(),
+            major_revision: false,
+            source_package_digest: String::new(),
+            source_commit: String::new(),
+            dataset_proposals: Vec::new(),
+        };
+        proposal.proposal_digest = proposal.content_digest().unwrap();
+        proposal.verify().unwrap();
+        assert!(
+            !serde_json::to_string(&proposal)
+                .unwrap()
+                .contains("dataset_proposals")
+        );
+
+        let v1 = proposal.clone();
+        proposal.dataset_proposals = vec![DatasetProposalAttachment {
+            dataset_id: "orders".into(),
+            proposal_id: digest('d'),
+            parent_version_id: "v1".into(),
+            branch_digest: digest('c'),
+            tenant: String::new(),
+        }];
+        proposal.proposal_digest = proposal.content_digest().unwrap();
+        assert_ne!(proposal.proposal_digest, v1.proposal_digest);
+        assert!(
+            proposal.verify().is_err(),
+            "attachments under v1 must not verify"
+        );
+        proposal.contract_version =
+            DefinitionProposal::contract_version_for(&proposal.dataset_proposals).into();
+        assert_eq!(proposal.contract_version, PROPOSAL_CONTRACT_VERSION_V2);
+        proposal.verify().unwrap();
+
+        let mut empty_v2 = v1;
+        empty_v2.contract_version = PROPOSAL_CONTRACT_VERSION_V2.into();
+        assert!(
+            empty_v2.verify().is_err(),
+            "v2 without attachments must not verify"
+        );
     }
 
     #[test]

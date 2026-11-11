@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS sekai_plan_reviews (
     submitted_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, plan_id)
 );
+CREATE INDEX IF NOT EXISTS idx_sekai_plan_reviews_pending
+    ON sekai_plan_reviews (namespace, decision, submitted_at_ms DESC, plan_id DESC);
 CREATE TABLE IF NOT EXISTS sekai_plan_executions (
     namespace TEXT NOT NULL,
     plan_id TEXT NOT NULL,
@@ -232,10 +234,42 @@ impl SekaiDb {
         .transpose()
     }
 
-    /// Records the decision only while the review is undecided; `false`
-    /// when another decision landed first.
+    /// Undecided reviews of `namespace`, newest first.
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT body_json FROM sekai_plan_reviews
+                 WHERE namespace = ?1 AND decision = ''
+                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![namespace, limit as i64, offset as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| decode(&row.map_err(|error| error.to_string())?))
+            .collect()
+    }
+
+    /// Records the decision only while the review is undecided, with its
+    /// audit row and receipt in the same transaction; `false`, writing
+    /// nothing, when another decision landed first.
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
-        self.conn()
+        let (audit, receipt) = review.decision_records();
+        crate::sekai::audit::validate_decision(&audit)?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let updated = tx
             .execute(
                 "UPDATE sekai_plan_reviews SET decision = ?3, body_json = ?4
                  WHERE namespace = ?1 AND plan_id = ?2 AND decision = ''",
@@ -246,8 +280,15 @@ impl SekaiDb {
                     encode(review)?
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        crate::sekai::ledger::insert_chained_decision(&tx, &audit)?;
+        crate::db::chisei_receipt_sqlite::upsert_operation_receipt(&tx, &receipt)?;
+        crate::db::receipt_chain::append_operation_receipt_chain(&tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
 
     pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
@@ -527,8 +568,32 @@ impl PostgresDb {
         .transpose()
     }
 
-    pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
         self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_plan_reviews
+                 WHERE namespace = $1 AND decision = ''
+                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT $2 OFFSET $3",
+                &[&namespace, &(limit as i64), &(offset as i64)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| decode(row.get(0)))
+            .collect()
+    }
+
+    pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {
+        let (audit, receipt) = review.decision_records();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let updated = tx
             .execute(
                 "UPDATE sekai_plan_reviews SET decision = $3, body_json = $4
                  WHERE namespace = $1 AND plan_id = $2 AND decision = ''",
@@ -539,8 +604,15 @@ impl PostgresDb {
                     &encode(review)?,
                 ],
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Ok(false);
+        }
+        crate::db::postgres_decision::insert_chained_decision(&mut tx, &audit)?;
+        self.upsert_operation_receipt_on(&mut tx, &receipt)?;
+        crate::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, &receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
     pub fn put_plan_execution(&self, execution: &PlanExecution) -> Result<PlanExecution, String> {
         self.connection()?
@@ -735,6 +807,16 @@ impl crate::db::runtime_db::RuntimeDb {
         plan_id: &str,
     ) -> Result<Option<PlanReview>, String> {
         dispatch!(self, db => db.get_plan_review(namespace, plan_id))
+    }
+
+    /// Undecided reviews of `namespace`, newest first (#2203).
+    pub fn list_pending_plan_reviews(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<PlanReview>, String> {
+        dispatch!(self, db => db.list_pending_plan_reviews(namespace, limit, offset))
     }
 
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {

@@ -420,9 +420,9 @@ projection, policy attestations, handoffs, retention, scoped content, and
 reconciliation. Remaining community PostgreSQL fail-closed surfaces are the
 shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
-(experimental ontology deletes and named admin projections) plus Chisei
-`PlanExecution` / `PlanContentExecution` (receipt persist with Kioku
-holdouts). See the parity guides.
+(experimental ontology deletes and named admin projections). Governed runs
+persist their receipts on both backends; Kioku memory retrieval and
+missing-execution-evidence alerts stay SQLite-only. See the parity guides.
 
 A checked-in `sekai.rpc-inventory/v1` inventory maps every public `SekaiService`
 RPC to shared backend evidence or an explicit computed/query implementation

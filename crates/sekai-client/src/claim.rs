@@ -1,17 +1,27 @@
-//! Versioned runtime-claim client for Action, isolated-process transform and
-//! agent-turn work.
+//! Versioned runtime-claim client for Action, isolated-process transform,
+//! agent-turn, export-delivery and Source sync work.
 //!
 //! Lives in `sekai-client` so Shikigami and kako pin one crate with
 //! `sekai-proto`. The plane remains authoritative; this module maps wire
 //! codes onto fence loss, contention, denial, and unavailability without
 //! embedding credentials or provider semantics.
 //!
+//! Every kind goes through the one claim family of ADR 0149
+//! (`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim`, `AckWork`);
+//! the per-kind methods narrow its `oneof` payloads. On a plane that does
+//! not serve that family, each call falls back to the per-kind RPC, so
+//! planes and workers upgrade in either order. Export delivery has no
+//! per-kind claim RPCs, nor has Source sync, so they need a plane that
+//! serves the family. Heartbeat and acknowledge carry the client's
+//! namespace, which Source sync needs because a Source id is unique only
+//! inside one namespace.
+//!
 //! `SdkError` does not retain arbitrary server status text. Allowlisted
 //! `delegator_*` tokens are kept as `reason_code` so claim and owned-claim
 //! RPCs can surface them instead of collapsing to contention or fence loss.
 //! Other owned-claim `FailedPrecondition` stays fence loss. Other initial
 //! `Claim*` `FailedPrecondition` stays contention. Empty-queue
-//! `ClaimTransformWork` is `NotFound` (idle); a targeted run_id that is gone
+//! transform `ClaimWork` is `NotFound` (idle); a targeted run_id that is gone
 //! or held is contention. Fence loss is never mapped to idle.
 //! Isolated `TransformWork.tenant_id` is the submitting quota owner. A
 //! JobSource keys kako quotas on that value and must not substitute
@@ -22,22 +32,29 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
+pub use crate::protocol::sekai::WorkKind;
 use crate::protocol::sekai::{
     AckActionWorkRequest, AckActionWorkResponse, AckAgentTurnRequest, AckAgentTurnResponse,
-    AgentTurn, AgentTurnContinuation, ApplyStreamingTransformBatchRequest,
+    AckWorkRequest, AckWorkResponse, ActionAckOptions, AgentTurn, AgentTurnAckOptions,
+    AgentTurnContinuation, AgentTurnWorkOptions, ApplyStreamingTransformBatchRequest,
     ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
     ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
-    ClaimTransformWorkResponse, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
-    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
-    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse,
+    ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, ConnectorSource,
+    ConnectorTypeRef, DeliverableExportArtifact, ExportDeliveryWorkOptions,
+    HeartbeatActionClaimRequest, HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest,
+    HeartbeatAgentTurnClaimResponse, HeartbeatTransformClaimRequest,
+    HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest, HeartbeatWorkClaimResponse,
     ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
-    ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
+    ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
+    ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
-    ReportActionClaimEventResponse, StreamingTransformInputPosition, StreamingTransformObjectEdit,
-    TransformLabel, TransformRunInputRow, WriteTransformRunResultRequest,
-    WriteTransformRunResultResponse,
+    ReportActionClaimEventResponse, SourceSyncWorkOptions, StreamingTransformInputPosition,
+    StreamingTransformObjectEdit, TransformLabel, TransformRunInputRow,
+    WriteTransformRunResultRequest, WriteTransformRunResultResponse, ack_work_request,
+    ack_work_response, claim_work_request, claim_work_response, claimable_work,
+    heartbeat_work_claim_response, list_claimable_work_request,
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -54,22 +71,28 @@ pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
 pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
 pub const DELEGATOR_RECORD_MISSING: &str = "delegator_record_missing";
 
+const LIST_WORK: &str = "/sekai.SekaiService/ListClaimableWork";
+const CLAIM_WORK: &str = "/sekai.SekaiService/ClaimWork";
+const HEARTBEAT_WORK: &str = "/sekai.SekaiService/HeartbeatWorkClaim";
+const ACK_WORK: &str = "/sekai.SekaiService/AckWork";
+// The per-kind paths: `DispatchKind` names them, and the client falls back
+// to them on a plane without the work family.
 const LIST_ACTION: &str = "/sekai.SekaiService/ListClaimableActionWork";
 const CLAIM_ACTION: &str = "/sekai.SekaiService/ClaimActionWork";
 const HEARTBEAT_ACTION: &str = "/sekai.SekaiService/HeartbeatActionClaim";
 const ACK_ACTION: &str = "/sekai.SekaiService/AckActionWork";
-const REPORT_ACTION: &str = "/sekai.SekaiService/ReportActionClaimEvent";
-const REGISTER_TRANSFORM_RUNTIME: &str = "/sekai.SekaiService/RegisterTransformRuntime";
-const LIST_TRANSFORM: &str = "/sekai.SekaiService/ListClaimableTransformWork";
-const CLAIM_TRANSFORM: &str = "/sekai.SekaiService/ClaimTransformWork";
 const HEARTBEAT_TRANSFORM: &str = "/sekai.SekaiService/HeartbeatTransformClaim";
-const READ_TRANSFORM: &str = "/sekai.SekaiService/ReadTransformRunInputs";
-const WRITE_TRANSFORM: &str = "/sekai.SekaiService/WriteTransformRunResult";
-const APPLY_STREAMING_TRANSFORM: &str = "/sekai.SekaiService/ApplyStreamingTransformBatch";
 const LIST_AGENT_TURN: &str = "/sekai.SekaiService/ListClaimableAgentTurns";
 const CLAIM_AGENT_TURN: &str = "/sekai.SekaiService/ClaimAgentTurn";
 const HEARTBEAT_AGENT_TURN: &str = "/sekai.SekaiService/HeartbeatAgentTurnClaim";
 const ACK_AGENT_TURN: &str = "/sekai.SekaiService/AckAgentTurn";
+const REPORT_ACTION: &str = "/sekai.SekaiService/ReportActionClaimEvent";
+const REGISTER_TRANSFORM_RUNTIME: &str = "/sekai.SekaiService/RegisterTransformRuntime";
+const LIST_TRANSFORM: &str = "/sekai.SekaiService/ListClaimableTransformWork";
+const CLAIM_TRANSFORM: &str = "/sekai.SekaiService/ClaimTransformWork";
+const READ_TRANSFORM: &str = "/sekai.SekaiService/ReadTransformRunInputs";
+const WRITE_TRANSFORM: &str = "/sekai.SekaiService/WriteTransformRunResult";
+const APPLY_STREAMING_TRANSFORM: &str = "/sekai.SekaiService/ApplyStreamingTransformBatch";
 
 /// Dispatch kind a worker lists or claims. Transform work uses the isolated
 /// JobSpec profile; Action work uses `runtime_dispatch`.
@@ -101,6 +124,23 @@ pub enum ClaimAttempt<T> {
     Claimed(T),
     Idle,
     Contended,
+}
+
+impl<T> ClaimAttempt<T> {
+    /// Keeps idle and contention and narrows a claim with `pick`; a claim
+    /// `pick` refuses is a response of the wrong kind.
+    fn narrow<U>(
+        self,
+        pick: impl FnOnce(T) -> Option<U>,
+    ) -> Result<ClaimAttempt<U>, RuntimeClaimError> {
+        match self {
+            Self::Claimed(claimed) => pick(claimed)
+                .map(ClaimAttempt::Claimed)
+                .ok_or_else(unexpected_response),
+            Self::Idle => Ok(ClaimAttempt::Idle),
+            Self::Contended => Ok(ClaimAttempt::Contended),
+        }
+    }
 }
 
 /// Typed claim-protocol failure. Fence loss stays distinct from idle,
@@ -154,43 +194,24 @@ impl RuntimeClaimError {
         }
     }
 
-    fn from_action_claim(error: SdkError) -> Result<ClaimAttempt<std::convert::Infallible>, Self> {
-        if let Some(reason) = error.reason_code {
-            return Err(Self::DelegatorRefused(reason));
-        }
-        match error.code {
-            SdkErrorCode::FailedPrecondition => Ok(ClaimAttempt::Contended),
-            _ => Err(Self::from_sdk(error, false)),
-        }
-    }
-
-    fn from_transform_claim(
+    /// One mapping for every kind's claim. An empty-queue `NotFound` is
+    /// idle. A targeted transform run or agent turn that is gone, and any
+    /// `FailedPrecondition` (held, finished, frozen), is contention. A
+    /// missing Action effect is neither: Action claims always name one.
+    fn from_claim<T>(
+        kind: WorkKind,
+        work_id: &str,
         error: SdkError,
-        run_id: &str,
-    ) -> Result<ClaimAttempt<std::convert::Infallible>, Self> {
+    ) -> Result<ClaimAttempt<T>, Self> {
         if let Some(reason) = error.reason_code {
             return Err(Self::DelegatorRefused(reason));
         }
         match error.code {
-            SdkErrorCode::NotFound if run_id.trim().is_empty() => Ok(ClaimAttempt::Idle),
-            SdkErrorCode::NotFound | SdkErrorCode::FailedPrecondition => {
-                Ok(ClaimAttempt::Contended)
+            SdkErrorCode::NotFound if kind != WorkKind::Action && work_id.trim().is_empty() => {
+                Ok(ClaimAttempt::Idle)
             }
-            _ => Err(Self::from_sdk(error, false)),
-        }
-    }
-
-    /// A targeted turn that is gone, held, finished, or refused because its
-    /// instance is frozen is contention, never fence loss or idle. An empty
-    /// `turn_id` NotFound is an empty queue.
-    fn from_agent_turn_claim<T>(error: SdkError, turn_id: &str) -> Result<ClaimAttempt<T>, Self> {
-        match error.code {
-            SdkErrorCode::NotFound if turn_id.trim().is_empty() => Ok(ClaimAttempt::Idle),
-            SdkErrorCode::NotFound | SdkErrorCode::FailedPrecondition
-                if error.reason_code.is_none() =>
-            {
-                Ok(ClaimAttempt::Contended)
-            }
+            SdkErrorCode::NotFound if kind != WorkKind::Action => Ok(ClaimAttempt::Contended),
+            SdkErrorCode::FailedPrecondition => Ok(ClaimAttempt::Contended),
             _ => Err(Self::from_sdk(error, false)),
         }
     }
@@ -251,6 +272,58 @@ impl AgentTurnFence {
             runtime_id: turn.claim_owner.clone(),
             generation: turn.claim_generation,
             fencing_token: turn.fencing_token.clone(),
+        }
+    }
+}
+
+/// A held claim of any kind: what heartbeat and acknowledge present. The
+/// per-kind fences convert into it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkFence {
+    pub kind: WorkKind,
+    /// The run, effect or turn id.
+    pub work_id: String,
+    pub runtime_id: String,
+    pub generation: i64,
+    pub fencing_token: String,
+}
+
+impl TryFrom<&ActionFence> for WorkFence {
+    type Error = RuntimeClaimError;
+
+    /// Fails for a generation past `i64::MAX`, which no plane hands out.
+    fn try_from(fence: &ActionFence) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: WorkKind::Action,
+            work_id: fence.effect_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            generation: i64::try_from(fence.generation)
+                .map_err(|_| RuntimeClaimError::Invalid(SdkError::invalid_argument()))?,
+            fencing_token: fence.fencing_token.clone(),
+        })
+    }
+}
+
+impl From<&TransformFence> for WorkFence {
+    fn from(fence: &TransformFence) -> Self {
+        Self {
+            kind: WorkKind::Transform,
+            work_id: fence.run_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+        }
+    }
+}
+
+impl From<&AgentTurnFence> for WorkFence {
+    fn from(fence: &AgentTurnFence) -> Self {
+        Self {
+            kind: WorkKind::AgentTurn,
+            work_id: fence.turn_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
         }
     }
 }
@@ -423,27 +496,507 @@ impl<'a> RuntimeClaimClient<'a> {
         Req: prost::Message + Default + Clone + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
-        self.client
-            .raw()
-            .unary(path, request, self.options(retryable))
+        self.call(path, request, retryable)
             .await
             .map_err(|error| RuntimeClaimError::from_sdk(error, owned_fence))
     }
 
-    async fn list_unary<Req, Resp>(
+    async fn call<Req, Resp>(
         &self,
         path: &str,
         request: Req,
-    ) -> Result<Resp, RuntimeClaimError>
+        retryable: bool,
+    ) -> Result<Resp, SdkError>
     where
         Req: prost::Message + Default + Clone + Send + 'static,
         Resp: prost::Message + Default + Send + 'static,
     {
         self.client
             .raw()
-            .unary(path, request, self.options(true))
+            .unary(path, request, self.options(retryable))
             .await
-            .map_err(RuntimeClaimError::from_list)
+    }
+
+    /// Lists claimable work of `kind` in the client's namespace. Agent turns
+    /// are listed with continuation support declared.
+    pub async fn list_work(
+        &self,
+        kind: WorkKind,
+        runtime_id: impl Into<String>,
+        limit: i32,
+    ) -> Result<Vec<claimable_work::Payload>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: kind.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: (kind == WorkKind::AgentTurn).then_some(
+                list_claimable_work_request::Options::AgentTurn(turn_options()),
+            ),
+        };
+        match self.call(LIST_WORK, request.clone(), true).await {
+            Ok(ListClaimableWorkResponse { work }) => {
+                Ok(work.into_iter().filter_map(|work| work.payload).collect())
+            }
+            Err(error) if unserved(&error) && has_per_kind_rpcs(kind) => {
+                self.list_per_kind(request).await
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(RuntimeClaimError::from_list)
+    }
+
+    /// Lists Source sync work this runtime may take, of the connector types
+    /// it implements (`(name, version)` pairs), so Sources of other types
+    /// never fill its page.
+    pub async fn list_source_sync_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<ConnectorSource>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::SourceSync.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::SourceSync(
+                SourceSyncWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::SourceSync(source)) => Some(source),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Lists export-delivery work a Source of one of `connector_types`
+    /// delivers (`(name, version)` pairs) and this runtime may take, so
+    /// artifacts left to other deliverers never fill its page. A plane
+    /// that predates the option lists every artifact.
+    pub async fn list_export_delivery_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<DeliverableExportArtifact>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::ExportDelivery.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::ExportDelivery(
+                ExportDeliveryWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::ExportDelivery(artifact)) => Some(artifact),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Claims `work_id` of `kind` in the client's namespace; an empty
+    /// `work_id` claims the next due transform run or agent turn. Action
+    /// claims need an idempotency key and get a fresh one when `request_id`
+    /// is `None`. A lost race is contention, an empty queue is idle.
+    pub async fn claim_work(
+        &self,
+        kind: WorkKind,
+        runtime_id: impl Into<String>,
+        work_id: impl Into<String>,
+        ttl: Duration,
+        request_id: Option<String>,
+    ) -> Result<ClaimAttempt<claim_work_response::Payload>, RuntimeClaimError> {
+        let request = ClaimWorkRequest {
+            kind: kind.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            work_id: work_id.into(),
+            ttl_ms: duration_millis(ttl)?,
+            request_id: match kind {
+                WorkKind::Action => request_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                _ => String::new(),
+            },
+            options: (kind == WorkKind::AgentTurn)
+                .then_some(claim_work_request::Options::AgentTurn(turn_options())),
+        };
+        let claimed = match self.call(CLAIM_WORK, request.clone(), false).await {
+            Ok(ClaimWorkResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) && has_per_kind_rpcs(kind) => {
+                self.claim_per_kind(request.clone()).await
+            }
+            Err(error) => Err(error),
+        };
+        match claimed {
+            Ok(payload) => Ok(ClaimAttempt::Claimed(payload)),
+            Err(error) => RuntimeClaimError::from_claim(kind, &request.work_id, error),
+        }
+    }
+
+    /// Extends the held claim `fence` by `ttl`.
+    pub async fn heartbeat_work(
+        &self,
+        fence: &WorkFence,
+        ttl: Duration,
+    ) -> Result<heartbeat_work_claim_response::Payload, RuntimeClaimError> {
+        let request = HeartbeatWorkClaimRequest {
+            kind: fence.kind.into(),
+            namespace: self.client.config().namespace.clone().unwrap_or_default(),
+            work_id: fence.work_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            claim_generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+            ttl_ms: duration_millis(ttl)?,
+        };
+        match self.call(HEARTBEAT_WORK, request.clone(), false).await {
+            Ok(HeartbeatWorkClaimResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) && has_per_kind_rpcs(fence.kind) => {
+                self.heartbeat_per_kind(request).await
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(|error| RuntimeClaimError::from_sdk(error, true))
+    }
+
+    /// Ends the held claim `fence` with `outcome` (`completed`, `failed` or
+    /// `parked`). Transform work is acknowledged by its write-back instead.
+    /// Agent-turn, export-delivery and source-sync acknowledges replay, so
+    /// only they retry.
+    pub async fn ack_work(
+        &self,
+        fence: &WorkFence,
+        outcome: &str,
+        reason: String,
+        options: Option<ack_work_request::Options>,
+    ) -> Result<ack_work_response::Payload, RuntimeClaimError> {
+        let request = AckWorkRequest {
+            kind: fence.kind.into(),
+            namespace: self.client.config().namespace.clone().unwrap_or_default(),
+            work_id: fence.work_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            claim_generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+            outcome: outcome.into(),
+            reason,
+            options,
+        };
+        let retryable = matches!(
+            fence.kind,
+            WorkKind::AgentTurn | WorkKind::ExportDelivery | WorkKind::SourceSync
+        );
+        match self.call(ACK_WORK, request.clone(), retryable).await {
+            Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
+            Err(error) if unserved(&error) && has_per_kind_rpcs(fence.kind) => {
+                self.ack_per_kind(request).await
+            }
+            Err(error) => Err(error),
+        }
+        .map_err(|error| RuntimeClaimError::from_sdk(error, true))
+    }
+
+    // Per-kind fallback for planes that predate the work family, so planes
+    // and workers upgrade in either order. Each mirrors the plane's own
+    // translation in `claimable_work_rpc.rs`. Remove with the per-kind RPCs
+    // at the next major.
+
+    async fn list_per_kind(
+        &self,
+        request: ListClaimableWorkRequest,
+    ) -> Result<Vec<claimable_work::Payload>, SdkError> {
+        use claimable_work::Payload;
+        let kind = request.kind();
+        let ListClaimableWorkRequest {
+            namespace,
+            runtime_id,
+            limit,
+            options,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => {
+                let listed: ListClaimableActionWorkResponse = self
+                    .call(
+                        LIST_ACTION,
+                        ListClaimableActionWorkRequest {
+                            namespace,
+                            runtime_id,
+                            limit: u32::try_from(limit)
+                                .map_err(|_| SdkError::invalid_argument())?,
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.effects.into_iter().map(Payload::Action).collect()
+            }
+            WorkKind::Transform => {
+                let listed: ListClaimableTransformWorkResponse = self
+                    .call(
+                        LIST_TRANSFORM,
+                        ListClaimableTransformWorkRequest {
+                            namespace,
+                            runtime_id,
+                            limit,
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.work.into_iter().map(Payload::Transform).collect()
+            }
+            WorkKind::AgentTurn => {
+                let listed: ListClaimableAgentTurnsResponse = self
+                    .call(
+                        LIST_AGENT_TURN,
+                        ListClaimableAgentTurnsRequest {
+                            namespace,
+                            limit,
+                            accepts_continuation: matches!(
+                                options,
+                                Some(list_claimable_work_request::Options::AgentTurn(options))
+                                    if options.accepts_continuation
+                            ),
+                        },
+                        true,
+                    )
+                    .await?;
+                listed.turns.into_iter().map(Payload::AgentTurn).collect()
+            }
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+                return Err(SdkError::invalid_argument());
+            }
+        })
+    }
+
+    async fn claim_per_kind(
+        &self,
+        request: ClaimWorkRequest,
+    ) -> Result<claim_work_response::Payload, SdkError> {
+        use claim_work_response::Payload;
+        let kind = request.kind();
+        let ClaimWorkRequest {
+            namespace,
+            runtime_id,
+            work_id,
+            ttl_ms,
+            request_id,
+            options,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => Payload::Action(
+                self.call(
+                    CLAIM_ACTION,
+                    ClaimActionWorkRequest {
+                        effect_id: work_id,
+                        runtime_id,
+                        request_id,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Transform => Payload::Transform(
+                self.call(
+                    CLAIM_TRANSFORM,
+                    ClaimTransformWorkRequest {
+                        namespace,
+                        runtime_id,
+                        run_id: work_id,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::AgentTurn => Payload::AgentTurn(
+                self.call(
+                    CLAIM_AGENT_TURN,
+                    ClaimAgentTurnRequest {
+                        namespace,
+                        runtime_id,
+                        turn_id: work_id,
+                        ttl_ms,
+                        accepts_continuation: matches!(
+                            options,
+                            Some(claim_work_request::Options::AgentTurn(options))
+                                if options.accepts_continuation
+                        ),
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+                return Err(SdkError::invalid_argument());
+            }
+        })
+    }
+
+    async fn heartbeat_per_kind(
+        &self,
+        request: HeartbeatWorkClaimRequest,
+    ) -> Result<heartbeat_work_claim_response::Payload, SdkError> {
+        use heartbeat_work_claim_response::Payload;
+        let kind = request.kind();
+        let HeartbeatWorkClaimRequest {
+            work_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            ttl_ms,
+            ..
+        } = request;
+        Ok(match kind {
+            WorkKind::Action => Payload::Action(
+                self.call(
+                    HEARTBEAT_ACTION,
+                    HeartbeatActionClaimRequest {
+                        effect_id: work_id,
+                        runtime_id,
+                        claim_generation: action_generation(claim_generation)?,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Transform => Payload::Transform(
+                self.call(
+                    HEARTBEAT_TRANSFORM,
+                    HeartbeatTransformClaimRequest {
+                        run_id: work_id,
+                        runtime_id,
+                        claim_generation,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::AgentTurn => Payload::AgentTurn(
+                self.call(
+                    HEARTBEAT_AGENT_TURN,
+                    HeartbeatAgentTurnClaimRequest {
+                        turn_id: work_id,
+                        runtime_id,
+                        claim_generation,
+                        fencing_token,
+                        ttl_ms,
+                    },
+                    false,
+                )
+                .await?,
+            ),
+            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+                return Err(SdkError::invalid_argument());
+            }
+        })
+    }
+
+    async fn ack_per_kind(
+        &self,
+        request: AckWorkRequest,
+    ) -> Result<ack_work_response::Payload, SdkError> {
+        use ack_work_response::Payload;
+        let kind = request.kind();
+        let AckWorkRequest {
+            work_id,
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            outcome,
+            reason,
+            options,
+            ..
+        } = request;
+        // As on the plane, omitted options are the kind's defaults.
+        Ok(match kind {
+            WorkKind::Action => {
+                let options = match options {
+                    None => ActionAckOptions::default(),
+                    Some(ack_work_request::Options::Action(options)) => options,
+                    Some(_) => return Err(SdkError::invalid_argument()),
+                };
+                Payload::Action(
+                    self.call(
+                        ACK_ACTION,
+                        AckActionWorkRequest {
+                            effect_id: work_id,
+                            runtime_id,
+                            claim_generation: action_generation(claim_generation)?,
+                            fencing_token,
+                            outcome,
+                            reason,
+                            request_id: options.request_id,
+                            checkpoint_store_id: options.checkpoint_store_id,
+                            checkpoint_ref: options.checkpoint_ref,
+                            checkpoint_digest: options.checkpoint_digest,
+                            artifact_json: options.artifact_json,
+                        },
+                        false,
+                    )
+                    .await?,
+                )
+            }
+            WorkKind::AgentTurn => {
+                let options = match options {
+                    None => AgentTurnAckOptions::default(),
+                    Some(ack_work_request::Options::AgentTurn(options)) => options,
+                    Some(_) => return Err(SdkError::invalid_argument()),
+                };
+                Payload::AgentTurn(
+                    self.call(
+                        ACK_AGENT_TURN,
+                        AckAgentTurnRequest {
+                            turn_id: work_id,
+                            runtime_id,
+                            claim_generation,
+                            fencing_token,
+                            outcome,
+                            reason,
+                            parked_action_instance_id: options.parked_action_instance_id,
+                        },
+                        true,
+                    )
+                    .await?,
+                )
+            }
+            _ => return Err(SdkError::invalid_argument()),
+        })
     }
 
     pub async fn list_action_work(
@@ -451,18 +1004,16 @@ impl<'a> RuntimeClaimClient<'a> {
         runtime_id: impl Into<String>,
         limit: u32,
     ) -> Result<Vec<crate::protocol::sekai::ActionEffect>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let listed: ListClaimableActionWorkResponse = self
-            .list_unary(
-                LIST_ACTION,
-                ListClaimableActionWorkRequest {
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    limit,
-                },
-            )
-            .await?;
-        Ok(listed.effects)
+        let limit = i32::try_from(limit)
+            .map_err(|_| RuntimeClaimError::Invalid(SdkError::invalid_argument()))?;
+        let listed = self.list_work(WorkKind::Action, runtime_id, limit).await?;
+        listed
+            .into_iter()
+            .map(|work| match work {
+                claimable_work::Payload::Action(effect) => Ok(effect),
+                _ => Err(unexpected_response()),
+            })
+            .collect()
     }
 
     pub async fn claim_action_work(
@@ -472,30 +1023,13 @@ impl<'a> RuntimeClaimClient<'a> {
         ttl: Duration,
         request_id: Option<String>,
     ) -> Result<ClaimAttempt<ClaimActionWorkResponse>, RuntimeClaimError> {
-        let ttl_ms = duration_millis(ttl)?;
-        let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        match self
-            .client
-            .raw()
-            .unary(
-                CLAIM_ACTION,
-                ClaimActionWorkRequest {
-                    effect_id: effect_id.into(),
-                    runtime_id: runtime_id.into(),
-                    request_id,
-                    ttl_ms,
-                },
-                self.options(false),
-            )
-            .await
-        {
-            Ok(response) => Ok(ClaimAttempt::Claimed(response)),
-            Err(error) => match RuntimeClaimError::from_action_claim(error)? {
-                ClaimAttempt::Idle => Ok(ClaimAttempt::Idle),
-                ClaimAttempt::Contended => Ok(ClaimAttempt::Contended),
-                ClaimAttempt::Claimed(_) => unreachable!("infallible claim mapping"),
-            },
-        }
+        let claimed = self
+            .claim_work(WorkKind::Action, runtime_id, effect_id, ttl, request_id)
+            .await?;
+        claimed.narrow(|payload| match payload {
+            claim_work_response::Payload::Action(response) => Some(response),
+            _ => None,
+        })
     }
 
     /// List then claim the next Action item. Empty list is idle. A lost race
@@ -520,19 +1054,13 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &ActionFence,
         ttl: Duration,
     ) -> Result<HeartbeatActionClaimResponse, RuntimeClaimError> {
-        self.unary(
-            HEARTBEAT_ACTION,
-            HeartbeatActionClaimRequest {
-                effect_id: fence.effect_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                ttl_ms: duration_millis(ttl)?,
-            },
-            false,
-            true,
-        )
-        .await
+        match self
+            .heartbeat_work(&WorkFence::try_from(fence)?, ttl)
+            .await?
+        {
+            heartbeat_work_claim_response::Payload::Action(response) => Ok(response),
+            _ => Err(unexpected_response()),
+        }
     }
 
     pub async fn ack_action(
@@ -540,57 +1068,49 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &ActionFence,
         ack: ActionAck,
     ) -> Result<AckActionWorkResponse, RuntimeClaimError> {
-        let request = match ack {
+        let (outcome, reason, options) = match ack {
             ActionAck::Completed {
                 reason,
                 artifact_json,
-            } => AckActionWorkRequest {
-                effect_id: fence.effect_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                outcome: "completed".into(),
+            } => (
+                "completed",
                 reason,
-                request_id: String::new(),
-                checkpoint_store_id: String::new(),
-                checkpoint_ref: String::new(),
-                checkpoint_digest: String::new(),
-                artifact_json,
-            },
-            ActionAck::Failed { reason } => AckActionWorkRequest {
-                effect_id: fence.effect_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                outcome: "failed".into(),
-                reason,
-                request_id: String::new(),
-                checkpoint_store_id: String::new(),
-                checkpoint_ref: String::new(),
-                checkpoint_digest: String::new(),
-                artifact_json: String::new(),
-            },
+                ActionAckOptions {
+                    artifact_json,
+                    ..Default::default()
+                },
+            ),
+            ActionAck::Failed { reason } => ("failed", reason, ActionAckOptions::default()),
             ActionAck::Parked {
                 reason,
                 request_id,
                 checkpoint_store_id,
                 checkpoint_ref,
                 checkpoint_digest,
-            } => AckActionWorkRequest {
-                effect_id: fence.effect_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                outcome: "parked".into(),
+            } => (
+                "parked",
                 reason,
-                request_id,
-                checkpoint_store_id,
-                checkpoint_ref,
-                checkpoint_digest,
-                artifact_json: String::new(),
-            },
+                ActionAckOptions {
+                    request_id,
+                    checkpoint_store_id,
+                    checkpoint_ref,
+                    checkpoint_digest,
+                    artifact_json: String::new(),
+                },
+            ),
         };
-        self.unary(ACK_ACTION, request, false, true).await
+        let acked = self
+            .ack_work(
+                &WorkFence::try_from(fence)?,
+                outcome,
+                reason,
+                Some(ack_work_request::Options::Action(options)),
+            )
+            .await?;
+        match acked {
+            ack_work_response::Payload::Action(response) => Ok(response),
+            _ => Err(unexpected_response()),
+        }
     }
 
     pub async fn report_action_event(
@@ -657,18 +1177,16 @@ impl<'a> RuntimeClaimClient<'a> {
         runtime_id: impl Into<String>,
         limit: i32,
     ) -> Result<Vec<crate::protocol::sekai::TransformWork>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let listed: ListClaimableTransformWorkResponse = self
-            .list_unary(
-                LIST_TRANSFORM,
-                ListClaimableTransformWorkRequest {
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    limit,
-                },
-            )
+        let listed = self
+            .list_work(WorkKind::Transform, runtime_id, limit)
             .await?;
-        Ok(listed.work)
+        listed
+            .into_iter()
+            .map(|work| match work {
+                claimable_work::Payload::Transform(work) => Ok(work),
+                _ => Err(unexpected_response()),
+            })
+            .collect()
     }
 
     pub async fn claim_transform_work(
@@ -677,45 +1195,24 @@ impl<'a> RuntimeClaimClient<'a> {
         run_id: impl Into<String>,
         ttl: Duration,
     ) -> Result<ClaimAttempt<ClaimTransformWorkResponse>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let run_id = run_id.into();
-        match self
-            .client
-            .raw()
-            .unary(
-                CLAIM_TRANSFORM,
-                ClaimTransformWorkRequest {
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    run_id: run_id.clone(),
-                    ttl_ms: duration_millis(ttl)?,
-                },
-                self.options(false),
-            )
-            .await
-        {
-            Ok(response) => Ok(ClaimAttempt::Claimed(response)),
-            Err(error) => match RuntimeClaimError::from_transform_claim(error, &run_id)? {
-                ClaimAttempt::Idle => Ok(ClaimAttempt::Idle),
-                ClaimAttempt::Contended => Ok(ClaimAttempt::Contended),
-                ClaimAttempt::Claimed(_) => unreachable!("infallible claim mapping"),
-            },
-        }
+        let claimed = self
+            .claim_work(WorkKind::Transform, runtime_id, run_id, ttl, None)
+            .await?;
+        claimed.narrow(|payload| match payload {
+            claim_work_response::Payload::Transform(response) => Some(response),
+            _ => None,
+        })
     }
 
     pub async fn list_agent_turns(&self, limit: i32) -> Result<Vec<AgentTurn>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let listed: ListClaimableAgentTurnsResponse = self
-            .list_unary(
-                LIST_AGENT_TURN,
-                ListClaimableAgentTurnsRequest {
-                    namespace,
-                    limit,
-                    accepts_continuation: true,
-                },
-            )
-            .await?;
-        Ok(listed.turns)
+        let listed = self.list_work(WorkKind::AgentTurn, "", limit).await?;
+        listed
+            .into_iter()
+            .map(|work| match work {
+                claimable_work::Payload::AgentTurn(turn) => Ok(turn),
+                _ => Err(unexpected_response()),
+            })
+            .collect()
     }
 
     /// Claims `turn_id`. A turn that is gone, held, finished, or refused
@@ -727,28 +1224,21 @@ impl<'a> RuntimeClaimClient<'a> {
         turn_id: impl Into<String>,
         ttl: Duration,
     ) -> Result<ClaimAttempt<ClaimedAgentTurn>, RuntimeClaimError> {
-        let namespace = self.namespace()?.to_string();
-        let turn_id = turn_id.into();
-        match self
-            .client
-            .raw()
-            .unary::<_, ClaimAgentTurnResponse>(
-                CLAIM_AGENT_TURN,
-                ClaimAgentTurnRequest {
-                    namespace,
-                    runtime_id: runtime_id.into(),
-                    turn_id: turn_id.clone(),
-                    ttl_ms: duration_millis(ttl)?,
-                    accepts_continuation: true,
-                },
-                self.options(false),
-            )
-            .await
-        {
-            Ok(response) => Ok(ClaimedAgentTurn::from_response(response)
-                .map_or(ClaimAttempt::Contended, ClaimAttempt::Claimed)),
-            Err(error) => RuntimeClaimError::from_agent_turn_claim(error, &turn_id),
-        }
+        let claimed = self
+            .claim_work(WorkKind::AgentTurn, runtime_id, turn_id, ttl, None)
+            .await?;
+        // A response without its turn cannot be worked, so it is contention.
+        Ok(
+            match claimed.narrow(|payload| match payload {
+                claim_work_response::Payload::AgentTurn(response) => Some(response),
+                _ => None,
+            })? {
+                ClaimAttempt::Claimed(response) => ClaimedAgentTurn::from_response(response)
+                    .map_or(ClaimAttempt::Contended, ClaimAttempt::Claimed),
+                ClaimAttempt::Idle => ClaimAttempt::Idle,
+                ClaimAttempt::Contended => ClaimAttempt::Contended,
+            },
+        )
     }
 
     /// Claims the next due turn. An empty queue is idle. The plane picks and
@@ -766,19 +1256,10 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &AgentTurnFence,
         ttl: Duration,
     ) -> Result<HeartbeatAgentTurnClaimResponse, RuntimeClaimError> {
-        self.unary(
-            HEARTBEAT_AGENT_TURN,
-            HeartbeatAgentTurnClaimRequest {
-                turn_id: fence.turn_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                ttl_ms: duration_millis(ttl)?,
-            },
-            false,
-            true,
-        )
-        .await
+        match self.heartbeat_work(&WorkFence::from(fence), ttl).await? {
+            heartbeat_work_claim_response::Payload::AgentTurn(response) => Ok(response),
+            _ => Err(unexpected_response()),
+        }
     }
 
     /// Finishes the turn; the response carries its receipt. Retrying with
@@ -796,21 +1277,20 @@ impl<'a> RuntimeClaimClient<'a> {
                 reason,
             } => ("parked", reason, action_instance_id),
         };
-        self.unary(
-            ACK_AGENT_TURN,
-            AckAgentTurnRequest {
-                turn_id: fence.turn_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                outcome: outcome.into(),
+        let acked = self
+            .ack_work(
+                &WorkFence::from(fence),
+                outcome,
                 reason,
-                parked_action_instance_id,
-            },
-            true,
-            true,
-        )
-        .await
+                Some(ack_work_request::Options::AgentTurn(AgentTurnAckOptions {
+                    parked_action_instance_id,
+                })),
+            )
+            .await?;
+        match acked {
+            ack_work_response::Payload::AgentTurn(response) => Ok(response),
+            _ => Err(unexpected_response()),
+        }
     }
 
     pub async fn heartbeat_transform(
@@ -818,19 +1298,10 @@ impl<'a> RuntimeClaimClient<'a> {
         fence: &TransformFence,
         ttl: Duration,
     ) -> Result<HeartbeatTransformClaimResponse, RuntimeClaimError> {
-        self.unary(
-            HEARTBEAT_TRANSFORM,
-            HeartbeatTransformClaimRequest {
-                run_id: fence.run_id.clone(),
-                runtime_id: fence.runtime_id.clone(),
-                claim_generation: fence.generation,
-                fencing_token: fence.fencing_token.clone(),
-                ttl_ms: duration_millis(ttl)?,
-            },
-            false,
-            true,
-        )
-        .await
+        match self.heartbeat_work(&WorkFence::from(fence), ttl).await? {
+            heartbeat_work_claim_response::Payload::Transform(response) => Ok(response),
+            _ => Err(unexpected_response()),
+        }
     }
 
     pub async fn read_transform_inputs(
@@ -933,6 +1404,51 @@ impl<'a> RuntimeClaimClient<'a> {
     }
 }
 
+/// A response without its kind's payload, or with another kind's.
+/// Whether a work-family call may have hit a plane without that family.
+/// Such a plane answers `Unimplemented` (see `UNSERVED_RPC_MESSAGE` in the
+/// crate root for its maturity gate), or its auth refuses the unknown method
+/// first with `PermissionDenied`: runtime tokens on heartbeat and acknowledge,
+/// enterprise-scoped credentials on every call. The per-kind RPC runs its own
+/// auth, so a real denial still comes back denied, one call later.
+/// Whether `kind` predates the work family and has its own claim RPCs to
+/// fall back to. Export delivery and Source sync are claimable only through
+/// the family.
+fn has_per_kind_rpcs(kind: WorkKind) -> bool {
+    matches!(
+        kind,
+        WorkKind::Action | WorkKind::Transform | WorkKind::AgentTurn
+    )
+}
+
+fn unserved(error: &SdkError) -> bool {
+    matches!(
+        error.code,
+        SdkErrorCode::Unimplemented | SdkErrorCode::PermissionDenied
+    )
+}
+
+/// A work-family response without its `oneof` payload.
+fn missing_payload() -> SdkError {
+    SdkError::new(SdkErrorCode::Internal)
+}
+
+/// Action RPCs carry the claim generation unsigned.
+fn action_generation(generation: i64) -> Result<u64, SdkError> {
+    u64::try_from(generation).map_err(|_| SdkError::invalid_argument())
+}
+
+fn unexpected_response() -> RuntimeClaimError {
+    RuntimeClaimError::Transport(SdkError::new(SdkErrorCode::Internal))
+}
+
+/// This client resumes parked turns from their continuation.
+fn turn_options() -> AgentTurnWorkOptions {
+    AgentTurnWorkOptions {
+        accepts_continuation: true,
+    }
+}
+
 fn duration_millis(duration: Duration) -> Result<i64, RuntimeClaimError> {
     let millis = i64::try_from(duration.as_millis())
         .map_err(|_| RuntimeClaimError::Invalid(SdkError::invalid_argument()))?;
@@ -1005,9 +1521,12 @@ mod tests {
 
     #[test]
     fn initial_failed_precondition_is_contention() {
-        let mapped =
-            RuntimeClaimError::from_action_claim(SdkError::new(SdkErrorCode::FailedPrecondition))
-                .expect("contention is a claim attempt");
+        let mapped = RuntimeClaimError::from_claim::<()>(
+            WorkKind::Action,
+            "effect-1",
+            SdkError::new(SdkErrorCode::FailedPrecondition),
+        )
+        .expect("contention is a claim attempt");
         assert!(matches!(mapped, ClaimAttempt::Contended));
     }
 
@@ -1019,10 +1538,11 @@ mod tests {
 
     #[test]
     fn claim_delegator_refusal_is_not_contention() {
-        let error = RuntimeClaimError::from_action_claim(sdk_with_reason(
-            SdkErrorCode::FailedPrecondition,
-            DELEGATOR_DISABLED,
-        ))
+        let error = RuntimeClaimError::from_claim::<()>(
+            WorkKind::Action,
+            "effect-1",
+            sdk_with_reason(SdkErrorCode::FailedPrecondition, DELEGATOR_DISABLED),
+        )
         .expect_err("delegator refusal is not a claim attempt");
         assert!(
             matches!(
@@ -1066,28 +1586,35 @@ mod tests {
     fn agent_turn_claim_refusals_are_contention() {
         for code in [SdkErrorCode::NotFound, SdkErrorCode::FailedPrecondition] {
             assert_eq!(
-                RuntimeClaimError::from_agent_turn_claim::<()>(SdkError::new(code), "turn-1"),
+                RuntimeClaimError::from_claim::<()>(
+                    WorkKind::AgentTurn,
+                    "turn-1",
+                    SdkError::new(code)
+                ),
                 Ok(ClaimAttempt::Contended)
             );
         }
         assert_eq!(
-            RuntimeClaimError::from_agent_turn_claim::<()>(
-                SdkError::new(SdkErrorCode::NotFound),
-                ""
+            RuntimeClaimError::from_claim::<()>(
+                WorkKind::AgentTurn,
+                "",
+                SdkError::new(SdkErrorCode::NotFound)
             ),
             Ok(ClaimAttempt::Idle)
         );
         assert!(matches!(
-            RuntimeClaimError::from_agent_turn_claim::<()>(
-                SdkError::new(SdkErrorCode::Unavailable),
-                "turn-1"
+            RuntimeClaimError::from_claim::<()>(
+                WorkKind::AgentTurn,
+                "turn-1",
+                SdkError::new(SdkErrorCode::Unavailable)
             ),
             Err(RuntimeClaimError::Unavailable(_))
         ));
         assert!(matches!(
-            RuntimeClaimError::from_agent_turn_claim::<()>(
-                SdkError::new(SdkErrorCode::InvalidArgument),
-                "turn-1"
+            RuntimeClaimError::from_claim::<()>(
+                WorkKind::AgentTurn,
+                "turn-1",
+                SdkError::new(SdkErrorCode::InvalidArgument)
             ),
             Err(RuntimeClaimError::Invalid(_))
         ));
@@ -1133,17 +1660,23 @@ mod tests {
 
     #[test]
     fn transform_not_found_is_idle_not_fence_lost() {
-        let mapped =
-            RuntimeClaimError::from_transform_claim(SdkError::new(SdkErrorCode::NotFound), "")
-                .expect("idle is a claim attempt");
+        let mapped = RuntimeClaimError::from_claim::<()>(
+            WorkKind::Transform,
+            "",
+            SdkError::new(SdkErrorCode::NotFound),
+        )
+        .expect("idle is a claim attempt");
         assert!(matches!(mapped, ClaimAttempt::Idle));
     }
 
     #[test]
     fn targeted_transform_not_found_is_contention() {
-        let mapped =
-            RuntimeClaimError::from_transform_claim(SdkError::new(SdkErrorCode::NotFound), "run-1")
-                .expect("targeted miss is contention");
+        let mapped = RuntimeClaimError::from_claim::<()>(
+            WorkKind::Transform,
+            "run-1",
+            SdkError::new(SdkErrorCode::NotFound),
+        )
+        .expect("targeted miss is contention");
         assert!(matches!(mapped, ClaimAttempt::Contended));
     }
 
@@ -1156,8 +1689,12 @@ mod tests {
 
     #[test]
     fn action_not_found_is_not_idle() {
-        let error = RuntimeClaimError::from_action_claim(SdkError::new(SdkErrorCode::NotFound))
-            .unwrap_err();
+        let error = RuntimeClaimError::from_claim::<()>(
+            WorkKind::Action,
+            "effect-1",
+            SdkError::new(SdkErrorCode::NotFound),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, RuntimeClaimError::Transport(_)),
             "missing Action effect is not an empty queue: {error}"

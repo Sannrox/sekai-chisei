@@ -745,6 +745,25 @@ impl PostgresDb {
         )
     }
 
+    /// As on SQLite.
+    pub fn list_source_identities(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT DISTINCT source_instance, type_digest FROM sekai_source_bindings
+                 WHERE namespace = $1 ORDER BY source_instance, type_digest LIMIT $2",
+                &[&namespace, &i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
     pub fn list_source_batch_transactions(
         &self,
         namespace: &str,

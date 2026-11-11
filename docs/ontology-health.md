@@ -16,11 +16,12 @@ part is never averaged away behind healthy ones.
 | `lint` | share of published members without a lint error or warning | the [ontology lint](ontology-lint.md) findings, errors and warnings first; only errors and warnings about a published member lower the score |
 | `trust` | unavailable (`not_stored`) | trust scores are computed per object on request by `ScoreObjectTrust` and not stored |
 | `access` | share of grants on the namespace and its objects in good standing | `expired`: past its end date; `unreviewed`: no purpose or end date while the namespace policy requires terms, and no recorded exception |
+| `source` | share of visible sources `healthy` by [source health](source-health.md) | `delayed`, `blocked`, `unavailable`: the source's class, named `source_instance@type_digest` |
 
 A part with nothing to score scores 100. A part is `available: false` with
 an `unavailable_reason` when the server cannot compute it or the caller may
 not see it, and it leaves the total. `complete: false` means its inputs were
-capped (500 datasets, 10,000 grants of the namespace, or the lint caps), so the score may be
+capped (500 datasets, 500 sources, 10,000 grants of the namespace, or the lint caps), so the score may be
 too high.
 
 ## Visibility
@@ -34,7 +35,11 @@ tenant-wide call leaves the namespace out. Every part reads as the caller:
   `GetOntologyLintReport` with the caller's own request;
 - access needs administration of the namespace boundary, and counts each
   grant only when `ListGrants` would show it for its target; a grant it
-  would not show makes the part incomplete.
+  would not show makes the part incomplete;
+- sources as `GetSourceSyncState` shows them: each source bound in the
+  namespace whose type the namespace still admits, scored by the same
+  projector as `GetSourceHealth` with the default delay. Nothing new is
+  stored.
 
 A tenant-wide call scores at most 20 namespaces and says `complete: false`
 past that.
@@ -42,16 +47,30 @@ past that.
 ## Trends and threshold events
 
 `RecordOntologyHealthSnapshot` stores the part scores of one namespace for
-the window holding the current time. The plane runs no scheduler: an
-external periodic caller drives it and carries the schedule in each call
-(`window_ms`, at least one minute; `retention_ms`, at least one window;
-`threshold`, 0-100). Only the namespace's administrator records, so a
-snapshot scores what the namespace holds. Problems are not stored.
+the window holding the current time. Each call carries the window
+(`window_ms`, at least one minute), the retention (`retention_ms`, at least
+one window) and the threshold (`threshold`, 0-100). Only the namespace's
+administrator records, so a snapshot scores what the namespace holds.
+Problems are not stored.
+
+A stored schedule records with no caller outside the plane (#2192).
+`PutOntologyHealthSchedule` saves one schedule per namespace with the same
+window, retention and threshold. Only the namespace's administrator may put
+it, outside a tenant assertion, and snapshots record as that administrator.
+`DeleteOntologyHealthSchedule` stops it and keeps the trend.
+`ListOntologyHealthTrend` returns the schedule to the namespace's
+administrator. The schedule is a member of the transform schedule graph:
+`TickGovernedTransforms` records each due window, scored and authorized as
+the recorder at that moment (see [governed-transforms.md](governed-transforms.md)).
+If the recorder is refused, for example because their administration was
+revoked, the tick fails with `FAILED_PRECONDITION`. The schedule then halts
+with `last_error` and is not tried again until a put replaces it. On-demand
+calls still work alongside the schedule.
 
 - Recording is idempotent per (namespace, window): the window's first
   record is kept, and every later or concurrent call, including a retry
-  after a crash past commit, returns it with `replay: true` and writes
-  nothing.
+  after a crash past commit or a tick racing an on-demand call, returns it
+  with `replay: true` and writes nothing.
 - A window older than the latest recorded one is refused
   (`FAILED_PRECONDITION`), so the trend stays ordered.
 - When the total falls below the threshold, a `below_threshold` event is
@@ -64,14 +83,21 @@ snapshot scores what the namespace holds. Problems are not stored.
 snapshots and events, oldest first. A part the reader may not see now is
 left out of the snapshot: one that reads `not_permitted` to them on
 `GetOntologyHealth`; a dataset part (freshness, quality) scored from a
-dataset they may not read; and a contract part scored from a definition
-revision they may not read. The snapshot stores which datasets and which
-revision fed those parts, never returned. Lint and access count only the
+dataset they may not read; a contract part scored from a definition
+revision they may not read; and a source part scored from a source they may
+not see now. The snapshot stores which datasets, which revision and which
+sources fed those parts, never returned. A degrading source lowers the
+source part, and so the snapshot's score, from the existing tables. Lint and access count only the
 objects, links and grants the recorder could see, which a stored score
 cannot prove for anyone else, so they show only to the principal that
 recorded the snapshot. Each snapshot's `score` is the lowest of the parts
 shown. An event shows
 only when the reader may see every part its score was taken from.
+
+The source part's inputs start with the `sekai.source-health/v1` contract
+name, which names no dataset. A binary from before the source part reads
+every input as a dataset, so during a rolling deploy it hides the source
+part, and the events it fed, rather than show them unchecked.
 
 ## Not covered
 

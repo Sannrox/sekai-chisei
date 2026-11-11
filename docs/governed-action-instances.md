@@ -113,6 +113,13 @@ reviewed as one bundle, not one Action at a time.
 - The same decision again replays (`replay`); the other decision is
   `plan_review_already_decided`. The first decision of two concurrent ones
   wins.
+- The transaction that records a decision also writes one audit row
+  (action `plan_review.decide`, target the plan id, with the namespace,
+  simulation, digest and decision as evidence) and one receipt (operation
+  `plan-review:<namespace>:<plan id>`, class `plan_review.decide`) whose
+  `approval_decided` event names the decider, decision, reason, plan and
+  digest. Policy, routing and budget stay uncovered on it: each step decides
+  them at execution. A replay or a losing decision writes neither.
 - `GetPlan` returns the review with the plan. Routing can depend on
   parameters, so the review names only the queues of steps the reader may
   see.
@@ -310,6 +317,24 @@ marking clearance, entitlement and review-queue placement. Those checks
 replace the namespace read check, as they do for a decision. An instance
 the caller may not decide is absent, and a caller who may decide nothing
 gets an empty list.
+
+`ListPendingDecisions` (#2203, experimental) is the inbox across review
+kinds: parked Action instances, plan reviews, open definition proposals and
+open dataset branch merge proposals in one namespace. Each kind is filtered
+by the check its decide RPC applies (`DecideActionInstance`,
+`DecidePlanReview`, `ApproveDefinitionProposal`, `MergeDatasetBranch`),
+including that RPC's space role, so an item is listed only when that RPC
+would accept the caller. A definition proposal the caller already approved
+is not listed. A dataset proposal is listed under the namespace of its
+dataset's binding object and carries `dataset_id`; one attached to an open
+definition proposal or naming a change bundle is merged through the
+proposal, so it is absent. Freshness preconditions, such as a moved branch
+base or a changed target object, are left to the decide RPC. Kinds come in
+enum order, newest first within a kind; `next_page_token` resumes after the
+last item of a full page. `sekaictl inbox --namespace <ns>` merges this list
+with Chisei's open memory candidates and proposed learning changes. Against
+a plane without the RPC it falls back to `ListActionInstances` with
+`decidable_by_caller`.
 
 - **Who decides.** A principal listed in the type's `approvers`, or, when the
   type declares none, a namespace administrator. The submitter never decides

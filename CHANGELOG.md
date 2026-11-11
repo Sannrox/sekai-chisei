@@ -6,6 +6,91 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 3.0.0
+
+Upgrade notes:
+
+- Rust library consumers must update `sekai-proto` to 3.0.0, `sekai-core` to 4.0.0, and `chisei-core` to 3.0.0. Removed modules, regenerated proto types, and new struct fields break exhaustive literals and matches. Server and protocol family version is 3.0.0. Tenkai products move to `chisei.admin-rpc` 1.1.0; `chisei.enterprise-rpc` stays 1.0.0.
+- Back up both stores before the first 3.0.0 boot. PostgreSQL applies migration files `0144_external_action_reclaim_index.sql` through `0155_embedding_rebuild_cursor.sql`, including the drop of the fence and geo feed tables (`0145`) and the search index copy (`0154`). SQLite applies the same changes on open. A binary or image rollback to 2.0.0 does not undo applied schema.
+- The search index migration copies the legacy index into new tables, so search index storage roughly doubles until a later release drops the legacy tables (#2254).
+- The in-plane fence binding and geo feed are gone. Their tables are dropped and stored bindings and feeds are not migrated. The experimental RPCs `PutFenceBinding`, `RunFenceBinding`, `PutEzuGeoFeed`, `RunEzuGeoFeed`, and `BackfillEzuGeoFeed` are removed, and `SEKAI_EZU_URL` and `EZU_TOKEN` are ignored (#2181).
+- The in-plane feedback workers are gone. Remove `SEKAI_FEEDBACK_GITHUB_*` and `SEKAI_FEEDBACK_QUALITY_*`; they are ignored. To keep investigating observations or publishing issues, run the reference adapters as an external runtime (#2177, #2178).
+- Feedback producers move to package v2 and emit `operation_id`, `observed_at_ms`, and a non-blank `scope`. Namespaces left on v1 keep their v1 types (#2179).
+- `AdmitGovernedDocument` takes `GovernedDocumentAdmission`, and `AttachGovernedDocumentRendition` takes `DocumentRenditionAttachment`. Regenerate clients from `proto/sekai.proto`. In `sekaictl admin documents admit --document` files, drop `admitted_by`, `admitted_at_ms`, and `deleted_at_ms`; `owner` is optional and must name the caller, or the admission is refused. In `attach-rendition --rendition` files, drop `attached_by` and `attached_at_ms` (#2267, #2268, #2272).
+- The seven governed-document RPCs, `Search`, and `GetSearchIndexStatus` are stable. They no longer need `SEKAI_EXPERIMENTAL_RPCS=1`, and the document RPCs are served over HTTP/JSON (#2258, #2268).
+- Operators who activate a namespace classification lattice must keep the tokens stored documents in that namespace use. A document whose marking the lattice does not name is invisible until the lattice includes it (#2267).
+- `Search` page tokens are opaque. Send back `next_page_token` with the same request; a numeric offset now returns `INVALID_ARGUMENT` (#2256).
+- `PutEmbeddingSpec` refuses specs over the new limits. A stored spec over a limit keeps its vectors but is refused on the next catch-up until it is changed (#2261).
+- `sekaictl admin sync health --actor` is retired. The command needs a running plane started with `SEKAI_EXPERIMENTAL_RPCS=1` (#2221).
+- During a rolling deploy from 2.0.0, old replicas keep their feedback workers until replaced, their fence and geo feed RPCs fail once the tables are gone, and they may still overwrite a conflicting rendition. Both versions read the same data.
+
+### Security
+
+- Governed-document RPCs authorize the namespace, tenant context, service-principal scope, shared space, and team-namespace membership before the store (#2249). Versions from 2.0.0 skipped these checks.
+- Move to rusqlite 0.41 for RUSTSEC-2026-0459 (#2237).
+
+### Breaking
+
+- Remove the in-plane feedback workers (#2178).
+- Count operations on observed time per scope in package v2 (#2179).
+- Remove the in-plane Ezu fence bindings and geo feed (#2181).
+- Share one decider check between parked Actions and plan steps (#2214).
+- Attach dataset branch proposals to a definition proposal and merge them atomically (#2215).
+- Claim saved-export deliveries as the export_delivery work kind (#2219).
+- Record ontology health snapshots from the transform schedule graph (#2220).
+- Source part in namespace health and a source health RPC (#2221).
+- Show attached dataset proposals on a definition proposal (#2224).
+- Source admin RPCs and source_sync on the work claim family (#2230).
+- Connector runtime that claims Source sync work (#2231).
+- Source batches name their Source (#2232).
+- Sources deliver saved exports through their runtime (#2233).
+- Sync GitHub Sources through the runtime (#2234).
+- Opaque query-bound page cursor for Search (#2256).
+- Bound Search query cost and add PostgreSQL RPC tests (#2257).
+- Resumable embedding rebuild, spec limits and ListEmbeddingSpecs paging (#2261).
+- Namespace lattice and admission input for governed documents (#2267).
+- Promote governed-document RPCs to stable (#2268).
+- Refuse a document admission that names another owner (#2272).
+
+### Upgrade
+
+- Index expired reserved authorization reclaim (#2171).
+- Fenced scheduled worker for search index catch-up (#2254).
+
+### Added
+
+- Run investigation and GitHub publication as adapters (#2177).
+- One claimable-work RPC family over every kind (#2210).
+- One claim client over the work family (#2211).
+- List pending decisions across review kinds (#2223).
+- Connector type contract (#2227).
+- Store Sources on SQLite and PostgreSQL (#2228).
+- Source sync as a claimable work kind (#2229).
+- Deliver saved exports into relational Sources (#2235).
+- Reference receiver for signed feedback observation webhooks (#2239).
+
+### Changed
+
+- Transaction-scoped dataset branch merge (#2208).
+- One claim engine for transform, action and agent-turn work (#2207).
+
+### Fixed
+
+- Publish only investigation-runtime findings (#2170).
+- Template public feedback issues (#2173).
+- Ignore foreign feedback mapping ids (#2175).
+- Report proto breaks already on the base as a notice (#2206).
+- Refuse self-approval of learning changes (#2205).
+- Refuse a direct merge of a change-bundle proposal (#2209).
+- Schedule dataset health checks on the transform schedule graph (#2213).
+- Bound retention of consumer violation notifications (#2217).
+- Record plan review decisions on the audit trail (#2216).
+- Make criticality outbox events durable and bounded (#2218).
+- Read image digest without an early-exit pipeline (#2240).
+- Report Search capabilities active without the experimental flag (#2258).
+- Boot on PostgreSQL without the source tree on disk (#2262).
+- Persist governed-run receipts with Kioku holdouts on PostgreSQL (#2265).
+
 ## 2.0.0
 
 Upgrade notes:
@@ -100,6 +185,11 @@ Upgrade notes:
 
 ## 1.4.0
 
+This section was regenerated after release (#2045). The original 1.4.0 notes
+relabelled the whole previous Unreleased body, so they repeated changes that
+shipped in 1.1.0 to 1.3.0 and missed several operator-visible changes listed
+below.
+
 Upgrade notes:
 
 - Rust library consumers must update `sekai-client` to 0.2.0 and
@@ -107,846 +197,341 @@ Upgrade notes:
   registration fields, acknowledgement variants and moved store methods break
   the previous library API. `sekai-source-sdk` advances to 1.4.0. Server and
   protocol versions remain 1.4.0; these libraries have independent versions.
-
-- Community SQLite and PostgreSQL apply new schema on startup. Backup the store before the first 1.4.0 boot. This release carries migrations (`GATE:mig`).
-- Guest contexts are denied unless an installed identity extension admits them. Extensions must populate `home_tenant`, return `GuestGrant`, and implement `authorize_discovery` (`GATE:break`, #1432, #1433, #1435). Community installs without an extension keep existing credential behavior.
-- Optional `deny_unmarked` stays off. Enable with namespace property `deny_unmarked=true` or `SEKAI_DENY_UNMARKED=1` (#1430).
-- A binary or image rollback to 1.3.0 does not undo applied schema. Restore from backup.
-- Sync and devices: a device-bound credential must send the device's proof
-  on `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas`, so a copied
-  credential without the key is refused. A revoked device's wipe-only
-  assertion (`device.wipe`) gets `wipe_required` and no data on sync reads,
-  and is refused everywhere else (ADR 0126, #1634).
-
-- Local twins: `sekai::synthetic_shape` extracts a `sekai.twin-shape/v1`
-  shape from a tenant (definitions, counts, marking shares, numeric ranges,
-  link counts; no string or individual value), and a
-  `ShapeDomain` lets the synthetic generator build a twin from it
-  deterministically (docs/local-twins.md, #1735).
-- Offline sync purges: a change in what the caller may read no longer ends
-  the cursor. The next delta purges objects the caller lost whole and
-  properties it lost alone (`purges`). Scopes may set `max_offline_age_ms`,
-  and snapshots and deltas return `offline_until_ms`. A reference replica
-  is in `sekai_client::sync_replica` (ADR 0128, PostgreSQL migration
-  `0097_sync_member_properties`, #1633).
-- Experimental `DryRunDefinitionChangeBundle` runs a change bundle's
-  backfill on a dataset branch per backed object type, named for the bundle
-  digest, and reports row counts and marking-aware samples; the datasets
-  themselves are never written (docs/definition-change-bundles.md, #1692).
-
-- Query embedding for vector search: `embed_query` embeds a query through
-  the stored spec's admitted route and refuses a route whose model or
-  version differs from the indexed vectors, or an external route for a
-  spec with a restricted property (docs/embedding-index.md, #1681).
-
-- Embedding specs are stored per namespace and managed with experimental
-  `PutEmbeddingSpec`, `ListEmbeddingSpecs` and `DeleteEmbeddingSpec`. Combined
-  mode embeds every stored spec on a schedule through its hosted catalog
-  route over the OpenAI-compatible embeddings API, admitted like hosted
-  execution; a changed spec is a recorded rebuild
-  (docs/embedding-index.md, `0095_embedding_specs`, GATE:mig, #1609).
-
-- Catalog entry owners and stewards curate `description`, `tags` and
-  `owners` through a governed Action on `catalog_entry`, with the Action's
-  receipt; the marking only rises, and later registrations keep curated
-  fields (docs/catalog.md, ADR 0122 amended, #1686).
-
-- Governed Actions prepared offline: `SubmitActionInstance` accepts an
-  `offline` record (prepare time, base version, base values of the written
-  properties, optional lease) with a device-bound assertion and the
-  device's proof. Policy is decided at arrival. A base the object moved
-  past is judged by the type's new `offline_conflict` rule (`reject_any`,
-  `reject_touched`, `last_writer_wins`), and a conflict is stored on the
-  denied instance and replayed on retry. Receipts record the offline
-  provenance (ADR 0127, #1580).
-
-- A device-bound identity assertion is refused by every RPC that does not
-  check device proofs; none does until sync adds its RPCs (ADR 0126).
-
-- Identity assertions (`sekai.identity-assertion/v1`) accept an optional
-  `device { id, ed25519_pub }` claim, and a verified one binds the
-  authenticated context to the device. A protected RPC can require the
-  device's Ed25519 proof over the assertion nonce and the request digest
-  (`x-sekai-device-proof`). Assertions without the claim are unchanged.
-  Servers accept the claim before issuers emit it (ADR 0126, #1697).
-
-- Experimental `GenerateDefinitionChangeBundle` returns a read-only
-  definition change bundle for a candidate revision: the diff, a migration
-  plan from declared renames, defaults and type changes, a declarative
-  backfill, and the caller's consumer impact report. Undeclared changes
-  become manual steps (docs/definition-change-bundles.md, ADR 0125, #1691).
-
-- `ListObjectChanges` works on PostgreSQL with the same semantics and paging
-  as SQLite. Each change row stores the operation that produced it, and the
-  RPC returns that stored id instead of correlating by object and time
-  (docs/operation-correlation.md, `0093_object_change_operation`, GATE:mig,
-  #1689).
-
-- Experimental offline sync scopes (contract `sekai.sync/v1`):
-  `PutSyncScope` defines a kind, property filters, optional linked
-  objects up to two hops and an object quota; `ReadSyncSnapshot` pages a
-  policy-filtered snapshot, and `ReadSyncDeltas` resumes from its cursor
-  with upserts and removals. Every object passes the online read checks
-  and is projected per property, and a scope over its quota is refused
-  with the quota named (ADR 0124, #1632).
-
-- Enterprise-scoped credentials may call `ProposeDefinitionRollback`,
-  `ExportDefinitionPackage` and `ImportDefinitionPackage`, which authorize
-  the tenant's namespace and members like the other definition proposal
-  RPCs, so a composing platform can promote and roll back definitions with
-  the caller's authority (#1700).
-
-- Experimental governed media uploads: `BeginMediaUpload`,
-  `UploadMediaChunk` and `CompleteMediaUpload` take a file in resumable
-  chunks, check its SHA-256, and return a `sekai-media:` reference to a
-  `media_attachment` object carrying the upload's marking. `ReadMedia`
-  reads it under the object read checks, and the same idempotency key
-  returns the same reference (ADR 0123, #1623).
-
-- Experimental fence bindings (ADR 0121): `PutFenceBinding` binds Ezu
-  geofence events (enter, exit, inside, dwell) for one collection to a
-  pinned governed Action type run as a service principal, and
-  `RunFenceBinding` submits one Action per bound event from a bounded page
-  after the binding's durable cursor. Submits are idempotent by Ezu event
-  id, approval policies park them, every event keeps a receipt with its id,
-  and `sekai_fence_binding_lag_ms` reports lag. Configure `SEKAI_EZU_URL`
-  and `EZU_TOKEN` (#1564).
-
-- Experimental signed definition packages: `ExportDefinitionPackage` signs a
-  published revision as a namespace-independent `sekai.definition-package/v1`
-  envelope, and `ImportDefinitionPackage` verifies it against the plane's
-  trusted package keys and opens a proposal holding exactly its members, with
-  `source_package_digest` recorded. Import never merges; tampered,
-  unverified, or incompatible packages are refused by name and write nothing
-  (docs/definition-branches.md, #1700).
-
-- Experimental governed catalog entries for datasets, object types and
-  pipelines: `RegisterCatalogEntry` records owners, steward, tags,
-  markings, schema summary, freshness and status, idempotently by the
-  source's stable id. Entries are `catalog_entry` objects, so reads and
-  search follow the ordinary read policy; only registration writes them,
-  markings only rise, and deregistration deprecates. A background
-  reconciler registers and retires entries for published object types
-  (ADR 0122, #1559).
-
-- The guarded isolation probe runner executes declarative probe specs
-  (`sekai.probe-spec/v1`): a read-only object-scoped RPC, the principal to
-  call as and the expected denial, with no endpoint, credential, tenant or
-  object of their own. `sekaictl admin assurance probes run --specs <dir>`
-  validates them before any call; a spec not denied as expected is a
-  finding with the spec as reproduction, and `tests/fixtures/probe_specs/`
-  runs promoted specs in the regression suite (docs/isolation-probes.md,
-  #1680).
-
-- Experimental live policy shadow: `StartPolicyShadow` evaluates a candidate
-  namespace route policy beside the active one on every live resolution,
-  without changing the decision. `GetPolicyShadowReport` shows the match
-  rate and bounded samples of differing decisions, and `SetNamespacePolicy`
-  refuses the shadowed candidate until the report passes. Start and stop
-  are recorded as decisions (docs/policy-dry-run.md,
-  `0090_chisei_policy_shadow`, GATE:mig, #1630).
-
-- Governed Action instances carry the marking they were derived from: the
-  least upper bound of the bound object's marking and the submitting
-  binding's `markings` (action and fence bindings), read at admission and
-  failing closed on unknown tokens. Reading the instance, its effects or its
-  operation receipt needs clearance for it, and a caller without it sees the
-  instance as missing. Objects an Action writes inherit the marking, and an
-  Action parameter can no longer lower an object's marking (#1706).
-
-- Experimental `RunEvalDataset` runs an eval dataset version through a
-  registered evaluator against a named agent, model and tool version, with a
-  concurrency limit, a run budget enforced before each case, a per-case cost
-  ledger, and results durable per (run, case), so a restarted run resumes
-  without rerunning or double-counting a case (docs/eval-datasets.md, #1674).
-
-- Versioned eval datasets (`chisei.eval-dataset/v1`) generated
-  deterministically from synthetic tenant seeds and checked-in case
-  templates: the version follows the digest, so the same seed gives the same
-  dataset and a changed one a new version, and cases feed the existing
-  evaluation executor as evidence (docs/eval-datasets.md, #1673).
-
-- Experimental `GetOntologyChangelog` lists what changed in a reader's
-  namespaces over a window: each published definition revision with a
-  plain-language summary, compatibility, author, approvers, publisher and
-  affected registered consumers, and policy activations. A credential admin
-  can build a team's weekly digest, authorized as that team alone; a
-  namespace the reader cannot read contributes nothing
-  (docs/ontology-changelog.md, #1471).
-
-- A consumer can mark its definition consumer binding `blocking`.
-  Publishing a revision that breaks a valid blocking binding then fails and
-  names it, unless the proposal is an approved major revision
-  (`major_revision`). Blocking bindings are disclosed to producers in
-  impact reports; advisory bindings keep the ADR 0067 non-disclosure
-  (ADR 0067 amended, #1635).
-
-- Experimental transform replays (ADR 0120): `ReplayGovernedTransform`
-  re-runs a governed transform, as stored or as a candidate definition,
-  over input dataset versions pinned by id or by time, on a fresh branch of
-  its output. The record pins inputs, definition and engine, flags
-  non-deterministic SQL, diffs the result against a baseline output version
-  by key and names the datasets and object types downstream. Promote it by
-  merging the branch, discard it by deleting it. `GetTransformReplay`
-  returns the record (#1585).
-
-- Experimental comment threads on objects and their properties, with
-  mentions, resolve and reopen. A comment is visible only to callers who
-  can read its object and property, quoted values of hidden properties are
-  redacted, and mentioning a principal without read access is refused.
-  Every write is in the audited object change log, which is the edit
-  history and the receipt (docs/object-comments.md, #1442).
-
-- Experimental trust scores: a versioned per-namespace scoring rule turns
-  source health, age against expected freshness, manual verification and
-  corroborating or contradicting links into a 0 to 100 score per object
-  with its reasons. `ScoreObjectTrust` scores an object-set page as the
-  caller and filters or sorts by score. Rule changes are credential-admin,
-  compare-and-set and audited in the object change log
-  (docs/trust-scores.md, #1456).
-
-- `QueryCounterfactualView` shows what a namespace's objects would have
-  shown at a past time under candidate object security policies or a
-  candidate marking rule, per principal: visible then, visible under the
-  candidate, hidden and revealed. The object set is rebuilt from the
-  recorded change log; objects deleted since, rules changed since and times
-  before the retained history fail closed. Credential-admin, read-only,
-  recorded as a decision, and behind
-  `SEKAI_EXPERIMENTAL_RPCS` (#1453).
-
-- Experimental gRPC for dataset branches (ADR 0119): create, list, delete,
-  compare, propose a merge, merge, and run a governed transform on a branch.
-  The tenant comes from the authenticated context, reads need dataset read
-  access and changes need write access, and a merge is refused for the
-  proposer (#1444).
-
-- Experimental `ExpandNeighborhood` and `FindPaths` explore how objects are
-  linked: a bounded expansion from seed objects with a total count, and all
-  shortest paths between two objects up to depth 4. Every hop applies the
-  caller's read policy, including the marking join along the path. Hidden
-  objects are omitted, never counted, and never used as a step; a hidden
-  start object is the same not-found as a missing one
-  (docs/graph-exploration.md, #1562).
-
-- A governed transform can run on a dataset branch (ADR 0119). Inputs read
-  their branch where it exists and the parent otherwise. The output is
-  written only to the output dataset's branch, so the parent's rows,
-  checkpoint and marking stay as they were. A run that would raise the
-  output marking, or that targets another tenant's branch, is refused; an
-  isolated-process transform cannot run on a branch yet (#1444).
-
-- Datasets have branches (ADR 0119): a branch is one working copy forked from
-  a version, and until its first write it reads that version, so creating one
-  copies nothing. Branch writes never touch the parent. Compare reports
-  columns, row counts and a row digest against the parent. A merge goes
-  through a proposal that pins both heads, is merged by another principal,
-  and writes exactly one new version with a receipt id; a replay writes
-  nothing. Deleting a branch frees its rows, and retention keeps any version
-  an open branch forks from (`0088_dataset_branches`, GATE:mig, #1444).
-
-- `sekaictl admin assurance probes run` checks an allow-listed deployment's
-  object reads for isolation (unauthenticated and cross-tenant) as two
-  synthetic tenants. The
-  target guard fails closed on an endpoint off `SEKAI_PROBE_TARGET_ALLOWLIST`
-  or a tenant that is not synthetic. Every attempt is appended to a ledger,
-  `probes summary` reports the week from it, and a bypass writes a private
-  advisory draft with reproduction steps instead of any public report
-  (`docs/isolation-probes.md`, #1621).
-
-- The game reference workload is a synthetic tenant domain (`GameWorkload`):
-  its kinds and links come from the `game-ontology/v1` package
-  (players own planets, fleets are stationed at planets, players ally), and
-  it runs through the same `generate` and `apply` as every domain, with
-  seeded markings, principals and governed fleet orders (#1616).
-
-- Relational change capture beyond PostgreSQL has one contract (ADR 0118):
-  per-family positions (LSN, GTID set, SCN) with a comparison rule, snapshot
-  handoff, committed records with optional transaction markers, schema
-  change classes mapped onto drift handling, and a distinct retention-loss
-  state. `sekai-source-sdk` 1.3.0 adds `assert_change_capture` and per-family
-  fixtures; the conformance digest covers them (#1578).
-
-- The certification gate lists each agent member's bound tools with the
-  derived effect and whether it blocks publish, and `DiscoverCapabilities`
-  returns `tool_effect` on Action entries. Effects now use the enabled versions
-  of an Action type (#1646).
-
-- Agent definitions can bind tools (`action`, `query` or `gateway`), each
-  with an optional approval policy. Effects are derived from the governed
-  Action type, and unknown Actions and gateway tools count as destructive.
-  Merge and the certification gate refuse a mutating or destructive tool
-  without a policy (`agent_tool_approval_required:<tool>`). Definitions
-  without tools keep their digests (#1644).
-
-- Agent promotion refuses a regressed candidate: binding a certification
-  records the run's mean case score, and a candidate scoring more than
-  `SEKAI_AGENT_PROMOTION_MAX_REGRESSION_PERCENT` (default 20) below the
-  published revision's certification on the same suite is refused with
-  `agent_promotion_eval_regression` at the gate and at merge. Unscored rows
-  keep the pass/fail gate (`0087_agent_certification_score`, GATE:mig, #1640).
-
-- Identity assertion replay state keeps each nonce only until its assertion's
-  expiry plus clock skew, so a caller that mints one assertion per request no
-  longer grows the core's memory with total traffic. Replay protection inside
-  the live window is unchanged (#1638).
-
-- Embedding index for object properties: an embedding spec names an object
-  kind, source properties, chunking and dimension. Catch-up follows the
-  object-change feed and re-embeds only changed chunks; a spec or model
-  version change is a recorded rebuild. Vectors carry model, version, source
-  digest, the object's marking and each source property's classification. An
-  external route refuses properties the egress policy keeps in the
-  deployment. Writes are fenced per spec (ADR 0117, `0086_embedding_index`, GATE:mig,
-  #1581).
-
-- Isolated-process streaming workers can apply a batch of Action-written
-  object edits together with an input checkpoint in one transaction.
-  Replay of the same `(run_id, checkpoint)` returns the original receipt.
-  An older claim generation is fenced. Action policy Deny and
-  RequireApproval fail closed. `ApplyStreamingTransformBatch` stays behind
-  `SEKAI_EXPERIMENTAL_RPCS` (`0085_streaming_transform_apply`, GATE:mig,
-  #1583).
-
-- Grant and deny on parked Actions store structured decision memory. A later
-  similar Action of the same type surfaces those precedents on
-  `GetActionInstance`, omitting decisions the caller cannot read and labelling
-  superseded rows (`0084_decision_memory`, #1465).
-
-- MCP lists definition-branch tools so an agent can create a branch, edit it,
-  diff, report impact, and open a proposal. Approve and merge stay off MCP.
-  The creating agent principal cannot approve or merge, including when it
-  holds changed-member admin. Backing RPCs stay behind
-  `SEKAI_EXPERIMENTAL_RPCS` (#1311).
-
-- Agents start propose-only. After enough unchanged approvals and no
-  incidents, an admin can grant auto-apply for that Action type against a
-  live bounded envelope. Matching submits skip review; other types still
-  park. A rejected Action, a dead envelope, or a model pin change revokes
-  the grant. Grant and revoke write Decision receipts
-  (`sekaictl admin autonomy offer|grant-auto-apply|revoke-auto-apply`,
-  #1469).
-
-- Parked Actions can route to a review queue on the type: SLA, assignee pool,
-  threshold, and auto-deny or reassign escalation. `DecideActionInstance`
-  refuses a reviewer who is not the assignee. The approval receipt names the
-  queue, reviewer, and reason (#1455).
-
-- Invoice extraction function revisions are scored on a labelled fixture
-  set before publish. A worse vendor extraction is denied; an unchanged
-  revision still publishes (#1327).
-
-- Operators can freeze writes or agent Actions by tenant, namespace, principal,
-  or Action type. The next object write and Action admission fail closed with
-  the freeze reason. In-flight claims fail at ack. Freeze and unfreeze write
-  Decision receipts. `SetWriteFreeze` / `ListWriteFreezes` stay behind
-  `SEKAI_EXPERIMENTAL_RPCS` (`0083_write_freeze`, GATE:mig, #1458).
-
-- `DiscoverCapabilities` lists enabled governed Action types as
-  `sekai.actions.{type_id}` on the core pack, with parameter schema,
-  selected `action_version`, description, approval matching submit
-  admission, and visible markings from the bound object kind.
-  Catalog-bound `SubmitActionInstance` rechecks the live catalog and fails
-  closed after revoke. Hidden types, restricted properties, and markings stay
-  off the catalog. The response carries `ontology_revision` (ADR 0116, #1459).
-
-- New grants can require a purpose and an end date when a namespace opts in.
-  Permanent grants need an explicit exception. Expired grants stop authorizing.
-  Create and renew write Decision receipts (#1462).
-
-- Action, transform-run, and agent-turn receipts join a per-namespace
-  Ed25519-signed hash chain when `CHISEI_RECEIPT_CHAIN_SIGNING_KEY` is set.
-  Genesis and periodic checkpoints detect truncation. `sekaictl admin
-  assurance receipts export|verify` checks a bundle offline and names the
-  first bad position when `--trusted-key` matches the operator key.
-  Isolated-process `TransformRun` JSON verifies with the same tool.
-  Dataset field redaction rewrites chained transform-run bodies and re-signs
-  the namespace (`0081_receipt_chain`, GATE:mig, ADR 0114, #1449).
-
-- gRPC GetObject, ListObjects, ApplySourceBatch, and object-change reads run
-  store work on `spawn_blocking`, bounded by the connection pool, so a slow
-  batch does not pin a Tokio worker (#1439).
-
-- ApplySourceBatch authorizes a page with one namespace-scoped external-id
-  lookup and one active object-policy load per kind, instead of a lookup
-  pair per record (#1438).
-
-- Object-path gRPC workloads (GetObject, ListObjects, EvaluateObjectSet,
-  Action apply, policy-checked reads, ApplySourceBatch) are measured at 10⁴/10⁵
-  objects on SQLite and PostgreSQL. Scheduled runs start TLS PostgreSQL, fail
-  a missed published budget or a >20% p95 regression, and reject a matrix that
-  dropped every postgres workload. Pull requests run a wide-budget SQLite smoke
-  subset (#1437).
-
-- Object-log dual-read maps min, max, and avg against the tagged object-log
-  when reconstructed hop measures agree with the mikura fixture, including
-  zero-hop whole-set aggregates. `group_by`, distinct, multi-key sort, and
-  min/max whose checked average overflows stay named refusals: SQL still
-  requires one group key and falls back to the source key when it is absent,
-  counts only numeric distinct values, sorts on one `order_by`, and does not
-  share the object-log's checked `(sum, n)` overflow. The plane aggregation
-  contract is unchanged. The mikura pin remains `0d43c57` (#1540).
-
-- Object-log identity is `(namespace, kind, key)`. Ingest, generation reads,
-  dual-read, and the host client pass the plane namespace. `MIKURAV1` logs
-  fail closed until an explicit projection-driven migration. The mikura pin
-  is `0d43c57` (#1552, ADR 0112).
-
-- Enterprise-scoped sessions can publish a governed transform definition with
-  namespace write and read access to its datasets. A scoped Put cannot name a
-  schedule or input-commit trigger. Community Put still requires credential
-  administration. Run stays unadmitted for scoped sessions (#1557).
-
-- A space can be shared across tenants when both the owning tenant and the
-  member's home tenant approve. The owning tenant names the namespaces, kinds,
-  and marking ceiling the space exposes. Members act under their own home
-  tenant; storage keys stay per tenant. One-sided approval grants nothing.
-  Withdrawal applies to the next request. Only exposed namespaces, kinds, and
-  markings are visible; history hides values written while the object was
-  above the ceiling and redacts old values when no retained prior write
-  attests their original marking. Every cross-tenant access through the space is
-  audited (`tenant.shared_space_access`) with the owning resource tenant
-  even when membership is denied. Unshared spaces are unchanged
-  (`GATE:break`, #1434).
-
-- Isolated transform claims persist a per-run tenant concurrency hold and
-  release it once on write, cancel, reclaim, or terminal lease failure
-  (`0074_transform_quota_hold`, GATE:mig). The submitting tenant is stored on
-  the work row (`0075_transform_work_tenant`, GATE:mig) so a runner without
-  tenant context still admits and records usage against that owner. Put
-  records the submitting tenant as the quota owner
-  (`0076_transform_quota_owner`, GATE:mig) so scheduled and triggered
-  isolated enqueue copies that owner onto the work row. In-process
-  scheduled and triggered ticks admit and record usage against that owner
-  before the run; quota exhaustion skips the slot without advancing the
-  schedule cursor. RunGovernedTransform uses that Put owner when the caller
-  has no tenant context, so an admin or runner still meters the submitting
-  tenant. Isolated claims bind that owner onto empty work even when no
-  quota limits are configured. CLI `admin transform run` admits and records
-  in-process Put-owner quota the same way.   PostgreSQL discovers persisted
-  tenant quota limits for that admission instead of skipping the gate,
-  including `GetEffectivePolicySummary` limit projection.
-  Quota-denied claims return to the queue even if admission outlasted the
-  lease, so a deny does not consume lease expiries. PostgreSQL records
-  measured request usage onto `chisei_usage_events`
-  (`0077_chisei_usage_events`, GATE:mig) so isolated write-back and
-  in-process runs are metered on that runtime too.   Combined Split
-  admits and records that usage on the Chisei dest, not the Sekai
-  plane that omits budget and usage tables.   Claim and list work
-  include that submitting `tenant_id` so a runner can key quotas on
-  the owner instead of the namespace. CLI `admin transform run` admits
-  and records usage on the Chisei dest in a Combined Split layout.
-  PostgreSQL persist of a claim hold locks the work namespace and
-  rechecks the live fence so a concurrent cancel cannot leave reserved
-  concurrency on cancelled work.   The runtime-claim client exposes
-  `transform_quota_tenant_id` so a JobSource keys quotas on that owner
-  instead of the namespace.   A fenced write-back that already completed
-  records usage on retry instead of returning a lost fence, so a
-  failed usage persist after commit can still meter that run once.
-  That retry still requires the completing owner, generation, and
-  token, including after the completing lease expires. Binding a
-  claim tenant requires the current generation and token, so an
-  expired first claimant cannot stamp a different owner after a
-  later claim. In-process scheduled and triggered commits persist a
-  pending usage row (`0078_transform_usage_pending`, GATE:mig) so a
-  later tick can meter that run if usage persist failed after the
-  run and cursor committed. That pending row stores the original
-  completion time so a retry after a period boundary still meters
-  the earlier period.   Isolated write-back records the same original
-  completion time on retry. An untargeted claim that is quota-denied
-  skips that run and continues through later work in the same
-  namespace so another tenant's eligible run is not stuck behind
-  exhausted work. A Sekai-only plane that omits budget and usage
-  tables skips admission and usage instead of failing after the run
-  is already durable. PostgreSQL missing-table errors keep the relation
-  name so a Sekai-only plane is not treated as Internal. Usage persist
-  failures after commit leave the pending row for a later tick instead
-  of failing the caller.
-  Isolated write-back, cancel, lease-fail, and reclaim restore a taken
-  concurrency hold if releasing that reservation fails, so a quota-store
-  error after commit does not leave the tenant permanently exhausted.
-  Claim-time hold inserts still require CLAIMED work so a delayed insert
-  cannot land after cancel. Releasing a reserved concurrency unit reports
-  a storage error instead of swallowing it, so the restored hold can retry.
-  An in-process run that cannot release concurrency persists a hold without
-  work, and Tick retries restored holds on missing or terminal work so the
-  tenant is not left exhausted.   An untargeted claim that skips quota-denied
-  work defers that run so a later claim can reach another tenant.
-  Quota holds are keyed by run and claim generation so restoring an
-  older reservation cannot overwrite a live claimant's hold. Tick
-  releases only a retryable generation after rechecking current work
-  status, so an older restored hold cannot drain a live claimant's
-  reservation. Reclaim and older-hold deletes take one generation at
-  a time so multiple outstanding holds do not fail PostgreSQL or drop
-  extra reservations. A replacement claim copies request-admission onto
-  the new generation in the same transaction, so Tick releasing an older
-  concurrency hold cannot make that run pay a second request. Abandoning
-  an unused admission reports a storage error and persists a retryable
-  hold for only the metrics that still need refunding, so a quota-store
-  failure cannot leave the tenant permanently exhausted or double-refund
-  a metric that already committed.
-
-- `PutDefinitionCertification` copies suite identity and pass/fail from a
-  stored eval run, refuses a bind by authors of agent-member changes since
-  the published base, treats revocation as one-way, and caps expiry at 90
-  days from bind time. A later unrelated edit cannot restore the author's
-  ability to self-certify or to clear `revoked_at_ms` (#1513).
-
-- Dataset writes snapshot a retained version id. `ListDatasetVersions` and
-  `GetDatasetVersion` read a prior snapshot by id or timestamp; `RollbackDataset`
-  restores that snapshot as a new audited version and marks consuming transform
-  outputs stale. Retention `0` keeps every version; a positive limit purges
-  older snapshots. Additive experimental RPCs and PostgreSQL migration
-  `0073_dataset_versions` (`GATE:mig`, #1412). Enable `SEKAI_EXPERIMENTAL_RPCS=1`
-  or the `experimental-rpcs` feature to invoke.
-
-- Dataset health checks run after each committed write and on a schedule.
-  Freshness, row-count, schema, null/uniqueness, and predicate checks store
-  results with the judged version. A failing blocking check quarantines the
-  new version so `QueryRows` stays on the last healthy snapshot. Late
-  schedules emit one alert and recovery emits a resolve; check and job
-  metrics carry tenant and space labels. Additive experimental RPCs and
-  PostgreSQL migration `0079_dataset_health_checks` (`GATE:mig`, #1411).
-  Enable `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature to
-  invoke.
-
-- Experimental `ProposeDefinitionRollback` opens an append-only proposal whose
-  candidate restores a prior published revision as a new descendant of the live
-  head. Merge records `restored_from_digest` on the receipt and refuses when
-  the rollback would drop object or dataset properties still present unless a
-  migration plan digest is pinned (#1390). Additive experimental RPC and JSON
-  fields; no PostgreSQL migration.
-
-- Governed images, renditions, and annotations, and registered Iceberg/Parquet
-  open-table projections persist on community PostgreSQL with the same owner
-  CAS, parent, tombstone, and snapshot-digest behavior as SQLite (#1479).
-  `admin.governed-image` and `admin.open-table` leave the shrink-only
-  SQLite-only list. Adds PostgreSQL migration
-  `0072_governed_images_and_open_tables` (`GATE:mig`, #1479).
-
-- Capability-package certifications persist on community PostgreSQL with the
-  same certify, replay, supersede, and revoke behavior as SQLite (#1478).
-  `admin.capability-package` leaves the shrink-only SQLite-only list. Adds
-  PostgreSQL migration `0071_capability_packages` (`GATE:mig`, #1478).
-
-- Versioned client packages persist on community PostgreSQL with the same
-  publish, replay, live-identity, and supersede behavior as SQLite (#1477).
-  `admin.client-package` leaves the shrink-only SQLite-only list. Adds
-  PostgreSQL migration `0070_client_packages` (`GATE:mig`, #1477).
-
-- Signed namespace snapshot export/import, peer namespace grants, and imported
-  assertion provenance persist on community PostgreSQL with the same sequence,
-  upsert, and list behavior as SQLite (#1476). `admin.federation-snapshot`
-  leaves the shrink-only SQLite-only list. Adds PostgreSQL migration
-  `0069_federation_snapshots_and_provenance` (`GATE:mig`, #1476).
-
-- Federation network contracts, site/peer profile tables, governed conflicts,
-  and revocations persist on community PostgreSQL with the same install, CAS,
-  and list behavior as SQLite (#1475). `admin.federation-network` leaves the
-  shrink-only SQLite-only list. Namespace snapshots, grants, and peer-import
-  provenance stay SQLite-only until #1476. Adds PostgreSQL migration
-  `0068_federation_network_and_profile` (`GATE:mig`, #1475).
-
-- Gunshi allocation state (`IssueGunshiRecommendations`,
-  `SetGunshiAllocationPolicy`, `GetGunshiAllocationStatus`) persists on
-  community PostgreSQL with the same CAS install/update behavior as SQLite
-  (#1474). The three RPCs leave the shrink-only SQLite-only list. Adds
-  PostgreSQL migration `0067_chisei_gunshi_allocation_state` (`GATE:mig`, #1474).
-
-- Service tokens are held to their live service-principal registration:
-  requests outside the namespace allowlist, `SubmitActionInstance` and
-  `ClaimActionWork` outside the registered Action types, and objects above the
-  profile `classification_ceiling` are refused. Runtime tokens from a claim
-  made with a service token stay within the same scope; removing the
-  registration revokes both. Other callers are unaffected (#1511).
-
-- Experimental `IssueServicePrincipalToken` exchanges client credentials for a
-  short-lived tenant-bound service token through an identity-extension issuance
-  hook (#1510). The plane reuses the #1507 assertion signing key; the
-  authentication boundary admits the token as the registered service principal
-  (a machine identity, never a user). Refused without an extension, for an
-  unregistered principal, for invalid credentials, or once expired. Additive
-  experimental RPC; no existing field changes.
-
-- Concurrent Chisei SQLite opens serialize lookup-index backfill with
-  `BEGIN IMMEDIATE`, skip it after `PRAGMA user_version` is set, and create the
-  unique lookup index with `IF NOT EXISTS`, so a second opener no longer fails
-  with `index already exists` (#1394).
-
-- Property `order_by` on object lists extracts the sort value once per matching
-  row (SQLite `MATERIALIZED` CTE, PostgreSQL `LATERAL` with `OFFSET 0`) instead
-  of repeating JSON extraction in every `ORDER BY` term (#1374).
-
-- The shrink-only SQLite-only list now includes `ListObjectChanges` and
-  `SubmitEvidence`. Community PostgreSQL answers `UNAVAILABLE` for object-change
-  listing and execution-evidence admission before that work, instead of
-  `INTERNAL` after a partial write. Handler evidence methods are an explicit
-  table so a renamed RuntimeDb helper cannot hide a SQLite-only RPC (#1373).
-
-- Experimental `PutServicePrincipal`, `GetServicePrincipal` and
-  `DeleteServicePrincipal` register a worker as a service principal with
-  allowed Action types and a namespace allowlist, owned by the caller's
-  authenticated tenant. The marking ceiling is read from the principal
-  profile's `classification_ceiling`. No secret is stored; issuance and
-  enforcement follow separately. Adds PostgreSQL migration
-  `0066_service_principals` (`GATE:mig`, #1508).
-
-- Experimental `ListPublishedDefinitionRevisions` returns a namespace's published
-  definition merge history newest first, with optional member-change filter and
-  keyset pagination. Auth matches `GetPublishedDefinitionRevision`. Adds
-  PostgreSQL migration `0065_definition_proposal_merged_history` (`GATE:mig`,
-  #1354).
-
-- `ClaimActionWork` returns a short-lived runtime token bound to the claiming
-  principal, tenant, namespace, effect, runtime and claim generation when an
-  assertion signing key is configured and the caller has a tenant;
-  `HeartbeatActionClaim` refreshes it. The token authenticates only the
-  heartbeat, ack and claim-event calls for that claim and expires no later
-  than the claim. New response fields are additive; workers without a token
-  keep using their credential. Claim RPCs now accept tenant-scoped
-  credentials under the usual namespace and tenant checks (#1507).
-
-- Merging a definition proposal that changes an agent-definition member
-  requires a current, non-revoked, baseline-passing certification bound to
-  the candidate revision (ADR 0079). Missing, stale, failed, or revoked
-  evidence is `failed_precondition`. Direct publish of an agent member is
-  still refused. Experimental `PutDefinitionCertification` and
-  `GetDefinitionCertificationGate` bind and report that gate. Adds PostgreSQL
-  migration `0064_agent_definition_certification` (`GATE:mig`, #1353).
-
-- Opt-in customer-hosted routes can require current Tenkai-signed runtime
-  evidence (`tenkai.model_runtime_evidence.v1`) before admission. Chisei
-  verifies signatures against installed trust roots, ledgers which evidence
-  admitted a route, signs `chisei.model_evaluation_evidence.v1` from pinned
-  `EvalStore::compare_runs` results, and stores operator feedback. Default
-  routes stay unchanged. Adds ADR 0107, `sekaictl admin model-release-evidence`,
-  experimental RPCs, and PostgreSQL migration
-  `0063_chisei_model_release_evidence` (`GATE:mig`, #1396).
-
-- Registered customer-hosted routing profiles carry an optional
-  `artifact_digest` (`PutRoutingProfileRequest` and `RoutingProfile` field),
-  stored on SQLite and PostgreSQL and passed to
-  `EnterpriseExtension::admit_model`, so digest-pinned admission works for
-  registered routes. Adds PostgreSQL migration
-  `0062_routing_profile_artifact_digest` (#1499).
-
-- Channel operators can persist per-namespace model review state and family
-  enablement keyed by the #1352 identity and `ResidencyPolicy` region labels.
-  Missing state is `disallowed`; a per-model row overrides its provider family
-  in the same namespace; a named namespace (model, then family) overrides the
-  instance default. Admin RPCs and
-  `sekaictl admin model-review` set, revoke, and list with a decision-ledger
-  reason. Operators run a one-shot backfill to mark currently routed hosted
-  families and registry-canonical policy models `enabled` when still
-  `disallowed`. Adds ADR 0106 and PostgreSQL migration
-  `0061_chisei_model_review` (#1493).
-
-- Route admission default-denies any model that is not `enabled` for the
-  namespace, #1352 identity, and `ResidencyPolicy` region: native planning
-  and execution, gateway decide, customer-hosted routes, and gateway
-  failover candidates returned with an admitted decide. Refusals use a
-  stable reason (`model_review.not_enabled` or
-  `model_review.residency_mismatch`) and a decision-ledger row. Unused
-  fallbacks are dropped without a ledger row. Backfilled routes keep
-  working (#1494).
-
-- Governed transforms stream claim reads inside a byte bound, persist
-  optional dataset `partition_keys`, and write named partitions atomically.
-  `sekai-client::claim` exposes the partition selector and `max_bytes`.
-  Partitioned datasets use `sha256-partitions-v1:` (not folded into
-  `sha256-sum-v1:`). Incremental in-process projection appends into changed
-  partitions so historical output row IDs stay stable. Adds ADR 0105 and
-  PostgreSQL migration `0060_partitioned_transform_io` (`GATE:mig`, #1388).
-
-- Sensitive egress reuses compiled entity literals from a per-namespace
-  object-change generation instead of listing the graph on every cache hit.
-  SQLite and PostgreSQL advance that generation in the same transaction as
-  every object write (create, update, delete, namespace move, sync apply,
-  definition-migration rewrites). Adds ADR 0104 and PostgreSQL migration
-  `0059_namespace_object_generation` (#1492).
-
-- Governed transforms accept an optional schedule and change trigger. The
-  plane admits one run per schedule tick across restarts, runs downstream
-  once after an upstream commit or `ApplySourceBatch`, refuses dependency
-  cycles at Put, and records the trigger cause on the receipt. Output
-  freshness is `fresh`, `stale`, or `blocked`. Cancelling a run skips
-  not-yet-started downstream work. Per-namespace concurrency bounds
-  isolated admission. Adds `sekai.transforms.scheduler`, experimental tick,
-  output-state, and cancel RPCs, ADR 0103, and PostgreSQL migration
-  `0058_transform_schedule` (#1387).
-
-- The privacy entity scan lists at most 501 objects in one query that
-  excludes `leak_rule` in SQL, instead of paging up to 1000 objects and
-  filtering in Rust, and fingerprints the set with a streaming digest
-  instead of formatting, sorting, and joining strings (#1491).
-
-- `sekai-client` publishes a versioned runtime-claim module
-  (`sekai.sdk-runtime-claim/v1`) so Action and isolated-process transform
-  workers share list, claim, heartbeat, ack, claim-event, streamed input
-  read, and fenced write-back helpers. Typed errors keep fence loss distinct
-  from idle, contention, denial, and unavailability (#1389).
-
-- Isolated-process governed transforms admit claimable work instead of
-  computing in-process. A worker claims with a fencing token, streams the
-  admitted JobSpec snapshot, and writes the output, receipt, and lineage in
-  one transaction. Write-back keeps the admitted destination after a later
-  Put. A stale fence or digest mismatch commits nothing. Claim RPCs require
-  credential admin. Adds `sekai.transforms.isolated_process`, experimental
-  claim RPCs, ADR 0102, and PostgreSQL migration `0057_isolated_transform_work`
-  (#1386).
-
-- Enterprise extensions can admit or refuse the resolved model of a provider
-  execution before its credential lookup and provider call:
-  `EnterpriseExtension::admit_model` receives a `ModelIdentity` (provider,
-  model, profile version, pinned `artifact_digest`, and the endpoint the
-  provider client uses) and defaults to admit. Provider profiles and hosted
-  endpoints gain an optional `artifact_digest`. With an extension installed,
-  any `resolve_provider_credential` error, `CredentialNotFound` included,
-  now refuses execution instead of falling back to the process key; an
-  extension that wants the instance key returns it explicitly (#1352).
-
-- `CreateFunction` refuses a function with an LLM step. The gated publish
-  records an approval for the revision digest and stores it; `InvokeFunction`
-  and document extraction refuse an LLM revision without that approval, so
-  rows stored before this change stay unapproved. Adds PostgreSQL migration
-  `0056_function_gate_approvals` (#1384).
-
-- Governed-document hold, release, expire, and delete check and write the
-  record in one transaction on SQLite and PostgreSQL, so a concurrent delete
-  or expire can no longer drop a hold reported as placed. Delete drops the
-  renditions in the same transaction, and a rendition no longer attaches to
-  a deleted document (#1381).
-
-- The egress entity scan no longer truncates at 500 literals. Every name and
-  external id of the up to 500 scanned objects is checked, so namespaces with
-  more than about 250 named objects stop refusing all `Sensitive` egress to
-  non-safe providers. A truncated scan (more than 500 objects) now refuses
-  with `privacy_scan_truncated: ...` and the `EgressDecision` reason
-  `privacy_scan_truncated`, distinct from a leak match. See
-  `docs/egress-privacy-scan.md` (#1372).
-
-- Function document extraction resolves the namespace action policy for every
-  extraction: `deny` refuses, `require_approval` parks the Action at any
-  confidence, and `allow` writes only at or above the threshold. A direct
-  write also runs the caller's CreateObject authorization, which
-  `FunctionDocumentExtractRequest.authorize_write` now requires (#1382).
-
-- Connector certifications persist on PostgreSQL with the SQLite certify, get,
-  verify, revoke, and supersession semantics. Adds PostgreSQL migration
-  `0055_connector_certifications` (#1481).
-
-- Source-webhook key pins and registered source-type descriptors persist on
-  PostgreSQL, and PostgreSQL `ApplySourceBatch` admits batches for live
-  registered descriptors. Register, inspect, and retire descriptor RPCs and
-  `sekaictl admin sync pin-webhook-key` now work on both backends. Adds
-  PostgreSQL migration `0054_source_registry` (#1322).
-
-- `sekaictl admin connectors new <name> --out <dir>` generates a source
-  connector from `crates/sekai-connector-template`: check, discover, and read
-  stubs, a fake source, gRPC transport, outbox commit per batch, and a config
-  that references credentials by environment variable. CI builds a generated
-  connector and runs its conformance tests. `sekai-source-sdk` 1.2.0 adds
-  `build_registered_source_batch` for registered descriptors (#1409).
-
-- Source adapters gain `check` (connectivity, zero records) and `discover`
-  (kinds, columns, key candidates, optional profile hints). Discovery drafts
-  a source-type descriptor; catalog admission stays a separate review.
-  Reference GitHub and warehouse adapters implement both (#1408).
-
-- Source adapters depend on the versioned `sekai-source-sdk` crate for the
-  batch builder, outbox, snapshot and change-feed runners, and conformance
-  kit. A breaking public-API change without a major bump fails CI. Connector
-  certification records the SDK version and conformance-suite digest (#1407).
-
-- The identity contract distinguishes the acting tenant from a guest's home
-  tenant (`AuthenticatedContext.home_tenant`). Guest contexts are denied
-  unless an installed extension's `authorize_guest_namespace` admits the
-  namespace and action (default deny); they reach only the namespace object
-  RPCs and never approve. Every guest decision is audited with both tenants.
-  Extensions must set the new field (`GATE:break`, #1432).
-- `authorize_guest_namespace` returns the host tenant's `GuestGrant`: a
-  role and a marking ceiling. Guests get only that role and never see or
-  write objects the ceiling does not cover, whatever their home authority.
-  An activated namespace lattice evaluates the ceiling with dominance;
-  otherwise the evidence ordinal. Ceiling denials are audited. Grants are
-  asked for on every request, so revocation applies to the next one.
-  Extensions implementing the hook must return the grant (`GATE:break`,
-  #1433).
-
-- Administrator-approved discovery rules name which tenants, principals,
-  spaces, and namespaces another tenant may find. Without a rule,
-  cross-tenant list and lookup look missing. A rule never grants read or
-  write. Rule changes apply on the next request. Every decision is audited
-  as `tenant.discovery`. Extensions implementing `authorize_discovery` must
-  return the current rule (`GATE:break`, #1435).
-
-- Derived transform outputs inherit the union of input object and row
-  `access_marking` values. Unknown input markings fail closed with no output
-  write. Marked runs require a bound output dataset object. Receipts record
-  `markings_in` and `markings_out`. Lowering or removing a marking on object
-  update requires a principal profile `declassify_markings` grant; owner,
-  admin, and trusted service principals do not bypass it. Trusted principals
-  may still declassify when that grant is on their sealed profile. Every
-  declassify decision is audited (`GATE:mig`, #1403).
-- Optional `deny_unmarked` hides unmarked objects unless the caller is a
-  trusted service or holds an explicit object ACL grant. Default stays
-  fail-open. Enable with namespace property `deny_unmarked=true` or
-  `SEKAI_DENY_UNMARKED=1`. `sekaictl admin access unmarked list|apply`
-  reports unmarked objects per namespace and can write a default marking
-  (`GATE:mig`, #1399).
-- Policy understands a discover permission below read. Discoverer space
-  roles and human `sekai.discover` list and describe namespaces, object
-  types, and datasets (filtered by marking ceiling and object policy) and
-  are refused for object reads, queries, aggregates, and counts. Credential
-  scopes apply with or without an installed enterprise extension (#1405).
-- An LLM function may bind a governed document `extracted_text` rendition.
-  Caller-held text must match the pinned digest. Produced objects inherit
-  the document classification and carry `derived_from` lineage to a
-  namespaced document stub. Confidence below
-  `LlmStep.minimum_confidence_micros` parks a `require_approval` Action
-  instead of writing the object. Scores and thresholds above 1_000_000 fail
-  closed. `LlmStep` gains additive field 5 for the threshold (#1326).
-  The parked Action type must create the extracted kind. Granting it writes
-  the same object, classification and `derived_from` lineage included,
-  after re-checking the lineage against the live document and rendition
-  (#1383).
-- LLM function revisions are a governed evaluation subject. A fixture set is
-  invoked, each output is retained as evidence at the union of input markings,
-  and the existing `stochastic_model/v1` rubric scores it. A score below the
-  manifest threshold denies publish (`#1312`).
-- Restore pre-#1368 `PipelineStep` wire fields 1–9 for operator clients.
-  Operator responses include matching legacy and structured representations;
-  conflicting inputs are rejected. Structured operator/LLM variants now use
-  fields 10/11. Regenerate clients built from the unreleased #1368 protocol
-  before upgrading; its incompatible fields 1/2 are not supported (#1371).
-
-- Governed documents and renditions persist on community PostgreSQL with the
-  same owner, purpose, classification, and hold rules as SQLite. Experimental
-  RPCs admit, attach a rendition, get, hold, release hold, expire, and delete
-  (`SEKAI_EXPERIMENTAL_RPCS=1`). The plane still stores no bytes (#1325).
-- `DecideActionInstance` and `ListActionInstances` are stable. Community
-  PostgreSQL grants or denies a parked instance with the same named-approver
-  rules as SQLite; `ListActionInstances.status` is the parked inbox. The
-  stable ceiling moves from 66 to 68 ([ADR 0071](docs/decisions/0071-rpc-maturity.md),
-  #1314).
-- Experimental function pipelines are a `oneof` of operator steps and `LlmStep`
-  (prompt revision, input bindings, JSON Schema output, pinned model route).
-  Invoke records prompt, input, and output digests on the receipt and fail-closes
-  schema-invalid structured output with no fallback route (#1310).
-- Public RPC Real backend is a projection of RuntimeDb fail-closed evidence and
-  the shrink-only list `tests/fixtures/sqlite_only_surfaces/v1.json`. CI fails
-  on a mislabeled row, a new SQLite-only RPC missing from the list, or list
-  growth. PostgreSQL conformance runs on every pull request (#1316).
-- Versioned evidence and finding package (`pkg:feedback.evidence-finding/v1`) registers Observation, Finding, Investigation result, Hypothesis, External issue reference, and Verification record types plus governed Actions, an evidence schema, and an evaluation member. Hypotheses cannot be verification subjects. Invalid, stale, conflicting, or unauthorized evidence is rejected without creating observation objects (ADR 0095, #1230).
-- Combined, both planes, `sekaictl launch`, and single-store `sekaictl` commands refuse `DB_PATH`, `DATABASE_URL`, and `SEKAI_SHARED_STORE` with guidance toward `SEKAI_DATA_DIR`, dest-pair paths/URLs, and `sekaictl admin store relocate`. The server image sets `SEKAI_DATA_DIR=/data` (#1239).
-- Combined dest-pair evaluation apply/resolve reads governed invariants from the Sekai store. `sekaictl admin learning` opens the dest pair (or `SEKAI_DATA_DIR`) and writes change records to the Chisei dest (#1239).
-- Compliance export, `sekaictl report quality`, and `sekaictl report substitution` refuse Combined Split instead of a Sekai-only bundle and name the gRPC report RPCs (#1264).
-- Combined Split records Chisei `RecordDecision` rows on the Sekai dest so `verify_ledger` covers them; relocate leaves that table with Sekai (ADR 0083, #1265).
-- Unattested Split with Chisei families still in the Sekai dest refuses restamp and names `sekaictl admin store relocate` (#1263).
-- `deploy/tenkai.toml` sets Combined dest-pair `SEKAI_DB_PATH`/`CHISEI_DB_PATH` on `/data` and pins product/image `1.1.0`, matching crate version and compose (#1268).
-- Workflow-step admission takes a caller `BudgetTracker` over the Chisei store, or defers when the caller has none, instead of wrapping the Sekai runtime as Chisei state (#1270).
-- Chisei persistence goes through per-family store traits. `src/chisei` no longer calls `ChiseiStore::runtime()`, and that method is crate-private. `sekaictl admin quality` opens the dest pair (or `SEKAI_DATA_DIR`) so evaluate/restart can read dataset facts from Sekai (#1237).
-- Pipeline implement and evaluable checks reuse the same per-request type cache as property filtering, so context assembly does not re-list schema types per object (#1262).
-- Governed transforms are a Sekai in-process class on both community backends: put a JobSpec, run a `projection`, inspect the run receipt. `sekaictl admin transform` and Console `/transforms` are the operator path. RPCs stay experimental (ADR 0097, #1287).
+- Community SQLite and PostgreSQL apply new schema on startup (`GATE:mig`).
+  PostgreSQL goes from schema version 51 (file `0052`, the highest at 1.3.0)
+  to 138 (file `0139`). Backup the store before the first 1.4.0 boot. A 1.3.0
+  binary refuses a migrated PostgreSQL store with "newer than supported".
+- Model review is default deny. Native planning and execution, gateway
+  decide, and hosted routes refuse any model that is not `enabled` for the
+  namespace with `model_review.not_enabled`, and gateway failover drops
+  unreviewed candidates (ADR 0106, #1502, #1503, #1504). Initialization does
+  not mark existing routes enabled. Run `sekaictl admin model-review backfill`
+  once after the first 1.4.0 boot and before serving traffic; it enables the
+  currently routed hosted families and the registry-canonical policy models.
+  Use `sekaictl admin model-review set` or `family-set` for anything it does
+  not cover.
+- LLM functions need an evaluation-gate approval. `CreateFunction` refuses
+  LLM steps, and `InvokeFunction` and document extraction refuse an LLM
+  revision without an approval for its digest. Revisions stored before 1.4.0
+  have none, so republish them through the gated publish (#1487).
+- With an enterprise extension installed, any provider credential error
+  refuses execution instead of falling back to the process key. An extension
+  that wants the instance key returns it explicitly (#1488).
+- Retention runs on its own. Every Sekai plane instance archives eligible
+  records on a one-minute tick (ADR 0129, #2020). SQLite stores carry the
+  default policies seeded by earlier releases (`audit` 365 days, `llm_calls`
+  90 days, `task_observations` 90 days), so the first 1.4.0 boot moves older
+  rows into archive tables in the same database (ADR 0141). PostgreSQL has no
+  seeded policies and archives nothing until a policy is set (#2011). To see
+  what the tick will archive, run the 1.4.0 `sekaictl admin retention
+  dry-run` against a restored copy of the backup, never the live store:
+  opening a store with 1.4.0 applies its schema. 2.0.0 stops seeding these policies for fresh
+  stores and adds `sekaictl admin retention policy delete` (#2118, #2120).
+- Runtime tokens are new. Action work claims (#1509) and agent-turn claims
+  (#2012) return a short-lived `sekai.runtime-token/v1` token that names
+  either an effect or a turn; the verifier rejects unknown claims. A 1.3.0
+  replica neither issues nor accepts these tokens, so upgrade every replica
+  behind one endpoint before workers rely on them. Agent turns add the
+  `parked` status and the `agent_turn_worker` service-principal capability
+  (ADR 0142, #2015, #2018).
+- Embedders: Chisei schema is applied only when `ChiseiStore` opens. Code that
+  calls `SekaiDb::new` or `PostgresDb::connect` directly no longer gets Chisei
+  tables, and the Chisei family `RuntimeDb` methods moved to `chisei-core`
+  (#2039).
+- Forgetting site agent memory now erases the retained writer-Action content
+  after admission, including decision-memory facts and offline base values.
+  Request digests are not recomputed (#2032).
+- Guest contexts are denied unless an installed identity extension admits
+  them. Extensions must populate `home_tenant`, return `GuestGrant`, and
+  implement `authorize_discovery` (`GATE:break`, #1432, #1433, #1435).
+  Community installs without an extension keep existing credential behavior.
+- Optional `deny_unmarked` stays off. Enable with namespace property
+  `deny_unmarked=true` or `SEKAI_DENY_UNMARKED=1` (#1430).
+- Sync and devices: a device-bound credential must send the device's proof on
+  `PutSyncScope`, `ReadSyncSnapshot` and `ReadSyncDeltas`. A revoked device's
+  wipe-only assertion (`device.wipe`) gets `wipe_required` and no data on sync
+  reads, and is refused everywhere else (ADR 0126, #1740).
+- Feedback: combined mode investigates recurring observations through governed
+  work (#2049) and can publish findings to one GitHub repository under
+  governed permits (#2050). The publisher idles until
+  `SEKAI_FEEDBACK_GITHUB_OWNER`, `SEKAI_FEEDBACK_GITHUB_REPO` and
+  `SEKAI_FEEDBACK_GITHUB_TOKEN` are set; it opens at most five new issues per
+  UTC day by default (`SEKAI_FEEDBACK_GITHUB_DAILY_CAP`).
+- Exports accept `format=parquet` (#2069), and `EvaluateObjectSetResponse`
+  gains an additive `source` field that old clients ignore (#2070).
+- Rollback: a binary or image rollback does not undo applied schema. To return
+  to the previously deployed version, restore the backup taken before the
+  first 1.4.0 boot.
+
+Upgrading from 1.2.x crosses 1.3.0. Apply the [1.3.0](#130) identity notes
+first: enterprise identity extensions advertise
+`sekai.identity-extension/v2`, every authenticated context carries a tenant,
+and delegated apply and claim refuse with `delegator_*` reasons. From 1.2.x the
+previously deployed version is 1.2.x, and only a backup restore returns to it.
+
+### Upgrade
+
+- Placement requirements on transform runs matched against worker labels at claim (#1904).
+- Model price table and recorded token usage for cost reporting (#1908).
+- Security finding and exposure package with governed record Actions (#1927).
+- Route models by the operation's impact class (#1935).
+- Default budget limits for every work unit (#1938).
+- State the freeze barrier for agent turns (#1955).
+- Change wakes coalesce visible responsibility changes into one turn (#1952) (#1961).
+- Run security disposition reopens from the server (#1962).
+- Caller-scoped ad-hoc governed transform runs, analytical path (#1964) (#1974).
+- Object-set transform inputs, contract and in-process path (#1977) (#1992).
+- Gate agent disposition autonomy on measured precision (#1991) (#1998).
+- Federated aggregate receipts on SQLite and PostgreSQL (#2000).
+- Replay of runs with object-set inputs (#1979) (#2002).
+- Shared retention archive tables and one RuntimeDb retention entry point (#2003).
+- Policy-driven retention on PostgreSQL for LLM calls, observations and content events (#2011).
+- Scoped agent-turn workers (#2006) (#2015).
+- Parked agent turns with a continuation (#2007) (#2018).
+- Operator read of a site agent instance's turns (#2001) (#2019).
+- Move Chisei family migrations into chisei-core persist (#2039).
+
+### Added
+
+- Enforce a discover-only permission below read (#1428).
+- Optional deny_unmarked for unmarked objects (#1430).
+- Inherit transform markings and gate declassify (#1403) (#1431).
+- Distinguish home and acting tenant; deny guest contexts by default (#1436).
+- Host-admitted guests with role and marking ceiling (#1440).
+- Extract versioned sekai-source-sdk crate (#1407) (#1441).
+- Add check and discover to the source-adapter SDK (#1445).
+- Connector template and generator next to the source SDK (#1472).
+- Source-webhook key pins and source-type descriptors on PostgreSQL (#1480).
+- Persist connector certifications on PostgreSQL (#1482).
+- Add analytical governed-transform SQL profile (#1483).
+- Admit the resolved model through the enterprise extension and drop the env-key fallback (#1488).
+- Add isolated-process governed-transform profile (#1489).
+- Publish a versioned runtime-claim client (#1490).
+- Admit scheduled and change-triggered governed-transform runs (#1496).
+- Key the privacy scan cache on a per-namespace object generation (#1492) (#1497).
+- Re-validate the delegating principal at claim time (#1421) (#1498).
+- Stream partitioned governed-transform I/O (#1501).
+- Persist per-namespace model review state (#1493) (#1502).
+- Enforce model review state at route admission with default deny (#1503).
+- Registered hosted routing profiles carry an optional artifact digest (#1500).
+- Admit opt-in hosted routes on signed release evidence (#1505).
+- Gate agent-definition merges on bound certification (#1353) (#1506).
+- Short-lived runtime token in the Action work claim response (#1509).
+- List published definition revision history (#1354) (#1512).
+- Register workers as scoped service principals (#1515).
+- Issue service tokens through an identity-extension hook (#1517).
+- Enforce service-principal scopes on Action RPCs (#1520).
+- Persist Gunshi allocation state on PostgreSQL (#1474) (#1521).
+- Persist federation network and profile state on PostgreSQL (#1475) (#1522).
+- Persist federation snapshots and peer-import provenance on PostgreSQL (#1476) (#1523).
+- Persist versioned client packages on PostgreSQL (#1477) (#1524).
+- Persist capability-package certifications on PostgreSQL (#1478) (#1525).
+- Persist governed images and open-table projections on PostgreSQL (#1479) (#1526).
+- Propose append-only definition rollback as a new descendant (#1390) (#1527).
+- Snapshot dataset versions and roll back as a new audited version (#1412).
+- Admit and meter tenant-scoped governed transform runs (#1531).
+- Hide cross-tenant lookup until a discovery rule names the target (#1535).
+- Admit dual-approved shared spaces on object get, list, mutate, and history (#1541).
+- Dry-run an Agent draft on one input without submitting Actions (#1533) (#1543).
+- Preview a governed transform on a bounded sample without committing (#1532) (#1544).
+- Admit scoped contexts for definition proposal create, approve, and merge (#1545).
+- Admit scoped contexts for governed transform reads and preview (#1555).
+- Dataset health checks with job and schedule alerts (#1556).
+- Add a permission-aware SQLite search index with incremental catch-up (#1558).
+- Add a PostgreSQL GIN search index with the same candidate set as SQLite (#1560).
+- Add experimental permission-aware Search and index-status RPCs (#1561).
+- Admit scoped PutGovernedTransform under namespace write (#1570).
+- Adopt namespaced mikura object-log identity (#1571).
+- Dual-read mikura min, max, and avg against the object-set SQL path (#1574).
+- Object-path benchmark workloads and a 20% regression gate (#1590).
+- Add customer-managed key contract and sekai-keys crate (#1593).
+- Sign per-namespace receipt chains (#1449) (#1595).
+- Per-principal and per-agent rate limits and agent grant ceiling (#1594).
+- Require purpose and end date on opt-in namespace grants (#1596).
+- Add versioned compliance packs over export evidence (#1597).
+- List governed Action types on DiscoverCapabilities (#1599).
+- Freeze writes or agent Actions by tenant, namespace, principal, or type (#1598).
+- Gate invoice extraction revisions on labelled fixtures (#1600).
+- Route parked Actions through review queues (#1601).
+- Grant gradual auto-apply after measured agent reviews (#1602).
+- Add definition-branch tools for agent proposals (#1604).
+- Store Action decision memory and surface similar precedents (#1606).
+- Apply streaming transform output exactly once (#1607).
+- Governed embedding index for object properties (#1608).
+- Deterministic synthetic tenant generator with size presets (#1637).
+- Refuse agent promotion when the suite score regresses (#1641).
+- Bind tools to an agent revision and refuse publish without approval for mutating tools (#1645).
+- Report derived tool effects on the certification gate and capability read (#1647).
+- Markings, roles and Action history with receipts in synthetic tenants (#1648).
+- Game reference workload as a synthetic tenant domain generator (#1654).
+- Dataset branches with a governed one-version merge (#1655).
+- Run a governed transform on a dataset branch (#1656).
+- Experimental ExpandNeighborhood and FindPaths over object links (#1657).
+- Experimental gRPC for dataset branches (#1663).
+- Query what a view would have shown under a different rule (#1665).
+- Trust scores on objects from a versioned namespace rule (#1667).
+- Comment threads on objects under object read policy (#1672).
+- Blocking consumer bindings gate breaking publishes (#1702).
+- Ontology changelog and team digest of definition changes (#1703).
+- Replay governed transforms into a branch with a diff (#1705).
+- Live shadow evaluation of a candidate namespace policy (#1704).
+- Signed definition package export and import as a proposal (#1707).
+- Bind Ezu geofence events to governed Actions (#1709).
+- Governed catalog entries registered by stable source id (#1708).
+- Versioned eval datasets generated from synthetic tenant seeds (#1712).
+- Resumable, checksummed media uploads that return a governed reference (#1713).
+- ListObjectChanges on PostgreSQL with a stored operation id (#1714).
+- Action instances carry the markings of the objects and bindings they derive from (#1715).
+- Experimental GenerateDefinitionChangeBundle for candidate revisions (#1717).
+- Device claim on identity assertions and per-request device proof (#1719).
+- Offline sync scopes with a policy-filtered snapshot and resumable deltas (#1716).
+- Catalog owner curation through governed Actions (#1721).
+- Stored embedding specs embedded through hosted catalog routes (#1720).
+- Queued governed Actions from disconnected devices (#1729).
+- Parallel eval runs with a concurrency limit, run budget, cost ledger and per-case resume (#1718).
+- Embed vector search queries through the indexed spec's route (#1736).
+- Dry-run a definition change bundle's backfill on dataset branches (#1731).
+- Purge sync deltas on access revocation and bound offline age (#1730).
+- Shape-driven synthetic domain for local twins (#1739).
+- Record writer kind, reference and receipt on every object change (#1728).
+- Sync requires device proof, a revoked device may only wipe (#1740).
+- Policy-outcome scoring per eval run (#1744).
+- Certify connectors bound to a registered source type descriptor (#1746).
+- Permission-aware hybrid search over exact vectors (#1743).
+- Page through a source binding's batch transactions (#1745).
+- Eval baseline comparison with significance gating promotion (#1748).
+- ExplainValue, the chain of writes behind a property value (#1747).
+- Persist intents and simulated plans through the Action preview path (#1768).
+- Apply an approved definition change bundle as one governed change (#1693) (#1769).
+- Review a simulated plan as one bundle bounded by approver authority (#1678) (#1775).
+- Ontology lint over a namespace under the caller's read policy (#1454) (#1778).
+- Unreferenced-property lint rule and definition-held suppressions (#1684) (#1781).
+- Block definition merges that introduce unsuppressed lint errors (#1784).
+- Object-change Action bindings on PostgreSQL (#1319) (#1785).
+- Purpose authorizations and classification lattices on PostgreSQL (#1321) (#1787).
+- Execute a granted plan step by step under a fenced claim (#1679) (#1790).
+- Governed object-set export under an export grant with a receipt (#1627) (#1792).
+- Stored ontology health trends and threshold events (#1694) (#1801).
+- Export a dataset version under the export grant (#1695) (#1802).
+- List the parked Action instances the caller may decide (#1771) (#1803).
+- Resume or abort an open source batch from its stored body (#1766) (#1805).
+- Saved export definitions run for their owner into stored artifacts (#1628) (#1808).
+- Admit preview, action-type, object and definition RPCs for tenant assertions (#1777) (#1810).
+- Transform run receipts pin the input versions they read (#1794) (#1811).
+- Fingerprint marked export measurements for later trace (#1466) (#1812).
+- Schedule saved exports and deliver artifacts through an adapter (#1813).
+- Shadow agent revisions against recorded trigger envelopes (#1814).
+- Notify bound consumers of freshness and quality violations (#1816).
+- Bind catalog entries and walk GetCatalogEntryLineage (#1817).
+- Export catalog service criticality through the outbox (#1818).
+- Package governed transforms as signed members (#1819).
+- Add Kubernetes manifests deployable through Tenkai (#1820).
+- Persist execution-evidence reject and record on PostgreSQL (#1821).
+- Feed object geo changes into Ezu (#1823).
+- Persist permit redeem, reconcile, and delegation on PostgreSQL (#1825).
+- Backfill Ezu geo feeds through GeoArrow Flight (#1826).
+- Shadow a candidate transform revision against the active one's runs (#1834).
+- Gate transform promotion on a passing shadow report (#1835).
+- Admit tenant-scoped device assertions on sync RPCs (#1838).
+- PostgreSQL takes the identity extension and holds no tenant state (#1839).
+- Ontology export writes a namespace as a canonical file tree (#1664).
+- Ontology import applies a file tree as a governed proposal (#1849).
+- Run ontology lint on imported file trees (#1858).
+- Option to trust only the configured CA certificates (#1887).
+- Name the rule and approvers when an Action parks for approval (#1889).
+- Admit GetOperationReceipt and GetQualityTrend for tenant-scoped assertions (#1891).
+- Read budget usage and remaining limit per scope (#1895).
+- Accept DOCX as a governed document content type (#1897).
+- Transform work queue-depth metrics per pool and profile (#1906).
+- Carry isolated-process code with the transform definition (#1907).
+- Impact class on Action types and Action-claim references on model calls (#1911).
+- Remove the stable RPC ceiling (#1917).
+- Per-turn segments and spend-weighted action budgets (#1859) (#1926).
+- Federated aggregate domain module (#1920) (#1939).
+- Submission criterion that reads cross-tenant sharing state (#1940).
+- Security dispositions with a validity basis and grant-gated risk acceptance (#1924) (#1942).
+- Site agent instances as governed objects (#1933) (#1944).
+- Per-tenant federated aggregate allowances (store and admin surface) (#1921) (#1946).
+- Freeze a site agent instance (#1934) (#1947).
+- Reopen dispositions when their validity basis changes (#1956).
+- Schedule wakes admit one agent turn per due time (#1951) (#1959).
+- Fence package reference reads through the admission write (#1941) (#1963).
+- Governed working memory for site agent instances (#1973).
+- Retention sweep for ad-hoc scratch datasets (#1965) (#1976).
+- Ad-hoc governed transform runs, isolated-process path (#1966) (#1981).
+- Measure agent disposition precision per revision and finding class (#1990) (#1993).
+- Object-set transform inputs, isolated-process claim path (#1978) (#1994).
+- A fixed exposure needs a bound regression probe (#1989) (#1995).
+- Runtime tokens for agent-turn claims (#2005) (#2012).
+- FederatedAggregate tenant evaluation and RPC (#2008).
+- Verify the audit ledger on PostgreSQL before purging audit records (#2014).
+- Record and retain object changes on PostgreSQL (#2017).
+- Plane retention tick and sekaictl admin retention (#2020).
+- Read site agent working memory as both the agent and its requester (#2021).
+- Erase forgotten site agent memory from Action payloads (#2032).
+- Investigate recurring observations through governed work (#2049).
+- Publish deduplicated findings to GitHub with governed permits (#2050).
+- Verify improvements and evaluate issue quality (#2052).
+- Export object sets and datasets as Parquet (#2069).
+- Name EvaluateObjectSet serving source (#2070).
+- Add remediation plans and mitigating-control Actions (#2075).
+
+### Changed
+
+- Bound the privacy entity scan in SQL and stream its fingerprint (#1495).
+- Extract object-list property order_by once per row (#1374) (#1518).
+- Offload store work from Tokio workers (#1592).
+- Move Sekai vocabulary out of the provider crate and rename it chisei-provider (#1666).
+- Move Chisei persistence out of src/db into src/chisei_store (#1671).
+- Cut sekai-core below the root crate (#1815).
+- Cut chisei-core below the root crate (#1827).
+- Own the game reference workload's ontology fixture (#1841).
+- Split RuntimeDb dispatch by store area (#2040).
+
+### Fixed
+
+- Write parked extractions with classification and lineage on grant (#1429).
+- Apply the action policy and write authorization to every document extraction (#1486).
+- Scan every in-window entity literal and refuse truncated scans distinctly (#1484).
+- Make governed-document lifecycle updates atomic (#1485).
+- Require an allowing evaluation gate before storing or running an LLM function (#1487).
+- Drop unreviewed models from gateway failover candidates (#1504).
+- List PostgreSQL refusals for SubmitEvidence and ListObjectChanges (#1373) (#1516).
+- Serialize Chisei SQLite lookup-index backfill across concurrent opens (#1394) (#1519).
+- Refuse agent-definition self-certification and revoke undo (#1528).
+- Bind hosted-profile evidence to digest and served origin (#1587).
+- Admit isolated-process claims through the enterprise extension (#1589).
+- Batch ApplySourceBatch object-policy lookups (#1591).
+- Bound assertion replay state by assertion expiry (#1639).
+- Admit definition package and rollback RPCs for enterprise credentials (#1710).
+- Refuse device-bound assertions on RPCs that check no device proof (#1723).
+- Patch the rustls-webpki, webpki-roots and ctutils advisories (#1764).
+- In-process tool dispatch applies the experimental RPC gate (#1767).
+- Refuse source_turn on Agent definition documents (#1782).
+- Only warnings on published members lower the lint part (#1783).
+- Shared row filters on PostgreSQL; ontology deadline covers pool checkout (#1789).
+- Withhold refusal details with credential-like names (#1800).
+- Start compute timing once dataset locks are held (#1809).
+- Drop postgres execution-recording pool off the tokio worker (#1822).
+- Replace yanked chacha20 0.10.1 in Cargo.lock (#1844).
+- Concurrent decision writers each take the next ledger seq (#1722) (#1888).
+- Make governed document admission atomic (#1776) (#1892).
+- An interrupted pairing-epoch advance no longer wedges split stores (#1845) (#1893).
+- Wait out SQLite write locks when changing ontology classes (#1851) (#1894).
+- Charge an action type's budget_scope on split stores (#1863) (#1896).
+- Split-store submits refused for invalid parameters charge no budget (#1864) (#1898).
+- Planned executions charge the work-unit budget chain (#1866) (#1901).
+- Record split-store budget refusals in the decision ledger (#1871) (#1903).
+- Refund a reservation that replays a concurrent budget denial, once (#1902) (#1909).
+- Fence action admission reservations with an owner lease (#1936).
+- Recover abandoned action admission reservations (#1945).
+- Finish an admission's follow-ups after its receipt (#1953).
+- Resume an approver decision's follow-ups after a crash (#1960).
+- Fence site agent writes against a concurrent freeze or principal change (#1975).
+- Bump pulldown-cmark to 0.13.5 for RUSTSEC-2026-0414 (#2010).
+- Add deterministic SBOM document identity (#2081).
+- Refresh parser and independent test-reader versions (#2084).
+- Version public Rust library API changes (#2082).
 
 ## 1.3.0
 

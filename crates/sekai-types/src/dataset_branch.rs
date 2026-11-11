@@ -37,6 +37,10 @@ pub const PROPOSAL_SELF_MERGE: &str = "a dataset branch proposal is merged by an
 pub const PROPOSAL_STALE_PARENT: &str =
     "the parent dataset changed since the proposal; propose again";
 pub const PROPOSAL_STALE_BRANCH: &str = "the branch changed since the proposal; propose again";
+/// The proposal is attached to an open definition proposal, whose merge
+/// lands it; close that proposal to merge this one on its own.
+pub const PROPOSAL_ATTACHED: &str =
+    "dataset branch proposal is attached to an open definition proposal";
 
 pub const BRANCH_RUN_ISOLATED: &str =
     "an isolated-process transform cannot run on a dataset branch";

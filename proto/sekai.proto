@@ -726,6 +726,10 @@ message ExportDefinition {
   int64 created_at_ms = 6;
   // Interval for the transform schedule graph (ADR 0103). Zero is unscheduled.
   int64 every_ms = 7;
+  // The Source (ADR 0148) whose runtime delivers this export's artifacts.
+  // It must be active and of a type that delivers when saved. Empty leaves
+  // delivery to any claimer the artifact admits.
+  string delivery_source_id = 8;
 }
 message PutExportDefinitionRequest {
   ExportDefinition definition = 1;
@@ -758,7 +762,9 @@ message RunExportDefinitionResponse {
   int64 row_count = 2;
   string content_digest = 3;
 }
-// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts.
+// Adapter delivery (#1628): completed, unexpired, unacknowledged artifacts
+// no live export_delivery claim holds. Deprecated: claim them as
+// WORK_KIND_EXPORT_DELIVERY through ListClaimableWork and ClaimWork.
 message ListDeliverableExportArtifactsRequest {
   string namespace = 1;
 }
@@ -769,17 +775,32 @@ message DeliverableExportArtifact {
   string content_digest = 4;
   int64 created_at_ms = 5;
   int64 expires_at_ms = 6;
+  // The Source that delivers it, from its definition; empty for none.
+  string delivery_source_id = 7;
 }
 message ListDeliverableExportArtifactsResponse {
   repeated DeliverableExportArtifact artifacts = 1;
 }
+// The export_delivery claim (ADR 0149) its holder presents to fetch or
+// acknowledge a claimed artifact. Without one, a claimed artifact is
+// refused while the claim is live.
+message ExportDeliveryFence {
+  string runtime_id = 1;
+  int64 claim_generation = 2;
+  string fencing_token = 3;
+}
 message FetchExportArtifactRequest {
   string receipt_id = 1;
+  // Required while a live claim holds the artifact.
+  ExportDeliveryFence claim = 2;
 }
+// Deprecated: acknowledge claimed work with AckWork.
 message AcknowledgeExportDeliveryRequest {
   // The digest the adapter verified over the fetched bytes.
   string receipt_id = 1;
   string content_digest = 2;
+  // Required while a live claim holds the artifact.
+  ExportDeliveryFence claim = 3;
 }
 message AcknowledgeExportDeliveryResponse {
   bool acknowledged = 1;
@@ -1341,6 +1362,188 @@ message AckAgentTurnRequest {
 message AckAgentTurnResponse {
   AgentTurn turn = 1;
 }
+// Experimental (ADR 0149). A kind of claimable work. Every kind follows the
+// ADR 0129 claim contract; the old per-kind RPCs and these see the same
+// claim on the same row.
+enum WorkKind {
+  WORK_KIND_UNSPECIFIED = 0;
+  WORK_KIND_TRANSFORM = 1;
+  WORK_KIND_ACTION = 2;
+  WORK_KIND_AGENT_TURN = 3;
+  // A saved-export artifact awaiting delivery. Its work_id is the receipt
+  // id. Callers need what ListDeliverableExportArtifacts needs: the run's
+  // initiating actor or a namespace administrator.
+  WORK_KIND_EXPORT_DELIVERY = 4;
+  // A Source's due sync (ADR 0148). Its work_id is the source_id; the
+  // request's namespace names the Source's namespace. Listing and claiming
+  // offer it only to a runtime whose registered labels (see
+  // RegisterTransformRuntime) satisfy the Source's placement.
+  WORK_KIND_SOURCE_SYNC = 5;
+}
+// A claimed Source sync: the Source as the claim granted it.
+message SourceSyncWork {
+  ConnectorSource source = 1;
+  string claim_owner = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  int64 claim_expires_at_ms = 5;
+}
+// A claimed saved-export artifact: a reference, not bytes. Fetch them with
+// FetchExportArtifact under this claim, then acknowledge with AckWork.
+message ExportDeliveryWork {
+  DeliverableExportArtifact artifact = 1;
+  string claim_owner = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  // Never later than the artifact's expires_at_ms.
+  int64 claim_expires_at_ms = 5;
+}
+// Options of a list or claim of agent turns.
+message AgentTurnWorkOptions {
+  // When false, parked turns that would resume with a continuation are
+  // neither listed nor claimed.
+  bool accepts_continuation = 1;
+}
+// A connector type by name and version (ADR 0148).
+message ConnectorTypeRef {
+  string name = 1;
+  string version = 2;
+}
+// Options of a list of Source sync work.
+message SourceSyncWorkOptions {
+  // Lists only Sources of these types, the ones the runtime implements, so
+  // Sources of other types never fill its page. Empty lists every type.
+  repeated ConnectorTypeRef connector_types = 1;
+}
+// Options of a list of export-delivery work.
+message ExportDeliveryWorkOptions {
+  // When set, lists only artifacts a Source delivers, of these types (the
+  // ones the runtime implements; empty means any type), so artifacts left
+  // to other deliverers never fill the runtime's page.
+  repeated ConnectorTypeRef connector_types = 1;
+}
+message ListClaimableWorkRequest {
+  WorkKind kind = 1;
+  string namespace = 2;
+  // Transform, Action and Source sync work: lists only work this runtime
+  // may take.
+  string runtime_id = 3;
+  int32 limit = 4;
+  oneof options {
+    AgentTurnWorkOptions agent_turn = 10;
+    SourceSyncWorkOptions source_sync = 11;
+    ExportDeliveryWorkOptions export_delivery = 12;
+  }
+}
+// One claimable item; the set field names its kind.
+message ClaimableWork {
+  oneof payload {
+    TransformWork transform = 1;
+    ActionEffect action = 2;
+    AgentTurn agent_turn = 3;
+    DeliverableExportArtifact export_delivery = 4;
+    ConnectorSource source_sync = 5;
+  }
+}
+message ListClaimableWorkResponse {
+  repeated ClaimableWork work = 1;
+}
+message ClaimWorkRequest {
+  WorkKind kind = 1;
+  // Transform work and agent turns. Action work is named by work_id alone.
+  string namespace = 2;
+  string runtime_id = 3;
+  // run_id, effect_id, turn_id or receipt_id. Empty claims the next due
+  // item, for every kind but Action work.
+  string work_id = 4;
+  int64 ttl_ms = 5;
+  // Action work: the idempotency key of this claim. Required for it.
+  string request_id = 6;
+  oneof options {
+    AgentTurnWorkOptions agent_turn = 10;
+  }
+}
+// The kind's own claim response, as its per-kind RPC returns it.
+message ClaimWorkResponse {
+  oneof payload {
+    ClaimTransformWorkResponse transform = 1;
+    ClaimActionWorkResponse action = 2;
+    ClaimAgentTurnResponse agent_turn = 3;
+    ExportDeliveryWork export_delivery = 4;
+    SourceSyncWork source_sync = 5;
+  }
+}
+message HeartbeatWorkClaimRequest {
+  WorkKind kind = 1;
+  // run_id, effect_id, turn_id, receipt_id or source_id.
+  string work_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  int64 ttl_ms = 6;
+  // Source sync: the Source's namespace.
+  string namespace = 7;
+}
+message HeartbeatWorkClaimResponse {
+  oneof payload {
+    HeartbeatTransformClaimResponse transform = 1;
+    HeartbeatActionClaimResponse action = 2;
+    HeartbeatAgentTurnClaimResponse agent_turn = 3;
+    ExportDeliveryWork export_delivery = 4;
+    SourceSyncWork source_sync = 5;
+  }
+}
+// Action-work fields of an acknowledge; see AckActionWorkRequest.
+message ActionAckOptions {
+  string request_id = 1;
+  string checkpoint_store_id = 2;
+  string checkpoint_ref = 3;
+  string checkpoint_digest = 4;
+  string artifact_json = 5;
+}
+// Agent-turn fields of an acknowledge; see AckAgentTurnRequest.
+message AgentTurnAckOptions {
+  string parked_action_instance_id = 1;
+}
+// Export-delivery fields of an acknowledge; required for that kind.
+message ExportDeliveryAckOptions {
+  // The digest the runtime verified over the fetched bytes.
+  string content_digest = 1;
+}
+// Transform work is acknowledged by WriteTransformRunResult, which carries
+// its output.
+message AckWorkRequest {
+  WorkKind kind = 1;
+  // effect_id, turn_id, receipt_id or source_id.
+  string work_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  // completed, failed or parked. Export delivery takes completed, which
+  // deletes the artifact's bytes, or failed with the failure class as
+  // reason, which records the Source's delivery health and leaves the claim
+  // to lapse so the artifact is retried. Source sync takes completed,
+  // or failed with the failure class as reason: unavailable, unreachable,
+  // auth_failed, permission_missing, invalid or unsupported. A failed sync
+  // waits for the next interval.
+  string outcome = 6;
+  string reason = 7;
+  // Source sync: the Source's namespace.
+  string namespace = 8;
+  oneof options {
+    ActionAckOptions action = 10;
+    AgentTurnAckOptions agent_turn = 11;
+    ExportDeliveryAckOptions export_delivery = 12;
+  }
+}
+message AckWorkResponse {
+  oneof payload {
+    AckActionWorkResponse action = 1;
+    AckAgentTurnResponse agent_turn = 2;
+    AcknowledgeExportDeliveryResponse export_delivery = 3;
+    ConnectorSource source_sync = 4;
+  }
+}
 // Experimental (#1968). Live (not forgotten) working memory of one site
 // agent instance, for an agent turn. An item is returned only when the
 // instance principal and the requester can each read it on their own.
@@ -1507,14 +1710,52 @@ message DocumentView {
   bool has_metadata = 15;
   bool has_renditions = 16;
 }
+// What a caller submits to admit a document. Field numbers match
+// GovernedDocument; the server sets the reserved ones: the admission and
+// deletion fields are its own. The owner is always the caller: an empty owner
+// means the caller, and any other owner is refused. content_digest, when set,
+// must match the digest of content_ref.
+message GovernedDocumentAdmission {
+  reserved 15, 16, 17;
+  reserved "admitted_by", "admitted_at_ms", "deleted_at_ms";
+  string contract_version = 1;
+  string document_id = 2;
+  string namespace = 3;
+  string owner = 4;
+  string type_revision = 5;
+  string purpose = 6;
+  string classification = 7;
+  string title = 8;
+  map<string, string> metadata = 9;
+  ContentReference content_ref = 10;
+  string content_digest = 11;
+  int64 expires_at_ms = 12;
+  string hold_id = 13;
+  string hold_reason = 14;
+}
 message AdmitGovernedDocumentRequest {
-  GovernedDocument document = 1;
+  GovernedDocumentAdmission document = 1;
 }
 message AdmitGovernedDocumentResponse {
   GovernedDocument document = 1;
 }
+// What a caller submits to attach a rendition. Field numbers match
+// DocumentRendition; the server sets the reserved ones: attached_by is the
+// caller and attached_at_ms the attach time.
+message DocumentRenditionAttachment {
+  reserved 9, 10;
+  reserved "attached_by", "attached_at_ms";
+  string namespace = 1;
+  string document_id = 2;
+  string rendition_id = 3;
+  string class = 4;
+  string parent_content_digest = 5;
+  ContentReference content_ref = 6;
+  string extractor_id = 7;
+  string extractor_profile_digest = 8;
+}
 message AttachGovernedDocumentRenditionRequest {
-  DocumentRendition rendition = 1;
+  DocumentRenditionAttachment rendition = 1;
 }
 message AttachGovernedDocumentRenditionResponse {
   DocumentRendition rendition = 1;
@@ -1701,7 +1942,9 @@ message PutClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 message GetClassificationLatticeRequest { string namespace = 1; }
 message GetClassificationLatticeResponse { ClassificationLattice lattice = 1; }
 // What embedding catch-up embeds in a namespace, and the hosted catalog
-// model route (`hosted.<name>/<model>`) that embeds it (#1609).
+// model route (`hosted.<name>/<model>`) that embeds it (#1609). Put refuses
+// dimension above 4096, chunk_chars above 8192, batch_size above 256, more
+// than 32 properties, and a 17th spec in a namespace (#2244).
 message EmbeddingSpecDefinition {
   string namespace = 1;
   string spec_id = 2;
@@ -1716,8 +1959,18 @@ message EmbeddingSpecDefinition {
 }
 message PutEmbeddingSpecRequest { EmbeddingSpecDefinition spec = 1; }
 message PutEmbeddingSpecResponse { EmbeddingSpecDefinition spec = 1; }
-message ListEmbeddingSpecsRequest { string namespace = 1; }
-message ListEmbeddingSpecsResponse { repeated EmbeddingSpecDefinition specs = 1; }
+message ListEmbeddingSpecsRequest {
+  string namespace = 1;
+  // At most 100; 0 means 100.
+  int32 page_size = 2;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 3;
+}
+message ListEmbeddingSpecsResponse {
+  repeated EmbeddingSpecDefinition specs = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message DeleteEmbeddingSpecRequest {
   string namespace = 1;
   string spec_id = 2;
@@ -3250,6 +3503,60 @@ message ListActionInstancesRequest {
 }
 message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
 
+// Experimental (#2203): what waits on the caller's decision, across the four
+// review kinds. Rows stay in each kind's own store, and deciding still goes
+// through that kind's RPC.
+enum PendingDecisionKind {
+  PENDING_DECISION_KIND_UNSPECIFIED = 0;
+  // A parked Action instance, decided with DecideActionInstance.
+  PENDING_DECISION_KIND_ACTION_INSTANCE = 1;
+  // A submitted plan review, decided with DecidePlanReview.
+  PENDING_DECISION_KIND_PLAN_REVIEW = 2;
+  // An open definition proposal, approved with ApproveDefinitionProposal.
+  PENDING_DECISION_KIND_DEFINITION_PROPOSAL = 3;
+  // An open dataset branch proposal, merged with MergeDatasetBranch.
+  PENDING_DECISION_KIND_DATASET_BRANCH_PROPOSAL = 4;
+}
+// Each kind is filtered by the check its decide RPC applies, so the caller
+// sees only what that RPC would accept from them and nothing else; a caller
+// who may decide nothing gets an empty list. Freshness preconditions (a
+// moved branch base, a changed target object) are not checked here; the
+// decide RPC reports them.
+message ListPendingDecisionsRequest {
+  string namespace = 1;
+  // Empty: every kind.
+  repeated PendingDecisionKind kinds = 2;
+  // Default 100, at most 500.
+  uint32 limit = 3;
+  // next_page_token of the previous page.
+  string page_token = 4;
+}
+message PendingDecision {
+  PendingDecisionKind kind = 1;
+  string namespace = 2;
+  // Action instance id, plan id, definition proposal id, or dataset branch
+  // proposal id.
+  string subject_id = 3;
+  // What the decision binds: the instance request digest, the plan's
+  // simulation digest, the proposal digest, or the branch digest.
+  string subject_digest = 4;
+  string requested_by = 5;
+  int64 requested_at_ms = 6;
+  // Review SLA deadline of a parked Action; 0 when none.
+  int64 deadline_ms = 7;
+  // Review queue of a parked Action, or the first of a plan's step queues;
+  // empty when none.
+  string queue_id = 8;
+  // Set for a dataset branch proposal: MergeDatasetBranch names it.
+  string dataset_id = 9;
+}
+// Kinds in enum order, newest first within a kind.
+message ListPendingDecisionsResponse {
+  repeated PendingDecision decisions = 1;
+  // Empty on the last page. A full page may be followed by an empty one.
+  string next_page_token = 2;
+}
+
 // Typed ActionInstance effects (#398). Children of admitted instances.
 message ActionEffect {
   string effect_id = 1;
@@ -3841,6 +4148,10 @@ message SourceBatch {
   // Rebound to the single authenticated transport principal by the server.
   string producer_identity = 3;
   string source = 4;
+  // Free-form with `source`, deprecated as the way to name where a batch
+  // comes from: name the Source with `source_id` (ADR 0148). Object ids
+  // still derive from `source`, `source_instance` and each record's
+  // external id, so naming a Source changes no identity.
   string source_instance = 5;
   string family = 6;
   string adapter_id = 7;
@@ -3853,6 +4164,12 @@ message SourceBatch {
   int64 collected_at_ms = 14;
   repeated SourceRecord records = 15;
   SourceDeliveryWindow delivery = 16;
+  // The Source (ADR 0148) this batch syncs. When set, that Source must own
+  // `source` and `source_instance`. Empty keeps the deprecated free-form
+  // path, open for unowned tokens and active Sources alike; a disabled
+  // Source refuses every batch for its tokens either way. Not part of the
+  // batch digest.
+  string source_id = 17;
 }
 
 message SourceBinding {
@@ -4293,6 +4610,24 @@ message DefinitionProposal {
   string source_package_digest = 20;
   // Commit of the definition file tree this proposal imports (#1618).
   string source_commit = 21;
+  // Dataset branch merge proposals this proposal merges with (#2222), as
+  // pinned at creation. The caller sees one only when it may read that
+  // dataset in the proposal's tenant; otherwise the entry is only `hidden`.
+  // Readable entries come first, in dataset-id order. Empty for a proposal
+  // without attachments.
+  repeated DefinitionProposalDatasetAttachment dataset_proposals = 22;
+}
+
+// One dataset branch merge proposal attached to a definition proposal.
+message DefinitionProposalDatasetAttachment {
+  // True when the caller may not read the attached dataset proposal; every
+  // other field is then empty.
+  bool hidden = 1;
+  string dataset_id = 2;
+  string proposal_id = 3;
+  // Pinned when the definition proposal was created; part of its digest.
+  string parent_version_id = 4;
+  string branch_digest = 5;
 }
 
 message CreateDefinitionProposalRequest {
@@ -4310,6 +4645,18 @@ message CreateDefinitionProposalRequest {
   // The change bundle digest this proposal migrates by (#1693). Part of the
   // approved proposal digest: ApplyDefinitionChangeBundle runs only it.
   string migration_plan_digest = 10;
+  // Dataset branch merge proposals that merge with this proposal, in one
+  // transaction, or not at all (#2199). Each must be open, in the caller's
+  // tenant, writable by the caller, and not a change bundle branch. Their
+  // pinned parent version and branch digest are part of the approved
+  // proposal digest. Cannot be combined with migration_plan_digest.
+  repeated DatasetProposalRef dataset_proposals = 11;
+}
+
+// One dataset branch merge proposal, as ProposeDatasetBranchMerge returned it.
+message DatasetProposalRef {
+  string dataset_id = 1;
+  string proposal_id = 2;
 }
 
 message CreateDefinitionProposalResponse {
@@ -4573,15 +4920,17 @@ message GetOntologyHealthRequest {
 }
 message OntologyHealthProblem {
   // dataset | binding | grant | object_type | link_type | object | marking |
-  // action_type
+  // action_type | source
   string subject_kind = 1;
+  // For a source, `source_instance@type_digest`.
   string subject_id = 2;
   // What is wrong: stale, check_failed, member_removed, property_removed,
-  // unverifiable, expired, unreviewed, or a lint rule.
+  // unverifiable, expired, unreviewed, a lint rule, or a source's health
+  // class (delayed, blocked, unavailable).
   string code = 3;
 }
 message OntologyHealthPart {
-  // freshness | quality | contract | lint | trust | access
+  // freshness | quality | contract | lint | trust | access | source
   string part = 1;
   // False when the server cannot compute the part or the caller may not see
   // it; unavailable_reason says which, and the part leaves the total.
@@ -4608,9 +4957,8 @@ message GetOntologyHealthResponse {
   bool complete = 3;
 }
 // Records one health snapshot of a namespace for the current window
-// (#1694). An external periodic caller drives it; the plane runs no
-// scheduler. The caller's schedule carries the window, retention and
-// threshold.
+// (#1694), on demand. A stored OntologyHealthSchedule records from the
+// transform schedule tick (#2192); this call stays for on-demand records.
 message RecordOntologyHealthSnapshotRequest {
   string namespace = 1;
   // Window length; the snapshot belongs to the window holding the current
@@ -4623,7 +4971,7 @@ message RecordOntologyHealthSnapshotRequest {
   uint32 threshold = 4;
 }
 message OntologyHealthPartScore {
-  // freshness | quality | contract | lint | trust | access
+  // freshness | quality | contract | lint | trust | access | source
   string part = 1;
   // Absent when the part was unavailable when recorded.
   optional uint32 score = 2;
@@ -4665,6 +5013,186 @@ message ListOntologyHealthTrendResponse {
   repeated OntologyHealthSnapshot snapshots = 1;
   // Only events whose snapshot the reader may see in full.
   repeated OntologyHealthEvent events = 2;
+  // The namespace's schedule, shown only to its administrator; absent when
+  // none is stored.
+  optional OntologyHealthSchedule schedule = 3;
+}
+// A namespace's health snapshot schedule (#2192): a member of the transform
+// schedule graph. TickGovernedTransforms records each due window as
+// recorded_by.
+message OntologyHealthSchedule {
+  string namespace = 1;
+  // Window length and cadence. At least one minute.
+  int64 window_ms = 2;
+  // At least one window.
+  int64 retention_ms = 3;
+  // 0-100.
+  uint32 threshold = 4;
+  // Set by the plane: the administrator that put it.
+  string recorded_by = 5;
+  // Set by the plane.
+  int64 updated_at_ms = 6;
+  // Set by the plane: start of the last recorded window; 0 before the first.
+  int64 last_window_start_ms = 7;
+  // Set by the plane: why the schedule halted; empty while it runs. A halted
+  // schedule records again after a put replaces it.
+  string last_error = 8;
+}
+// Creates or replaces the namespace's schedule. Only the namespace's
+// administrator, outside a tenant assertion; they become recorded_by.
+message PutOntologyHealthScheduleRequest {
+  OntologyHealthSchedule schedule = 1;
+}
+message PutOntologyHealthScheduleResponse {
+  OntologyHealthSchedule schedule = 1;
+}
+// Stops the schedule; the recorded trend stays.
+message DeleteOntologyHealthScheduleRequest {
+  string namespace = 1;
+}
+message DeleteOntologyHealthScheduleResponse {
+  bool deleted = 1;
+}
+// Bounded health of one source (ADR 0046, #2193): a sekai.source-health/v1
+// projection of its sync state, authorized as GetSourceSyncState. It never
+// writes or contacts the source. A source the caller may not see reports
+// exactly as an unknown one. Each call is audited as source.health.
+message GetSourceHealthRequest {
+  string namespace = 1;
+  string source_instance = 2;
+  string type_digest = 3;
+  // A last success older than this is delayed. Absent: fifteen minutes.
+  // Must be positive.
+  optional int64 delayed_after_ms = 4;
+}
+message SourceHealth {
+  // sekai.source-health/v1
+  string contract_version = 1;
+  string namespace = 2;
+  string source_instance = 3;
+  string type_digest = 4;
+  // healthy | delayed | blocked | unavailable
+  string health_class = 5;
+  // none | open_transaction | aborted | quarantined | recovery_required |
+  // invalid_checkpoint | unknown_version | foreign_identity |
+  // ambiguous_lifecycle | absent (unknown, or not visible to the caller)
+  string failure_class = 6;
+  // success | denial | unavailable | partial | unknown
+  string outcome = 7;
+  optional int64 checkpoint_age_ms = 8;
+  optional int64 lag = 9;
+  optional int64 last_success_at_ms = 10;
+  int64 observed_at_ms = 11;
+}
+message GetSourceHealthResponse {
+  SourceHealth health = 1;
+}
+// Experimental (ADR 0148). One configuration value of a Source.
+message SourceConfigValue {
+  oneof value {
+    string text = 1;
+    int64 integer = 2;
+    bool boolean = 3;
+  }
+}
+// What a namespace administrator puts. The plane stores credential_ref, a
+// handle the operator issued to the connector runtime, and never a
+// credential: configuration that looks like one is refused.
+message ConnectorSourceSpec {
+  // A connector type the plane knows, such as github or relational.
+  string connector_type = 1;
+  string connector_version = 2;
+  map<string, SourceConfigValue> config = 3;
+  string credential_ref = 4;
+  // host or host:port rules; the runtime connects only to these.
+  repeated string egress = 5;
+  // Labels a connector runtime must carry to claim this Source's work.
+  map<string, string> placement = 6;
+  // Sync interval on the transform schedule graph; 0 for none, otherwise
+  // at least 60000.
+  int64 every_ms = 7;
+  string owner = 8;
+  repeated string markings = 9;
+  string certification_id = 10;
+}
+// Where a Source's sync stands, from the plane's own records.
+message ConnectorSourceSync {
+  int64 last_success_at_ms = 1;
+  int64 last_failure_at_ms = 2;
+  // The failure class of the last failed sync; empty for none.
+  string last_failure = 3;
+  // The runtime that finished the last sync.
+  string last_runtime = 4;
+  // The runtime holding the current claim, and when its lease ends; empty
+  // and 0 when none holds one.
+  string claim_owner = 5;
+  int64 claim_expires_at_ms = 6;
+  // Whether a sync is due and not finished.
+  bool due = 7;
+}
+// Experimental (ADR 0148). A Source: the governed record of one
+// integration. source and source_instance are the tokens its batches carry;
+// they never change after create.
+message ConnectorSource {
+  string namespace = 1;
+  string source_id = 2;
+  string source = 3;
+  string source_instance = 4;
+  ConnectorSourceSpec spec = 5;
+  // active or disabled.
+  string status = 6;
+  // Bumped by every put and disable.
+  int64 revision = 7;
+  int64 created_at_ms = 8;
+  int64 updated_at_ms = 9;
+  ConnectorSourceSync sync = 10;
+  ConnectorSourceDelivery delivery = 11;
+}
+// Where a Source's saved-export delivery stands.
+message ConnectorSourceDelivery {
+  int64 last_success_at_ms = 1;
+  int64 last_failure_at_ms = 2;
+  // The failure class of the last failed delivery; empty for none.
+  string last_failure = 3;
+  // The runtime that acknowledged the last delivery.
+  string last_runtime = 4;
+}
+message PutSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+  string source = 3;
+  string source_instance = 4;
+  ConnectorSourceSpec spec = 5;
+  // 0 creates the Source; otherwise the revision the caller read. A put
+  // re-enables a disabled Source.
+  int64 expected_revision = 6;
+}
+message PutSourceResponse {
+  ConnectorSource source = 1;
+}
+message GetSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+}
+message GetSourceResponse {
+  ConnectorSource source = 1;
+}
+message ListSourcesRequest {
+  string namespace = 1;
+  // The last source_id of the previous page; empty for the first.
+  string page_token = 2;
+  int32 limit = 3;
+}
+message ListSourcesResponse {
+  repeated ConnectorSource sources = 1;
+  string next_page_token = 2;
+}
+message DisableSourceRequest {
+  string namespace = 1;
+  string source_id = 2;
+}
+message DisableSourceResponse {
+  ConnectorSource source = 1;
 }
 message DefinitionPropertyRef {
   string object_type = 1;
@@ -4987,6 +5515,18 @@ service SekaiService {
       returns (RecordOntologyHealthSnapshotResponse);
   rpc ListOntologyHealthTrend(ListOntologyHealthTrendRequest)
       returns (ListOntologyHealthTrendResponse);
+  rpc PutOntologyHealthSchedule(PutOntologyHealthScheduleRequest)
+      returns (PutOntologyHealthScheduleResponse);
+  rpc DeleteOntologyHealthSchedule(DeleteOntologyHealthScheduleRequest)
+      returns (DeleteOntologyHealthScheduleResponse);
+  rpc GetSourceHealth(GetSourceHealthRequest) returns (GetSourceHealthResponse);
+  // Experimental (ADR 0148): Sources, sekai.source/v1. Put and disable need
+  // a namespace administrator; get and list need namespace read access.
+  // Disabling raises the generation of the Source's live claims.
+  rpc PutSource(PutSourceRequest) returns (PutSourceResponse);
+  rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
+  rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
+  rpc DisableSource(DisableSourceRequest) returns (DisableSourceResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).
@@ -5020,9 +5560,17 @@ service SekaiService {
   rpc GetExportDefinition(GetExportDefinitionRequest) returns (GetExportDefinitionResponse);
   rpc DeleteExportDefinition(DeleteExportDefinitionRequest) returns (DeleteExportDefinitionResponse);
   rpc RunExportDefinition(RunExportDefinitionRequest) returns (RunExportDefinitionResponse);
-  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse);
+  // Deprecated (ADR 0148): list and claim WORK_KIND_EXPORT_DELIVERY through
+  // ListClaimableWork and ClaimWork. Kept, unfenced for unclaimed
+  // artifacts, until the next major.
+  rpc ListDeliverableExportArtifacts(ListDeliverableExportArtifactsRequest) returns (ListDeliverableExportArtifactsResponse) {
+    option deprecated = true;
+  }
   rpc FetchExportArtifact(FetchExportArtifactRequest) returns (stream ExportObjectSetChunk);
-  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse);
+  // Deprecated (ADR 0148): acknowledge claimed work with AckWork.
+  rpc AcknowledgeExportDelivery(AcknowledgeExportDeliveryRequest) returns (AcknowledgeExportDeliveryResponse) {
+    option deprecated = true;
+  }
   rpc ExportDatasetVersion(ExportDatasetVersionRequest) returns (stream ExportObjectSetChunk);
   rpc RegisterObjectTypeDatasource(RegisterObjectTypeDatasourceRequest) returns (RegisterObjectTypeDatasourceResponse);
   rpc ReindexObjectType(ReindexObjectTypeRequest) returns (ReindexObjectTypeResponse);
@@ -5047,6 +5595,14 @@ service SekaiService {
   rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
   rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
   rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
+  // Experimental (ADR 0149). One claim family over every work kind; each
+  // call runs the kind's own claim path, so both families see one claim.
+  // Export delivery has no claim RPCs of its own; its old delivery RPCs
+  // above honor these claims.
+  rpc ListClaimableWork(ListClaimableWorkRequest) returns (ListClaimableWorkResponse);
+  rpc ClaimWork(ClaimWorkRequest) returns (ClaimWorkResponse);
+  rpc HeartbeatWorkClaim(HeartbeatWorkClaimRequest) returns (HeartbeatWorkClaimResponse);
+  rpc AckWork(AckWorkRequest) returns (AckWorkResponse);
   rpc ListSiteAgentWorkingMemory(ListSiteAgentWorkingMemoryRequest) returns (ListSiteAgentWorkingMemoryResponse);
   rpc ReadTransformRunInputs(ReadTransformRunInputsRequest) returns (stream ReadTransformRunInputsResponse);
   rpc WriteTransformRunResult(WriteTransformRunResultRequest) returns (WriteTransformRunResultResponse);
@@ -5203,6 +5759,8 @@ service SekaiService {
   rpc ExecuteActionPlan(ExecuteActionPlanRequest) returns (ExecuteActionPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
+  // Experimental: decisions the caller may make across review kinds (#2203).
+  rpc ListPendingDecisions(ListPendingDecisionsRequest) returns (ListPendingDecisionsResponse);
   // Typed effects on admitted ActionInstances (#398).
   rpc GetActionEffect(GetActionEffectRequest) returns (GetActionEffectResponse);
   rpc ListActionEffects(ListActionEffectsRequest) returns (ListActionEffectsResponse);

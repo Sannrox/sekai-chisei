@@ -242,6 +242,42 @@ async fn exercise_product_loop(server: &LoopServer) {
     ]);
     assert!(seeded.contains("object: inc-1"), "{seeded}");
 
+    // A governed, lookup-first run persists its receipt on both backends (#2263).
+    let ran = server.sekaictl_ok(&[
+        "ontology",
+        "run",
+        "--namespace",
+        "demo",
+        "--task-type",
+        "sekai.semantic.resolve_ref",
+        "--spec",
+        r#"{"object_id":"inc-1"}"#,
+        "--target",
+        &socket,
+    ]);
+    assert!(ran.contains("executable=true"), "{ran}\n{}", logs());
+    let run_request_id = ran
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("request_id="))
+        .expect("run request_id")
+        .to_string();
+    let run_receipt = server
+        .chisei()
+        .await
+        .get_operation_receipt(GetOperationReceiptRequest {
+            request_id: run_request_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("run receipt: {error}\n{}", logs()))
+        .into_inner();
+    assert!(
+        run_receipt
+            .receipt_json
+            .contains("sekai.semantic.resolve_ref"),
+        "{run_receipt:?}"
+    );
+
     let mut sekai = server.sekai().await;
     let incident = sekai
         .get_object(GetObjectRequest { id: "inc-1".into() })
@@ -312,6 +348,7 @@ async fn exercise_product_loop(server: &LoopServer) {
             idempotency_key: "loop-propose".into(),
             major_revision: false,
             migration_plan_digest: String::new(),
+            dataset_proposals: Vec::new(),
         })
         .await
         .unwrap_or_else(|error| panic!("propose: {error}\n{}", logs()));

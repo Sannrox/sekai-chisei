@@ -204,6 +204,7 @@ fn source_batch(namespace: &str, package: &SourcePackage) -> Result<SourceBatch,
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     })
 }
 

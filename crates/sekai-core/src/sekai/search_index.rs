@@ -13,7 +13,7 @@ use crate::sekai::markings::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 pub const ANALYZER_VERSION: &str = "search.text/v1";
 /// The one hybrid fusion profile: reciprocal rank fusion with k = 60.
@@ -22,6 +22,13 @@ pub const RRF_K: f64 = 60.0;
 pub const SEARCH_INDEX_UNAVAILABLE: &str = "search index is unavailable on this runtime";
 
 pub const POLICY_ATTRIBUTE_KEYS: &[&str] = &["owner", "acl", "access_marking", "purpose"];
+
+/// The most candidates one index read keeps (#2252): text documents per
+/// source (the `limit` callers pass), and objects a vector ranking keeps per
+/// spec. Both count only entries the store's read policy admits, so a cut
+/// never depends on entries the caller cannot read. Past it the read reports
+/// itself truncated, so the caller's count is a lower bound.
+pub const SEARCH_OVERSCAN: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchIndexError {
@@ -46,7 +53,58 @@ impl From<String> for SearchIndexError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How long a rebuild's last checkpoint write holds off catch-up on other
+/// instances (#2250). A rebuild renews it with every document it writes; one
+/// that stopped is taken over after it lapses.
+pub const SEARCH_REBUILD_LEASE_MS: i64 = 5 * 60 * 1000;
+
+/// [`SearchIndexError::Unavailable`] text when another writer moved the
+/// namespace checkpoint revision first. Nothing past that point was kept;
+/// the next scheduled pass retries.
+pub const SEARCH_CHECKPOINT_CONFLICT: &str = "search index changed by another catch-up; retry";
+
+/// [`SearchIndexError::Unavailable`] text when a rebuild on another instance
+/// still holds its lease.
+pub const SEARCH_REBUILD_IN_PROGRESS: &str = "search index rebuild in progress on another instance";
+
+impl SearchIndexError {
+    /// Another writer holds the namespace's index: a lost revision fence or
+    /// a rebuild lease. Expected when replicas run catch-up at once.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Unavailable(message)
+            if message == SEARCH_CHECKPOINT_CONFLICT || message == SEARCH_REBUILD_IN_PROGRESS)
+    }
+}
+
+/// A namespace's durable index position (`sekai_search_checkpoint`). A
+/// rebuild clears `analyzer_version` until it completes; `indexed_at_ms` is
+/// the last fenced write, which is the rebuild's lease.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SearchCheckpoint {
+    pub analyzer_version: String,
+    pub last_change_rowid: u64,
+    pub last_generation: u64,
+    pub dataset_catalog_digest: String,
+    pub indexed_at_ms: i64,
+    /// Bumped by every fenced write; see [`SEARCH_CHECKPOINT_CONFLICT`].
+    pub revision: i64,
+}
+
+impl SearchCheckpoint {
+    /// The index is complete for this binary's analyzer.
+    pub fn current(&self) -> bool {
+        self.analyzer_version == ANALYZER_VERSION
+    }
+
+    /// A rebuild started and wrote within the lease window.
+    pub fn rebuild_lease_held(&self, now_ms: i64) -> bool {
+        self.analyzer_version.is_empty()
+            && self.indexed_at_ms > 0
+            && now_ms.saturating_sub(self.indexed_at_ms) < SEARCH_REBUILD_LEASE_MS
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchSourceKind {
     Object,
     Dataset,
@@ -94,7 +152,27 @@ pub struct SearchCandidateQuery {
     pub text: String,
     pub source: Option<SearchSourceKind>,
     pub policy: SearchPolicyFilter,
+    /// The most candidates kept per source, counted after the store's read
+    /// policy; 0 means 32.
     pub limit: usize,
+}
+
+/// Candidates from one bounded index read. `truncated`: the read stopped at
+/// its bound, so more candidates may follow those returned and a count over
+/// them is a lower bound.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedCandidates<T> {
+    pub candidates: Vec<T>,
+    pub truncated: bool,
+}
+
+impl<T> Default for BoundedCandidates<T> {
+    fn default() -> Self {
+        Self {
+            candidates: Vec::new(),
+            truncated: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +221,8 @@ pub struct VectorCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchIndexStatus {
     pub namespace: String,
+    /// The analyzer the stored index is complete for; empty before the
+    /// first build and while a rebuild is in progress.
     pub analyzer_version: String,
     pub last_change_rowid: u64,
     pub last_generation: u64,
@@ -196,10 +276,12 @@ pub struct SearchDatasetDump {
 pub trait SearchIndex {
     fn index(&self, document: &SearchDocument, now_ms: i64) -> Result<(), SearchIndexError>;
     fn delete(&self, key: &SearchDocumentKey) -> Result<(), SearchIndexError>;
+    /// The first `query.limit` text candidates per source, by id, that the
+    /// index's read policy admits.
     fn query_candidates(
         &self,
         query: &SearchCandidateQuery,
-    ) -> Result<Vec<SearchCandidate>, SearchIndexError>;
+    ) -> Result<BoundedCandidates<SearchCandidate>, SearchIndexError>;
     fn rebuild_namespace(
         &self,
         namespace: &str,
@@ -207,14 +289,15 @@ pub trait SearchIndex {
     ) -> Result<SearchRebuildReport, SearchIndexError>;
     fn status(&self, namespace: &str, now_ms: i64) -> Result<SearchIndexStatus, SearchIndexError>;
     /// Objects nearest to the query vector, best first: the first
-    /// `query.limit` that pass the index's read policy and then `keep`, the
-    /// caller's live check. Exact today; an ANN index may back this later
-    /// behind the same contract.
+    /// `query.limit` that pass `keep`, the caller's live check, among the
+    /// [`SEARCH_OVERSCAN`] nearest the index's read policy admits. Exact
+    /// today, paging through the spec's chunks; an ANN index may back this
+    /// later behind the same contract.
     fn vector_candidates(
         &self,
         query: &VectorCandidateQuery,
         keep: &mut dyn FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
-    ) -> Result<Vec<VectorCandidate>, SearchIndexError>;
+    ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError>;
 }
 
 /// The marking authority a search policy carries: a trusted service
@@ -253,64 +336,158 @@ pub fn policy_marking_allows(
         != MarkingDecision::Deny
 }
 
-/// Exact search shared by every backend: drop chunks the policy's marking
-/// check denies, score the rest by cosine similarity, rank objects by their
-/// best chunk (then id), and keep the first `limit` that `allows`, the
-/// backend's per-object read policy check. Policy applies before the limit,
-/// so recall is exact over what the caller may see.
-pub fn exact_vector_candidates(
-    chunks: Vec<EmbeddingChunk>,
-    query: &VectorCandidateQuery,
-    lattice: Option<&ClassificationLattice>,
-    mut allows: impl FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
-) -> Result<Vec<VectorCandidate>, SearchIndexError> {
-    let mut best = BTreeMap::<String, (f32, String)>::new();
+/// Exact vector search shared by every backend, in bounded memory: chunks
+/// stream in grouped by object (both backends read them ordered by object
+/// id); chunks the policy's marking check denies are dropped, the rest are
+/// scored by cosine similarity, and each object ranks by its best chunk
+/// (then id). `admits`, the backend's per-object read policy, decides each
+/// complete object once, before it may enter the `cap` best kept, so the cap
+/// and the truncation flag count only objects the caller may read.
+pub struct VectorRanking<'a, A> {
+    query: &'a VectorCandidateQuery,
+    lattice: Option<&'a ClassificationLattice>,
+    cap: usize,
+    admits: A,
     // Few distinct markings: decide each once.
-    let mut marking_allowed = BTreeMap::<String, bool>::new();
-    for chunk in chunks {
+    marking_allowed: BTreeMap<String, bool>,
+    current: Option<VectorCandidate>,
+    worst_first: BinaryHeap<Ranked>,
+    overflowed: bool,
+}
+
+/// Orders candidates worst first, so the heap's top is the one to evict.
+struct Ranked(VectorCandidate);
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then_with(|| self.0.object_id.cmp(&other.0.object_id))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Ranked {}
+
+impl<'a, A> VectorRanking<'a, A>
+where
+    A: FnMut(&str) -> Result<bool, SearchIndexError>,
+{
+    pub fn new(
+        query: &'a VectorCandidateQuery,
+        lattice: Option<&'a ClassificationLattice>,
+        cap: usize,
+        admits: A,
+    ) -> Self {
+        Self {
+            query,
+            lattice,
+            cap,
+            admits,
+            marking_allowed: BTreeMap::new(),
+            current: None,
+            worst_first: BinaryHeap::new(),
+            overflowed: false,
+        }
+    }
+
+    pub fn push(&mut self, chunk: EmbeddingChunk) -> Result<(), SearchIndexError> {
         let marking = chunk.source.marking.unwrap_or_default();
-        let allowed = match marking_allowed.get(&marking) {
+        let allowed = match self.marking_allowed.get(&marking) {
             Some(allowed) => *allowed,
             None => {
-                let allowed = policy_marking_allows(&marking, &query.policy, lattice);
-                marking_allowed.insert(marking, allowed);
+                let allowed = policy_marking_allows(&marking, &self.query.policy, self.lattice);
+                self.marking_allowed.insert(marking, allowed);
                 allowed
             }
         };
         if !allowed {
-            continue;
+            return Ok(());
         }
-        let Some(score) = cosine(&chunk.vector, &query.vector) else {
-            continue;
+        let Some(score) = cosine(&chunk.vector, &self.query.vector) else {
+            return Ok(());
         };
-        let digest = chunk.source.source_digest;
-        best.entry(chunk.object_id)
-            .and_modify(|current: &mut (f32, String)| current.0 = current.0.max(score))
-            .or_insert((score, digest));
+        match &mut self.current {
+            Some(current) if current.object_id == chunk.object_id => {
+                current.score = current.score.max(score);
+            }
+            current => {
+                let done = current.replace(VectorCandidate {
+                    object_id: chunk.object_id,
+                    score,
+                    source_digest: chunk.source.source_digest,
+                });
+                return self.keep(done);
+            }
+        }
+        Ok(())
     }
-    let mut ranked = best
-        .into_iter()
-        .map(|(object_id, (score, source_digest))| VectorCandidate {
-            object_id,
-            score,
-            source_digest,
+
+    fn keep(&mut self, candidate: Option<VectorCandidate>) -> Result<(), SearchIndexError> {
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        let candidate = Ranked(candidate);
+        let evicted = self.worst_first.len() >= self.cap
+            && self
+                .worst_first
+                .peek()
+                .is_none_or(|worst| candidate > *worst);
+        // An object that cannot enter only matters as proof that an
+        // admitted one was dropped; once that is known, skip its check.
+        if evicted && self.overflowed {
+            return Ok(());
+        }
+        if !(self.admits)(&candidate.0.object_id)? {
+            return Ok(());
+        }
+        if evicted {
+            self.overflowed = true;
+            return Ok(());
+        }
+        self.worst_first.push(candidate);
+        if self.worst_first.len() > self.cap {
+            self.worst_first.pop();
+            self.overflowed = true;
+        }
+        Ok(())
+    }
+
+    /// The first `query.limit` kept objects that `allows`, best first;
+    /// truncated when admitted objects past the cap were dropped.
+    pub fn select(
+        mut self,
+        mut allows: impl FnMut(&VectorCandidate) -> Result<bool, SearchIndexError>,
+    ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError> {
+        let last = self.current.take();
+        self.keep(last)?;
+        let mut candidates = Vec::new();
+        for Ranked(candidate) in self.worst_first.into_sorted_vec() {
+            if candidates.len() >= self.query.limit {
+                break;
+            }
+            if allows(&candidate)? {
+                candidates.push(candidate);
+            }
+        }
+        Ok(BoundedCandidates {
+            candidates,
+            truncated: self.overflowed,
         })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.object_id.cmp(&b.object_id))
-    });
-    let mut allowed = Vec::new();
-    for candidate in ranked {
-        if allowed.len() >= query.limit {
-            break;
-        }
-        if allows(&candidate)? {
-            allowed.push(candidate);
-        }
     }
-    Ok(allowed)
 }
 
 /// Cosine similarity; none for a dimension mismatch or a zero vector.
@@ -600,10 +777,12 @@ pub fn dataset_classification_allows(stored: &str, clearance: Option<&str>) -> b
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
-    use crate::db::search_index::SearchIndexStore;
+    use crate::db::search_index::{
+        DocumentWrite, SearchIndexStore, SearchMaintenance, SearchPosition,
+    };
     use crate::domain::{ListFilter, Object};
     use crate::sekai::dataset::{ColumnDef, Dataset};
 
@@ -733,7 +912,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "note-munich");
         let ascii = db
@@ -749,7 +929,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(ascii.len(), 1);
         assert_eq!(ascii[0].id, "note-munich");
     }
@@ -787,7 +968,8 @@ mod tests {
                     },
                     limit: 10,
                 })
-                .unwrap();
+                .unwrap()
+                .candidates;
             assert_eq!(hits.len(), 1, "{query}");
             assert_eq!(hits[0].id, "note-lodz");
         }
@@ -845,7 +1027,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let trusted = db
             .query_candidates(&SearchCandidateQuery {
@@ -860,7 +1043,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(trusted.len(), 1);
         assert_eq!(trusted[0].id, "note-bare");
     }
@@ -948,6 +1132,7 @@ mod tests {
                 &mut |_| Ok(true),
             )
             .unwrap()
+            .candidates
             .into_iter()
             .map(|candidate| candidate.object_id)
             .collect::<Vec<_>>()
@@ -1025,7 +1210,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
 
         let custom = ClassificationLattice {
@@ -1064,7 +1250,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "note-compartment");
         let denied = db
@@ -1081,7 +1268,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(denied.is_empty());
     }
 
@@ -1130,7 +1318,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "note-1");
         assert!(!hits[0].authority);
@@ -1289,7 +1478,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "note-stale");
     }
@@ -1331,7 +1521,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "note-repeat");
     }
@@ -1368,7 +1559,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hits.is_empty());
     }
 
@@ -1382,6 +1574,304 @@ mod tests {
     fn postgres_property_names_are_not_full_text_matches() {
         let (_scratch, db) = postgres_runtime();
         exercise_property_names_are_not_full_text_matches(&db);
+    }
+
+    /// #2252: a text query keeps a bounded number of candidates and says
+    /// when it stopped early. The bound counts only entries the caller may
+    /// read: more hidden matches than the bound, ahead of the readable
+    /// ones, neither hide them nor report a cut.
+    fn exercise_text_scan_is_bounded_and_reports_truncation(db: &RuntimeDb) {
+        for index in 0..5 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("a-hidden-{index}"),
+                    "acme",
+                    "alpha",
+                    &[("body", "shared token"), ("owner", "alice")],
+                ),
+                "alice",
+            )
+            .unwrap();
+        }
+        for id in ["z-visible-0", "z-visible-1"] {
+            db.create_object_with_audit(
+                &object(id, "acme", "alpha", &[("body", "shared token")]),
+                "editor",
+            )
+            .unwrap();
+        }
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        let read = |limit: usize| {
+            db.query_candidates(&SearchCandidateQuery {
+                mode: SearchQueryMode::Text,
+                text: "shared".into(),
+                source: Some(SearchSourceKind::Object),
+                policy: SearchPolicyFilter {
+                    namespace: "acme".into(),
+                    namespace_authorized: true,
+                    subjects: vec!["editor".into()],
+                    ..SearchPolicyFilter::default()
+                },
+                limit,
+            })
+            .unwrap()
+        };
+        let ids = |found: &BoundedCandidates<SearchCandidate>| {
+            found
+                .candidates
+                .iter()
+                .map(|hit| hit.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let cut = read(1);
+        assert_eq!(ids(&cut), vec!["z-visible-0"]);
+        assert!(cut.truncated);
+        let full = read(2);
+        assert_eq!(ids(&full), vec!["z-visible-0", "z-visible-1"]);
+        assert!(!full.truncated);
+    }
+
+    /// Each source keeps its own bound: an object scan cut at its bound
+    /// still leaves the dataset scan to run.
+    fn exercise_text_scan_bound_is_per_source(db: &RuntimeDb) {
+        for index in 0..3 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("note-{index}"),
+                    "acme",
+                    "alpha",
+                    &[("body", "shared token")],
+                ),
+                "editor",
+            )
+            .unwrap();
+        }
+        db.create_dataset(&dataset("shared-ds", "shared", "", &[("id", "public")]))
+            .unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        let found = db
+            .query_candidates(&SearchCandidateQuery {
+                mode: SearchQueryMode::Text,
+                text: "shared".into(),
+                source: None,
+                policy: SearchPolicyFilter {
+                    namespace: "acme".into(),
+                    namespace_authorized: true,
+                    subjects: vec!["editor".into()],
+                    ..SearchPolicyFilter::default()
+                },
+                limit: 2,
+            })
+            .unwrap();
+        assert!(found.truncated);
+        assert_eq!(
+            found
+                .candidates
+                .iter()
+                .map(|hit| (hit.source, hit.id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SearchSourceKind::Object, "note-0"),
+                (SearchSourceKind::Object, "note-1"),
+                (SearchSourceKind::Dataset, "shared-ds"),
+            ]
+        );
+    }
+
+    #[test]
+    fn text_scan_bound_is_per_source() {
+        exercise_text_scan_bound_is_per_source(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_text_scan_bound_is_per_source() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_text_scan_bound_is_per_source(&db);
+    }
+
+    #[test]
+    fn text_scan_is_bounded_and_reports_truncation() {
+        exercise_text_scan_is_bounded_and_reports_truncation(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_text_scan_is_bounded_and_reports_truncation() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_text_scan_is_bounded_and_reports_truncation(&db);
+    }
+
+    /// The requested kinds narrow the scan before its bound: matches of
+    /// another kind cannot use it up.
+    fn exercise_text_scan_bound_applies_after_the_kind_filter(db: &RuntimeDb) {
+        for index in 0..4 {
+            let mut other = object(
+                &format!("a-other-{index}"),
+                "acme",
+                "alpha",
+                &[("body", "shared token")],
+            );
+            other.kind = "memo".into();
+            db.create_object_with_audit(&other, "editor").unwrap();
+        }
+        db.create_object_with_audit(
+            &object("z-note", "acme", "alpha", &[("body", "shared token")]),
+            "editor",
+        )
+        .unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        let read = |kinds: &[&str]| {
+            db.query_candidates(&SearchCandidateQuery {
+                mode: SearchQueryMode::Text,
+                text: "shared".into(),
+                source: Some(SearchSourceKind::Object),
+                policy: SearchPolicyFilter {
+                    namespace: "acme".into(),
+                    namespace_authorized: true,
+                    kinds: kinds.iter().map(|kind| (*kind).into()).collect(),
+                    subjects: vec!["editor".into()],
+                    ..SearchPolicyFilter::default()
+                },
+                limit: 3,
+            })
+            .unwrap()
+        };
+        let notes = read(&["note"]);
+        assert_eq!(
+            notes
+                .candidates
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-note"]
+        );
+        assert!(!notes.truncated);
+        // Unfiltered, the other kind fills the bound first.
+        let all = read(&[]);
+        assert!(all.truncated);
+        assert!(all.candidates.iter().all(|hit| hit.id != "z-note"));
+    }
+
+    #[test]
+    fn text_scan_bound_applies_after_the_kind_filter() {
+        exercise_text_scan_bound_applies_after_the_kind_filter(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_text_scan_bound_applies_after_the_kind_filter() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_text_scan_bound_applies_after_the_kind_filter(&db);
+    }
+
+    /// The scan bound counts only fields holding every query token, on
+    /// both backends: fields with only some of them cannot use it up.
+    fn exercise_text_scan_bound_counts_only_full_query_matches(db: &RuntimeDb) {
+        for index in 0..4 {
+            db.create_object_with_audit(
+                &object(
+                    &format!("a-common-{index}"),
+                    "acme",
+                    "alpha",
+                    &[("body", "common token")],
+                ),
+                "editor",
+            )
+            .unwrap();
+        }
+        db.create_object_with_audit(
+            &object("z-both", "acme", "alpha", &[("body", "common and rare")]),
+            "editor",
+        )
+        .unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        let found = db
+            .query_candidates(&SearchCandidateQuery {
+                mode: SearchQueryMode::Text,
+                text: "common rare".into(),
+                source: Some(SearchSourceKind::Object),
+                policy: SearchPolicyFilter {
+                    namespace: "acme".into(),
+                    namespace_authorized: true,
+                    subjects: vec!["editor".into()],
+                    ..SearchPolicyFilter::default()
+                },
+                limit: 3,
+            })
+            .unwrap();
+        assert_eq!(
+            found
+                .candidates
+                .iter()
+                .map(|hit| hit.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["z-both"]
+        );
+        assert!(!found.truncated);
+    }
+
+    #[test]
+    fn text_scan_bound_counts_only_full_query_matches() {
+        exercise_text_scan_bound_counts_only_full_query_matches(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_text_scan_bound_counts_only_full_query_matches() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_text_scan_bound_counts_only_full_query_matches(&db);
+    }
+
+    /// A token longer than a PostgreSQL lexeme falls back to scanning stored
+    /// dataset text; that scan bounds admitted datasets, as the indexed scan
+    /// does, and reports truncation.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_oversized_token_dataset_scan_is_bounded() {
+        let (_scratch, db) = postgres_runtime();
+        let long = "x".repeat(2_100);
+        // Stored text ahead of the matches that does not hold the token.
+        for index in 0..3 {
+            db.create_dataset(&dataset(
+                &format!("a-{index}"),
+                "plain",
+                "",
+                &[("id", "public")],
+            ))
+            .unwrap();
+        }
+        for index in 0..3 {
+            db.create_dataset(&dataset(
+                &format!("ds-{index}"),
+                &long,
+                "",
+                &[("id", "public")],
+            ))
+            .unwrap();
+        }
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        let read = |limit: usize| {
+            db.query_candidates(&SearchCandidateQuery {
+                mode: SearchQueryMode::Text,
+                text: long.clone(),
+                source: Some(SearchSourceKind::Dataset),
+                policy: SearchPolicyFilter {
+                    namespace: "acme".into(),
+                    namespace_authorized: true,
+                    ..SearchPolicyFilter::default()
+                },
+                limit,
+            })
+            .unwrap()
+        };
+        let cut = read(2);
+        // Non-matching rows read first do not count toward the bound.
+        assert!(cut.truncated);
+        assert_eq!(cut.candidates.len(), 2);
+        let full = read(10);
+        assert_eq!(full.candidates.len(), 3);
+        assert!(!full.truncated);
     }
 
     fn exercise_dataset_catalog_change_updates_metadata_entries(db: &RuntimeDb) {
@@ -1420,7 +1910,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "ds-sales");
     }
@@ -1466,7 +1957,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let visible = db
             .query_candidates(&SearchCandidateQuery {
@@ -1481,7 +1973,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "ds-secret");
     }
@@ -1526,7 +2019,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let visible = db
             .query_candidates(&SearchCandidateQuery {
@@ -1542,7 +2036,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "ds-finance");
     }
@@ -1588,7 +2083,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(denied.is_empty());
         let allowed = db
             .query_candidates(&SearchCandidateQuery {
@@ -1603,7 +2099,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0].id, "note-grant");
     }
@@ -1672,7 +2169,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(denied.is_empty());
         let allowed = db
             .query_candidates(&SearchCandidateQuery {
@@ -1687,7 +2185,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0].id, "note-owned");
     }
@@ -1731,7 +2230,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
     }
 
@@ -1799,7 +2299,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hits.is_empty());
     }
 
@@ -1834,7 +2335,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let datasets = db
             .query_candidates(&SearchCandidateQuery {
@@ -1849,7 +2351,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(datasets.len(), 1);
         assert_eq!(datasets[0].id, "ds-kind");
     }
@@ -1887,7 +2390,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "ds-global");
     }
@@ -1927,7 +2431,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let visible = db
             .query_candidates(&SearchCandidateQuery {
@@ -1942,7 +2447,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "ds-global");
     }
@@ -2009,7 +2515,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(denied.is_empty());
         let allowed = db
             .query_candidates(&SearchCandidateQuery {
@@ -2026,7 +2533,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(allowed.len(), 1);
         assert_eq!(allowed[0].id, "note-purpose");
     }
@@ -2077,7 +2585,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
     }
 
@@ -2118,7 +2627,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(hidden.is_empty());
         let visible = db
             .query_candidates(&SearchCandidateQuery {
@@ -2133,7 +2643,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(visible.len(), 1);
     }
 
@@ -2174,7 +2685,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(closed.is_empty());
         let policy_field = db
             .query_candidates(&SearchCandidateQuery {
@@ -2188,7 +2700,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(policy_field.is_empty());
     }
 
@@ -2202,6 +2715,422 @@ mod tests {
     fn postgres_empty_compiled_property_projection_fails_closed() {
         let (_scratch, db) = postgres_runtime();
         exercise_empty_compiled_property_projection_fails_closed(&db);
+    }
+
+    /// The backend under `db`, for driving fenced writes as a second
+    /// instance would.
+    fn maintenance(db: &RuntimeDb) -> &dyn SearchMaintenance {
+        match db {
+            RuntimeDb::Sqlite(db) => db.as_ref(),
+            RuntimeDb::Postgres(db) => db.as_ref(),
+        }
+    }
+
+    fn exercise_incremental_catch_up_cannot_publish_over_a_rebuild_in_progress(db: &RuntimeDb) {
+        let store = maintenance(db);
+        db.create_object_with_audit(&object("note-a", "acme", "alpha", &[]), "editor")
+            .unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        db.create_object_with_audit(&object("note-b", "acme", "beta", &[]), "editor")
+            .unwrap();
+        // An incremental catch-up read this checkpoint; then another
+        // instance started a rebuild.
+        let seen = store.read_search_checkpoint("acme").unwrap().unwrap();
+        store
+            .start_search_rebuild("acme", seen.revision, 20)
+            .unwrap();
+        let note = store.get_object("note-b").unwrap().unwrap();
+        let write = store.write_search_document(
+            "acme",
+            DocumentWrite::IndexObject(&note),
+            seen.revision,
+            21,
+        );
+        assert!(write.unwrap_err().is_conflict());
+        let advance = store.advance_search_checkpoint(
+            "acme",
+            &SearchPosition {
+                last_change_rowid: db.object_change_watermark("acme").unwrap(),
+                last_generation: db.namespace_object_generation("acme").unwrap(),
+                dataset_catalog_digest: seen.dataset_catalog_digest.clone(),
+            },
+            seen.revision,
+            21,
+        );
+        assert!(advance.unwrap_err().is_conflict());
+        // A catch-up starting now leaves the rebuild alone while its lease
+        // holds, and status reports it in progress.
+        assert!(
+            db.catch_up_search_namespace("acme", 22)
+                .unwrap_err()
+                .is_conflict()
+        );
+        let status = db.status("acme", 22).unwrap();
+        assert_eq!(status.analyzer_version, "");
+        assert_eq!(status.object_count, 0);
+        assert!(status.pending_changes > 0);
+    }
+
+    #[test]
+    fn incremental_catch_up_cannot_publish_over_a_rebuild_in_progress() {
+        exercise_incremental_catch_up_cannot_publish_over_a_rebuild_in_progress(
+            &RuntimeDb::memory(),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_incremental_catch_up_cannot_publish_over_a_rebuild_in_progress() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_incremental_catch_up_cannot_publish_over_a_rebuild_in_progress(&db);
+    }
+
+    fn exercise_abandoned_rebuild_is_taken_over_after_its_lease(db: &RuntimeDb) {
+        let store = maintenance(db);
+        for id in ["note-a", "note-b"] {
+            db.create_object_with_audit(&object(id, "acme", id, &[]), "editor")
+                .unwrap();
+        }
+        // A rebuild that indexed one object, then died.
+        let revision = store.start_search_rebuild("acme", 0, 10).unwrap();
+        let note = store.get_object("note-a").unwrap().unwrap();
+        let abandoned = store
+            .write_search_document("acme", DocumentWrite::IndexObject(&note), revision, 11)
+            .unwrap();
+        let lapsed = 11 + SEARCH_REBUILD_LEASE_MS;
+        assert!(
+            db.catch_up_search_namespace("acme", lapsed - 1)
+                .unwrap_err()
+                .is_conflict()
+        );
+        assert!(
+            db.rebuild_namespace("acme", lapsed - 1)
+                .unwrap_err()
+                .is_conflict()
+        );
+        let report = db.catch_up_search_namespace("acme", lapsed).unwrap();
+        assert!(report.rebuilt);
+        assert_eq!(report.objects, 2);
+        // The dead rebuild cannot publish if it comes back.
+        let resumed = store.advance_search_checkpoint(
+            "acme",
+            &SearchPosition {
+                last_change_rowid: 0,
+                last_generation: 0,
+                dataset_catalog_digest: String::new(),
+            },
+            abandoned,
+            lapsed + 1,
+        );
+        assert!(resumed.unwrap_err().is_conflict());
+        let status = db.status("acme", lapsed + 1).unwrap();
+        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
+        assert_eq!(status.object_count, 2);
+    }
+
+    #[test]
+    fn abandoned_rebuild_is_taken_over_after_its_lease() {
+        exercise_abandoned_rebuild_is_taken_over_after_its_lease(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_abandoned_rebuild_is_taken_over_after_its_lease() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_abandoned_rebuild_is_taken_over_after_its_lease(&db);
+    }
+
+    /// Index `object` the way a plane from before #2250 did, into the
+    /// legacy tables, with a current checkpoint at the namespace's feed
+    /// position. Uses plain ASCII text, so search folding is the identity.
+    pub(crate) fn index_into_legacy_tables(db: &RuntimeDb, object: &Object) {
+        let watermark = db.object_change_watermark(&object.namespace).unwrap() as i64;
+        let generation = db.namespace_object_generation(&object.namespace).unwrap() as i64;
+        let attributes = serde_json::to_string(&policy_attributes(object)).unwrap();
+        let digest = object_content_digest(object);
+        let catalog = dataset_catalog_digest(&[]);
+        match db {
+            RuntimeDb::Sqlite(db) => {
+                let conn = db.conn();
+                conn.execute(
+                    "INSERT INTO sekai_search_object
+                     (namespace, object_id, kind, access_marking, policy_attributes,
+                      content_digest, indexed_at_ms)
+                     VALUES (?1, ?2, ?3, '', ?4, ?5, 1)",
+                    rusqlite::params![object.namespace, object.id, object.kind, attributes, digest],
+                )
+                .unwrap();
+                for (property, text) in object_text_properties(object) {
+                    conn.execute(
+                        "INSERT INTO sekai_search_object_text (namespace, object_id, property, text)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![object.namespace, object.id, property, text],
+                    )
+                    .unwrap();
+                    conn.execute(
+                        "INSERT INTO sekai_search_object_fts(rowid, property, text)
+                         VALUES (last_insert_rowid(), ?1, ?2)",
+                        rusqlite::params![property, indexed_search_text(&text)],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO sekai_search_checkpoint
+                     (namespace, analyzer_version, last_change_rowid, last_generation,
+                      dataset_catalog_digest, indexed_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)
+                     ON CONFLICT(namespace) DO UPDATE SET
+                        analyzer_version = excluded.analyzer_version,
+                        last_change_rowid = excluded.last_change_rowid,
+                        last_generation = excluded.last_generation,
+                        dataset_catalog_digest = excluded.dataset_catalog_digest,
+                        indexed_at_ms = excluded.indexed_at_ms",
+                    rusqlite::params![
+                        object.namespace,
+                        ANALYZER_VERSION,
+                        watermark,
+                        generation,
+                        catalog
+                    ],
+                )
+                .unwrap();
+            }
+            RuntimeDb::Postgres(db) => {
+                let mut conn = db.connection().unwrap();
+                conn.execute(
+                    "INSERT INTO sekai_search_object
+                     (namespace, object_id, kind, access_marking, policy_attributes,
+                      content_digest, indexed_at_ms)
+                     VALUES ($1, $2, $3, '', $4, $5, 1)",
+                    &[
+                        &object.namespace,
+                        &object.id,
+                        &object.kind,
+                        &attributes,
+                        &digest,
+                    ],
+                )
+                .unwrap();
+                for (property, text) in object_text_properties(object) {
+                    conn.execute(
+                        "INSERT INTO sekai_search_object_text
+                         (namespace, object_id, property, chunk, text, tsv)
+                         VALUES ($1, $2, $3, 0, $4, to_tsvector('simple', $4))",
+                        &[&object.namespace, &object.id, &property, &text],
+                    )
+                    .unwrap();
+                }
+                conn.execute(
+                    "INSERT INTO sekai_search_checkpoint
+                     (namespace, analyzer_version, last_change_rowid, last_generation,
+                      dataset_catalog_digest, indexed_at_ms)
+                     VALUES ($1, $2, $3, $4, $5, 1)
+                     ON CONFLICT (namespace) DO UPDATE SET
+                        analyzer_version = EXCLUDED.analyzer_version,
+                        last_change_rowid = EXCLUDED.last_change_rowid,
+                        last_generation = EXCLUDED.last_generation,
+                        dataset_catalog_digest = EXCLUDED.dataset_catalog_digest,
+                        indexed_at_ms = EXCLUDED.indexed_at_ms",
+                    &[
+                        &object.namespace,
+                        &ANALYZER_VERSION,
+                        &watermark,
+                        &generation,
+                        &catalog,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    /// Clear the legacy index of `namespace` the way an older plane's
+    /// rebuild did: one unfenced transaction per document.
+    fn clear_legacy_tables(db: &RuntimeDb, namespace: &str) {
+        match db {
+            RuntimeDb::Sqlite(db) => {
+                let mut conn = db.conn();
+                let ids: Vec<String> = conn
+                    .prepare("SELECT object_id FROM sekai_search_object WHERE namespace = ?1")
+                    .unwrap()
+                    .query_map([namespace], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                for object_id in ids {
+                    let tx = conn.transaction().unwrap();
+                    let rows: Vec<(i64, String, String)> = tx
+                        .prepare(
+                            "SELECT id, property, text FROM sekai_search_object_text
+                             WHERE namespace = ?1 AND object_id = ?2",
+                        )
+                        .unwrap()
+                        .query_map([namespace, object_id.as_str()], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })
+                        .unwrap()
+                        .collect::<Result<_, _>>()
+                        .unwrap();
+                    for (id, property, text) in rows {
+                        tx.execute(
+                            "INSERT INTO sekai_search_object_fts(sekai_search_object_fts, rowid, property, text)
+                             VALUES('delete', ?1, ?2, ?3)",
+                            rusqlite::params![id, property, indexed_search_text(&text)],
+                        )
+                        .unwrap();
+                    }
+                    tx.execute(
+                        "DELETE FROM sekai_search_object_text WHERE namespace = ?1 AND object_id = ?2",
+                        [namespace, object_id.as_str()],
+                    )
+                    .unwrap();
+                    tx.execute(
+                        "DELETE FROM sekai_search_object WHERE namespace = ?1 AND object_id = ?2",
+                        [namespace, object_id.as_str()],
+                    )
+                    .unwrap();
+                    tx.commit().unwrap();
+                }
+            }
+            RuntimeDb::Postgres(db) => {
+                let mut conn = db.connection().unwrap();
+                let ids: Vec<String> = conn
+                    .query(
+                        "SELECT object_id FROM sekai_search_object WHERE namespace = $1",
+                        &[&namespace],
+                    )
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                for object_id in ids {
+                    let mut tx = conn.transaction().unwrap();
+                    tx.execute(
+                        "DELETE FROM sekai_search_object_text WHERE namespace = $1 AND object_id = $2",
+                        &[&namespace, &object_id],
+                    )
+                    .unwrap();
+                    tx.execute(
+                        "DELETE FROM sekai_search_object WHERE namespace = $1 AND object_id = $2",
+                        &[&namespace, &object_id],
+                    )
+                    .unwrap();
+                    tx.commit().unwrap();
+                }
+            }
+        }
+    }
+
+    /// After an upgrade seeded the new index from [`index_into_legacy_tables`]
+    /// for `note-a` ("join customers"), new code serves it without a rebuild.
+    pub(crate) fn assert_seeded_hit_is_served_without_a_rebuild(db: &RuntimeDb) {
+        let query = SearchCandidateQuery {
+            mode: SearchQueryMode::Text,
+            text: "customers".into(),
+            source: Some(SearchSourceKind::Object),
+            policy: SearchPolicyFilter {
+                namespace: "acme".into(),
+                namespace_authorized: true,
+                ..SearchPolicyFilter::default()
+            },
+            limit: 10,
+        };
+        // Before any catch-up: the hit comes from the seeded index.
+        let hits = db.query_candidates(&query).unwrap().candidates;
+        assert_eq!(hits.len(), 1);
+        let status = db.status("acme", 10).unwrap();
+        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
+        assert_eq!(status.object_count, 1);
+        let report = db.catch_up_search_namespace("acme", 10).unwrap();
+        assert!(!report.rebuilt);
+        assert_eq!(report.consumed_changes, 0);
+        assert_eq!(db.query_candidates(&query).unwrap().candidates.len(), 1);
+    }
+
+    #[test]
+    fn an_upgrade_seeds_the_new_index_from_the_legacy_one() {
+        let db = RuntimeDb::memory();
+        let RuntimeDb::Sqlite(sqlite) = &db else {
+            unreachable!()
+        };
+        // The store as a plane from before #2250 left it.
+        sqlite
+            .conn()
+            .execute_batch(
+                "DROP TABLE sekai_search_object_v2_fts;
+                 DROP TABLE sekai_search_dataset_v2_fts;
+                 DROP TABLE sekai_search_checkpoint_v2;
+                 DROP TABLE sekai_search_object_v2;
+                 DROP TABLE sekai_search_object_text_v2;
+                 DROP TABLE sekai_search_dataset_v2;
+                 DROP TABLE sekai_search_dataset_text_v2;",
+            )
+            .unwrap();
+        let note = object("note-a", "acme", "alpha", &[("body", "join customers")]);
+        db.create_object_with_audit(&note, "editor").unwrap();
+        index_into_legacy_tables(&db, &note);
+        sqlite.migrate_search_index().unwrap();
+        // A second open finds the index created and does not seed again.
+        sqlite.migrate_search_index().unwrap();
+        assert_seeded_hit_is_served_without_a_rebuild(&db);
+    }
+
+    fn exercise_legacy_writes_leave_the_new_index_alone(db: &RuntimeDb) {
+        let store = maintenance(db);
+        let alpha = object("note-a", "acme", "alpha", &[("body", "join customers")]);
+        db.create_object_with_audit(&alpha, "editor").unwrap();
+        db.create_object_with_audit(&object("note-b", "acme", "beta", &[]), "editor")
+            .unwrap();
+        // A fenced rebuild of the new index indexes one object.
+        let mut revision = store.start_search_rebuild("acme", 0, 10).unwrap();
+        revision = store
+            .write_search_document("acme", DocumentWrite::IndexObject(&alpha), revision, 11)
+            .unwrap();
+        // Meanwhile an older plane indexes, publishes, and then clears its
+        // own index.
+        let stale = object("note-a", "acme", "alpha", &[("body", "stale words")]);
+        index_into_legacy_tables(db, &stale);
+        clear_legacy_tables(db, "acme");
+        // The fenced rebuild finishes and publishes the new index intact.
+        let beta = store.get_object("note-b").unwrap().unwrap();
+        revision = store
+            .write_search_document("acme", DocumentWrite::IndexObject(&beta), revision, 12)
+            .unwrap();
+        store
+            .advance_search_checkpoint(
+                "acme",
+                &SearchPosition {
+                    last_change_rowid: db.object_change_watermark("acme").unwrap(),
+                    last_generation: db.namespace_object_generation("acme").unwrap(),
+                    dataset_catalog_digest: dataset_catalog_digest(&[]),
+                },
+                revision,
+                13,
+            )
+            .unwrap();
+        let status = db.status("acme", 13).unwrap();
+        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
+        assert_eq!(status.object_count, 2);
+        let dump = db.search_index_dump("acme").unwrap();
+        assert_eq!(
+            dump.objects["note-a"]
+                .properties
+                .get("body")
+                .map(String::as_str),
+            Some("join customers")
+        );
+    }
+
+    #[test]
+    fn legacy_writes_leave_the_new_index_alone() {
+        exercise_legacy_writes_leave_the_new_index_alone(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_legacy_writes_leave_the_new_index_alone() {
+        let (_scratch, db) = postgres_runtime();
+        exercise_legacy_writes_leave_the_new_index_alone(&db);
     }
 
     fn exercise_lag_gauge_moves_with_unindexed_backlog(db: &RuntimeDb) {
@@ -2262,7 +3191,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert_eq!(
             hits.iter().map(|hit| hit.id.as_str()).collect::<Vec<_>>(),
             ["note-a"]
@@ -2280,7 +3210,8 @@ mod tests {
                 },
                 limit: 10,
             })
-            .unwrap();
+            .unwrap()
+            .candidates;
         assert!(denied.is_empty());
         let listed = db
             .list_objects(&ListFilter {
@@ -2335,6 +3266,20 @@ mod tests {
         }
     }
 
+    /// Rank `chunks` with at most `cap` objects that `admits` kept.
+    fn rank(
+        chunks: Vec<EmbeddingChunk>,
+        query: &VectorCandidateQuery,
+        cap: usize,
+        admits: impl FnMut(&str) -> Result<bool, SearchIndexError>,
+    ) -> BoundedCandidates<VectorCandidate> {
+        let mut ranking = VectorRanking::new(query, None, cap, admits);
+        for chunk in chunks {
+            ranking.push(chunk).unwrap();
+        }
+        ranking.select(|_| Ok(true)).unwrap()
+    }
+
     #[test]
     fn exact_vector_candidates_rank_best_chunk_and_drop_denied_markings_first() {
         let chunks = vec![
@@ -2349,7 +3294,9 @@ mod tests {
             chunk("odd", None, &[1.0, 0.0, 0.0]),
         ];
         let query = vector_query(&[1.0, 0.0], Some("internal"), 10);
-        let ranked = exact_vector_candidates(chunks.clone(), &query, None, |_| Ok(true)).unwrap();
+        let ranked = rank(chunks.clone(), &query, SEARCH_OVERSCAN, |_| Ok(true));
+        assert!(!ranked.truncated);
+        let ranked = ranked.candidates;
         assert_eq!(
             ranked
                 .iter()
@@ -2360,14 +3307,49 @@ mod tests {
         // The per-object policy applies before the limit: a denied object
         // never takes the place of an allowed one.
         let query = vector_query(&[1.0, 0.0], Some("internal"), 1);
-        let top = exact_vector_candidates(chunks, &query, None, |candidate| {
-            Ok(candidate.object_id != "near")
-        })
-        .unwrap();
+        let top = rank(chunks, &query, SEARCH_OVERSCAN, |id| Ok(id != "near")).candidates;
         assert_eq!(
             top.iter().map(|c| c.object_id.as_str()).collect::<Vec<_>>(),
             vec!["split"]
         );
+    }
+
+    #[test]
+    fn vector_ranking_keeps_the_nearest_objects_up_to_its_cap_and_reports_the_rest() {
+        // Streamed in id order, nearest last, as a large spec would arrive.
+        let chunks = (0..6)
+            .map(|index| chunk(&format!("o{index}"), None, &[index as f32, 1.0]))
+            .collect::<Vec<_>>();
+        let query = vector_query(&[1.0, 0.0], None, 10);
+        let capped = rank(chunks.clone(), &query, 3, |_| Ok(true));
+        assert!(capped.truncated);
+        assert_eq!(
+            capped
+                .candidates
+                .iter()
+                .map(|c| c.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["o5", "o4", "o3"]
+        );
+        // The cap counts admitted objects only: a denied one never takes
+        // a place, so the next nearest admitted one does.
+        let denied = rank(chunks.clone(), &query, 3, |id| Ok(id != "o5"));
+        assert!(denied.truncated);
+        assert_eq!(
+            denied
+                .candidates
+                .iter()
+                .map(|c| c.object_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["o4", "o3", "o2"]
+        );
+        assert!(!rank(chunks.clone(), &query, 6, |_| Ok(true)).truncated);
+        // More denied objects than the cap, nearer than the one admitted:
+        // it is kept, and nothing the caller may read was dropped.
+        let one = rank(chunks, &query, 3, |id| Ok(id == "o0"));
+        assert!(!one.truncated);
+        assert_eq!(one.candidates.len(), 1);
+        assert_eq!(one.candidates[0].object_id, "o0");
     }
 
     #[test]
@@ -2411,11 +3393,14 @@ mod tests {
             .collect::<Vec<_>>();
         let query = (0..DIMENSION).map(|_| next()).collect::<Vec<_>>();
         let started = std::time::Instant::now();
-        let ranked =
-            exact_vector_candidates(chunks, &vector_query(&query, None, 256), None, |_| Ok(true))
-                .unwrap();
+        let ranked = rank(
+            chunks,
+            &vector_query(&query, None, 256),
+            SEARCH_OVERSCAN,
+            |_| Ok(true),
+        );
         let elapsed = started.elapsed();
-        assert_eq!(ranked.len(), 256);
+        assert_eq!(ranked.candidates.len(), 256);
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 }

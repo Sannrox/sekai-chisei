@@ -1,7 +1,7 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::catalog::CatalogError;
 use crate::sekai::catalog_criticality::{
-    CriticalityEvent, clamp_page_size, decode_page_token, encode_page_token,
+    CriticalityEvent, SWEEP_BATCH, clamp_page_size, decode_page_token, encode_page_token,
 };
 
 impl PostgresDb {
@@ -49,6 +49,75 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(n > 0)
+    }
+
+    /// Ids after `after`, in id order and at most `limit`, of catalog
+    /// entries whose stored declared, derived or effective criticality
+    /// differs from their latest outbox event. The kinds are the ones
+    /// `EntryKind::carries_derived_criticality` accepts.
+    pub fn drifted_catalog_criticality_entries(
+        &self,
+        after: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT o.id FROM sekai_objects o
+                 LEFT JOIN sekai_catalog_criticality_outbox e
+                   ON e.entry_id = o.id
+                  AND e.seq = (SELECT MAX(seq) FROM sekai_catalog_criticality_outbox
+                               WHERE entry_id = o.id)
+                 WHERE o.kind = $1 AND o.id > $2
+                   AND o.properties::jsonb ->> 'entry_kind'
+                       IN ('service', 'release', 'environment')
+                   AND (COALESCE(o.properties::jsonb ->> 'declared_criticality', '')
+                            <> COALESCE(e.declared, '')
+                     OR COALESCE(o.properties::jsonb ->> 'derived_criticality', '')
+                            <> COALESCE(e.derived, '')
+                     OR COALESCE(o.properties::jsonb ->> 'effective_criticality', '')
+                            <> COALESCE(e.effective, ''))
+                 ORDER BY o.id LIMIT $3",
+                &[&crate::sekai::catalog::CATALOG_ENTRY_KIND, &after, &limit],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
+    }
+
+    /// Deletes at most [`SWEEP_BATCH`] events written before `cutoff_ms`
+    /// that a later event of the same entry supersedes, and returns how many
+    /// it deleted. An entry's latest event is never deleted. The batch is
+    /// locked first and rows another instance holds are skipped, so
+    /// concurrent sweeps never wait on or overlap each other.
+    pub fn delete_superseded_catalog_criticality_events(
+        &self,
+        cutoff_ms: i64,
+    ) -> Result<usize, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let event_ids: Vec<String> = tx
+            .query(
+                "SELECT o.event_id FROM sekai_catalog_criticality_outbox o
+                 WHERE o.created_at_ms < $1
+                   AND EXISTS (SELECT 1 FROM sekai_catalog_criticality_outbox n
+                               WHERE n.entry_id = o.entry_id AND n.seq > o.seq)
+                 LIMIT $2 FOR UPDATE OF o SKIP LOCKED",
+                &[&cutoff_ms, &SWEEP_BATCH],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let deleted = tx
+            .execute(
+                "DELETE FROM sekai_catalog_criticality_outbox WHERE event_id = ANY($1)",
+                &[&event_ids],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        usize::try_from(deleted).map_err(|error| error.to_string())
     }
 
     pub fn latest_catalog_criticality_event(
@@ -142,4 +211,56 @@ fn row_to_event(row: postgres::Row) -> Result<CriticalityEvent, String> {
         evidence_digest: row.get(10),
         created_at_ms: row.get(11),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::postgres::ScratchDatabase;
+    use crate::db::runtime_db::RuntimeDb;
+    use crate::sekai::catalog_criticality::{SWEEP_BATCH, store_tests};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_sweep_keeps_latest_event_and_seq_monotonic() {
+        let scratch = ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        store_tests::sweep_keeps_latest_event_and_seq_monotonic(&db);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_reconcile_appends_a_missed_event_once() {
+        let scratch = ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        store_tests::reconcile_appends_a_missed_event_once(&db);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_concurrent_instances_sweep_and_reconcile_once() {
+        let scratch = ScratchDatabase::create();
+        // More superseded events than one batch, so sweeps take turns.
+        let seeded = SWEEP_BATCH / 2 + 7;
+        scratch
+            .connect()
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO sekai_catalog_criticality_outbox
+                 (event_id, namespace, entry_id, entry_kind, source_system, source_id,
+                  seq, evidence_digest, created_at_ms)
+                 SELECT 'seed-' || n || ':' || seq, 'acme', 'seed-' || n, 'service', 's', 's',
+                        seq, 'd', 0
+                 FROM generate_series(0, $1::BIGINT - 1) AS n,
+                      generate_series(1::BIGINT, 3::BIGINT) AS seq",
+                &[&seeded],
+            )
+            .unwrap();
+        // Each instance has its own pool, like two processes.
+        let instances = (0..2)
+            .map(|_| RuntimeDb::Postgres(Arc::new(scratch.connect())))
+            .collect();
+        store_tests::concurrent_instances_sweep_and_reconcile_once(instances, seeded);
+    }
 }

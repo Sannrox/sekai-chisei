@@ -106,3 +106,21 @@ the shrink-only SQLite-only list.
   `examples/shikigami-definition-branch/` consume them on the default build.
   Approve and merge stay `experimental` and off MCP. The HTTP/JSON projection
   and generated stable SDKs pick the five up as unary stables.
+- 2026-11-10, Issue [#2243](https://github.com/Sannrox/sekai-chisei/issues/2243):
+  `Search` and `GetSearchIndexStatus` become `stable` after meeting the #2089
+  promotion criteria: a fenced scheduled index worker (#2250), a query-bound
+  page cursor (#2251), and bounded query cost with PostgreSQL RPC tests
+  (#2252). The MCP adapter (`sekai.search.query`) consumes `Search`;
+  `GetSearchIndexStatus` is its required sibling for index lag. The HTTP/JSON
+  projection and generated stable SDKs pick both up as unary stables.
+- 2026-11-11, Issue [#2266](https://github.com/Sannrox/sekai-chisei/issues/2266):
+  the seven governed-document RPCs (`AdmitGovernedDocument`,
+  `AttachGovernedDocumentRendition`, `GetGovernedDocument`,
+  `HoldGovernedDocument`, `ReleaseGovernedDocumentHold`,
+  `ExpireGovernedDocument`, `DeleteGovernedDocument`) become `stable` after
+  meeting the #2089 promotion criteria: namespace authorization (#2248), the
+  namespace classification lattice and an admission input (#2245), a
+  rendition input without server-set fields, and RPC-level tests on SQLite
+  and PostgreSQL (#2266). `native_server_smoke` consumes all seven on the
+  spawned binary, as for `DecideActionInstance` (#1314). The HTTP/JSON
+  projection and generated stable SDKs pick them up as unary stables.

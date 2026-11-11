@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "chisei-core"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1460,9 +1460,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2321,17 +2321,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "r2d2_sqlite"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d362d41ad1f9a278dd971842c63c0fc7ae2e01bccbfbbc8c9a4689a46fa7051f"
-dependencies = [
- "r2d2",
- "rusqlite",
- "uuid",
-]
-
-[[package]]
 name = "rand"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2586,9 +2575,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags",
  "fallible-iterator 0.3.0",
@@ -2817,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-chisei"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2849,7 +2838,6 @@ dependencies = [
  "prost-types",
  "r2d2",
  "r2d2_postgres",
- "r2d2_sqlite",
  "rand 0.8.8",
  "regex",
  "reqwest 0.12.28",
@@ -2858,6 +2846,7 @@ dependencies = [
  "same-file",
  "sekai-admin-client",
  "sekai-client",
+ "sekai-connector-runtime",
  "sekai-connector-template",
  "sekai-core",
  "sekai-domain",
@@ -2907,6 +2896,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sekai-connector-runtime"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "native-tls",
+ "postgres",
+ "postgres-native-tls",
+ "reqwest 0.12.28",
+ "sekai-client",
+ "sekai-source-sdk",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "sekai-connector-template"
 version = "0.1.0"
 dependencies = [
@@ -2922,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-core"
-version = "3.0.0"
+version = "4.0.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2938,7 +2945,6 @@ dependencies = [
  "postgres-native-tls",
  "r2d2",
  "r2d2_postgres",
- "r2d2_sqlite",
  "rusqlite",
  "same-file",
  "sekai-domain",
@@ -3015,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-proto"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -3815,7 +3821,6 @@ checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
- "rand 0.10.2",
  "wasm-bindgen",
 ]
 

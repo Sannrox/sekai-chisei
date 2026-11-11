@@ -387,7 +387,10 @@ jobs:
             echo "must not produce a latest image tag" >&2
             exit 1
           fi
-          digest="$(docker buildx imagetools inspect "$image" | awk '/^Digest:/{print $2; exit}')"
+          # Structured read, no pipe: an awk that exits on the Digest line can
+          # end the producer early under pipefail (#2085). A bare
+          # `{{.Manifest.Digest}}` falls back to the full text output, so printf.
+          digest="$(docker buildx imagetools inspect "$image" --format '{{printf "%s" .Manifest.Digest}}')"
           [[ "$digest" == sha256:* ]] || { echo "missing digest for ${image}" >&2; exit 1; }
           mkdir -p dist
           gh release download "$TAG" --dir dist --pattern sekai-chisei-release.json
@@ -417,7 +420,7 @@ jobs:
   # draft that a re-run for the same tag can resume.
   publish:
     name: Publish GitHub Release
-    needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest]
+    needs: [verify-tag, sekai-release, attest, compatibility-matrix, sekai-binaries, record-image-digest, n1-upgrade]
     if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
@@ -457,6 +460,17 @@ jobs:
           fi
           echo "Published GitHub Release ${TAG} from CHANGELOG"
           echo "Image tags: version only, never latest"
+
+  # The previous final release against the tagged commit: N-1 stores open,
+  # N-1 clients work, and both versions share PostgreSQL during the upgrade.
+  # Publish waits for it, so a failed gate leaves a resumable draft.
+  n1-upgrade:
+    name: N-1 upgrade gate
+    needs: verify-tag
+    if: needs.verify-tag.outputs.tag != ''
+    uses: ./.github/workflows/n1-upgrade.yml
+    with:
+      sha: ${{ needs.verify-tag.outputs.sha }}
 
   compatibility-matrix:
     name: Upload compatibility matrix
@@ -511,7 +525,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
             os: macos-15-intel
           - target: x86_64-unknown-linux-gnu

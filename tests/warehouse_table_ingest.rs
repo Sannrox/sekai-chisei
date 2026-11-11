@@ -83,6 +83,7 @@ fn to_proto(batch: sekai_chisei::sekai::object_sync::SourceBatch) -> SourceBatch
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     }
 }
 
@@ -185,6 +186,7 @@ async fn publish_object_type(
                 idempotency_key: "orders-propose".into(),
                 major_revision: false,
                 migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
             },
             SCHEMA_ADMIN,
         ))

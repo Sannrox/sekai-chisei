@@ -102,11 +102,12 @@ jobs:
         run: bash scripts/check-connector-template.sh
       - run: bash scripts/validate-ontology-deps.sh
 
-  # Proto compatibility against the last final v* tag (proto/buf.yaml sets the
-  # rules). A reported break passes only when the pull request is marked
-  # breaking (`type!:` subject or a Breaking/Upgrade heading, as
-  # scripts/changelog-draft.sh reads it) and labelled `risk:breaking`; a tool
-  # failure stays red.
+  # Proto compatibility against the pull request base and the last final v*
+  # tag (proto/buf.yaml sets the rules). A break vs the base passes only when
+  # the pull request is marked breaking (`type!:` subject or a Breaking/Upgrade
+  # heading, as scripts/changelog-draft.sh reads it) and labelled
+  # `risk:breaking`. A break vs the tag that is already on the base is a
+  # notice, as in scripts/check-semver.py. A tool failure stays red.
   proto-breaking:
     name: Proto breaking
     if: github.event_name == 'pull_request'
@@ -119,10 +120,22 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
-        with:
-          version: 1.75.0
-          setup_only: true
+      # Install buf with retries: one release-download 504 must not fail the
+      # job before buf runs (#2174). The pinned checksum fixes the binary.
+      - name: Install buf
+        env:
+          BUF_VERSION: 1.75.0
+          BUF_SHA256: fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b
+        run: |
+          set -euo pipefail
+          bin="${RUNNER_TEMP}/buf/bin"
+          mkdir -p "$bin"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            -o "$bin/buf" "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/buf-Linux-x86_64"
+          echo "${BUF_SHA256}  $bin/buf" | sha256sum -c -
+          chmod +x "$bin/buf"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/buf" --version
       - name: buf breaking
         env:
           GH_TOKEN: ${{ github.token }}
@@ -131,22 +144,33 @@ jobs:
         run: |
           set -euo pipefail
           tag="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "$BASE" 2>/dev/null || true)"
-          if [[ -z "$tag" ]]; then
-            echo "::notice::No final v* tag yet; nothing to compare against."
-            exit 0
-          fi
-          if ! git cat-file -e "${tag}:proto" 2>/dev/null; then
-            echo "::notice::${tag} has no proto/ directory; nothing to compare against."
-            exit 0
-          fi
-          rc=0
-          out="$(buf breaking proto --against ".git#tag=${tag},subdir=proto" --error-format github-actions 2>&1)" || rc=$?
-          echo "$out"
-          [[ $rc -eq 0 ]] && exit 0
           # buf exits 100 for reported incompatibilities; anything else is a tool error.
-          if [[ $rc -ne 100 ]]; then
-            echo "::error::buf breaking failed without reporting a break (exit ${rc}); see the log."
-            exit "$rc"
+          breaking() {
+            local rc=0
+            buf breaking proto --against "$1" "${@:2}" 2>&1 || rc=$?
+            if [[ $rc -ne 0 && $rc -ne 100 ]]; then
+              echo "::error::buf breaking failed without reporting a break (exit ${rc}); see the log."
+              exit "$rc"
+            fi
+            return "$rc"
+          }
+          if ! git cat-file -e "${BASE}:proto" 2>/dev/null; then
+            echo "::notice::The pull request base has no proto/ directory; nothing to compare against."
+            exit 0
+          fi
+          if breaking ".git#ref=${BASE},subdir=proto" --error-format github-actions; then
+            # Compatible with the base. A break against the tag is then already on the
+            # base: report it, release prep owns the major.
+            if [[ -n "$tag" ]] && git cat-file -e "${tag}:proto" 2>/dev/null; then
+              echo "::group::buf breaking against ${tag}"
+              rc=0
+              breaking ".git#tag=${tag},subdir=proto" || rc=$?
+              echo "::endgroup::"
+              if [[ $rc -eq 100 ]]; then
+                echo "::notice::Proto break against ${tag} (already on the pull request base; release prep must cut a major)."
+              fi
+            fi
+            exit 0
           fi
           # Read the live title, body, and labels so an edit plus a re-run is enough.
           pr="$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json title,body,labels)"
@@ -159,10 +183,10 @@ jobs:
           fi
           labelled="$(jq '[.labels[].name] | index("risk:breaking") != null' <<<"$pr")"
           if [[ "$marked" == true && "$labelled" == true ]]; then
-            echo "::notice::Proto break against ${tag} accepted: the pull request is marked breaking and labelled risk:breaking."
+            echo "::notice::Proto break against the pull request base accepted: the pull request is marked breaking and labelled risk:breaking."
             exit 0
           fi
-          echo "::error::buf breaking found incompatible proto changes against ${tag}. Mark the pull request breaking (a 'type!:' title or a '### Breaking' heading) and add the risk:breaking label, or keep the change compatible."
+          echo "::error::buf breaking found incompatible proto changes against the pull request base. Mark the pull request breaking (a 'type!:' title or a '### Breaking' heading) and add the risk:breaking label, or keep the change compatible."
           exit 1
 
   # Not a required check: it runs beside Build & Test, not after it.

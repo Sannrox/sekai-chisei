@@ -31,6 +31,7 @@ use crate::sekai::governed_transform::{
     MAX_TRANSFORM_LEASE_EXPIRIES, normalize_transform_claim_ttl_ms,
 };
 use crate::sekai::site_agent_instance;
+use crate::sekai::work_claim::{ClaimError, ClaimRecord, Fence, Hold};
 
 /// Execution profile of agent-turn queue gauges (ADR 0129, 0137).
 pub const PROFILE: &str = "agent-turn";
@@ -194,19 +195,67 @@ impl AgentTurn {
     }
 
     fn claimable(&self, now_ms: i64) -> bool {
-        self.due_at_ms <= now_ms
-            && match self.status.as_str() {
-                PENDING => true,
-                CLAIMED => self.claim_expires_at_ms <= now_ms,
-                _ => false,
-            }
+        self.due_at_ms <= now_ms && self.claim_record().is_takeable(self.hold(), 0, now_ms)
     }
 
     fn fence_matches(&self, runtime_id: &str, generation: i64, fencing_token: &str) -> bool {
-        !fencing_token.is_empty()
-            && self.claim_owner == runtime_id
-            && self.claim_generation == generation
-            && self.fencing_token == fencing_token
+        self.claim_record()
+            .matches(fence(runtime_id, generation, fencing_token))
+    }
+
+    /// The turn's claim state, for the claim engine (ADR 0149).
+    pub fn claim_record(&self) -> ClaimRecord {
+        ClaimRecord {
+            owner: self.claim_owner.clone(),
+            generation: self.claim_generation,
+            fencing_token: self.fencing_token.clone(),
+            expires_at_ms: self.claim_expires_at_ms,
+            lease_expiries: self.lease_expiries,
+        }
+    }
+
+    fn set_claim_record(&mut self, record: ClaimRecord) {
+        self.claim_owner = record.owner;
+        self.claim_generation = record.generation;
+        self.fencing_token = record.fencing_token;
+        self.claim_expires_at_ms = record.expires_at_ms;
+        self.lease_expiries = record.lease_expiries;
+    }
+
+    /// What the turn status means for its claim. A parked turn is closed;
+    /// a claim that resumes a decided park passes [`Hold::Open`] itself.
+    pub fn hold(&self) -> Hold {
+        match self.status.as_str() {
+            PENDING => Hold::Open,
+            CLAIMED => Hold::Held,
+            _ => Hold::Closed,
+        }
+    }
+
+    /// Fails with [`TurnError::StaleClaim`] unless the fence names the live
+    /// claim.
+    fn require_live(
+        &self,
+        runtime_id: &str,
+        generation: i64,
+        fencing_token: &str,
+        now_ms: i64,
+    ) -> Result<(), TurnError> {
+        self.claim_record()
+            .require_live(
+                self.hold(),
+                fence(runtime_id, generation, fencing_token),
+                now_ms,
+            )
+            .map_err(|_| TurnError::StaleClaim)
+    }
+}
+
+fn fence<'a>(owner: &'a str, generation: i64, token: &'a str) -> Fence<'a> {
+    Fence {
+        owner,
+        generation,
+        token,
     }
 }
 
@@ -417,9 +466,7 @@ pub fn park(
         if parked_here && turn.parked_action_id == action_id {
             return Ok(());
         }
-        if turn.status != CLAIMED || turn.claim_expires_at_ms <= now_ms {
-            return Err(TurnError::StaleClaim);
-        }
+        turn.require_live(runtime_id, claim_generation, fencing_token, now_ms)?;
         if !submitted_here || !(awaiting_approval || decision_stands) {
             return Err(TurnError::Invalid(
                 "a turn parks only on an Action it submitted under this claim that awaits approval or whose decision stands"
@@ -608,22 +655,8 @@ pub fn claim_accepting_continuation(
         if !resuming && !turn.claimable(now_ms) {
             return Err(TurnError::NotClaimable);
         }
-        if turn.status == CLAIMED {
-            turn.lease_expiries += 1;
-            if turn.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
-                exhausted = true;
-                turn.status = FAILED.into();
-                turn.reason = LEASE_EXHAUSTED.into();
-                turn.finished_at_ms = now_ms;
-                turn.claim_expires_at_ms = 0;
-                return Ok(());
-            }
-        }
-        turn.status = CLAIMED.into();
-        turn.claim_owner = runtime_id.into();
-        turn.claim_generation += 1;
-        turn.fencing_token = uuid::Uuid::new_v4().to_string();
-        turn.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+        let hold = if resuming { Hold::Open } else { turn.hold() };
+        exhausted = !assign_claim(turn, runtime_id, ttl_ms, now_ms, hold)?;
         Ok(())
     })?;
     if exhausted {
@@ -713,13 +746,16 @@ pub fn heartbeat(
     now_ms: i64,
 ) -> Result<AgentTurn, TurnError> {
     edit(db, turn_id, |turn| {
-        if turn.status != CLAIMED
-            || turn.claim_expires_at_ms <= now_ms
-            || !turn.fence_matches(runtime_id, claim_generation, fencing_token)
-        {
-            return Err(TurnError::StaleClaim);
-        }
-        turn.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
+        let mut record = turn.claim_record();
+        record
+            .heartbeat(
+                turn.hold(),
+                fence(runtime_id, claim_generation, fencing_token),
+                normalize_transform_claim_ttl_ms(ttl_ms),
+                now_ms,
+            )
+            .map_err(|_| TurnError::StaleClaim)?;
+        turn.set_claim_record(record);
         Ok(())
     })
 }
@@ -744,13 +780,18 @@ pub fn acknowledge(
         if turn.status == outcome.as_str() {
             return Ok(());
         }
-        if turn.status != CLAIMED || turn.claim_expires_at_ms <= now_ms {
-            return Err(TurnError::StaleClaim);
-        }
+        let mut record = turn.claim_record();
+        record
+            .release(
+                turn.hold(),
+                fence(runtime_id, claim_generation, fencing_token),
+                now_ms,
+            )
+            .map_err(|_| TurnError::StaleClaim)?;
+        turn.set_claim_record(record);
         turn.status = outcome.as_str().into();
         turn.reason = reason.into();
         turn.finished_at_ms = now_ms;
-        turn.claim_expires_at_ms = 0;
         Ok(())
     })
 }
@@ -1077,28 +1118,38 @@ fn retire_unclaimed(turn: &mut AgentTurn, reason: &str, now_ms: i64) {
     turn.claim_expires_at_ms = 0;
 }
 
+/// Claims `turn` for `runtime_id` through the claim engine. `hold` is the
+/// turn's own unless the claim resumes a decided park. `Ok(false)` means the
+/// lapsed lease reached its limit and the turn failed; persist it.
 fn assign_claim(
     turn: &mut AgentTurn,
     runtime_id: &str,
     ttl_ms: i64,
     now_ms: i64,
-) -> Result<(), TurnError> {
-    if turn.status == CLAIMED {
-        turn.lease_expiries += 1;
-        if turn.lease_expiries >= MAX_TRANSFORM_LEASE_EXPIRIES {
+    hold: Hold,
+) -> Result<bool, TurnError> {
+    let mut record = turn.claim_record();
+    match record.count_lapse(hold, MAX_TRANSFORM_LEASE_EXPIRIES, now_ms) {
+        Ok(_) => {}
+        Err(ClaimError::LeaseLimit) => {
+            record.expires_at_ms = 0;
+            turn.set_claim_record(record);
             turn.status = FAILED.into();
             turn.reason = LEASE_EXHAUSTED.into();
             turn.finished_at_ms = now_ms;
-            turn.claim_expires_at_ms = 0;
-            return Err(TurnError::NotClaimable);
+            return Ok(false);
         }
+        Err(_) => return Err(TurnError::NotClaimable),
     }
+    record.grant(
+        runtime_id,
+        normalize_transform_claim_ttl_ms(ttl_ms),
+        now_ms,
+        |_| uuid::Uuid::new_v4().to_string(),
+    );
+    turn.set_claim_record(record);
     turn.status = CLAIMED.into();
-    turn.claim_owner = runtime_id.into();
-    turn.claim_generation += 1;
-    turn.fencing_token = uuid::Uuid::new_v4().to_string();
-    turn.claim_expires_at_ms = now_ms.saturating_add(normalize_transform_claim_ttl_ms(ttl_ms));
-    Ok(())
+    Ok(true)
 }
 
 fn persist_pg(
@@ -1198,10 +1249,16 @@ fn next_pick_after_lock(
     if turn.is_parked() && !parked_decided {
         return Ok(NextPick::Skip);
     }
-    match assign_claim(turn, runtime_id, ttl_ms, now_ms) {
-        Ok(()) => Ok(NextPick::Take),
-        Err(TurnError::NotClaimable) => Ok(NextPick::Persist),
-        Err(error) => Err(error),
+    // The pick query only returns due, takeable turns and decided parks.
+    let hold = if turn.is_parked() {
+        Hold::Open
+    } else {
+        turn.hold()
+    };
+    if assign_claim(turn, runtime_id, ttl_ms, now_ms, hold)? {
+        Ok(NextPick::Take)
+    } else {
+        Ok(NextPick::Persist)
     }
 }
 

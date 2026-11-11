@@ -5,6 +5,8 @@
 //! `sekai.definition-consumer-binding/v1` objects bound to the affected
 //! dataset. Transport (email, webhooks) stays out of the core. Evidence is
 //! stored in full and filtered by read policy when the caller lists.
+//! Every delivery is deleted once it is older than
+//! [`DELIVERY_RETENTION_MS`], acknowledged or not; any instance may sweep.
 
 use crate::db::sekai::SekaiDb;
 use crate::domain::Object;
@@ -19,6 +21,10 @@ pub const KIND_QUALITY: &str = "quality";
 pub const MEMBER_KIND_DATASET: &str = "dataset";
 pub const DEFAULT_PAGE_SIZE: i32 = 50;
 pub const MAX_PAGE_SIZE: i32 = 100;
+/// How long a delivery is kept after it was written, acknowledged or not.
+pub const DELIVERY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Expired deliveries deleted per transaction by a sweep.
+pub(crate) const SWEEP_BATCH: i64 = 500;
 
 const SQLITE_SCHEMA: &str = "
             CREATE TABLE IF NOT EXISTS sekai_consumer_violation_deliveries (
@@ -36,6 +42,8 @@ const SQLITE_SCHEMA: &str = "
             );
             CREATE INDEX IF NOT EXISTS idx_sekai_consumer_violation_deliveries_recipient
                 ON sekai_consumer_violation_deliveries(recipient, created_at_ms, event_id);
+            CREATE INDEX IF NOT EXISTS idx_sekai_consumer_violation_deliveries_created
+                ON sekai_consumer_violation_deliveries(created_at_ms);
 ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +337,21 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?
             .map(row_to_delivery)
             .transpose()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Deletes at most [`SWEEP_BATCH`] deliveries written before
+    /// `cutoff_ms` and returns how many it deleted.
+    pub fn delete_expired_consumer_violations(&self, cutoff_ms: i64) -> Result<usize, String> {
+        self.conn()
+            .execute(
+                "DELETE FROM sekai_consumer_violation_deliveries
+                 WHERE rowid IN (
+                     SELECT rowid FROM sekai_consumer_violation_deliveries
+                     WHERE created_at_ms < ?1 LIMIT ?2
+                 )",
+                params![cutoff_ms, SWEEP_BATCH],
+            )
             .map_err(|error| error.to_string())
     }
 
@@ -687,5 +710,103 @@ mod tests {
             .unwrap_err(),
             "namespace is required"
         );
+    }
+
+    fn alice_inbox(db: &crate::db::runtime_db::RuntimeDb) -> Vec<String> {
+        db.list_consumer_violation_deliveries(&ListViolationDeliveries {
+            recipients: vec!["alice".into()],
+            page_token: String::new(),
+            page_size: 0,
+            include_acknowledged: true,
+        })
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|delivery| delivery.event_id)
+        .collect()
+    }
+
+    #[test]
+    fn sqlite_sweep_deletes_only_deliveries_past_retention() {
+        let sqlite = SekaiDb::new(":memory:").unwrap();
+        sqlite
+            .create_object(&binding("a", "alice", "orders", true))
+            .unwrap();
+        let db = crate::db::runtime_db::RuntimeDb::Sqlite(std::sync::Arc::new(sqlite));
+        let old = freshness_event_id("orders", "v1", "fresh");
+        let new = freshness_event_id("orders", "v2", "fresh");
+        for (event_id, now_ms) in [(&old, 1_000), (&new, 1_000 + DELIVERY_RETENTION_MS)] {
+            db.emit_consumer_violation(&EmitViolation {
+                kind: KIND_FRESHNESS,
+                namespace: "ops",
+                member_id: "orders",
+                event_id,
+                rule_id: "fresh",
+                evidence: "age_ms=12",
+                now_ms,
+            })
+            .unwrap();
+        }
+
+        let swept = db
+            .sweep_consumer_violation_deliveries(1_001 + DELIVERY_RETENTION_MS)
+            .unwrap();
+
+        assert_eq!(swept, 1);
+        assert_eq!(alice_inbox(&db), [new]);
+        let alice = ["alice".to_string()];
+        assert!(
+            db.get_consumer_violation_delivery(&alice, &old)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.acknowledge_consumer_violation(&alice, &old, 2)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sqlite_concurrent_sweeps_delete_each_expired_delivery_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekai.db");
+        let path = path.to_str().unwrap();
+        let total = 3 * SWEEP_BATCH + 7;
+        {
+            let seed = SekaiDb::new(path).unwrap();
+            let mut conn = seed.conn();
+            let tx = conn.transaction().unwrap();
+            for n in 0..total {
+                tx.execute(
+                    "INSERT INTO sekai_consumer_violation_deliveries
+                     (recipient, event_id, kind, namespace, member_kind, member_id, rule_id, evidence, created_at_ms)
+                     VALUES ('alice', ?1, 'freshness', 'ops', 'dataset', 'orders', 'fresh', '', 0)",
+                    params![format!("event-{n}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let sweeps: Vec<_> = (0..2)
+            .map(|_| {
+                let db = crate::db::runtime_db::RuntimeDb::Sqlite(std::sync::Arc::new(
+                    SekaiDb::new(path).unwrap(),
+                ));
+                std::thread::spawn(move || {
+                    db.sweep_consumer_violation_deliveries(DELIVERY_RETENTION_MS + 1)
+                })
+            })
+            .collect();
+        let swept: usize = sweeps
+            .into_iter()
+            .map(|sweep| sweep.join().unwrap().unwrap())
+            .sum();
+
+        assert_eq!(swept as i64, total);
+        let db = crate::db::runtime_db::RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path).unwrap(),
+        ));
+        assert!(alice_inbox(&db).is_empty());
     }
 }

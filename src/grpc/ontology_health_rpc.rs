@@ -2,14 +2,17 @@
 //! the caller may see. Lint runs through `GetOntologyLintReport` with the
 //! caller's own request context, so it applies the same visibility; the other
 //! parts read as the matching list RPCs would. Stored trends and threshold
-//! events (#1694) are recorded and read here too.
+//! events (#1694) are recorded and read here too, and so is the bounded
+//! health of one source (`GetSourceHealth`, #2193), which the source part
+//! scores.
 
 use super::*;
 use crate::sekai::ontology_health::{
-    self, BoundTarget, DatasetSignals, Finding, PART_ACCESS, PART_CONTRACT, PART_LINT, PART_TRUST,
-    Part,
+    self, BoundTarget, DatasetSignals, Finding, PART_ACCESS, PART_CONTRACT, PART_LINT, PART_SOURCE,
+    PART_TRUST, Part,
 };
-use crate::sekai::ontology_health_trend::{HealthSnapshot, PartScore};
+use crate::sekai::ontology_health_trend::{HealthSnapshot, PartScore, ScoreInputs};
+use crate::sekai::source_health;
 use std::collections::{BTreeSet, HashMap};
 
 /// Namespaces one tenant-wide request scores; more mark it incomplete.
@@ -18,6 +21,8 @@ const MAX_HEALTH_NAMESPACES: usize = 20;
 const MAX_HEALTH_DATASETS: usize = 500;
 /// Grants of the namespace the access part scores; more mark it incomplete.
 const MAX_HEALTH_GRANTS: usize = 10_000;
+/// Sources one namespace reads; more mark the source part incomplete.
+const MAX_HEALTH_SOURCES: usize = 500;
 
 pub(super) async fn get_ontology_health(
     service: &SekaiServiceImpl,
@@ -91,12 +96,12 @@ pub(super) async fn get_ontology_health(
     }))
 }
 
-/// A namespace's parts, and what the dataset and definition parts were
-/// scored from, so a stored score can be shown only to who may see those.
+/// A namespace's parts, and what the dataset, definition and source parts
+/// were scored from, so a stored score can be shown only to who may see
+/// those.
 struct Scored {
     parts: Vec<Part>,
-    datasets: Vec<String>,
-    definition_revision: Option<String>,
+    inputs: ScoreInputs,
 }
 
 async fn namespace_parts(
@@ -178,11 +183,128 @@ async fn namespace_parts(
     // Trust scores are computed per object on request and not stored.
     parts.push(Part::unavailable(PART_TRUST, "not_stored"));
     parts.push(access_part(service, principals, namespace)?);
+    let (sources, sources_complete) = source_reports(db, namespace, now_millis())?;
+    parts.push(ontology_health::source(&sources, sources_complete));
     Ok(Scored {
         parts,
-        datasets: datasets.into_iter().map(|dataset| dataset.id).collect(),
-        definition_revision: published.map(|revision| revision.revision_digest),
+        inputs: ScoreInputs {
+            datasets: datasets.into_iter().map(|dataset| dataset.id).collect(),
+            sources: sources
+                .iter()
+                .map(|report| {
+                    ontology_health::source_subject(&report.source_instance, &report.type_digest)
+                })
+                .collect(),
+            definition_revision: published
+                .map(|revision| revision.revision_digest)
+                .unwrap_or_default(),
+        },
     })
+}
+
+/// The sync state of one source to a caller who may read its namespace, as
+/// `GetSourceSyncState` would return it; `None` when the source is not bound
+/// or its type is not admitted, so it reads as unknown.
+fn visible_source_state(
+    db: &RuntimeDb,
+    namespace: &str,
+    source_instance: &str,
+    type_digest: &str,
+) -> Result<Option<crate::sekai::object_sync::SourceSyncState>, Status> {
+    if require_admitted_source_type(db, namespace, type_digest).is_err() {
+        return Ok(None);
+    }
+    db.get_source_sync_state(namespace, source_instance, type_digest)
+        .map_err(|_| Status::internal("source health unavailable"))
+}
+
+/// The bounded health (ADR 0046) of the visible sources of `namespace`, by
+/// the projector alone: nothing is audited per source.
+fn source_reports(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+) -> Result<(Vec<source_health::SourceHealth>, bool), Status> {
+    let mut identities = db
+        .list_source_identities(namespace, MAX_HEALTH_SOURCES + 1)
+        .map_err(|_| Status::internal("source health unavailable"))?;
+    let complete = identities.len() <= MAX_HEALTH_SOURCES;
+    identities.truncate(MAX_HEALTH_SOURCES);
+    let mut reports = Vec::new();
+    for (source_instance, type_digest) in identities {
+        let Some(state) = visible_source_state(db, namespace, &source_instance, &type_digest)?
+        else {
+            continue;
+        };
+        let query = source_health::SourceHealthQuery {
+            namespace: namespace.into(),
+            source_instance,
+            type_digest,
+            delayed_after_ms: source_health::DEFAULT_DELAYED_AFTER_MS,
+            contract_version: None,
+        };
+        reports.push(source_health::project_source_health(&state, &query, now_ms));
+    }
+    Ok((reports, complete))
+}
+
+/// `GetSourceHealth` (#2193): one source's bounded health, authorized as
+/// `GetSourceSyncState` and audited as `source.health`. Another tenant's
+/// namespace is refused, as on every tenant RPC; within the tenant, a
+/// namespace the caller may not read and a type it does not admit report
+/// exactly as an unknown source.
+pub(super) async fn get_source_health(
+    service: &SekaiServiceImpl,
+    req: Request<GetSourceHealthRequest>,
+) -> Result<Response<GetSourceHealthResponse>, Status> {
+    let principals = caller_principals(&req);
+    let actor = require_single_source_principal(&principals)?.to_owned();
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let input = req.into_inner();
+    let query = source_health::parse_source_health_query(
+        &input.namespace,
+        &input.source_instance,
+        &input.type_digest,
+        input.delayed_after_ms,
+        None,
+    )
+    .map_err(Status::invalid_argument)?;
+    let db = service.db.runtime();
+    enforce_namespace_tenant_context(db, tenant_context.as_ref(), &query.namespace, false)?;
+    let authorized = match authorize_source_sync_namespace(
+        service,
+        &principals,
+        tenant_context.as_ref(),
+        &query.namespace,
+        false,
+    ) {
+        Ok(()) => require_admitted_source_type(db, &query.namespace, &query.type_digest).is_ok(),
+        Err(status) if status.code() == tonic::Code::Internal => return Err(status),
+        Err(_) => false,
+    };
+    let report = source_health::report_authorized_source_health(
+        db,
+        &actor,
+        &query,
+        now_millis(),
+        authorized,
+    )
+    .map_err(|_| Status::internal("source health unavailable"))?;
+    Ok(Response::new(GetSourceHealthResponse {
+        health: Some(SourceHealth {
+            contract_version: report.contract_version,
+            namespace: report.namespace,
+            source_instance: report.source_instance,
+            type_digest: report.type_digest,
+            health_class: report.class,
+            failure_class: report.failure_class,
+            outcome: report.outcome,
+            checkpoint_age_ms: report.checkpoint_age_ms,
+            lag: report.lag,
+            last_success_at_ms: report.last_success_at_ms,
+            observed_at_ms: report.observed_at_ms,
+        }),
+    }))
 }
 
 /// Whether `dataset` is bound into `namespace` and the caller may read it, as
@@ -376,8 +498,9 @@ const NOT_PERMITTED: &str = "not_permitted";
 
 /// What a caller may see of stored snapshots, judged from their own scoring
 /// of the namespace now: no part that reads `not_permitted` to them, no
-/// dataset part scored from a dataset they may not read, and no definition
-/// part scored from a revision they may not read. Lint and access count only
+/// dataset part scored from a dataset they may not read, no source part
+/// scored from a source they may not see, and no definition part scored
+/// from a revision they may not read. Lint and access count only
 /// the objects, links and grants their scorer could see, which a stored score
 /// cannot prove for anyone else: they show only to the recording principal.
 struct Projection<'a> {
@@ -387,6 +510,7 @@ struct Projection<'a> {
     namespace: &'a str,
     hidden: BTreeSet<&'static str>,
     datasets: std::cell::RefCell<HashMap<String, bool>>,
+    sources: std::cell::RefCell<HashMap<String, bool>>,
     revisions: std::cell::RefCell<HashMap<String, bool>>,
 }
 
@@ -410,16 +534,26 @@ impl<'a> Projection<'a> {
                 .map(|part| part.part)
                 .collect(),
             datasets: Default::default(),
+            sources: Default::default(),
             revisions: Default::default(),
         }
     }
 
     fn visible(&self, snapshot: &HealthSnapshot, part: &PartScore) -> bool {
-        if self.hidden.contains(part.part.as_str())
-            || !part
-                .inputs
-                .iter()
-                .all(|dataset| self.dataset_readable(dataset))
+        if self.hidden.contains(part.part.as_str()) {
+            return false;
+        }
+        // The source part's inputs are sources; an encoding this binary does
+        // not know hides it.
+        if part.part == PART_SOURCE {
+            return part
+                .source_inputs()
+                .is_some_and(|sources| sources.iter().all(|source| self.source_visible(source)));
+        }
+        if !part
+            .inputs
+            .iter()
+            .all(|dataset| self.dataset_readable(dataset))
         {
             return false;
         }
@@ -482,6 +616,28 @@ impl<'a> Projection<'a> {
             })
     }
 
+    /// Whether the caller may see the source `subject` now: it is still
+    /// bound with an admitted type. The caller already reads the namespace.
+    fn source_visible(&self, subject: &str) -> bool {
+        *self
+            .sources
+            .borrow_mut()
+            .entry(subject.to_owned())
+            .or_insert_with(|| {
+                ontology_health::parse_source_subject(subject).is_some_and(
+                    |(source_instance, type_digest)| {
+                        visible_source_state(
+                            self.service.db.runtime(),
+                            self.namespace,
+                            source_instance,
+                            type_digest,
+                        )
+                        .is_ok_and(|state| state.is_some())
+                    },
+                )
+            })
+    }
+
     /// The snapshot with only the parts the caller may see.
     fn snapshot(&self, snapshot: &HealthSnapshot) -> OntologyHealthSnapshot {
         let parts: Vec<OntologyHealthPartScore> = snapshot
@@ -537,7 +693,8 @@ async fn score_as_caller(
 
 /// `RecordOntologyHealthSnapshot` (#1694): scores the namespace as its
 /// administrator and stores the part scores for the current window, with
-/// what they were scored from. A periodic caller drives it. The response
+/// what they were scored from. The on-demand call; a stored schedule records
+/// from the transform schedule tick (#2192). The response
 /// shows the caller what they may see of the stored snapshot, a replayed one
 /// included.
 pub(super) async fn record_ontology_health_snapshot(
@@ -549,16 +706,7 @@ pub(super) async fn record_ontology_health_snapshot(
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let (metadata, extensions, input) = req.into_parts();
-    authorize_source_sync_namespace(
-        service,
-        &principals,
-        tenant_context.as_ref(),
-        &input.namespace,
-        true,
-    )?;
-    let recorded_by =
-        authorize_source_type_namespace_admin(service, &principals, &input.namespace)?;
-    let scored = score_as_caller(
+    let (recorded_by, scored) = score_as_recorder(
         service,
         &principals,
         tenant_context.as_ref(),
@@ -578,8 +726,7 @@ pub(super) async fn record_ontology_health_snapshot(
             now_ms: now_millis(),
         },
         &scored.parts,
-        &scored.datasets,
-        scored.definition_revision.as_deref().unwrap_or_default(),
+        &scored.inputs,
     )
     .map_err(|error| match error {
         TrendError::Invalid(message) => Status::invalid_argument(message),
@@ -607,6 +754,117 @@ pub(super) async fn record_ontology_health_snapshot(
         replay,
         event: event.filter(|_| whole).map(event_to_proto),
     }))
+}
+
+/// Scores `namespace` for a record: only its administrator records, so a
+/// snapshot scores what the namespace holds. Returns the recorder.
+async fn score_as_recorder(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    metadata: tonic::metadata::MetadataMap,
+    extensions: tonic::Extensions,
+    namespace: &str,
+) -> Result<(String, Scored), Status> {
+    authorize_source_sync_namespace(service, principals, tenant_context, namespace, true)?;
+    let recorded_by = authorize_source_type_namespace_admin(service, principals, namespace)?;
+    let scored = score_as_caller(
+        service,
+        principals,
+        tenant_context,
+        metadata,
+        extensions,
+        namespace,
+    )
+    .await?;
+    Ok((recorded_by, scored))
+}
+
+/// The ontology health member of the transform schedule tick (#2192):
+/// records the due window of every stored schedule, scored and authorized as
+/// the administrator that put it, outside any tenant assertion. Schedules
+/// record one at a time and each on its own. A recorder refused now (revoked,
+/// say) halts its schedule with the reason, so later ticks skip it until a
+/// put replaces it; a store failure leaves the window due for the next tick.
+/// Either way the first error is returned after every schedule was tried.
+/// Returns the number of windows this tick wrote.
+pub(super) async fn tick_ontology_health_schedules(
+    service: &SekaiServiceImpl,
+    now_ms: i64,
+) -> Result<usize, Status> {
+    use crate::sekai::ontology_health_schedule::{self as schedules, HealthSchedule};
+    use crate::sekai::ontology_health_trend::{Recorded, TrendError};
+    let db = service.db.runtime();
+    let due =
+        schedules::due(db, now_ms).map_err(|_| Status::internal("health schedules unavailable"))?;
+    // None when the halt was fenced off: a put replaced the schedule, or
+    // another plane finished the window, so this tick has nothing to report.
+    let halt = |schedule: &HealthSchedule, reason: &str| -> Option<Status> {
+        match schedules::halt(db, schedule, now_ms, reason) {
+            Ok(true) => Some(Status::failed_precondition(format!(
+                "ontology health schedule of {} halted: {reason}",
+                schedule.namespace
+            ))),
+            Ok(false) => None,
+            Err(_) => Some(Status::internal("health schedules unavailable")),
+        }
+    };
+    let mut written = 0;
+    let mut first_error = None;
+    for schedule in due {
+        let principals = vec![schedule.recorded_by.clone()];
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        let Ok(principal) = tonic::metadata::MetadataValue::try_from(schedule.recorded_by.as_str())
+        else {
+            if let Some(error) = halt(&schedule, "recorder is not a principal") {
+                first_error.get_or_insert(error);
+            }
+            continue;
+        };
+        metadata.insert("x-principal", principal);
+        let scored = score_as_recorder(
+            service,
+            &principals,
+            None,
+            metadata,
+            tonic::Extensions::default(),
+            &schedule.namespace,
+        )
+        .await;
+        let error = match scored {
+            Ok((_, scored)) => {
+                match schedules::record_due(db, &schedule, now_ms, &scored.parts, &scored.inputs) {
+                    Ok(recorded) => {
+                        written += usize::from(matches!(recorded, Recorded::Fresh { .. }));
+                        continue;
+                    }
+                    Err(TrendError::Invalid(message)) => halt(&schedule, &message),
+                    Err(TrendError::Store(_)) => Some(Status::internal("health trend unavailable")),
+                }
+            }
+            Err(status) if refuses_recorder(status.code()) => halt(&schedule, status.message()),
+            Err(status) => Some(status),
+        };
+        let Some(error) = error else {
+            continue;
+        };
+        tracing::warn!(namespace = %schedule.namespace, error = %error.message(), "ontology health schedule failed");
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(written), Err)
+}
+
+/// A refusal that a retry would get again, until someone changes a grant or
+/// the schedule; anything else may pass on the next tick.
+fn refuses_recorder(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+            | tonic::Code::NotFound
+            | tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+    )
 }
 
 /// `ListOntologyHealthTrend` (#1694): the namespace's stored snapshots and
@@ -654,7 +912,20 @@ pub(super) async fn list_ontology_health_trend(
         .filter(|snapshot| projection.whole(snapshot))
         .map(|snapshot| snapshot.window_start_ms)
         .collect();
+    // The schedule names its recorder and why it halted: administrators only.
+    let schedule =
+        if authorize_source_type_namespace_admin(service, &principals, &input.namespace).is_ok() {
+            service
+                .db
+                .runtime()
+                .get_ontology_health_schedule(&input.namespace)
+                .map_err(|_| Status::internal("health schedule unavailable"))?
+                .map(schedule_to_proto)
+        } else {
+            None
+        };
     Ok(Response::new(ListOntologyHealthTrendResponse {
+        schedule,
         snapshots: snapshots
             .iter()
             .map(|snapshot| projection.snapshot(snapshot))
@@ -665,6 +936,93 @@ pub(super) async fn list_ontology_health_trend(
             .map(event_to_proto)
             .collect(),
     }))
+}
+
+/// The caller and namespace a schedule put or delete is for: the namespace's
+/// administrator, outside a tenant assertion, since the tick records with no
+/// tenant context (as saved exports run).
+fn schedule_admin<T: std::any::Any>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    namespace: &str,
+) -> Result<String, Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    if request_tenant_context(service.db.runtime(), req)?.is_some() {
+        return Err(Status::failed_precondition(
+            "ontology health schedules are for principals outside a tenant assertion",
+        ));
+    }
+    authorize_source_sync_namespace(service, &principals, None, namespace, true)?;
+    authorize_source_type_namespace_admin(service, &principals, namespace)
+}
+
+/// `PutOntologyHealthSchedule` (#2192): creates or replaces the namespace's
+/// schedule, recording as the caller. A replace clears a halt.
+pub(super) async fn put_ontology_health_schedule(
+    service: &SekaiServiceImpl,
+    req: Request<PutOntologyHealthScheduleRequest>,
+) -> Result<Response<PutOntologyHealthScheduleResponse>, Status> {
+    use crate::sekai::ontology_health_schedule::{self as schedules, PutSchedule};
+    use crate::sekai::ontology_health_trend::TrendError;
+    let namespace = req
+        .get_ref()
+        .schedule
+        .as_ref()
+        .map(|schedule| schedule.namespace.clone())
+        .ok_or_else(|| Status::invalid_argument("schedule is required"))?;
+    let recorded_by = schedule_admin(service, &req, &namespace)?;
+    let input = req.into_inner().schedule.unwrap_or_default();
+    let schedule = schedules::put(
+        service.db.runtime(),
+        &PutSchedule {
+            namespace: &namespace,
+            window_ms: input.window_ms,
+            retention_ms: input.retention_ms,
+            threshold: input.threshold,
+            recorded_by: &recorded_by,
+            now_ms: now_millis(),
+        },
+    )
+    .map_err(|error| match error {
+        TrendError::Invalid(message) => Status::invalid_argument(message),
+        TrendError::Store(_) => Status::internal("health schedule unavailable"),
+    })?;
+    Ok(Response::new(PutOntologyHealthScheduleResponse {
+        schedule: Some(schedule_to_proto(schedule)),
+    }))
+}
+
+/// `DeleteOntologyHealthSchedule` (#2192): stops the schedule; the trend stays.
+pub(super) async fn delete_ontology_health_schedule(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteOntologyHealthScheduleRequest>,
+) -> Result<Response<DeleteOntologyHealthScheduleResponse>, Status> {
+    let namespace = req.get_ref().namespace.clone();
+    schedule_admin(service, &req, &namespace)?;
+    let deleted = service
+        .db
+        .runtime()
+        .delete_ontology_health_schedule(&namespace)
+        .map_err(|_| Status::internal("health schedule unavailable"))?;
+    Ok(Response::new(DeleteOntologyHealthScheduleResponse {
+        deleted,
+    }))
+}
+
+fn schedule_to_proto(
+    schedule: crate::sekai::ontology_health_schedule::HealthSchedule,
+) -> OntologyHealthSchedule {
+    OntologyHealthSchedule {
+        namespace: schedule.namespace,
+        window_ms: schedule.window_ms,
+        retention_ms: schedule.retention_ms,
+        threshold: u32::from(schedule.threshold),
+        recorded_by: schedule.recorded_by,
+        updated_at_ms: schedule.updated_at_ms,
+        last_window_start_ms: schedule.last_window_start_ms,
+        last_error: schedule.last_error,
+    }
 }
 
 fn event_to_proto(event: crate::sekai::ontology_health_trend::HealthEvent) -> OntologyHealthEvent {

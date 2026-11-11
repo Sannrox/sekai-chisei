@@ -17,11 +17,12 @@ fn workspace_matrix_projects_the_contract_and_proto_revision() {
     let generated = workspace_matrix();
     assert_eq!(generated.contract_version, MATRIX_CONTRACT);
     let json = generated.to_pretty_json().expect("encode");
-    assert!(json.contains("\"chisei.admin-rpc\": \"1.0.0\""), "{json}");
-    assert!(
-        json.contains("\"chisei.enterprise-rpc\": \"1.0.0\""),
-        "{json}"
-    );
+    for (name, version) in compatibility_matrix::PROVIDED_CONTRACTS {
+        assert!(
+            json.contains(&format!("\"{name}\": \"{version}\"")),
+            "{json}"
+        );
+    }
     assert_eq!(
         generated.proto_revision,
         protocol_revision(".").expect("proto revision")

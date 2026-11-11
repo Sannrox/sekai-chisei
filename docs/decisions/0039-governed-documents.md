@@ -47,6 +47,52 @@ community PostgreSQL and exposes those operations as experimental
 `SekaiService` RPCs. managed media sets keep bytes and extractors in the
 platform; this plane records digest-addressed references only.
 
+## Amendment 2026-11-10
+
+#2245 moves document classification onto the namespace classification
+lattice, the rule Search and the embedding index already use
+([ADR 0032](0032-hierarchical-classifications.md)). This is the move
+[ADR 0007](0007-provisional-classification-markings.md) expects for its
+provisional markings.
+
+- A namespace with an activated lattice admits only its tokens, matched
+  exactly. A read needs the caller's sealed ceiling to dominate the marking
+  in that lattice. Trusted service principals stay the exception.
+- A namespace without a lattice keeps the fixed markings
+  `public < internal < confidential < restricted`, matched without regard to
+  case. `public` stays visible to the owner without a ceiling. The default
+  lattice names the same four tokens in the same order, so no stored value
+  changes and no data migration runs on SQLite or PostgreSQL.
+- A stored fixed marking that an activated lattice does not name is
+  unknown, and an unknown marking is never visible, trusted principals
+  included. Operators who activate a lattice keep the fixed tokens their
+  documents use, or re-admit them under a new identity.
+- A requested `classification_ceiling` must be a token of the same rule and
+  only restricts: the read also needs it to dominate the marking.
+
+Until every instance runs this version, an older instance still compares a
+fixed marking by the fixed order in an activated namespace, and hides a
+custom token, which it cannot parse.
+
+Admission takes `GovernedDocumentAdmission`, not the stored record. It has
+no `admitted_by`, `admitted_at_ms`, or `deleted_at_ms`: the server sets
+`admitted_by` to the caller and stamps the time. Its optional `owner` may be
+empty or name the caller; any other owner is refused, so admitting on behalf
+of someone else fails instead of silently admitting as the caller (#2271).
+Its field numbers match `GovernedDocument`, so a request encoded by an older
+client still decodes. The server ignores the other stored-record fields it
+carries.
+
+## Amendment 2026-11-11
+
+Issue [#2266](https://github.com/Sannrox/sekai-chisei/issues/2266):
+attachment takes `DocumentRenditionAttachment`, as admission does. It
+has no `attached_by` or `attached_at_ms`: the server sets them to the caller
+and the attach time. Its field numbers match `DocumentRendition`. Attaching
+the same rendition again returns the stored one, so a retry after a lost
+response is idempotent. With RPC-level tests on SQLite and PostgreSQL, the
+seven document RPCs become `stable` ([ADR 0071](0071-rpc-maturity.md)).
+
 ## Alternatives considered
 
 Treating documents as blobs with sidecar metadata was rejected because

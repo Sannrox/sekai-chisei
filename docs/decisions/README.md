@@ -173,4 +173,6 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0145: Ed25519 identity assertions verified by key id](0145-ed25519-identity-assertions.md)
 - [ADR 0146: A turn worker is never the instance principal](0146-turn-worker-is-not-the-instance.md)
 - [ADR 0147: Spatial engine integration runs outside the plane](0147-spatial-engine-integration-outside-the-plane.md)
+- [ADR 0148: Sources are first-class; one connector runtime runs source integrations](0148-sources-and-one-connector-runtime.md)
+- [ADR 0149: One claimable work queue, with typed kinds](0149-one-claimable-work-queue.md)
 <!-- adr-index:end -->

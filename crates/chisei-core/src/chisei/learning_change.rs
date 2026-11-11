@@ -2,8 +2,8 @@
 //!
 //! A recorded learning candidate becomes a `chisei.learning-change/v1` object
 //! that binds baseline, candidate, and evidence digests. Approval and
-//! activation are explicit. Rollback supersedes history without rewriting
-//! source evidence.
+//! activation are explicit, and whoever proposed the change cannot approve
+//! it. Rollback supersedes history without rewriting source evidence.
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
@@ -19,6 +19,7 @@ pub const CHANGE_CONTRACT: &str = "chisei.learning-change/v1";
 pub const POSTGRES_UNAVAILABLE: &str =
     "learning changes are unavailable on the PostgreSQL community runtime";
 pub const UNAVAILABLE: &str = "learning change is unavailable";
+pub const SELF_APPROVAL_DENIED: &str = "learning change proposer cannot approve";
 pub const PROPOSE_ACTION: &str = "learning.change_propose";
 pub const APPROVE_ACTION: &str = "learning.change_approve";
 pub const ACTIVATE_ACTION: &str = "learning.change_activate";
@@ -182,6 +183,19 @@ pub fn approve_change(
     let mut record = get_change(db, namespace, learning_id)?;
     deny_if_unusable(&record)?;
     require_current_candidate(facts, &record)?;
+    if is_candidate_proposer(&record, actor) {
+        // Every attempt is its own audit row. Keying by actor keeps two
+        // refused actors in the same millisecond apart, and the idempotent
+        // write absorbs a same-millisecond repeat so it still reports the
+        // denial instead of a duplicate-id error.
+        let mut denied = decision(actor, APPROVE_ACTION, "denied", &record, now_ms);
+        denied.id = format!(
+            "{APPROVE_ACTION}:denied:{}:{actor}:{now_ms}",
+            record.change_id
+        );
+        db.record_decisions_idempotently(&[denied])?;
+        return Err(SELF_APPROVAL_DENIED.into());
+    }
     if record.status == STATUS_APPROVED
         && record
             .approval
@@ -458,6 +472,23 @@ fn require_current_candidate(
     Ok(())
 }
 
+/// True when `actor` proposed the change or bound its current candidate by
+/// re-proposing, so approving would be self-review. `root` / `local` are the
+/// single unix-socket operator identity and stay exempt, as for definition
+/// proposals.
+fn is_candidate_proposer(record: &LearningChange, actor: &str) -> bool {
+    if matches!(actor, "root" | "local") {
+        return false;
+    }
+    let latest_proposer = record
+        .lineage
+        .iter()
+        .rev()
+        .find(|entry| entry.action == "propose")
+        .map(|entry| entry.actor.as_str());
+    record.proposed_by == actor || latest_proposer == Some(actor)
+}
+
 fn deny_if_unusable(record: &LearningChange) -> Result<(), String> {
     if record.reconciliation != RECONCILE_NONE {
         return Err(UNAVAILABLE.into());
@@ -541,7 +572,17 @@ fn audit(
     record: &LearningChange,
     now_ms: i64,
 ) -> Result<(), String> {
-    db.record_decision(&Decision {
+    db.record_decision(&decision(actor, action, outcome, record, now_ms))
+}
+
+fn decision(
+    actor: &str,
+    action: &str,
+    outcome: &str,
+    record: &LearningChange,
+    now_ms: i64,
+) -> Decision {
+    Decision {
         id: format!("{action}:{}:{now_ms}", record.change_id),
         timestamp: now_ms,
         actor: actor.into(),
@@ -559,7 +600,7 @@ fn audit(
         ]),
         target_id: record.change_id.clone(),
         outcome: outcome.into(),
-    })
+    }
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

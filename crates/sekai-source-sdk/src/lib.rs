@@ -7,6 +7,7 @@
 
 pub mod change_capture;
 pub mod conformance;
+pub mod connector;
 pub mod contract;
 pub mod discover;
 pub mod feed;
@@ -26,6 +27,12 @@ pub use conformance::{
     assert_deterministic_batch, assert_deterministic_discovery, assert_files_omit,
     assert_lifecycle_report, assert_snapshot_chain, github_issue_lifecycle_fixture,
     run_check_conformance, run_lifecycle_fixture, run_restart_and_commit,
+};
+pub use connector::{
+    CONNECTOR_TYPES, ConfigError, ConfigField, ConfigFieldKind, ConfigValue, Connector,
+    ConnectorFailure, ConnectorType, CredentialSlot, Destination, EgressAllowlist, ExportArtifact,
+    GITHUB_CONNECTOR, MAX_CONFIG_FIELDS, MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, Operation,
+    RELATIONAL_CONNECTOR, RecordChange, SourceConfig, connector_type,
 };
 pub use contract::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,

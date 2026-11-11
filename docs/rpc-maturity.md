@@ -60,6 +60,38 @@ HTTP/JSON is a generated projection of the same `stable` unary RPCs
 on `SEKAI_HTTP_PORT`. Authorization, cursors, and hidden-row rules match gRPC.
 Streaming RPCs stay on gRPC. Experimental RPCs stay behind this gate.
 
+## Promotion criteria
+
+An `experimental` RPC moves to `stable` only when it meets the
+`stable` class above and all of these (#2089):
+
+1. **Wire compatibility.** The server trait has a default stub, and request
+   and response messages grow through `..Default::default()` (#2035). A
+   public enum or trait that will gain variants or methods is
+   `#[non_exhaustive]` or has default methods. Request semantics such as
+   paging are final, because changing them after promotion breaks callers.
+2. **Authorization.** The caller's namespace grant, tenant context, and team
+   namespace are checked. Results are filtered by namespace, marking, and
+   object policy before ranking and before the limit, so hidden rows never
+   take a slot. A test covers restricted objects.
+3. **Restartable lifecycle.** Index rebuilds, spec changes, and backfills keep
+   their state in the database, are idempotent, and resume or redo after a
+   crash. Writes from several instances are fenced. A crash test covers this.
+4. **Both backends.** Behavior and RPC-level tests run on SQLite and on
+   PostgreSQL through `scripts/postgres-conformance.sh`.
+5. **Bounded cost.** List and query RPCs page, and the upper limits on input,
+   results, and index size are enforced and documented.
+
+Search (#2243) and the governed-document RPCs (#2266) met these criteria
+and are `stable`. Status of the remaining experimental embedding-spec RPCs:
+
+| RPCs | Status | Blocked by |
+| --- | --- | --- |
+| `SekaiService.PutEmbeddingSpec`, `SekaiService.ListEmbeddingSpecs`, `SekaiService.DeleteEmbeddingSpec` | `experimental` | #2089 gaps closed by #2244; no SDK, host, or example consumer yet, which `stable` requires ([ADR 0071](decisions/0071-rpc-maturity.md)) |
+
+When a blocking Issue closes, its RPCs move to `stable` in
+`tests/fixtures/rpc_maturity/v1.json` and leave this table.
+
 ## Table
 
 **Real backend** is `yes` when the RPC runs on both community runtimes,
@@ -112,9 +144,16 @@ Edit the fixture, then regenerate with
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | mcp, example | `stable` |
 | `SekaiService.ReportDefinitionConsumerImpact` | `sekai.definition-branch, sekai.graph` | yes | mcp, example | `stable` |
 | `SekaiService.GetOntologyLintReport` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
-| `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetOntologyHealth` | `sekai.definition-branch, sekai.graph, sekai.datasets, sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RecordOntologyHealthSnapshot` | `sekai.ontology-definitions` | yes | none | `experimental` |
 | `SekaiService.ListOntologyHealthTrend` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.PutOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.DeleteOntologyHealthSchedule` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.GetSourceHealth` | `sekai.object-sync` | yes | cli | `experimental` |
+| `SekaiService.PutSource` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.GetSource` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.ListSources` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.DisableSource` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
@@ -150,8 +189,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.Search` | `sekai.graph` | yes | none | `experimental` |
-| `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.Search` | `sekai.graph` | yes | mcp | `stable` |
+| `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.PutEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
@@ -171,6 +210,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.ClaimAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatAgentTurnClaim` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.AckAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListClaimableWork` | `sekai.datasets, sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ClaimWork` | `sekai.datasets, sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.HeartbeatWorkClaim` | `sekai.datasets, sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.AckWork` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListSiteAgentWorkingMemory` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
@@ -180,13 +223,13 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
-| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `experimental` |
+| `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.GetGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.HoldGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.ReleaseGovernedDocumentHold` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.ExpireGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
+| `SekaiService.DeleteGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
 | `SekaiService.ReadObjectChangeSubscription` | `sekai.graph, sekai.audit` | yes | none | `stable` |
 | `SekaiService.PutObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `stable` |
 | `SekaiService.GetObjectSecurityPolicyRevision` | `sekai.object-security` | yes | none | `experimental` |
@@ -306,6 +349,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ExecuteActionPlan` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
+| `SekaiService.ListPendingDecisions` | `sekai.audit` | yes | cli | `experimental` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionEffects` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListClaimableActionWork` | `sekai.audit` | yes | none | `experimental` |

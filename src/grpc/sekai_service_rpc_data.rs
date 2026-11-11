@@ -4845,6 +4845,27 @@ pub(super) async fn tick_governed_transforms(
             }
         }
     }
+    // Scheduled dataset health checks (#2187), ontology health snapshots
+    // (#2192) and Source syncs (ADR 0148) join the same graph. Last, and all
+    // always run, so a failing member fails the tick visibly without holding
+    // back other work.
+    let health_runtime = runtime.clone();
+    let datasets =
+        tokio::task::spawn_blocking(move || health_runtime.tick_dataset_health_checks(now_ms))
+            .await
+            .map_err(|_| Status::internal("dataset health tick failed"))?
+            .map_err(Status::internal);
+    let sync_runtime = runtime.clone();
+    let sources =
+        tokio::task::spawn_blocking(move || crate::sekai::source_sync::tick(&sync_runtime, now_ms))
+            .await
+            .map_err(|_| Status::internal("source sync tick failed"))?
+            .map_err(Status::internal);
+    let ontology =
+        super::ontology_health_rpc::tick_ontology_health_schedules(service, now_ms).await;
+    datasets?;
+    sources?;
+    ontology?;
     let runs = runs
         .iter()
         .map(|run| {
@@ -4974,14 +4995,14 @@ fn to_proto_content_ref(reference: &crate::sekai::document::ContentReference) ->
     }
 }
 
-fn from_proto_document(
-    proto: GovernedDocument,
-) -> Result<crate::sekai::document::GovernedDocument, Status> {
+fn from_proto_admission(
+    proto: GovernedDocumentAdmission,
+) -> Result<crate::sekai::document::DocumentAdmission, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::GovernedDocument {
+    Ok(crate::sekai::document::DocumentAdmission {
         contract_version: proto.contract_version,
         document_id: proto.document_id,
         namespace: proto.namespace,
@@ -4996,9 +5017,6 @@ fn from_proto_document(
         expires_at_ms: proto.expires_at_ms,
         hold_id: proto.hold_id,
         hold_reason: proto.hold_reason,
-        admitted_by: proto.admitted_by,
-        admitted_at_ms: proto.admitted_at_ms,
-        deleted_at_ms: proto.deleted_at_ms,
     })
 }
 
@@ -5024,14 +5042,14 @@ fn to_proto_document(document: &crate::sekai::document::GovernedDocument) -> Gov
     }
 }
 
-fn from_proto_rendition(
-    proto: DocumentRendition,
-) -> Result<crate::sekai::document::DocumentRendition, Status> {
+fn from_proto_attachment(
+    proto: DocumentRenditionAttachment,
+) -> Result<crate::sekai::document::RenditionAttachment, Status> {
     let content_ref = proto
         .content_ref
         .map(from_proto_content_ref)
         .ok_or_else(|| Status::invalid_argument("content_ref required"))?;
-    Ok(crate::sekai::document::DocumentRendition {
+    Ok(crate::sekai::document::RenditionAttachment {
         namespace: proto.namespace,
         document_id: proto.document_id,
         rendition_id: proto.rendition_id,
@@ -5040,8 +5058,6 @@ fn from_proto_rendition(
         content_ref,
         extractor_id: proto.extractor_id,
         extractor_profile_digest: proto.extractor_profile_digest,
-        attached_by: proto.attached_by,
-        attached_at_ms: proto.attached_at_ms,
     })
 }
 
@@ -5088,21 +5104,45 @@ fn to_proto_document_view(view: crate::sekai::document::DocumentView) -> Documen
     }
 }
 
+/// Namespace authorization for a document RPC: the sequence object writes
+/// and `Search` run (tenant context and service-principal scope, shared
+/// space, then team-namespace membership), before the store is touched.
+fn authorize_document_namespace<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    principals: &[String],
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, req)?;
+    enforce_collaboration_namespace(db, tenant_context.as_ref(), namespace, write)?;
+    check_team_namespace(db, principals, namespace, write)
+}
+
 pub(super) async fn admit_governed_document(
     service: &SekaiServiceImpl,
     req: Request<AdmitGovernedDocumentRequest>,
 ) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .document
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("document required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .document
         .ok_or_else(|| Status::invalid_argument("document required"))?;
-    let document = from_proto_document(proto)?;
+    let admission = from_proto_admission(proto)?;
     let admitted = crate::sekai::document::admit_document(
         service.db.runtime(),
         actor,
-        &document,
+        &admission,
         now_millis(),
     )
     .map_err(map_document_error)?;
@@ -5117,15 +5157,23 @@ pub(super) async fn attach_governed_document_rendition(
 ) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .rendition
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("rendition required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .rendition
         .ok_or_else(|| Status::invalid_argument("rendition required"))?;
-    let rendition = from_proto_rendition(proto)?;
+    let attachment = from_proto_attachment(proto)?;
     let attached = crate::sekai::document::attach_rendition(
         service.db.runtime(),
         actor,
-        &rendition,
+        &attachment,
         now_millis(),
     )
     .map_err(map_document_error)?;
@@ -5140,6 +5188,7 @@ pub(super) async fn get_governed_document(
 ) -> Result<Response<GetGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, false)?;
     let input = req.into_inner();
     let view = crate::sekai::document::retrieve_document(
         service.db.runtime(),
@@ -5166,6 +5215,7 @@ pub(super) async fn hold_governed_document(
 ) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::place_hold(
         service.db.runtime(),
@@ -5188,6 +5238,7 @@ pub(super) async fn release_governed_document_hold(
 ) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::release_hold(
         service.db.runtime(),
@@ -5209,6 +5260,7 @@ pub(super) async fn expire_governed_document(
 ) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::expire_document(
         service.db.runtime(),
@@ -5229,6 +5281,7 @@ pub(super) async fn delete_governed_document(
 ) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::delete_document(
         service.db.runtime(),
@@ -5256,6 +5309,7 @@ pub(super) fn branch_status(error: String) -> Status {
         branch::PROPOSAL_NOT_OPEN
         | branch::PROPOSAL_STALE_PARENT
         | branch::PROPOSAL_STALE_BRANCH
+        | branch::PROPOSAL_ATTACHED
         | branch::BRANCH_RUN_ISOLATED
         | branch::BRANCH_RUN_RAISES_MARKING => Status::failed_precondition(error),
         _ if error.starts_with("branch run") => Status::failed_precondition(error),
@@ -5263,11 +5317,67 @@ pub(super) fn branch_status(error: String) -> Status {
     }
 }
 
-fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
+pub(super) fn context_tenant(context: Option<&RequestEnterpriseContext>) -> String {
     context
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.clone())
         .unwrap_or_default()
+}
+
+/// Whether the caller may read `attachment`, a dataset branch proposal
+/// attached to a definition proposal (#2222): the read check of every dataset
+/// branch read, in the tenant the proposal was pinned in. A refusal or a
+/// missing dataset hides it; a store failure stays an error.
+pub(super) fn attached_dataset_proposal_readable(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    attachment: &definition_proposal_domain::DatasetProposalAttachment,
+) -> Result<bool, Status> {
+    if attachment.tenant != context_tenant(context) {
+        return Ok(false);
+    }
+    let Some(dataset) = service
+        .db
+        .runtime()
+        .get_dataset(&attachment.dataset_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(false);
+    };
+    match authorize_dataset(service, principals, context, &dataset, false) {
+        Ok(()) => Ok(true),
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::Internal | tonic::Code::Unavailable
+            ) =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// The caller's tenant once it may write every dataset in `dataset_ids`:
+/// attaching a dataset branch proposal to a definition proposal, or merging
+/// one that attaches it (#2199). A missing dataset reads as unavailable.
+pub(super) fn authorize_attached_datasets<'a>(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    dataset_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<String, Status> {
+    for dataset_id in dataset_ids {
+        let dataset = service
+            .db
+            .runtime()
+            .get_dataset(dataset_id)
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found("definition resource unavailable"))?;
+        authorize_dataset(service, principals, context, &dataset, true)?;
+    }
+    Ok(context_tenant(context))
 }
 
 /// The caller, its tenant, and the dataset after the read or write check.
@@ -5451,17 +5561,12 @@ pub(super) async fn merge_dataset_branch(
     let dataset_id = req.get_ref().dataset_id.clone();
     let (actor, tenant) = branch_caller(service, &req, &dataset_id, true)?;
     let inner = req.into_inner();
-    // A bundle branch merges only through its approved definition proposal,
-    // which checks the bundle's column rules at the merge.
     if let Ok(proposal) = service
         .db
         .runtime()
         .get_dataset_branch_proposal(&dataset_id, &inner.proposal_id)
-        && proposal.branch.starts_with(BUNDLE_BRANCH_PREFIX)
     {
-        return Err(Status::failed_precondition(
-            "definition change bundle branches merge only through ApplyDefinitionChangeBundle",
-        ));
+        refuse_bundle_branch_merge(&proposal)?;
     }
     let proposal = service
         .db
@@ -5477,6 +5582,75 @@ pub(super) async fn merge_dataset_branch(
     Ok(Response::new(MergeDatasetBranchResponse {
         proposal: Some(to_proto_proposal(proposal)),
     }))
+}
+
+/// A bundle branch merges only through its approved definition proposal,
+/// which checks the bundle's column rules at the merge.
+fn refuse_bundle_branch_merge(
+    proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+) -> Result<(), Status> {
+    if proposal.branch.starts_with(BUNDLE_BRANCH_PREFIX) {
+        return Err(Status::failed_precondition(
+            "definition change bundle branches merge only through ApplyDefinitionChangeBundle",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `principals` may merge the open `proposal` of a dataset bound in
+/// `namespace` through `MergeDatasetBranch`, by its checks before freshness:
+/// write access to the dataset, not a change-bundle branch, not `attached`
+/// to an open definition proposal, and [`check_mergeable`] (another
+/// principal, the same tenant). A refusal is `false`; a store failure is an
+/// error. Used by the pending-decision listing (#2203).
+///
+/// [`check_mergeable`]: crate::db::dataset_branch::check_mergeable
+pub(super) fn may_merge_dataset_proposal(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    proposal: &crate::sekai::dataset_branch::DatasetBranchProposal,
+    attached: bool,
+) -> Result<bool, Status> {
+    let Some(actor) = principals.first() else {
+        return Ok(false);
+    };
+    if attached || refuse_bundle_branch_merge(proposal).is_err() {
+        return Ok(false);
+    }
+    let request = crate::sekai::dataset_branch::MergeDatasetBranch {
+        dataset_id: proposal.dataset_id.clone(),
+        proposal_id: proposal.id.clone(),
+        actor: actor.clone(),
+        tenant: context_tenant(context),
+        reason: String::new(),
+    };
+    if crate::db::dataset_branch::check_mergeable(proposal, &request).is_err() {
+        return Ok(false);
+    }
+    let Some(dataset) = service
+        .db
+        .runtime()
+        .get_dataset(&proposal.dataset_id)
+        .map_err(Status::internal)?
+    else {
+        return Ok(false);
+    };
+    match authorize_dataset_access(service, principals, context, &dataset, true) {
+        Ok(access) => Ok(access
+            .binding
+            .is_some_and(|binding| binding.namespace == namespace)),
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::Internal | tonic::Code::Unavailable
+            ) =>
+        {
+            Err(status)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Admitted like a parent run (credential admin, namespace tenant, transform

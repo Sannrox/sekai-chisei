@@ -230,6 +230,60 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "Search") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::search(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetSearchIndexStatus") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_search_index_status(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "AdmitGovernedDocument") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::admit_governed_document(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "AttachGovernedDocumentRendition") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::attach_governed_document_rendition(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetGovernedDocument") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_governed_document(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "HoldGovernedDocument") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::hold_governed_document(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ReleaseGovernedDocumentHold") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::release_governed_document_hold(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ExpireGovernedDocument") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::expire_governed_document(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "DeleteGovernedDocument") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::delete_governed_document(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "GetPublishedDefinitionRevision") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_published_definition_revision(&*svc, req).await
@@ -1215,6 +1269,110 @@ mod tests {
                 "{rpc} is stable and must not hit the experimental gate: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn promoted_search_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in ["Search", "GetSearchIndexStatus"] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promoted_document_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in [
+            "AdmitGovernedDocument",
+            "AttachGovernedDocumentRendition",
+            "GetGovernedDocument",
+            "HoldGovernedDocument",
+            "ReleaseGovernedDocumentHold",
+            "ExpireGovernedDocument",
+            "DeleteGovernedDocument",
+        ] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
+    }
+
+    /// Proto3 JSON may omit default-valued fields of a nested input message;
+    /// admission and attachment still decode (#2266).
+    #[tokio::test]
+    async fn document_inputs_decode_with_default_valued_fields_omitted() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        let (status, admitted) = http_json(
+            app.clone(),
+            "/sekai.SekaiService/AdmitGovernedDocument",
+            Some(&token),
+            json!({"document": {
+                "contractVersion": "sekai.governed-document/v1",
+                "documentId": "doc:brief",
+                "namespace": "acme",
+                "typeRevision": "v1",
+                "purpose": "case-review",
+                "classification": "public",
+                "title": "Brief",
+                "contentRef": {
+                    "scheme": "digest",
+                    "digest": format!("sha256:01{}", "ab".repeat(31)),
+                    "mediaType": "application/pdf",
+                    "byteLength": 128
+                }
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{admitted}");
+        assert_eq!(admitted["document"]["owner"], "alice");
+        let parent = admitted["document"]["contentDigest"].clone();
+
+        let (status, attached) = http_json(
+            app,
+            "/sekai.SekaiService/AttachGovernedDocumentRendition",
+            Some(&token),
+            json!({"rendition": {
+                "namespace": "acme",
+                "documentId": "doc:brief",
+                "renditionId": "rend:text",
+                "class": "extracted_text",
+                "parentContentDigest": parent,
+                "contentRef": {
+                    "scheme": "digest",
+                    "digest": format!("sha256:02{}", "cd".repeat(31)),
+                    "mediaType": "text/plain",
+                    "byteLength": 32
+                },
+                "extractorId": "extractor:text",
+                "extractorProfileDigest": format!("sha256:03{}", "ef".repeat(31))
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{attached}");
+        assert_eq!(attached["rendition"]["attachedBy"], "alice");
     }
 
     #[tokio::test]

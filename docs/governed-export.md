@@ -141,11 +141,71 @@ deliver. The plane holds no destination credentials.
   `TickGovernedTransforms` admits one run per due bucket for its owner,
   the same way it admits a due transform: a replica tick is idempotent, and
   a revoked export grant fails that run closed with a receipt.
-- `ListDeliverableExportArtifacts` lists completed, unexpired, unacknowledged
-  artifacts in a namespace to the run's initiating owner or a namespace
-  administrator. `FetchExportArtifact` streams the bytes and the receipt
-  digest; the adapter verifies the digest before delivering.
-  `AcknowledgeExportDelivery` takes that digest, deletes the bytes, and is
-  idempotent. Access follows the receipt, so a later definition under the
+- Delivery is claimable work, the `export_delivery` kind of the one work
+  queue ([ADR 0149](decisions/0149-one-claimable-work-queue.md)). An
+  adapter lists with `ListClaimableWork`, claims with `ClaimWork` (an empty
+  `work_id` takes the oldest artifact it may deliver), renews with
+  `HeartbeatWorkClaim`, and acknowledges with `AckWork` (outcome
+  `completed`, the digest in `ExportDeliveryAckOptions`). The claim names
+  the artifact (`receipt_id`, `namespace`, `definition_id`,
+  `content_digest`, `expires_at_ms`) with its fence, never the bytes, and
+  expires no later than the artifact. Claimable artifacts are completed,
+  unexpired and unacknowledged, oldest first. Claim, renewal and
+  acknowledge need namespace write, and runtime tokens are refused for
+  this kind.
+- `FetchExportArtifact` streams the bytes and the receipt digest; the
+  adapter verifies the digest before delivering. The holder of a claim
+  passes its fence in `claim`. Each page is read under the claim check, so
+  a claim lost mid-stream stops the stream.
+- The acknowledge takes that digest and deletes the bytes in the same
+  transaction. It is idempotent, and a replay under a fence other than the
+  one that acknowledged is refused. A stale fence cannot acknowledge
+  (`FAILED_PRECONDITION`). On `AckWork` a wrong digest is
+  `INVALID_ARGUMENT`, so it never reads as a lost claim.
+- Access follows the receipt: the run's initiating owner or a namespace
+  administrator. Anyone else gets nothing, so a later definition under the
   same id cannot fetch another owner's retained artifact. The plane never
   pushes and holds no destination credentials.
+- `ListDeliverableExportArtifacts` and `AcknowledgeExportDelivery` are
+  deprecated in favor of the work family. They keep their wire shape and
+  stay unfenced for an artifact no live claim holds. While a claim is live,
+  the list hides the artifact, and fetch and acknowledge refuse it
+  (`NOT_FOUND`) to anyone without the holder's fence. An unfenced
+  acknowledge of an artifact whose claim lapsed closes the work, and that
+  claim's fence can no longer acknowledge. During a rolling deploy a plane
+  that predates the claim does not see it, so exclusive delivery holds once
+  every plane runs a version that does.
+- A claim lapses at its expiry and any eligible claimer may take the
+  artifact again at a higher generation. Reclaims are not limited: the
+  artifact's retention bounds them.
+- A definition may name a delivery Source with `delivery_source_id`
+  ([ADR 0148](decisions/0148-sources-and-one-connector-runtime.md)). Saving
+  it needs that Source to be active and of a type that delivers
+  (`FAILED_PRECONDITION` otherwise). Its artifacts then go only to a runtime
+  whose registered labels satisfy the Source's placement, while the Source
+  is active: other claimers neither list nor claim them, the deprecated
+  list leaves them out, and an unfenced fetch or acknowledge refuses them
+  (`NOT_FOUND`). Disabling or re-placing the Source also ends a claim
+  already taken: its heartbeat fails as a lost fence and its fenced fetch
+  is refused. A runtime lists only such artifacts, of the types it
+  delivers through, with `ExportDeliveryWorkOptions`, so artifacts left to
+  other deliverers never fill its page. The connector runtime claims them,
+  fetches under the fence, verifies the digest, and delivers through the
+  Source with the credential bound in the runtime. The Source is read from the definition as
+  it stands at delivery time.
+- A `relational` Source delivers into its `delivery_table` (`table` or
+  `schema.table`, folded to lower case as unquoted names are) in
+  PostgreSQL, over TLS that verifies the server against
+  the system roots and the runtime's optional `relational_ca_file`. Each
+  artifact is one row: `receipt_id` (unique text), `namespace`,
+  `definition_id`, `content_digest` (text) and `content` (bytea), inserted
+  with `ON CONFLICT (receipt_id) DO NOTHING`. A redelivery after a crash or
+  takeover is a replay. A row already there with another digest fails the
+  delivery as `invalid` and is not overwritten. A Source without a
+  `delivery_table` fails deliveries as `invalid`.
+- `AckWork` with outcome `failed` and a failure class as `reason`
+  (`unavailable`, `unreachable`, `auth_failed`, `permission_missing`,
+  `invalid` or `unsupported`) records a failed delivery under a live fence.
+  It keeps the bytes and the claim, which lapses, so the artifact is tried
+  again a lease later until it expires. Every acknowledged delivery, failed
+  or completed, lands in the delivery Source's `delivery` health.

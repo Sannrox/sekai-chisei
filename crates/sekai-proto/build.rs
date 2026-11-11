@@ -22,6 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .generate_default_stubs(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        // Nested inputs of stable RPCs on the HTTP/JSON projection: proto3
+        // JSON may omit any default-valued field, and the projection only
+        // fills defaults for the top-level request (#2266).
+        .type_attribute("sekai.GovernedDocumentAdmission", "#[serde(default)]")
+        .type_attribute("sekai.DocumentRenditionAttachment", "#[serde(default)]")
+        .type_attribute("sekai.ContentReference", "#[serde(default)]")
         // Generated messages may gain fields. Downstream constructs them with
         // `..Default::default()` so a new field stays additive.
         //
@@ -40,10 +46,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "#[serde(default)]",
         )
         .field_attribute(
+            "sekai.CreateDefinitionProposalRequest.dataset_proposals",
+            "#[serde(default)]",
+        )
+        // Omitted when empty, so a v1 proposal serializes as before (#2222).
+        .field_attribute(
+            "sekai.DefinitionProposal.dataset_proposals",
+            "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]",
+        )
+        .field_attribute(
             "sekai.DefinitionConsumerImpactPath.blocking",
             "#[serde(default)]",
         )
         .field_attribute("sekai.ExportDefinition.every_ms", "#[serde(default)]")
+        .field_attribute("sekai.SourceBatch.source_id", "#[serde(default)]")
+        .field_attribute(
+            "sekai.ExportDefinition.delivery_source_id",
+            "#[serde(default)]",
+        )
+        .field_attribute(
+            "sekai.DeliverableExportArtifact.delivery_source_id",
+            "#[serde(default)]",
+        )
         .field_attribute(
             "sekai.ObjectSetDescriptor.property_filters",
             "#[serde(default)]",

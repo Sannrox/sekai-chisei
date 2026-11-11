@@ -4,6 +4,7 @@
 #
 #   bash scripts/postgres-conformance.sh            # Docker (CI default)
 #   SEKAI_CONTAINER_CLI=container bash scripts/postgres-conformance.sh   # Apple container
+#   bash scripts/postgres-conformance.sh <command> [args...]   # run <command> instead
 #
 # Overrides: SEKAI_TEST_POSTGRES_PORT, SEKAI_TEST_POSTGRES_IMAGE.
 set -euo pipefail
@@ -134,6 +135,15 @@ base="postgresql://sekai:${POSTGRES_PASSWORD}@localhost:${POSTGRES_PORT}"
 export SEKAI_TEST_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt"
 export SEKAI_POSTGRES_CA_CERT="$CERTIFICATE_DIR/ca.crt"
 
+# With arguments, run that command against the empty sekai_lib and
+# sekai_lib_chisei databases instead of the test suites (the N-1 upgrade gate).
+if [ "$#" -gt 0 ]; then
+  status=0
+  SEKAI_DATABASE_URL="$base/sekai_lib" CHISEI_DATABASE_URL="$base/sekai_lib_chisei" \
+    "$@" || status=$?
+  exit "$status"
+fi
+
 # Self-contained conformance files compile in the grouped `it` target (#1308).
 # Filters match the former binary names so ignored postgres cases still run.
 status=0
@@ -152,4 +162,7 @@ SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
 SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
   cargo test --locked -p chisei-core --lib -- --ignored --test-threads=1 postgres || status=$?
+# The connector runtime's relational type delivers into a table of its own.
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+  cargo test --locked -p sekai-connector-runtime --lib -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

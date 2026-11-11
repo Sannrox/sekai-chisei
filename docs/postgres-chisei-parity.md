@@ -62,12 +62,13 @@ Tenant state, OIDC and OAuth are not Sekai-owned on any backend (ADR 0099,
 
 - Host-local permit verification crypto (`verify_for_executor`) — never a
   control-plane dual-backend claim
-- `PlanExecution` and `PlanContentExecution` fail closed on PostgreSQL:
-  both persist the plan through `put_operation_receipt_with_kioku_holdouts`,
-  which the community PostgreSQL store rejects even with an empty holdout
-  list. This is a public planning limitation, not a shrink-only helper.
+- Kioku memory retrieval for `PlanExecution` context is SQLite-only. On
+  PostgreSQL the memory step is skipped with its reason, and the run goes on
+  without memory context.
 - Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
-  Chisei stores on one connection and stays fail-closed on PostgreSQL
+  Chisei stores on one connection. On PostgreSQL the reconciler does not run:
+  boot logs one warning, and external-action redemptions raise no
+  missing-evidence alerts.
 
 ## Operator posture
 
@@ -78,6 +79,6 @@ community choice. Combined PostgreSQL opens `SEKAI_DATABASE_URL` +
 dual-backend budget reserve/usage, limit projection, policy, execution
 storage, Kioku, permit redeem/reconcile, and gateway governance (see
 [configuration.md](configuration.md) and #238). `PlanExecution` and
-`PlanContentExecution` fail closed on PostgreSQL until receipt persist with
-Kioku holdouts lands. Remaining shrink-only admin projections
+`PlanContentExecution` persist their receipt, chain entry, and Kioku holdouts
+in one transaction on both backends (#2263). Remaining shrink-only admin projections
 (`admin.data-quality`, `admin.learning-change`) also fail closed.

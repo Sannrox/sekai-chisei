@@ -1,5 +1,5 @@
+use crate::db::sqlite_manager::SqliteConnectionManager;
 use r2d2::{CustomizeConnection, Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::RefCell;
@@ -409,6 +409,8 @@ impl SekaiDb {
         self.migrate_agent_turns()?;
         self.migrate_agent_wake_cursors()?;
         self.migrate_ontology_health_trends()?;
+        self.migrate_ontology_health_schedules()?;
+        self.migrate_sources()?;
         self.migrate_catalog_criticality_outbox()?;
         Ok(())
     }

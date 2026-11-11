@@ -385,6 +385,7 @@ fn to_proto_batch(batch: DomainBatch) -> SourceBatch {
             })
             .collect(),
         delivery: None,
+        source_id: String::new(),
     }
 }
 

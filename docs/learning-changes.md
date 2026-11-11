@@ -10,11 +10,18 @@ A recorded learning candidate is not adoption. Activation requires a
 digests. Approval and activation are explicit. Rollback supersedes history and
 does not rewrite the source learning object.
 
+Whoever proposed the change cannot approve it, nor can the actor whose
+latest re-proposal bound the current candidate. The refusal is recorded as a
+`denied` `learning.change_approve` decision. `--actor` defaults to `operator`,
+so name a second principal when approving. The `root` and `local` operator
+identities are exempt, as they are for definition proposals.
+
 ```text
 sekaictl admin learning propose --namespace payments --learning-id learning-1 \
   --evidence-digest sha256:...
 sekaictl admin learning inspect --namespace payments --learning-id learning-1
-sekaictl admin learning approve --namespace payments --learning-id learning-1
+sekaictl admin learning approve --namespace payments --learning-id learning-1 \
+  --actor reviewer
 sekaictl admin learning activate --namespace payments --learning-id learning-1
 sekaictl admin learning rollback --namespace payments --learning-id learning-1
 ```
@@ -35,7 +42,8 @@ activate it, then pass the approved digest on the next plan:
 ```text
 sekaictl admin learning propose --namespace payments --learning-id learning-1 \
   --evidence-digest sha256:<verification-evidence>
-sekaictl admin learning approve  --namespace payments --learning-id learning-1
+sekaictl admin learning approve  --namespace payments --learning-id learning-1 \
+  --actor reviewer
 sekaictl admin learning activate --namespace payments --learning-id learning-1
 ```
 

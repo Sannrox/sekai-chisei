@@ -560,6 +560,8 @@ impl SekaiDb {
             );
             CREATE INDEX IF NOT EXISTS idx_action_instances_ns
                 ON sekai_action_instances(namespace, created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_action_instances_ns_status
+                ON sekai_action_instances(namespace, status, created_at_ms DESC, instance_id DESC);
             CREATE INDEX IF NOT EXISTS idx_action_instances_op
                 ON sekai_action_instances(operation_id);
             CREATE INDEX IF NOT EXISTS idx_action_instances_type

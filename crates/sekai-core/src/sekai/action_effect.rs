@@ -13,6 +13,7 @@ use crate::sekai::parked_work::{
     ParkedWorkResolutionInput, ResolutionResult, canonical_json, sha256_digest,
     validate_checkpoint_tuple, validate_reason, validate_request_id,
 };
+use crate::sekai::work_claim::{ClaimError, ClaimRecord, Fence, Hold};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -476,16 +477,183 @@ impl ActionEffect {
     }
 
     pub fn is_claimable_at(&self, now_ms: i64) -> bool {
+        self.claim_record().is_takeable(self.hold(), 0, now_ms)
+    }
+
+    /// The effect's claim state, for the claim engine (ADR 0149).
+    pub fn claim_record(&self) -> ClaimRecord {
+        ClaimRecord {
+            owner: self.claim_owner.clone(),
+            generation: i64::try_from(self.claim_generation).unwrap_or(i64::MAX),
+            fencing_token: self.claim_fencing_token.clone(),
+            expires_at_ms: self.claim_expires_at_ms,
+            lease_expiries: i64::from(self.lease_expiry_count),
+        }
+    }
+
+    fn set_claim_record(&mut self, record: ClaimRecord) {
+        self.claim_owner = record.owner;
+        self.claim_generation = u64::try_from(record.generation).unwrap_or_default();
+        self.claim_fencing_token = record.fencing_token;
+        self.claim_expires_at_ms = record.expires_at_ms;
+        self.lease_expiry_count = u32::try_from(record.lease_expiries).unwrap_or(u32::MAX);
+    }
+
+    /// What the effect's lifecycle means for its claim. Only
+    /// `runtime_dispatch` is claimable; a claimed effect without an expiry
+    /// never was.
+    pub fn hold(&self) -> Hold {
         if self.kind != EFFECT_KIND_RUNTIME_DISPATCH {
-            return false;
+            return Hold::Closed;
         }
         match self.effective_lifecycle_state() {
-            EFFECT_LIFECYCLE_READY => true,
-            EFFECT_LIFECYCLE_CLAIMED => {
-                self.claim_expires_at_ms > 0 && self.claim_expires_at_ms <= now_ms
-            }
-            _ => false,
+            EFFECT_LIFECYCLE_READY => Hold::Open,
+            EFFECT_LIFECYCLE_CLAIMED if self.claim_expires_at_ms > 0 => Hold::Held,
+            _ => Hold::Closed,
         }
+    }
+
+    /// Decides a claim of the loaded effect for `runtime_id` under the
+    /// request `request_id`, with `ttl_ms` already normalized. Both stores
+    /// call it inside their claim transaction and persist on
+    /// [`ClaimStep::Granted`] and [`ClaimStep::DeadLettered`].
+    pub fn take_claim(
+        &mut self,
+        runtime_id: &str,
+        request_id: &str,
+        principal: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<ClaimStep, String> {
+        let legacy_replay = self.claim_expires_at_ms > now_ms
+            && self.legacy_claim_replay_matches(runtime_id, request_id);
+        if !legacy_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("request_id", request_id)?;
+        }
+        if self.kind != EFFECT_KIND_RUNTIME_DISPATCH {
+            return Err("only runtime_dispatch effects are claimable".into());
+        }
+        // Idempotent claim replay for the same owner and request.
+        if self.status == EFFECT_STATUS_CLAIMED
+            && self.claim_owner == runtime_id
+            && self.claim_request_id == request_id
+            && self.claim_expires_at_ms > now_ms
+        {
+            return Ok(ClaimStep::Replay);
+        }
+        let mut record = self.claim_record();
+        match record.count_lapse(self.hold(), i64::from(self.max_lease_expiries), now_ms) {
+            Ok(_) => {}
+            Err(ClaimError::Held) => {
+                return Err(format!("effect already claimed by {}", self.claim_owner));
+            }
+            Err(ClaimError::LeaseLimit) => {
+                self.set_claim_record(record);
+                return Ok(self.dead_letter(
+                    "lease_expiry_limit_exceeded",
+                    "lease expiry retry limit exceeded; effect dead-lettered",
+                    now_ms,
+                ));
+            }
+            Err(_) => return Err(format!("effect not claimable in status {}", self.status)),
+        }
+        self.set_claim_record(record);
+        if self.max_claim_attempts > 0 && self.claim_attempt_count >= self.max_claim_attempts {
+            return Ok(self.dead_letter(
+                "claim_attempt_limit_exceeded",
+                "claim retry limit exceeded; effect dead-lettered",
+                now_ms,
+            ));
+        }
+        let mut record = self.claim_record();
+        record.grant(runtime_id, ttl_ms, now_ms, |generation| {
+            fencing_token(
+                &self.effect_id,
+                u64::try_from(generation).unwrap_or_default(),
+                runtime_id,
+            )
+        });
+        self.set_claim_record(record);
+        self.status = EFFECT_STATUS_CLAIMED.into();
+        self.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
+        self.claim_attempt_count = self.claim_attempt_count.saturating_add(1);
+        self.claim_request_id = request_id.into();
+        self.claim_principal = principal.into();
+        self.updated_at_ms = now_ms;
+        self.failure_reason.clear();
+        Ok(ClaimStep::Granted)
+    }
+
+    fn dead_letter(&mut self, reason: &str, message: &str, now_ms: i64) -> ClaimStep {
+        self.status = EFFECT_STATUS_DEAD_LETTERED.into();
+        self.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
+        self.failure_reason = reason.into();
+        self.updated_at_ms = now_ms;
+        ClaimStep::DeadLettered(message.into())
+    }
+
+    /// Extends the live claim of the loaded effect; `ttl_ms` is already
+    /// normalized.
+    pub fn heartbeat_claim(
+        &mut self,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token_in: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        if !self.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
+        }
+        self.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
+        self.claim_expires_at_ms = now_ms.saturating_add(ttl_ms);
+        self.updated_at_ms = now_ms;
+        Ok(())
+    }
+
+    /// Decides a `completed` or `failed` acknowledge of the loaded effect,
+    /// after [`validate_ack_outcome`]. [`AckStep::Replay`] is a retry of the
+    /// stored outcome and writes nothing.
+    pub fn ack_claim(
+        &mut self,
+        runtime_id: &str,
+        generation: u64,
+        fencing_token_in: &str,
+        outcome: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<AckStep, String> {
+        let (status, lifecycle) = match outcome {
+            ACK_OUTCOME_COMPLETED => (EFFECT_STATUS_COMPLETED, EFFECT_LIFECYCLE_COMPLETED),
+            ACK_OUTCOME_FAILED => (EFFECT_STATUS_FAILED, EFFECT_LIFECYCLE_FAILED),
+            other => {
+                return Err(format!(
+                    "invalid ack outcome {other:?}; parked requires park_action_work"
+                ));
+            }
+        };
+        if self.kind != EFFECT_KIND_RUNTIME_DISPATCH {
+            return Err("only runtime_dispatch effects support ack".into());
+        }
+        let legacy_ack_replay = self.legacy_claim_fence_matches(runtime_id, fencing_token_in)
+            || (self.status == status
+                && self.legacy_claim_terminal_replay_matches(runtime_id, fencing_token_in));
+        if !legacy_ack_replay {
+            validate_no_nul("runtime_id", runtime_id)?;
+            validate_no_nul("fencing_token", fencing_token_in)?;
+        }
+        // Terminal already with the same outcome: idempotent.
+        if self.status == status {
+            return Ok(AckStep::Replay);
+        }
+        self.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
+        self.status = status.into();
+        self.lifecycle_state = lifecycle.into();
+        self.failure_reason = reason.to_string();
+        self.updated_at_ms = now_ms;
+        Ok(AckStep::Apply)
     }
 
     pub fn effective_lifecycle_state(&self) -> &str {
@@ -521,17 +689,49 @@ impl ActionEffect {
         if self.claim_expires_at_ms <= now_ms {
             return Err("claim lease expired".into());
         }
-        if !self.fence_matches(owner, generation, fencing_token) {
-            return Err("fencing token or generation mismatch".into());
-        }
-        Ok(())
+        self.claim_record()
+            .require_live(
+                self.hold(),
+                claim_fence(owner, generation, fencing_token),
+                now_ms,
+            )
+            .map_err(|_| "fencing token or generation mismatch".to_string())
     }
 
     pub fn fence_matches(&self, owner: &str, generation: u64, fencing_token: &str) -> bool {
-        self.claim_owner == owner
-            && self.claim_generation == generation
-            && self.claim_fencing_token == fencing_token
-            && !self.claim_fencing_token.is_empty()
+        self.claim_record()
+            .matches(claim_fence(owner, generation, fencing_token))
+    }
+}
+
+/// What [`ActionEffect::take_claim`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClaimStep {
+    /// The same owner and request already hold the live claim.
+    Replay,
+    /// The claim is granted; persist the effect.
+    Granted,
+    /// A retry limit is exhausted; persist the effect, then fail the call
+    /// with the message.
+    DeadLettered(String),
+}
+
+/// What [`ActionEffect::ack_claim`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AckStep {
+    Replay,
+    Apply,
+}
+
+/// An Action fence as the engine sees it. Generations above `i64::MAX`
+/// never match.
+fn claim_fence<'a>(owner: &'a str, generation: u64, token: &'a str) -> Fence<'a> {
+    Fence {
+        owner,
+        generation: i64::try_from(generation).unwrap_or(-1),
+        token,
     }
 }
 
@@ -546,7 +746,38 @@ fn fencing_token(effect_id: &str, generation: u64, owner: &str) -> String {
     format!("fx-{:x}", hasher.finalize())
 }
 
-fn normalize_ttl_ms(ttl_ms: i64) -> Result<i64, String> {
+/// Checks a claim request before the effect is read, and returns its
+/// normalized TTL. Both stores use it.
+pub(crate) fn validate_claim_request(
+    runtime_id: &str,
+    request_id: &str,
+    ttl_ms: i64,
+) -> Result<i64, String> {
+    if runtime_id_is_blank(runtime_id) {
+        return Err("runtime_id required".into());
+    }
+    if request_id.trim().is_empty() {
+        return Err("request_id required".into());
+    }
+    if request_id.chars().any(char::is_whitespace) {
+        return Err("request_id must not contain whitespace".into());
+    }
+    normalize_ttl_ms(ttl_ms)
+}
+
+/// Checks an acknowledge before the effect is read. Both stores use it.
+pub(crate) fn validate_ack_outcome(outcome: &str, reason: &str) -> Result<(), String> {
+    validate_no_nul("reason", reason)?;
+    if outcome != ACK_OUTCOME_COMPLETED && outcome != ACK_OUTCOME_FAILED {
+        return Err(format!(
+            "invalid ack outcome {outcome:?}; parked requires park_action_work"
+        ));
+    }
+    Ok(())
+}
+
+/// The Action claim TTL: 60 s by default, at most 24 h. Both stores use it.
+pub(crate) fn normalize_ttl_ms(ttl_ms: i64) -> Result<i64, String> {
     let ttl = if ttl_ms <= 0 {
         DEFAULT_CLAIM_TTL_MS
     } else {
@@ -1270,78 +1501,19 @@ impl SekaiDb {
         ttl_ms: i64,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        if runtime_id_is_blank(runtime_id) {
-            return Err("runtime_id required".into());
-        }
-        if request_id.trim().is_empty() {
-            return Err("request_id required".into());
-        }
-        if request_id.chars().any(char::is_whitespace) {
-            return Err("request_id must not contain whitespace".into());
-        }
-        let ttl = normalize_ttl_ms(ttl_ms)?;
+        let ttl = validate_claim_request(runtime_id, request_id, ttl_ms)?;
         // Single-writer style: read, decide, write (same as other SQLite SoR paths).
         let mut effect = self
             .get_action_effect(effect_id)?
             .ok_or_else(|| "action effect not found".to_string())?;
-        let legacy_replay = effect.claim_expires_at_ms > now_ms
-            && effect.legacy_claim_replay_matches(runtime_id, request_id);
-        if !legacy_replay {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("request_id", request_id)?;
-        }
-        if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
-            return Err("only runtime_dispatch effects are claimable".into());
-        }
-        // Idempotent claim replay for same owner + request_id.
-        if effect.status == EFFECT_STATUS_CLAIMED
-            && effect.claim_owner == runtime_id
-            && effect.claim_request_id == request_id
-            && effect.claim_expires_at_ms > now_ms
-        {
-            return Ok(effect);
-        }
-        if !effect.is_claimable_at(now_ms) {
-            if effect.status == EFFECT_STATUS_CLAIMED && effect.claim_expires_at_ms > now_ms {
-                return Err(format!("effect already claimed by {}", effect.claim_owner));
-            }
-            return Err(format!("effect not claimable in status {}", effect.status));
-        }
-        if effect.status == EFFECT_STATUS_CLAIMED && effect.claim_expires_at_ms <= now_ms {
-            effect.lease_expiry_count = effect.lease_expiry_count.saturating_add(1);
-            if effect.max_lease_expiries > 0
-                && effect.lease_expiry_count >= effect.max_lease_expiries
-            {
-                effect.status = EFFECT_STATUS_DEAD_LETTERED.into();
-                effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
-                effect.failure_reason = "lease_expiry_limit_exceeded".into();
-                effect.updated_at_ms = now_ms;
+        match effect.take_claim(runtime_id, request_id, principal, ttl, now_ms)? {
+            ClaimStep::Replay => Ok(effect),
+            ClaimStep::Granted => self.update_action_effect_lifecycle(&effect),
+            ClaimStep::DeadLettered(message) => {
                 self.update_action_effect_lifecycle(&effect)?;
-                return Err("lease expiry retry limit exceeded; effect dead-lettered".into());
+                Err(message)
             }
         }
-        if effect.max_claim_attempts > 0 && effect.claim_attempt_count >= effect.max_claim_attempts
-        {
-            effect.status = EFFECT_STATUS_DEAD_LETTERED.into();
-            effect.lifecycle_state = EFFECT_LIFECYCLE_DEAD_LETTERED.into();
-            effect.failure_reason = "claim_attempt_limit_exceeded".into();
-            effect.updated_at_ms = now_ms;
-            self.update_action_effect_lifecycle(&effect)?;
-            return Err("claim retry limit exceeded; effect dead-lettered".into());
-        }
-        let generation = effect.claim_generation.saturating_add(1).max(1);
-        effect.status = EFFECT_STATUS_CLAIMED.into();
-        effect.lifecycle_state = EFFECT_LIFECYCLE_CLAIMED.into();
-        effect.claim_attempt_count = effect.claim_attempt_count.saturating_add(1);
-        effect.claim_owner = runtime_id.into();
-        effect.claim_generation = generation;
-        effect.claim_fencing_token = fencing_token(effect_id, generation, runtime_id);
-        effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
-        effect.claim_request_id = request_id.into();
-        effect.claim_principal = principal.into();
-        effect.updated_at_ms = now_ms;
-        effect.failure_reason.clear();
-        self.update_action_effect_lifecycle(&effect)
     }
 
     pub fn heartbeat_action_claim(
@@ -1357,13 +1529,7 @@ impl SekaiDb {
         let mut effect = self
             .get_action_effect(effect_id)?
             .ok_or_else(|| "action effect not found".to_string())?;
-        if !effect.legacy_claim_fence_matches(runtime_id, fencing_token_in) {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("fencing_token", fencing_token_in)?;
-        }
-        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
-        effect.claim_expires_at_ms = now_ms.saturating_add(ttl);
-        effect.updated_at_ms = now_ms;
+        effect.heartbeat_claim(runtime_id, generation, fencing_token_in, ttl, now_ms)?;
         self.update_action_effect_lifecycle(&effect)
     }
 
@@ -1378,45 +1544,21 @@ impl SekaiDb {
         reason: &str,
         now_ms: i64,
     ) -> Result<ActionEffect, String> {
-        validate_no_nul("reason", reason)?;
-        let status = match outcome {
-            ACK_OUTCOME_COMPLETED => EFFECT_STATUS_COMPLETED,
-            ACK_OUTCOME_FAILED => EFFECT_STATUS_FAILED,
-            other => {
-                return Err(format!(
-                    "invalid ack outcome {other:?}; parked requires park_action_work"
-                ));
-            }
-        };
+        validate_ack_outcome(outcome, reason)?;
         let mut effect = self
             .get_action_effect(effect_id)?
             .ok_or_else(|| "action effect not found".to_string())?;
-        if effect.kind != EFFECT_KIND_RUNTIME_DISPATCH {
-            return Err("only runtime_dispatch effects support ack".into());
+        match effect.ack_claim(
+            runtime_id,
+            generation,
+            fencing_token_in,
+            outcome,
+            reason,
+            now_ms,
+        )? {
+            AckStep::Replay => Ok(effect),
+            AckStep::Apply => self.update_action_effect_lifecycle(&effect),
         }
-        let legacy_ack_replay = effect.legacy_claim_fence_matches(runtime_id, fencing_token_in)
-            || (effect.status == status
-                && effect.legacy_claim_terminal_replay_matches(runtime_id, fencing_token_in));
-        if !legacy_ack_replay {
-            validate_no_nul("runtime_id", runtime_id)?;
-            validate_no_nul("fencing_token", fencing_token_in)?;
-        }
-        // Terminal already with same outcome: idempotent.
-        if effect.status == status {
-            return Ok(effect);
-        }
-        effect.require_live_fence(runtime_id, generation, fencing_token_in, now_ms)?;
-        effect.status = status.into();
-        effect.lifecycle_state = match status {
-            EFFECT_STATUS_COMPLETED => EFFECT_LIFECYCLE_COMPLETED,
-            EFFECT_STATUS_FAILED => EFFECT_LIFECYCLE_FAILED,
-            EFFECT_STATUS_PARKED => EFFECT_LIFECYCLE_AWAITING_CONTINUATION,
-            _ => status,
-        }
-        .into();
-        effect.failure_reason = reason.to_string();
-        effect.updated_at_ms = now_ms;
-        self.update_action_effect_lifecycle(&effect)
     }
 
     #[allow(clippy::too_many_arguments)]

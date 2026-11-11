@@ -473,7 +473,7 @@ changed-member admin.
 ### Hybrid search tool
 
 `tools/list` also returns `sekai.search.query` → `Search` (#1683), whose RPC
-stays `experimental` and gated by `SEKAI_EXPERIMENTAL_RPCS`. The call binds the
+is `stable` (#2243). The call binds the
 session namespace, searches objects only, and runs hybrid unless `input.mode`
 is `text`. Only `text`, `kinds`, `page_size`, `page_token`, `text_weight` and
 `vector_weight` cross the adapter. It returns object references (type, id,

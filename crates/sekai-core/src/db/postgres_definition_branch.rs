@@ -12,15 +12,15 @@ use crate::sekai::definition_branch::{
 };
 use crate::sekai::definition_proposal::{
     ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    DefinitionProposal, DefinitionProposalApproval, DefinitionProposalMergeResult,
-    MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput,
-    ProposeDefinitionImport, ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
-    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
-    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
-    list_published_definition_history, merge_receipt_id, object_property_keys,
-    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
-    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
-    rollback_member_edits,
+    DatasetProposalAttachment, DefinitionMergePath, DefinitionProposal, DefinitionProposalApproval,
+    DefinitionProposalMergeResult, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
+    PreparedProposalDigestInput, ProposeDefinitionImport, ProposeDefinitionRollback,
+    PublishedDefinitionHistoryStore, PublishedDefinitionRevisionHistoryEntry, ReplacementProposal,
+    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, dataset_column_names,
+    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
+    object_property_keys, proposal_content_digest, reject_foreign_member_grants,
+    require_descendant_candidate, require_rollback_migration_plan,
+    rollback_may_drop_live_object_type_properties, rollback_member_edits,
 };
 
 impl PostgresDb {
@@ -315,6 +315,26 @@ impl PostgresDb {
         load_proposal_postgres(&mut *self.connection()?, namespace, proposal_id)
     }
 
+    /// Open proposals of `namespace`, newest first (#2203).
+    pub fn list_open_definition_proposals(
+        &self,
+        namespace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DefinitionProposal>, String> {
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_definition_proposals
+                 WHERE namespace = $1 AND status = $2
+                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT $3 OFFSET $4",
+                &[&namespace, &STATUS_OPEN, &(limit as i64), &(offset as i64)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| crate::db::definition_branch::decode_proposal(row.get(0)))
+            .collect()
+    }
+
     pub fn propose_definition_import(
         &self,
         request: &ProposeDefinitionImport,
@@ -541,8 +561,8 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
-        let (eval_plan_digests, named_foreign_digests, proposal_digest, request_digest) =
-            request.prepare()?;
+        let prepared = request.prepare()?;
+        let request_digest = prepared.request_digest;
         validate_write_context(actor, now_ms)?;
         let mut connection = self.connection()?;
         let mut transaction = connection
@@ -599,17 +619,28 @@ impl PostgresDb {
         .ok_or_else(|| {
             "definition_revision_not_found: candidate revision is unavailable".to_string()
         })?;
-        reject_foreign_member_grants(&candidate, &named_foreign_digests)?;
-        let proposal = DefinitionProposal {
-            contract_version: PROPOSAL_CONTRACT_VERSION.into(),
+        reject_foreign_member_grants(&candidate, &prepared.named_foreign_digests)?;
+        let mut dataset_proposals = Vec::with_capacity(prepared.dataset_proposals.len());
+        for reference in &prepared.dataset_proposals {
+            let proposal = crate::db::postgres_dataset_branch::load_proposal(
+                &mut transaction,
+                &reference.dataset_id,
+                &reference.proposal_id,
+                false,
+            )
+            .map_err(crate::db::definition_branch::not_found_as_unattachable)?;
+            dataset_proposals.push(DatasetProposalAttachment::pin(&proposal, &request.tenant)?);
+        }
+        let mut proposal = DefinitionProposal {
+            contract_version: DefinitionProposal::contract_version_for(&dataset_proposals).into(),
             namespace: request.namespace.clone(),
             branch_id: request.branch_id.clone(),
             proposal_id: request.proposal_id.clone(),
             base_digest: request.base_digest.clone(),
             candidate_digest: request.candidate_digest.clone(),
-            proposal_digest,
-            eval_plan_digests,
-            named_foreign_digests,
+            proposal_digest: String::new(),
+            eval_plan_digests: prepared.eval_plan_digests,
+            named_foreign_digests: prepared.named_foreign_digests,
             approvals: Vec::new(),
             status: STATUS_OPEN.into(),
             created_by: actor.into(),
@@ -622,7 +653,9 @@ impl PostgresDb {
             major_revision: request.major_revision,
             source_package_digest: String::new(),
             source_commit: String::new(),
+            dataset_proposals,
         };
+        proposal.proposal_digest = proposal.content_digest()?;
         insert_proposal_postgres(&mut transaction, &proposal)?;
         let result = DefinitionWriteResult::CreateProposal {
             proposal: proposal.clone(),
@@ -701,9 +734,22 @@ impl PostgresDb {
         Ok(result)
     }
 
+    /// Merges a proposal on the direct path, as `MergeDefinitionProposal` does.
     pub fn merge_definition_proposal(
         &self,
         request: &MergeDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        self.merge_definition_proposal_via(request, DefinitionMergePath::Direct, actor, now_ms)
+    }
+
+    /// Merges a proposal for `path`: only `BundleApply` publishes a
+    /// change-bundle proposal (`DefinitionProposal::require_merge_path`).
+    pub fn merge_definition_proposal_via(
+        &self,
+        request: &MergeDefinitionProposal,
+        path: DefinitionMergePath,
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
@@ -752,6 +798,7 @@ impl PostgresDb {
                     "definition_proposal_not_found: proposal is unavailable".to_string()
                 })?;
         proposal.require_open()?;
+        proposal.require_merge_path(path)?;
         if proposal.approvals.is_empty() {
             return Err(
                 "definition_proposal_missing_approval: merge requires a live approval".into(),
@@ -809,6 +856,20 @@ impl PostgresDb {
                     crate::sekai::definition_proposal::MERGE_DATASET_MOVED
                 ));
             }
+        }
+        // Attached dataset proposals (#2199): each dataset's rows lock, taken
+        // in dataset-id order, holds its writers off until the publish
+        // commits. A proposal never carries both these and bundle versions.
+        for attachment in &proposal.dataset_proposals {
+            crate::db::postgres::lock_dataset_rows(&mut transaction, &attachment.dataset_id)?;
+            let dataset_proposal = crate::db::postgres_dataset_branch::load_proposal(
+                &mut transaction,
+                &attachment.dataset_id,
+                &attachment.proposal_id,
+                false,
+            )
+            .map_err(|error| attachment.stale_or(error))?;
+            attachment.recheck(&dataset_proposal, actor)?;
         }
         // The binding lock, which registration takes too, holds a concurrent
         // registration off until the publish, including for a binding that
@@ -943,15 +1004,19 @@ impl PostgresDb {
             baseline.as_ref(),
             now_ms,
         )?;
-        let receipt_id = merge_receipt_id(
-            &proposal.namespace,
-            &proposal.proposal_id,
-            &proposal.proposal_digest,
-            &proposal.base_digest,
-            &proposal.candidate_digest,
-            &published,
-            &proposal.restored_from_digest,
-        )?;
+        // Every gate passed: land the attached data, then publish. Any error
+        // rolls the whole transaction back.
+        let mut dataset_receipt_ids = Vec::with_capacity(proposal.dataset_proposals.len());
+        for attachment in &proposal.dataset_proposals {
+            let merged = crate::db::postgres_dataset_branch::merge_dataset_branch_pg(
+                &mut transaction,
+                &crate::db::definition_branch::attached_dataset_merge(&proposal, attachment),
+                &|_| Ok(()),
+            )
+            .map_err(|error| attachment.stale_or(error))?;
+            dataset_receipt_ids.push(merged.receipt_id);
+        }
+        let receipt_id = merge_receipt_id(&proposal, &published, &dataset_receipt_ids)?;
         let published_revision = mark_revision_published_postgres(&mut transaction, &candidate)?;
         write_published_head_postgres(
             &mut transaction,
@@ -1305,13 +1370,7 @@ fn load_proposal_postgres(
             &[&namespace, &proposal_id],
         )
         .map_err(|error| error.to_string())?
-        .map(|row| {
-            let body: String = row.get(0);
-            let proposal: DefinitionProposal = serde_json::from_str(&body)
-                .map_err(|error| format!("corrupt definition proposal: {error}"))?;
-            proposal.verify()?;
-            Ok(proposal)
-        })
+        .map(|row| crate::db::definition_branch::decode_proposal(row.get(0)))
         .transpose()
 }
 
@@ -1393,6 +1452,7 @@ fn open_replacement_proposal_postgres(
         major_revision: false,
         source_package_digest: replacement.source_package_digest,
         source_commit: replacement.source_commit,
+        dataset_proposals: &[],
     })?;
     let proposal = DefinitionProposal {
         contract_version: PROPOSAL_CONTRACT_VERSION.into(),
@@ -1416,6 +1476,7 @@ fn open_replacement_proposal_postgres(
         major_revision: false,
         source_package_digest: replacement.source_package_digest.into(),
         source_commit: replacement.source_commit.into(),
+        dataset_proposals: Vec::new(),
     };
     insert_proposal_postgres(transaction, &proposal)?;
     Ok(proposal)

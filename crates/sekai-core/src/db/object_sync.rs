@@ -1635,6 +1635,30 @@ impl SekaiDb {
         }))
     }
 
+    /// Up to `limit` source identities `(source_instance, type_digest)` bound
+    /// in `namespace`, ordered, each once: the sources `get_source_sync_state`
+    /// can read there.
+    pub fn list_source_identities(
+        &self,
+        namespace: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT source_instance, type_digest FROM sekai_source_bindings
+                 WHERE namespace=?1 ORDER BY source_instance, type_digest LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(
+                params![namespace, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .and_then(Iterator::collect)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn list_source_batch_transactions(
         &self,
         namespace: &str,

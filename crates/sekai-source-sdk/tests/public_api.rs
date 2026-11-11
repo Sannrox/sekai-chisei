@@ -99,6 +99,7 @@ fn surface_from_source(src_root: &Path) -> Vec<String> {
     for module in [
         "change_capture",
         "conformance",
+        "connector",
         "contract",
         "discover",
         "feed",

@@ -53,7 +53,8 @@ to be computed, and it outlives the text it came from unless it follows edits.
    the feed was purged and forces a rebuild. A page never ends inside a
    mutation, so no mutation is counted twice. A rebuild clears the stored
    spec digest when it resets the index and publishes the new digest only
-   when it completes, so an interrupted rebuild is redone, never trusted.
+   when it completes, so an interrupted rebuild is never trusted as
+   complete (amended by #2244: it resumes from a saved cursor).
    Mutations are identified like the search index does, by object and
    millisecond timestamp; two writes to one object in the same millisecond
    undercount, which can only trigger an unneeded rebuild. Rebuilds walk objects by id
@@ -82,3 +83,22 @@ the compiled read policy before the candidate cap, so recall is 1.0. The
 was rejected for now (no measured need), and so were PostgreSQL-only vectors
 (they leave SQLite without vector search). See
 [search.md](../search.md#hybrid-search).
+
+Amended by #2252: the exact search reads a spec's chunks in pages and keeps
+only its 10,000 nearest objects the read policy admits, so recall is 1.0
+over those. Dropping admitted objects past them does not mark the count a
+lower bound, since that cut precedes the source-value checks. The 10^6-vector budget is the
+maximum supported index size per spec. See
+[search.md](../search.md#query-bounds).
+
+Amended by #2244: an interrupted rebuild resumes instead of starting over.
+The reset that starts a rebuild saves a cursor in the checkpoint (target
+digest, last finished id, and the feed position and generation read at the
+start), and each finished page of 500 ids moves it on in a fenced write. A
+restart toward the same digest skips the finished ids and embeds only
+chunks whose digest is not stored yet. Resuming is itself a fenced write
+that takes the lease and drops the vectors of deleted objects. The cursor is valid only at the
+revision its own plane carried it to, so a put, a delete, or a fenced write
+from a plane that predates the cursor voids it and the next rebuild starts
+over. Spec inputs and index size have upper limits; see
+[search.md](../search.md#embedding-spec-limits).

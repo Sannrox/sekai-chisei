@@ -55,6 +55,8 @@ pub fn migrate_dataset_branches(conn: &rusqlite::Connection) -> Result<(), Strin
         );
         CREATE INDEX IF NOT EXISTS idx_sekai_dataset_branch_proposals_branch
             ON sekai_dataset_branch_proposals(dataset_id, branch, status);
+        CREATE INDEX IF NOT EXISTS idx_sekai_dataset_branch_proposals_open
+            ON sekai_dataset_branch_proposals(tenant, status, created_at_ms DESC, id DESC);
         CREATE TABLE IF NOT EXISTS sekai_transform_replays (
             id TEXT PRIMARY KEY,
             namespace TEXT NOT NULL,
@@ -491,6 +493,48 @@ impl SekaiDb {
         load_proposal(&tx, dataset_id, id)
     }
 
+    /// Open proposals of `tenant`, newest first, each with whether an open
+    /// definition proposal attaches it, so it merges only through that
+    /// proposal (#2203).
+    pub fn list_open_dataset_branch_proposals(
+        &self,
+        tenant: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<(DatasetBranchProposal, bool)>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let keys = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT dataset_id, id FROM sekai_dataset_branch_proposals
+                     WHERE tenant = ?1 AND status = ?2
+                     ORDER BY created_at_ms DESC, id DESC LIMIT ?3 OFFSET ?4",
+                )
+                .map_err(|error| error.to_string())?;
+            stmt.query_map(
+                params![
+                    tenant,
+                    dataset_branch::STATUS_OPEN,
+                    limit as i64,
+                    offset as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?
+        };
+        keys.iter()
+            .map(|(dataset_id, id)| {
+                Ok((
+                    load_proposal(&tx, dataset_id, id)?,
+                    attached_to_open_definition_proposal(&tx, dataset_id, id)?,
+                ))
+            })
+            .collect()
+    }
+
     /// Merge a proposal as exactly one new parent version with a receipt. A
     /// replay of a merged proposal returns it unchanged.
     pub fn merge_dataset_branch(
@@ -509,91 +553,132 @@ impl SekaiDb {
     ) -> Result<DatasetBranchProposal, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let mut proposal = load_proposal(&tx, &request.dataset_id, &request.proposal_id)?;
-        // Another tenant's proposal reads as missing, replay included.
-        if proposal.tenant != request.tenant {
-            return Err(dataset_branch::PROPOSAL_NOT_FOUND.into());
+        // Only an open proposal is held; a merged one still replays.
+        if load_proposal(&tx, &request.dataset_id, &request.proposal_id)
+            .is_ok_and(|proposal| proposal.status == dataset_branch::STATUS_OPEN)
+            && attached_to_open_definition_proposal(&tx, &request.dataset_id, &request.proposal_id)?
+        {
+            return Err(dataset_branch::PROPOSAL_ATTACHED.into());
         }
-        if proposal.status == dataset_branch::STATUS_MERGED {
-            return Ok(proposal);
-        }
-        check_mergeable(&proposal, request)?;
-        if latest_version_id(&tx, &request.dataset_id)? != proposal.parent_version_id {
-            return Err(dataset_branch::PROPOSAL_STALE_PARENT.into());
-        }
-        let branch = load_branch(&tx, &request.dataset_id, &proposal.branch)
-            .map_err(|_| dataset_branch::PROPOSAL_STALE_BRANCH.to_string())?;
-        let head = branch_rows_tx(&tx, &branch)?;
-        if dataset_branch::rows_digest(&head) != proposal.branch_digest {
-            return Err(dataset_branch::PROPOSAL_STALE_BRANCH.into());
-        }
-        let columns: String = tx
-            .query_row(
-                "SELECT columns FROM sekai_datasets WHERE id = ?1",
-                params![request.dataset_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        check(&crate::sekai::dataset::parse_columns(&columns)?)?;
-        tx.execute(
-            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
-            params![request.dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-        for row in &head {
-            tx.execute(
-                "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
-                params![request.dataset_id, encode_row_map(row)?],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        let keys_json: String = tx
-            .query_row(
-                "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
-                params![request.dataset_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        reindex_dataset_partition_keys(
-            &tx,
-            &request.dataset_id,
-            &parse_partition_keys(&keys_json)?,
-        )?;
-        let now = dataset_version::now_ms();
-        mark_consuming_transform_outputs_stale_tx(&tx, &request.dataset_id, &proposal.id, now)?;
-        let version = snapshot_dataset_version_tx(
-            &tx,
-            &request.dataset_id,
-            &request.actor,
-            &request.tenant,
-            &merge_reason(request, &proposal),
-            "",
-            now,
-        )?;
-        proposal.status = dataset_branch::STATUS_MERGED.into();
-        proposal.merged_by = request.actor.clone();
-        proposal.merged_version_id = version.version_id.clone();
-        proposal.receipt_id = dataset_branch::merge_receipt_id(&proposal, &version.version_id);
-        proposal.merged_at_ms = now;
-        tx.execute(
-            "UPDATE sekai_dataset_branch_proposals
-             SET status = ?1, merged_by = ?2, merged_version_id = ?3, receipt_id = ?4,
-                 merged_at_ms = ?5
-             WHERE id = ?6",
-            params![
-                proposal.status,
-                proposal.merged_by,
-                proposal.merged_version_id,
-                proposal.receipt_id,
-                proposal.merged_at_ms,
-                proposal.id
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        drop_branch(&tx, &request.dataset_id, &proposal.branch)?;
+        let proposal = merge_dataset_branch_tx(&tx, request, check)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
+}
+
+/// The merge of [`SekaiDb::merge_dataset_branch_checked`] inside the caller's
+/// transaction, so it can commit together with other writes. The caller owns
+/// `tx`: it commits on success and rolls back on any error, since an error can
+/// follow partial writes. A merged proposal replays without writing.
+pub fn merge_dataset_branch_tx(
+    tx: &Transaction<'_>,
+    request: &MergeDatasetBranch,
+    check: &dyn Fn(&[crate::sekai::dataset::ColumnDef]) -> Result<(), String>,
+) -> Result<DatasetBranchProposal, String> {
+    let mut proposal = load_proposal(tx, &request.dataset_id, &request.proposal_id)?;
+    // Another tenant's proposal reads as missing, replay included.
+    if proposal.tenant != request.tenant {
+        return Err(dataset_branch::PROPOSAL_NOT_FOUND.into());
+    }
+    if proposal.status == dataset_branch::STATUS_MERGED {
+        return Ok(proposal);
+    }
+    check_mergeable(&proposal, request)?;
+    if latest_version_id(tx, &request.dataset_id)? != proposal.parent_version_id {
+        return Err(dataset_branch::PROPOSAL_STALE_PARENT.into());
+    }
+    let branch = load_branch(tx, &request.dataset_id, &proposal.branch)
+        .map_err(|_| dataset_branch::PROPOSAL_STALE_BRANCH.to_string())?;
+    let head = branch_rows_tx(tx, &branch)?;
+    if dataset_branch::rows_digest(&head) != proposal.branch_digest {
+        return Err(dataset_branch::PROPOSAL_STALE_BRANCH.into());
+    }
+    let columns: String = tx
+        .query_row(
+            "SELECT columns FROM sekai_datasets WHERE id = ?1",
+            params![request.dataset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    check(&crate::sekai::dataset::parse_columns(&columns)?)?;
+    tx.execute(
+        "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
+        params![request.dataset_id],
+    )
+    .map_err(|error| error.to_string())?;
+    for row in &head {
+        tx.execute(
+            "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES (?1, ?2)",
+            params![request.dataset_id, encode_row_map(row)?],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let keys_json: String = tx
+        .query_row(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
+            params![request.dataset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    reindex_dataset_partition_keys(tx, &request.dataset_id, &parse_partition_keys(&keys_json)?)?;
+    let now = dataset_version::now_ms();
+    mark_consuming_transform_outputs_stale_tx(tx, &request.dataset_id, &proposal.id, now)?;
+    let version = snapshot_dataset_version_tx(
+        tx,
+        &request.dataset_id,
+        &request.actor,
+        &request.tenant,
+        &merge_reason(request, &proposal),
+        "",
+        now,
+    )?;
+    proposal.status = dataset_branch::STATUS_MERGED.into();
+    proposal.merged_by = request.actor.clone();
+    proposal.merged_version_id = version.version_id.clone();
+    proposal.receipt_id = dataset_branch::merge_receipt_id(&proposal, &version.version_id);
+    proposal.merged_at_ms = now;
+    tx.execute(
+        "UPDATE sekai_dataset_branch_proposals
+         SET status = ?1, merged_by = ?2, merged_version_id = ?3, receipt_id = ?4,
+             merged_at_ms = ?5
+         WHERE id = ?6",
+        params![
+            proposal.status,
+            proposal.merged_by,
+            proposal.merged_version_id,
+            proposal.receipt_id,
+            proposal.merged_at_ms,
+            proposal.id
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    drop_branch(tx, &request.dataset_id, &proposal.branch)?;
+    Ok(proposal)
+}
+
+/// Whether an open definition proposal attaches this dataset proposal
+/// (#2199). Attachments live in the proposal body, so this narrows open
+/// proposals by the id's text and then checks the parsed attachments.
+fn attached_to_open_definition_proposal(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    proposal_id: &str,
+) -> Result<bool, String> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE status = ?1 AND instr(body_json, ?2) > 0",
+        )
+        .map_err(|error| error.to_string())?;
+    let bodies = stmt
+        .query_map(
+            params![crate::sekai::definition_proposal::STATUS_OPEN, proposal_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    crate::sekai::definition_proposal::any_attaches(&bodies, dataset_id, proposal_id)
 }
 
 pub fn create_branch_tx(
@@ -1123,7 +1208,7 @@ fn drop_branch(tx: &Transaction<'_>, dataset_id: &str, name: &str) -> Result<(),
     Ok(())
 }
 
-fn load_proposal(
+pub(crate) fn load_proposal(
     tx: &Transaction<'_>,
     dataset_id: &str,
     id: &str,
