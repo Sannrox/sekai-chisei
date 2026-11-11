@@ -919,6 +919,11 @@ impl SekaiDb {
         if sqlite_changed_reference(&tx, references)?.is_some() {
             return Ok(ParkedGrantOutcome::Stale);
         }
+        if let Some(ParkedGrantWrite::Create(object)) = write
+            && sqlite_hosted_session_join_cap(&tx, object)?.is_some()
+        {
+            return Ok(ParkedGrantOutcome::Stale);
+        }
         let previous = match write {
             Some(ParkedGrantWrite::Create(object)) => {
                 crate::sekai::audit::insert_created_object_in(
@@ -1086,6 +1091,11 @@ impl SekaiDb {
         }
         if let Some(changed) = sqlite_changed_reference(&tx, references)? {
             return Err(format!("{REFERENCE_CHANGED}{changed}"));
+        }
+        if let ParkedGrantWrite::Create(object) = write
+            && let Some(reason) = sqlite_hosted_session_join_cap(&tx, object)?
+        {
+            return Err(reason);
         }
         let previous = match write {
             ParkedGrantWrite::Create(object) => {
@@ -1352,6 +1362,48 @@ pub(crate) fn reserve_for_test(
     instance.admission_lease = Some(lease.clone());
     db.put_action_instance(&instance).unwrap();
     (instance.instance_id, lease)
+}
+
+/// Refuse a hosted-session join whose cap is already full in `tx`.
+fn sqlite_hosted_session_join_cap(
+    tx: &rusqlite::Transaction<'_>,
+    object: &crate::domain::Object,
+) -> Result<Option<String>, String> {
+    use crate::db::sekai::row_to_object;
+    use crate::sekai::hosted_session::{MEMBER_KIND, SESSION_KIND, join_cap_refusal};
+    if object.kind != MEMBER_KIND {
+        return Ok(None);
+    }
+    let Some(session_id) = object
+        .properties
+        .get("session_id")
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let session = tx
+        .query_row(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated
+             FROM sekai_objects WHERE id = ?1 AND kind = ?2 AND namespace = ?3",
+            params![session_id, SESSION_KIND, object.namespace],
+            row_to_object,
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("hosted session {session_id} not found"))?;
+    let members: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM sekai_objects
+             WHERE kind = ?1 AND namespace = ?2
+               AND json_extract(properties, '$.session_id') = ?3",
+            params![MEMBER_KIND, object.namespace, session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    join_cap_refusal(
+        &session,
+        u32::try_from(members).map_err(|error| error.to_string())?,
+    )
 }
 
 /// The id of the first of `references` no longer as planning read it

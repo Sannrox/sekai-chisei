@@ -85,6 +85,7 @@ pub mod governed_facts;
 pub mod governed_transform;
 pub mod handoff;
 pub mod handoff_lifecycle;
+pub mod hosted_session;
 pub mod image;
 pub mod security_package;
 pub mod security_precision;

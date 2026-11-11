@@ -115,6 +115,8 @@ lives in the separate [research index](research/README.md).
   versioned decision types.
 - [ActionInstance admission](governed-action-instances.md) — idempotent submit
   and admit lifecycle.
+- [Hosted session](hosted-session.md) — bounded join, host-clock intents, and
+  per-member graphs through `SubmitActionInstance`.
 - [Typed ActionInstance effects](governed-action-effects.md) —
   `runtime_dispatch`, `notify`, and `external_mutate` effects.
 - [Runtime claim API](runtime-claim.md) — claim, heartbeat, and terminal
