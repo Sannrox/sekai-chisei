@@ -33,6 +33,7 @@ pub const RENDITION_THUMBNAIL: &str = "thumbnail";
 pub const MAX_METADATA_KEYS: usize = 32;
 pub const MAX_METADATA_BYTES: usize = 8 * 1024;
 pub const MAX_RENDITIONS: usize = 16;
+pub const RENDITIONS_OVERSIZED: &str = "governed document rendition list is oversized";
 pub const DOCUMENT_UNAVAILABLE: &str = "governed document is unavailable";
 pub const DOCUMENT_HELD: &str = "governed document is held";
 pub const REVISION_UNSUPPORTED: &str = "governed document revision is unsupported";
@@ -106,6 +107,22 @@ pub struct DocumentAdmission {
     pub hold_id: String,
     #[serde(default)]
     pub hold_reason: String,
+}
+
+/// What a caller submits to attach a rendition. The server sets the rest of
+/// the stored rendition: `attached_by` is the caller and `attached_at_ms` the
+/// attach time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenditionAttachment {
+    pub namespace: String,
+    pub document_id: String,
+    pub rendition_id: String,
+    pub class: String,
+    pub parent_content_digest: String,
+    pub content_ref: ContentReference,
+    pub extractor_id: String,
+    pub extractor_profile_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,10 +240,13 @@ pub fn admit_document(
     Err(DOCUMENT_UNAVAILABLE.into())
 }
 
+/// Attaches a rendition to a live document owned by `actor`. Attaching the
+/// same rendition again returns the stored one, so a retry is idempotent; a
+/// different rendition under the same id is refused.
 pub fn attach_rendition(
     db: &RuntimeDb,
     actor: &str,
-    rendition: &DocumentRendition,
+    attachment: &RenditionAttachment,
     now_ms: i64,
 ) -> Result<DocumentRendition, String> {
     required("actor", actor)?;
@@ -235,31 +255,27 @@ pub fn attach_rendition(
     }
     let document = live_document(
         db,
-        &rendition.namespace,
-        &rendition.document_id,
+        &attachment.namespace,
+        &attachment.document_id,
         actor,
         now_ms,
     )?;
-    let validated = validate_rendition(&document, rendition, actor, now_ms)?;
-    let existing = db.list_governed_renditions(&document.namespace, &document.document_id)?;
-    if existing.len() >= MAX_RENDITIONS
-        && existing
-            .iter()
-            .all(|item| item.rendition_id != validated.rendition_id)
-    {
-        return Err("governed document rendition list is oversized".into());
+    let validated = validate_rendition(&document, attachment, actor, now_ms)?;
+    // Insert-or-read in one step: under concurrency the first attachment
+    // wins and every other one is compared against it.
+    let Some(prior) = db.insert_governed_rendition(&validated, MAX_RENDITIONS)? else {
+        return Ok(validated);
+    };
+    // A retry of the same attachment differs from the stored one by its
+    // attach time alone.
+    let retry = DocumentRendition {
+        attached_at_ms: prior.attached_at_ms,
+        ..validated
+    };
+    if prior == retry {
+        return Ok(prior);
     }
-    if let Some(prior) = existing
-        .iter()
-        .find(|item| item.rendition_id == validated.rendition_id)
-    {
-        if prior == &validated {
-            return Ok(prior.clone());
-        }
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    db.put_governed_rendition(&validated)?;
-    Ok(validated)
+    Err(DOCUMENT_UNAVAILABLE.into())
 }
 
 pub fn retrieve_document(
@@ -544,7 +560,7 @@ fn validate_document(
 
 fn validate_rendition(
     document: &GovernedDocument,
-    rendition: &DocumentRendition,
+    rendition: &RenditionAttachment,
     actor: &str,
     now_ms: i64,
 ) -> Result<DocumentRendition, String> {
@@ -569,9 +585,16 @@ fn validate_rendition(
     }
     validate_content_ref(&rendition.content_ref, Some(&rendition.class))?;
     Ok(DocumentRendition {
+        namespace: rendition.namespace.clone(),
+        document_id: rendition.document_id.clone(),
+        rendition_id: rendition.rendition_id.clone(),
+        class: rendition.class.clone(),
+        parent_content_digest: rendition.parent_content_digest.clone(),
+        content_ref: rendition.content_ref.clone(),
+        extractor_id: rendition.extractor_id.clone(),
+        extractor_profile_digest: rendition.extractor_profile_digest.clone(),
         attached_by: actor.into(),
         attached_at_ms: now_ms,
-        ..rendition.clone()
     })
 }
 
@@ -842,8 +865,8 @@ mod tests {
         }
     }
 
-    fn rendition() -> DocumentRendition {
-        DocumentRendition {
+    fn rendition() -> RenditionAttachment {
+        RenditionAttachment {
             namespace: "records".into(),
             document_id: "doc:brief".into(),
             rendition_id: "rend:text".into(),
@@ -857,8 +880,6 @@ mod tests {
             },
             extractor_id: "extractor:text".into(),
             extractor_profile_digest: digest(3),
-            attached_by: String::new(),
-            attached_at_ms: 0,
         }
     }
 
@@ -1410,6 +1431,35 @@ mod tests {
         assert!(serde_json::from_value::<DocumentAdmission>(stored).is_err());
     }
 
+    /// The server sets `attached_by` and `attached_at_ms` (#2266), and a
+    /// retry of the same attachment later returns the stored rendition.
+    #[test]
+    fn the_server_sets_attachment_fields_and_a_retry_is_idempotent() {
+        let runtime = db();
+        admit(&runtime);
+        let attached = attach_rendition(&runtime, "analyst", &rendition(), 1_500).unwrap();
+        assert_eq!(
+            (attached.attached_by.as_str(), attached.attached_at_ms),
+            ("analyst", 1_500)
+        );
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &rendition(), 1_700).unwrap(),
+            attached
+        );
+        let mut changed = rendition();
+        changed.extractor_id = "extractor:other".into();
+        assert_eq!(
+            attach_rendition(&runtime, "analyst", &changed, 1_800).unwrap_err(),
+            DOCUMENT_UNAVAILABLE
+        );
+        let mut stored = serde_json::to_value(rendition()).unwrap();
+        stored
+            .as_object_mut()
+            .unwrap()
+            .insert("attached_by".into(), serde_json::json!("someone-else"));
+        assert!(serde_json::from_value::<RenditionAttachment>(stored).is_err());
+    }
+
     /// Concurrent admissions of one id with different titles: exactly one
     /// succeeds and the stored definition is the one it returned (#1776).
     fn concurrent_conflicting_admissions_keep_one(
@@ -1475,6 +1525,91 @@ mod tests {
         concurrent_conflicting_admissions_keep_one(&runtime, &principal, &document);
     }
 
+    /// The first attachment of a rendition id wins (#2266): a later write of
+    /// the same id keeps the stored record, overlapping identical attaches
+    /// all return it, and overlapping conflicting attaches leave exactly one.
+    fn first_attachment_wins(
+        runtime: &RuntimeDb,
+        principal: &str,
+        rendition: &RenditionAttachment,
+    ) {
+        let first = attach_rendition(runtime, principal, rendition, 1_500).unwrap();
+        let later = DocumentRendition {
+            attached_at_ms: 1_700,
+            ..first.clone()
+        };
+        assert_eq!(
+            runtime
+                .insert_governed_rendition(&later, MAX_RENDITIONS)
+                .unwrap(),
+            Some(first.clone())
+        );
+        let stored = || {
+            runtime
+                .list_governed_renditions(&rendition.namespace, &rendition.document_id)
+                .unwrap()
+        };
+        assert_eq!(stored(), vec![first.clone()]);
+
+        const ATTACHES: usize = 8;
+        let barrier = std::sync::Barrier::new(ATTACHES);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..ATTACHES)
+                .map(|n| {
+                    let barrier = &barrier;
+                    let mut variant = rendition.clone();
+                    // Even attaches differ by attach time alone; each odd
+                    // one conflicts with every other attach.
+                    variant.rendition_id = "rend:raced".into();
+                    if n % 2 == 1 {
+                        variant.extractor_id = format!("extractor:{n}");
+                    }
+                    scope.spawn(move || {
+                        barrier.wait();
+                        attach_rendition(runtime, principal, &variant, 2_000 + n as i64)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let raced: Vec<_> = stored()
+            .into_iter()
+            .filter(|item| item.rendition_id == "rend:raced")
+            .collect();
+        assert_eq!(raced.len(), 1);
+        for result in &results {
+            match result {
+                Ok(attached) => assert_eq!(attached, &raced[0], "{results:?}"),
+                Err(error) => assert_eq!(error, DOCUMENT_UNAVAILABLE, "{results:?}"),
+            }
+        }
+        assert!(results.iter().any(Result::is_ok), "{results:?}");
+    }
+
+    #[test]
+    fn the_first_attachment_of_a_rendition_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(dir.path().join("docs.db").to_str().unwrap()).unwrap(),
+        ));
+        admit(&runtime);
+        first_attachment_wins(&runtime, "analyst", &rendition());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_the_first_attachment_of_a_rendition_wins() {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let runtime = postgres_runtime();
+        let (principal, document, rendition) = unique_case(&suffix);
+        pin_ceiling(&runtime, &principal, "internal");
+        admit_document(&runtime, &principal, &document, 1_000).unwrap();
+        first_attachment_wins(&runtime, &principal, &rendition);
+    }
+
     fn postgres_runtime() -> RuntimeDb {
         use crate::db::postgres::PostgresDb;
         use std::sync::Arc;
@@ -1493,7 +1628,7 @@ mod tests {
         RuntimeDb::Postgres(Arc::new(db))
     }
 
-    fn unique_case(suffix: &str) -> (String, DocumentAdmission, DocumentRendition) {
+    fn unique_case(suffix: &str) -> (String, DocumentAdmission, RenditionAttachment) {
         let principal = format!("analyst-{suffix}");
         let mut document = document();
         document.namespace = format!("records-{suffix}");

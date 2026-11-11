@@ -80,6 +80,16 @@ sets the owner and `admitted_by` to the caller and stamps the time. Its
 field numbers match `GovernedDocument`, so a request encoded by an older
 client still decodes. The server ignores the stored-record fields it carries.
 
+## Amendment 2026-11-11
+
+Issue [#2266](https://github.com/Sannrox/sekai-chisei/issues/2266):
+attachment takes `DocumentRenditionAttachment`, as admission does. It
+has no `attached_by` or `attached_at_ms`: the server sets them to the caller
+and the attach time. Its field numbers match `DocumentRendition`. Attaching
+the same rendition again returns the stored one, so a retry after a lost
+response is idempotent. With RPC-level tests on SQLite and PostgreSQL, the
+seven document RPCs become `stable` ([ADR 0071](0071-rpc-maturity.md)).
+
 ## Alternatives considered
 
 Treating documents as blobs with sidecar metadata was rejected because

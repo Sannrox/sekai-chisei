@@ -36,7 +36,7 @@ use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
     AcquireLeaseRequest, AdmitGovernedDocumentRequest, AttachGovernedDocumentRenditionRequest,
     ContentReference, CreateObjectRequest, DecideActionInstanceRequest,
-    DeleteGovernedDocumentRequest, DocumentRendition, EnsureTeamNamespaceRequest,
+    DeleteGovernedDocumentRequest, DocumentRenditionAttachment, EnsureTeamNamespaceRequest,
     ExpireGovernedDocumentRequest, GetActionInstanceRequest, GetGovernedDocumentRequest,
     GetLeaseRequest, GetLinkedObjectsRequest, GetObjectRequest, GovernedActionType,
     GovernedDocumentAdmission, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
@@ -2101,19 +2101,19 @@ async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
         "unauthorized field",
     );
 
+    let attachment = DocumentRenditionAttachment {
+        namespace: namespace.clone(),
+        document_id: document_id.clone(),
+        rendition_id: format!("rend:text-{suffix}"),
+        class: "extracted_text".into(),
+        parent_content_digest: parent_digest,
+        content_ref: Some(smoke_content_ref(2, "text/plain", 32)),
+        extractor_id: "extractor:text".into(),
+        extractor_profile_digest: document_digest(3),
+    };
     let attached = sekai
         .attach_governed_document_rendition(AttachGovernedDocumentRenditionRequest {
-            rendition: Some(DocumentRendition {
-                namespace: namespace.clone(),
-                document_id: document_id.clone(),
-                rendition_id: format!("rend:text-{suffix}"),
-                class: "extracted_text".into(),
-                parent_content_digest: parent_digest,
-                content_ref: Some(smoke_content_ref(2, "text/plain", 32)),
-                extractor_id: "extractor:text".into(),
-                extractor_profile_digest: document_digest(3),
-                ..Default::default()
-            }),
+            rendition: Some(attachment.clone()),
         })
         .await
         .unwrap_or_else(|error| panic!("attach: {error}\n{}", server.logs()))
@@ -2121,8 +2121,11 @@ async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
         .rendition
         .expect("attached rendition");
     assert_eq!(attached.class, "extracted_text");
+    // The server sets the attachment fields from the caller (#2266).
+    assert_eq!(attached.attached_by, admitted.owner);
+    assert!(attached.attached_at_ms > 0);
 
-    let mut bad_class = attached.clone();
+    let mut bad_class = attachment;
     bad_class.rendition_id = format!("rend:ocr-{suffix}");
     bad_class.class = "ocr-box".into();
     let rendition_class = sekai

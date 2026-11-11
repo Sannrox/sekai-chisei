@@ -1737,8 +1737,23 @@ message AdmitGovernedDocumentRequest {
 message AdmitGovernedDocumentResponse {
   GovernedDocument document = 1;
 }
+// What a caller submits to attach a rendition. Field numbers match
+// DocumentRendition; the server sets the reserved ones: attached_by is the
+// caller and attached_at_ms the attach time.
+message DocumentRenditionAttachment {
+  reserved 9, 10;
+  reserved "attached_by", "attached_at_ms";
+  string namespace = 1;
+  string document_id = 2;
+  string rendition_id = 3;
+  string class = 4;
+  string parent_content_digest = 5;
+  ContentReference content_ref = 6;
+  string extractor_id = 7;
+  string extractor_profile_digest = 8;
+}
 message AttachGovernedDocumentRenditionRequest {
-  DocumentRendition rendition = 1;
+  DocumentRenditionAttachment rendition = 1;
 }
 message AttachGovernedDocumentRenditionResponse {
   DocumentRendition rendition = 1;

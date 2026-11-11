@@ -30,14 +30,16 @@ impl RuntimeDb {
         }
     }
 
-    pub fn put_governed_rendition(
+    /// Atomic first-writer-wins insert; see `SekaiDb::insert_governed_rendition`.
+    pub fn insert_governed_rendition(
         &self,
         rendition: &crate::sekai::document::DocumentRendition,
-    ) -> Result<(), String> {
+        max: usize,
+    ) -> Result<Option<crate::sekai::document::DocumentRendition>, String> {
         match self {
-            Self::Sqlite(db) => db.put_governed_rendition(rendition),
+            Self::Sqlite(db) => db.insert_governed_rendition(rendition, max),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_governed_rendition(rendition))
+                crate::db::postgres::off_runtime(|| db.insert_governed_rendition(rendition, max))
             }
         }
     }
