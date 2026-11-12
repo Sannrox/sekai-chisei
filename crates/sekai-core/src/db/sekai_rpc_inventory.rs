@@ -4,7 +4,7 @@
 //! The inventory is the fail-closed bridge between `proto/sekai.proto` and the
 //! shared SQLite/PostgreSQL evidence harnesses. PostgreSQL may advertise the
 //! complete reusable Sekai surface set only when this inventory is complete
-//! and every listed evidence path exists.
+//! and every listed evidence path exists (checked by `cargo test`).
 
 use crate::db::graph::POSTGRES_GRAPH_SURFACES;
 use crate::db::reusable::{POSTGRES_FOUNDATION_SURFACES, postgres_reusable_capabilities};
@@ -13,12 +13,14 @@ use crate::runtime_backend::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 
 /// Fixture evidence paths are repo-relative (`crates/sekai-core/...`, `tests/...`).
 /// Crate tests run with cwd = this package, so also accept the crate-relative
-/// suffix and paths resolved from `CARGO_MANIFEST_DIR`.
+/// suffix and paths resolved from `CARGO_MANIFEST_DIR`. Test-only: a running
+/// server has no checkout to look in.
+#[cfg(test)]
 pub(crate) fn repo_evidence_exists(path: &str) -> bool {
+    use std::path::Path;
     if Path::new(path).exists() {
         return true;
     }
@@ -128,6 +130,9 @@ impl SekaiRpcInventory {
         Ok(inventory)
     }
 
+    /// Checks the embedded inventory against the embedded proto. Runs at server
+    /// boot, so it reads no files: the server image ships without the source
+    /// tree. Evidence paths are checked by `cargo test` instead.
     pub fn validate(&self) -> Result<(), String> {
         if self.version != SEKAI_RPC_INVENTORY_VERSION {
             return Err(format!(
@@ -243,17 +248,6 @@ impl SekaiRpcInventory {
                     "internal surface {} is missing evidence",
                     internal.surface
                 ));
-            }
-        }
-
-        // Fail closed when a listed evidence path is absent from the checkout.
-        for path in self.all_evidence_paths() {
-            if (path.starts_with("tests/")
-                || path.starts_with("src/")
-                || path.starts_with("crates/"))
-                && !repo_evidence_exists(path)
-            {
-                return Err(format!("inventory evidence path does not exist: {path}"));
             }
         }
 
@@ -384,6 +378,14 @@ pub fn postgres_complete_sekai_capabilities() -> Result<BackendCapabilities, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_evidence_paths_exist() {
+        let inventory = SekaiRpcInventory::load().unwrap();
+        for path in inventory.all_evidence_paths() {
+            assert!(repo_evidence_exists(path), "missing evidence path {path}");
+        }
+    }
 
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
