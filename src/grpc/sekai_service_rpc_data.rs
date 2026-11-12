@@ -5088,12 +5088,36 @@ fn to_proto_document_view(view: crate::sekai::document::DocumentView) -> Documen
     }
 }
 
+/// Namespace authorization for a document RPC: the sequence object writes
+/// and `Search` run (tenant context and service-principal scope, shared
+/// space, then team-namespace membership), before the store is touched.
+fn authorize_document_namespace<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    principals: &[String],
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    let db = service.db.runtime();
+    let tenant_context = request_tenant_context(db, req)?;
+    enforce_collaboration_namespace(db, tenant_context.as_ref(), namespace, write)?;
+    check_team_namespace(db, principals, namespace, write)
+}
+
 pub(super) async fn admit_governed_document(
     service: &SekaiServiceImpl,
     req: Request<AdmitGovernedDocumentRequest>,
 ) -> Result<Response<AdmitGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .document
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("document required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .document
@@ -5117,6 +5141,14 @@ pub(super) async fn attach_governed_document_rendition(
 ) -> Result<Response<AttachGovernedDocumentRenditionResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    let namespace = req
+        .get_ref()
+        .rendition
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("rendition required"))?
+        .namespace
+        .clone();
+    authorize_document_namespace(service, &req, &principals, &namespace, true)?;
     let proto = req
         .into_inner()
         .rendition
@@ -5140,6 +5172,7 @@ pub(super) async fn get_governed_document(
 ) -> Result<Response<GetGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, false)?;
     let input = req.into_inner();
     let view = crate::sekai::document::retrieve_document(
         service.db.runtime(),
@@ -5166,6 +5199,7 @@ pub(super) async fn hold_governed_document(
 ) -> Result<Response<HoldGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::place_hold(
         service.db.runtime(),
@@ -5188,6 +5222,7 @@ pub(super) async fn release_governed_document_hold(
 ) -> Result<Response<ReleaseGovernedDocumentHoldResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::release_hold(
         service.db.runtime(),
@@ -5209,6 +5244,7 @@ pub(super) async fn expire_governed_document(
 ) -> Result<Response<ExpireGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::expire_document(
         service.db.runtime(),
@@ -5229,6 +5265,7 @@ pub(super) async fn delete_governed_document(
 ) -> Result<Response<DeleteGovernedDocumentResponse>, Status> {
     let principals = caller_principals(&req);
     let actor = caller_actor(&principals)?;
+    authorize_document_namespace(service, &req, &principals, &req.get_ref().namespace, true)?;
     let input = req.into_inner();
     let document = crate::sekai::document::delete_document(
         service.db.runtime(),
