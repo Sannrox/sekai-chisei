@@ -14,7 +14,8 @@ use crate::grpc::TokenAuthInterceptor;
 use crate::sekai::security::Role;
 use axum::Form;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
@@ -210,19 +211,110 @@ fn credential_still_active(db: &RuntimeDb, session: &ConsoleSession) -> bool {
     }
 }
 
-fn resolve_session(state: &ConsoleState, headers: &HeaderMap) -> Option<ConsoleSession> {
-    let sid = parse_cookie_value(headers, SESSION_COOKIE)?;
+enum SessionResolution {
+    Authenticated(ConsoleSession),
+    Unauthenticated { had_cookie: bool },
+}
+
+fn resolve_session(state: &ConsoleState, headers: &HeaderMap) -> SessionResolution {
+    let Some(sid) = parse_cookie_value(headers, SESSION_COOKIE) else {
+        return SessionResolution::Unauthenticated { had_cookie: false };
+    };
     state.sessions.purge_expired(now_unix());
-    let session = state.sessions.get(&sid)?;
+    let Some(session) = state.sessions.get(&sid) else {
+        return SessionResolution::Unauthenticated { had_cookie: true };
+    };
     if session.expires_unix <= now_unix() {
         state.sessions.remove(&sid);
-        return None;
+        return SessionResolution::Unauthenticated { had_cookie: true };
     }
     if !credential_still_active(&state.db, &session) {
         state.sessions.remove(&sid);
-        return None;
+        return SessionResolution::Unauthenticated { had_cookie: true };
     }
-    Some(session)
+    SessionResolution::Authenticated(session)
+}
+
+fn attach_clear_cookie(had_cookie: bool, response: &mut Response) {
+    if had_cookie {
+        response
+            .headers_mut()
+            .insert(header::SET_COOKIE, clear_session_cookie());
+    }
+}
+
+/// HTML data routes. Never used by GET /console/login.
+fn unauthenticated_html_redirect(had_cookie: bool) -> Response {
+    let mut response = Redirect::to("/console/login").into_response();
+    attach_clear_cookie(had_cookie, &mut response);
+    response
+}
+
+/// JSON data routes. Caller supplies the 401 body.
+fn unauthenticated_json(had_cookie: bool, body: impl IntoResponse) -> Response {
+    let mut response = body.into_response();
+    attach_clear_cookie(had_cookie, &mut response);
+    response
+}
+
+/// GET /console/login only. 200 form, never 303 to itself.
+fn unauthenticated_login_page(had_cookie: bool, error: Option<&str>) -> Response {
+    let mut response = login_page(error).into_response();
+    attach_clear_cookie(had_cookie, &mut response);
+    response
+}
+
+fn login_failure(headers: &HeaderMap, message: &str) -> Response {
+    let mut response = (StatusCode::UNAUTHORIZED, login_page(Some(message))).into_response();
+    attach_clear_cookie(
+        parse_cookie_value(headers, SESSION_COOKIE).is_some(),
+        &mut response,
+    );
+    response
+}
+
+/// Authenticated HTML data route. Rejection 303s to `/console/login` and
+/// clears a presented cookie. Do not extract on `GET /console/login`.
+struct HtmlSession(ConsoleSession);
+
+/// Authenticated JSON data route whose unauthenticated body is
+/// `{"error":"unauthenticated"}`.
+struct JsonSession(ConsoleSession);
+
+impl FromRequestParts<ConsoleState> for HtmlSession {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ConsoleState,
+    ) -> Result<Self, Self::Rejection> {
+        match resolve_session(state, &parts.headers) {
+            SessionResolution::Authenticated(session) => Ok(Self(session)),
+            SessionResolution::Unauthenticated { had_cookie } => {
+                Err(unauthenticated_html_redirect(had_cookie))
+            }
+        }
+    }
+}
+
+impl FromRequestParts<ConsoleState> for JsonSession {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ConsoleState,
+    ) -> Result<Self, Self::Rejection> {
+        match resolve_session(state, &parts.headers) {
+            SessionResolution::Authenticated(session) => Ok(Self(session)),
+            SessionResolution::Unauthenticated { had_cookie } => Err(unauthenticated_json(
+                had_cookie,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({"error": "unauthenticated"})),
+                ),
+            )),
+        }
+    }
 }
 
 /// Namespace identifiers allowed in console URLs (fail closed on anything else).
@@ -574,10 +666,10 @@ async fn console_root() -> Redirect {
     Redirect::to("/console/")
 }
 
-async fn console_home(State(state): State<ConsoleState>, headers: HeaderMap) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
+async fn console_home(
+    State(state): State<ConsoleState>,
+    HtmlSession(session): HtmlSession,
+) -> Response {
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     let main = r#"
 <section class="panel" aria-labelledby="home-heading">
@@ -589,10 +681,12 @@ async fn console_home(State(state): State<ConsoleState>, headers: HeaderMap) -> 
 }
 
 async fn login_get(State(state): State<ConsoleState>, headers: HeaderMap) -> Response {
-    if resolve_session(&state, &headers).is_some() {
-        return Redirect::to("/console/").into_response();
+    match resolve_session(&state, &headers) {
+        SessionResolution::Authenticated(_) => Redirect::to("/console/").into_response(),
+        SessionResolution::Unauthenticated { had_cookie } => {
+            unauthenticated_login_page(had_cookie, None)
+        }
     }
-    login_page(None).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -600,21 +694,17 @@ struct LoginForm {
     token: String,
 }
 
-async fn login_post(State(state): State<ConsoleState>, Form(form): Form<LoginForm>) -> Response {
+async fn login_post(
+    State(state): State<ConsoleState>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let token = form.token.trim();
     if token.is_empty() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            login_page(Some("Token is required.")),
-        )
-            .into_response();
+        return login_failure(&headers, "Token is required.");
     }
     let Some(credential) = state.auth.resolve_credential(token) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            login_page(Some("Invalid or inactive credentials.")),
-        )
-            .into_response();
+        return login_failure(&headers, "Invalid or inactive credentials.");
     };
     let sid = new_session_id();
     let ttl = state.session_ttl.as_secs().max(60);
@@ -644,14 +734,19 @@ async fn logout_post(State(state): State<ConsoleState>, headers: HeaderMap) -> R
 }
 
 async fn api_session(State(state): State<ConsoleState>, headers: HeaderMap) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "authenticated": false
-            })),
-        )
-            .into_response();
+    let session = match resolve_session(&state, &headers) {
+        SessionResolution::Authenticated(session) => session,
+        SessionResolution::Unauthenticated { had_cookie } => {
+            return unauthenticated_json(
+                had_cookie,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "authenticated": false
+                    })),
+                ),
+            );
+        }
     };
     (
         StatusCode::OK,
@@ -664,16 +759,10 @@ async fn api_session(State(state): State<ConsoleState>, headers: HeaderMap) -> R
         .into_response()
 }
 
-async fn api_namespaces(State(state): State<ConsoleState>, headers: HeaderMap) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": "unauthenticated"
-            })),
-        )
-            .into_response();
-    };
+async fn api_namespaces(
+    State(state): State<ConsoleState>,
+    JsonSession(session): JsonSession,
+) -> Response {
     match list_accessible_namespaces(&state.db, &session.principal) {
         Ok(namespaces) => {
             let items: Vec<_> = namespaces
@@ -704,26 +793,17 @@ async fn api_namespaces(State(state): State<ConsoleState>, headers: HeaderMap) -
 }
 
 async fn namespace_root(
-    State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(_session): HtmlSession,
     Path(namespace): Path<String>,
-) -> Response {
-    // Auth check first so unauthenticated users are not redirected into a
-    // namespaced path before login.
-    if resolve_session(&state, &headers).is_none() {
-        return Redirect::to("/console/login").into_response();
-    }
-    Redirect::to(&format!("/console/n/{namespace}/ops")).into_response()
+) -> Redirect {
+    Redirect::to(&format!("/console/n/{namespace}/ops"))
 }
 
 async fn screen_operations(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_workspace::list_visible_operations(
         &state.db,
@@ -768,12 +848,9 @@ async fn screen_operations(
 
 async fn screen_transforms(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_transforms::load_home(&state.db, &session.principal, &namespace) {
         Ok(home) => {
@@ -806,12 +883,9 @@ async fn screen_transforms(
 
 async fn screen_transform_run(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path((namespace, run_id)): Path<(String, String)>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_transforms::load_run(
         &state.db,
@@ -849,12 +923,9 @@ async fn screen_transform_run(
 
 async fn screen_operation_workspace(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path((namespace, operation_id)): Path<(String, String)>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_workspace::timed_load_report(
         &state.db,
@@ -913,10 +984,16 @@ async fn api_operation_workspace(
     headers: HeaderMap,
     Path((namespace, operation_id)): Path<(String, String)>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return crate::obs::console_workspace::json_error_response(
-            crate::obs::console_workspace::WorkspaceError::Unauthenticated,
-        );
+    let session = match resolve_session(&state, &headers) {
+        SessionResolution::Authenticated(session) => session,
+        SessionResolution::Unauthenticated { had_cookie } => {
+            return unauthenticated_json(
+                had_cookie,
+                crate::obs::console_workspace::json_error_response(
+                    crate::obs::console_workspace::WorkspaceError::Unauthenticated,
+                ),
+            );
+        }
     };
     match crate::obs::console_workspace::load_authorized_report(
         &state.db,
@@ -931,12 +1008,9 @@ async fn api_operation_workspace(
 
 async fn screen_pressure(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_pressure::load_pressure_snapshot(
         &state.db,
@@ -984,16 +1058,9 @@ async fn screen_pressure(
 
 async fn api_pressure(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    JsonSession(session): JsonSession,
     Path(namespace): Path<String>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({"error": "unauthenticated"})),
-        )
-            .into_response();
-    };
     match crate::obs::console_pressure::load_pressure_snapshot(
         &state.db,
         &session.principal,
@@ -1020,13 +1087,10 @@ struct KillSwitchForm {
 
 async fn pressure_kill_switch(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
     Form(form): Form<KillSwitchForm>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     if form.confirm.as_deref() != Some("1") {
         let snapshot = crate::obs::console_pressure::load_pressure_snapshot(
@@ -1098,12 +1162,9 @@ async fn pressure_kill_switch(
 
 async fn screen_policy(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     match crate::obs::console_policy::load_effective_policy_view(
         &state.db,
@@ -1163,13 +1224,10 @@ fn split_csv(raw: Option<String>) -> Vec<String> {
 
 async fn policy_dry_run(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
     Form(form): Form<DryRunForm>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     let start = form.start_timestamp_ms.parse::<i64>().unwrap_or(0);
     let end = form.end_timestamp_ms.parse::<i64>().unwrap_or(0);
@@ -1256,13 +1314,10 @@ struct RollbackForm {
 
 async fn policy_promote(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
     Form(form): Form<PromoteForm>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     if form.confirm.as_deref() != Some("1") {
         return policy_flash(
@@ -1297,13 +1352,10 @@ async fn policy_promote(
 
 async fn policy_rollback(
     State(state): State<ConsoleState>,
-    headers: HeaderMap,
+    HtmlSession(session): HtmlSession,
     Path(namespace): Path<String>,
     Form(form): Form<RollbackForm>,
 ) -> Response {
-    let Some(session) = resolve_session(&state, &headers) else {
-        return Redirect::to("/console/login").into_response();
-    };
     let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     if form.confirm.as_deref() != Some("1") {
         return policy_flash(
@@ -1467,6 +1519,18 @@ mod tests {
             .collect()
     }
 
+    fn assert_cleared_session_cookie(headers: &HeaderMap) {
+        let cookie = headers
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("Set-Cookie clearer");
+        assert!(cookie.contains(&format!("{SESSION_COOKIE}=")));
+        assert!(cookie.contains("Path=/console"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=0"));
+    }
+
     #[test]
     fn safe_namespace_rejects_path_and_space() {
         assert!(is_safe_namespace("team-a"));
@@ -1507,6 +1571,7 @@ mod tests {
             home.headers().get(header::LOCATION).unwrap(),
             "/console/login"
         );
+        assert!(home.headers().get(header::SET_COOKIE).is_none());
 
         let api = app
             .clone()
@@ -1519,8 +1584,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+        assert!(api.headers().get(header::SET_COOKIE).is_none());
 
         let ops = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/console/n/alpha/ops")
@@ -1530,6 +1597,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ops.status(), StatusCode::SEE_OTHER);
+        assert!(ops.headers().get(header::SET_COOKIE).is_none());
+
+        let login_get = app
+            .oneshot(
+                Request::builder()
+                    .uri("/console/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_get.status(), StatusCode::OK);
+        assert!(login_get.headers().get(header::SET_COOKIE).is_none());
+        let login_body = to_bytes(login_get.into_body(), usize::MAX).await.unwrap();
+        let login_text = String::from_utf8(login_body.to_vec()).unwrap();
+        assert!(login_text.contains("Sign in"));
+        assert!(!login_text.contains("Signed in as"));
     }
 
     #[tokio::test]
@@ -1651,5 +1735,230 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(after.headers());
+    }
+
+    #[tokio::test]
+    async fn session_from_instance_a_is_unauthenticated_on_instance_b() {
+        let db = test_db();
+        let token = "alice-failover-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .unwrap();
+        seed_namespace_grant(&db, "alpha", "alice", Role::Viewer);
+
+        let app_a = router(test_state(db.clone()));
+        let app_b = router(test_state(db.clone()));
+
+        let (status, sid) = login(&app_a, token).await;
+        assert!(status.is_redirection());
+        let sid = sid.expect("sid minted on A");
+        let cookie = format!("{SESSION_COOKIE}={sid}");
+
+        let on_a = app_a
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(on_a.status(), StatusCode::OK);
+
+        let json_b = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(json_b.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(json_b.headers());
+        let body = to_bytes(json_b.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["authenticated"], false);
+        assert!(v.get("principal").is_none() || v["principal"].is_null());
+
+        let ns_b = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/namespaces")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ns_b.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(ns_b.headers());
+        let ns_body = to_bytes(ns_b.into_body(), usize::MAX).await.unwrap();
+        let ns_v: serde_json::Value = serde_json::from_slice(&ns_body).unwrap();
+        assert_eq!(ns_v["error"], "unauthenticated");
+
+        let html_b = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(html_b.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            html_b.headers().get(header::LOCATION).unwrap(),
+            "/console/login"
+        );
+        assert_cleared_session_cookie(html_b.headers());
+        let html_body = to_bytes(html_b.into_body(), usize::MAX).await.unwrap();
+        let html_text = String::from_utf8(html_body.to_vec()).unwrap();
+        assert!(!html_text.contains("Signed in as"));
+
+        let ops_b = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/n/alpha/ops")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ops_b.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            ops_b.headers().get(header::LOCATION).unwrap(),
+            "/console/login"
+        );
+        assert_cleared_session_cookie(ops_b.headers());
+        let ops_body = to_bytes(ops_b.into_body(), usize::MAX).await.unwrap();
+        let ops_text = String::from_utf8(ops_body.to_vec()).unwrap();
+        assert!(!ops_text.contains("Signed in as"));
+
+        let login_get_b = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/login")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_get_b.status(), StatusCode::OK);
+        assert!(login_get_b.headers().get(header::LOCATION).is_none());
+        assert_cleared_session_cookie(login_get_b.headers());
+        let login_body = to_bytes(login_get_b.into_body(), usize::MAX).await.unwrap();
+        let login_text = String::from_utf8(login_body.to_vec()).unwrap();
+        assert!(login_text.contains("Sign in"));
+        assert!(login_text.contains("name=\"token\""));
+        assert!(!login_text.contains("Signed in as"));
+
+        let (login_b, sid_b) = login(&app_b, token).await;
+        assert!(login_b.is_redirection());
+        let sid_b = sid_b.expect("sid minted on B");
+        assert_ne!(sid_b, sid);
+        let cookie_b = format!("{SESSION_COOKIE}={sid_b}");
+        let recovered = app_b
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/session")
+                    .header(header::COOKIE, &cookie_b)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let recovered_body = to_bytes(recovered.into_body(), usize::MAX).await.unwrap();
+        let recovered_v: serde_json::Value = serde_json::from_slice(&recovered_body).unwrap();
+        assert_eq!(recovered_v["authenticated"], true);
+        assert_eq!(recovered_v["principal"], "alice");
+
+        let stale = app_b
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(stale.headers());
+    }
+
+    #[tokio::test]
+    async fn revoked_credential_clears_session_on_minting_instance() {
+        let db = test_db();
+        let token = "alice-revoke-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .unwrap();
+        let app = router(test_state(db.clone()));
+        let (_, sid) = login(&app, token).await;
+        let sid = sid.expect("sid");
+        let cookie = format!("{SESSION_COOKIE}={sid}");
+
+        db.revoke_principal_credential("alice").unwrap();
+
+        let after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/console/api/session")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(after.headers());
+        let body = to_bytes(after.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["authenticated"], false);
+    }
+
+    #[tokio::test]
+    async fn failed_login_on_instance_b_clears_presented_sid() {
+        let db = test_db();
+        let token = "alice-fail-login-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .unwrap();
+        let app_a = router(test_state(db.clone()));
+        let app_b = router(test_state(db));
+        let (_, sid) = login(&app_a, token).await;
+        let sid = sid.expect("sid");
+        let cookie = format!("{SESSION_COOKIE}={sid}");
+
+        let failed = app_b
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/console/login")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::from("token=not-a-real-token"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::UNAUTHORIZED);
+        assert_cleared_session_cookie(failed.headers());
+        let body = to_bytes(failed.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("Sign in"));
+        assert!(!text.contains("Signed in as"));
     }
 }

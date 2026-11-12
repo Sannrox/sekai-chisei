@@ -111,6 +111,17 @@
       "evidence": [
         "crates/chisei-core/src/chisei/eval.rs"
       ]
+    },
+    {
+      "id": "ops.console.sessions",
+      "class": "process_local_ok",
+      "notes": "Opaque console cookies map to a process-local SessionStore. Not replica authority. Foreign or dead SIDs fail closed (HTML data 303, GET /console/login 200 form, JSON 401, cookie clear). Durable trust is sekai.credentials, rechecked per request.",
+      "evidence": [
+        "src/obs/console.rs",
+        "src/obs/ops.rs",
+        "docs/operator-console.md",
+        "docs/decisions/0150-process-local-console-sessions.md"
+      ]
     }
   ],
   "required_authoritative_surfaces": [
