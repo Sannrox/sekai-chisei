@@ -5,10 +5,12 @@ FROM ${BASE_IMAGE}
 ARG VCS_REF=unknown
 LABEL org.opencontainers.image.revision=$VCS_REF
 
+# Fixed ids: deploy/kubernetes sets runAsUser and fsGroup to 999.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --create-home sekai \
+    && groupadd --system --gid 999 sekai \
+    && useradd --system --uid 999 --gid 999 --create-home sekai \
     && mkdir /data && chown sekai:sekai /data
 
 COPY sekai-chisei chisei-gateway sekaictl /usr/local/bin/

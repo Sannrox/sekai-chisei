@@ -15,21 +15,23 @@ spec:
       labels:
         app: sekai-chisei
     spec:
+      # Pod Security "restricted": the image user (uid/gid 999) owns /data
+      # through fsGroup, so no root init container is needed.
       securityContext:
-        fsGroup: 100
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
         fsGroupChangePolicy: OnRootMismatch
-      initContainers:
-        - name: data-owner
-          image: ghcr.io/sannrox/sekai-chisei:3.0.0
-          command: ["chown", "-R", "sekai:sekai", "/data"]
-          securityContext:
-            runAsUser: 0
-          volumeMounts:
-            - name: data
-              mountPath: /data
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: sekai-chisei
-          image: ghcr.io/sannrox/sekai-chisei:3.0.0
+          image: ghcr.io/sannrox/sekai-chisei:v3.0.0
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           ports:
             - name: grpc
               containerPort: 50051
