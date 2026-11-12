@@ -2997,11 +2997,12 @@ mod tests {
         let (revision, members) = seed_members(&db, &["Ticket", "Incident", "Change", "Problem"]);
         MEMBER_SQL.with(|log| log.borrow_mut().clear());
         {
-            let conn = db.conn();
+            let mut conn = db.conn();
             conn.trace_v2(
                 rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
                 Some(trace_member_sql),
-            );
+            )
+            .unwrap();
         }
         let loaded = db
             .get_definition_members("team-a", &revision.revision_digest)
