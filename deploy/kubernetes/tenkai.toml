@@ -20,9 +20,9 @@ workdir = "."
 # Fail closed if the operator forgets TENKAI_SOFTWARE_EXECUTOR.
 install = "echo 'set TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess for this product' >&2; exit 1"
 uninstall = "true"
-# In-process health is workload conditions. This command is the shell-path
-# reminder if the executor env is forgotten.
-health = "echo 'set TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess for this product' >&2; exit 1"
+# No `health`: in-process health is the workload conditions, and Tenkai also
+# runs a set `health` command after them, so a fail-closed reminder here
+# would fail every apply.
 inputs = ["manifests"]
 
 # Contracts this release provides to dependents (Tenkai profile v2), as its
