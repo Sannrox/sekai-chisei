@@ -54,7 +54,9 @@ fn kubernetes_product_uses_inprocess_executor_and_matches_crate_version() {
     // Tenkai runs a set `health` after the in-process workload checks, so a
     // fail-closed reminder there fails every apply.
     assert!(
-        !TENKAI.lines().any(|line| line.trim_start().starts_with("health")),
+        !TENKAI
+            .lines()
+            .any(|line| line.trim_start().starts_with("health")),
         "deploy.health must stay unset; workload conditions are the health check"
     );
 }
