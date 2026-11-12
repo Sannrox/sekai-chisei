@@ -1,7 +1,8 @@
 //! Checked-in inventory of ChiseiService RPCs for PostgreSQL parity.
 //!
 //! PostgreSQL may advertise complete reusable Chisei surfaces only when this
-//! inventory is complete and every listed evidence path exists. Partial
+//! inventory is complete and every listed evidence path exists (checked by
+//! `cargo test`). Partial
 //! surfaces may be advertised earlier when their harnesses pass.
 
 use crate::runtime_backend::{
@@ -196,17 +197,6 @@ impl ChiseiRpcInventory {
             }
         }
 
-        for path in self.all_evidence_paths() {
-            if (path.starts_with("tests/")
-                || path.starts_with("src/")
-                || path.starts_with("docs/")
-                || path.starts_with("crates/"))
-                && !crate::db::sekai_rpc_inventory::repo_evidence_exists(path)
-            {
-                return Err(format!("inventory evidence path does not exist: {path}"));
-            }
-        }
-
         for surface in complete.iter().chain(remaining.iter()) {
             let lower = surface.to_ascii_lowercase();
             for banned in ["tenant", "oidc", "oauth"] {
@@ -340,6 +330,17 @@ pub fn postgres_partial_chisei_capabilities() -> Result<BackendCapabilities, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_evidence_paths_exist() {
+        let inventory = ChiseiRpcInventory::load().unwrap();
+        for path in inventory.all_evidence_paths() {
+            assert!(
+                crate::db::sekai_rpc_inventory::repo_evidence_exists(path),
+                "missing evidence path {path}"
+            );
+        }
+    }
 
     #[test]
     fn inventory_matches_proto_and_evidence_paths() {
