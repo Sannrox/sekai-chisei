@@ -87,6 +87,18 @@ fn combined_without_store_vars_boots_split_under_default_data_dir() {
     assert!(cwd.path().join("data/chisei.db").is_file());
 }
 
+/// Operators copy `.env.example` to `.env`, so its backend line is the
+/// backend a first launch runs on. It stays SQLite, as with no variable set.
+#[test]
+fn the_example_environment_keeps_the_sqlite_backend() {
+    let example = include_str!("../.env.example");
+    let backends: Vec<&str> = example
+        .lines()
+        .filter_map(|line| line.strip_prefix("SEKAI_DB_BACKEND="))
+        .collect();
+    assert_eq!(backends, ["sqlite"]);
+}
+
 #[test]
 fn each_plane_derives_only_its_own_file_from_the_data_dir() {
     let cwd = tempdir().unwrap();
