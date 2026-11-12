@@ -67,7 +67,9 @@ Tenant state, OIDC and OAuth are not Sekai-owned on any backend (ADR 0099,
   which the community PostgreSQL store rejects even with an empty holdout
   list. This is a public planning limitation, not a shrink-only helper.
 - Dest-pair `reconcile_missing_execution_evidence` cannot join the Sekai and
-  Chisei stores on one connection and stays fail-closed on PostgreSQL
+  Chisei stores on one connection. On PostgreSQL the reconciler does not run:
+  boot logs one warning, and external-action redemptions raise no
+  missing-evidence alerts.
 
 ## Operator posture
 

@@ -2072,7 +2072,17 @@ fn evidence_reconcile_backoff(last_alert_count: usize) -> std::time::Duration {
     }
 }
 
+/// Raises missing-execution-evidence alerts on SQLite. On PostgreSQL the
+/// redemptions (Chisei) and evidence (Sekai) live in separate stores, so the
+/// reconciler does not run; boot says so once (docs/postgres-chisei-parity.md).
 fn spawn_execution_evidence_reconciler(db: Arc<RuntimeDb>) {
+    if matches!(*db, RuntimeDb::Postgres(_)) {
+        tracing::warn!(
+            "missing execution evidence is not reconciled on PostgreSQL; \
+             external-action redemptions raise no missing-evidence alerts"
+        );
+        return;
+    }
     tokio::spawn(async move {
         let mut delay = std::time::Duration::ZERO;
         loop {
