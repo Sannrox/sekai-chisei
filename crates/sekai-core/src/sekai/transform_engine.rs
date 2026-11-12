@@ -250,7 +250,7 @@ pub fn execute_sql_until(
     if Instant::now() >= deadline {
         return Err(TransformError::Quarantined(BUDGET_TIME.into()));
     }
-    let conn = Connection::open_in_memory().map_err(|error| {
+    let mut conn = Connection::open_in_memory().map_err(|error| {
         TransformError::InvalidArgument(format!("analytical engine unavailable: {error}"))
     })?;
     apply_memory_bound(&conn, memory)?;
@@ -301,11 +301,7 @@ fn execute_sql_inner(
     let mut stmt = conn
         .prepare(sql.trim().trim_end_matches(';'))
         .map_err(map_engine_error)?;
-    let names: Vec<String> = stmt
-        .column_names()
-        .into_iter()
-        .map(|name| name.to_string())
-        .collect();
+    let names: Vec<String> = stmt.column_names().map(|name| name.to_string()).collect();
     let mut unique = BTreeSet::new();
     for name in &names {
         if !unique.insert(name.as_str()) {
