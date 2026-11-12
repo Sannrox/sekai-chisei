@@ -41,8 +41,8 @@ fn tenkai_install_sets_compose_dest_pair_and_matches_crate_version() {
     assert_eq!(product_version(), version);
     let install = install_script();
     assert!(
-        install.contains(&format!("ghcr.io/sannrox/sekai-chisei:{version}")),
-        "image tag must match crate version {version}"
+        install.contains(&format!("ghcr.io/sannrox/sekai-chisei:v{version}")),
+        "image must use the published v-prefixed tag for crate version {version}"
     );
     assert!(
         COMPOSE.contains("SEKAI_DB_PATH=/data/sekai.db"),

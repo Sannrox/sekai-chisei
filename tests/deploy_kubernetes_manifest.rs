@@ -45,21 +45,48 @@ fn kubernetes_product_uses_inprocess_executor_and_matches_crate_version() {
     );
     assert!(
         TENKAI.contains("TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess"),
-        "install/health must name kubernetes-inprocess"
+        "install must name kubernetes-inprocess"
     );
     assert!(
         TENKAI.contains("exit 1"),
         "shell install must fail closed without the in-process executor"
+    );
+    // Tenkai runs a set `health` after the in-process workload checks, so a
+    // fail-closed reminder there fails every apply.
+    assert!(
+        !TENKAI.lines().any(|line| line.trim_start().starts_with("health")),
+        "deploy.health must stay unset; workload conditions are the health check"
+    );
+}
+
+#[test]
+fn statefulset_meets_pod_security_restricted() {
+    for required in [
+        "runAsNonRoot: true",
+        "runAsUser: 999",
+        "fsGroup: 999",
+        "type: RuntimeDefault",
+        "allowPrivilegeEscalation: false",
+        "drop: [\"ALL\"]",
+    ] {
+        assert!(
+            STATEFULSET.contains(required),
+            "restricted pod security needs {required}"
+        );
+    }
+    assert!(
+        !STATEFULSET.contains("runAsUser: 0") && !STATEFULSET.contains("initContainers"),
+        "no root init container; fsGroup owns /data"
     );
 }
 
 #[test]
 fn statefulset_is_single_replica_sqlite_tls_with_ops_probes() {
     let version = crate_version();
-    let image = format!("ghcr.io/sannrox/sekai-chisei:{version}");
+    let image = format!("ghcr.io/sannrox/sekai-chisei:v{version}");
     assert!(
         STATEFULSET.contains(&format!("image: {image}")),
-        "image tag must match crate version {version}"
+        "image must use the published v-prefixed tag for crate version {version}"
     );
     assert!(
         STATEFULSET.contains("kind: StatefulSet"),
