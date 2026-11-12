@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use sekai_chisei::mcp_adapter::{
     FixtureObject, FixtureSurface, InProcessSurface, MAX_FRAME_BYTES, handle_message, read_frame,
-    run_synthetic_host, serve_io, write_frame,
+    run_synthetic_host, serve_io, well_known_tools, write_frame,
 };
+use sekai_chisei::rpc_maturity::{capability_backing_rpc, capability_is_stable};
 use serde_json::json;
 use tokio::io::BufReader;
 
@@ -39,6 +40,17 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
     assert_eq!(report.action_status, "admitted");
     assert_eq!(report.action_operation_id, "op-act-1");
     assert!(report.receipt_present);
+}
+
+/// A projected tool whose backing RPC turned experimental would be refused
+/// by the default MCP host, so every RPC-backed tool on the list is stable.
+#[test]
+fn every_rpc_backed_projected_tool_is_stable() {
+    for tool in well_known_tools() {
+        if capability_backing_rpc(tool).is_some() {
+            assert!(capability_is_stable(tool), "{tool}");
+        }
+    }
 }
 
 #[tokio::test]

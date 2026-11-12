@@ -99,6 +99,15 @@ fn the_example_environment_keeps_the_sqlite_backend() {
     assert_eq!(backends, ["sqlite"]);
 }
 
+/// The server image boots from `SEKAI_DATA_DIR`. A retired single-store
+/// variable in the image would make every container refuse boot.
+#[test]
+fn the_server_image_boots_from_the_data_dir() {
+    let image = include_str!("../build/server-image/Dockerfile");
+    assert!(image.contains("SEKAI_DATA_DIR=/data"));
+    assert!(!image.contains("DB_PATH"));
+}
+
 #[test]
 fn each_plane_derives_only_its_own_file_from_the_data_dir() {
     let cwd = tempdir().unwrap();
