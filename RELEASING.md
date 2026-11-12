@@ -70,14 +70,38 @@ PostgreSQL part prints `skipped: no PostgreSQL`.
 
 ## Tag
 
-Create an annotated, signed tag on the merged release commit on `main`:
+Create an annotated, signed tag on the merged release commit on `main`, or on
+the matching maintenance line (see below):
 
 ```text
 vX.Y.Z
 ```
 
 A tag is never moved, deleted, or reused. The tagged commit must be on
-`main`; the workflow refuses any other commit.
+`main` or on the tag's own line (`release-2.0` for `v2.0.y`); the workflow
+refuses any other commit.
+
+## Maintenance lines
+
+The shared procedure is agent-kit's `prepare-release` reference
+`maintenance-lines.md`. In this repository:
+
+- A line is `release-<major>.<minor>` (`release-2.0` for `v2.0.y`), one per
+  minor. It is created from the last tag of that line when the first eligible
+  fix needs it, never in advance.
+- Only critical bug fixes, security fixes, and prerequisites of a required
+  dependency update qualify. Each lands on `main` first; the backport is one
+  pull request into the line, built with `git cherry-pick -x`, and says so
+  when the pick needed a rewrite.
+- `main` plus at most one previous line are supported.
+- The version bump runs on the line: bump branch `release/<version>` from
+  `release-<major>.<minor>`, squash-merged into the line, then the maintainer tags
+  the merged commit.
+- CI, CodeQL, PostgreSQL conformance, and the security audit run on pushes to
+  `release-*`. The semver and proto-break baselines are the nearest tag on
+  the line, and the N-1 gate tests the line's previous final tag.
+- A release from a line is never GitHub's latest release.
+- `release-*` branches carry the same protection as `main`.
 
 ## Contract versions
 
@@ -128,7 +152,9 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 - checks out the tag and fetches the annotated tag object
 - verifies the signed tag with main's `scripts/verify-release-tag.sh` and
   main's allowed keys against the tagged commit's `Cargo.toml`
-- requires the tagged commit to be on `main`
+- requires the tagged commit to be on `main` or on the tag's maintenance line
+  (`verify-release-tag.sh ancestry`), and marks a line-only release so it is
+  never published as latest
 - builds, packages, tags images, and writes the manifest `git_sha` from that
   commit, and creates the release with `gh release create <tag> --verify-tag`
 - drafts the GitHub Release from the matching CHANGELOG section, uploads the

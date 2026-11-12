@@ -5,7 +5,7 @@ name: PostgreSQL conformance
 # default SQLite test run, so every pull request runs these too (#1316).
 on:
   push:
-    branches: [main]
+    branches: [main, "release-*"]
   pull_request:
   schedule:
     - cron: "41 3 * * 1"

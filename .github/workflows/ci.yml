@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release-*"]
   pull_request:
   schedule:
     - cron: "27 3 * * 1"
 
-# A new push to a pull request cancels its previous run; main runs every push.
+# A new push to a pull request cancels its previous run; main and release-* run every push.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
