@@ -503,14 +503,6 @@ pub fn ollama_models(snapshot: &ModelAvailabilitySnapshot) -> Vec<InstalledModel
 }
 
 #[cfg(test)]
-pub fn replace_model_availability_for_test(snapshot: ModelAvailabilitySnapshot) {
-    let mut cache = CACHE
-        .write()
-        .expect("model availability cache lock is not poisoned");
-    cache.latest = snapshot;
-}
-
-#[cfg(test)]
 mod tests {
     use super::{
         ModelAvailabilitySnapshot, ModelDiscoveryConfig, available_model, discover_catalog,

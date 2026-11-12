@@ -67,8 +67,7 @@ pub struct InProcessSurface {
     /// Whether experimental tools may run. The synthetic plane enables them;
     /// a deployed host passes the operator setting.
     pub experimental_rpcs: bool,
-    /// The plane's store, for tests that seed it directly.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The plane's store, for fixture methods that seed it directly.
     db: Arc<RuntimeDb>,
 }
 

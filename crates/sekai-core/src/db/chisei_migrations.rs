@@ -225,11 +225,4 @@ impl SekaiDb {
             .expect("chisei sql function tables");
         db
     }
-
-    pub fn open_for_chisei_sql_functions(path: &str) -> Self {
-        let db = Self::new(path).expect("open sqlite");
-        db.apply_chisei_sql_function_tables_for_tests()
-            .expect("chisei sql function tables");
-        db
-    }
 }
