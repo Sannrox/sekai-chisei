@@ -6,6 +6,14 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 2.0.2
+
+Maintenance release on the 2.0 line (`release-2.0`). The fix landed on `main` first.
+
+### Fixed
+
+- On PostgreSQL the missing-execution-evidence reconciler no longer starts. Boot logs one warning, where every cycle used to log an error. Missing-evidence alerts stay SQLite-only (#2265).
+
 ## 2.0.1
 
 Maintenance release on the 2.0 line (`release-2.0`). Each fix landed on `main` first.

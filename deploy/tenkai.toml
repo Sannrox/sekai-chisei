@@ -11,14 +11,14 @@
 
 [product]
 name = "sekai-chisei"
-version = "2.0.1"
+version = "2.0.2"
 description = "sekai-chisei control plane (workload instance via Apple container)"
 
 [deploy]
 workdir = "."
 install = """
 set -e
-IMG=ghcr.io/sannrox/sekai-chisei:v2.0.1
+IMG=ghcr.io/sannrox/sekai-chisei:v2.0.2
 container image pull "$IMG" || container image inspect "$IMG" >/dev/null 2>&1
 container volume create sekai-chisei-prod-data >/dev/null 2>&1 || true
 container run --rm --user root -v sekai-chisei-prod-data:/data "$IMG" chown -R sekai /data
@@ -47,7 +47,7 @@ max_evidence_age_ms = 86400000
 
 [compatibility.components.sekai-chisei.pin]
 kind = "digest"
-value = "sha256:84112909c3e6cb1732481f83611796c327a07aa9080f55c1f59e485959556c20"
+value = "sha256:e66d46c2132cc9041fe7bbf5b24fa23a63f372e1920ca1548e5d426db6fbed4e"
 
 [compatibility.components.sekai-chisei.provides]
 "chisei.admin-rpc" = "1.0.0"
