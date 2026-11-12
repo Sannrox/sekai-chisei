@@ -1,8 +1,9 @@
 //! Fail CI when the public API snapshot disagrees with the crate source.
 //!
-//! `public-api.txt` is the retained baseline. After the crate exists on
-//! `origin/main`, removing or changing a recorded item without a major bump
-//! fails even if the working-tree snapshot is updated.
+//! `public-api.txt` is the retained baseline. After the crate exists on the
+//! branch a change merges into (`origin/main`, or `origin/release-*` for a
+//! maintenance line), removing or changing a recorded item without a major
+//! bump fails even if the working-tree snapshot is updated.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +51,7 @@ fn public_api_snapshot_matches_and_major_tracks_breaks() {
         snap_version,
         "public-api.txt crate-version must match CARGO_PKG_VERSION"
     );
-    if let Some((base_version, base_items)) = snapshot_on_origin_main() {
+    if let Some((base_version, base_items)) = snapshot_on_base() {
         let changed: Vec<&String> = base_items
             .iter()
             .filter(|item| !actual.contains(item))
@@ -59,7 +60,8 @@ fn public_api_snapshot_matches_and_major_tracks_breaks() {
             assert_ne!(
                 major(crate_version()),
                 major(&base_version),
-                "public API items changed from origin/main require a major crate bump: {changed:?}"
+                "public API items changed from {} require a major crate bump: {changed:?}",
+                base_ref()
             );
         }
     }
@@ -81,9 +83,22 @@ fn parse_snapshot(text: &str) -> (String, Vec<String>) {
     (version, body)
 }
 
-fn snapshot_on_origin_main() -> Option<(String, Vec<String>)> {
+/// The branch a change merges into: a pull request's base, a pushed
+/// maintenance line, and `main` otherwise (local runs, pushes to `main`).
+fn base_ref() -> String {
+    let var = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let branch = var("GITHUB_BASE_REF")
+        .or_else(|| var("GITHUB_REF_NAME").filter(|name| name.starts_with("release-")))
+        .unwrap_or_else(|| "main".to_string());
+    format!("origin/{branch}")
+}
+
+fn snapshot_on_base() -> Option<(String, Vec<String>)> {
     let output = Command::new("git")
-        .args(["show", "origin/main:crates/sekai-source-sdk/public-api.txt"])
+        .args([
+            "show",
+            &format!("{}:crates/sekai-source-sdk/public-api.txt", base_ref()),
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
