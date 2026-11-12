@@ -71,9 +71,8 @@ axum = "0.8"
 async-stream = "0.3"
 
 # Database
-rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "limits"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "hooks", "limits"] }
 r2d2 = "0.8"
-r2d2_sqlite = "0.35"
 postgres = "0.19"
 postgres-native-tls = "0.5"
 r2d2_postgres = "0.18"
@@ -132,7 +131,7 @@ chisei-core = { version = "2.0.1", path = "crates/chisei-core", features = ["gat
 sekai-core = { version = "3.0.1", path = "crates/sekai-core", features = ["gateway-test-support"] }
 sekai-client = { path = "crates/sekai-client" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
-rusqlite = { version = "0.40", features = ["trace"] }
+rusqlite = { version = "0.41", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned revision.
 mikura-host = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }

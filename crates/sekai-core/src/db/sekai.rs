@@ -1,5 +1,5 @@
+use crate::db::sqlite_manager::SqliteConnectionManager;
 use r2d2::{CustomizeConnection, Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::RefCell;

@@ -13,11 +13,12 @@ Maintenance release on the 2.0 line (`release-2.0`). Each fix landed on `main` f
 Upgrade notes:
 
 - Kubernetes product: the pod now runs as uid and gid 999 with `fsGroup: 999` and no root init container, so it meets restricted pod security. Existing data volumes keep working; on first start, `fsGroup` changes ownership of `/data` (#2311).
-- `sekai-core` is 3.0.1. Library consumers on 2.0.0 need no code change.
+- `sekai-core` is 3.0.1 and depends on `rusqlite` 0.41 (Rust 1.89). Library consumers that also depend on `rusqlite` directly move to 0.41 with it.
 
 ### Security
 
 - Governed-document RPCs require namespace membership (#2249).
+- Move to `rusqlite` 0.41, which bundles SQLite 3.54.1, for RUSTSEC-2026-0459. The bundled SQLite could return uninitialized memory when it opened a crafted `-wal` file (#2237).
 
 ### Fixed
 
