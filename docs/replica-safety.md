@@ -19,13 +19,14 @@ transitions.
 | --- | --- |
 | `shared_store_required` | Only the shared store is authoritative. |
 | `cache_allowed` | Process cache OK with `max_stale_ms`; reload must never widen authority. |
-| `process_local_ok` | Non-authoritative helpers only (e.g. single-process eval scratch). |
+| `process_local_ok` | Non-authoritative helpers only (e.g. single-process eval scratch, operator console cookies). |
 
 Required authoritative surfaces are listed under
 `required_authoritative_surfaces` in the inventory. Callers that treat a surface
 as multi-replica authority must resolve it through
 `ReplicaSafetyInventory::require_authoritative`, which fails closed for unlisted
-or process-local IDs.
+or process-local IDs. Operator console cookies (`ops.console.sessions`) are
+`process_local_ok`; they do not converge across replicas ([ADR 0150](decisions/0150-process-local-console-sessions.md)).
 
 ## Two-replica harness
 

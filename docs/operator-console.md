@@ -56,7 +56,7 @@ foreign data.
 | TLS | Prefer terminating TLS on a reverse proxy in front of the ops port, or run the control plane with `SEKAI_TLS_*` for gRPC and proxy HTTPS to loopback ops. |
 | Cookie Secure | The process issues console cookies without the `Secure` flag so loopback HTTP works. When serving the console only over HTTPS, set `Secure` at the proxy (or restrict the console to HTTPS-only hosts). |
 | Credentials | Use principal-scoped tokens. Sessions re-check durable credential status on every request; revocation ends the session. |
-| Multi-replica | Sessions are **process-local**. Pin console traffic to one instance or accept re-login after failover. |
+| Multi-replica | Sessions are **process-local** ([ADR 0150](decisions/0150-process-local-console-sessions.md)). Pin console traffic to one instance to avoid extra logins. If a request reaches another replica, a rolling restart, or a process that did not mint the cookie, the console fails closed: HTML data routes 303 to `/console/login`, `GET /console/login` returns the sign-in form (200), JSON returns 401, and the session cookie is cleared. Sign in again with the same principal Bearer token. The serving process never renders signed-in chrome for a session it does not hold. |
 | Metrics exposure | `/metrics`, `/healthz`, and `/readyz` remain unauthenticated process endpoints. Do not expose the ops port on an untrusted network solely to serve the console. |
 
 Example reverse-proxy sketch (nginx):

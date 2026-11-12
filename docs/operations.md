@@ -79,8 +79,9 @@ curl --fail http://127.0.0.1:9464/metrics
   [governed-transforms.md](governed-transforms.md).
 - `/console/*` is the authenticated operator shell (principal Bearer login,
   HttpOnly session cookie, namespace context). It always fails closed without a
-  valid session. See [operator-console.md](operator-console.md) for local and
-  TLS run paths.
+  valid session. After failover onto a replica that did not mint the cookie,
+  re-authenticate. See [operator-console.md](operator-console.md) for local,
+  TLS, and multi-replica paths.
 
 Trace export is optional and disabled unless an OTLP endpoint is configured:
 
