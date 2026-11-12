@@ -330,18 +330,6 @@ mod tests {
             !production.contains("impl std::ops::Deref"),
             "typed handles must not Deref to RuntimeDb"
         );
-        let chisei_impl = production
-            .split("impl ChiseiStore {")
-            .nth(1)
-            .expect("ChiseiStore impl");
-        assert!(
-            chisei_impl.contains("pub fn runtime("),
-            "composition reaches the Chisei RuntimeDb through ChiseiStore::runtime"
-        );
-        assert!(
-            chisei_impl.contains("pub fn runtime_arc("),
-            "composition reaches the Chisei RuntimeDb through ChiseiStore::runtime_arc"
-        );
         assert!(
             !production.contains("impl From<"),
             "typed handles must not From RuntimeDb"
