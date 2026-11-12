@@ -1,6 +1,6 @@
 [package]
 name = "sekai-core"
-version = "3.0.0"
+version = "3.0.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "Durable Sekai graph, audit, lineage, security, coordination, and persistence."
@@ -36,7 +36,7 @@ sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
 sekai-ontology = { version = "1.0.0", path = "../sekai-ontology" }
 sekai-parquet-export = { version = "1.0.0", path = "../sekai-parquet-export" }
 sekai-source-sdk = { version = "1.4.0", path = "../sekai-source-sdk" }
-sekai-types = { version = "2.0.0", path = "../sekai-types" }
+sekai-types = { version = "2.0.1", path = "../sekai-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

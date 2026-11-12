@@ -1,6 +1,6 @@
 [package]
 name = "sekai-chisei"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2024"
 license = "Apache-2.0"
 readme = "README.md"
@@ -108,15 +108,15 @@ http-body-util = "0.1"
 pin-project-lite = "0.2"
 tracing = "0.1"
 metrics = "0.24"
-chisei-core = { version = "2.0.0", path = "crates/chisei-core" }
-sekai-core = { version = "3.0.0", path = "crates/sekai-core" }
+chisei-core = { version = "2.0.1", path = "crates/chisei-core" }
+sekai-core = { version = "3.0.1", path = "crates/sekai-core" }
 sekai-domain = { version = "1.1.0", path = "crates/sekai-domain" }
-sekai-types = { version = "2.0.0", path = "crates/sekai-types" }
+sekai-types = { version = "2.0.1", path = "crates/sekai-types" }
 sekai-source-sdk = { version = "1.4.0", path = "crates/sekai-source-sdk" }
 sekai-obs = { version = "1.1.0", path = "crates/sekai-obs" }
 chisei-provider = { version = "1.0.0", path = "crates/chisei-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
-sekai-proto = { version = "2.0.0", path = "crates/sekai-proto" }
+sekai-proto = { version = "2.0.1", path = "crates/sekai-proto" }
 sekai-ontology = { version = "1.0.0", path = "crates/sekai-ontology" }
 mikura = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
 mikura-ingest = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
@@ -128,8 +128,8 @@ arrow-flight = { version = "60", default-features = false }
 futures = "0.3"
 
 [dev-dependencies]
-chisei-core = { version = "2.0.0", path = "crates/chisei-core", features = ["gateway-test-support"] }
-sekai-core = { version = "3.0.0", path = "crates/sekai-core", features = ["gateway-test-support"] }
+chisei-core = { version = "2.0.1", path = "crates/chisei-core", features = ["gateway-test-support"] }
+sekai-core = { version = "3.0.1", path = "crates/sekai-core", features = ["gateway-test-support"] }
 sekai-client = { path = "crates/sekai-client" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.40", features = ["trace"] }
