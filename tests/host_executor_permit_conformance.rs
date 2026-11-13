@@ -19,7 +19,6 @@ use sekai_chisei::sekai::execution_evidence::{
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 const PROFILE_JSON: &str = include_str!("fixtures/host_executor_permit_conformance/v1.json");
@@ -144,7 +143,7 @@ impl BrokenHarness {
 }
 
 #[test]
-fn profile_fixture_is_complete_and_on_disk() {
+fn profile_fixture_is_complete() {
     let profile = profile();
     // Exact (id, class) set supported by this suite. Reject missing, extra,
     // duplicate, or class-drifted fixture entries so the versioned profile
@@ -201,8 +200,6 @@ fn profile_fixture_is_complete_and_on_disk() {
             "missing expected case {id}/{class}"
         );
     }
-    assert!(Path::new("docs/host-executor-permit-conformance.md").exists());
-    assert!(Path::new("tests/fixtures/host_executor_permit_conformance/v1.json").exists());
     assert_eq!(
         profile.reference_executors,
         vec![

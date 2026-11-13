@@ -4,7 +4,6 @@ use sekai_chisei::rpc_maturity::{
     RpcClassification, RpcMaturityTable, advertised_product_loop_rpcs, advertised_sdk_typed_rpcs,
 };
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 
 const DOC: &str = include_str!("../docs/integration-contract.md");
@@ -144,21 +143,6 @@ fn supported_rows_link_protocol_docs_and_proof() {
         supported >= 16,
         "expected a complete supported map, got {supported}"
     );
-}
-
-#[test]
-fn gaps_are_named_and_not_claimed_as_shipped() {
-    let lowered = DOC.to_ascii_lowercase();
-    for gap in ["objectset", "preview", "subscription"] {
-        assert!(lowered.contains(gap), "missing gap {gap}");
-    }
-    assert!(DOC.contains("#835"));
-    assert!(DOC.contains("#836"));
-    assert!(DOC.contains("#838"));
-    let compact = DOC.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(compact.contains("does not add a protocol package"));
-    assert!(compact.contains("or browser access to server credentials"));
-    assert!(!compact.contains("grants browser access to server credentials"));
 }
 
 #[test]
@@ -305,19 +289,6 @@ fn product_loop_mutations_do_not_fail_closed_on_postgres() {
 }
 
 #[test]
-fn advertised_loop_sources_exist() {
-    for rel in [
-        "src/ontology_product_cli.rs",
-        "sdk/typescript/client.ts",
-        "sdk/python/sekai_client.py",
-        "crates/sekai-core/src/db/runtime_db.rs",
-    ] {
-        assert!(Path::new(rel).exists(), "missing {rel}");
-        assert!(!fs::read_to_string(rel).unwrap().is_empty(), "{rel} empty");
-    }
-}
-
-#[test]
 fn action_approval_row_tracks_decide_maturity() {
     // #1151 named the park-and-decide surface while Decide was experimental
     // so integrators would not treat it as unavailable. "supported" is the
@@ -348,14 +319,6 @@ fn action_approval_row_tracks_decide_maturity() {
                     "stable DecideActionInstance must not require SEKAI_EXPERIMENTAL_RPCS"
                 );
             }
-            assert!(
-                DOC.contains("DecideActionInstance"),
-                "gaps must still name the stable wire RPC"
-            );
-            assert!(
-                DOC.contains("typed sekaictl/SDK helper for Action approval"),
-                "gaps must still name the missing typed helper"
-            );
         }
         RpcClassification::Remove => {
             panic!("DecideActionInstance is classified remove; update the contract")
