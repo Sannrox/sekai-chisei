@@ -9,7 +9,6 @@ use sekai_chisei::sekai::workflow_action::{
 };
 use serde::Deserialize;
 
-pub const ADAPTER_ID: &str = PROFILE_APPROVAL_STEP;
 pub const ADAPTER_VERSION: &str = PROFILE_VERSION;
 
 #[derive(Debug, Clone, Deserialize)]

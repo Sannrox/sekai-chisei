@@ -123,6 +123,4 @@ fn hidden_fields_fail_closed() {
         .unwrap()
         .insert("token".into(), serde_json::json!("sk-live"));
     assert!(autonomy_simulate::parse(&serde_json::to_vec(&document).unwrap()).is_err());
-    assert_eq!(autonomy_simulate::ADAPTER_ID, PROFILE_SIMULATE);
-    assert_eq!(autonomy_evaluate::ADAPTER_ID, PROFILE_EVALUATE);
 }

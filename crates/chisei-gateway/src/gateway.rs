@@ -745,14 +745,6 @@ impl GatewayRuntime {
         result
     }
 
-    #[cfg(test)]
-    async fn invalidate_registry_snapshot(&self) {
-        let mut refresh = self.provider_registry_refresh.lock().await;
-        refresh.refreshed_at = None;
-        refresh.result = None;
-        self.provider_registry_refresh_generation
-            .fetch_add(1, Ordering::Release);
-    }
     fn with_recovery_spool_path(mut self, path: Option<PathBuf>) -> Self {
         self.recovery_spool_path = path;
         self

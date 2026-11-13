@@ -5,8 +5,6 @@ use sekai_core::sekai::autonomous_envelope::{
 };
 use serde::Deserialize;
 
-pub const ADAPTER_ID: &str = PROFILE_SIMULATE;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimulateDocument {

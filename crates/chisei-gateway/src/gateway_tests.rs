@@ -713,14 +713,14 @@ async fn retry_safety_is_observable_on_gateway_errors() {
 #[test]
 fn buffered_responses_preserve_incomplete_reason() {
     assert_eq!(
-        buffered_responses_incomplete_reason(
+        buffered_responses_terminal(
             br#"{"id":"resp_1","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}"#,
-        )
-        .as_deref(),
-        Some("max_output_tokens")
+        ),
+        Some(ResponsesTerminal::Incomplete("max_output_tokens".into()))
     );
-    assert!(
-        buffered_responses_incomplete_reason(br#"{"id":"resp_1","status":"completed"}"#,).is_none()
+    assert_eq!(
+        buffered_responses_terminal(br#"{"id":"resp_1","status":"completed"}"#),
+        Some(ResponsesTerminal::Completed)
     );
     assert_eq!(
         buffered_responses_terminal(br#"{"id":"resp_1","status":"failed"}"#),
@@ -2452,8 +2452,7 @@ async fn lifecycle_mutation_invalidation_reloads_the_runtime_snapshot() {
     )
     .unwrap();
 
-    runtime.invalidate_registry_snapshot().await;
-    let after = runtime.refresh_registry_snapshot(false).await.unwrap();
+    let after = runtime.refresh_registry_snapshot(true).await.unwrap();
 
     assert_eq!(before.state_version, 0);
     assert_eq!(after.state_version, 1);

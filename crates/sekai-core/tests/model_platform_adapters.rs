@@ -103,6 +103,4 @@ fn hidden_fields_fail_closed() {
         .unwrap()
         .insert("token".into(), serde_json::json!("sk-live"));
     assert!(model_responses::parse(&serde_json::to_vec(&responses).unwrap()).is_err());
-    assert_eq!(model_responses::ADAPTER_ID, PROFILE_RESPONSES);
-    assert_eq!(model_messages::ADAPTER_ID, PROFILE_MESSAGES);
 }

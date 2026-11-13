@@ -210,7 +210,6 @@ fn two_adapters_pass_submit_park_resume_cancel_duplicate_stale_callback_and_rece
     )
     .unwrap();
     assert_eq!(job.profile_id, PROFILE_JOB_STEP);
-    assert_eq!(workflow_job_step::ADAPTER_ID, PROFILE_JOB_STEP);
     assert_eq!(workflow_job_step::ADAPTER_VERSION, "1.0.0");
     assert_eq!(job.step_id, "job:nightly/build");
     adapter_lifecycle(job, PROFILE_JOB_STEP);
@@ -223,7 +222,6 @@ fn two_adapters_pass_submit_park_resume_cancel_duplicate_stale_callback_and_rece
     )
     .unwrap();
     assert_eq!(approval.profile_id, PROFILE_APPROVAL_STEP);
-    assert_eq!(workflow_approval_step::ADAPTER_ID, PROFILE_APPROVAL_STEP);
     assert_eq!(workflow_approval_step::ADAPTER_VERSION, "1.0.0");
     assert_eq!(approval.step_id, "req:change-1/security");
     adapter_lifecycle(approval, PROFILE_APPROVAL_STEP);

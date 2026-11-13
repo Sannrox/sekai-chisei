@@ -7,8 +7,6 @@ use sekai_core::sekai::lakehouse_snapshot::{
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-pub const ADAPTER_ID: &str = PROFILE_METRICS;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsDocument {
