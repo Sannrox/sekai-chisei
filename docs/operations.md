@@ -129,10 +129,20 @@ recovery state.
 ## Persistence and backups
 
 Combined SQLite dest-pair is two WAL databases (`SEKAI_DB_PATH` and
-`CHISEI_DB_PATH`). A filesystem copy is not safe unless it includes each
-database plus its `-wal` and `-shm` sidecars from one consistent snapshot.
-Prefer SQLite's `VACUUM INTO` for an online logical backup of each dest. The
-retired single `DB_PATH` refuses boot; relocate an old single file first.
+`CHISEI_DB_PATH`) plus the object log (`SEKAI_OBJECT_LOG`, default
+`<SEKAI_DATA_DIR>/objects.mikura`). A filesystem copy is not safe unless it
+includes each database plus its `-wal` and `-shm` sidecars, the object log,
+and the log sidecars (`{log}.joins`, `{log}.joins.delta`, `{log}.ckpt`,
+`{log}.ckpt.prev`) from one consistent snapshot. Prefer SQLite's
+`VACUUM INTO` for an online logical backup of each dest, and copy the object
+log with that snapshot. Restore the log together with the databases; a
+database without its log is a deployment that never had identity generations,
+and a log without its databases cannot rebuild receipts. The retired single
+`DB_PATH` refuses boot; relocate an old single file first.
+
+A deployment that ran without a log is backfilled once at start from recorded
+objects and admitted Action receipts. Killing that backfill and starting
+again produces the same log as an uninterrupted run.
 
 Also preserve state files configured for provider registry lifecycle, gateway
 usage recovery, and durable receipt, usage, and refusal recovery. Test
@@ -212,7 +222,7 @@ reports the full chain on either backend. See
 - [ ] Provider secrets come from the process environment or a secrets adapter.
 - [ ] Gateway request, rate, context, and spool limits are explicit.
 - [ ] The governance failure posture matches the deployment risk model.
-- [ ] Database and sidecar/state backup restoration has been tested.
+- [ ] Database, object log, and sidecar/state backup restoration has been tested.
 - [ ] Logs, receipts, audit records, and metrics have an operator-owned
   retention policy.
 - [ ] The ignored provider smoke tests have been run against the intended

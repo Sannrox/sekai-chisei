@@ -131,18 +131,21 @@ require TLS; the optional CA path only extends trust for a private test CA.
 
 The image exports `SEKAI_DATA_DIR=/data` and `SEKAI_SOCKET=/data/sekai.sock`
 only, so Combined `sekai-chisei` opens split `/data/sekai.db` and
-`/data/chisei.db` without further configuration. Images before this change
-exported `DB_PATH=/data/sekai.db`; a volume that still holds one shared file
-must be relocated before the new image boots. Checked-in compose and
-`deploy/tenkai.toml` set `SEKAI_DB_PATH=/data/sekai.db` and
-`CHISEI_DB_PATH=/data/chisei.db` on the server. File databases use SQLite WAL
-mode, so volume backups must include both dest files plus `-wal`/`-shm`
-sidecars, or use `VACUUM INTO` on each.
+`/data/chisei.db` and the object log `/data/objects.mikura` without further
+configuration. Images before this change exported `DB_PATH=/data/sekai.db`;
+a volume that still holds one shared file must be relocated before the new
+image boots. Checked-in compose and `deploy/tenkai.toml` set
+`SEKAI_DB_PATH=/data/sekai.db` and `CHISEI_DB_PATH=/data/chisei.db` on the
+server. File databases use SQLite WAL mode, so volume backups must include
+both dest files plus `-wal`/`-shm` sidecars, the object log and its sidecars
+(`objects.mikura.joins`, `.joins.delta`, `.ckpt`, `.ckpt.prev`), or use
+`VACUUM INTO` on each dest and copy the log with that snapshot.
 
 The default setup uses:
 
 - shared `sekai-data` volume mounted at `/data`
 - Combined dest-pair files at `/data/sekai.db` and `/data/chisei.db`
+- object log at `/data/objects.mikura`
 - server socket at `/data/sekai.sock`
 - gateway target also set to `/data/sekai.sock` via `SEKAI_SOCKET`
 

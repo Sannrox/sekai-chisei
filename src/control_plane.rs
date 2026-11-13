@@ -44,6 +44,10 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
             .open_layout(&config.db_path)
             .map_err(std::io::Error::other)?,
     );
+    if plane.serves_sekai() {
+        crate::object_log_boot::require_object_log(plane, stores.sekai_runtime().as_ref())
+            .map_err(std::io::Error::other)?;
+    }
     // Principal credentials are Sekai-owned. A Chisei-only dest does not
     // migrate that table; this process authenticates callers without a local
     // credential catalog (insecure local, or a later hop to Sekai).

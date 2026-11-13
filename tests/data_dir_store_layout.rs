@@ -85,6 +85,7 @@ fn combined_without_store_vars_boots_split_under_default_data_dir() {
     boot(env!("CARGO_BIN_EXE_sekai-chisei"), cwd.path(), &[]);
     assert!(cwd.path().join("data/sekai.db").is_file());
     assert!(cwd.path().join("data/chisei.db").is_file());
+    assert!(cwd.path().join("data/objects.mikura").is_file());
 }
 
 /// Operators copy `.env.example` to `.env`, so its backend line is the
@@ -120,6 +121,7 @@ fn each_plane_derives_only_its_own_file_from_the_data_dir() {
         &[("SEKAI_DATA_DIR", sekai_dir.to_str().unwrap())],
     );
     assert!(sekai_dir.join("sekai.db").is_file());
+    assert!(sekai_dir.join("objects.mikura").is_file());
     assert!(!sekai_dir.join("chisei.db").exists());
 
     boot(
@@ -132,6 +134,7 @@ fn each_plane_derives_only_its_own_file_from_the_data_dir() {
     );
     assert!(chisei_dir.join("chisei.db").is_file());
     assert!(!chisei_dir.join("sekai.db").exists());
+    assert!(!chisei_dir.join("objects.mikura").exists());
 }
 
 #[test]
@@ -153,8 +156,46 @@ fn explicit_store_paths_override_the_data_dir() {
     );
     assert!(sekai.is_file());
     assert!(chisei.is_file());
+    assert!(data_dir.join("objects.mikura").is_file());
     assert!(!data_dir.join("sekai.db").exists());
     assert!(!data_dir.join("chisei.db").exists());
+}
+
+#[test]
+fn a_second_combined_process_on_the_same_log_fails_closed() {
+    let cwd = tempdir().unwrap();
+    let port = free_port();
+    let mut first = Running(
+        server_command(env!("CARGO_BIN_EXE_sekai-chisei"), cwd.path(), port, &[])
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(status) = first.0.try_wait().unwrap() {
+            panic!("first combined process exited before serving: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first combined process did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut second = server_command(
+        env!("CARGO_BIN_EXE_sekai-chisei"),
+        cwd.path(),
+        free_port(),
+        &[],
+    );
+    second.stderr(Stdio::piped());
+    let output = second.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "second writer booted: {stderr}");
+    assert!(
+        stderr.contains("log in use") || stderr.contains("HOST"),
+        "second writer must fail closed: {stderr}"
+    );
+    drop(first);
 }
 
 /// Run `bin` with `extras` and require it to refuse boot with the guidance.

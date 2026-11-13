@@ -17,8 +17,8 @@ ed25519-dalek = "2"
 fs2 = "0.4.3"
 hmac = "0.12"
 metrics = "0.24"
-mikura = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
-mikura-ingest = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
+mikura = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
+mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 native-tls = "0.2"
 postgres = { version = "0.19", default-features = false, features = [
     "with-chrono-0_4",
@@ -49,7 +49,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 rusqlite = { version = "0.41", features = ["trace"] }
-mikura-host = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
+mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "std",

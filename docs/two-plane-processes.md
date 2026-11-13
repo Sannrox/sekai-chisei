@@ -10,9 +10,9 @@ Keeping `chisei-plane` is [ADR 0098](decisions/0098-keep-chisei-plane-process.md
 
 | Process | Store | Credentials | Public service |
 | --- | --- | --- | --- |
-| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`; with none set, `<SEKAI_DATA_DIR>/sekai.db`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store only | `SekaiService` |
-| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db` | no local catalog (Sekai-owned); UDS uses the local principal | `ChiseiService` |
-| `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store (combined) | both |
+| `sekai-plane` | `SEKAI_DB_PATH` or `SEKAI_DATABASE_URL`; with none set, `<SEKAI_DATA_DIR>/sekai.db`. Object log: `SEKAI_OBJECT_LOG` or `SEKAI_OBJECT_LOG_HOST`; with neither, `<SEKAI_DATA_DIR>/objects.mikura`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store only | `SekaiService` |
+| `chisei-plane` | `CHISEI_DB_PATH` or `CHISEI_DATABASE_URL`; with no store variable set, `<SEKAI_DATA_DIR>/chisei.db`. Does not open the object log | no local catalog (Sekai-owned); UDS uses the local principal | `ChiseiService` |
+| `sekai-chisei` | dest-pair (`SEKAI_DB_PATH`+`CHISEI_DB_PATH` or the two Postgres URLs); with no store variable set, both files under `SEKAI_DATA_DIR` (default `./data`). Object log defaults to `<SEKAI_DATA_DIR>/objects.mikura`. `DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE` refuse boot | Sekai store (combined) | both |
 
 A Sekai process refuses `CHISEI_DB_PATH` / `CHISEI_DATABASE_URL`. A Chisei
 process refuses `SEKAI_DB_PATH` / `SEKAI_DATABASE_URL`. Each physical store is

@@ -1590,17 +1590,21 @@ dependencies = [
 
 [[package]]
 name = "mikura"
-version = "0.2.0"
-source = "git+https://github.com/Sannrox/mikura?rev=0d43c57df9ddc4de62ecd1b3ad53932766b10124#0d43c57df9ddc4de62ecd1b3ad53932766b10124"
+version = "0.5.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.5.0#63c3dd98d7505e88f7098c5a44d3c0a17fc2dd9e"
 dependencies = [
+ "aes-gcm",
  "crc32fast",
+ "rand 0.8.8",
+ "sekai-keys 1.0.0 (git+https://github.com/Sannrox/sekai-chisei.git?rev=1b2e12789a2b360759a087252367cf4bc633caf0)",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "mikura-host"
-version = "0.2.0"
-source = "git+https://github.com/Sannrox/mikura?rev=0d43c57df9ddc4de62ecd1b3ad53932766b10124#0d43c57df9ddc4de62ecd1b3ad53932766b10124"
+version = "0.5.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.5.0#63c3dd98d7505e88f7098c5a44d3c0a17fc2dd9e"
 dependencies = [
  "mikura",
  "mikura-ingest",
@@ -1610,8 +1614,8 @@ dependencies = [
 
 [[package]]
 name = "mikura-ingest"
-version = "0.2.0"
-source = "git+https://github.com/Sannrox/mikura?rev=0d43c57df9ddc4de62ecd1b3ad53932766b10124#0d43c57df9ddc4de62ecd1b3ad53932766b10124"
+version = "0.5.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.5.0#63c3dd98d7505e88f7098c5a44d3c0a17fc2dd9e"
 dependencies = [
  "mikura",
 ]
@@ -2981,6 +2985,18 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
+ "zeroize",
+]
+
+[[package]]
+name = "sekai-keys"
+version = "1.0.0"
+source = "git+https://github.com/Sannrox/sekai-chisei.git?rev=1b2e12789a2b360759a087252367cf4bc633caf0#1b2e12789a2b360759a087252367cf4bc633caf0"
+dependencies = [
+ "aes-gcm",
+ "libc",
+ "rand 0.8.8",
+ "serde",
  "zeroize",
 ]
 
