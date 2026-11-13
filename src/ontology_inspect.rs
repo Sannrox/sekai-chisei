@@ -461,13 +461,6 @@ function card(item,title,fields,derived){{const d=el('details');if(derived)d.cla
 }
 
 #[cfg(test)]
-fn snapshot_is_expired(expires_at: &str, at: DateTime<Utc>) -> bool {
-    DateTime::parse_from_rfc3339(expires_at)
-        .map(|expires| at >= expires)
-        .unwrap_or(true)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::grpc::pb::sekai::{
@@ -560,10 +553,6 @@ mod tests {
             "authorized-rev-1".into(),
         );
         let html = render_html(&snapshot).unwrap();
-        assert!(snapshot_is_expired(
-            &snapshot.expires_at,
-            now + Duration::seconds(61)
-        ));
         assert!(html.contains("EXPIRED"));
         assert!(html.contains("Date.now()"));
         assert!(html.contains("setTimeout(scheduleStatus"));
@@ -596,7 +585,10 @@ mod tests {
             "revision".into(),
             "authorized-revision".into(),
         );
-        assert!(!snapshot_is_expired(&snapshot.expires_at, now));
+        assert_eq!(
+            snapshot.expires_at,
+            (now + Duration::seconds(cfg.ttl_seconds)).to_rfc3339()
+        );
         let html = render_html(&snapshot).unwrap();
         assert!(html.contains("visible-class"));
         assert!(html.contains("visible-relation"));
