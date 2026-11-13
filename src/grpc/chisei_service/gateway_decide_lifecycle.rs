@@ -251,7 +251,6 @@ impl ChiseiServiceImpl {
             agent: r.agent.trim().to_string(),
             key_id: r.key_id.trim().to_string(),
             task_class: r.task_class.trim().to_string(),
-            user_id: r.user_id.trim().to_string(),
             expected_calls: r.expected_calls.max(1),
             budget_route_bias: route_bias.clone(),
             route_override: r.route_override.trim().to_string(),

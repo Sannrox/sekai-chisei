@@ -655,8 +655,6 @@ pub(super) struct ResolvePolicyRequest {
     pub(super) agent: String,
     pub(super) key_id: String,
     pub(super) task_class: String,
-    #[allow(dead_code)]
-    pub(super) user_id: String,
     pub(super) expected_calls: i64,
     pub(super) budget_route_bias: String,
     pub(super) route_override: String,
