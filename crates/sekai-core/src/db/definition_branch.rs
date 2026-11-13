@@ -1301,7 +1301,7 @@ impl SekaiDb {
         for (kind, fingerprint) in &request.expected_datasources {
             let current = transaction
                 .query_row(
-                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only
+                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property
                      FROM sekai_object_type_datasource WHERE namespace = ?1 AND kind = ?2",
                     params![request.namespace, kind],
                     |row| {
@@ -1311,29 +1311,38 @@ impl SekaiDb {
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|error| error.to_string())?;
             let actual = match current {
-                Some((dataset_id, key_column, mapping, hidden_column, edits_only)) => {
-                    crate::sekai::object_type_index::datasource_fingerprint(
-                        &crate::sekai::object_type_index::ObjectTypeDatasource {
-                            contract_version: crate::sekai::object_type_index::CONTRACT_VERSION
-                                .into(),
-                            namespace: request.namespace.clone(),
-                            kind: kind.clone(),
-                            definition_digest: String::new(),
-                            dataset_id,
-                            key_column,
-                            property_mapping: serde_json::from_str(&mapping)
-                                .map_err(|error| error.to_string())?,
-                            hidden_column,
-                            edits_only: edits_only != 0,
-                        },
-                    )
-                }
+                Some((
+                    dataset_id,
+                    key_column,
+                    mapping,
+                    hidden_column,
+                    edits_only,
+                    conflict_rule,
+                    source_timestamp_property,
+                )) => crate::sekai::object_type_index::datasource_fingerprint(
+                    &crate::sekai::object_type_index::ObjectTypeDatasource {
+                        contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                        namespace: request.namespace.clone(),
+                        kind: kind.clone(),
+                        definition_digest: String::new(),
+                        dataset_id,
+                        key_column,
+                        property_mapping: serde_json::from_str(&mapping)
+                            .map_err(|error| error.to_string())?,
+                        hidden_column,
+                        edits_only: edits_only != 0,
+                        conflict_rule,
+                        source_timestamp_property,
+                    },
+                ),
                 None => String::new(),
             };
             if actual != *fingerprint {

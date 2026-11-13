@@ -9,12 +9,15 @@
 use crate::domain::Object;
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
-use crate::sekai::object_type_index::ObjectTypeIndexMember;
+use crate::sekai::object_type_index::{
+    ObjectTypeIndexEdit, ObjectTypeIndexMember, carry_index_edits, merge_index_edits,
+    parse_property_edit_times,
+};
 use mikura::{
     Aggregate, Breakdown, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
-    ObjectSet, PropertyAcl, Store,
+    ObjectSet, OverlayPatch, PropertyAcl, Store, VersionOrigin,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -776,6 +779,505 @@ fn configured_log_path() -> Option<PathBuf> {
         .or_else(|| INSTALLED_LOG_PATH.get().cloned())
 }
 
+/// One generation of a named property on an identity, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyEditVersion {
+    pub generation: u64,
+    pub action_id: String,
+    pub value: Option<String>,
+    pub origin: &'static str,
+}
+
+/// Merge a sparse index edit into the live overlay, then persist it.
+///
+/// The local log is an exclusive writer, so load-merge-apply runs under the
+/// cached store lock. SQL is the rebuildable projection of that result.
+pub fn merge_and_apply_index_edit(
+    sql_stored: Option<ObjectTypeIndexEdit>,
+    mut incoming: ObjectTypeIndexEdit,
+) -> Result<ObjectTypeIndexEdit, String> {
+    if incoming.action_id.trim().is_empty() {
+        incoming.action_id = overlay_action_id(&incoming);
+    }
+    if configured_log_host()?.is_none() && configured_log_path().is_none() {
+        // Fixture path without a log. Production merge is fenced by the
+        // object log; concurrent SQL-only puts are not recovered from it.
+        return Ok(merge_index_edits(sql_stored, incoming));
+    }
+    ensure_overlay_identity(&incoming)?;
+    if let Some(host) = configured_log_host()? {
+        return merge_and_apply_on_host(&host, sql_stored, incoming);
+    }
+    let path = configured_log_path().ok_or_else(|| "object log path missing".to_string())?;
+    with_cached_object_log_store(&path, |store| {
+        merge_and_apply_on_store(store, sql_stored, incoming)
+    })
+}
+
+fn load_store_overlay(
+    store: &Store,
+    namespace: &str,
+    kind: &str,
+    key: &str,
+) -> Result<Option<ObjectTypeIndexEdit>, String> {
+    match store.overlay(namespace, kind, key) {
+        Ok(patch) => patch.map(edit_from_overlay).transpose(),
+        Err(error) if error.contains("unknown namespace") || error.contains("unknown identity") => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn merge_and_apply_on_store(
+    store: &mut Store,
+    sql_stored: Option<ObjectTypeIndexEdit>,
+    incoming: ObjectTypeIndexEdit,
+) -> Result<ObjectTypeIndexEdit, String> {
+    let expected_gen = live_record(
+        store,
+        &incoming.namespace,
+        &incoming.kind,
+        &incoming.source_key,
+    )
+    .map(|record| record.r#gen);
+    let overlay = load_store_overlay(
+        store,
+        &incoming.namespace,
+        &incoming.kind,
+        &incoming.source_key,
+    )?;
+    let live = overlay.clone().or(sql_stored.clone());
+    let merged = merge_index_edits(live.clone(), incoming.clone());
+    let patch = overlay_patch_from_edit(&merged)?;
+    match store.apply_overlay(patch, merged.action_id.clone(), expected_gen) {
+        Ok(()) => Ok(merged),
+        Err(error) if error.contains("body conflict") => {
+            if incoming_matches_committed_action(store, &incoming)? {
+                return Ok(load_store_overlay(
+                    store,
+                    &incoming.namespace,
+                    &incoming.kind,
+                    &incoming.source_key,
+                )?
+                .or(live)
+                .unwrap_or(incoming));
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn merge_and_apply_on_host(
+    host: &crate::sekai::object_log_host::ObjectLogHost,
+    sql_stored: Option<ObjectTypeIndexEdit>,
+    incoming: ObjectTypeIndexEdit,
+) -> Result<ObjectTypeIndexEdit, String> {
+    let incoming_props = incoming.properties.clone();
+    let incoming_hidden = incoming.hidden;
+    for attempt in 0..8 {
+        let expected_gen = host
+            .load(&incoming.namespace, &incoming.kind, &incoming.source_key)?
+            .map(|record| record.r#gen);
+        let overlay =
+            load_index_overlay(&incoming.namespace, &incoming.kind, &incoming.source_key)?;
+        let merged = merge_index_edits(
+            overlay.clone().or_else(|| sql_stored.clone()),
+            incoming.clone(),
+        );
+        let patch = overlay_patch_from_edit(&merged)?;
+        match host.apply_overlay(&patch, &merged.action_id, expected_gen) {
+            Ok(()) => {
+                let latest =
+                    load_index_overlay(&incoming.namespace, &incoming.kind, &incoming.source_key)?;
+                if latest.as_ref().is_some_and(|edit| {
+                    incoming_props
+                        .iter()
+                        .all(|(key, value)| edit.properties.get(key) == Some(value))
+                        && edit.hidden == incoming_hidden
+                }) {
+                    return Ok(merged);
+                }
+            }
+            Err(error) if error.contains("stale generation") => {}
+            Err(error) if error.contains("body conflict") => {
+                // Host wire has no action-body history. A delayed retry is
+                // accepted only when its properties and hidden still match
+                // the live overlay.
+                if overlay.as_ref().is_some_and(|stored| {
+                    stored.hidden == incoming_hidden
+                        && incoming_props
+                            .iter()
+                            .all(|(key, value)| stored.properties.get(key) == Some(value))
+                }) {
+                    return Ok(overlay.or(sql_stored).unwrap_or(incoming));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
+        if attempt == 7 {
+            return Err("object-log host overlay merge lost an edit".into());
+        }
+    }
+    Err("object-log host overlay merge lost an edit".into())
+}
+
+fn incoming_matches_committed_action(
+    store: &Store,
+    incoming: &ObjectTypeIndexEdit,
+) -> Result<bool, String> {
+    let versions = match store.history(
+        &incoming.namespace,
+        &incoming.kind,
+        &incoming.source_key,
+        &PropertyAcl::allow_all(),
+    ) {
+        Err(error) if error.contains("unknown identity") => return Ok(false),
+        other => other?,
+    };
+    let Some(version) = versions
+        .into_iter()
+        .find(|version| version.record.action_id.as_deref() == Some(incoming.action_id.as_str()))
+    else {
+        return Ok(false);
+    };
+    let hidden = version
+        .record
+        .props
+        .get(INDEX_HIDDEN_PROP)
+        .map(|value| value == "1")
+        .unwrap_or(version.record.hidden);
+    Ok(hidden == incoming.hidden
+        && incoming
+            .properties
+            .iter()
+            .all(|(key, value)| version.record.props.get(key) == Some(value)))
+}
+
+/// Append the accumulated per-property overlay for an index edit.
+///
+/// No configured log is a no-op so SQL-only fixtures keep working.
+pub fn apply_index_edit_overlay(edit: &ObjectTypeIndexEdit) -> Result<(), String> {
+    if configured_log_host()?.is_none() && configured_log_path().is_none() {
+        return Ok(());
+    }
+    let mut edit = edit.clone();
+    if edit.action_id.trim().is_empty() {
+        edit.action_id = overlay_action_id(&edit);
+    }
+    ensure_overlay_identity(&edit)?;
+    let patch = overlay_patch_from_edit(&edit)?;
+    if let Some(host) = configured_log_host()? {
+        return host.apply_overlay(&patch, &edit.action_id, None);
+    }
+    let Some(path) = configured_log_path() else {
+        return Ok(());
+    };
+    with_cached_object_log_store(&path, |store| {
+        store.apply_overlay(patch, edit.action_id.clone(), None)
+    })
+}
+
+/// Rewrite stored overlays after a type-revision rename. Same action_id with
+/// a different patch fails closed, so each rewrite mints a rename action id.
+///
+/// Each identity is loaded from the live overlay and fenced with that
+/// generation so a concurrent property edit is not overwritten by a stale
+/// SQL snapshot.
+pub fn rewrite_index_edit_overlays(
+    edits: &mut [ObjectTypeIndexEdit],
+    rename: &[(String, String)],
+    revision: &str,
+) -> Result<(), String> {
+    if configured_log_host()?.is_none() && configured_log_path().is_none() {
+        carry_index_edits(edits, rename, &[])?;
+        return Ok(());
+    }
+    for edit in edits.iter_mut() {
+        rewrite_one_index_edit_overlay(edit, rename, revision)?;
+    }
+    Ok(())
+}
+
+fn rewrite_one_index_edit_overlay(
+    edit: &mut ObjectTypeIndexEdit,
+    rename: &[(String, String)],
+    revision: &str,
+) -> Result<(), String> {
+    ensure_overlay_identity(edit)?;
+    if let Some(host) = configured_log_host()? {
+        return rewrite_one_on_host(&host, edit, rename, revision);
+    }
+    let path = configured_log_path().ok_or_else(|| "object log path missing".to_string())?;
+    with_cached_object_log_store(&path, |store| {
+        rewrite_one_on_store(store, edit, rename, revision)
+    })
+}
+
+fn rewrite_one_on_store(
+    store: &mut Store,
+    edit: &mut ObjectTypeIndexEdit,
+    rename: &[(String, String)],
+    revision: &str,
+) -> Result<(), String> {
+    let expected_gen = live_record(store, &edit.namespace, &edit.kind, &edit.source_key)
+        .map(|record| record.r#gen);
+    let overlay = load_store_overlay(store, &edit.namespace, &edit.kind, &edit.source_key)?;
+    let mut next = overlay.unwrap_or_else(|| edit.clone());
+    carry_index_edits(std::slice::from_mut(&mut next), rename, &[])?;
+    next.action_id = rename_overlay_action_id(&next, rename, revision);
+    let patch = overlay_patch_from_rename(&next, rename)?;
+    store.apply_overlay(patch, next.action_id.clone(), expected_gen)?;
+    *edit = next;
+    Ok(())
+}
+
+fn rewrite_one_on_host(
+    host: &crate::sekai::object_log_host::ObjectLogHost,
+    edit: &mut ObjectTypeIndexEdit,
+    rename: &[(String, String)],
+    revision: &str,
+) -> Result<(), String> {
+    for attempt in 0..8 {
+        let expected_gen = host
+            .load(&edit.namespace, &edit.kind, &edit.source_key)?
+            .map(|record| record.r#gen);
+        let overlay = load_index_overlay(&edit.namespace, &edit.kind, &edit.source_key)?;
+        let mut next = overlay.unwrap_or_else(|| edit.clone());
+        carry_index_edits(std::slice::from_mut(&mut next), rename, &[])?;
+        next.action_id = rename_overlay_action_id(&next, rename, revision);
+        let patch = overlay_patch_from_rename(&next, rename)?;
+        match host.apply_overlay(&patch, &next.action_id, expected_gen) {
+            Ok(()) => {
+                *edit = next;
+                return Ok(());
+            }
+            Err(error) if error.contains("stale generation") => {}
+            Err(error) => return Err(error),
+        }
+        if attempt == 7 {
+            return Err("object-log host rename rewrite lost an edit".into());
+        }
+    }
+    Err("object-log host rename rewrite lost an edit".into())
+}
+
+/// Latest overlay for each identity, projected as index edits.
+pub fn load_index_overlays(
+    namespace: &str,
+    kind: &str,
+    keys: &[String],
+) -> Result<Vec<ObjectTypeIndexEdit>, String> {
+    if configured_log_host()?.is_none() && configured_log_path().is_none() {
+        return Ok(Vec::new());
+    }
+    let mut edits = Vec::new();
+    for key in keys {
+        if let Some(edit) = load_index_overlay(namespace, kind, key)? {
+            edits.push(edit);
+        }
+    }
+    Ok(edits)
+}
+
+/// History of one property of one identity, oldest first.
+pub fn property_history(
+    namespace: &str,
+    kind: &str,
+    key: &str,
+    property: &str,
+) -> Result<Vec<PropertyEditVersion>, String> {
+    let path = configured_log_path()
+        .ok_or_else(|| "property history requires a local object log".to_string())?;
+    with_cached_object_log_store(&path, |store| {
+        let versions = store.history(namespace, kind, key, &PropertyAcl::allow_all())?;
+        Ok(versions
+            .into_iter()
+            .map(|version| PropertyEditVersion {
+                generation: version.record.r#gen,
+                action_id: version.record.action_id.clone().unwrap_or_default(),
+                value: version.record.props.get(property).cloned(),
+                origin: match version.origin {
+                    VersionOrigin::Source => "source",
+                    VersionOrigin::Edit => "edit",
+                    VersionOrigin::Hide => "hide",
+                },
+            })
+            .collect())
+    })
+}
+
+const INDEX_HIDDEN_PROP: &str = "__sekai_index_hidden";
+const INDEX_PROPERTY_TIMES_PROP: &str = "__sekai_index_property_times";
+
+fn overlay_action_id(edit: &ObjectTypeIndexEdit) -> String {
+    let body = serde_json::to_string(&(edit.hidden, edit.edited_at_ms, &edit.properties))
+        .unwrap_or_default();
+    format!(
+        "put-index-edit:{}/{}/{}:{}",
+        edit.namespace,
+        edit.kind,
+        edit.source_key,
+        crate::sekai::embedding_index::sha_hex(&body)
+    )
+}
+
+fn rename_overlay_action_id(
+    edit: &ObjectTypeIndexEdit,
+    rename: &[(String, String)],
+    revision: &str,
+) -> String {
+    let body = serde_json::to_string(&(revision, rename, &edit.properties)).unwrap_or_default();
+    format!(
+        "type-revision-rename:{}/{}/{}:{}",
+        edit.namespace,
+        edit.kind,
+        edit.source_key,
+        crate::sekai::embedding_index::sha_hex(&body)
+    )
+}
+
+fn overlay_patch_from_edit(edit: &ObjectTypeIndexEdit) -> Result<OverlayPatch, String> {
+    overlay_patch_from_edit_cleared(edit, Vec::new())
+}
+
+fn overlay_patch_from_rename(
+    edit: &ObjectTypeIndexEdit,
+    rename: &[(String, String)],
+) -> Result<OverlayPatch, String> {
+    overlay_patch_from_edit_cleared(
+        edit,
+        rename
+            .iter()
+            .filter(|(old, new)| old != new)
+            .map(|(old, _)| old.clone())
+            .collect(),
+    )
+}
+
+fn overlay_patch_from_edit_cleared(
+    edit: &ObjectTypeIndexEdit,
+    cleared: Vec<String>,
+) -> Result<OverlayPatch, String> {
+    let mut props: HashMap<String, String> = edit.properties.clone().into_iter().collect();
+    props.insert(
+        INDEX_HIDDEN_PROP.into(),
+        if edit.hidden { "1" } else { "0" }.into(),
+    );
+    if !edit.property_edited_at_ms.is_empty() {
+        props.insert(
+            INDEX_PROPERTY_TIMES_PROP.into(),
+            serde_json::to_string(&edit.property_edited_at_ms)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(OverlayPatch {
+        namespace: edit.namespace.clone(),
+        kind: edit.kind.clone(),
+        key: edit.source_key.clone(),
+        props,
+        cleared,
+        action_id: None,
+        at: Some(overlay_at_rfc3339(edit.edited_at_ms)),
+    })
+}
+
+fn overlay_at_rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms.max(0))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn overlay_at_millis(raw: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.timestamp_millis())
+        .unwrap_or(0)
+}
+
+fn edit_from_overlay(patch: OverlayPatch) -> Result<ObjectTypeIndexEdit, String> {
+    let mut properties: BTreeMap<String, String> = patch.props.into_iter().collect();
+    let hidden = properties
+        .remove(INDEX_HIDDEN_PROP)
+        .is_some_and(|value| value == "1");
+    let property_edited_at_ms = match properties.remove(INDEX_PROPERTY_TIMES_PROP) {
+        Some(raw) => parse_property_edit_times(&raw)?,
+        None => BTreeMap::new(),
+    };
+    Ok(ObjectTypeIndexEdit {
+        namespace: patch.namespace,
+        kind: patch.kind,
+        source_key: patch.key,
+        properties,
+        hidden,
+        action_id: patch.action_id.unwrap_or_default(),
+        edited_at_ms: patch.at.as_deref().map(overlay_at_millis).unwrap_or(0),
+        property_edited_at_ms,
+    })
+}
+
+fn ensure_overlay_identity(edit: &ObjectTypeIndexEdit) -> Result<(), String> {
+    if overlay_identity_exists(&edit.namespace, &edit.kind, &edit.source_key)? {
+        return Ok(());
+    }
+    let object = Object {
+        id: edit.source_key.clone(),
+        kind: edit.kind.clone(),
+        name: edit.source_key.clone(),
+        namespace: edit.namespace.clone(),
+        external_id: String::new(),
+        properties: HashMap::new(),
+        created: edit.edited_at_ms.max(1),
+        updated: edit.edited_at_ms.max(1),
+    };
+    ensure_admitted_object_in_configured_log(&object).map(|_| ())
+}
+
+fn overlay_identity_exists(namespace: &str, kind: &str, key: &str) -> Result<bool, String> {
+    if let Some(host) = configured_log_host()? {
+        return host
+            .load(namespace, kind, key)
+            .map(|record| record.is_some());
+    }
+    let Some(path) = configured_log_path() else {
+        return Ok(false);
+    };
+    with_cached_object_log_store(&path, |store| {
+        Ok(live_record(store, namespace, kind, key).is_some())
+    })
+}
+
+fn load_index_overlay(
+    namespace: &str,
+    kind: &str,
+    key: &str,
+) -> Result<Option<ObjectTypeIndexEdit>, String> {
+    if let Some(host) = configured_log_host()? {
+        let Some(record) = host.load(
+            namespace,
+            mikura::OVERLAY_KIND,
+            &OverlayPatch::identity_key(kind, key),
+        )?
+        else {
+            return Ok(None);
+        };
+        return OverlayPatch::from_record(&record)
+            .and_then(edit_from_overlay)
+            .map(Some);
+    }
+    let Some(path) = configured_log_path() else {
+        return Ok(None);
+    };
+    with_cached_object_log_store(&path, |store| match store.overlay(namespace, kind, key) {
+        Ok(patch) => patch.map(edit_from_overlay).transpose(),
+        Err(error) if error.contains("unknown namespace") || error.contains("unknown identity") => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    })
+}
+
 /// Record the local log path Combined/Sekai boot opened so later admits
 /// write the same file without requiring the operator to set `SEKAI_OBJECT_LOG`.
 pub fn install_process_log_path(path: PathBuf) {
@@ -1248,11 +1750,14 @@ pub fn identity_generation(
 
 /// The current visible record for one identity, by direct lookup. Missing or
 /// hidden identities read as absent, as the v0.1 visible-kind scan did.
-fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Option<ObjectRecord> {
+fn live_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Option<ObjectRecord> {
     store
         .load(namespace, kind, key, &PropertyAcl::allow_all())
         .ok()
-        .filter(|record| !record.hidden)
+}
+
+fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Option<ObjectRecord> {
+    live_record(store, namespace, kind, key).filter(|record| !record.hidden)
 }
 
 #[cfg(test)]

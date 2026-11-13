@@ -884,7 +884,7 @@ impl PostgresDb {
             )?;
             let current = transaction
                 .query_opt(
-                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only
+                    "SELECT dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property
                      FROM sekai_object_type_datasource WHERE namespace = $1 AND kind = $2",
                     &[&request.namespace, kind],
                 )
@@ -902,6 +902,8 @@ impl PostgresDb {
                             .map_err(|error| error.to_string())?,
                         hidden_column: row.get(3),
                         edits_only: row.get(4),
+                        conflict_rule: row.get(5),
+                        source_timestamp_property: row.get(6),
                     },
                 ),
                 None => String::new(),

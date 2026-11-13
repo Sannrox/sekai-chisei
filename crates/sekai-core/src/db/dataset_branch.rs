@@ -982,6 +982,8 @@ pub fn datasource(
         property_mapping: Default::default(),
         hidden_column: String::new(),
         edits_only: false,
+        conflict_rule: String::new(),
+        source_timestamp_property: String::new(),
     }
 }
 

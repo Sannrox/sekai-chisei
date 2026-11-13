@@ -112,6 +112,8 @@ pub(super) async fn register_object_type_datasource(
         property_mapping: proto.property_mapping.into_iter().collect(),
         hidden_column: proto.hidden_column,
         edits_only: proto.edits_only,
+        conflict_rule: proto.conflict_rule,
+        source_timestamp_property: proto.source_timestamp_property,
     }
     .prepare()
     .map_err(|error| Status::invalid_argument(error.message()))?;
@@ -219,6 +221,9 @@ pub(super) async fn put_object_type_index_edit(
             source_key: input.source_key,
             properties: input.properties.into_iter().collect(),
             hidden: input.hidden,
+            action_id: input.idempotency_key,
+            edited_at_ms: now_millis(),
+            property_edited_at_ms: Default::default(),
         })
         .map_err(Status::internal)?;
     Ok(Response::new(PutObjectTypeIndexEditResponse {}))
@@ -237,6 +242,8 @@ fn to_proto_datasource(
         property_mapping: binding.property_mapping.clone().into_iter().collect(),
         hidden_column: binding.hidden_column.clone(),
         edits_only: binding.edits_only,
+        conflict_rule: binding.conflict_rule.clone(),
+        source_timestamp_property: binding.source_timestamp_property.clone(),
     }
 }
 

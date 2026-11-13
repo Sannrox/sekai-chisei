@@ -3,7 +3,7 @@ use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
     HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
     ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
-    member_from_edit, member_from_row, schema_drift,
+    mapping_renames, member_from_row, overlay_member, parse_property_edit_times, schema_drift,
 };
 use rusqlite::params;
 use std::collections::{BTreeMap, HashMap};
@@ -22,6 +22,8 @@ impl SekaiDb {
                     property_mapping TEXT NOT NULL,
                     hidden_column TEXT NOT NULL DEFAULT '',
                     edits_only INTEGER NOT NULL DEFAULT 0,
+                    conflict_rule TEXT NOT NULL DEFAULT '',
+                    source_timestamp_property TEXT NOT NULL DEFAULT '',
                     created_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (namespace, kind)
                 );
@@ -52,6 +54,9 @@ impl SekaiDb {
                     source_key TEXT NOT NULL,
                     properties TEXT NOT NULL,
                     hidden INTEGER NOT NULL DEFAULT 0,
+                    action_id TEXT NOT NULL DEFAULT '',
+                    edited_at_ms INTEGER NOT NULL DEFAULT 0,
+                    property_edited_at_ms TEXT NOT NULL DEFAULT '{}',
                     PRIMARY KEY (namespace, kind, source_key)
                 );
                 CREATE TABLE IF NOT EXISTS sekai_object_type_index_join (
@@ -85,6 +90,31 @@ impl SekaiDb {
              ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
             [],
         );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_datasource
+             ADD COLUMN conflict_rule TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_datasource
+             ADD COLUMN source_timestamp_property TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_index_edit
+             ADD COLUMN action_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_index_edit
+             ADD COLUMN edited_at_ms INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = self.conn().execute(
+            "ALTER TABLE sekai_object_type_index_edit
+             ADD COLUMN property_edited_at_ms TEXT NOT NULL DEFAULT '{}'",
+            [],
+        );
         Ok(())
     }
 
@@ -96,11 +126,28 @@ impl SekaiDb {
         let existing = self.get_object_type_datasource(&binding.namespace, &binding.kind)?;
         let mapping =
             serde_json::to_string(&binding.property_mapping).map_err(|e| e.to_string())?;
+        let rename = existing.as_ref().map_or(Vec::new(), |previous| {
+            mapping_renames(&previous.property_mapping, &binding.property_mapping)
+        });
+        if !rename.is_empty() {
+            let mut edits = self.list_object_type_index_edits(&binding.namespace, &binding.kind)?;
+            // Rewrite overlays before the mapping INSERT so a failed rewrite
+            // does not strand edits under old names. Retrying this register
+            // recomputes the same rename from the still-old mapping and
+            // replays. Holding the SQL lock across the log rewrite deadlocks
+            // with put (log then SQL).
+            crate::sekai::object_log::rewrite_index_edit_overlays(
+                &mut edits,
+                &rename,
+                &binding.definition_digest,
+            )?;
+            self.replace_object_type_index_edits(&binding.namespace, &binding.kind, &edits)?;
+        }
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_object_type_datasource
-                 (namespace, kind, definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (namespace, kind, definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property, created_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                 params![
                     binding.namespace,
                     binding.kind,
@@ -110,6 +157,8 @@ impl SekaiDb {
                     mapping,
                     binding.hidden_column,
                     i64::from(binding.edits_only),
+                    binding.conflict_rule,
+                    binding.source_timestamp_property,
                     created_at_ms
                 ],
             )
@@ -130,7 +179,7 @@ impl SekaiDb {
     ) -> Result<Option<ObjectTypeDatasource>, String> {
         self.conn()
             .query_row(
-                "SELECT definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only
+                "SELECT definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property
                  FROM sekai_object_type_datasource WHERE namespace = ?1 AND kind = ?2",
                 params![namespace, kind],
                 |row| {
@@ -142,13 +191,24 @@ impl SekaiDb {
                         mapping,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .optional_row()
             .map_err(|error| error.to_string())?
             .map(
-                |(definition_digest, dataset_id, key_column, mapping, hidden_column, edits_only)| {
+                |(
+                    definition_digest,
+                    dataset_id,
+                    key_column,
+                    mapping,
+                    hidden_column,
+                    edits_only,
+                    conflict_rule,
+                    source_timestamp_property,
+                )| {
                     let property_mapping: BTreeMap<String, String> =
                         serde_json::from_str(&mapping).map_err(|error| error.to_string())?;
                     Ok(ObjectTypeDatasource {
@@ -161,6 +221,50 @@ impl SekaiDb {
                         property_mapping,
                         hidden_column,
                         edits_only: edits_only != 0,
+                        conflict_rule,
+                        source_timestamp_property,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn get_object_type_index_edit(
+        &self,
+        namespace: &str,
+        kind: &str,
+        source_key: &str,
+    ) -> Result<Option<ObjectTypeIndexEdit>, String> {
+        self.conn()
+            .query_row(
+                "SELECT properties, hidden, action_id, edited_at_ms, property_edited_at_ms
+                 FROM sekai_object_type_index_edit
+                 WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
+                params![namespace, kind, source_key],
+                |row| {
+                    let properties: String = row.get(0)?;
+                    Ok((
+                        properties,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional_row()
+            .map_err(|error| error.to_string())?
+            .map(
+                |(properties, hidden, action_id, edited_at_ms, property_edited_at_ms)| {
+                    Ok(ObjectTypeIndexEdit {
+                        namespace: namespace.into(),
+                        kind: kind.into(),
+                        source_key: source_key.into(),
+                        properties: serde_json::from_str(&properties).map_err(|e| e.to_string())?,
+                        hidden: hidden != 0,
+                        action_id,
+                        edited_at_ms,
+                        property_edited_at_ms: parse_property_edit_times(&property_edited_at_ms)?,
                     })
                 },
             )
@@ -168,21 +272,63 @@ impl SekaiDb {
     }
 
     pub fn put_object_type_index_edit(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
+        self.reserve_index_edit_identity(edit)?;
+        let merged = crate::sekai::object_log::merge_and_apply_index_edit(
+            self.get_object_type_index_edit(&edit.namespace, &edit.kind, &edit.source_key)?,
+            edit.clone(),
+        )?;
+        self.store_index_edit_projection(&merged)
+    }
+
+    fn reserve_index_edit_identity(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
+        self.conn()
+            .execute(
+                "INSERT OR IGNORE INTO sekai_object_type_index_edit
+                 (namespace, kind, source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms)
+                 VALUES (?1,?2,?3,'{}',0,'',0,'{}')",
+                params![edit.namespace, edit.kind, edit.source_key],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn store_index_edit_projection(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
         let properties = serde_json::to_string(&edit.properties).map_err(|e| e.to_string())?;
+        let property_times =
+            serde_json::to_string(&edit.property_edited_at_ms).map_err(|e| e.to_string())?;
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO sekai_object_type_index_edit
-                 (namespace, kind, source_key, properties, hidden) VALUES (?1,?2,?3,?4,?5)",
+                 (namespace, kind, source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     edit.namespace,
                     edit.kind,
                     edit.source_key,
                     properties,
-                    i64::from(edit.hidden)
+                    i64::from(edit.hidden),
+                    edit.action_id,
+                    edit.edited_at_ms,
+                    property_times
                 ],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn replace_object_type_index_edits(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+        edits: &[ObjectTypeIndexEdit],
+    ) -> Result<(), String> {
+        // Upsert in place. A pre-delete would drop recovery keys for
+        // identities the log still holds if the process crashed before the
+        // following inserts.
+        for edit in edits {
+            self.store_index_edit_projection(edit)?;
+        }
+        Ok(())
     }
 
     pub fn apply_object_type_index(
@@ -257,6 +403,13 @@ impl SekaiDb {
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut last_row_id = after_id;
+        self.project_log_overlays_into_edits(namespace, kind)?;
+        let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
+            .list_object_type_index_edits(namespace, kind)?
+            .into_iter()
+            .map(|edit| (edit.source_key.clone(), edit))
+            .collect();
+        let mut members: BTreeMap<String, ObjectTypeIndexMember> = BTreeMap::new();
         if !binding.edits_only {
             let rows = self.list_dataset_row_records(&binding.dataset_id)?;
             for (row_id, data) in rows {
@@ -264,19 +417,41 @@ impl SekaiDb {
                     continue;
                 }
                 last_row_id = last_row_id.max(row_id);
-                let member = match member_from_row(&binding, &data) {
-                    Ok(member) => member,
-                    Err(_) => continue,
+                let Ok(member) = member_from_row(&binding, &data) else {
+                    continue;
                 };
-                if self.upsert_index_member(&member)? {
-                    rewritten += 1;
-                } else {
-                    skipped += 1;
-                }
+                members.insert(member.source_key.clone(), member);
             }
         }
-        for edit in self.list_object_type_index_edits(namespace, kind)? {
-            let member = member_from_edit(&binding, &edit);
+        let processed: BTreeMap<String, ()> =
+            members.keys().cloned().map(|key| (key, ())).collect();
+        for (source_key, mut member) in members {
+            if let Some(edit) = edits.get(&source_key) {
+                member = overlay_member(&binding, Some(member), edit)?;
+            }
+            if self.upsert_index_member(&member)? {
+                rewritten += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        let leftover_keys: BTreeMap<String, ()> = edits
+            .keys()
+            .filter(|key| !processed.contains_key(*key))
+            .cloned()
+            .map(|key| (key, ()))
+            .collect();
+        let mut sources = self.leftover_source_members(&binding, &leftover_keys)?;
+        for (source_key, edit) in &edits {
+            if processed.contains_key(source_key) {
+                continue;
+            }
+            // Reservation stub: key exists for log recovery, not a committed edit.
+            if edit.properties.is_empty() && edit.action_id.is_empty() && !edit.hidden {
+                continue;
+            }
+            let source = sources.remove(source_key);
+            let member = overlay_member(&binding, source, edit)?;
             self.force_upsert_index_member(&member)?;
             rewritten += 1;
         }
@@ -446,7 +621,7 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
-    fn list_object_type_index_edits(
+    pub fn list_object_type_index_edits(
         &self,
         namespace: &str,
         kind: &str,
@@ -454,7 +629,8 @@ impl SekaiDb {
         let conn = self.conn();
         let mut stmt = conn
             .prepare(
-                "SELECT source_key, properties, hidden FROM sekai_object_type_index_edit
+                "SELECT source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms
+                 FROM sekai_object_type_index_edit
                  WHERE namespace = ?1 AND kind = ?2",
             )
             .map_err(|error| error.to_string())?;
@@ -464,15 +640,92 @@ impl SekaiDb {
         let mut edits = Vec::new();
         while let Some(row) = rows.next().map_err(|error| error.to_string())? {
             let properties: String = row.get(1).map_err(|error| error.to_string())?;
+            let property_times: String = row.get(5).map_err(|error| error.to_string())?;
             edits.push(ObjectTypeIndexEdit {
                 namespace: namespace.into(),
                 kind: kind.into(),
                 source_key: row.get(0).map_err(|error| error.to_string())?,
                 properties: serde_json::from_str(&properties).map_err(|error| error.to_string())?,
                 hidden: row.get::<_, i64>(2).map_err(|error| error.to_string())? != 0,
+                action_id: row.get(3).map_err(|error| error.to_string())?,
+                edited_at_ms: row.get(4).map_err(|error| error.to_string())?,
+                property_edited_at_ms: parse_property_edit_times(&property_times)?,
             });
         }
         Ok(edits)
+    }
+
+    fn leftover_source_members(
+        &self,
+        binding: &ObjectTypeDatasource,
+        keys: &BTreeMap<String, ()>,
+    ) -> Result<BTreeMap<String, ObjectTypeIndexMember>, String> {
+        let mut sources = BTreeMap::new();
+        if binding.edits_only || keys.is_empty() {
+            return Ok(sources);
+        }
+        for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+            let Ok(member) = member_from_row(binding, &data) else {
+                continue;
+            };
+            if keys.contains_key(&member.source_key) {
+                sources.insert(member.source_key.clone(), member);
+            }
+        }
+        Ok(sources)
+    }
+
+    fn project_log_overlays_into_edits(&self, namespace: &str, kind: &str) -> Result<(), String> {
+        let keys = self.index_overlay_keys(namespace, kind)?;
+        for edit in crate::sekai::object_log::load_index_overlays(namespace, kind, &keys)? {
+            self.store_index_edit_projection(&edit)?;
+        }
+        Ok(())
+    }
+
+    fn index_overlay_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+        let mut keys = BTreeMap::new();
+        for edit in self.list_object_type_index_edits(namespace, kind)? {
+            keys.insert(edit.source_key, ());
+        }
+        // Pinned Store has no overlay identity scan. SQL edit keys include the
+        // stub reserved before overlay apply, so a crash after the log commit
+        // still names the identity. Hidden members and dataset keys remain
+        // recovery keys when that stub is gone.
+        for key in self.list_index_member_keys(namespace, kind)? {
+            keys.insert(key, ());
+        }
+        if let Some(binding) = self.get_object_type_datasource(namespace, kind)?
+            && !binding.edits_only
+        {
+            for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+                if let Some(key) = data.get(&binding.key_column) {
+                    let key = key.trim();
+                    if !key.is_empty() {
+                        keys.insert(key.to_string(), ());
+                    }
+                }
+            }
+        }
+        Ok(keys.into_keys().collect())
+    }
+
+    fn list_index_member_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_key FROM sekai_object_type_index_member
+                 WHERE namespace = ?1 AND kind = ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut rows = stmt
+            .query(params![namespace, kind])
+            .map_err(|error| error.to_string())?;
+        let mut keys = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            keys.push(row.get(0).map_err(|error| error.to_string())?);
+        }
+        Ok(keys)
     }
 
     fn upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<bool, String> {
@@ -955,6 +1208,8 @@ mod tests {
             property_mapping: BTreeMap::from([("region".into(), "region".into())]),
             hidden_column: "hidden".into(),
             edits_only: false,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         }
         .prepare()
         .unwrap()
@@ -1089,6 +1344,9 @@ mod tests {
             source_key: "c1".into(),
             properties: BTreeMap::from([("region".into(), "edited".into())]),
             hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 25,
+            property_edited_at_ms: Default::default(),
         })
         .unwrap();
         db.apply_object_type_index("sales", "Customer", true, 30)
@@ -1098,6 +1356,930 @@ mod tests {
             .unwrap();
         assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
         assert!(visible[0].from_edit);
+    }
+
+    #[test]
+    fn property_edit_keeps_unedited_source_values_after_rebuild() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "name", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("name".into(), "Ada".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("name".into(), "name".into());
+        db.register_object_type_datasource(&binding, 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 25,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("name".into(), "Ada L.".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 40)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
+        assert_eq!(visible[0].properties.get("name").unwrap(), "Ada L.");
+    }
+
+    #[test]
+    fn newest_wins_rebuild_keeps_later_source_value() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "updated_at", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("updated_at".into(), "10".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("updated_at".into(), "updated_at".into());
+        binding.conflict_rule = "newest_wins".into();
+        binding.source_timestamp_property = "updated_at".into();
+        db.register_object_type_datasource(&binding, 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("updated_at".into(), "50".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 40)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert_eq!(visible[0].properties.get("region").unwrap(), "us");
+    }
+
+    #[test]
+    fn type_revision_rename_carries_property_edits() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 25,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        let mut next = binding();
+        next.property_mapping = BTreeMap::from([("area".into(), "region".into())]);
+        db.register_object_type_datasource(&next, 30).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 40)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert_eq!(visible[0].properties.get("area").unwrap(), "edited");
+        assert!(!visible[0].properties.contains_key("region"));
+    }
+
+    #[test]
+    fn deleted_sql_edits_rebuild_from_the_object_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("objects-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "name", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("name".into(), "Ada".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            let mut binding = binding();
+            binding
+                .property_mapping
+                .insert("name".into(), "name".into());
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 20)
+                .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 30)
+                .unwrap();
+            let before = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            db.conn()
+                .execute("DELETE FROM sekai_object_type_index_edit", [])
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 40)
+                .unwrap();
+            let after = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(after[0].properties, before[0].properties);
+            assert_eq!(after[0].properties.get("region").unwrap(), "edited");
+            assert_eq!(after[0].properties.get("name").unwrap(), "Ada");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn property_history_reads_edits_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("history-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            db.register_object_type_datasource(&binding(), 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region-1".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "later".into())]),
+                hidden: false,
+                action_id: "act-region-2".into(),
+                edited_at_ms: 40,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            let history =
+                crate::sekai::object_log::property_history("sales", "Customer", "c1", "region")
+                    .unwrap();
+            let edits: Vec<_> = history
+                .iter()
+                .filter(|version| version.origin == "edit")
+                .map(|version| version.value.clone())
+                .collect();
+            assert_eq!(edits, vec![Some("edited".into()), Some("later".into())]);
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn incremental_reindex_applies_edit_without_new_dataset_rows() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 25,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        db.apply_object_type_index("sales", "Customer", false, 30)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
+    }
+
+    #[test]
+    fn incremental_reindex_unhides_when_edit_clears_hidden() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows(
+            "ds-customers",
+            &[HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::new(),
+            hidden: true,
+            action_id: "act-hide".into(),
+            edited_at_ms: 25,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        db.apply_object_type_index("sales", "Customer", false, 30)
+            .unwrap();
+        assert!(
+            db.list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+        db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::new(),
+            hidden: false,
+            action_id: "act-show".into(),
+            edited_at_ms: 35,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap();
+        db.apply_object_type_index("sales", "Customer", false, 40)
+            .unwrap();
+        let visible = db
+            .list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert!(!visible[0].hidden);
+    }
+
+    #[test]
+    fn hidden_edit_rebuilds_from_the_object_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("hidden-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            db.register_object_type_datasource(&binding(), 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::new(),
+                hidden: true,
+                action_id: "act-hide".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 30)
+                .unwrap();
+            assert!(
+                db.list_visible_index_members("sales", "Customer", &RowQuery::default())
+                    .unwrap()
+                    .is_empty()
+            );
+            db.conn()
+                .execute("DELETE FROM sekai_object_type_index_edit", [])
+                .unwrap();
+            db.conn()
+                .execute("DELETE FROM sekai_object_type_index_member", [])
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 40)
+                .unwrap();
+            assert!(
+                db.list_visible_index_members("sales", "Customer", &RowQuery::default())
+                    .unwrap()
+                    .is_empty()
+            );
+            let hidden: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT hidden FROM sekai_object_type_index_member
+                     WHERE namespace = 'sales' AND kind = 'Customer' AND source_key = 'c1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(hidden, 1);
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn type_revision_rename_rewrites_object_log_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("rename-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            db.register_object_type_datasource(&binding(), 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            let mut next = binding();
+            next.property_mapping = BTreeMap::from([("area".into(), "region".into())]);
+            db.register_object_type_datasource(&next, 30).unwrap();
+            db.conn()
+                .execute("DELETE FROM sekai_object_type_index_edit", [])
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 40)
+                .unwrap();
+            let visible = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(visible[0].properties.get("area").unwrap(), "edited");
+            assert!(!visible[0].properties.contains_key("region"));
+            let region_history =
+                crate::sekai::object_log::property_history("sales", "Customer", "c1", "region")
+                    .unwrap();
+            assert!(
+                region_history
+                    .last()
+                    .is_some_and(|version| version.value.is_none()),
+                "{region_history:?}"
+            );
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn newest_wins_rebuild_from_log_uses_per_property_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("times-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "name", "updated_at", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("name".into(), "Ada".into()),
+                    ("updated_at".into(), "20".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            let mut binding = binding();
+            binding
+                .property_mapping
+                .insert("name".into(), "name".into());
+            binding
+                .property_mapping
+                .insert("updated_at".into(), "updated_at".into());
+            binding.conflict_rule = "newest_wins".into();
+            binding.source_timestamp_property = "updated_at".into();
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 20)
+                .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 10,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("name".into(), "Edited".into())]),
+                hidden: false,
+                action_id: "act-name".into(),
+                edited_at_ms: 30,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "us".into()),
+                    ("name".into(), "Ada L.".into()),
+                    ("updated_at".into(), "20".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 40)
+                .unwrap();
+            let before = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(before[0].properties.get("region").unwrap(), "us");
+            assert_eq!(before[0].properties.get("name").unwrap(), "Edited");
+            db.conn()
+                .execute("DELETE FROM sekai_object_type_index_edit", [])
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 50)
+                .unwrap();
+            let after = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(after[0].properties.get("region").unwrap(), "us");
+            assert_eq!(after[0].properties.get("name").unwrap(), "Edited");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn delayed_retry_of_an_earlier_action_keeps_later_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("retry-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "name", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("name".into(), "Ada".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            let mut binding = binding();
+            binding
+                .property_mapping
+                .insert("name".into(), "name".into());
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("name".into(), "Ada L.".into())]),
+                hidden: false,
+                action_id: "act-name".into(),
+                edited_at_ms: 40,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 55,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 60)
+                .unwrap();
+            let visible = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
+            assert_eq!(visible[0].properties.get("name").unwrap(), "Ada L.");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn generated_action_ids_distinguish_hide_and_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("hide-show-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            db.register_object_type_datasource(&binding(), 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::new(),
+                hidden: true,
+                action_id: String::new(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::new(),
+                hidden: false,
+                action_id: String::new(),
+                edited_at_ms: 40,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 50)
+                .unwrap();
+            let visible = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(visible.len(), 1);
+            assert!(!visible[0].hidden);
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn reserved_edit_identity_rebuilds_after_stub_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("stub-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            let mut binding = binding();
+            binding.edits_only = true;
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.conn()
+                .execute(
+                    "UPDATE sekai_object_type_index_edit
+                     SET properties = '{}', action_id = '', edited_at_ms = 0, property_edited_at_ms = '{}'
+                     WHERE namespace = 'sales' AND kind = 'Customer' AND source_key = 'c1'",
+                    [],
+                )
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 40)
+                .unwrap();
+            let stored = db
+                .get_object_type_index_edit("sales", "Customer", "c1")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.properties.get("region").unwrap(), "edited");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn reservation_stub_without_overlay_does_not_create_a_member() {
+        let db = db();
+        let mut binding = binding();
+        binding.edits_only = true;
+        db.register_object_type_datasource(&binding, 10).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_object_type_index_edit
+                 (namespace, kind, source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms)
+                 VALUES ('sales', 'Customer', 'c1', '{}', 0, '', 0, '{}')",
+                [],
+            )
+            .unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        assert!(
+            db.list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mutated_retry_of_an_earlier_action_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("mutated-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "name", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("name".into(), "Ada".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            let mut binding = binding();
+            binding
+                .property_mapping
+                .insert("name".into(), "name".into());
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("name".into(), "Ada L.".into())]),
+                hidden: false,
+                action_id: "act-name".into(),
+                edited_at_ms: 40,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            let error = db
+                .put_object_type_index_edit(&ObjectTypeIndexEdit {
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    source_key: "c1".into(),
+                    properties: BTreeMap::from([("region".into(), "asia".into())]),
+                    hidden: false,
+                    action_id: "act-region".into(),
+                    edited_at_ms: 55,
+                    property_edited_at_ms: Default::default(),
+                })
+                .unwrap_err();
+            assert!(error.contains("body conflict"), "{error}");
+            db.apply_object_type_index("sales", "Customer", true, 60)
+                .unwrap();
+            let visible = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(visible[0].properties.get("region").unwrap(), "edited");
+            assert_eq!(visible[0].properties.get("name").unwrap(), "Ada L.");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
+    }
+
+    #[test]
+    fn type_revision_rename_keeps_a_newer_live_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir
+            .path()
+            .join(format!("rename-live-{}.mikura", std::process::id()));
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            let db = db();
+            db.create_dataset(&dataset(
+                "ds-customers",
+                &["customer_id", "region", "name", "hidden"],
+            ))
+            .unwrap();
+            db.append_rows(
+                "ds-customers",
+                &[HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("name".into(), "Ada".into()),
+                    ("hidden".into(), "0".into()),
+                ])],
+            )
+            .unwrap();
+            let mut binding = binding();
+            binding
+                .property_mapping
+                .insert("name".into(), "name".into());
+            db.register_object_type_datasource(&binding, 10).unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 25,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            let mut snapshot = db
+                .list_object_type_index_edits("sales", "Customer")
+                .unwrap();
+            db.put_object_type_index_edit(&ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("name".into(), "Ada L.".into())]),
+                hidden: false,
+                action_id: "act-name".into(),
+                edited_at_ms: 40,
+                property_edited_at_ms: Default::default(),
+            })
+            .unwrap();
+            crate::sekai::object_log::rewrite_index_edit_overlays(
+                &mut snapshot,
+                &[("region".into(), "area".into())],
+                "rev-area",
+            )
+            .unwrap();
+            db.replace_object_type_index_edits("sales", "Customer", &snapshot)
+                .unwrap();
+            db.apply_object_type_index("sales", "Customer", true, 50)
+                .unwrap();
+            let visible = db
+                .list_visible_index_members("sales", "Customer", &RowQuery::default())
+                .unwrap();
+            assert_eq!(visible[0].properties.get("area").unwrap(), "edited");
+            assert_eq!(visible[0].properties.get("name").unwrap(), "Ada L.");
+        });
+        crate::sekai::object_log::release_process_object_log_cache();
     }
 
     #[test]

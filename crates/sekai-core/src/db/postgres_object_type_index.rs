@@ -3,9 +3,9 @@ use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
     HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
     ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
-    member_from_edit, member_from_row, schema_drift,
+    mapping_renames, member_from_row, overlay_member, parse_property_edit_times, schema_drift,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 impl PostgresDb {
     pub fn register_object_type_datasource(
@@ -16,6 +16,23 @@ impl PostgresDb {
         let existing = self.get_object_type_datasource(&binding.namespace, &binding.kind)?;
         let mapping =
             serde_json::to_string(&binding.property_mapping).map_err(|e| e.to_string())?;
+        let rename = existing.as_ref().map_or(Vec::new(), |previous| {
+            mapping_renames(&previous.property_mapping, &binding.property_mapping)
+        });
+        if !rename.is_empty() {
+            let mut edits = self.list_object_type_index_edits(&binding.namespace, &binding.kind)?;
+            // Rewrite overlays before the mapping INSERT so a failed rewrite
+            // does not strand edits under old names. Retrying this register
+            // recomputes the same rename from the still-old mapping and
+            // replays. Holding the datasource lock across the log rewrite
+            // deadlocks with put (log then SQL).
+            crate::sekai::object_log::rewrite_index_edit_overlays(
+                &mut edits,
+                &rename,
+                &binding.definition_digest,
+            )?;
+            self.replace_object_type_index_edits(&binding.namespace, &binding.kind, &edits)?;
+        }
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
@@ -28,15 +45,17 @@ impl PostgresDb {
         transaction
             .execute(
                 "INSERT INTO sekai_object_type_datasource
-                 (namespace, kind, definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, created_at_ms)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                 (namespace, kind, definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property, created_at_ms)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                  ON CONFLICT (namespace, kind) DO UPDATE SET
                    definition_digest = EXCLUDED.definition_digest,
                    dataset_id = EXCLUDED.dataset_id,
                    key_column = EXCLUDED.key_column,
                    property_mapping = EXCLUDED.property_mapping,
                    hidden_column = EXCLUDED.hidden_column,
-                   edits_only = EXCLUDED.edits_only",
+                   edits_only = EXCLUDED.edits_only,
+                   conflict_rule = EXCLUDED.conflict_rule,
+                   source_timestamp_property = EXCLUDED.source_timestamp_property",
                 &[
                     &binding.namespace,
                     &binding.kind,
@@ -46,6 +65,8 @@ impl PostgresDb {
                     &mapping,
                     &binding.hidden_column,
                     &binding.edits_only,
+                    &binding.conflict_rule,
+                    &binding.source_timestamp_property,
                     &created_at_ms,
                 ],
             )
@@ -67,7 +88,7 @@ impl PostgresDb {
     ) -> Result<Option<ObjectTypeDatasource>, String> {
         self.connection()?
             .query_opt(
-                "SELECT definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only
+                "SELECT definition_digest, dataset_id, key_column, property_mapping, hidden_column, edits_only, conflict_rule, source_timestamp_property
                  FROM sekai_object_type_datasource WHERE namespace=$1 AND kind=$2",
                 &[&namespace, &kind],
             )
@@ -84,29 +105,109 @@ impl PostgresDb {
                     property_mapping: serde_json::from_str(&mapping).map_err(|e| e.to_string())?,
                     hidden_column: row.get(4),
                     edits_only: row.get(5),
+                    conflict_rule: row.get(6),
+                    source_timestamp_property: row.get(7),
+                })
+            })
+            .transpose()
+    }
+
+    pub fn get_object_type_index_edit(
+        &self,
+        namespace: &str,
+        kind: &str,
+        source_key: &str,
+    ) -> Result<Option<ObjectTypeIndexEdit>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT properties, hidden, action_id, edited_at_ms, property_edited_at_ms
+                 FROM sekai_object_type_index_edit
+                 WHERE namespace=$1 AND kind=$2 AND source_key=$3",
+                &[&namespace, &kind, &source_key],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                let properties: String = row.get(0);
+                let property_times: String = row.get(4);
+                Ok(ObjectTypeIndexEdit {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key: source_key.into(),
+                    properties: serde_json::from_str(&properties).map_err(|e| e.to_string())?,
+                    hidden: row.get(1),
+                    action_id: row.get(2),
+                    edited_at_ms: row.get(3),
+                    property_edited_at_ms: parse_property_edit_times(&property_times)?,
                 })
             })
             .transpose()
     }
 
     pub fn put_object_type_index_edit(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
-        let properties = serde_json::to_string(&edit.properties).map_err(|e| e.to_string())?;
+        self.reserve_index_edit_identity(edit)?;
+        let merged = crate::sekai::object_log::merge_and_apply_index_edit(
+            self.get_object_type_index_edit(&edit.namespace, &edit.kind, &edit.source_key)?,
+            edit.clone(),
+        )?;
+        self.store_index_edit_projection(&merged)
+    }
+
+    fn reserve_index_edit_identity(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
         self.connection()?
             .execute(
                 "INSERT INTO sekai_object_type_index_edit
-                 (namespace, kind, source_key, properties, hidden) VALUES ($1,$2,$3,$4,$5)
+                 (namespace, kind, source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms)
+                 VALUES ($1,$2,$3,'{}',false,'',0,'{}')
+                 ON CONFLICT (namespace, kind, source_key) DO NOTHING",
+                &[&edit.namespace, &edit.kind, &edit.source_key],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn store_index_edit_projection(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
+        let properties = serde_json::to_string(&edit.properties).map_err(|e| e.to_string())?;
+        let property_times =
+            serde_json::to_string(&edit.property_edited_at_ms).map_err(|e| e.to_string())?;
+        self.connection()?
+            .execute(
+                "INSERT INTO sekai_object_type_index_edit
+                 (namespace, kind, source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT (namespace, kind, source_key) DO UPDATE SET
-                   properties = EXCLUDED.properties, hidden = EXCLUDED.hidden",
+                   properties = EXCLUDED.properties,
+                   hidden = EXCLUDED.hidden,
+                   action_id = EXCLUDED.action_id,
+                   edited_at_ms = EXCLUDED.edited_at_ms,
+                   property_edited_at_ms = EXCLUDED.property_edited_at_ms",
                 &[
                     &edit.namespace,
                     &edit.kind,
                     &edit.source_key,
                     &properties,
                     &edit.hidden,
+                    &edit.action_id,
+                    &edit.edited_at_ms,
+                    &property_times,
                 ],
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    pub fn replace_object_type_index_edits(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+        edits: &[ObjectTypeIndexEdit],
+    ) -> Result<(), String> {
+        // Upsert in place. A pre-delete would drop recovery keys for
+        // identities the log still holds if the process crashed before the
+        // following inserts.
+        for edit in edits {
+            self.store_index_edit_projection(edit)?;
+        }
+        Ok(())
     }
 
     pub fn apply_object_type_index(
@@ -159,6 +260,13 @@ impl PostgresDb {
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut last_row_id = after_id;
+        self.project_log_overlays_into_edits(namespace, kind)?;
+        let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
+            .list_object_type_index_edits(namespace, kind)?
+            .into_iter()
+            .map(|edit| (edit.source_key.clone(), edit))
+            .collect();
+        let mut members: BTreeMap<String, ObjectTypeIndexMember> = BTreeMap::new();
         if !binding.edits_only {
             for (row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
                 if row_id <= after_id {
@@ -168,15 +276,38 @@ impl PostgresDb {
                 let Ok(member) = member_from_row(&binding, &data) else {
                     continue;
                 };
-                if self.upsert_index_member(&member)? {
-                    rewritten += 1;
-                } else {
-                    skipped += 1;
-                }
+                members.insert(member.source_key.clone(), member);
             }
         }
-        for edit in self.list_object_type_index_edits(namespace, kind)? {
-            let member = member_from_edit(&binding, &edit);
+        let processed: BTreeMap<String, ()> =
+            members.keys().cloned().map(|key| (key, ())).collect();
+        for (source_key, mut member) in members {
+            if let Some(edit) = edits.get(&source_key) {
+                member = overlay_member(&binding, Some(member), edit)?;
+            }
+            if self.upsert_index_member(&member)? {
+                rewritten += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        let leftover_keys: BTreeMap<String, ()> = edits
+            .keys()
+            .filter(|key| !processed.contains_key(*key))
+            .cloned()
+            .map(|key| (key, ()))
+            .collect();
+        let mut sources = self.leftover_source_members(&binding, &leftover_keys)?;
+        for (source_key, edit) in &edits {
+            if processed.contains_key(source_key) {
+                continue;
+            }
+            // Reservation stub: key exists for log recovery, not a committed edit.
+            if edit.properties.is_empty() && edit.action_id.is_empty() && !edit.hidden {
+                continue;
+            }
+            let source = sources.remove(source_key);
+            let member = overlay_member(&binding, source, edit)?;
             self.force_upsert_index_member(&member)?;
             rewritten += 1;
         }
@@ -331,14 +462,15 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    fn list_object_type_index_edits(
+    pub fn list_object_type_index_edits(
         &self,
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<ObjectTypeIndexEdit>, String> {
         self.connection()?
             .query(
-                "SELECT source_key, properties, hidden FROM sekai_object_type_index_edit
+                "SELECT source_key, properties, hidden, action_id, edited_at_ms, property_edited_at_ms
+                 FROM sekai_object_type_index_edit
                  WHERE namespace=$1 AND kind=$2",
                 &[&namespace, &kind],
             )
@@ -346,14 +478,86 @@ impl PostgresDb {
             .into_iter()
             .map(|row| {
                 let properties: String = row.get(1);
+                let property_times: String = row.get(5);
                 Ok(ObjectTypeIndexEdit {
                     namespace: namespace.into(),
                     kind: kind.into(),
                     source_key: row.get(0),
                     properties: serde_json::from_str(&properties).map_err(|e| e.to_string())?,
                     hidden: row.get(2),
+                    action_id: row.get(3),
+                    edited_at_ms: row.get(4),
+                    property_edited_at_ms: parse_property_edit_times(&property_times)?,
                 })
             })
+            .collect()
+    }
+
+    fn leftover_source_members(
+        &self,
+        binding: &ObjectTypeDatasource,
+        keys: &BTreeMap<String, ()>,
+    ) -> Result<BTreeMap<String, ObjectTypeIndexMember>, String> {
+        let mut sources = BTreeMap::new();
+        if binding.edits_only || keys.is_empty() {
+            return Ok(sources);
+        }
+        for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+            let Ok(member) = member_from_row(binding, &data) else {
+                continue;
+            };
+            if keys.contains_key(&member.source_key) {
+                sources.insert(member.source_key.clone(), member);
+            }
+        }
+        Ok(sources)
+    }
+
+    fn project_log_overlays_into_edits(&self, namespace: &str, kind: &str) -> Result<(), String> {
+        let keys = self.index_overlay_keys(namespace, kind)?;
+        for edit in crate::sekai::object_log::load_index_overlays(namespace, kind, &keys)? {
+            self.store_index_edit_projection(&edit)?;
+        }
+        Ok(())
+    }
+
+    fn index_overlay_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+        let mut keys = BTreeMap::new();
+        for edit in self.list_object_type_index_edits(namespace, kind)? {
+            keys.insert(edit.source_key, ());
+        }
+        // Pinned Store has no overlay identity scan. SQL edit keys include the
+        // stub reserved before overlay apply, so a crash after the log commit
+        // still names the identity. Hidden members and dataset keys remain
+        // recovery keys when that stub is gone.
+        for key in self.list_index_member_keys(namespace, kind)? {
+            keys.insert(key, ());
+        }
+        if let Some(binding) = self.get_object_type_datasource(namespace, kind)?
+            && !binding.edits_only
+        {
+            for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+                if let Some(key) = data.get(&binding.key_column) {
+                    let key = key.trim();
+                    if !key.is_empty() {
+                        keys.insert(key.to_string(), ());
+                    }
+                }
+            }
+        }
+        Ok(keys.into_keys().collect())
+    }
+
+    fn list_index_member_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+        self.connection()?
+            .query(
+                "SELECT source_key FROM sekai_object_type_index_member
+                 WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| Ok(row.get(0)))
             .collect()
     }
 
