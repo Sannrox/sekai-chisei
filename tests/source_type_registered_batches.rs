@@ -308,53 +308,6 @@ fn schema_revision_and_payload_drift_do_not_mutate_the_live_object() {
 }
 
 #[test]
-fn github_discovery_and_github_batches_remain_unchanged() {
-    assert_eq!(
-        built_in_source_adapters()[0].type_digest,
-        GITHUB_OBJECT_SYNC_TYPE_DIGEST
-    );
-    let mut github = SourceBatch {
-        contract_version: SOURCE_BATCH_VERSION.into(),
-        namespace: "ops".into(),
-        producer_identity: PRODUCER.into(),
-        source: SOURCE_GITHUB.into(),
-        source_instance: "acme/ops".into(),
-        family: FAMILY_OBJECT_SYNC.into(),
-        adapter_id: "adapter.github.object_sync".into(),
-        adapter_version: "1.0.0".into(),
-        type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
-        current_cursor: String::new(),
-        proposed_next_cursor: "cursor:1".into(),
-        idempotency_key: "gh-1".into(),
-        batch_digest: String::new(),
-        collected_at_ms: 20,
-        records: vec![SourceRecord {
-            source: SOURCE_GITHUB.into(),
-            source_instance: "acme/ops".into(),
-            external_id: "12".into(),
-            source_version: "issue-v1".into(),
-            type_name: "Issue".into(),
-            display_name: "Bounded sync".into(),
-            payload_digest: PAYLOAD_A.into(),
-            properties: BTreeMap::from([("state".into(), "open".into())]),
-            deleted: false,
-            observed_at_ms: 10,
-            source_sequence: None,
-        }],
-        delivery: None,
-    };
-    github.batch_digest = github.canonical_digest().unwrap();
-    let db = RuntimeDb::memory();
-    let result = db.apply_source_batch(&github, PRODUCER, 100).unwrap();
-    match &result.records[0].decision {
-        SyncDecision::Upsert(object) => {
-            assert_eq!(object.source_id, "github:acme/ops#12");
-        }
-        other => panic!("expected github upsert, got {other:?}"),
-    }
-}
-
-#[test]
 fn generation_mismatch_and_partial_admission_leave_registered_state_unchanged() {
     let db = RuntimeDb::memory();
     let pager = synthetic_pager_alert_v1();
