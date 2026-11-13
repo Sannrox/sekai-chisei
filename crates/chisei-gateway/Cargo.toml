@@ -48,5 +48,5 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-sekai-chisei = { version = "3.0.0", path = "../..", features = ["gateway-test-support"] }
+sekai-chisei = { version = "3.1.0", path = "../..", features = ["gateway-test-support"] }
 tempfile = "3"

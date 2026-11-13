@@ -27,7 +27,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: sekai-chisei
-          image: ghcr.io/sannrox/sekai-chisei:v3.0.0
+          image: ghcr.io/sannrox/sekai-chisei:v3.1.0
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

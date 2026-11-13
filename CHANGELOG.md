@@ -6,6 +6,30 @@ pull request body, which becomes the squash commit; at release,
 
 ## Unreleased
 
+## 3.1.0
+
+Upgrade notes:
+
+- Server and protocol family version is 3.1.0. `sekai-proto` stays 3.0.0. Tenkai products stay on `chisei.admin-rpc` 1.1.0 and `chisei.enterprise-rpc` 1.0.0.
+- No store migration. A 3.0.0 SQLite or PostgreSQL store opens on 3.1.0 unchanged. A binary or image rollback to 3.0.0 does not need a schema undo.
+- Operator console sessions stay process-local. After failover, a rolling restart, or a request that lands on a process that did not mint `sekai_console_sid`, HTML data routes 303 to `/console/login`, JSON returns 401, and the cookie is cleared. Sign in again with the same principal Bearer token (#2088, #2312).
+- Kubernetes product image tag is `v3.1.0`. The pod runs as uid and gid 999 with Pod Security restricted and no root init container; `fsGroup: 999` adopts the data volume. Tenkai in-process health is the StatefulSet conditions (#2313).
+- Hosted sessions use existing `SubmitActionInstance`. New kinds are `hosted_session` and `hosted_session_member`; new Action types are `hosted_session.create`, `hosted_session.join`, and `hosted_session.intent`. Direct `CreateObject` / `UpdateObject` of those kinds is refused. No new RPC (#2132, #2308).
+
+### Added
+
+- Host bounded sessions with join and intents (#2308)
+
+### Fixed
+
+- Fail closed when a console session is unknown to this process (#2312)
+- Make the Kubernetes product deliverable (#2313)
+
+### Changed
+
+- Release tags from a matching maintenance line (#2316)
+- Build the aarch64-apple-darwin binary on macos-15 (#2275)
+
 ## 3.0.0
 
 Upgrade notes:

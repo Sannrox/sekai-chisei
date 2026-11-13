@@ -10,7 +10,7 @@
 
 [product]
 name = "sekai-chisei"
-version = "3.0.0"
+version = "3.1.0"
 description = "sekai-chisei control plane (Kubernetes StatefulSet)"
 kind = "software"
 
@@ -36,7 +36,7 @@ max_evidence_age_ms = 86400000
 
 [compatibility.components.sekai-chisei.pin]
 kind = "digest"
-value = "sha256:3688411f5a80a4c17f026e185291e82b8fc0399cfa3f3e55041fd6f790e46664"
+value = "sha256:5cdf63e90d93ff3bb6a1e410a60a535eeadb9535d44fff147e07761b251c804a"
 
 [compatibility.components.sekai-chisei.provides]
 "chisei.admin-rpc" = "1.1.0"
