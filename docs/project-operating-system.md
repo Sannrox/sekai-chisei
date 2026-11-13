@@ -239,6 +239,8 @@ project-specific material.
 | `assess-change-impact` | Scope a proposed or implemented change across domain and trust boundaries. | Issue/PR/diff and affected paths. | Impact matrix, required tests, migration/docs/security obligations, open risks. | Trace SQLite/PostgreSQL, gateway/native, and policy/audit effects. It does not approve architecture or replace a security audit. |
 | `verify-change` | Select and run proportionate deterministic checks for a Rust change. | Diff or paths plus stated outcome. | Commands, results, skipped checks with reasons, and remaining uncertainty. | Start focused, expand by risk, and never claim unrun checks. Live-provider tests stay opt-in and secret-safe. |
 | `capture-project-decision` | Promote a resolved choice into the right durable artifact. | Accepted Discussion/Issue/PR outcome and alternatives. | ADR, doc/Skill update, or explicit `no durable artifact` decision with links. | Preserve one source of truth and mark superseded ADRs. It does not turn unresolved debate into policy. |
+| `technical-documentation` | Build or review technical docs and agent instruction files. | Doc or governance scope, build or review mode. | Drafted or reviewed docs, drift findings, and validation notes. | Keep `AGENTS.md` canonical and `CLAUDE.md` identical. It does not change product behavior. |
+| `refactor-docs` | Restructure an existing docs page without losing facts. | Target page and its sources. | Rewritten page with a keep/drop/move audit and verification. | Preserve every source-backed claim. It does not add unverified content. |
 | `prepare-release` | Assemble release readiness and evidence. | Target version, milestone/merged PRs, current tree and CI. | Version/compatibility checklist, validation report, release-note draft, and blockers. | Verify rather than publish. Tagging, pushing, and releasing require explicit maintainer authorization. |
 
 The Skills are intentionally composable:
@@ -570,7 +572,7 @@ edited into user-facing `Added`, `Changed`, `Fixed`, `Security`, and
 `Migration` sections where applicable.
 
 Release prep runs `bash scripts/changelog-draft.sh <version>`, which prints a
-Keep a Changelog section for the Pull Requests merged since the last `v*` tag:
+Keep a Changelog section for the Pull Requests merged since the last final `v*` tag (rc and beta tags do not count):
 `feat` under Added, `fix` under Fixed, `refactor` and `perf` under Changed,
 and Breaking and Upgrade entries from `risk:breaking` and `risk:migration`
 labels or the matching body headings. The release owner edits that section
@@ -645,7 +647,7 @@ or merging solely from AI review. These need accountable maintainer judgment.
 Use Issues only for work that will outlive the current session or needs a
 decision trail. Keep a weekly ready queue of roughly three to seven items. Use
 Discussions sparingly for decisions where outside feedback is genuinely useful.
-The maintainer owns all artifacts; the five core Skills supply consistency.
+The maintainer owns all artifacts; the core workflow Skills supply consistency.
 
 ### Small OSS project
 

@@ -138,8 +138,9 @@ lives in the separate [research index](research/README.md).
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
   `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
   hops/aggregates, evaluated through authorized list and traverse.
-- [Permission-aware search](search.md) — experimental text search over
-  objects and dataset metadata under the live read policy.
+- [Permission-aware search](search.md) — stable `Search` and
+  `GetSearchIndexStatus` over objects and dataset metadata under the live read
+  policy.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   `ExpandNeighborhood` and `FindPaths` under the live read policy at every hop.
 - [Explaining a property value](explain-value.md) — experimental

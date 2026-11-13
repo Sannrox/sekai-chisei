@@ -232,7 +232,7 @@ holds the record.
    `status=denied` (not a hard gRPC error so clients can inspect the receipt).
    `require_approval` → durable instance with `status=parked`: no object
    write, no effects, and an open receipt. See [Approval](#approval).
-8. **Budget** hierarchical subject `action:governed[/:<budget_scope>]/project:<ns>/agent:<actor>`
+8. **Budget** hierarchical subject `action:governed[:<budget_scope>]/project:<ns>/agent:<actor>`
    when a `BudgetTracker` is configured. Exhausted → `status=denied`. A type
    with `budget_work_unit_parameter` appends `/work_unit:<value>`, so a limit
    set on that scope caps one turn; one with `budget_amount_parameter`

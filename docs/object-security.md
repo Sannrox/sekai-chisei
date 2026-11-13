@@ -130,8 +130,8 @@ digest; it is not an object grant. Missing, incompatible, expired,
 wrong-actor, stale, or out-of-scope purpose omits the row. List cursors bind
 the presented purpose with the existing authority digest. Credential admins
 issue and revoke authorizations through `PutPurposeAuthorization` and
-`RevokePurposeAuthorization`. SQLite stores them; PostgreSQL fails closed as
-unavailable. Optional namespace classification lattices
+`RevokePurposeAuthorization`. SQLite and PostgreSQL
+store them. Optional namespace classification lattices
 (`sekai.classification-lattice/v1`) are published the same way; see
 [classification markings](classification-markings.md). Generic object writes reject NUL
 property keys and values so new rows cannot poison PostgreSQL policy casts.

@@ -63,5 +63,4 @@ Unrequested classified fields are omitted. Requesting them fails before any
 disclosure. Re-admission of the same live image and content digest is
 idempotent. Partial output is discarded.
 
-SQLite stores images, renditions, and annotations. PostgreSQL surfaces stay
-unavailable.
+SQLite and PostgreSQL store images, renditions, and annotations.

@@ -21,8 +21,8 @@ issuance; do not share the socket with untrusted local processes.
 
 ### Local insecure TCP
 
-`SEKAI_INSECURE=1` disables token authentication, allows the compatibility
-`x-principal` identity header, and defaults TCP to `127.0.0.1`. An explicit
+`SEKAI_INSECURE=1` disables token authentication, forces the caller principal to
+`local` (a client `x-principal` header is ignored), and defaults TCP to `127.0.0.1`. An explicit
 `SEKAI_BIND` overrides that loopback default. Never combine insecure mode with
 a non-loopback bind; use it only for trusted local development.
 

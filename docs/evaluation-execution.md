@@ -243,7 +243,9 @@ receipts. Partially completed receipts remain resumable by a compatible
 executor; otherwise they remain readable evidence and correctly do not produce
 `allow`.
 
-Metrics expose only evaluator labels (`compiled_builtin` or `external_adapter`),
+Metrics expose only evaluator labels (`subject_digest_equality`,
+`bounded_rubric_score`, `external_adapter`, or `custom_builtin` /
+`custom_stochastic` for unlabelled registrations),
 version labels, the closed status vocabulary, and latency. They contain no namespace,
 subject, evidence identifier, digest, parameter, or content label.
 

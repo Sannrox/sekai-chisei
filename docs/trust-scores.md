@@ -57,7 +57,7 @@ purpose, as members are. It scores each member, drops members below
 `min_score`, and with `order_by_score` sorts highest first, then by object
 id. Every signal is read as the caller: a hidden verification property, a
 hidden linking object adds nothing, and a caller outside the namespace sees
-every source as `unavailable`, as `ReportSourceHealth` does. One request reads
+every source as `unavailable`, as `GetSourceHealth` does. One request reads
 at most 10,000 link rows for the agreement and conflict factors, then fails
 with `RESOURCE_EXHAUSTED`; a factor with no weight reads none.
 

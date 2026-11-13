@@ -45,7 +45,7 @@ names it. The superseded record stays inspectable and fails smoke.
 | Unknown package, foreign owner, digest mismatch, unknown language, superseded smoke | `client package is unavailable` |
 | Unknown contract version | `client package protocol is unsupported` |
 
-SQLite stores publications. PostgreSQL surfaces stay unavailable.
+SQLite and community PostgreSQL store publications (#1477).
 
 Local artifacts, publication records, and registry packages are different
 objects. Isolated proof stages Rust, TypeScript, and Python trees, pins

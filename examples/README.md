@@ -3,9 +3,9 @@
 Runnable examples for the `sekai-chisei` control plane. Each one is a standalone
 binary that links the library crate and talks to a running gRPC server.
 
-Evidence adapter examples (`evidence_*`) and the batch Responses harness live
-under `examples/` as thin runners and are documented in
-[adapters/README.md](../adapters/README.md).
+Evidence adapter examples (`evidence_*`, under `crates/sekai-adapters/examples/`)
+and the batch Responses harness (`crates/chisei-core/examples/`) are thin
+runners documented in [adapters/README.md](../adapters/README.md).
 
 ## epistemic_replication
 
@@ -123,18 +123,6 @@ ollama pull llama3.2
 If the model is not reachable, the step reports the error and the demo still
 finishes.
 
-## delegation
-
-[delegation.rs](../crates/sekai-adapters/examples/delegation.rs) sketches the privacy-preserving delegation chain:
-local Ollama planning with private context, a frontier `template_only` rubric
-request, local private composition, and a leak-checked `template_only` polish
-pass. It prints the `PlanExecution` request sequence without making network or
-model calls:
-
-```bash
-cargo run -p sekai-adapters --example delegation
-```
-
 ### Configuration
 
 The example honors the same environment variables as the server:
@@ -161,6 +149,18 @@ It sends caller identity via `x-principal` using `SEKAI_PRINCIPAL`.
   demo's generated object id, so it reports `namespace not found in sekai` for the
   enrichment steps. That is expected — the graph object and the pipeline's namespace
   lookup are independent in this demo.
+
+## delegation
+
+[delegation.rs](../crates/sekai-adapters/examples/delegation.rs) sketches the privacy-preserving delegation chain:
+local Ollama planning with private context, a frontier `template_only` rubric
+request, local private composition, and a leak-checked `template_only` polish
+pass. It prints the `PlanExecution` request sequence without making network or
+model calls:
+
+```bash
+cargo run -p sekai-adapters --example delegation
+```
 
 ## incident_response
 

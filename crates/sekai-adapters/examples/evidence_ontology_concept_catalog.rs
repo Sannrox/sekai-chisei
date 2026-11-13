@@ -19,8 +19,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "submission={} state={} projected={} deduplicated={}",
         submission.id, submission.lifecycle_state, result.projected, result.deduplicated
     );
-    println!(
-        "next: ProposeOntologyDefinitions with submission id (dry_run=true first), then ReviewOntologyDefinitionProposal"
-    );
     Ok(())
 }

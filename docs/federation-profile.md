@@ -219,9 +219,8 @@ follow-up.
 
 ## Runtime notes
 
-- SQLite is the reference store (`sekai_federation_local_site`,
-  `sekai_federation_peers`). Community PostgreSQL fails closed as unavailable
-  until parity is required.
+- SQLite and community PostgreSQL both store federation state
+  (`sekai_federation_local_site`, `sekai_federation_peers`).
 - Trust roots live in `sekai_peer_trust_roots` (#290).
 - Single-plane residency enforcement remains [residency-policy.md](residency-policy.md).
 
