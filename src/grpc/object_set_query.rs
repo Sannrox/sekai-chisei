@@ -2265,6 +2265,8 @@ mod tests {
                     )]),
                     hidden_column: "hidden".into(),
                     edits_only: false,
+                    conflict_rule: String::new(),
+                    source_timestamp_property: String::new(),
                 }),
                 idempotency_key: "reg-1".into(),
             },
@@ -2425,6 +2427,8 @@ mod tests {
                     ]),
                     hidden_column: "hidden".into(),
                     edits_only: false,
+                    conflict_rule: String::new(),
+                    source_timestamp_property: String::new(),
                 }),
                 idempotency_key: "reg-filter".into(),
             },
@@ -3877,6 +3881,8 @@ mod tests {
                 .collect(),
             hidden_column: "hidden".into(),
             edits_only: false,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         }
         .prepare()
         .unwrap();
@@ -4745,6 +4751,8 @@ mod tests {
                     property_mapping: Default::default(),
                     hidden_column: String::new(),
                     edits_only: false,
+                    conflict_rule: String::new(),
+                    source_timestamp_property: String::new(),
                 },
                 99,
             )

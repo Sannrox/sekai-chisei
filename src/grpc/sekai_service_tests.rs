@@ -31076,6 +31076,8 @@ async fn change_bundle_dry_run_backfills_a_branch_and_leaves_the_dataset() {
                 property_mapping: BTreeMap::new(),
                 hidden_column: String::new(),
                 edits_only: false,
+                conflict_rule: String::new(),
+                source_timestamp_property: String::new(),
             },
             1,
         )
@@ -31748,6 +31750,8 @@ async fn bundle_apply_fixture(
                 property_mapping: BTreeMap::new(),
                 hidden_column: String::new(),
                 edits_only: false,
+                conflict_rule: String::new(),
+                source_timestamp_property: String::new(),
             },
             1,
         )
@@ -32343,6 +32347,8 @@ async fn a_datasource_remapped_between_attempts_is_migrated_again() {
                 property_mapping: BTreeMap::from([("subject".into(), "subject_col".into())]),
                 hidden_column: String::new(),
                 edits_only: false,
+                conflict_rule: String::new(),
+                source_timestamp_property: String::new(),
             },
             2,
         )

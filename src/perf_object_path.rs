@@ -888,6 +888,8 @@ fn seed_two_hop_index(
             property_mapping,
             hidden_column: String::new(),
             edits_only: true,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         }
         .prepare()
         .map_err(|error| error.message())?;
@@ -917,6 +919,9 @@ fn seed_two_hop_index(
                 source_key,
                 properties,
                 hidden: false,
+                action_id: String::new(),
+                edited_at_ms: 0,
+                property_edited_at_ms: Default::default(),
             })?;
         }
         db.apply_object_type_index(namespace, kind, true, 40)?;

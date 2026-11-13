@@ -221,6 +221,8 @@ const SOURCE_DELIVERY_SCHEMA: &str = include_str!("postgres/0153_source_delivery
 const SEARCH_INDEX_V2_SCHEMA: &str = include_str!("postgres/0154_search_index_v2.sql");
 const EMBEDDING_REBUILD_CURSOR_SCHEMA: &str =
     include_str!("postgres/0155_embedding_rebuild_cursor.sql");
+const OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA: &str =
+    include_str!("postgres/0156_object_type_index_property_edits.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1115,6 +1117,12 @@ const MIGRATIONS: &[Migration] = &[
         154,
         "embedding_rebuild_cursor",
         EMBEDDING_REBUILD_CURSOR_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        155,
+        "object_type_index_property_edits",
+        OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

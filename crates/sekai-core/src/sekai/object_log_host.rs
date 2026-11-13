@@ -18,7 +18,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use mikura::ObjectRecord;
+use mikura::{ObjectRecord, OverlayPatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -208,6 +208,31 @@ impl ObjectLogHost {
             return Err("object-log host generation does not carry the admitted properties".into());
         }
         Ok(committed.r#gen)
+    }
+
+    /// Admits a property overlay on the host (ADR 0009).
+    pub fn apply_overlay(
+        &self,
+        patch: &OverlayPatch,
+        action_id: &str,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
+        let mut request = json!({
+            "op": "apply_overlay",
+            "id": action_id,
+            "namespace": patch.namespace,
+            "kind": patch.kind,
+            "key": patch.key,
+            "props": patch.props,
+            "cleared": patch.cleared,
+        });
+        if let Some(at) = &patch.at {
+            request["at"] = json!(at);
+        }
+        if let Some(generation) = expected_gen {
+            request["expected_gen"] = json!(generation);
+        }
+        Self::require_ok(self.call(request)?).map(|_| ())
     }
 }
 

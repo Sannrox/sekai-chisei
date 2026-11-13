@@ -876,6 +876,10 @@ message ObjectTypeDatasource {
   map<string, string> property_mapping = 7;
   string hidden_column = 8;
   bool edits_only = 9;
+  // edit_wins (default, including empty) or newest_wins.
+  string conflict_rule = 10;
+  // Source property compared to the edit time when conflict_rule is newest_wins.
+  string source_timestamp_property = 11;
 }
 message RegisterObjectTypeDatasourceRequest {
   ObjectTypeDatasource datasource = 1;

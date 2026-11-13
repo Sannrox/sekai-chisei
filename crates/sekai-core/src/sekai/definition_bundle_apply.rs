@@ -445,6 +445,8 @@ mod tests {
             property_mapping: Default::default(),
             hidden_column: String::new(),
             edits_only: false,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         };
         db.register_object_type_datasource(&binding, 1).unwrap();
         binding.key_column = "key".into();

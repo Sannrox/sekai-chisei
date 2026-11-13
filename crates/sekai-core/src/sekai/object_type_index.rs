@@ -15,6 +15,8 @@ pub fn datasource_fingerprint(source: &ObjectTypeDatasource) -> String {
         &source.hidden_column,
         source.edits_only,
         &source.property_mapping,
+        &source.conflict_rule,
+        &source.source_timestamp_property,
     ))
     .unwrap_or_default();
     crate::sekai::embedding_index::sha_hex(&encoded)

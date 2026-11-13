@@ -1062,6 +1062,8 @@ mod tests {
             .collect(),
             hidden_column: "hidden".into(),
             edits_only: false,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         }
         .prepare()
         .unwrap();

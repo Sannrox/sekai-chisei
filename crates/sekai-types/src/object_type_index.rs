@@ -241,6 +241,40 @@ impl From<ObjectTypeIndexError> for String {
     }
 }
 
+/// How a later source value and a stored property edit share one member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum EditConflictRule {
+    /// The latest edit for a property keeps that property (default).
+    #[default]
+    EditWins,
+    /// The later of the edit time and the source timestamp property wins.
+    NewestWins,
+}
+
+impl EditConflictRule {
+    pub const EDIT_WINS: &'static str = "edit_wins";
+    pub const NEWEST_WINS: &'static str = "newest_wins";
+
+    pub fn parse(value: &str) -> Result<Self, ObjectTypeIndexError> {
+        match value.trim() {
+            "" | Self::EDIT_WINS => Ok(Self::EditWins),
+            Self::NEWEST_WINS => Ok(Self::NewestWins),
+            other => Err(ObjectTypeIndexError::InvalidArgument(format!(
+                "unsupported edit conflict rule {other}"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EditWins => Self::EDIT_WINS,
+            Self::NewestWins => Self::NEWEST_WINS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectTypeDatasource {
     pub contract_version: String,
@@ -252,6 +286,12 @@ pub struct ObjectTypeDatasource {
     pub property_mapping: BTreeMap<String, String>,
     pub hidden_column: String,
     pub edits_only: bool,
+    /// `edit_wins` (default) or `newest_wins`. Empty is `edit_wins`.
+    #[serde(default)]
+    pub conflict_rule: String,
+    /// Source property compared to the edit time when `conflict_rule` is `newest_wins`.
+    #[serde(default)]
+    pub source_timestamp_property: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +325,23 @@ pub struct ObjectTypeIndexEdit {
     pub source_key: String,
     pub properties: BTreeMap<String, String>,
     pub hidden: bool,
+    /// Overlay retry key. Empty until an Action or `PutObjectTypeIndexEdit` names one.
+    #[serde(default)]
+    pub action_id: String,
+    /// Clerk time of this overlay, milliseconds since Unix epoch.
+    #[serde(default)]
+    pub edited_at_ms: i64,
+    /// Per-property overlay times. Empty keys fall back to `edited_at_ms`.
+    #[serde(default)]
+    pub property_edited_at_ms: BTreeMap<String, i64>,
+}
+
+/// Decode the SQL JSON sidecar of per-property overlay times.
+pub fn parse_property_edit_times(raw: &str) -> Result<BTreeMap<String, i64>, String> {
+    if raw.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    serde_json::from_str(raw).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -306,6 +363,12 @@ impl ObjectTypeDatasource {
             || self.property_mapping != next.property_mapping
             || self.hidden_column != next.hidden_column
             || self.edits_only != next.edits_only
+            || self.conflict_rule() != next.conflict_rule()
+            || self.source_timestamp_property != next.source_timestamp_property
+    }
+
+    pub fn conflict_rule(&self) -> EditConflictRule {
+        EditConflictRule::parse(&self.conflict_rule).unwrap_or(EditConflictRule::EditWins)
     }
 
     pub fn prepare(self) -> Result<Self, ObjectTypeIndexError> {
@@ -324,6 +387,10 @@ impl ObjectTypeDatasource {
         for (property, column) in &self.property_mapping {
             require_token("property", property)?;
             require_token("column", column)?;
+        }
+        let rule = EditConflictRule::parse(&self.conflict_rule)?;
+        if rule == EditConflictRule::NewestWins {
+            require_token("source_timestamp_property", &self.source_timestamp_property)?;
         }
         Ok(self)
     }
@@ -397,7 +464,7 @@ pub fn member_from_edit(
     binding: &ObjectTypeDatasource,
     edit: &ObjectTypeIndexEdit,
 ) -> ObjectTypeIndexMember {
-    ObjectTypeIndexMember {
+    overlay_member(binding, None, edit).unwrap_or_else(|_| ObjectTypeIndexMember {
         namespace: binding.namespace.clone(),
         kind: binding.kind.clone(),
         object_id: sourced_object_id(&binding.kind, &edit.source_key),
@@ -406,7 +473,321 @@ pub fn member_from_edit(
         properties: edit.properties.clone(),
         hidden: edit.hidden,
         from_edit: true,
+    })
+}
+
+/// Overlay the latest edit per property onto a source member. Unedited
+/// properties keep the source value. `newest_wins` keeps a later source
+/// timestamp over an older edit.
+pub fn overlay_member(
+    binding: &ObjectTypeDatasource,
+    source: Option<ObjectTypeIndexMember>,
+    edit: &ObjectTypeIndexEdit,
+) -> Result<ObjectTypeIndexMember, ObjectTypeIndexError> {
+    let had_source = source.is_some();
+    let mut member = match source {
+        Some(member) => member,
+        None => ObjectTypeIndexMember {
+            namespace: binding.namespace.clone(),
+            kind: binding.kind.clone(),
+            object_id: sourced_object_id(&binding.kind, &edit.source_key),
+            source_key: edit.source_key.clone(),
+            content_hash: String::new(),
+            properties: BTreeMap::new(),
+            hidden: false,
+            from_edit: false,
+        },
+    };
+    let rule = binding.conflict_rule();
+    let source_ts = member
+        .properties
+        .get(&binding.source_timestamp_property)
+        .cloned();
+    let mut from_edit = member.from_edit;
+    for (property, value) in &edit.properties {
+        if property.starts_with("__sekai_index_") {
+            continue;
+        }
+        let keep_edit = if !had_source {
+            true
+        } else {
+            match rule {
+                EditConflictRule::EditWins => true,
+                EditConflictRule::NewestWins => {
+                    let edit_ts = edit
+                        .property_edited_at_ms
+                        .get(property)
+                        .copied()
+                        .unwrap_or(edit.edited_at_ms);
+                    edit_is_newer(edit_ts, source_ts.as_deref())?
+                }
+            }
+        };
+        if keep_edit {
+            member.properties.insert(property.clone(), value.clone());
+            from_edit = true;
+        }
     }
+    let source_hidden = had_source && member.hidden;
+    member.hidden = source_hidden || edit.hidden;
+    if member.hidden != source_hidden {
+        from_edit = true;
+    }
+    member.from_edit = from_edit;
+    member.content_hash = content_hash(&member.properties, member.hidden);
+    Ok(member)
+}
+
+/// Merge a later sparse overlay into the stored latest-per-property projection.
+pub fn merge_index_edits(
+    stored: Option<ObjectTypeIndexEdit>,
+    incoming: ObjectTypeIndexEdit,
+) -> ObjectTypeIndexEdit {
+    let incoming = stamp_property_edit_times(incoming);
+    let Some(stored) = stored else {
+        return incoming;
+    };
+    let mut stored = stamp_property_edit_times(stored);
+    if !incoming.action_id.is_empty() && incoming.action_id == stored.action_id {
+        let retry = incoming
+            .properties
+            .iter()
+            .all(|(key, value)| stored.properties.get(key) == Some(value))
+            && stored.hidden == incoming.hidden;
+        if retry {
+            return stored;
+        }
+        return incoming;
+    }
+    for (key, value) in incoming.properties {
+        stored.properties.insert(key.clone(), value);
+        if let Some(at) = incoming.property_edited_at_ms.get(&key) {
+            stored.property_edited_at_ms.insert(key, *at);
+        }
+    }
+    stored.hidden = incoming.hidden;
+    if !incoming.action_id.is_empty() {
+        stored.action_id = incoming.action_id;
+    }
+    if incoming.edited_at_ms >= stored.edited_at_ms {
+        stored.edited_at_ms = incoming.edited_at_ms;
+    }
+    stored
+}
+
+fn stamp_property_edit_times(mut edit: ObjectTypeIndexEdit) -> ObjectTypeIndexEdit {
+    for key in edit.properties.keys() {
+        edit.property_edited_at_ms
+            .entry(key.clone())
+            .or_insert(edit.edited_at_ms);
+    }
+    edit
+}
+
+/// One-to-one property-key remap between datasource mappings.
+pub fn mapping_renames(
+    previous: &BTreeMap<String, String>,
+    next: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let removed: Vec<String> = previous
+        .keys()
+        .filter(|key| !next.contains_key(*key))
+        .cloned()
+        .collect();
+    let added: Vec<String> = next
+        .keys()
+        .filter(|key| !previous.contains_key(*key))
+        .cloned()
+        .collect();
+    if removed.len() == 1 && added.len() == 1 {
+        let old = &removed[0];
+        let new = &added[0];
+        if previous.get(old) == next.get(new) {
+            vec![(old.clone(), new.clone())]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+/// Carry edits through a property rename. Type recasts that cannot parse
+/// fail with the affected count.
+pub fn carry_index_edits(
+    edits: &mut [ObjectTypeIndexEdit],
+    rename: &[(String, String)],
+    recast: &[(String, crate::object_schema::PropertyType)],
+) -> Result<(), ObjectTypeIndexError> {
+    for (old, new) in rename {
+        if old == new {
+            continue;
+        }
+        for edit in edits.iter_mut() {
+            if let Some(value) = edit.properties.remove(old) {
+                edit.properties.entry(new.clone()).or_insert(value);
+            }
+            if let Some(at) = edit.property_edited_at_ms.remove(old) {
+                edit.property_edited_at_ms.entry(new.clone()).or_insert(at);
+            }
+        }
+    }
+    for (property, prop_type) in recast {
+        let mut failed = 0i32;
+        for edit in edits.iter_mut() {
+            let Some(value) = edit.properties.get(property).cloned() else {
+                continue;
+            };
+            match recast_edit_value(&value, prop_type.clone()) {
+                Ok(canonical) => {
+                    edit.properties.insert(property.clone(), canonical);
+                }
+                Err(()) => failed += 1,
+            }
+        }
+        if failed > 0 {
+            return Err(ObjectTypeIndexError::InvalidArgument(format!(
+                "type revision cannot recast {failed} edits of property {property} to {}",
+                prop_type.as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn recast_edit_value(
+    value: &str,
+    prop_type: crate::object_schema::PropertyType,
+) -> Result<String, ()> {
+    match prop_type {
+        crate::object_schema::PropertyType::String | crate::object_schema::PropertyType::Enum => {
+            Ok(value.to_string())
+        }
+        crate::object_schema::PropertyType::Int => value
+            .parse::<i64>()
+            .map(|parsed| parsed.to_string())
+            .map_err(|_| ()),
+        crate::object_schema::PropertyType::Float => value
+            .parse::<f64>()
+            .map(|parsed| parsed.to_string())
+            .map_err(|_| ()),
+        crate::object_schema::PropertyType::Bool => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Ok("true".into()),
+                "0" | "false" | "no" => Ok("false".into()),
+                _ => Err(()),
+            }
+        }
+        crate::object_schema::PropertyType::Timestamp => {
+            if value.parse::<i64>().is_ok() || looks_like_rfc3339(value) {
+                Ok(value.to_string())
+            } else {
+                Err(())
+            }
+        }
+        crate::object_schema::PropertyType::Link
+        | crate::object_schema::PropertyType::Computed
+        | crate::object_schema::PropertyType::Struct => Ok(value.to_string()),
+    }
+}
+
+fn edit_is_newer(edited_at_ms: i64, source_ts: Option<&str>) -> Result<bool, ObjectTypeIndexError> {
+    let Some(source_ts) = source_ts.filter(|value| !value.trim().is_empty()) else {
+        return Err(ObjectTypeIndexError::InvalidArgument(
+            "newest conflict requires source timestamp".into(),
+        ));
+    };
+    let source_ms = parse_source_timestamp_ms(source_ts).ok_or_else(|| {
+        ObjectTypeIndexError::InvalidArgument("newest conflict requires source timestamp".into())
+    })?;
+    Ok(edited_at_ms >= source_ms)
+}
+
+fn parse_source_timestamp_ms(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if let Ok(ms) = trimmed.parse::<i64>() {
+        return Some(ms);
+    }
+    parse_rfc3339_ms(trimmed)
+}
+
+fn looks_like_rfc3339(raw: &str) -> bool {
+    parse_rfc3339_ms(raw).is_some()
+}
+
+/// Minimal RFC3339 parser for `YYYY-MM-DDTHH:MM:SS[.sss]Z` or `±HH:MM`.
+fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    let (datetime, offset_ms) = if let Some(prefix) = raw.strip_suffix('Z') {
+        (prefix, 0i64)
+    } else if raw.len() >= 6 {
+        let sign_at = raw.len() - 6;
+        let sign = raw.as_bytes().get(sign_at)?;
+        if *sign != b'+' && *sign != b'-' {
+            return None;
+        }
+        let (hours, minutes) = raw[sign_at + 1..].split_once(':')?;
+        let hours: i64 = hours.parse().ok()?;
+        let minutes: i64 = minutes.parse().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        let mut offset_ms = (hours * 60 + minutes) * 60 * 1000;
+        if *sign == b'+' {
+            offset_ms = -offset_ms;
+        }
+        (&raw[..sign_at], offset_ms)
+    } else {
+        return None;
+    };
+    let (date, time) = datetime.split_once('T')?;
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    let (hms, frac) = match time.split_once('.') {
+        Some((hms, frac)) => (hms, frac),
+        None => (time, "0"),
+    };
+    let mut hms = hms.split(':');
+    let hour: i64 = hms.next()?.parse().ok()?;
+    let minute: i64 = hms.next()?.parse().ok()?;
+    let second: i64 = hms.next()?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut digits: String = frac
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .take(3)
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    while digits.len() < 3 {
+        digits.push('0');
+    }
+    let millis: i64 = digits.parse().ok()?;
+    let days = days_from_civil(year, month, day)?;
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis + offset_ms)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let mut y = year;
+    let m = month;
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146097 + doe - 719468)
 }
 
 pub fn sourced_object_id(kind: &str, source_key: &str) -> String {
@@ -458,6 +839,8 @@ mod tests {
             property_mapping: BTreeMap::from([("region".into(), "region".into())]),
             hidden_column: "hidden".into(),
             edits_only: false,
+            conflict_rule: String::new(),
+            source_timestamp_property: String::new(),
         }
         .prepare()
         .unwrap()
@@ -521,6 +904,315 @@ mod tests {
         status.lag_ms = 1;
         status.stale = true;
         assert!(!freshness_holds(&status, 10_000));
+    }
+
+    #[test]
+    fn overlay_keeps_unedited_source_properties() {
+        let source = member_from_row(
+            &binding(),
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let edit = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-1".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: Default::default(),
+        };
+        let overlaid = overlay_member(&binding(), Some(source), &edit).unwrap();
+        assert_eq!(overlaid.properties.get("region").unwrap(), "edited");
+        assert!(overlaid.from_edit);
+    }
+
+    #[test]
+    fn newest_wins_keeps_later_source_value() {
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("updated_at".into(), "updated_at".into());
+        binding.conflict_rule = EditConflictRule::NEWEST_WINS.into();
+        binding.source_timestamp_property = "updated_at".into();
+        let binding = binding.prepare().unwrap();
+        let source = member_from_row(
+            &binding,
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("updated_at".into(), "50".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let edit = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-1".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: Default::default(),
+        };
+        let overlaid = overlay_member(&binding, Some(source), &edit).unwrap();
+        assert_eq!(overlaid.properties.get("region").unwrap(), "us");
+    }
+
+    #[test]
+    fn newest_wins_uses_per_property_edit_times() {
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("name".into(), "name".into());
+        binding
+            .property_mapping
+            .insert("updated_at".into(), "updated_at".into());
+        binding.conflict_rule = EditConflictRule::NEWEST_WINS.into();
+        binding.source_timestamp_property = "updated_at".into();
+        let binding = binding.prepare().unwrap();
+        let source = member_from_row(
+            &binding,
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("name".into(), "Ada".into()),
+                ("updated_at".into(), "20".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let edit = merge_index_edits(
+            Some(ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("region".into(), "edited".into())]),
+                hidden: false,
+                action_id: "act-region".into(),
+                edited_at_ms: 10,
+                property_edited_at_ms: BTreeMap::new(),
+            }),
+            ObjectTypeIndexEdit {
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                source_key: "c1".into(),
+                properties: BTreeMap::from([("name".into(), "Ada L.".into())]),
+                hidden: false,
+                action_id: "act-name".into(),
+                edited_at_ms: 30,
+                property_edited_at_ms: BTreeMap::new(),
+            },
+        );
+        let overlaid = overlay_member(&binding, Some(source), &edit).unwrap();
+        assert_eq!(overlaid.properties.get("region").unwrap(), "us");
+        assert_eq!(overlaid.properties.get("name").unwrap(), "Ada L.");
+    }
+
+    #[test]
+    fn merge_same_action_id_keeps_admission_time() {
+        let first = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-1".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        let retry = ObjectTypeIndexEdit {
+            edited_at_ms: 40,
+            ..first.clone()
+        };
+        let merged = merge_index_edits(Some(first.clone()), retry);
+        assert_eq!(merged.edited_at_ms, 20);
+        assert_eq!(merged.properties, first.properties);
+    }
+
+    #[test]
+    fn merge_sparse_retry_keeps_accumulated_properties() {
+        let region = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-region".into(),
+            edited_at_ms: 10,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        let name = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("name".into(), "Ada L.".into())]),
+            hidden: false,
+            action_id: "act-name".into(),
+            edited_at_ms: 30,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        let stored = merge_index_edits(Some(region), name.clone());
+        let retried = merge_index_edits(Some(stored.clone()), name);
+        assert_eq!(retried.properties.get("region").unwrap(), "edited");
+        assert_eq!(retried.properties.get("name").unwrap(), "Ada L.");
+        assert_eq!(retried.action_id, stored.action_id);
+        assert_eq!(retried.edited_at_ms, stored.edited_at_ms);
+    }
+
+    #[test]
+    fn mapping_rename_requires_the_same_source_column() {
+        let previous = BTreeMap::from([("region".into(), "region".into())]);
+        let renamed = BTreeMap::from([("area".into(), "region".into())]);
+        assert_eq!(
+            mapping_renames(&previous, &renamed),
+            vec![("region".into(), "area".into())]
+        );
+        let replaced = BTreeMap::from([("age".into(), "age".into())]);
+        assert!(mapping_renames(&previous, &replaced).is_empty());
+    }
+
+    #[test]
+    fn overlay_hidden_follows_source_or_edit() {
+        let source = member_from_row(
+            &binding(),
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "eu".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let hide = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::new(),
+            hidden: true,
+            action_id: "act-hide".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        assert!(
+            overlay_member(&binding(), Some(source.clone()), &hide)
+                .unwrap()
+                .hidden
+        );
+        let show = ObjectTypeIndexEdit {
+            hidden: false,
+            action_id: "act-show".into(),
+            ..hide
+        };
+        assert!(
+            !overlay_member(&binding(), Some(source), &show)
+                .unwrap()
+                .hidden
+        );
+    }
+
+    #[test]
+    fn newest_wins_pads_fractional_rfc3339_seconds() {
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("updated_at".into(), "updated_at".into());
+        binding.conflict_rule = EditConflictRule::NEWEST_WINS.into();
+        binding.source_timestamp_property = "updated_at".into();
+        let binding = binding.prepare().unwrap();
+        let source = member_from_row(
+            &binding,
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("updated_at".into(), "1970-01-01T00:00:00.1Z".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let edit = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-1".into(),
+            edited_at_ms: 50,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        let overlaid = overlay_member(&binding, Some(source), &edit).unwrap();
+        assert_eq!(overlaid.properties.get("region").unwrap(), "us");
+    }
+
+    #[test]
+    fn newest_wins_accepts_rfc3339_timezone_offsets() {
+        let mut binding = binding();
+        binding
+            .property_mapping
+            .insert("updated_at".into(), "updated_at".into());
+        binding.conflict_rule = EditConflictRule::NEWEST_WINS.into();
+        binding.source_timestamp_property = "updated_at".into();
+        let binding = binding.prepare().unwrap();
+        let source = member_from_row(
+            &binding,
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("region".into(), "us".into()),
+                ("updated_at".into(), "1970-01-01T00:01:00+01:00".into()),
+                ("hidden".into(), "0".into()),
+            ]),
+        )
+        .unwrap();
+        let edit = ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "edited".into())]),
+            hidden: false,
+            action_id: "act-offset".into(),
+            edited_at_ms: 50,
+            property_edited_at_ms: BTreeMap::new(),
+        };
+        let overlaid = overlay_member(&binding, Some(source), &edit).unwrap();
+        assert_eq!(overlaid.properties.get("region").unwrap(), "edited");
+    }
+
+    #[test]
+    fn property_rename_carries_edits_and_recast_names_the_count() {
+        let mut edits = [ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("region".into(), "eu".into())]),
+            hidden: false,
+            action_id: "act-1".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: Default::default(),
+        }];
+        carry_index_edits(&mut edits, &[("region".into(), "area".into())], &[]).unwrap();
+        assert_eq!(edits[0].properties.get("area").unwrap(), "eu");
+        let mut bad = [ObjectTypeIndexEdit {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: BTreeMap::from([("rank".into(), "north".into())]),
+            hidden: false,
+            action_id: "act-2".into(),
+            edited_at_ms: 20,
+            property_edited_at_ms: Default::default(),
+        }];
+        let error = carry_index_edits(
+            &mut bad,
+            &[],
+            &[("rank".into(), crate::object_schema::PropertyType::Int)],
+        )
+        .unwrap_err();
+        assert!(error.message().contains("1 edits of property rank"));
     }
 
     #[test]
