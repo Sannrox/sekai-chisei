@@ -233,6 +233,7 @@ impl GatewayStack {
             .env_remove("CHISEI_DATABASE_URL")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut control_plane, dir.path());
         let control_plane = KillOnDrop::new(control_plane.spawn().expect("spawn sekai-chisei"));
         wait_for_socket(&socket, &log_path);
 

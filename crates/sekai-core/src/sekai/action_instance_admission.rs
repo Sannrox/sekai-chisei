@@ -4781,6 +4781,7 @@ mod tests {
                 .unwrap()
                 .expect("clerk receipt stays out of the object log");
             assert_eq!(receipt.ontology_digest.as_deref(), Some(ONTOLOGY_DIGEST));
+            crate::sekai::object_log::release_process_object_log_cache();
             let store = mikura::Store::open(&log).unwrap();
             assert_eq!(
                 crate::sekai::object_log::identity_generation(
@@ -4873,6 +4874,7 @@ mod tests {
             let admitted = admission.admit(request, "alice", 20).unwrap();
             assert_eq!(admitted.instance.status, STATUS_ADMITTED);
             assert!(db.get_object("rec-retry").unwrap().is_some());
+            crate::sekai::object_log::release_process_object_log_cache();
             let store = mikura::Store::open(&log).unwrap();
             assert_eq!(
                 crate::sekai::object_log::identity_generation(
@@ -4920,6 +4922,7 @@ mod tests {
 
             let replay = admission.admit(request, "alice", 20).unwrap();
             assert!(replay.replay);
+            crate::sekai::object_log::release_process_object_log_cache();
             let store = mikura::Store::open(&log).unwrap();
             assert_eq!(
                 crate::sekai::object_log::identity_generation(

@@ -118,6 +118,7 @@ fn tls_boot_command(
             command.env_remove("SEKAI_TLS_CLIENT_CA");
         }
     }
+    crate::isolate_object_log(&mut command, dir);
     command
 }
 

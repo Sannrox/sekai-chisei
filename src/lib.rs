@@ -52,6 +52,7 @@ pub mod control_plane;
 pub mod mcp_adapter;
 pub mod memory_cli;
 pub mod models_cli;
+pub mod object_log_boot;
 pub mod obs;
 pub mod onboarding;
 pub mod ontology_codegen;

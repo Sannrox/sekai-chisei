@@ -155,3 +155,12 @@ the `v0.1.0` behavior this ADR decided:
   ACL and the canary skips instead of comparing against a pretended view. The
   aggregated evaluate path does not filter by caller, so there is no per-caller
   object hiding for `hide_kinds` / `hide_identities` to witness yet.
+
+## Amendment: pin mikura `v0.5.0` and require the log (#2287)
+
+Combined now depends on the published `v0.5.0` tag of `mikura`,
+`mikura-ingest`, and `mikura-host`. A second writer fails closed on open
+(`mikura::LOG_IN_USE`). Combined and Sekai processes require an object log:
+with neither `SEKAI_OBJECT_LOG` nor `SEKAI_OBJECT_LOG_HOST`, they open
+`<SEKAI_DATA_DIR>/objects.mikura`. A deployment that ran without a log is
+backfilled once from recorded objects and admitted Action receipts.

@@ -23,7 +23,10 @@ use std::sync::{Mutex, OnceLock};
 pub const DUAL_READ_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ";
 pub const LOG_PATH_ENV: &str = "SEKAI_OBJECT_LOG";
 pub const SAMPLE_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE";
+/// Default Combined/Sekai file name under `SEKAI_DATA_DIR`.
+pub const DEFAULT_LOG_FILE: &str = "objects.mikura";
 const DEFAULT_SAMPLE_N: u32 = 32;
+const BACKFILL_MARKER_SUFFIX: &str = ".backfill-complete";
 
 static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 
@@ -44,11 +47,32 @@ static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 /// so a committed write that did not go through it (an operator tool, a test
 /// fixture) is never served from stale memory.
 static OBJECT_LOG_STORE: OnceLock<Mutex<Option<CachedObjectLogStore>>> = OnceLock::new();
+/// Combined/Sekai boot installs the resolved local path so later admits
+/// use the same file the process opened.
+static INSTALLED_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 struct CachedObjectLogStore {
     path: PathBuf,
-    store: Store,
+    store: Option<Store>,
     stamp: Option<LogStamp>,
+}
+
+impl CachedObjectLogStore {
+    fn store_mut(&mut self) -> Result<&mut Store, String> {
+        self.store
+            .as_mut()
+            .ok_or_else(|| "object log handle dropped".into())
+    }
+
+    /// Drop the exclusive writer and open from disk again. mikura v0.5.0
+    /// refuses a second `Store` on the same path (`LOG_IN_USE`).
+    fn reopen(&mut self) -> Result<&mut Store, String> {
+        self.store = None;
+        let opened = Store::open(&self.path)?;
+        self.stamp = log_stamp(&self.path);
+        self.store = Some(opened);
+        self.store_mut()
+    }
 }
 
 /// Bytes at the head of the log that hold mikura's superblock. The pinned
@@ -78,23 +102,29 @@ fn log_stamp(path: &Path) -> Option<LogStamp> {
     Some((metadata.len(), metadata.modified().ok(), hasher.finish()))
 }
 
-/// Runs `body` against a `Store` for `path`, reusing the cached handle when
+fn open_or_create_store(path: &Path) -> Result<Store, String> {
+    if path.exists() {
+        Store::open(path)
+    } else {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        Store::create(path)
+    }
+}
+
+/// Runs `body` against a cached writer for `path`, reusing the handle when
 /// it already wraps `path` and opening (creating the log and its parent
 /// directory if `path` does not exist yet) otherwise. Holds the cache lock
 /// for the whole check-then-use sequence so a concurrent caller can never
-/// observe a handle for the wrong path.
-///
-/// Evicts the cache whenever `body` returns `Err`: mikura's writer is not
-/// failure-atomic (a partial page or superblock write on error can leave
-/// its cursor inconsistent with what actually landed on disk), so a failed
-/// operation must not leave that handle cached for a later call to keep
-/// writing through. The next call reopens and re-derives the correct
-/// cursor from disk instead, exactly as every call did before this cache
-/// existed.
-fn with_object_log_store_cache<R>(
+/// observe a handle for the wrong path. A failed `body` drops the writer
+/// then immediately reopens so this process keeps the exclusive lock.
+fn with_cached_object_log<R>(
     cache: &Mutex<Option<CachedObjectLogStore>>,
     path: &Path,
-    body: impl FnOnce(&mut Store) -> Result<R, String>,
+    body: impl FnOnce(&mut CachedObjectLogStore) -> Result<R, String>,
 ) -> Result<R, String> {
     let mut guard = cache
         .lock()
@@ -106,32 +136,59 @@ fn with_object_log_store_cache<R>(
         None => true,
     };
     if stale {
+        // Drop the exclusive writer before opening again (mikura v0.5.0).
+        *guard = None;
         #[cfg(test)]
         OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
-        let store = if path.exists() {
-            Store::open(path)?
-        } else {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            Store::create(path)?
-        };
+        let store = open_or_create_store(path)?;
         *guard = Some(CachedObjectLogStore {
             path: path.to_path_buf(),
-            store,
+            store: Some(store),
             stamp: None,
         });
     }
     let cached = guard.as_mut().expect("cache populated above");
-    let result = body(&mut cached.store);
+    let result = body(cached);
     if result.is_err() {
+        // mikura's writer is not failure-atomic: drop it, then reopen so
+        // this process keeps the exclusive lock. A reopen failure leaves
+        // the cache empty and later admits fail closed.
         *guard = None;
-    } else {
+        #[cfg(test)]
+        OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
+        if let Ok(store) = open_or_create_store(path) {
+            *guard = Some(CachedObjectLogStore {
+                path: path.to_path_buf(),
+                store: Some(store),
+                stamp: log_stamp(path),
+            });
+        }
+    } else if let Some(cached) = guard.as_mut() {
         cached.stamp = log_stamp(path);
     }
     result
+}
+
+fn with_object_log_store_cache<R>(
+    cache: &Mutex<Option<CachedObjectLogStore>>,
+    path: &Path,
+    body: impl FnOnce(&mut Store) -> Result<R, String>,
+) -> Result<R, String> {
+    with_cached_object_log(cache, path, |cached| body(cached.store_mut()?))
+}
+
+#[cfg(test)]
+fn release_object_log_cache(cache: &Mutex<Option<CachedObjectLogStore>>) {
+    *cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn release_process_object_log_cache() {
+    if let Some(cache) = OBJECT_LOG_STORE.get() {
+        release_object_log_cache(cache);
+    }
 }
 
 fn with_cached_object_log_store<R>(
@@ -167,12 +224,22 @@ pub struct ObjectLogDualRead {
 
 impl ObjectLogDualRead {
     pub fn from_env() -> Self {
+        let host = env::var(crate::sekai::object_log_host::HOST_ENV).ok();
+        let host_configured = host.as_ref().is_some_and(|value| !value.trim().is_empty());
         Self::resolve(
             env::var(DUAL_READ_ENV).ok(),
             env::var(SAMPLE_ENV).ok(),
             env::var(LOG_PATH_ENV).ok(),
-            env::var(crate::sekai::object_log_host::HOST_ENV).ok(),
+            host,
         )
+        .with_default_log(INSTALLED_LOG_PATH.get().cloned(), host_configured)
+    }
+
+    fn with_default_log(mut self, default: Option<PathBuf>, host_configured: bool) -> Self {
+        if self.log_path.is_none() && !host_configured {
+            self.log_path = default;
+        }
+        self
     }
 
     /// Resolves the dual-read settings. A configured object-log host owns
@@ -637,9 +704,10 @@ fn compare_sql_to_log_with_cache(
 /// the stored record is appended.
 ///
 /// Clerk admission and receipts stay here. The log owns identity generations.
-/// Missing `SEKAI_OBJECT_LOG` skips ingest so SQL-only fixtures keep working.
-/// A configured object-log host (`SEKAI_OBJECT_LOG_HOST`, ADR 0088) owns the
-/// log instead: admits go through it, and it is exclusive with a local log.
+/// Missing `SEKAI_OBJECT_LOG` (and no boot-installed path) skips ingest so
+/// SQL-only fixtures keep working. A configured object-log host
+/// (`SEKAI_OBJECT_LOG_HOST`, ADR 0088) owns the log instead: admits go
+/// through it, and it is exclusive with a local log.
 pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Option<u64>, String> {
     let host = configured_log_host()?;
     let path = configured_log_path();
@@ -658,24 +726,7 @@ pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Optio
     if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
         return Err("injected object-log ingest failure".into());
     }
-    if path.exists() {
-        // #1106: an open/read failure here falls through to apply, exactly
-        // as the pre-cache `if let Ok(store) = Store::open(&path)` guard
-        // did — an unreadable log is "couldn't verify the check", not a
-        // reason to fail the admission.
-        // #1127: a direct identity lookup replaces the full-kind scan.
-        let existing = with_cached_object_log_store(&path, |store| {
-            Ok(
-                visible_record(store, &object.namespace, &object.kind, &object.id)
-                    .filter(|record| record.props == object.properties)
-                    .map(|record| record.r#gen),
-            )
-        });
-        if let Ok(Some(generation)) = existing {
-            return Ok(Some(generation));
-        }
-    }
-    apply_admitted_object_to_log(&path, object).map(Some)
+    ensure_admitted_object_in_log(&path, object).map(Some)
 }
 
 fn configured_log_host() -> Result<Option<crate::sekai::object_log_host::ObjectLogHost>, String> {
@@ -722,6 +773,135 @@ fn configured_log_path() -> Option<PathBuf> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .or_else(|| INSTALLED_LOG_PATH.get().cloned())
+}
+
+/// Record the local log path Combined/Sekai boot opened so later admits
+/// write the same file without requiring the operator to set `SEKAI_OBJECT_LOG`.
+pub fn install_process_log_path(path: PathBuf) {
+    let _ = INSTALLED_LOG_PATH.set(path);
+}
+
+/// Open or create the local log and keep the exclusive writer for this process.
+pub fn hold_local_log(path: &Path) -> Result<(), String> {
+    with_object_log_store_cache(
+        OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None)),
+        path,
+        |_| Ok(()),
+    )
+}
+
+fn backfill_marker_path(log: &Path) -> PathBuf {
+    let mut name = log
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| DEFAULT_LOG_FILE.into());
+    name.push(BACKFILL_MARKER_SUFFIX);
+    log.with_file_name(name)
+}
+
+/// True when a previous complete scan wrote the marker next to a populated
+/// log. An orphaned marker beside an empty replacement log is removed so a
+/// kill after the first recovered object cannot treat the partial rebuild
+/// as complete.
+pub fn backfill_already_complete(path: &Path) -> Result<bool, String> {
+    let marker = backfill_marker_path(path);
+    if !marker.exists() {
+        return Ok(false);
+    }
+    let populated = with_cached_object_log_store(path, |store| Ok(store.committed_pages() > 0))?;
+    if populated {
+        return Ok(true);
+    }
+    std::fs::remove_file(&marker).map_err(|error| error.to_string())?;
+    Ok(false)
+}
+
+fn log_can_own_identity(object: &Object) -> bool {
+    !object.namespace.trim().is_empty()
+        && !object.kind.trim().is_empty()
+        && !object.id.trim().is_empty()
+}
+
+/// Ingest recorded objects into `path` when the identity is absent. An
+/// identity already in the log keeps its generation, so a concurrent admit
+/// of newer properties is not overwritten by a boot snapshot. A kill
+/// mid-run and a retry match an uninterrupted pass. Writes the complete
+/// marker only after every object. An orphaned marker next to an empty
+/// replacement log does not skip recovery. Internal SQL records with an
+/// empty namespace are skipped: mikura refuses them, and they must not
+/// fail Combined/Sekai boot.
+pub fn backfill_recorded_objects<'a>(
+    path: &Path,
+    objects: impl IntoIterator<Item = &'a Object>,
+) -> Result<usize, String> {
+    if backfill_already_complete(path)? {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for object in objects {
+        if ingest_absent_identity(path, object)?.is_some() {
+            count += 1;
+        }
+    }
+    std::fs::write(backfill_marker_path(path), format!("{count}\n"))
+        .map_err(|error| error.to_string())?;
+    Ok(count)
+}
+
+/// Append only when the log has never committed this identity.
+pub fn ingest_absent_identity(path: &Path, object: &Object) -> Result<Option<u64>, String> {
+    if !log_can_own_identity(object) {
+        return Ok(None);
+    }
+    if path.exists() {
+        let present = with_cached_object_log_store(path, |store| {
+            Ok(store
+                .load(
+                    &object.namespace,
+                    &object.kind,
+                    &object.id,
+                    &PropertyAcl::allow_all(),
+                )
+                .ok()
+                .is_some())
+        })?;
+        if present {
+            return Ok(None);
+        }
+    }
+    apply_admitted_object_to_log(path, object)
+        .map(Some)
+        .map_err(|error| {
+            // The pinned log stores one record per 4KiB page. An oversized
+            // SQL object fails closed with its identity; skipping would
+            // leave identity only in the projection.
+            if error.contains("larger than a page") {
+                format!(
+                    "object {}/{}/{} exceeds the object-log page: {error}",
+                    object.namespace, object.kind, object.id
+                )
+            } else {
+                error
+            }
+        })
+}
+
+/// Append when the log lacks this identity at the current property map.
+pub fn ensure_admitted_object_in_log(path: &Path, object: &Object) -> Result<u64, String> {
+    if path.exists() {
+        let existing = with_cached_object_log_store(path, |store| {
+            Ok(
+                visible_record(store, &object.namespace, &object.kind, &object.id)
+                    .filter(|record| record.props == object.properties)
+                    .map(|record| record.r#gen),
+            )
+        });
+        if let Ok(Some(generation)) = existing {
+            return Ok(generation);
+        }
+    }
+    apply_admitted_object_to_log(path, object)
 }
 
 #[cfg(test)]
@@ -844,9 +1024,9 @@ fn apply_through_queue(
         .push(ticket.clone());
     let error = loop {
         let mut opened = false;
-        let led = with_object_log_store_cache(cache, path, |store| {
+        let led = with_cached_object_log(cache, path, |cached| {
             opened = true;
-            commit_queued(store, queue, path)
+            commit_queued(cached, queue, path)
         });
         if let Some(outcome) = ticket.take() {
             return outcome;
@@ -894,7 +1074,11 @@ fn apply_through_queue(
 /// Drains the queued records for `path` and commits them together. A
 /// second record for an identity already in this batch waits for the next
 /// batch, so every admit keeps its own generation.
-fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<(), String> {
+fn commit_queued(
+    cached: &mut CachedObjectLogStore,
+    queue: &IngestQueue,
+    path: &Path,
+) -> Result<(), String> {
     let batch = {
         let mut queued = queue
             .lock()
@@ -931,12 +1115,13 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
             &ticket.object.id,
         )
     };
-    let pages_before = store.committed_pages();
+    let pages_before = cached.store_mut()?.committed_pages();
     let records = batch
         .iter()
         .map(|ticket| object_record(&ticket.object))
         .collect::<Vec<_>>();
-    let Err(error) = run_batch(store, records) else {
+    let Err(error) = run_batch(cached.store_mut()?, records) else {
+        let store = cached.store_mut()?;
         for ticket in &batch {
             ticket.finish(generation(store, ticket));
         }
@@ -949,7 +1134,8 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
     // commits for the whole batch and publishes it with one superblock flush,
     // so a batch is never partly committed. This reads neither the error text nor per-record
     // state, so an idempotent re-admit is judged like any other record.
-    let reopened = match Store::open(path) {
+    // Drop the exclusive handle before opening again (mikura v0.5.0).
+    let reopened = match cached.reopen() {
         Ok(reopened) => reopened,
         Err(reopen) => {
             for ticket in &batch {
@@ -959,28 +1145,27 @@ fn commit_queued(store: &mut Store, queue: &IngestQueue, path: &Path) -> Result<
         }
     };
     let committed = reopened.committed_pages() > pages_before;
-    *store = reopened;
     for (index, ticket) in batch.iter().enumerate() {
         if committed {
-            ticket.finish(generation(store, ticket));
+            ticket.finish(generation(cached.store_mut()?, ticket));
             continue;
         }
         // A rolled-back batch retries each record alone, so one bad record
         // cannot fail the rest. A failed retry reopens the handle before the
         // next record, since a failed write can leave it inconsistent.
-        let outcome = mikura_ingest::BatchIngest::run(store, vec![object_record(&ticket.object)])
-            .and_then(|()| generation(store, ticket));
-        if outcome.is_err() {
-            match Store::open(path) {
-                Ok(reopened) => *store = reopened,
-                Err(reopen) => {
-                    ticket.finish(outcome);
-                    for rest in &batch[index + 1..] {
-                        rest.finish(Err(format!("{error}; reopening the log failed: {reopen}")));
-                    }
-                    return Err(error);
-                }
+        let outcome = {
+            let store = cached.store_mut()?;
+            mikura_ingest::BatchIngest::run(store, vec![object_record(&ticket.object)])
+                .and_then(|()| generation(store, ticket))
+        };
+        if outcome.is_err()
+            && let Err(reopen) = cached.reopen()
+        {
+            ticket.finish(outcome);
+            for rest in &batch[index + 1..] {
+                rest.finish(Err(format!("{error}; reopening the log failed: {reopen}")));
             }
+            return Err(error);
         }
         ticket.finish(outcome);
     }
@@ -1098,6 +1283,14 @@ mod tests {
             Some("  ".into()),
         );
         assert_eq!(blank_host.log_path, Some(PathBuf::from("./objects.mikura")));
+        let installed = PathBuf::from("data/objects.mikura");
+        let dual = ObjectLogDualRead::resolve(Some("1".into()), None, None, None)
+            .with_default_log(Some(installed.clone()), false);
+        assert_eq!(dual.log_path, Some(installed));
+        let hosted =
+            ObjectLogDualRead::resolve(Some("1".into()), None, None, Some("127.0.0.1:7070".into()))
+                .with_default_log(Some(PathBuf::from("data/objects.mikura")), true);
+        assert_eq!(hosted.log_path, None);
     }
     use mikura::ObjectRecord;
     use mikura_ingest::BatchIngest;
@@ -1129,11 +1322,197 @@ mod tests {
         };
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 1);
         assert_eq!(apply_admitted_object_to_log(&log, &object).unwrap(), 2);
-        let store = Store::open(&log).unwrap();
-        assert_eq!(
-            identity_generation(&store, "sales", "Customer", "c1").unwrap(),
-            2
+        with_cached_object_log_store(&log, |store| {
+            assert_eq!(
+                identity_generation(store, "sales", "Customer", "c1").unwrap(),
+                2
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_second_store_on_the_same_path_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        hold_local_log(&log).unwrap();
+        let error = match Store::open(&log) {
+            Ok(_) => panic!("second writer must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(mikura::LOG_IN_USE),
+            "second writer must fail closed: {error}"
         );
+        release_process_object_log_cache();
+        drop(Store::open(&log).expect("exclusive lock released"));
+    }
+
+    fn sample_object(id: &str, region: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: "Customer".into(),
+            name: id.into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: HashMap::from([("region".into(), region.into())]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    fn log_generations(path: &Path, ids: &[&str]) -> Vec<u64> {
+        with_cached_object_log_store(path, |store| {
+            ids.iter()
+                .map(|id| identity_generation(store, "sales", "Customer", id))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn backfill_killed_midway_matches_an_uninterrupted_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let interrupted = dir.path().join("interrupted.mikura");
+        let complete = dir.path().join("complete.mikura");
+        let objects = [
+            sample_object("a", "eu"),
+            sample_object("b", "us"),
+            sample_object("c", "ap"),
+        ];
+        backfill_recorded_objects(&complete, objects.iter()).unwrap();
+        release_process_object_log_cache();
+        ensure_admitted_object_in_log(&interrupted, &objects[0]).unwrap();
+        release_process_object_log_cache();
+        backfill_recorded_objects(&interrupted, objects.iter()).unwrap();
+        let ids = ["a", "b", "c"];
+        assert_eq!(
+            log_generations(&interrupted, &ids),
+            log_generations(&complete, &ids)
+        );
+        assert_eq!(
+            backfill_recorded_objects(&interrupted, objects.iter()).unwrap(),
+            0,
+            "complete marker skips a second scan"
+        );
+    }
+
+    #[test]
+    fn backfill_does_not_replace_a_newer_log_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        apply_admitted_object_to_log(&log, &sample_object("a", "us")).unwrap();
+        backfill_recorded_objects(&log, std::iter::once(&sample_object("a", "eu"))).unwrap();
+        assert_eq!(log_generations(&log, &["a"]), vec![1]);
+        with_cached_object_log_store(&log, |store| {
+            let record = visible_record(store, "sales", "Customer", "a").unwrap();
+            assert_eq!(record.props.get("region").map(String::as_str), Some("us"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn backfill_does_not_unhide_an_existing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![ObjectRecord {
+                action_id: None,
+                r#gen: 1,
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                key: "a".into(),
+                hidden: true,
+                props: HashMap::from([("region".into(), "us".into())]),
+                schema_version: 1,
+            }],
+        )
+        .unwrap();
+        drop(store);
+        backfill_recorded_objects(&log, std::iter::once(&sample_object("a", "eu"))).unwrap();
+        with_cached_object_log_store(&log, |store| {
+            let record = store
+                .load("sales", "Customer", "a", &PropertyAcl::allow_all())
+                .unwrap();
+            assert!(record.hidden);
+            assert_eq!(record.r#gen, 1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn backfill_fails_closed_when_a_record_exceeds_a_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let mut object = sample_object("huge", "eu");
+        object.properties.insert("blob".into(), "x".repeat(8000));
+        let error = backfill_recorded_objects(&log, std::iter::once(&object)).unwrap_err();
+        assert!(error.contains("huge"), "{error}");
+        assert!(error.contains("page"), "{error}");
+    }
+
+    #[test]
+    fn backfill_skips_internal_objects_with_empty_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let internal = Object {
+            id: "rule-1".into(),
+            kind: "TrustScoreRule".into(),
+            name: "rule".into(),
+            namespace: String::new(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        };
+        assert!(
+            apply_admitted_object_to_log(&log, &internal)
+                .unwrap_err()
+                .contains("namespace"),
+            "mikura must refuse empty-namespace internals"
+        );
+        let named = sample_object("a", "eu");
+        assert_eq!(
+            backfill_recorded_objects(&log, [&internal, &named].into_iter()).unwrap(),
+            1
+        );
+        assert_eq!(log_generations(&log, &["a"]), vec![1]);
+        assert!(backfill_already_complete(&log).unwrap());
+    }
+
+    #[test]
+    fn an_orphaned_marker_does_not_complete_a_partial_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let objects = [sample_object("a", "eu"), sample_object("b", "us")];
+        backfill_recorded_objects(&log, objects.iter()).unwrap();
+        release_process_object_log_cache();
+        std::fs::remove_file(&log).unwrap();
+        hold_local_log(&log).unwrap();
+        assert!(!backfill_already_complete(&log).unwrap());
+        assert!(!backfill_marker_path(&log).exists());
+        ingest_absent_identity(&log, &objects[0]).unwrap();
+        backfill_recorded_objects(&log, objects.iter()).unwrap();
+        assert_eq!(log_generations(&log, &["a", "b"]), vec![1, 1]);
+    }
+
+    #[test]
+    fn an_orphaned_backfill_marker_does_not_skip_an_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let objects = [sample_object("a", "eu")];
+        backfill_recorded_objects(&log, objects.iter()).unwrap();
+        release_process_object_log_cache();
+        std::fs::remove_file(&log).unwrap();
+        assert!(backfill_marker_path(&log).exists());
+        hold_local_log(&log).unwrap();
+        backfill_recorded_objects(&log, objects.iter()).unwrap();
+        assert_eq!(log_generations(&log, &["a"]), vec![1]);
     }
 
     #[test]
@@ -1187,14 +1566,20 @@ mod tests {
         assert_eq!(ingest_and_read(&cache, &log).unwrap(), 6);
         assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 3);
 
-        // A failed operation must evict the cache rather than leave a
-        // handle with possibly-inconsistent writer state cached for the
-        // next call to keep writing through.
+        // A failed operation discards the writer (not failure-atomic) then
+        // immediately reopens so the exclusive lock stays with this process.
         let failing = with_object_log_store_cache(&cache, &log, |_store| {
             Err::<(), _>("injected failure".to_string())
         });
         assert!(failing.is_err());
-        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 3);
+        assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 4);
+        match Store::open(&log) {
+            Ok(_) => panic!("second writer must fail closed while the process holds the log"),
+            Err(error) => assert!(
+                error.contains(mikura::LOG_IN_USE),
+                "unexpected second-open error: {error}"
+            ),
+        }
         assert_eq!(ingest_and_read(&cache, &log).unwrap(), 7);
         assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 4);
     }
@@ -1307,7 +1692,9 @@ mod tests {
         let queue: IngestQueue = Mutex::new(std::collections::HashMap::new());
         let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
         apply_through_queue(&cache, &queue, &path, &object("seed")).unwrap();
-        let pages_before = Store::open(&path).unwrap().committed_pages();
+        let pages_before =
+            with_object_log_store_cache(&cache, &path, |store| Ok(store.committed_pages()))
+                .unwrap();
         let queued = ["q1", "q2", "q3", "q4"]
             .into_iter()
             .map(|id| {
@@ -1330,14 +1717,17 @@ mod tests {
             .map(|ticket| ticket.take().expect("drained by the leader").unwrap())
             .collect::<Vec<_>>();
         generations.push(leader);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.committed_pages(), pages_before + 1);
-        for (id, generation) in ["q1", "q2", "q3", "q4", "leader"].iter().zip(&generations) {
-            assert_eq!(
-                identity_generation(&store, "sales", "Customer", id).unwrap(),
-                *generation
-            );
-        }
+        with_object_log_store_cache(&cache, &path, |store| {
+            assert_eq!(store.committed_pages(), pages_before + 1);
+            for (id, generation) in ["q1", "q2", "q3", "q4", "leader"].iter().zip(&generations) {
+                assert_eq!(
+                    identity_generation(store, "sales", "Customer", id).unwrap(),
+                    *generation
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     fn queue_admits_and_fail_their_batch(
@@ -1358,7 +1748,9 @@ mod tests {
         let queue: IngestQueue = Mutex::new(std::collections::HashMap::new());
         let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
         apply_through_queue(&cache, &queue, &path, &object("same", "eu")).unwrap();
-        let pages_before = Store::open(&path).unwrap().committed_pages();
+        let pages_before =
+            with_object_log_store_cache(&cache, &path, |store| Ok(store.committed_pages()))
+                .unwrap();
         // An identical re-admit rides in the batch with two new records.
         let queued = [object("same", "eu"), object("new-1", "us")]
             .into_iter()
@@ -1387,7 +1779,9 @@ mod tests {
             .map(|ticket| ticket.take().expect("drained by the leader").unwrap())
             .collect::<Vec<_>>();
         generations.push(leader.unwrap());
-        let pages_after = Store::open(&path).unwrap().committed_pages();
+        let pages_after =
+            with_object_log_store_cache(&cache, &path, |store| Ok(store.committed_pages()))
+                .unwrap();
         (generations, pages_before, pages_after, path, dir)
     }
 
@@ -1450,11 +1844,14 @@ mod tests {
         let newer = apply_through_queue(&cache, &queue, &path, &object("us")).unwrap();
         let older = older.take().expect("drained first").unwrap();
         assert!(newer > older, "the newer admit commits after its twin");
-        let store = Store::open(&path).unwrap();
-        assert_eq!(
-            identity_generation(&store, "sales", "Customer", "twin").unwrap(),
-            newer
-        );
+        with_object_log_store_cache(&cache, &path, |store| {
+            assert_eq!(
+                identity_generation(store, "sales", "Customer", "twin").unwrap(),
+                newer
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -1539,6 +1936,7 @@ mod tests {
             .into_iter()
             .flat_map(|handle| handle.join().unwrap())
             .collect::<Vec<_>>();
+        release_process_object_log_cache();
         let store = Store::open(&path).unwrap();
         assert_eq!(results.len(), 80);
         for (id, generation) in &results {
@@ -1615,6 +2013,7 @@ mod tests {
             ],
         )
         .unwrap();
+        drop(store);
         let descriptor = ObjectSetDescriptor {
             namespace: "sales".into(),
             kind: "Customer".into(),
@@ -1662,6 +2061,10 @@ mod tests {
         // Canary samples share one handle instead of a Store::open each.
         assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 1);
 
+        // mikura v0.5.0 holds an exclusive writer: an out-of-band ingest
+        // drops that handle first, then the next sample opens fresh.
+        release_object_log_cache(&cache);
+        let mut store = Store::open(&log).unwrap();
         BatchIngest::run(
             &mut store,
             vec![ObjectRecord {
@@ -1681,8 +2084,7 @@ mod tests {
             }],
         )
         .unwrap();
-        // A write that bypassed the cached handle changes the file, so the
-        // next sample reopens and sees it rather than serving stale memory.
+        drop(store);
         let err = compare().unwrap_err();
         assert!(matches!(err, ObjectLogCompareError::Mismatch { .. }));
         assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 2);
@@ -2046,6 +2448,7 @@ mod tests {
             }],
         )
         .unwrap();
+        drop(store);
         let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
         let descriptor = shop_order_descriptor();
         let paths: [Vec<&ObjectTypeIndexMember>; 0] = [];
@@ -2196,6 +2599,7 @@ mod tests {
             ],
         )
         .unwrap();
+        drop(store);
         let members = [
             member_props("order", "o1", &[("amount", "9223372036854775807")]),
             member_props("order", "o2", &[("amount", "1")]),
@@ -2520,6 +2924,7 @@ mod tests {
                 .props
                 .contains_key("secret")
         );
+        drop(store);
         let descriptor = ObjectSetDescriptor {
             namespace: "sales".into(),
             kind: "Customer".into(),
@@ -2559,6 +2964,8 @@ mod tests {
             )
         };
         compare().unwrap();
+        release_object_log_cache(&cache);
+        let mut store = Store::open(&log).unwrap();
         BatchIngest::run(
             &mut store,
             vec![record(
@@ -2568,6 +2975,7 @@ mod tests {
             )],
         )
         .unwrap();
+        drop(store);
         assert!(matches!(
             compare().unwrap_err(),
             ObjectLogCompareError::Mismatch { .. }
@@ -2642,16 +3050,19 @@ mod tests {
         assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 1);
         assert_eq!(apply_admitted_object_to_log(&log, &ops).unwrap(), 1);
         assert_eq!(apply_admitted_object_to_log(&log, &sales).unwrap(), 2);
-        let store = Store::open(&log).unwrap();
-        assert_eq!(
-            identity_generation(&store, "sales", "Customer", "shared").unwrap(),
-            2
-        );
-        assert_eq!(
-            identity_generation(&store, "ops", "Customer", "shared").unwrap(),
-            1
-        );
-        drop(store);
+        with_cached_object_log_store(&log, |store| {
+            assert_eq!(
+                identity_generation(store, "sales", "Customer", "shared").unwrap(),
+                2
+            );
+            assert_eq!(
+                identity_generation(store, "ops", "Customer", "shared").unwrap(),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        release_process_object_log_cache();
         let reopened = Store::open(&log).unwrap();
         assert_eq!(
             identity_generation(&reopened, "sales", "Customer", "shared").unwrap(),

@@ -46,6 +46,7 @@ fn split_server(dir: &Path, ops_port: u16, sekai: &str, chisei: &str) -> Command
         .env_remove("OLLAMA_URL")
         .env_remove("OPENAI_API_KEY")
         .env_remove("ANTHROPIC_API_KEY");
+    crate::isolate_object_log(&mut command, dir);
     command
 }
 

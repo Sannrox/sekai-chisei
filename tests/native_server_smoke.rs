@@ -226,6 +226,7 @@ impl NativeServer {
             .env_remove("NATIVE_LLM_URL")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut command, dir.path());
         if let Some(url) = ollama_url {
             command.env("OLLAMA_URL", url);
         } else {

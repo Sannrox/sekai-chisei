@@ -24,17 +24,18 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 4. `PutObjectTypeIndexEdit` — Action delta that survives a full rebuild.
 
 Admitted object create/update still persists clerk objects and receipts
-here. When `SEKAI_OBJECT_LOG` is set, the same admitted mutation is
-appended through tagged mikura ingest so the log owns identity
-generations. A denied or unadmitted Action does not append. Action apply
-does not write these SQL tables. See [ADR 0091](decisions/0091-object-log-owns-evaluate-identity.md).
+here. Combined and Sekai processes always open an object log (default
+`<SEKAI_DATA_DIR>/objects.mikura`, or `SEKAI_OBJECT_LOG_HOST`). The same
+admitted mutation is appended through tagged mikura ingest so the log owns
+identity generations. A denied or unadmitted Action does not append. Action
+apply does not write these SQL tables. See
+[ADR 0091](decisions/0091-object-log-owns-evaluate-identity.md).
 
-One process at a time may set `SEKAI_OBJECT_LOG` to a given path: the
-in-process log handle is a single writer. Several clerk processes, such as
-replicas sharing PostgreSQL or separate Sekai and Chisei planes, share
-object identity through the SQL index. The target is one object-log host
-that every clerk process calls, and it waits on a mikura release with that
-host. See [ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
+One process at a time may open a given `SEKAI_OBJECT_LOG` path: the
+in-process log handle is a single writer, and a second process fails closed
+on open. Several clerk processes share one object-log host
+(`SEKAI_OBJECT_LOG_HOST`). See
+[ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
 
 `EvaluateObjectSet` reads the index when a datasource is registered. Set
 `required_freshness_ms` to fail closed when the serving projection is stale

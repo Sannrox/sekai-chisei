@@ -121,6 +121,9 @@ fn spawn_plane(
     for (key, value) in extras {
         command.env(key, value);
     }
+    if let Some(dir) = stderr_path.parent() {
+        crate::isolate_object_log(&mut command, dir);
+    }
     let child = command.spawn().unwrap();
     killer.register(child.id());
     ChildGuard { child, stderr_path }
@@ -490,6 +493,7 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
         .env("SEKAI_DB_PATH", chisei_db.to_str().unwrap())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::isolate_object_log(&mut refuse, dir.path());
     let status = run_until_exit(refuse, Duration::from_secs(10));
     assert!(!status.success(), "sekai process opened a Chisei store");
 }
@@ -511,6 +515,7 @@ fn sekai_binary_refuses_chisei_destination_variables() {
         .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::isolate_object_log(&mut command, dir.path());
     let status = run_until_exit(command, Duration::from_secs(10));
     assert!(!status.success());
 }

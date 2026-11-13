@@ -86,6 +86,7 @@ impl LoopServer {
             .envs(env.iter().copied())
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut command, dir.path());
         match backend {
             Backend::Sqlite => {
                 command

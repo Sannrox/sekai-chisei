@@ -118,8 +118,8 @@ chisei-provider = { version = "1.0.0", path = "crates/chisei-provider" }
 sekai-admin-client = { version = "1.0.0", path = "crates/sekai-admin-client" }
 sekai-proto = { version = "3.0.0", path = "crates/sekai-proto" }
 sekai-ontology = { version = "1.0.0", path = "crates/sekai-ontology" }
-mikura = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
-mikura-ingest = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
+mikura = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
+mikura-ingest = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 fs2 = "0.4.3"
 futures = "0.3"
 
@@ -131,8 +131,8 @@ sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.41", features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
-# The object-log host the clerk adapter talks to (ADR 0088), same pinned revision.
-mikura-host = { git = "https://github.com/Sannrox/mikura", rev = "0d43c57df9ddc4de62ecd1b3ad53932766b10124" }
+# The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
+mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 sekai-parquet-export = { version = "1.0.0", path = "crates/sekai-parquet-export" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
