@@ -146,8 +146,8 @@ routing, evaluation gates, outcome attribution, and learning rules.
 
 The LLM provider adapters execute calls but do not own these decisions.
 Provider-specific behavior stays behind the `chisei-provider` crate. The
-`chisei-gateway` crate depends on `sekai-proto`, `chisei-provider`, and
-`sekai-admin-client` among workspace packages; governed decisions and durable
+`chisei-gateway` crate depends on `sekai-proto`, `chisei-provider`,
+`sekai-admin-client`, `sekai-domain`, and `sekai-obs` among workspace packages; governed decisions and durable
 mutations cross the gRPC contract instead of reaching into control-plane
 implementation modules.
 

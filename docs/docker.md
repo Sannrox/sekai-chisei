@@ -70,7 +70,7 @@ scripts/postgres_portfolio_tests_apple.sh
 ```
 
 The script generates a one-day test CA and server certificate, publishes
-PostgreSQL on `127.0.0.1:55432`, runs the focused tests, and removes the
+PostgreSQL on an ephemeral `127.0.0.1` port, runs the focused tests, and removes the
 container and certificates on exit. Override the port or OCI image with
 `SEKAI_TEST_POSTGRES_PORT` or `SEKAI_TEST_POSTGRES_IMAGE`.
 
@@ -81,8 +81,8 @@ database and run the same test groups directly:
 export SEKAI_TEST_POSTGRES_URL='postgresql://user:password@localhost/sekai_test'
 # Set this when the test server uses a private certificate authority.
 export SEKAI_TEST_POSTGRES_CA_CERT='/path/to/test-ca.pem'
-cargo test --locked 'db::postgres::tests::' -- --ignored --nocapture
-cargo test --locked 'db::postgres_portfolio::tests::' -- --ignored --nocapture
+cargo test --locked -p sekai-core --lib 'db::postgres::tests::' -- --ignored --nocapture
+cargo test --locked -p chisei-core --lib 'chisei_store::postgres_portfolio::tests::' -- --ignored --nocapture
 ```
 
 To run every PostgreSQL conformance suite the way CI does, including the

@@ -90,8 +90,12 @@ The TypeScript and Python facades expose that loop through
 is **not** a supported row; local artifacts and publication records are.
 
 The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
-`DescribeObjectAction`, `PreviewObjectAction`, `SubmitActionInstance`, and
-`GetOperationReceipt`. That allowlist is not the sekaictl/SDK product loop.
+`DescribeObjectAction`, `PreviewObjectAction`, `SubmitActionInstance`,
+`GetOperationReceipt`, `GetLinks`, `CreateLink`, `ResolveEvaluationPlan`,
+`ExecuteEvaluationManifest`, `CreateDefinitionBranch`,
+`ApplyDefinitionBranchEdit`, `CompareDefinitionRevisions`,
+`ReportDefinitionConsumerImpact`, `CreateDefinitionProposal`, and `Search`;
+experimental RPCs stay gated. That allowlist is not the sekaictl/SDK product loop.
 
 ## Version, errors, pagination, authorization
 
@@ -114,7 +118,7 @@ The MCP host allowlists `GetObject`, `EvaluateObjectSet`,
 | Ontology apply (class / relation) | `sekaictl ontology apply` | not a typed helper | not a typed helper | yes | yes |
 | Object / link seed | `sekaictl ontology seed` | `runCoreLoop` | `run_core_loop` | yes | yes |
 | Plan / receipt | `sekaictl ontology run` | `runCoreLoop` | `run_core_loop` | yes | see [postgres-chisei-parity.md](postgres-chisei-parity.md) |
-| Client-package records | `sekaictl admin sdk-packages` | publication metadata only | publication metadata only | yes | unavailable |
+| Client-package records | `sekaictl admin sdk-packages` | publication metadata only | publication metadata only | yes | yes |
 | MCP allowlist | `sekai-mcp` | MCP stdio host | MCP stdio host | — | — |
 
 ## Gaps (not shipped)

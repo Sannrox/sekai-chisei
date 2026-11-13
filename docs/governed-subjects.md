@@ -124,11 +124,8 @@ sekaictl admin governance subject provenance export \
   --operation-id governed-subject-<digest> \
   --receipt-digest sha256:<receipt-digest> \
   --export-id tenkai-release-v1.2.3 \
+  --trust-root-output provenance-trust.toml \
   --output governed-subject.json
-
-sekaictl admin governance subject provenance trust-root \
-  --export-id tenkai-release-v1.2.3 \
-  --output provenance-trust.toml
 ```
 
 The JSON file is the strict Tenkai envelope. The TOML file has Tenkai's
@@ -147,8 +144,9 @@ SQLite and PostgreSQL implementations. They are not generic Sekai objects and
 cannot be created, updated, or deleted through object CRUD APIs.
 
 Rotate keys by configuring a new seed and activation window for future export
-IDs. Each durable export stores its matching public key, so `trust-root
---export-id` continues to return the historical root required for that exact
+IDs. Each durable export stores its matching public key, so repeating
+`provenance export` with the same `--export-id` and `--trust-root-output`
+continues to return the historical root required for that exact
 envelope after server rotation. Tenkai accepts one `sekai-chisei` root per
 trust file; publish an envelope with the root retrieved for that export.
 Retiring a key stops new issuance, while envelope expiry bounds acceptance of
@@ -158,6 +156,6 @@ The export is evidence only. It grants no release, promotion, gate, delivery,
 or external-action authority; Tenkai independently authenticates and admits it
 against the exact manifest and artifact tree.
 
-Operational rollback removes or retires the signing key and disables the two
-additive provenance RPCs. It must retain the append-only export table so prior
+Operational rollback removes or retires the signing key and disables the additive
+provenance RPC. It must retain the append-only export table so prior
 envelopes and their historical public roots remain reconcilable.

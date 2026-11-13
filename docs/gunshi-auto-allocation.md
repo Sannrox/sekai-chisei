@@ -106,7 +106,6 @@ need dedicated RPCs.
 
 ## Persistence
 
-SQLite table `chisei_gunshi_allocation_state` stores the durable control blob with
-revision CAS. PostgreSQL community runtime returns unavailable for these methods
-until parity is added. Mutations also emit audit decisions under
+SQLite table `chisei_gunshi_allocation_state` and its PostgreSQL counterpart store
+the durable control blob with revision CAS. Mutations also emit audit decisions under
 `gunshi.allocation_policy.*`.

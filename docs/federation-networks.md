@@ -40,4 +40,4 @@ cannot reconnect.
 | Peer loss while disconnected | `federation peer is disconnected` |
 | Unknown contract revision | `federation network revision is unsupported` |
 
-SQLite stores contracts and exchanges. PostgreSQL surfaces stay unavailable.
+SQLite and PostgreSQL store contracts and exchanges.

@@ -140,8 +140,8 @@ If you want to deploy or operate the control plane:
   is not authority.
 - [Embedding index](embedding-index.md) — stored specs embedded through a
   hosted catalog route on a schedule, with governance tags on every vector.
-- [Permission-aware search](search.md) — experimental text search over
-  objects and dataset metadata. Hits, counts, facets, and highlights come
+- [Permission-aware search](search.md) — stable `Search` RPCs (experimental
+  product tier) over objects and dataset metadata. Hits, counts, facets, and highlights come
   from the live authorized projection. A page is not authority.
 - [Neighborhood and path queries](graph-exploration.md) — experimental
   bounded expansion and shortest paths over links, with read policy at

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve `sekai-chisei`. The 1.x core contract is stable, so
+Thanks for helping improve `sekai-chisei`. The 3.x core contract is stable, so
 focused changes with clear behavior, tests, and migration impact are easier to
 review than broad rewrites. Experimental surfaces must remain explicitly
 classified and opt-in.
@@ -194,8 +194,9 @@ cargo clippy-all
 cargo test-all
 ```
 
-Maintainers normally squash-merge PRs (`gh pr merge --squash --delete-branch`)
-so the land commit on `main` is GitHub-signed/Verified and history stays linear.
+Maintainers land PRs with
+`bash "${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}/skills/deliver-ready-issue/scripts/issue-lane.sh" land <issue> --pr <pr>`,
+which squash-merges the reviewed head so the land commit on `main` is GitHub-signed/Verified and history stays linear.
 Use a merge commit only when multi-commit history must be preserved. Avoid
 GitHub rebase-merge when Verified history matters: rebase rewrites commits and
 drops signatures. See `AGENTS.md` for the verified-push workflow.

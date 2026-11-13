@@ -35,10 +35,7 @@ enabled. See [rpc-maturity.md](rpc-maturity.md).
    fence, including a fenced retry after harvest failed and the case where
    harvest already recorded `OutcomeRecorded`. Unfenced completed-ack replay
    cannot bind a missing artifact.
-5. Consistency helper `evaluate_action_lifecycle` flags:
-   - terminal effect without receipt outcome (ack without harvest spine)
-   - receipt outcome while effect still claimed/pending (harvest without ack)
-6. Notifications and external_mutate do not use this claim/harvest binding.
+5. Notifications and external_mutate do not use this claim/harvest binding.
 
 ## Conflict preference
 

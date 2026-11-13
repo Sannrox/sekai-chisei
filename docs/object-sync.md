@@ -255,7 +255,7 @@ sekaictl admin sync inspect-descriptor --namespace ops --digest sha256:...
 sekaictl admin sync retire-descriptor --namespace ops --digest sha256:...
 ```
 
-SQLite stores the catalog. PostgreSQL stays unavailable. A **live** registered
+SQLite and PostgreSQL store the catalog. A **live** registered
 descriptor may authorize `ApplySourceBatch` with identity
 `{source}:{instance}#{record_kind}/{immutable_key}` and the same transactional
 lifecycle as GitHub. Apply re-reads live catalog status inside the Immediate

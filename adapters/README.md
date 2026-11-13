@@ -32,8 +32,7 @@ the Sekai core:
   endpoint and translates the response into expiring operational-health
   evidence.
 - `evidence_ontology_concept_catalog` maps one structured concept-catalog
-  document into `ontology.concept_catalog` evidence for governed
-  ontology-definition proposals (#147). Extraction and review stay in Sekai
+  document into `ontology.concept_catalog` instance evidence. Extraction and review stay in Sekai
   core; the adapter never mutates definitions.
 - `evidence_social_post_snapshot` and `evidence_social_reply` map bounded social
   observation documents into `social.post_snapshot` and `social.reply` evidence.
@@ -84,9 +83,11 @@ cargo run -p sekai-adapters --example evidence_http_health_poll
 ```
 
 The concept-catalog adapter uses evidence type `ontology.concept_catalog` and
-schema `adapter.ontology.concept_catalog@1.0.0`. After admission, ontology
-admins call `ProposeOntologyDefinitions` (prefer `dry_run=true` first) and
-`ReviewOntologyDefinitionProposal`:
+schema `adapter.ontology.concept_catalog@1.0.0`. After admission the evidence
+stays instance evidence. The evidence-driven proposal workflow was retired from
+the 1.0 runtime contract, so ontology admins author classes and relations
+directly through the ontology mutation APIs (see
+[ontology.md](../docs/ontology.md)):
 
 ```sh
 cargo run -p sekai-adapters --example evidence_ontology_concept_catalog \

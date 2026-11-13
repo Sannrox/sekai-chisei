@@ -125,7 +125,7 @@ pub(super) async fn score_object_trust(
     let rule = &stored.rule;
     let now_ms = now_millis();
     // Source health is disclosed only to namespace members, as on
-    // `ReportSourceHealth`; anyone else sees every source as unavailable.
+    // `GetSourceHealth`; anyone else sees every source as unavailable.
     let sources_disclosed = principals.first().is_some_and(|actor| {
         crate::sekai::namespace_access::principal_can_access_namespace(db, actor, &namespace)
             .unwrap_or(false)

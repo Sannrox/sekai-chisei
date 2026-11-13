@@ -61,5 +61,4 @@ Hidden fields that were not requested are omitted. Requesting them fails
 before any row is returned. The same snapshot digest always yields the same
 authorized projection. Partial output is discarded.
 
-SQLite stores registrations and snapshots. PostgreSQL surfaces stay
-unavailable.
+SQLite and community PostgreSQL store registrations and snapshots (#1479).

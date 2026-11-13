@@ -42,8 +42,7 @@ or product-specific schemas.
 ## Reference path (tests / examples)
 
 - Synthetic evidence envelope → optional `SubmitActionInstance` with
-  `evidence_submission_ids` (see unit test
-  `producer_contract_evidence_then_optional_action_submit`).
+  `evidence_submission_ids`.
 - Existing adapters under `adapters/` remain observation funnels; they may call
   Action submit after local policy without becoming runners.
 

@@ -43,7 +43,8 @@ tool.
 
 Copy `examples/definition-change-tracer/` and drive the same steps against
 `sekai-mcp` plus native gRPC. MCP JSON uses camelCase for definition tools and
-`from_id` / `to_id` / `relation` for links. Keep `experimental_rpcs` off.
+`from_id` / `to_id` / `relation` for links. Keep `experimental_rpcs` off for every step
+except approve and merge (see below).
 
 | Step | Surface | Name |
 | --- | --- | --- |

@@ -47,9 +47,7 @@ evidence may expose its own digest only through its existing source check.
 
 `RetrieveContext` and `ExpandRelations` attach one descriptor to each returned
 candidate after object, namespace, classification, and ontology ACL checks.
-Those RPCs, and `ExplainDerivation` below, are classified `experimental` and
-are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
-Cargo feature is enabled. See [rpc-maturity.md](rpc-maturity.md).
+Those RPCs, and `ExplainDerivation` below, are classified `stable`. See [rpc-maturity.md](rpc-maturity.md).
 Asserted candidates use their bounded source fact IDs. Entailed candidates use
 `origin_class=derived`, carry `derivation_ref=ontology_revision:<revision>`,
 and retain the complete authorized ontology revision and derivation steps in
@@ -63,10 +61,8 @@ and source identities are never reconciled or collapsed. Existing content and
 ACL checks run before the descriptor is returned.
 
 The graph retrieval path is reusable on SQLite and PostgreSQL for asserted
-mode. Query-time ontology entailment depends on the authorization-filtered
-ontology snapshot, which is currently a SQLite-only reusable surface; the
-PostgreSQL runtime fails closed with an explicit unavailable capability rather
-than returning a partial or unbounded projection. Evidence submission metadata
+mode. Query-time ontology entailment runs on SQLite and PostgreSQL (#1320) from
+the same authorization-filtered ontology snapshot. Evidence submission metadata
 uses the backend-neutral reusable surfaces; an unsupported backend-specific
 content projection continues to fail closed.
 

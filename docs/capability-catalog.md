@@ -127,7 +127,7 @@ Catalog-bound `SubmitActionInstance` with `x-sekai-capability` equal to
 gone or `action_version` is not the advertised version. Direct submit
 without those headers, and MCP v1's `sekai.actions.submit` tool when that
 name is not the native type entry, keep the existing submit path. MCP v1
-keeps its fixed ten-tool allowlist; the native catalog is the Action-type
+keeps its fixed allowlist (see [MCP and SDK projections](#mcp-and-sdk-projections)); the native catalog is the Action-type
 source.
 See [ADR 0116](decisions/0116-action-type-capability-discovery.md).
 
@@ -140,9 +140,9 @@ results, truncation metadata, evidence references, and receipts only.
 
 | Capability | RPC / input type | Product tier | Purpose |
 | --- | --- | --- | --- |
-| `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
-| `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
-| `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. Wire class `experimental`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or `experimental-rpcs`. |
+| `sekai.semantic.expand_relations` | `ExpandRelations` | **core** | Expand authorized relations from one root in `asserted_only` or `entailment` reasoning mode with hard bounds. Wire class `stable`. |
+| `sekai.context.retrieve` | `RetrieveContext` | **core** | Retrieve bounded context candidates with per-candidate provenance. Catalog binding requires `x-sekai-namespace`. Wire class `stable`. |
+| `sekai.semantic.explain_derivation` | `ExplainDerivation` | **core** | Return the authorized derivation explanation from `from` to `to` without hidden policy inputs. Denied intermediates yield `found=false`. Wire class `stable`. |
 
 ### Product tier filter (core pack)
 
