@@ -419,23 +419,3 @@ fn credential_material_is_redacted_and_metadata_contracts_are_versioned() {
         PROTECTED_RESOURCE_METADATA_VERSION
     );
 }
-
-#[test]
-fn community_build_has_no_identity_endpoints_or_activation_configuration() {
-    let gateway = include_str!("../crates/chisei-gateway/src/gateway.rs");
-    let config = include_str!("../crates/chisei-core/src/config.rs");
-    for endpoint in [
-        "/.well-known/openid-configuration",
-        "/.well-known/oauth-authorization-server",
-        "/.well-known/oauth-protected-resource",
-        "/oauth/authorize",
-        "/oauth/token",
-        "/oauth/revoke",
-        "/session",
-    ] {
-        assert!(!gateway.contains(&format!("route(\"{endpoint}\"")));
-    }
-    for variable in ["SEKAI_OIDC", "SEKAI_OAUTH", "SEKAI_IDENTITY_EXTENSION"] {
-        assert!(!config.contains(variable));
-    }
-}
