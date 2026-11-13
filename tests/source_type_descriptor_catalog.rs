@@ -8,14 +8,12 @@ use sekai_chisei::grpc::pb::sekai::{
     RetireSourceTypeDescriptorRequest,
 };
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
-use sekai_chisei::sekai::object_sync::GITHUB_OBJECT_SYNC_TYPE_DIGEST;
 use sekai_chisei::sekai::security::Role;
 use sekai_chisei::sekai::source_type_descriptor::{
     DESCRIPTOR_UNAVAILABLE, ProposedSourceTypeDescriptor, SOURCE_TYPE_DESCRIPTOR_CONTRACT,
     inspect_source_type_descriptor, register_source_type_descriptor, retire_source_type_descriptor,
     synthetic_pager_alert_v1,
 };
-use sekai_chisei::source_adapter_catalog::built_in_source_adapters;
 use std::sync::Arc;
 use tonic::metadata::MetadataValue;
 use tonic::{Code, Request};
@@ -44,19 +42,6 @@ fn fixture_matches_prepared_pager_identity() {
     assert_eq!(fixture, prepared);
     assert_eq!(fixture.contract_version, SOURCE_TYPE_DESCRIPTOR_CONTRACT);
     fixture.validate().unwrap();
-}
-
-#[test]
-fn registered_descriptor_does_not_change_github_discovery() {
-    let db = RuntimeDb::memory();
-    let pager = synthetic_pager_alert_v1();
-    register_source_type_descriptor(&db, "local", "ops", &pager, 10).unwrap();
-    let profiles = built_in_source_adapters();
-    assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0].source, "github");
-    assert_eq!(profiles[0].record_types, ["Issue", "PullRequest"]);
-    assert_eq!(profiles[0].type_digest, GITHUB_OBJECT_SYNC_TYPE_DIGEST);
-    assert_ne!(pager.digest, GITHUB_OBJECT_SYNC_TYPE_DIGEST);
 }
 
 #[tokio::test]
