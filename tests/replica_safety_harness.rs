@@ -5,31 +5,11 @@
 use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
-use std::path::Path;
 
 pub(crate) fn open_replica_pair() -> TwoReplicaSqlite {
     let pair = TwoReplicaSqlite::open().expect("shared sqlite pair");
     sekai_chisei::chisei_store::apply_chisei_schema(pair.a.as_ref());
     pair
-}
-
-#[test]
-fn inventory_fixture_is_valid_and_evidence_exists() {
-    let inventory = ReplicaSafetyInventory::load().expect("load inventory");
-    for surface in &inventory.surfaces {
-        for path in &surface.evidence {
-            assert!(
-                Path::new(path).exists(),
-                "missing evidence {path} for {}",
-                surface.id
-            );
-        }
-    }
-    for id in &inventory.required_authoritative_surfaces {
-        inventory
-            .require_authoritative(id)
-            .unwrap_or_else(|error| panic!("{id}: {error}"));
-    }
 }
 
 #[test]

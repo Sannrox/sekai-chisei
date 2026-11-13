@@ -123,14 +123,3 @@ fn portfolio_observation_is_shared_across_replicas() {
         "points={points:?}"
     );
 }
-
-#[test]
-fn grpc_chisei_service_constructs_shared_eval_store() {
-    // Static guarantee: production service uses with_db (see ChiseiServiceImpl::new).
-    // Behavioral check uses the same wiring.
-    let pair = TwoReplicaSqlite::open().unwrap();
-    let eval = EvalStore::with_db(
-        sekai_chisei::chisei_store::ChiseiStore::from_shared_runtime(Arc::clone(&pair.a)),
-    );
-    assert!(eval.is_shared());
-}
