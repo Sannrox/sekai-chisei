@@ -7,8 +7,6 @@ use sekai_core::sekai::model_platform::{
 };
 use serde::Deserialize;
 
-pub const ADAPTER_ID: &str = PROFILE_MESSAGES;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessagesDocument {

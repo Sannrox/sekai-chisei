@@ -111,6 +111,4 @@ fn hidden_fields_fail_closed() {
         .unwrap()
         .insert("token".into(), serde_json::json!("ghp_nope"));
     assert!(warehouse_orders::parse(&serde_json::to_vec(&orders).unwrap()).is_err());
-    assert_eq!(warehouse_orders::ADAPTER_ID, PROFILE_ORDERS);
-    assert_eq!(warehouse_inventory::ADAPTER_ID, PROFILE_INVENTORY);
 }

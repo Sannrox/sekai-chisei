@@ -7,8 +7,6 @@ use sekai_core::sekai::warehouse_projection::{
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-pub const ADAPTER_ID: &str = PROFILE_INVENTORY;
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InventoryDocument {

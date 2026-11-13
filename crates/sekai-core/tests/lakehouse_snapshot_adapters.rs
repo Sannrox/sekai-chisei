@@ -106,6 +106,4 @@ fn hidden_fields_fail_closed() {
         .unwrap()
         .insert("token".into(), serde_json::json!("ghp_nope"));
     assert!(lakehouse_events::parse(&serde_json::to_vec(&events).unwrap()).is_err());
-    assert_eq!(lakehouse_events::ADAPTER_ID, PROFILE_EVENTS);
-    assert_eq!(lakehouse_metrics::ADAPTER_ID, PROFILE_METRICS);
 }

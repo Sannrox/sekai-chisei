@@ -1117,13 +1117,6 @@ pub(super) async fn read_bounded_upstream_response(
 pub(super) fn buffered_response_exceeds_limit(buffered: usize, next_chunk: usize) -> bool {
     buffered.saturating_add(next_chunk) > DEFAULT_MAX_RESPONSE_BYTES
 }
-#[cfg(test)]
-pub(super) fn buffered_responses_incomplete_reason(body: &[u8]) -> Option<String> {
-    match buffered_responses_terminal(body) {
-        Some(ResponsesTerminal::Incomplete(reason)) => Some(reason),
-        _ => None,
-    }
-}
 pub(super) fn buffered_responses_terminal(body: &[u8]) -> Option<ResponsesTerminal> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     match value.get("status").and_then(|value| value.as_str())? {
