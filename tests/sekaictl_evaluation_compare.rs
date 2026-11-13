@@ -103,6 +103,7 @@ impl Workspace {
             .env_remove("ANTHROPIC_API_KEY")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut command, self.dir.path());
         if experimental {
             command.env("SEKAI_EXPERIMENTAL_RPCS", "1");
         }

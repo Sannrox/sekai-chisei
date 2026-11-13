@@ -24,7 +24,8 @@ impl Running {
         let socket = dir.path().join("sekai.sock");
         let log_path = dir.path().join("server.log");
         let log = std::fs::File::create(&log_path).expect("server log");
-        let child = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
+        command
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", dir.path().join("sekai.db"))
             .env("CHISEI_DB_PATH", dir.path().join("chisei.db"))
@@ -43,9 +44,9 @@ impl Running {
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("spawn sekai-chisei");
+            .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut command, dir.path());
+        let child = command.spawn().expect("spawn sekai-chisei");
         let mut running = Self {
             child,
             socket,

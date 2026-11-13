@@ -177,6 +177,7 @@ async fn spawned_binary_opens_two_sqlite_stores() {
         .env_remove("CHISEI_DATABASE_URL")
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
         .stderr(Stdio::from(log));
+    crate::isolate_object_log(&mut command, dir.path());
     let mut child = KillOnDrop(command.spawn().expect("spawn sekai-chisei"));
     wait_until_ready(&socket, &mut child.0, &log_path);
 

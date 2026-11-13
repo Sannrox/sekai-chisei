@@ -146,7 +146,8 @@ fn boot_split_server(dir: &Path, sekai: &Path, chisei: &Path) {
     let socket: PathBuf = dir.join("sekai.sock");
     let log_path = dir.join("server.log");
     let log = std::fs::File::create(&log_path).expect("server log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
+    command
         .env("SEKAI_SOCKET", &socket)
         .env("SEKAI_DB_PATH", sekai)
         .env("CHISEI_DB_PATH", chisei)
@@ -167,9 +168,9 @@ fn boot_split_server(dir: &Path, sekai: &Path, chisei: &Path) {
         .env_remove("OPENAI_API_KEY")
         .env_remove("ANTHROPIC_API_KEY")
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn sekai-chisei");
+        .stderr(Stdio::from(log));
+    crate::isolate_object_log(&mut command, dir);
+    let mut child = command.spawn().expect("spawn sekai-chisei");
     let deadline = Instant::now() + WAIT_BUDGET;
     let ready = loop {
         if std::os::unix::net::UnixStream::connect(&socket).is_ok() {

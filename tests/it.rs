@@ -5,6 +5,15 @@
 //! Prometheus recorder tests and `crate::`-coupled adapter, example, and
 //! ratchet tests stay separate `[[test]]` targets.
 
+/// Combined/Sekai default the object log under `SEKAI_DATA_DIR`. Spawned
+/// processes must not share `./data/objects.mikura` under the test CWD.
+fn isolate_object_log(command: &mut std::process::Command, dir: &std::path::Path) {
+    command
+        .env("SEKAI_DATA_DIR", dir)
+        .env_remove("SEKAI_OBJECT_LOG")
+        .env_remove("SEKAI_OBJECT_LOG_HOST");
+}
+
 mod action_binding_backend_conformance;
 mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;

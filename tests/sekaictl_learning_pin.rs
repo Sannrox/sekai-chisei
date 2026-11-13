@@ -84,7 +84,8 @@ impl Server {
             chisei_db.to_str().expect("utf8 chisei path"),
         )
         .expect("stamp dest pair after seeding Sekai facts");
-        let child = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
+        command
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", &sekai_db)
             .env("CHISEI_DB_PATH", &chisei_db)
@@ -113,9 +114,9 @@ impl Server {
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .expect("spawn sekai-chisei");
+            .stderr(Stdio::from(log));
+        crate::isolate_object_log(&mut command, dir.path());
+        let child = command.spawn().expect("spawn sekai-chisei");
         let mut server = Self {
             child,
             dir,
