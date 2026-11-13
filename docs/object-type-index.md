@@ -14,10 +14,17 @@ Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
 
 1. `RegisterObjectTypeDatasource` — namespace, kind, type-revision digest,
    dataset id, key column, property mapping, optional hidden column.
+   `ApplySourceBatch` registers this binding for each landed kind when the
+   kind has no datasource, or expands an identity mapping on the binding
+   dataset. An operator mapping on that dataset is left in place.
 2. `ReindexObjectType` — incremental by default; `full_rebuild` rematerializes
-   from source then reapplies Action deltas. Incremental apply clears
-   hop-projection ready before member upserts and keeps it false until the
-   join rewrite commits, so evaluate cannot pair new member keys with old
+   from source then reapplies Action deltas. Incremental apply that finds a
+   stored dataset cursor and zero live source members treats that as an
+   interrupted full rebuild and rematerializes from row 0. A full rebuild
+   writes that cursor to 0 after deleting source members so a crash that
+   already recreated some rows still resumes from the start. Incremental apply
+   clears hop-projection ready before member upserts and keeps it false until
+   the join rewrite commits, so evaluate cannot pair new member keys with old
    hop edges.
 3. `GetObjectTypeIndexStatus` — `stale`, `lag_ms`, `quarantine_reason`,
    visible `member_count`.
@@ -37,7 +44,12 @@ on open. Several clerk processes share one object-log host
 (`SEKAI_OBJECT_LOG_HOST`). See
 [ADR 0088](decisions/0088-one-object-log-host-many-clerk-clients.md).
 
-`EvaluateObjectSet` reads the index when a datasource is registered. Set
+`EvaluateObjectSet` reads the index when a datasource is registered and the
+descriptor has no one-hop traversal. One-hop still walks declared links
+from authorized near objects. Clerk objects of that kind whose ids are not
+index members stay in the indexed page so a first auto-registered binding
+does not hide Action-written objects or objects from additional source
+bindings. Set
 `required_freshness_ms` to fail closed when the serving projection is stale
 or lagging. Hidden rows never appear in members, counts, order, errors, or
 continuation tokens. Existing `object_type_index*` tables are retained as a

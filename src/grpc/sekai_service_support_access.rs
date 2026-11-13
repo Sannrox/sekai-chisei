@@ -1757,6 +1757,11 @@ pub(super) fn dataset_binding_after_access(
     dataset: &dataset::Dataset,
     write: bool,
 ) -> Result<Option<domain::Object>, Status> {
+    if crate::db::source_batch_dataset::is_source_owned_dataset_id(&dataset.id) {
+        return Err(Status::permission_denied(
+            "source-owned datasets cannot be queried or mutated through dataset APIs",
+        ));
+    }
     if dataset.object_id.is_empty() {
         if is_managed_team_principal(db, principals)? {
             return Err(Status::permission_denied(

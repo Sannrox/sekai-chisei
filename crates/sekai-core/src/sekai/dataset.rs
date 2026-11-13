@@ -1,6 +1,6 @@
 use crate::db::sekai::SekaiDb;
 use crate::sekai::dataset_version::{self, DatasetRollback, DatasetVersion};
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::HashMap;
 
 pub use sekai_types::dataset::*;
@@ -27,6 +27,156 @@ pub fn parse_columns(value: &str) -> Result<Vec<ColumnDef>, String> {
             .collect()),
         Err(error) => Err(format!("corrupt dataset columns: {error}")),
     }
+}
+
+pub(crate) fn encode_dataset_columns(columns: &[ColumnDef]) -> Result<String, String> {
+    serde_json::to_string(
+        &columns
+            .iter()
+            .map(|column| {
+                (
+                    &column.name,
+                    &column.col_type,
+                    crate::sekai::schema::normalize_property_classification(&column.classification),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn validate_dataset_columns(columns: &[ColumnDef]) -> Result<(), String> {
+    for column in columns {
+        if !crate::sekai::schema::is_valid_property_classification(&column.classification) {
+            return Err(format!(
+                "column {} has invalid classification: {}",
+                column.name, column.classification
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create a dataset using an already-open connection or transaction.
+pub fn create_dataset_tx(conn: &Connection, dataset: &Dataset) -> Result<(), String> {
+    validate_dataset_columns(&dataset.columns)?;
+    let cols = encode_dataset_columns(&dataset.columns)?;
+    conn.execute(
+        "INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            dataset.id,
+            dataset.name,
+            cols,
+            dataset.object_id,
+            dataset.created,
+            encode_partition_keys(&dataset.partition_keys)?
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Append missing column definitions using an already-open transaction.
+pub fn add_dataset_columns_tx(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    columns: &[ColumnDef],
+) -> Result<(), String> {
+    validate_dataset_columns(columns)?;
+    let json: String = tx
+        .query_row(
+            "SELECT columns FROM sekai_datasets WHERE id=?1",
+            params![dataset_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("dataset {dataset_id:?} not found"))?;
+    let mut current = parse_columns(&json)?;
+    let before = current.len();
+    for column in columns {
+        if !current.iter().any(|defined| defined.name == column.name) {
+            current.push(column.clone());
+        }
+    }
+    if current.len() == before {
+        return Ok(());
+    }
+    let encoded = encode_dataset_columns(&current)?;
+    tx.execute(
+        "UPDATE sekai_datasets SET columns=?2 WHERE id=?1",
+        params![dataset_id, encoded],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Append rows and snapshot a dataset version using an already-open transaction.
+/// Returns the inclusive `(first_id, last_id)` range of inserted rows, or `(0, 0)`
+/// when `rows` is empty.
+pub fn append_rows_tx(
+    tx: &Transaction<'_>,
+    dataset_id: &str,
+    rows: &[HashMap<String, String>],
+) -> Result<(i64, i64), String> {
+    if rows.is_empty() {
+        return Ok((0, 0));
+    }
+    let before: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows WHERE dataset_id = ?1",
+            params![dataset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    let keys_json: String = tx
+        .query_row(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
+            params![dataset_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| "[]".into());
+    let keys = parse_partition_keys(&keys_json)?;
+    if keys.is_empty() {
+        let payloads: Vec<String> = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())?;
+        let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_dataset_rows (dataset_id, data)
+             SELECT ?1, value FROM json_each(?2)",
+            params![dataset_id, json],
+        )
+        .map_err(|error| error.to_string())?;
+    } else {
+        for row in rows {
+            let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    dataset_id,
+                    data,
+                    crate::sekai::governed_transform::partition_value(&keys, row)
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    snapshot_dataset_version_tx(tx, dataset_id, "", "", "", "", dataset_version::now_ms())?;
+    let after: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows WHERE dataset_id = ?1",
+            params![dataset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok((before + 1, after))
 }
 
 pub fn reindex_dataset_partition_keys(
@@ -166,31 +316,8 @@ impl SekaiDb {
     }
 
     pub fn create_dataset(&self, d: &Dataset) -> Result<(), String> {
-        for column in &d.columns {
-            if !crate::sekai::schema::is_valid_property_classification(&column.classification) {
-                return Err(format!(
-                    "column {} has invalid classification: {}",
-                    column.name, column.classification
-                ));
-            }
-        }
         let conn = self.conn();
-        let cols = serde_json::to_string(
-            &d.columns
-                .iter()
-                .map(|c| {
-                    (
-                        &c.name,
-                        &c.col_type,
-                        crate::sekai::schema::normalize_property_classification(&c.classification),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        conn.execute("INSERT INTO sekai_datasets (id,name,columns,object_id,created,partition_keys) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![d.id, d.name, cols, d.object_id, d.created, encode_partition_keys(&d.partition_keys)?]).map_err(|e| e.to_string())?;
-        Ok(())
+        create_dataset_tx(&conn, d)
     }
 
     /// Append the column definitions the dataset lacks, against the
@@ -205,43 +332,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let json: String = tx
-            .query_row(
-                "SELECT columns FROM sekai_datasets WHERE id=?1",
-                params![dataset_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("dataset {dataset_id:?} not found"))?;
-        let mut current = parse_columns(&json)?;
-        let before = current.len();
-        for column in columns {
-            if !current.iter().any(|defined| defined.name == column.name) {
-                current.push(column.clone());
-            }
-        }
-        if current.len() == before {
-            return Ok(());
-        }
-        let encoded = serde_json::to_string(
-            &current
-                .iter()
-                .map(|c| {
-                    (
-                        &c.name,
-                        &c.col_type,
-                        crate::sekai::schema::normalize_property_classification(&c.classification),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "UPDATE sekai_datasets SET columns=?2 WHERE id=?1",
-            params![dataset_id, encoded],
-        )
-        .map_err(|error| error.to_string())?;
+        add_dataset_columns_tx(&tx, dataset_id, columns)?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -363,45 +454,7 @@ impl SekaiDb {
         }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let keys_json: String = tx
-            .query_row(
-                "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
-                params![dataset_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_else(|| "[]".into());
-        let keys = parse_partition_keys(&keys_json)?;
-        if keys.is_empty() {
-            let payloads: Vec<String> = rows
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<_, _>>()
-                .map_err(|error| error.to_string())?;
-            let json = serde_json::to_string(&payloads).map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO sekai_dataset_rows (dataset_id, data)
-                 SELECT ?1, value FROM json_each(?2)",
-                params![dataset_id, json],
-            )
-            .map_err(|error| error.to_string())?;
-        } else {
-            for row in rows {
-                let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
-                tx.execute(
-                    "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
-                     VALUES (?1, ?2, ?3)",
-                    params![
-                        dataset_id,
-                        data,
-                        crate::sekai::governed_transform::partition_value(&keys, row)
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-            }
-        }
-        snapshot_dataset_version_tx(&tx, dataset_id, "", "", "", "", dataset_version::now_ms())?;
+        append_rows_tx(&tx, dataset_id, rows)?;
         tx.commit().map_err(|error| error.to_string())?;
         i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
     }

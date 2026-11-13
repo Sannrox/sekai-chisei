@@ -613,6 +613,34 @@ impl ObjectSecurityPolicy {
         self.apply_value_instance_mutation(existing, object)
     }
 
+    /// Keep stored cells plus mapped writes that both property and
+    /// value-instance grants allow. Denied mapped cells stay as stored.
+    pub fn coerce_granted_mutation(&self, existing: &Object, object: &mut Object) {
+        if self
+            .apply_property_grant_mutation(Some(existing), object)
+            .is_ok()
+        {
+            return;
+        }
+        let proposed = std::mem::take(&mut object.properties);
+        object.properties = existing.properties.clone();
+        for (property, value) in proposed {
+            if existing.properties.get(&property) == Some(&value) {
+                continue;
+            }
+            if self.allows_property_access(&property, PropertyGrantAccess::Write)
+                && self.allows_value_instance_access(
+                    &existing.id,
+                    &property,
+                    &value,
+                    PropertyGrantAccess::Write,
+                )
+            {
+                object.properties.insert(property, value);
+            }
+        }
+    }
+
     fn apply_value_instance_mutation(
         &self,
         existing: Option<&Object>,
@@ -1338,6 +1366,49 @@ mod tests {
             renamed.properties.get("owner").map(String::as_str),
             Some("bob")
         );
+    }
+
+    #[test]
+    fn coerce_granted_mutation_drops_ungranted_value_instances() {
+        let mut input = serde_json::from_slice::<serde_json::Value>(&document(serde_json::json!([
+            {"operation":"update","predicates":[{"kind":"allow_all"}]}
+        ])))
+        .unwrap();
+        input["property_grants"] = serde_json::json!([
+            {"property":"owner","access":"read"},
+            {"property":"owner","access":"write"},
+            {"property":"note","access":"read"},
+            {"property":"note","access":"write"}
+        ]);
+        input["value_instance_grants"] = serde_json::json!([{
+            "object_id": "object-1",
+            "property": "owner",
+            "value_digest": value_instance_digest("alice").unwrap(),
+            "access": "write"
+        }]);
+        let policy =
+            ObjectSecurityPolicy::from_canonical_input(&serde_json::to_vec(&input).unwrap())
+                .unwrap();
+        let existing = sample_object("alice");
+        let mut proposed = sample_object("alice");
+        proposed.properties.insert("note".into(), "visible".into());
+        policy.coerce_granted_mutation(&existing, &mut proposed);
+        assert!(!proposed.properties.contains_key("note"));
+        assert_eq!(
+            proposed.properties.get("owner").map(String::as_str),
+            Some("alice")
+        );
+
+        let mut rewritten = sample_object("bob");
+        rewritten
+            .properties
+            .insert("secret".into(), "classified".into());
+        policy.coerce_granted_mutation(&existing, &mut rewritten);
+        assert_eq!(
+            rewritten.properties.get("owner").map(String::as_str),
+            Some("alice")
+        );
+        assert!(!rewritten.properties.contains_key("secret"));
     }
 
     #[test]

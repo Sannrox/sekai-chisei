@@ -27,6 +27,10 @@ thread_local! {
         std::cell::RefCell::new(None);
     static AFTER_SOURCE_BATCH_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_SOURCE_BATCH_DATASET_LAND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_SOURCE_BATCH_INDEX_DERIVE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 pub const POSTGRES_OBJECT_SYNC_SURFACE: &str = "sekai.object-sync";
@@ -335,13 +339,57 @@ pub fn source_batch_mapper(
 
 impl PreparedBatch {
     pub fn new(batch: &SourceBatch, mapper: &SourceBatchMapper) -> Result<Self, ApplyError> {
+        Self::prepare(batch, mapper, true)
+    }
+
+    /// Replay a committed batch for dataset backfill. `source_id`/`hidden`
+    /// payload keys were admitted before land reserved them; skip that gate.
+    pub fn from_committed(
+        batch: &SourceBatch,
+        mapper: &SourceBatchMapper,
+    ) -> Result<Self, ApplyError> {
+        Self::prepare(batch, mapper, false)
+    }
+
+    /// New admissions reject reserved dataset keys. Exact replay of a durable
+    /// open, committed, or quarantined transaction may still prepare them.
+    pub fn for_apply(
+        batch: &SourceBatch,
+        mapper: &SourceBatchMapper,
+        existing: Option<SourceBatchStatus>,
+    ) -> Result<Self, ApplyError> {
+        match Self::new(batch, mapper) {
+            Ok(prepared) => Ok(prepared),
+            Err(error)
+                if error.code() == Some("reserved_property")
+                    && existing.is_some_and(|status| {
+                        matches!(
+                            status,
+                            SourceBatchStatus::Open
+                                | SourceBatchStatus::Committed
+                                | SourceBatchStatus::Quarantined
+                        )
+                    }) =>
+            {
+                Self::from_committed(batch, mapper)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn prepare(
+        batch: &SourceBatch,
+        mapper: &SourceBatchMapper,
+        reject_dataset_keys: bool,
+    ) -> Result<Self, ApplyError> {
         let mut records = Vec::with_capacity(batch.records.len());
         for record in &batch.records {
-            if record
-                .properties
-                .keys()
-                .any(|key| RESERVED_SYNC_PROPERTIES.contains(&key.as_str()))
-            {
+            if record.properties.keys().any(|key| {
+                RESERVED_SYNC_PROPERTIES.contains(&key.as_str())
+                    || (reject_dataset_keys
+                        && (key == crate::db::source_batch_dataset::KEY_COLUMN
+                            || key == crate::db::source_batch_dataset::HIDDEN_COLUMN))
+            }) {
                 return Err(ApplyError::denied(
                     "reserved_property",
                     "record properties contain a plane-owned object-sync metadata key",
@@ -435,6 +483,7 @@ struct StoredIdentity {
     object_id: String,
     source_version: String,
     payload_digest: String,
+    synced_object_json: String,
 }
 
 const SOURCE_WRITE_RECORD_SQLITE: &str = "SELECT t.transaction_id, t.binding_id, t.namespace,
@@ -495,6 +544,9 @@ impl SekaiDb {
                     offset_start INTEGER,
                     offset_end INTEGER,
                     snapshot_complete INTEGER,
+                    dataset_landed INTEGER NOT NULL DEFAULT 0,
+                    dataset_row_from INTEGER,
+                    dataset_row_to INTEGER,
                     UNIQUE(namespace, producer_identity, idempotency_key),
                     FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
                 );
@@ -854,6 +906,9 @@ impl SekaiDb {
             "ALTER TABLE sekai_source_checkpoints ADD COLUMN sync_generation INTEGER",
             "ALTER TABLE sekai_source_checkpoints ADD COLUMN feed_epoch TEXT",
             "ALTER TABLE sekai_source_checkpoints ADD COLUMN committed_offset INTEGER",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_landed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_row_from INTEGER",
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_row_to INTEGER",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}
@@ -909,7 +964,19 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         #[cfg(test)]
         take_after_source_batch_mapper_hook();
-        let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
+        let existing = {
+            let conn = self.conn();
+            load_batch_by_key(
+                &conn,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+            )
+            .map_err(|error| error.to_string())?
+            .map(|stored| stored.transaction.status)
+        };
+        let prepared = PreparedBatch::for_apply(batch, &mapper, existing)
+            .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
@@ -918,18 +985,15 @@ impl SekaiDb {
             OpenDisposition::Open => {
                 #[cfg(test)]
                 take_after_source_batch_open_hook();
-                (
-                    self.commit_source_batch(
-                        batch,
-                        &prepared,
-                        authenticated_producer,
-                        now_ms,
-                        expected_policy_generation,
-                        authorized_objects,
-                    )
-                    .map_err(|error| error.to_string())?,
-                    true,
+                self.commit_source_batch(
+                    batch,
+                    &prepared,
+                    authenticated_producer,
+                    now_ms,
+                    expected_policy_generation,
+                    authorized_objects,
                 )
+                .map_err(|error| error.to_string())?
             }
         };
         if newly_committed && result.transaction.status == SourceBatchStatus::Committed {
@@ -997,7 +1061,9 @@ impl SekaiDb {
                             )
                         })?;
                     validate_binding(&binding.binding, batch)?;
-                    if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
+                    if !transaction_dataset_landed(&transaction, &prepared.transaction_id)?
+                        && let Err(error) = require_live_registered_descriptor(&transaction, batch)
+                    {
                         abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
                         transaction.commit()?;
                         return Err(error);
@@ -1145,7 +1211,7 @@ impl SekaiDb {
         now_ms: i64,
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
-    ) -> Result<SourceBatchResult, ApplyError> {
+    ) -> Result<(SourceBatchResult, bool), ApplyError> {
         let mut conn = self.conn();
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         crate::sekai::audit::require_sqlite_policy_generation(
@@ -1174,7 +1240,7 @@ impl SekaiDb {
         }
         match stored.transaction.status {
             SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
-                return parse_stored_result(&stored);
+                return Ok((parse_stored_result(&stored)?, false));
             }
             SourceBatchStatus::Aborted => {
                 return Err(ApplyError::denied(
@@ -1191,108 +1257,108 @@ impl SekaiDb {
                 "open transaction has no stable source binding",
             )
         })?;
-        if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
-            abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
-            transaction.commit()?;
-            return Err(error);
-        }
-        let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
-            preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)
-        });
-        if let Err(error) = preflight {
-            if !error.is_denial() {
+        let dataset_landed = transaction_dataset_landed(&transaction, &prepared.transaction_id)?;
+        if !dataset_landed {
+            if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
+                abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
+                transaction.commit()?;
                 return Err(error);
             }
-            if is_schema_drift_denial(error.code()) {
-                let result = persist_schema_quarantine(
-                    &transaction,
-                    &binding.binding,
-                    batch,
-                    prepared,
-                    &stored,
-                    now_ms,
-                    &error,
-                )?;
-                transaction.commit()?;
-                return Ok(result);
-            }
-            if error.code() == Some("missing_range") {
-                mark_generation_recovery_required(
-                    &transaction,
-                    &prepared.binding_id,
-                    batch,
-                    now_ms,
-                )?;
-            }
-            transaction.execute(
-                "UPDATE sekai_source_batch_transactions
+            let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
+                preflight_commit_state(&transaction, &binding.binding, batch, &prepared.records)
+            });
+            if let Err(error) = preflight {
+                if !error.is_denial() {
+                    return Err(error);
+                }
+                if is_schema_drift_denial(error.code()) {
+                    let result = persist_schema_quarantine(
+                        &transaction,
+                        &binding.binding,
+                        batch,
+                        prepared,
+                        &stored,
+                        now_ms,
+                        &error,
+                    )?;
+                    transaction.commit()?;
+                    return Ok((result, true));
+                }
+                if error.code() == Some("missing_range") {
+                    mark_generation_recovery_required(
+                        &transaction,
+                        &prepared.binding_id,
+                        batch,
+                        now_ms,
+                    )?;
+                }
+                transaction.execute(
+                    "UPDATE sekai_source_batch_transactions
                  SET status='ABORTED', outcome='denial', closed_at_ms=?1, reason=?2
                  WHERE transaction_id=?3 AND status='OPEN'",
-                params![now_ms, error.to_string(), prepared.transaction_id],
-            )?;
-            transaction.execute(
-                "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
-                params![now_ms, prepared.binding_id],
-            )?;
-            transaction.commit()?;
-            return Err(error);
-        }
-
-        if let Some(authorized) = authorized_objects {
-            for expected in authorized {
-                let current = load_object(&transaction, &expected.id)?;
-                require_authorized_object_snapshot(
-                    current.as_ref(),
-                    Some(std::slice::from_ref(expected)),
-                    &expected.id,
+                    params![now_ms, error.to_string(), prepared.transaction_id],
                 )?;
+                transaction.execute(
+                    "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
+                    params![now_ms, prepared.binding_id],
+                )?;
+                transaction.commit()?;
+                return Err(error);
             }
-        }
-        let mut record_results = Vec::with_capacity(prepared.records.len());
-        for prepared_record in &prepared.records {
-            let before = load_object(&transaction, &prepared_record.object.object_id)?;
-            require_authorized_object_snapshot(
-                before.as_ref(),
-                authorized_objects,
-                &prepared_record.object.object_id,
-            )?;
-            transaction.execute(
-                "DELETE FROM sekai_source_identities
+            if let Some(authorized) = authorized_objects {
+                for expected in authorized {
+                    let current = load_object(&transaction, &expected.id)?;
+                    require_authorized_object_snapshot(
+                        current.as_ref(),
+                        Some(std::slice::from_ref(expected)),
+                        &expected.id,
+                    )?;
+                }
+            }
+            for prepared_record in &prepared.records {
+                let before = load_object(&transaction, &prepared_record.object.object_id)?;
+                require_authorized_object_snapshot(
+                    before.as_ref(),
+                    authorized_objects,
+                    &prepared_record.object.object_id,
+                )?;
+                transaction.execute(
+                    "DELETE FROM sekai_source_identities
                  WHERE namespace=?1 AND source_id=?2",
-                params![batch.namespace, prepared_record.source_id],
-            )?;
-            let mut object = Object {
-                id: prepared_record.object.object_id.clone(),
-                kind: prepared_record.object.type_name.clone(),
-                name: prepared_record.display_name.clone(),
-                namespace: batch.namespace.clone(),
-                external_id: prepared_record.source_id.clone(),
-                properties: serde_json::from_str::<BTreeMap<String, String>>(
-                    &prepared_record.properties_json,
-                )
-                .map_err(|error| ApplyError::Storage(error.to_string()))?
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-                created: before
-                    .as_ref()
-                    .map(|object| object.created)
-                    .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
-                updated: now_ms,
-            };
-            if let Some(existing) = &before
-                && let Some(policy) = crate::db::object_security::load_active_policy_sqlite(
-                    &transaction,
-                    &object.namespace,
-                    &object.kind,
-                )
-                .map_err(ApplyError::Storage)?
-            {
-                policy.preserve_unwritable_properties(existing, &mut object);
-            }
-            let properties_json = crate::domain::storage_properties_json(&object.properties)
-                .map_err(ApplyError::Storage)?;
-            transaction.execute(
-                "INSERT INTO sekai_objects
+                    params![batch.namespace, prepared_record.source_id],
+                )?;
+                let mut object = Object {
+                    id: prepared_record.object.object_id.clone(),
+                    kind: prepared_record.object.type_name.clone(),
+                    name: prepared_record.display_name.clone(),
+                    namespace: batch.namespace.clone(),
+                    external_id: prepared_record.source_id.clone(),
+                    properties: serde_json::from_str::<BTreeMap<String, String>>(
+                        &prepared_record.properties_json,
+                    )
+                    .map_err(|error| ApplyError::Storage(error.to_string()))?
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                    created: before
+                        .as_ref()
+                        .map(|object| object.created)
+                        .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
+                    updated: now_ms,
+                };
+                if let Some(existing) = &before
+                    && let Some(policy) = crate::db::object_security::load_active_policy_sqlite(
+                        &transaction,
+                        &object.namespace,
+                        &object.kind,
+                    )
+                    .map_err(ApplyError::Storage)?
+                {
+                    policy.preserve_unwritable_properties(existing, &mut object);
+                }
+                let properties_json = crate::domain::storage_properties_json(&object.properties)
+                    .map_err(ApplyError::Storage)?;
+                transaction.execute(
+                    "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
@@ -1302,53 +1368,46 @@ impl SekaiDb {
                     external_id=excluded.external_id,
                     properties=excluded.properties,
                     updated=excluded.updated",
-                params![
-                    object.id,
-                    object.kind,
-                    object.name,
-                    object.namespace,
-                    object.external_id,
-                    properties_json,
-                    object.created,
-                    object.updated,
-                ],
-            )?;
-            // Attributed to the committed source transaction (#1690).
-            let changes = crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
+                    params![
+                        object.id,
+                        object.kind,
+                        object.name,
+                        object.namespace,
+                        object.external_id,
+                        properties_json,
+                        object.created,
+                        object.updated,
+                    ],
+                )?;
+                // Attributed to the committed source transaction (#1690).
+                let changes = crate::sekai::audit::ChangeAttribution::source(
+                    &prepared.transaction_id,
+                )
                 .stamp(object_diff_changes(
                     authenticated_producer,
                     before.as_ref(),
                     Some(&object),
                     now_ms,
                 ));
-            insert_object_changes(&transaction, &changes).map_err(ApplyError::Storage)?;
+                insert_object_changes(&transaction, &changes).map_err(ApplyError::Storage)?;
 
-            let reason = match prepared_record.decision {
-                SyncDecision::Upsert(_) => "upserted",
-                SyncDecision::Tombstone(_) => "tombstoned",
-                SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
-                    return Err(ApplyError::Storage(
-                        "prepared sync decision changed after validation".into(),
-                    ));
-                }
-            };
-            let record_result = SourceRecordResult {
-                transaction_id: prepared.transaction_id.clone(),
-                source_id: prepared_record.source_id.clone(),
-                source_version: prepared_record.object.source_version.clone(),
-                decision: prepared_record.decision.clone(),
-                outcome: OperationOutcome::Success,
-                reason: reason.into(),
-                source_sequence: prepared_record.source_sequence,
-            };
-            let synced_object_json = serde_json::to_string(&prepared_record.object)
-                .map_err(|error| ApplyError::Storage(error.to_string()))?;
-            let lineage_json = serde_json::to_string(&prepared_record.lineage)
-                .map_err(|error| ApplyError::Storage(error.to_string()))?;
-            let decision_json = serde_json::to_string(&prepared_record.decision)
-                .map_err(|error| ApplyError::Storage(error.to_string()))?;
-            transaction.execute(
-                "INSERT INTO sekai_source_identities (
+                let reason = match prepared_record.decision {
+                    SyncDecision::Upsert(_) => "upserted",
+                    SyncDecision::Tombstone(_) => "tombstoned",
+                    SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
+                        return Err(ApplyError::Storage(
+                            "prepared sync decision changed after validation".into(),
+                        ));
+                    }
+                };
+                let synced_object_json = serde_json::to_string(&prepared_record.object)
+                    .map_err(|error| ApplyError::Storage(error.to_string()))?;
+                let lineage_json = serde_json::to_string(&prepared_record.lineage)
+                    .map_err(|error| ApplyError::Storage(error.to_string()))?;
+                let decision_json = serde_json::to_string(&prepared_record.decision)
+                    .map_err(|error| ApplyError::Storage(error.to_string()))?;
+                transaction.execute(
+                    "INSERT INTO sekai_source_identities (
                     namespace, source_id, binding_id, type_digest, type_name, object_id,
                     source_version, payload_digest, tombstoned, synced_object_json,
                     lineage_json, last_transaction_id, updated_at_ms
@@ -1361,83 +1420,187 @@ impl SekaiDb {
                     lineage_json=excluded.lineage_json,
                     last_transaction_id=excluded.last_transaction_id,
                     updated_at_ms=excluded.updated_at_ms",
-                params![
-                    batch.namespace,
-                    prepared_record.source_id,
-                    prepared.binding_id,
-                    batch.type_digest,
-                    prepared_record.object.type_name,
-                    prepared_record.object.object_id,
-                    prepared_record.object.source_version,
-                    prepared_record.object.payload_digest,
-                    prepared_record.object.tombstoned,
-                    synced_object_json,
-                    lineage_json,
-                    prepared.transaction_id,
-                    now_ms,
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO sekai_source_record_results (
+                    params![
+                        batch.namespace,
+                        prepared_record.source_id,
+                        prepared.binding_id,
+                        batch.type_digest,
+                        prepared_record.object.type_name,
+                        prepared_record.object.object_id,
+                        prepared_record.object.source_version,
+                        prepared_record.object.payload_digest,
+                        prepared_record.object.tombstoned,
+                        synced_object_json,
+                        lineage_json,
+                        prepared.transaction_id,
+                        now_ms,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO sekai_source_record_results (
                     transaction_id, source_id, source_version, decision_json,
                     outcome, reason, lineage_json, source_sequence
                  ) VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6, ?7)",
-                params![
-                    prepared.transaction_id,
-                    prepared_record.source_id,
-                    prepared_record.object.source_version,
-                    decision_json,
-                    reason,
-                    lineage_json,
-                    prepared_record.source_sequence.map(|value| value as i64),
-                ],
-            )?;
-            record_results.push(record_result);
+                    params![
+                        prepared.transaction_id,
+                        prepared_record.source_id,
+                        prepared_record.object.source_version,
+                        decision_json,
+                        reason,
+                        lineage_json,
+                        prepared_record.source_sequence.map(|value| value as i64),
+                    ],
+                )?;
+            }
+            land_source_batch_dataset_rows(&transaction, batch, prepared, now_ms)?;
         }
+        let record_results = prepared_record_results(prepared)?;
+        let result = committed_source_batch_result(
+            batch,
+            prepared,
+            stored.transaction.opened_at_ms,
+            now_ms,
+            record_results,
+        );
+        transaction.commit()?;
+        drop(conn);
+        #[cfg(test)]
+        take_after_source_batch_dataset_land_hook();
+        let _derive = self
+            .lock_source_index_derive()
+            .map_err(ApplyError::Storage)?;
+        let already_closed = {
+            let conn = self.conn();
+            load_batch_by_key(
+                &conn,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+            )?
+            .is_some_and(|stored| {
+                matches!(
+                    stored.transaction.status,
+                    SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+                )
+            })
+        };
+        if !already_closed {
+            self.derive_source_batch_index(batch, prepared, now_ms)?;
+            #[cfg(test)]
+            take_after_source_batch_index_derive_hook();
+        }
+        self.finalize_source_batch_commit(batch, prepared, now_ms, &result)
+    }
 
-        let committed_transaction = SourceBatchTransaction {
-            transaction_id: prepared.transaction_id.clone(),
-            binding_id: prepared.binding_id.clone(),
-            namespace: batch.namespace.clone(),
-            producer_identity: batch.producer_identity.clone(),
-            idempotency_key: batch.idempotency_key.clone(),
-            batch_digest: batch.batch_digest.clone(),
-            current_cursor: batch.current_cursor.clone(),
-            proposed_next_cursor: batch.proposed_next_cursor.clone(),
-            status: SourceBatchStatus::Committed,
-            outcome: OperationOutcome::Success,
-            opened_at_ms: stored.transaction.opened_at_ms,
-            closed_at_ms: Some(now_ms),
-            reason: "committed".into(),
-            contract_version: batch.contract_version.clone(),
-            delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
-            sync_generation: batch
-                .delivery
+    fn derive_source_batch_index(
+        &self,
+        batch: &SourceBatch,
+        prepared: &PreparedBatch,
+        now_ms: i64,
+    ) -> Result<(), ApplyError> {
+        use crate::db::source_batch_dataset;
+
+        let dataset_ids = self
+            .list_datasets()
+            .map_err(ApplyError::Storage)?
+            .into_iter()
+            .map(|dataset| dataset.id);
+        for kind in
+            source_dataset_derive_kinds(dataset_ids, &prepared.binding_id, &prepared.records)
+        {
+            let dataset_id = source_batch_dataset::binding_dataset_id(&prepared.binding_id, &kind);
+            let columns = self
+                .get_dataset(&dataset_id)
+                .map_err(ApplyError::Storage)?
+                .map(|dataset| dataset.columns)
+                .filter(|columns| !columns.is_empty())
+                .unwrap_or(prepared_dataset_columns(&prepared.records, &kind)?);
+            let mut wanted = source_batch_dataset::datasource(
+                &batch.namespace,
+                &kind,
+                &batch.type_digest,
+                &dataset_id,
+                &columns,
+            );
+            let existing = self
+                .get_object_type_datasource(&batch.namespace, &kind)
+                .map_err(ApplyError::Storage)?;
+            let ours = existing
                 .as_ref()
-                .map(|delivery| delivery.sync_generation),
-            source_feed_epoch: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.source_feed_epoch.clone()),
-            offset_start: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.offset_start),
-            offset_end: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.offset_end),
-            snapshot_complete: batch
-                .delivery
-                .as_ref()
-                .map(|delivery| delivery.snapshot_complete),
-        };
-        let result = SourceBatchResult {
-            transaction: committed_transaction,
-            records: record_results,
-            checkpoint_advanced: true,
-        };
-        let result_json = serde_json::to_string(&result)
+                .is_none_or(|previous| previous.dataset_id == dataset_id);
+            let mut full_rebuild = existing.is_none();
+            let register = match &existing {
+                None => true,
+                Some(previous) if previous.dataset_id == dataset_id => {
+                    match source_batch_dataset::expand_identity_mapping(
+                        &previous.property_mapping,
+                        &wanted.property_mapping,
+                    ) {
+                        Some(merged) => {
+                            wanted = previous.clone();
+                            wanted.property_mapping = merged;
+                            full_rebuild = true;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Some(_) => false,
+            };
+            if register {
+                self.register_object_type_datasource(&wanted, now_ms)
+                    .map_err(ApplyError::Storage)?;
+            }
+            if !ours {
+                continue;
+            }
+            let report = self
+                .apply_object_type_index(&batch.namespace, &kind, full_rebuild, now_ms)
+                .map_err(ApplyError::Storage)?;
+            if report.quarantined {
+                // Clerk objects already dual-wrote. Quarantine keeps the last
+                // consistent index readable. COMMITTED so exact replay does not
+                // re-append rows; ReindexObjectType recovers the mapping.
+                continue;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_source_batch_commit(
+        &self,
+        batch: &SourceBatch,
+        prepared: &PreparedBatch,
+        now_ms: i64,
+        result: &SourceBatchResult,
+    ) -> Result<(SourceBatchResult, bool), ApplyError> {
+        let mut conn = self.conn();
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = load_batch_by_key(
+            &transaction,
+            &batch.namespace,
+            &batch.producer_identity,
+            &batch.idempotency_key,
+        )?
+        .ok_or_else(|| {
+            ApplyError::denied(
+                "missing_open_transaction",
+                "source batch has no durable open transaction",
+            )
+        })?;
+        match stored.transaction.status {
+            SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
+                return Ok((parse_stored_result(&stored)?, false));
+            }
+            SourceBatchStatus::Aborted => {
+                return Err(ApplyError::denied(
+                    "batch_aborted",
+                    "matching source batch was durably aborted and cannot become success",
+                ));
+            }
+            SourceBatchStatus::Open => {}
+        }
+        let result_json = serde_json::to_string(result)
             .map_err(|error| ApplyError::Storage(error.to_string()))?;
         let updated = transaction.execute(
             "UPDATE sekai_source_batch_transactions
@@ -1447,9 +1610,26 @@ impl SekaiDb {
             params![now_ms, result_json, prepared.transaction_id],
         )?;
         if updated != 1 {
-            return Err(ApplyError::Storage(
-                "open source batch changed during atomic commit".into(),
-            ));
+            let stored = load_batch_by_key(
+                &transaction,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+            )?
+            .ok_or_else(|| {
+                ApplyError::denied(
+                    "missing_open_transaction",
+                    "source batch has no durable open transaction",
+                )
+            })?;
+            return match stored.transaction.status {
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
+                    Ok((parse_stored_result(&stored)?, false))
+                }
+                _ => Err(ApplyError::Storage(
+                    "open source batch changed during atomic commit".into(),
+                )),
+            };
         }
         commit_generation_state(&transaction, &prepared.binding_id, batch, now_ms)?;
         transaction.execute(
@@ -1502,7 +1682,7 @@ impl SekaiDb {
             params![now_ms, prepared.binding_id],
         )?;
         transaction.commit()?;
-        Ok(result)
+        Ok((result.clone(), true))
     }
 
     pub fn get_source_identity_lineage(
@@ -1865,30 +2045,20 @@ fn preflight_commit_state(
                         "source identity conflicts with its bound type or graph object",
                     ));
                 }
-                let mut projected_properties =
-                    serde_json::from_str::<HashMap<String, String>>(&record.properties_json)
-                        .map_err(|error| ApplyError::Storage(error.to_string()))?;
-                if let Some(policy) = crate::db::object_security::load_active_policy_sqlite(
-                    conn,
-                    &object.namespace,
-                    &object.kind,
-                )
-                .map_err(ApplyError::Storage)?
-                {
-                    let mut projected = object.clone();
-                    projected.properties = projected_properties;
-                    policy.preserve_unwritable_properties(object, &mut projected);
-                    projected_properties = projected.properties;
-                }
-                if identity.source_version == record.object.source_version
-                    && (identity.payload_digest != record.object.payload_digest
+                if identity.source_version == record.object.source_version {
+                    let stored: crate::sekai::object_sync::SyncedObject =
+                        serde_json::from_str(&identity.synced_object_json)
+                            .map_err(|error| ApplyError::Storage(error.to_string()))?;
+                    if identity.payload_digest != record.object.payload_digest
                         || object.name != record.display_name
-                        || object.properties != projected_properties)
-                {
-                    return Err(ApplyError::denied(
-                        "source_revision_conflict",
-                        "immutable source version is bound to different payload content",
-                    ));
+                        || stored.properties != record.object.properties
+                        || stored.tombstoned != record.object.tombstoned
+                    {
+                        return Err(ApplyError::denied(
+                            "source_revision_conflict",
+                            "immutable source version is bound to different payload content",
+                        ));
+                    }
                 }
             }
             (Some(_), None) | (None, Some(_)) => {
@@ -2182,7 +2352,8 @@ fn load_identity(
     source_id: &str,
 ) -> Result<Option<StoredIdentity>, ApplyError> {
     conn.query_row(
-        "SELECT binding_id, type_digest, type_name, object_id, source_version, payload_digest
+        "SELECT binding_id, type_digest, type_name, object_id, source_version, payload_digest,
+                synced_object_json
          FROM sekai_source_identities WHERE namespace=?1 AND source_id=?2",
         params![namespace, source_id],
         |row| {
@@ -2193,6 +2364,7 @@ fn load_identity(
                 object_id: row.get(3)?,
                 source_version: row.get(4)?,
                 payload_digest: row.get(5)?,
+                synced_object_json: row.get(6)?,
             })
         },
     )
@@ -2547,6 +2719,9 @@ fn rebuild_source_batch_status_constraint(conn: &Connection) -> Result<(), Strin
             offset_start INTEGER,
             offset_end INTEGER,
             snapshot_complete INTEGER,
+            dataset_landed INTEGER NOT NULL DEFAULT 0,
+            dataset_row_from INTEGER,
+            dataset_row_to INTEGER,
             UNIQUE(namespace, producer_identity, idempotency_key),
             FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
          );
@@ -2788,18 +2963,39 @@ fn require_live_registered_descriptor(
     Ok(())
 }
 
+fn transaction_dataset_landed(
+    transaction: &rusqlite::Transaction<'_>,
+    transaction_id: &str,
+) -> Result<bool, ApplyError> {
+    Ok(transaction
+        .query_row(
+            "SELECT COALESCE(dataset_landed, 0) FROM sekai_source_batch_transactions
+             WHERE transaction_id=?1",
+            params![transaction_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        != 0)
+}
+
 fn abort_open_source_batch(
     transaction: &rusqlite::Transaction<'_>,
     prepared: &PreparedBatch,
     now_ms: i64,
     error: &ApplyError,
 ) -> Result<(), ApplyError> {
-    transaction.execute(
+    let updated = transaction.execute(
         "UPDATE sekai_source_batch_transactions
          SET status='ABORTED', outcome='denial', closed_at_ms=?1, reason=?2
-         WHERE transaction_id=?3 AND status='OPEN'",
+         WHERE transaction_id=?3 AND status='OPEN' AND COALESCE(dataset_landed, 0)=0",
         params![now_ms, error.to_string(), prepared.transaction_id],
     )?;
+    if updated == 0 && transaction_dataset_landed(transaction, &prepared.transaction_id)? {
+        return Err(ApplyError::denied(
+            "dataset_landed",
+            "replay the open batch to commit; abort is refused after dataset land",
+        ));
+    }
     transaction.execute(
         "UPDATE sekai_source_bindings SET updated_at_ms=?1 WHERE binding_id=?2",
         params![now_ms, prepared.binding_id],
@@ -2819,6 +3015,402 @@ fn take_after_source_batch_open_hook() {
     if let Some(hook) = AFTER_SOURCE_BATCH_OPEN.with(|cell| cell.borrow_mut().take()) {
         hook();
     }
+}
+
+#[cfg(test)]
+fn take_after_source_batch_dataset_land_hook() {
+    if let Some(hook) = AFTER_SOURCE_BATCH_DATASET_LAND.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn take_after_source_batch_index_derive_hook() {
+    if let Some(hook) = AFTER_SOURCE_BATCH_INDEX_DERIVE.with(|cell| cell.borrow_mut().take()) {
+        hook();
+    }
+}
+
+pub(crate) fn prepared_record_results(
+    prepared: &PreparedBatch,
+) -> Result<Vec<SourceRecordResult>, ApplyError> {
+    prepared
+        .records
+        .iter()
+        .map(|prepared_record| {
+            let reason = match prepared_record.decision {
+                SyncDecision::Upsert(_) => "upserted",
+                SyncDecision::Tombstone(_) => "tombstoned",
+                SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
+                    return Err(ApplyError::Storage(
+                        "prepared sync decision changed after validation".into(),
+                    ));
+                }
+            };
+            Ok(SourceRecordResult {
+                transaction_id: prepared.transaction_id.clone(),
+                source_id: prepared_record.source_id.clone(),
+                source_version: prepared_record.object.source_version.clone(),
+                decision: prepared_record.decision.clone(),
+                outcome: OperationOutcome::Success,
+                reason: reason.into(),
+                source_sequence: prepared_record.source_sequence,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn committed_source_batch_result(
+    batch: &SourceBatch,
+    prepared: &PreparedBatch,
+    opened_at_ms: i64,
+    now_ms: i64,
+    records: Vec<SourceRecordResult>,
+) -> SourceBatchResult {
+    SourceBatchResult {
+        transaction: SourceBatchTransaction {
+            transaction_id: prepared.transaction_id.clone(),
+            binding_id: prepared.binding_id.clone(),
+            namespace: batch.namespace.clone(),
+            producer_identity: batch.producer_identity.clone(),
+            idempotency_key: batch.idempotency_key.clone(),
+            batch_digest: batch.batch_digest.clone(),
+            current_cursor: batch.current_cursor.clone(),
+            proposed_next_cursor: batch.proposed_next_cursor.clone(),
+            status: SourceBatchStatus::Committed,
+            outcome: OperationOutcome::Success,
+            opened_at_ms,
+            closed_at_ms: Some(now_ms),
+            reason: "committed".into(),
+            contract_version: batch.contract_version.clone(),
+            delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
+            sync_generation: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.sync_generation),
+            source_feed_epoch: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.source_feed_epoch.clone()),
+            offset_start: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_start),
+            offset_end: batch
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.offset_end),
+            snapshot_complete: batch
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.snapshot_complete),
+        },
+        records,
+        checkpoint_advanced: true,
+    }
+}
+
+pub(crate) fn prepared_dataset_columns(
+    records: &[PreparedRecord],
+    kind: &str,
+) -> Result<Vec<crate::sekai::dataset::ColumnDef>, ApplyError> {
+    let mut keys = std::collections::BTreeSet::new();
+    for record in records {
+        if record.object.type_name != kind {
+            continue;
+        }
+        let properties: BTreeMap<String, String> = serde_json::from_str(&record.properties_json)
+            .map_err(|error| ApplyError::Storage(error.to_string()))?;
+        keys.extend(
+            properties
+                .into_keys()
+                .filter(|key| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str())),
+        );
+    }
+    Ok(crate::db::source_batch_dataset::columns_for_property_keys(
+        keys.iter().map(|key| key.as_str()),
+    ))
+}
+
+pub(crate) fn prepared_dataset_rows(
+    records: &[PreparedRecord],
+    kind: &str,
+) -> Result<Vec<std::collections::HashMap<String, String>>, ApplyError> {
+    let mut rows = Vec::new();
+    for record in records {
+        if record.object.type_name != kind {
+            continue;
+        }
+        let properties: BTreeMap<String, String> = serde_json::from_str(&record.properties_json)
+            .map_err(|error| ApplyError::Storage(error.to_string()))?;
+        let payload = properties
+            .into_iter()
+            .filter(|(key, _)| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str()))
+            .collect();
+        rows.push(crate::db::source_batch_dataset::row_for_record(
+            &record.source_id,
+            record.object.tombstoned,
+            &payload,
+        ));
+    }
+    Ok(rows)
+}
+
+pub(crate) fn prepared_kinds(records: &[PreparedRecord]) -> Vec<String> {
+    let mut kinds = std::collections::BTreeSet::new();
+    for record in records {
+        kinds.insert(record.object.type_name.clone());
+    }
+    kinds.into_iter().collect()
+}
+
+/// Kinds that must persist before historical COMMITTED batches can be marked
+/// landed: the live batch plus every unlanded committed batch for the binding.
+pub(crate) fn source_dataset_land_kinds(
+    mapper: &SourceBatchMapper,
+    current: &[PreparedRecord],
+    historical_jsons: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>, ApplyError> {
+    let mut kinds = std::collections::BTreeSet::new();
+    kinds.extend(prepared_kinds(current));
+    for json in historical_jsons {
+        let stored_batch: SourceBatch =
+            serde_json::from_str(&json).map_err(|error| ApplyError::Storage(error.to_string()))?;
+        let prepared = PreparedBatch::from_committed(&stored_batch, mapper)?;
+        kinds.extend(prepared_kinds(&prepared.records));
+    }
+    Ok(kinds.into_iter().collect())
+}
+
+pub(crate) fn source_dataset_derive_kinds(
+    dataset_ids: impl IntoIterator<Item = String>,
+    binding_id: &str,
+    current: &[PreparedRecord],
+) -> Vec<String> {
+    let mut kinds = std::collections::BTreeSet::new();
+    kinds.extend(prepared_kinds(current));
+    for dataset_id in dataset_ids {
+        if let Some(kind) =
+            crate::db::source_batch_dataset::kind_from_binding_dataset_id(binding_id, &dataset_id)
+        {
+            kinds.insert(kind.to_string());
+        }
+    }
+    kinds.into_iter().collect()
+}
+
+fn land_source_batch_dataset_rows(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &SourceBatch,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    use crate::db::source_batch_dataset;
+    use crate::sekai::dataset::{
+        Dataset, add_dataset_columns_tx, append_rows_tx, create_dataset_tx,
+    };
+
+    let mapper = source_batch_mapper(batch, || {
+        let json: Option<String> = tx
+            .query_row(
+                "SELECT record_json FROM sekai_source_type_descriptors
+                 WHERE namespace = ?1 AND digest = ?2",
+                params![batch.namespace, batch.type_digest],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        json.map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| format!("decode source-type descriptor: {error}"))
+        })
+        .transpose()
+    })?;
+    let historical_jsons = unlanded_committed_source_batch_jsons(tx, &prepared.binding_id)?;
+    let kinds = source_dataset_land_kinds(&mapper, &prepared.records, historical_jsons.clone())?;
+    let mut row_from = 0i64;
+    let mut row_to = 0i64;
+    for kind in kinds {
+        let dataset_id = source_batch_dataset::binding_dataset_id(&prepared.binding_id, &kind);
+        let columns = prepared_dataset_columns(&prepared.records, &kind)?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sekai_datasets WHERE id=?1)",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .map_err(ApplyError::from)?;
+        if !exists {
+            create_dataset_tx(
+                tx,
+                &Dataset {
+                    id: dataset_id.clone(),
+                    name: source_batch_dataset::dataset_name(&batch.source_instance, &kind),
+                    columns: columns.clone(),
+                    object_id: String::new(),
+                    created: now_ms,
+                    partition_keys: Vec::new(),
+                },
+            )
+            .map_err(ApplyError::Storage)?;
+        } else {
+            add_dataset_columns_tx(tx, &dataset_id, &columns).map_err(ApplyError::Storage)?;
+        }
+        backfill_source_dataset_from_committed(tx, &mapper, &dataset_id, &kind, &historical_jsons)?;
+        let rows = prepared_dataset_rows(&prepared.records, &kind)?;
+        if !rows.is_empty() {
+            let (from, to) = append_rows_tx(tx, &dataset_id, &rows).map_err(ApplyError::Storage)?;
+            if row_from == 0 {
+                row_from = from;
+            }
+            row_to = row_to.max(to);
+        }
+    }
+    tx.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET dataset_landed=1
+         WHERE binding_id=?1 AND status='COMMITTED' AND COALESCE(dataset_landed,0)=0",
+        params![prepared.binding_id],
+    )?;
+    tx.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET dataset_landed=1, dataset_row_from=?1, dataset_row_to=?2
+         WHERE transaction_id=?3 AND status='OPEN'",
+        params![row_from, row_to, prepared.transaction_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) type SourceDatasetBackfill = (
+    Vec<crate::sekai::dataset::ColumnDef>,
+    Vec<std::collections::HashMap<String, String>>,
+);
+
+pub(crate) struct CommittedSourceBatchRow {
+    pub current_cursor: String,
+    pub proposed_next_cursor: String,
+    pub batch_json: String,
+}
+
+/// Prefer the producer cursor chain. Fall back to the caller order when the
+/// chain forks, cycles, or does not cover every committed batch.
+pub(crate) fn order_committed_source_batch_jsons(
+    batches: Vec<CommittedSourceBatchRow>,
+) -> Vec<String> {
+    let total = batches.len();
+    if total <= 1 {
+        return batches.into_iter().map(|batch| batch.batch_json).collect();
+    }
+    let proposed: std::collections::HashSet<&str> = batches
+        .iter()
+        .map(|batch| batch.proposed_next_cursor.as_str())
+        .filter(|cursor| !cursor.is_empty())
+        .collect();
+    let starts: Vec<usize> = batches
+        .iter()
+        .enumerate()
+        .filter(|(_, batch)| !proposed.contains(batch.current_cursor.as_str()))
+        .map(|(index, _)| index)
+        .collect();
+    if starts.len() == 1 {
+        let mut by_current = std::collections::HashMap::new();
+        let unique = batches.iter().enumerate().all(|(index, batch)| {
+            by_current
+                .insert(batch.current_cursor.clone(), index)
+                .is_none()
+        });
+        if unique {
+            let mut ordered = Vec::with_capacity(total);
+            let mut seen = std::collections::HashSet::new();
+            let mut index = starts[0];
+            loop {
+                let batch = &batches[index];
+                if !seen.insert(index) {
+                    break;
+                }
+                ordered.push(batch.batch_json.clone());
+                if batch.proposed_next_cursor.is_empty() {
+                    break;
+                }
+                match by_current.get(&batch.proposed_next_cursor) {
+                    Some(&next) => index = next,
+                    None => break,
+                }
+            }
+            if ordered.len() == total {
+                return ordered;
+            }
+        }
+    }
+    batches.into_iter().map(|batch| batch.batch_json).collect()
+}
+
+pub(crate) fn committed_source_dataset_backfill(
+    mapper: &SourceBatchMapper,
+    jsons: impl IntoIterator<Item = String>,
+    kind: &str,
+) -> Result<SourceDatasetBackfill, ApplyError> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut rows = Vec::new();
+    for json in jsons {
+        let stored_batch: SourceBatch =
+            serde_json::from_str(&json).map_err(|error| ApplyError::Storage(error.to_string()))?;
+        let prepared = PreparedBatch::from_committed(&stored_batch, mapper)?;
+        for column in prepared_dataset_columns(&prepared.records, kind)? {
+            keys.insert(column.name);
+        }
+        rows.extend(prepared_dataset_rows(&prepared.records, kind)?);
+    }
+    Ok((
+        crate::db::source_batch_dataset::columns_for_property_keys(
+            keys.iter().map(|key| key.as_str()),
+        ),
+        rows,
+    ))
+}
+
+fn unlanded_committed_source_batch_jsons(
+    tx: &rusqlite::Transaction<'_>,
+    binding_id: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT current_cursor, proposed_next_cursor, batch_json
+             FROM sekai_source_batch_transactions
+             WHERE binding_id=?1 AND status='COMMITTED' AND COALESCE(dataset_landed,0)=0
+             ORDER BY COALESCE(closed_at_ms, opened_at_ms) ASC, transaction_id ASC",
+        )
+        .map_err(ApplyError::from)?;
+    let rows = stmt
+        .query_map(params![binding_id], |row| {
+            Ok(CommittedSourceBatchRow {
+                current_cursor: row.get(0)?,
+                proposed_next_cursor: row.get(1)?,
+                batch_json: row.get(2)?,
+            })
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(ApplyError::from)?;
+    Ok(order_committed_source_batch_jsons(rows))
+}
+
+fn backfill_source_dataset_from_committed(
+    tx: &rusqlite::Transaction<'_>,
+    mapper: &SourceBatchMapper,
+    dataset_id: &str,
+    kind: &str,
+    jsons: &[String],
+) -> Result<(), ApplyError> {
+    use crate::sekai::dataset::{add_dataset_columns_tx, append_rows_tx};
+
+    let (columns, rows) = committed_source_dataset_backfill(mapper, jsons.iter().cloned(), kind)?;
+    if !columns.is_empty() {
+        add_dataset_columns_tx(tx, dataset_id, &columns).map_err(ApplyError::Storage)?;
+    }
+    if !rows.is_empty() {
+        append_rows_tx(tx, dataset_id, &rows).map_err(ApplyError::Storage)?;
+    }
+    Ok(())
 }
 
 fn parse_stored_result(stored: &StoredBatch) -> Result<SourceBatchResult, ApplyError> {
@@ -2849,7 +3441,7 @@ pub mod tests {
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
         GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
         SOURCE_GITHUB, SourceBatchStatus, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
-        SourceSyncGenerationStatus,
+        SourceSyncGenerationStatus, object_id_for, source_id,
     };
 
     pub const PRODUCER: &str = "connector/github-primary";
@@ -3361,6 +3953,25 @@ pub mod tests {
             .unwrap();
         assert_eq!(committed, 1);
         assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+        let mut later = batch("cursor:1", "cursor:2", "batch-2");
+        later.records[0].external_id = "13".into();
+        later.records[0].source_version = "node-v2".into();
+        later.records[0].display_name = "Later issue".into();
+        later.records[0]
+            .properties
+            .insert("title".into(), "Later issue".into());
+        redigest(&mut later);
+        runtime(&path)
+            .apply_source_batch(&later, PRODUCER, 400)
+            .unwrap();
+        let members = runtime(&path)
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(members.len(), 2);
     }
 
     #[test]
@@ -3593,6 +4204,44 @@ pub mod tests {
         assert_eq!(after_forged_digest.name, before.name);
         assert_eq!(after_forged_digest.properties, before.properties);
         assert_eq!(after_forged_digest.updated, before.updated);
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+
+        let mut properties_only = batch("cursor:1", "cursor:2", "batch-4");
+        properties_only.records[0]
+            .properties
+            .insert("state".into(), "closed".into());
+        redigest(&mut properties_only);
+        let forged_properties = db
+            .apply_source_batch(&properties_only, PRODUCER, 400)
+            .unwrap();
+        assert_eq!(
+            forged_properties.transaction.status,
+            SourceBatchStatus::Quarantined
+        );
+        assert!(
+            forged_properties.records[0]
+                .reason
+                .starts_with("source_revision_conflict:")
+        );
+        assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
+
+        let mut tombstone_only = batch("cursor:1", "cursor:2", "batch-5");
+        tombstone_only.records[0].deleted = true;
+        redigest(&mut tombstone_only);
+        let forged_tombstone = db
+            .apply_source_batch(&tombstone_only, PRODUCER, 500)
+            .unwrap();
+        assert_eq!(
+            forged_tombstone.transaction.status,
+            SourceBatchStatus::Quarantined
+        );
+        assert!(
+            forged_tombstone.records[0]
+                .reason
+                .contains("source_revision_conflict:"),
+            "{}",
+            forged_tombstone.records[0].reason
+        );
         assert_eq!(checkpoint(&db).as_deref(), Some("cursor:1"));
     }
 
@@ -4037,5 +4686,762 @@ pub mod tests {
                 .cursor,
             "cursor:1"
         );
+    }
+
+    fn issue_object_id() -> String {
+        object_id_for(TYPE_DIGEST, &source_id(SOURCE_GITHUB, "acme/ops", "12"))
+    }
+
+    fn sqlite_dataset_row_count(db: &RuntimeDb, dataset_id: &str) -> i64 {
+        let RuntimeDb::Sqlite(db) = db else {
+            panic!("expected sqlite runtime");
+        };
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_dataset_rows WHERE dataset_id=?1",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn order_committed_source_batches_follows_cursor_chain() {
+        let jsons = super::order_committed_source_batch_jsons(vec![
+            super::CommittedSourceBatchRow {
+                current_cursor: "c2".into(),
+                proposed_next_cursor: "c3".into(),
+                batch_json: "second".into(),
+            },
+            super::CommittedSourceBatchRow {
+                current_cursor: String::new(),
+                proposed_next_cursor: "c2".into(),
+                batch_json: "first".into(),
+            },
+            super::CommittedSourceBatchRow {
+                current_cursor: "c3".into(),
+                proposed_next_cursor: String::new(),
+                batch_json: "third".into(),
+            },
+        ]);
+        assert_eq!(jsons, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn source_dataset_land_kinds_unions_historical_kinds() {
+        let current =
+            PreparedBatch::new(&batch("", "cursor:1", "live"), &SourceBatchMapper::Github).unwrap();
+        let mut historical = batch("", "cursor:h", "history");
+        historical.records[0].type_name = "PullRequest".into();
+        historical.records[0].external_id = "99".into();
+        redigest(&mut historical);
+        let kinds = super::source_dataset_land_kinds(
+            &SourceBatchMapper::Github,
+            &current.records,
+            vec![serde_json::to_string(&historical).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(kinds, vec!["Issue".to_string(), "PullRequest".to_string()]);
+    }
+
+    #[test]
+    fn from_committed_accepts_legacy_payload_source_id() {
+        let mut historical = batch("", "cursor:h", "legacy-source-id");
+        historical.records[0]
+            .properties
+            .insert("source_id".into(), "legacy".into());
+        redigest(&mut historical);
+        PreparedBatch::from_committed(&historical, &SourceBatchMapper::Github).unwrap();
+        assert_eq!(
+            PreparedBatch::new(&historical, &SourceBatchMapper::Github)
+                .unwrap_err()
+                .code(),
+            Some("reserved_property")
+        );
+        assert_eq!(
+            PreparedBatch::for_apply(&historical, &SourceBatchMapper::Github, None)
+                .unwrap_err()
+                .code(),
+            Some("reserved_property")
+        );
+        PreparedBatch::for_apply(
+            &historical,
+            &SourceBatchMapper::Github,
+            Some(SourceBatchStatus::Committed),
+        )
+        .unwrap();
+        PreparedBatch::for_apply(
+            &historical,
+            &SourceBatchMapper::Github,
+            Some(SourceBatchStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(
+            PreparedBatch::for_apply(
+                &historical,
+                &SourceBatchMapper::Github,
+                Some(SourceBatchStatus::Aborted),
+            )
+            .unwrap_err()
+            .code(),
+            Some("reserved_property")
+        );
+    }
+
+    #[test]
+    fn issue_only_land_backfills_unlanded_pull_request_history() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "issue-first"), PRODUCER, 100)
+            .unwrap();
+        let binding_id = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap()
+            .binding
+            .binding_id;
+        let mut historical = batch("cursor:1", "cursor:2", "old-pr-history");
+        historical.records[0].type_name = "PullRequest".into();
+        historical.records[0].external_id = "99".into();
+        historical.records[0].display_name = "Bounded pr".into();
+        historical.records[0]
+            .properties
+            .insert("title".into(), "Bounded pr".into());
+        redigest(&mut historical);
+        {
+            let RuntimeDb::Sqlite(sqlite) = &db else {
+                panic!("expected sqlite runtime");
+            };
+            sqlite
+                .conn()
+                .execute(
+                    "INSERT INTO sekai_source_batch_transactions (
+                        transaction_id, binding_id, namespace, producer_identity, idempotency_key,
+                        batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
+                        outcome, opened_at_ms, closed_at_ms, reason, result_json, contract_version,
+                        dataset_landed
+                     ) VALUES (?1, ?2, 'acme', ?3, 'old-pr-history', ?4, ?5, ?6, ?7,
+                               'COMMITTED', 'success', 50, 50, '', '', ?8, 0)",
+                    params![
+                        "tx-old-pr-history",
+                        binding_id,
+                        PRODUCER,
+                        historical.batch_digest,
+                        serde_json::to_string(&historical).unwrap(),
+                        historical.current_cursor,
+                        historical.proposed_next_cursor,
+                        historical.contract_version,
+                    ],
+                )
+                .unwrap();
+        }
+        let mut next = batch("cursor:1", "cursor:2", "issue-next");
+        next.records[0].external_id = "13".into();
+        next.records[0].source_version = "node-v2".into();
+        redigest(&mut next);
+        db.apply_source_batch(&next, PRODUCER, 200).unwrap();
+        let pr_dataset =
+            crate::db::source_batch_dataset::binding_dataset_id(&binding_id, "PullRequest");
+        assert_eq!(sqlite_dataset_row_count(&db, &pr_dataset), 1);
+        assert!(
+            db.get_object_type_datasource("acme", "PullRequest")
+                .unwrap()
+                .is_some()
+        );
+        let RuntimeDb::Sqlite(sqlite) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        let landed: i64 = sqlite
+            .conn()
+            .query_row(
+                "SELECT dataset_landed FROM sekai_source_batch_transactions
+                 WHERE transaction_id=?1",
+                params!["tx-old-pr-history"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 1);
+    }
+
+    #[test]
+    fn source_batch_lands_dataset_and_derives_index_members() {
+        let db = RuntimeDb::memory();
+        let admitted = db
+            .apply_source_batch(&batch("", "cursor:1", "land-dataset"), PRODUCER, 100)
+            .unwrap();
+        assert_eq!(admitted.transaction.status, SourceBatchStatus::Committed);
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        let dataset_id =
+            crate::db::source_batch_dataset::binding_dataset_id(&state.binding.binding_id, "Issue");
+        assert_eq!(sqlite_dataset_row_count(&db, &dataset_id), 1);
+        let datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .expect("auto-registered datasource");
+        assert_eq!(datasource.dataset_id, dataset_id);
+        assert_eq!(datasource.key_column, "source_id");
+        assert!(!datasource.property_mapping.contains_key("sync_source"));
+        assert_eq!(
+            datasource.property_mapping.get("title").map(String::as_str),
+            Some("title")
+        );
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].object_id, issue_object_id());
+        assert_eq!(
+            members[0].properties.get("title").map(String::as_str),
+            Some("Bounded sync")
+        );
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("title").map(String::as_str),
+            Some("Bounded sync")
+        );
+    }
+
+    #[test]
+    fn rematerialize_skips_identity_of_another_kind() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "kind-fence"), PRODUCER, 100)
+            .unwrap();
+        let issue_id = issue_object_id();
+        let before = db.get_object(&issue_id).unwrap().unwrap();
+        let source_key = source_id(SOURCE_GITHUB, "acme/ops", "12");
+        db.create_dataset(&crate::sekai::dataset::Dataset {
+            id: "ds-customer-collision".into(),
+            name: "customers".into(),
+            columns: vec![
+                crate::sekai::dataset::ColumnDef {
+                    name: "source_id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                crate::sekai::dataset::ColumnDef {
+                    name: "hidden".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+                crate::sekai::dataset::ColumnDef {
+                    name: "region".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                },
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            "ds-customer-collision",
+            &[HashMap::from([
+                ("source_id".into(), source_key),
+                ("hidden".into(), "0".into()),
+                ("region".into(), "eu".into()),
+            ])],
+        )
+        .unwrap();
+        db.register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: "acme".into(),
+                kind: "Customer".into(),
+                definition_digest: TYPE_DIGEST.into(),
+                dataset_id: "ds-customer-collision".into(),
+                key_column: "source_id".into(),
+                property_mapping: BTreeMap::from([("region".into(), "region".into())]),
+                hidden_column: "hidden".into(),
+                edits_only: false,
+                conflict_rule: String::new(),
+                source_timestamp_property: String::new(),
+            }
+            .prepare()
+            .unwrap(),
+            200,
+        )
+        .unwrap();
+        db.apply_object_type_index("acme", "Customer", true, 300)
+            .unwrap();
+        let after = db.get_object(&issue_id).unwrap().unwrap();
+        assert_eq!(after.properties, before.properties);
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Customer",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert_ne!(members[0].object_id, issue_id);
+    }
+
+    #[test]
+    fn mapping_change_full_rebuild_updates_objects_without_source_reread() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "map-change"), PRODUCER, 100)
+            .unwrap();
+        let mut datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .expect("auto-registered datasource");
+        datasource.property_mapping.remove("title");
+        datasource
+            .property_mapping
+            .insert("headline".into(), "title".into());
+        db.register_object_type_datasource(&datasource, 200)
+            .unwrap();
+        db.apply_object_type_index("acme", "Issue", true, 300)
+            .unwrap();
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            members[0].properties.get("headline").map(String::as_str),
+            Some("Bounded sync")
+        );
+        assert!(!members[0].properties.contains_key("title"));
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("headline").map(String::as_str),
+            Some("Bounded sync")
+        );
+        assert!(!object.properties.contains_key("title"));
+        let changes = db.list_object_changes(&issue_object_id(), 100, 0).unwrap();
+        assert!(changes.iter().any(|change| {
+            change.field == "properties.headline" && change.new_value == "Bounded sync"
+        }));
+        let mut next = batch("cursor:1", "cursor:2", "map-follow");
+        next.records[0].source_version = "node-v2".into();
+        redigest(&mut next);
+        db.apply_source_batch(&next, PRODUCER, 400).unwrap();
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("headline").map(String::as_str),
+            Some("Bounded sync")
+        );
+        assert!(!object.properties.contains_key("title"));
+    }
+
+    #[test]
+    fn mapping_change_same_source_version_refresh_succeeds() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "map-same-ver"), PRODUCER, 100)
+            .unwrap();
+        let mut datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .expect("auto-registered datasource");
+        datasource.property_mapping.remove("title");
+        datasource
+            .property_mapping
+            .insert("headline".into(), "title".into());
+        db.register_object_type_datasource(&datasource, 200)
+            .unwrap();
+        db.apply_object_type_index("acme", "Issue", true, 300)
+            .unwrap();
+        let refresh = batch("cursor:1", "cursor:2", "map-same-ver-refresh");
+        let result = db.apply_source_batch(&refresh, PRODUCER, 400).unwrap();
+        assert_eq!(result.transaction.status, SourceBatchStatus::Committed);
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("headline").map(String::as_str),
+            Some("Bounded sync")
+        );
+        assert!(!object.properties.contains_key("title"));
+    }
+
+    #[test]
+    fn identity_mapping_unions_new_columns_across_batches() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "union-1"), PRODUCER, 100)
+            .unwrap();
+        let mut second = batch("cursor:1", "cursor:2", "union-2");
+        second.records[0].external_id = "13".into();
+        second.records[0].source_version = "node-v2".into();
+        second.records[0].display_name = "Other".into();
+        second.records[0].properties = BTreeMap::from([("body".into(), "details".into())]);
+        redigest(&mut second);
+        db.apply_source_batch(&second, PRODUCER, 200).unwrap();
+        let mapping = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .unwrap()
+            .property_mapping;
+        assert_eq!(mapping.get("title").map(String::as_str), Some("title"));
+        assert_eq!(mapping.get("body").map(String::as_str), Some("body"));
+    }
+
+    #[test]
+    fn identity_mapping_expansion_keeps_operator_conflict_rule() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "keep-rule-1"), PRODUCER, 100)
+            .unwrap();
+        let mut datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .unwrap();
+        datasource.conflict_rule = "newest_wins".into();
+        datasource.source_timestamp_property = "observed_at".into();
+        db.register_object_type_datasource(&datasource, 150)
+            .unwrap();
+        let mut second = batch("cursor:1", "cursor:2", "keep-rule-2");
+        second.records[0].external_id = "13".into();
+        second.records[0].source_version = "node-v2".into();
+        second.records[0].properties = BTreeMap::from([("body".into(), "details".into())]);
+        redigest(&mut second);
+        db.apply_source_batch(&second, PRODUCER, 200).unwrap();
+        let stored = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.conflict_rule, "newest_wins");
+        assert_eq!(stored.source_timestamp_property, "observed_at");
+        assert_eq!(
+            stored.property_mapping.get("body").map(String::as_str),
+            Some("body")
+        );
+    }
+
+    #[test]
+    fn delete_index_tables_rebuild_restores_members() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "rebuild-index"), PRODUCER, 100)
+            .unwrap();
+        let before = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        let RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        store
+            .conn()
+            .execute_batch(
+                "DELETE FROM sekai_object_type_index_member;
+                 DELETE FROM sekai_object_type_index_join;
+                 DELETE FROM sekai_object_type_index_status;
+                 DELETE FROM sekai_object_type_index_join_status;",
+            )
+            .unwrap();
+        assert!(
+            db.list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default()
+            )
+            .unwrap()
+            .is_empty()
+        );
+        db.apply_object_type_index("acme", "Issue", true, 200)
+            .unwrap();
+        let after = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn incremental_apply_restores_source_members_wiped_before_status() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "wipe-members"), PRODUCER, 100)
+            .unwrap();
+        let before = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        let RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        store
+            .conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_member WHERE from_edit = 0",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default()
+            )
+            .unwrap()
+            .is_empty()
+        );
+        db.apply_object_type_index("acme", "Issue", false, 200)
+            .unwrap();
+        let after = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn incremental_apply_restores_members_after_partial_rebuild_cursor_reset() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "partial-rebuild-1"), PRODUCER, 100)
+            .unwrap();
+        let mut later = batch("cursor:1", "cursor:2", "partial-rebuild-2");
+        later.records[0].external_id = "13".into();
+        later.records[0].source_version = "node-v2".into();
+        later.records[0].display_name = "Later issue".into();
+        later.records[0]
+            .properties
+            .insert("title".into(), "Later issue".into());
+        redigest(&mut later);
+        db.apply_source_batch(&later, PRODUCER, 200).unwrap();
+        let before = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(before.len(), 2);
+        let RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        store
+            .conn()
+            .execute(
+                "DELETE FROM sekai_object_type_index_member
+                 WHERE from_edit = 0 AND rowid = (
+                    SELECT MIN(rowid) FROM sekai_object_type_index_member
+                    WHERE from_edit = 0
+                 )",
+                [],
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE sekai_object_type_index_status SET last_dataset_row_id = 0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            db.list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default()
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        db.apply_object_type_index("acme", "Issue", false, 300)
+            .unwrap();
+        let after = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(after.len(), 2);
+    }
+
+    #[test]
+    fn crash_after_dataset_land_replay_converges_without_duplicate_rows() {
+        let db = RuntimeDb::memory();
+        let first = batch("", "cursor:1", "crash-land");
+        AFTER_SOURCE_BATCH_DATASET_LAND.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(|| panic!("dataset land crash")));
+        });
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.apply_source_batch(&first, PRODUCER, 100)
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(batch_status_for(&db, "crash-land").as_deref(), Some("OPEN"));
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        let dataset_id =
+            crate::db::source_batch_dataset::binding_dataset_id(&state.binding.binding_id, "Issue");
+        assert_eq!(sqlite_dataset_row_count(&db, &dataset_id), 1);
+        let replayed = db.apply_source_batch(&first, PRODUCER, 200).unwrap();
+        assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
+        assert_eq!(sqlite_dataset_row_count(&db, &dataset_id), 1);
+        assert_eq!(
+            db.list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default()
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(db.get_object(&issue_object_id()).unwrap().is_some());
+    }
+
+    #[test]
+    fn crash_after_index_derive_replay_ignores_rematerialized_properties() {
+        let db = RuntimeDb::memory();
+        let first = batch("", "cursor:1", "crash-derive");
+        AFTER_SOURCE_BATCH_INDEX_DERIVE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(|| panic!("index derive crash")));
+        });
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.apply_source_batch(&first, PRODUCER, 100)
+        }));
+        assert!(panicked.is_err());
+        let mut datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .expect("auto-registered datasource");
+        datasource.property_mapping.remove("title");
+        datasource
+            .property_mapping
+            .insert("headline".into(), "title".into());
+        db.register_object_type_datasource(&datasource, 150)
+            .unwrap();
+        db.apply_object_type_index("acme", "Issue", true, 175)
+            .unwrap();
+        let replayed = db.apply_source_batch(&first, PRODUCER, 200).unwrap();
+        assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("headline").map(String::as_str),
+            Some("Bounded sync")
+        );
+    }
+
+    #[test]
+    fn prepared_batch_rejects_payload_source_id_and_hidden() {
+        let mut source_id_batch = batch("", "cursor:1", "reserved-source-id");
+        source_id_batch.records[0]
+            .properties
+            .insert("source_id".into(), "forged".into());
+        redigest(&mut source_id_batch);
+        assert_eq!(
+            PreparedBatch::new(&source_id_batch, &SourceBatchMapper::Github)
+                .unwrap_err()
+                .code(),
+            Some("reserved_property")
+        );
+        let mut hidden_batch = batch("", "cursor:1", "reserved-hidden");
+        hidden_batch.records[0]
+            .properties
+            .insert("hidden".into(), "1".into());
+        redigest(&mut hidden_batch);
+        assert_eq!(
+            PreparedBatch::new(&hidden_batch, &SourceBatchMapper::Github)
+                .unwrap_err()
+                .code(),
+            Some("reserved_property")
+        );
+    }
+
+    #[test]
+    fn abort_refused_after_dataset_land() {
+        let db = RuntimeDb::memory();
+        let first = batch("", "cursor:1", "abort-landed");
+        AFTER_SOURCE_BATCH_DATASET_LAND.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(|| panic!("dataset land crash")));
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                db.apply_source_batch(&first, PRODUCER, 100)
+            }))
+            .is_err()
+        );
+        let err = db
+            .abort_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, "gone", 150)
+            .unwrap_err();
+        assert!(err.starts_with("dataset_landed:"), "{err}");
+        assert_eq!(
+            batch_status_for(&db, "abort-landed").as_deref(),
+            Some("OPEN")
+        );
+        let replayed = db.apply_source_batch(&first, PRODUCER, 200).unwrap();
+        assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
+    }
+
+    #[test]
+    fn backfill_unions_historical_columns_from_committed_batches() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "hist-1"), PRODUCER, 100)
+            .unwrap();
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        let binding_id = &state.binding.binding_id;
+        let dataset_id = crate::db::source_batch_dataset::binding_dataset_id(binding_id, "Issue");
+        let RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        store
+            .conn()
+            .execute_batch(&format!(
+                "DELETE FROM sekai_dataset_rows WHERE dataset_id='{dataset_id}';
+                 DELETE FROM sekai_datasets WHERE id='{dataset_id}';
+                 DELETE FROM sekai_object_type_datasource
+                  WHERE namespace='acme' AND kind='Issue';
+                 UPDATE sekai_source_batch_transactions
+                    SET dataset_landed=0
+                  WHERE binding_id='{binding_id}';"
+            ))
+            .unwrap();
+        let mut second = batch("cursor:1", "cursor:2", "hist-2");
+        second.records[0].source_version = "node-v2".into();
+        second.records[0].properties = BTreeMap::from([("body".into(), "details".into())]);
+        redigest(&mut second);
+        db.apply_source_batch(&second, PRODUCER, 200).unwrap();
+        let dataset = db.get_dataset(&dataset_id).unwrap().unwrap();
+        let names: Vec<&str> = dataset
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert!(names.contains(&"title"), "{names:?}");
+        assert!(names.contains(&"body"), "{names:?}");
+        let mapping = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .unwrap()
+            .property_mapping;
+        assert_eq!(mapping.get("title").map(String::as_str), Some("title"));
+        assert_eq!(mapping.get("body").map(String::as_str), Some("body"));
+        let title_present: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_dataset_rows
+                 WHERE dataset_id=?1 AND json_extract(data, '$.title') IS NOT NULL",
+                params![dataset_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(title_present >= 1, "historical title rows backfilled");
     }
 }

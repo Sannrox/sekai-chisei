@@ -6049,6 +6049,44 @@ async fn dataset_rpc_round_trip() {
 }
 
 #[tokio::test]
+async fn query_rows_refuses_source_owned_dataset() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_dataset(&dataset::Dataset {
+            id: "srcds:binding:Issue".into(),
+            name: "source Issue".into(),
+            columns: vec![],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    let denied = svc
+        .query_rows(with_principal(QueryRowsRequest {
+            dataset_id: "srcds:binding:Issue".into(),
+            query: Some(RowQuery {
+                filters: vec![],
+                columns: vec![],
+                limit: 0,
+                offset: 0,
+            }),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    assert!(denied.message().contains("source-owned"));
+    let append = svc
+        .append_rows(with_principal(AppendRowsRequest {
+            dataset_id: "srcds:binding:Issue".into(),
+            rows: vec![],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(append.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
 async fn list_datasets_omits_bindings_above_marking_ceiling() {
     let svc = service();
     svc.db

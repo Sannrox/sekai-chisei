@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -67,6 +67,17 @@ pub struct SekaiDb {
     schema_plane: crate::db::schema_plane::SchemaPlane,
     chisei_schema: std::sync::OnceLock<()>,
     pub search_maintenance: Mutex<()>,
+    /// Shared across handles on the same file so a delayed OPEN replay cannot
+    /// overwrite a later committed batch's index.
+    source_index_derive: Arc<Mutex<()>>,
+    /// Sidecar SQLite lock file so two processes on the same store serialize
+    /// derive the same way the in-process mutex serializes handles.
+    source_index_derive_lock_path: Option<String>,
+}
+
+pub(crate) struct SqliteSourceIndexDeriveGuard<'a> {
+    _local: MutexGuard<'a, ()>,
+    _file: Option<Connection>,
 }
 
 #[derive(Debug)]
@@ -77,6 +88,28 @@ impl CustomizeConnection<Connection, rusqlite::Error> for SqliteConnectionSetup 
         conn.busy_timeout(Duration::from_secs(5))?;
         register_sql_helpers(conn)
     }
+}
+
+fn sqlite_source_index_derive_lock(
+    path: &str,
+    persistent: bool,
+) -> (Arc<Mutex<()>>, Option<String>) {
+    if !persistent {
+        return (Arc::new(Mutex::new(())), None);
+    }
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let local = locks
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    (local, Some(format!("{key}.source-index-derive")))
 }
 
 fn register_sql_helpers(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -219,6 +252,8 @@ impl SekaiDb {
         } else {
             NEXT_MEMORY_POOL_ID.fetch_add(1, Ordering::Relaxed)
         };
+        let (source_index_derive, source_index_derive_lock_path) =
+            sqlite_source_index_derive_lock(path, persistent);
         let db = Self {
             pool,
             enterprise_extension,
@@ -228,6 +263,8 @@ impl SekaiDb {
             schema_plane,
             chisei_schema: std::sync::OnceLock::new(),
             search_maintenance: Mutex::new(()),
+            source_index_derive,
+            source_index_derive_lock_path,
         };
         db.migrate_for_plane(schema_plane)?;
         Ok(db)
@@ -247,6 +284,30 @@ impl SekaiDb {
 
     pub fn pool_max_size(&self) -> u32 {
         self.pool.max_size()
+    }
+
+    pub(crate) fn lock_source_index_derive(
+        &self,
+    ) -> Result<SqliteSourceIndexDeriveGuard<'_>, String> {
+        let local = self
+            .source_index_derive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file = match &self.source_index_derive_lock_path {
+            Some(path) => {
+                let conn = Connection::open(path).map_err(|error| error.to_string())?;
+                conn.busy_timeout(Duration::from_secs(60))
+                    .map_err(|error| error.to_string())?;
+                conn.execute_batch("BEGIN EXCLUSIVE")
+                    .map_err(|error| error.to_string())?;
+                Some(conn)
+            }
+            None => None,
+        };
+        Ok(SqliteSourceIndexDeriveGuard {
+            _local: local,
+            _file: file,
+        })
     }
 
     /// Labels this pool's checkout signals with the store plane it serves.
