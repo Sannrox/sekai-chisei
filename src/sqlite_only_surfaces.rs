@@ -466,6 +466,12 @@ mod tests {
         listed_rpc_methods_are_handler_evidence(&list).unwrap();
         unlisted_fail_closed_rpcs(&table, &list, RUNTIME_DB_SRC).unwrap();
         real_backend_matches_list(&table, MATURITY_DOCS, &list).unwrap();
+        parity_docs_link_the_list(
+            include_str!("../docs/postgres-sekai-parity.md"),
+            include_str!("../docs/postgres-chisei-parity.md"),
+            MATURITY_DOCS,
+        )
+        .unwrap();
         assert_eq!(list.surfaces.len(), SQLITE_ONLY_SURFACE_LIMIT);
         assert!(list.contains_rpc("SekaiService", "DeleteOntologyClass"));
         assert!(!list.contains_rpc("SekaiService", "AppendRows"));

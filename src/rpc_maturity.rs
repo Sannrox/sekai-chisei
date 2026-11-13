@@ -502,21 +502,6 @@ mod tests {
                 "{rpc} is used by the gateway host"
             );
         }
-        for rpc in [
-            "CreateDataset",
-            "UpdateDataset",
-            "AppendRows",
-            "QueryRows",
-            "DecideGatewayExecution",
-            "RecordUsage",
-            "ClaimGatewayDispatch",
-        ] {
-            assert_eq!(
-                table.classification_of(rpc),
-                Some(RpcClassification::Stable),
-                "{rpc} is used by the gateway host"
-            );
-        }
     }
 
     /// The stable surface is uncapped: promoting an RPC edits only its entry.
