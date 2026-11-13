@@ -176,16 +176,6 @@ pub(super) fn from_proto_evidence_envelope(
         causality,
     })
 }
-#[cfg(test)]
-pub(super) fn evidence_content_is_readable(state: evidence_domain::EvidenceLifecycleState) -> bool {
-    matches!(
-        state,
-        evidence_domain::EvidenceLifecycleState::Available
-            | evidence_domain::EvidenceLifecycleState::Superseded
-            | evidence_domain::EvidenceLifecycleState::Retracted
-            | evidence_domain::EvidenceLifecycleState::Stale
-    )
-}
 pub(super) fn to_proto_evidence_submission(
     submission: &DomainEvidenceSubmissionRecord,
 ) -> EvidenceSubmissionRecord {

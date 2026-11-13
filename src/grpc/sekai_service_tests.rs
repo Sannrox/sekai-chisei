@@ -16694,26 +16694,6 @@ async fn evidence_control_plane_authenticates_and_filters_inspection() {
 }
 
 #[test]
-fn evidence_content_lifecycle_is_fail_closed() {
-    use evidence_domain::EvidenceLifecycleState::*;
-
-    for state in [Available, Superseded, Retracted, Stale] {
-        assert!(evidence_content_is_readable(state), "{state:?}");
-    }
-    for state in [
-        Received,
-        Validated,
-        Deduplicated,
-        Authorized,
-        Projected,
-        Rejected,
-        Quarantined,
-    ] {
-        assert!(!evidence_content_is_readable(state), "{state:?}");
-    }
-}
-
-#[test]
 fn reserved_governance_kinds_are_exclusion_safe() {
     // Every reserved kind must be ASCII alphanumeric/underscore so the
     // static SQL exclusion covers it; a kind with special characters would
