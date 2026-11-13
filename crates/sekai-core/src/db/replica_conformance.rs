@@ -482,6 +482,9 @@ mod tests {
         assert_eq!(report.version, VERSION);
         assert_eq!(report.runtime_instances, 2);
         assert_eq!(report.checks.len(), MAX_CHECKS);
+        let schema: serde_json::Value = serde_json::from_str(SCHEMA_JSON).unwrap();
+        assert_eq!(schema["version"], VERSION);
+        assert_eq!(schema["max_checks"].as_u64(), Some(MAX_CHECKS as u64));
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.len() < 2_048);
         assert!(!json.contains(std::env::temp_dir().to_string_lossy().as_ref()));
