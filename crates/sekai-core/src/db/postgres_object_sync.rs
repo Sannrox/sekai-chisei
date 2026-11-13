@@ -3,9 +3,12 @@ use std::collections::{BTreeMap, HashMap};
 use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
-    ApplyError, PreparedBatch, PreparedRecord, registered_descriptor_authorizes_batch,
+    ApplyError, PreparedBatch, PreparedRecord, SourceBatchMapper, committed_source_batch_result,
+    committed_source_dataset_backfill, prepared_dataset_columns, prepared_dataset_rows,
+    prepared_record_results, registered_descriptor_authorizes_batch,
     require_authorized_object_snapshot, source_batch_mapper, source_batch_trigger_ids,
-    unbound_type_revision, validate_binding,
+    source_dataset_derive_kinds, source_dataset_land_kinds, unbound_type_revision,
+    validate_binding,
 };
 use crate::db::postgres::PostgresDb;
 use crate::db::postgres_audit::{insert_changes, lock_object_lifecycle};
@@ -49,6 +52,7 @@ struct StoredIdentity {
     object_id: String,
     source_version: String,
     payload_digest: String,
+    synced_object_json: String,
 }
 
 impl PostgresDb {
@@ -85,14 +89,27 @@ impl PostgresDb {
             self.get_source_type_descriptor(&batch.namespace, &batch.type_digest)
         })
         .map_err(|error| error.to_string())?;
-        let prepared = PreparedBatch::new(batch, &mapper).map_err(|error| error.to_string())?;
+        let existing = {
+            let mut connection = self.connection().map_err(|error| error.to_string())?;
+            load_batch_by_key(
+                &mut *connection,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+                false,
+            )
+            .map_err(|error| error.to_string())?
+            .map(|stored| stored.transaction.status)
+        };
+        let prepared = PreparedBatch::for_apply(batch, &mapper, existing)
+            .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
             .map_err(|error| error.to_string())?
         {
             OpenDisposition::Committed(result) => (*result, false),
-            OpenDisposition::Open => (
-                self.commit_source_batch(
+            OpenDisposition::Open => self
+                .commit_source_batch(
                     batch,
                     &prepared,
                     authenticated_producer,
@@ -101,8 +118,6 @@ impl PostgresDb {
                     authorized_objects,
                 )
                 .map_err(|error| error.to_string())?,
-                true,
-            ),
         };
         if newly_committed && result.transaction.status == SourceBatchStatus::Committed {
             let ids = source_batch_trigger_ids(&result);
@@ -165,7 +180,9 @@ impl PostgresDb {
                             )
                         })?;
                     validate_binding(&binding.binding, batch)?;
-                    if let Err(error) = require_live_registered_descriptor(&mut transaction, batch)
+                    if !transaction_dataset_landed(&mut transaction, &prepared.transaction_id)?
+                        && let Err(error) =
+                            require_live_registered_descriptor(&mut transaction, batch)
                     {
                         abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
                         transaction.commit()?;
@@ -319,7 +336,7 @@ impl PostgresDb {
         now_ms: i64,
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
-    ) -> Result<SourceBatchResult, ApplyError> {
+    ) -> Result<(SourceBatchResult, bool), ApplyError> {
         let mut connection = self.connection().map_err(ApplyError::storage)?;
         let mut transaction = connection.transaction()?;
         lock_batch_identities(&mut transaction, batch)?;
@@ -352,7 +369,7 @@ impl PostgresDb {
             SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
                 let result = parse_stored_result(&stored)?;
                 transaction.commit()?;
-                return Ok(result);
+                return Ok((result, false));
             }
             SourceBatchStatus::Aborted => {
                 return Err(ApplyError::denied(
@@ -370,101 +387,104 @@ impl PostgresDb {
                     "open transaction has no stable source binding",
                 )
             })?;
-        if let Err(error) = require_live_registered_descriptor(&mut transaction, batch) {
-            abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
-            transaction.commit()?;
-            return Err(error);
-        }
-        let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
-            preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)
-        });
-        if let Err(error) = preflight {
-            if !error.is_denial() {
+        let dataset_landed =
+            transaction_dataset_landed(&mut transaction, &prepared.transaction_id)?;
+        if !dataset_landed {
+            if let Err(error) = require_live_registered_descriptor(&mut transaction, batch) {
+                abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
+                transaction.commit()?;
                 return Err(error);
             }
-            if is_schema_drift_denial(error.code()) {
-                let result = persist_schema_quarantine(
-                    &mut transaction,
-                    &binding.binding,
-                    batch,
-                    prepared,
-                    &stored,
-                    now_ms,
-                    &error,
-                )?;
+            let preflight = validate_binding(&binding.binding, batch).and_then(|()| {
+                preflight_commit_state(&mut transaction, &binding.binding, batch, &prepared.records)
+            });
+            if let Err(error) = preflight {
+                if !error.is_denial() {
+                    return Err(error);
+                }
+                if is_schema_drift_denial(error.code()) {
+                    let result = persist_schema_quarantine(
+                        &mut transaction,
+                        &binding.binding,
+                        batch,
+                        prepared,
+                        &stored,
+                        now_ms,
+                        &error,
+                    )?;
+                    transaction.commit()?;
+                    return Ok((result, true));
+                }
+                if error.code() == Some("missing_range") {
+                    mark_generation_recovery_required(
+                        &mut transaction,
+                        &prepared.binding_id,
+                        batch,
+                        now_ms,
+                    )?;
+                }
+                abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
                 transaction.commit()?;
-                return Ok(result);
+                return Err(error);
             }
-            if error.code() == Some("missing_range") {
-                mark_generation_recovery_required(
-                    &mut transaction,
-                    &prepared.binding_id,
-                    batch,
-                    now_ms,
-                )?;
+            if let Some(authorized) = authorized_objects {
+                for expected in authorized {
+                    let current = load_object(&mut transaction, &expected.id, true)?;
+                    require_authorized_object_snapshot(
+                        current.as_ref(),
+                        Some(std::slice::from_ref(expected)),
+                        &expected.id,
+                    )?;
+                }
             }
-            abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
-            transaction.commit()?;
-            return Err(error);
-        }
-
-        if let Some(authorized) = authorized_objects {
-            for expected in authorized {
-                let current = load_object(&mut transaction, &expected.id, true)?;
+            for prepared_record in &prepared.records {
+                let before =
+                    load_object(&mut transaction, &prepared_record.object.object_id, true)?;
                 require_authorized_object_snapshot(
-                    current.as_ref(),
-                    Some(std::slice::from_ref(expected)),
-                    &expected.id,
+                    before.as_ref(),
+                    authorized_objects,
+                    &prepared_record.object.object_id,
                 )?;
-            }
-        }
-        let mut record_results = Vec::with_capacity(prepared.records.len());
-        for prepared_record in &prepared.records {
-            let before = load_object(&mut transaction, &prepared_record.object.object_id, true)?;
-            require_authorized_object_snapshot(
-                before.as_ref(),
-                authorized_objects,
-                &prepared_record.object.object_id,
-            )?;
-            transaction
-                .execute(
-                    "DELETE FROM sekai_source_identities
+                transaction
+                    .execute(
+                        "DELETE FROM sekai_source_identities
                      WHERE namespace=$1 AND source_id=$2",
-                    &[&batch.namespace, &prepared_record.source_id],
-                )
-                .map_err(ApplyError::storage)?;
-            let mut object = Object {
-                id: prepared_record.object.object_id.clone(),
-                kind: prepared_record.object.type_name.clone(),
-                name: prepared_record.display_name.clone(),
-                namespace: batch.namespace.clone(),
-                external_id: prepared_record.source_id.clone(),
-                properties: serde_json::from_str::<BTreeMap<String, String>>(
-                    &prepared_record.properties_json,
-                )
-                .map_err(ApplyError::storage)?
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-                created: before
-                    .as_ref()
-                    .map(|object| object.created)
-                    .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
-                updated: now_ms,
-            };
-            if let Some(existing) = &before
-                && let Some(policy) = super::postgres_object_security::load_active_policy_postgres(
-                    &mut transaction,
-                    &object.namespace,
-                    &object.kind,
-                )
-                .map_err(ApplyError::storage)?
-            {
-                policy.preserve_unwritable_properties(existing, &mut object);
-            }
-            let properties_json = crate::domain::storage_properties_json(&object.properties)
-                .map_err(ApplyError::storage)?;
-            transaction.execute(
-                "INSERT INTO sekai_objects
+                        &[&batch.namespace, &prepared_record.source_id],
+                    )
+                    .map_err(ApplyError::storage)?;
+                let mut object = Object {
+                    id: prepared_record.object.object_id.clone(),
+                    kind: prepared_record.object.type_name.clone(),
+                    name: prepared_record.display_name.clone(),
+                    namespace: batch.namespace.clone(),
+                    external_id: prepared_record.source_id.clone(),
+                    properties: serde_json::from_str::<BTreeMap<String, String>>(
+                        &prepared_record.properties_json,
+                    )
+                    .map_err(ApplyError::storage)?
+                    .into_iter()
+                    .collect::<HashMap<_, _>>(),
+                    created: before
+                        .as_ref()
+                        .map(|object| object.created)
+                        .unwrap_or(prepared_record.observed_at_ms.min(now_ms)),
+                    updated: now_ms,
+                };
+                if let Some(existing) = &before
+                    && let Some(policy) =
+                        super::postgres_object_security::load_active_policy_postgres(
+                            &mut transaction,
+                            &object.namespace,
+                            &object.kind,
+                        )
+                        .map_err(ApplyError::storage)?
+                {
+                    policy.preserve_unwritable_properties(existing, &mut object);
+                }
+                let properties_json = crate::domain::storage_properties_json(&object.properties)
+                    .map_err(ApplyError::storage)?;
+                transaction.execute(
+                    "INSERT INTO sekai_objects
                     (id, kind, name, namespace, external_id, properties, created, updated)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT(id) DO UPDATE SET
@@ -474,57 +494,47 @@ impl PostgresDb {
                     external_id = EXCLUDED.external_id,
                     properties = EXCLUDED.properties,
                     updated = EXCLUDED.updated",
-                &[
-                    &object.id,
-                    &object.kind,
-                    &object.name,
-                    &object.namespace,
-                    &object.external_id,
-                    &properties_json,
-                    &object.created,
-                    &object.updated,
-                ],
-            )?;
-            // Attributed to the committed source transaction (#1690).
-            insert_changes(
-                &mut transaction,
-                &crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id).stamp(
-                    object_diff_changes(
-                        authenticated_producer,
-                        before.as_ref(),
-                        Some(&object),
-                        now_ms,
-                    ),
-                ),
-            )
-            .map_err(ApplyError::storage)?;
+                    &[
+                        &object.id,
+                        &object.kind,
+                        &object.name,
+                        &object.namespace,
+                        &object.external_id,
+                        &properties_json,
+                        &object.created,
+                        &object.updated,
+                    ],
+                )?;
+                // Attributed to the committed source transaction (#1690).
+                insert_changes(
+                    &mut transaction,
+                    &crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
+                        .stamp(object_diff_changes(
+                            authenticated_producer,
+                            before.as_ref(),
+                            Some(&object),
+                            now_ms,
+                        )),
+                )
+                .map_err(ApplyError::storage)?;
 
-            let reason = match prepared_record.decision {
-                SyncDecision::Upsert(_) => "upserted",
-                SyncDecision::Tombstone(_) => "tombstoned",
-                SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
-                    return Err(ApplyError::storage(
-                        "prepared sync decision changed after validation",
-                    ));
-                }
-            };
-            let record_result = SourceRecordResult {
-                transaction_id: prepared.transaction_id.clone(),
-                source_id: prepared_record.source_id.clone(),
-                source_version: prepared_record.object.source_version.clone(),
-                decision: prepared_record.decision.clone(),
-                outcome: OperationOutcome::Success,
-                reason: reason.into(),
-                source_sequence: prepared_record.source_sequence,
-            };
-            let synced_object_json =
-                serde_json::to_string(&prepared_record.object).map_err(ApplyError::storage)?;
-            let lineage_json =
-                serde_json::to_string(&prepared_record.lineage).map_err(ApplyError::storage)?;
-            let decision_json =
-                serde_json::to_string(&prepared_record.decision).map_err(ApplyError::storage)?;
-            transaction.execute(
-                "INSERT INTO sekai_source_identities (
+                let reason = match prepared_record.decision {
+                    SyncDecision::Upsert(_) => "upserted",
+                    SyncDecision::Tombstone(_) => "tombstoned",
+                    SyncDecision::Conflict { .. } | SyncDecision::Reject { .. } => {
+                        return Err(ApplyError::storage(
+                            "prepared sync decision changed after validation",
+                        ));
+                    }
+                };
+                let synced_object_json =
+                    serde_json::to_string(&prepared_record.object).map_err(ApplyError::storage)?;
+                let lineage_json =
+                    serde_json::to_string(&prepared_record.lineage).map_err(ApplyError::storage)?;
+                let decision_json = serde_json::to_string(&prepared_record.decision)
+                    .map_err(ApplyError::storage)?;
+                transaction.execute(
+                    "INSERT INTO sekai_source_identities (
                     namespace, source_id, binding_id, type_digest, type_name, object_id,
                     source_version, payload_digest, tombstoned, synced_object_json,
                     lineage_json, last_transaction_id, updated_at_ms
@@ -539,83 +549,184 @@ impl PostgresDb {
                     lineage_json = EXCLUDED.lineage_json,
                     last_transaction_id = EXCLUDED.last_transaction_id,
                     updated_at_ms = EXCLUDED.updated_at_ms",
-                &[
-                    &batch.namespace,
-                    &prepared_record.source_id,
-                    &prepared.binding_id,
-                    &batch.type_digest,
-                    &prepared_record.object.type_name,
-                    &prepared_record.object.object_id,
-                    &prepared_record.object.source_version,
-                    &prepared_record.object.payload_digest,
-                    &prepared_record.object.tombstoned,
-                    &synced_object_json,
-                    &lineage_json,
-                    &prepared.transaction_id,
-                    &now_ms,
-                ],
-            )?;
-            transaction.execute(
-                "INSERT INTO sekai_source_record_results (
+                    &[
+                        &batch.namespace,
+                        &prepared_record.source_id,
+                        &prepared.binding_id,
+                        &batch.type_digest,
+                        &prepared_record.object.type_name,
+                        &prepared_record.object.object_id,
+                        &prepared_record.object.source_version,
+                        &prepared_record.object.payload_digest,
+                        &prepared_record.object.tombstoned,
+                        &synced_object_json,
+                        &lineage_json,
+                        &prepared.transaction_id,
+                        &now_ms,
+                    ],
+                )?;
+                transaction.execute(
+                    "INSERT INTO sekai_source_record_results (
                     transaction_id, source_id, source_version, decision_json,
                     outcome, reason, lineage_json, source_sequence
                  ) VALUES ($1, $2, $3, $4, 'success', $5, $6, $7)",
-                &[
-                    &prepared.transaction_id,
-                    &prepared_record.source_id,
-                    &prepared_record.object.source_version,
-                    &decision_json,
-                    &reason,
-                    &lineage_json,
-                    &prepared_record.source_sequence.map(|value| value as i64),
-                ],
-            )?;
-            record_results.push(record_result);
+                    &[
+                        &prepared.transaction_id,
+                        &prepared_record.source_id,
+                        &prepared_record.object.source_version,
+                        &decision_json,
+                        &reason,
+                        &lineage_json,
+                        &prepared_record.source_sequence.map(|value| value as i64),
+                    ],
+                )?;
+            }
+            land_source_batch_dataset_rows_pg(&mut transaction, batch, prepared, now_ms)?;
         }
+        let result = committed_source_batch_result(
+            batch,
+            prepared,
+            stored.transaction.opened_at_ms,
+            now_ms,
+            prepared_record_results(prepared)?,
+        );
+        transaction.commit()?;
+        drop(connection);
+        let _derive = self
+            .lock_source_index_derive(&batch.namespace, &batch.source, &batch.source_instance)
+            .map_err(ApplyError::storage)?;
+        let already_closed = {
+            let mut connection = self.connection().map_err(ApplyError::storage)?;
+            load_batch_by_key(
+                &mut *connection,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+                false,
+            )?
+            .is_some_and(|stored| {
+                matches!(
+                    stored.transaction.status,
+                    SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+                )
+            })
+        };
+        if !already_closed {
+            self.derive_source_batch_index(batch, prepared, now_ms)?;
+        }
+        self.finalize_source_batch_commit(batch, prepared, now_ms, &result)
+    }
 
-        let committed_transaction = SourceBatchTransaction {
-            transaction_id: prepared.transaction_id.clone(),
-            binding_id: prepared.binding_id.clone(),
-            namespace: batch.namespace.clone(),
-            producer_identity: batch.producer_identity.clone(),
-            idempotency_key: batch.idempotency_key.clone(),
-            batch_digest: batch.batch_digest.clone(),
-            current_cursor: batch.current_cursor.clone(),
-            proposed_next_cursor: batch.proposed_next_cursor.clone(),
-            status: SourceBatchStatus::Committed,
-            outcome: OperationOutcome::Success,
-            opened_at_ms: stored.transaction.opened_at_ms,
-            closed_at_ms: Some(now_ms),
-            reason: "committed".into(),
-            contract_version: batch.contract_version.clone(),
-            delivery_mode: batch.delivery.as_ref().map(|delivery| delivery.mode),
-            sync_generation: batch
-                .delivery
+    fn derive_source_batch_index(
+        &self,
+        batch: &SourceBatch,
+        prepared: &PreparedBatch,
+        now_ms: i64,
+    ) -> Result<(), ApplyError> {
+        use crate::db::source_batch_dataset;
+
+        let dataset_ids = self
+            .list_datasets()
+            .map_err(ApplyError::storage)?
+            .into_iter()
+            .map(|dataset| dataset.id);
+        for kind in
+            source_dataset_derive_kinds(dataset_ids, &prepared.binding_id, &prepared.records)
+        {
+            let dataset_id = source_batch_dataset::binding_dataset_id(&prepared.binding_id, &kind);
+            let columns = self
+                .get_dataset(&dataset_id)
+                .map_err(ApplyError::storage)?
+                .map(|dataset| dataset.columns)
+                .filter(|columns| !columns.is_empty())
+                .unwrap_or(prepared_dataset_columns(&prepared.records, &kind)?);
+            let mut wanted = source_batch_dataset::datasource(
+                &batch.namespace,
+                &kind,
+                &batch.type_digest,
+                &dataset_id,
+                &columns,
+            );
+            let existing = self
+                .get_object_type_datasource(&batch.namespace, &kind)
+                .map_err(ApplyError::storage)?;
+            let ours = existing
                 .as_ref()
-                .map(|delivery| delivery.sync_generation),
-            source_feed_epoch: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.source_feed_epoch.clone()),
-            offset_start: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.offset_start),
-            offset_end: batch
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.offset_end),
-            snapshot_complete: batch
-                .delivery
-                .as_ref()
-                .map(|delivery| delivery.snapshot_complete),
-        };
-        let result = SourceBatchResult {
-            transaction: committed_transaction,
-            records: record_results,
-            checkpoint_advanced: true,
-        };
-        let result_json = serde_json::to_string(&result).map_err(ApplyError::storage)?;
+                .is_none_or(|previous| previous.dataset_id == dataset_id);
+            let mut full_rebuild = existing.is_none();
+            let register = match &existing {
+                None => true,
+                Some(previous) if previous.dataset_id == dataset_id => {
+                    match source_batch_dataset::expand_identity_mapping(
+                        &previous.property_mapping,
+                        &wanted.property_mapping,
+                    ) {
+                        Some(merged) => {
+                            wanted = previous.clone();
+                            wanted.property_mapping = merged;
+                            full_rebuild = true;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Some(_) => false,
+            };
+            if register {
+                self.register_object_type_datasource(&wanted, now_ms)
+                    .map_err(ApplyError::storage)?;
+            }
+            if !ours {
+                continue;
+            }
+            let report = self
+                .apply_object_type_index(&batch.namespace, &kind, full_rebuild, now_ms)
+                .map_err(ApplyError::storage)?;
+            if report.quarantined {
+                // Clerk objects already dual-wrote. Quarantine keeps the last
+                // consistent index readable. COMMITTED so exact replay does not
+                // re-append rows; ReindexObjectType recovers the mapping.
+                continue;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_source_batch_commit(
+        &self,
+        batch: &SourceBatch,
+        prepared: &PreparedBatch,
+        now_ms: i64,
+        result: &SourceBatchResult,
+    ) -> Result<(SourceBatchResult, bool), ApplyError> {
+        let mut connection = self.connection().map_err(ApplyError::storage)?;
+        let mut transaction = connection.transaction()?;
+        let stored = load_batch_by_key(
+            &mut transaction,
+            &batch.namespace,
+            &batch.producer_identity,
+            &batch.idempotency_key,
+            true,
+        )?;
+        let stored = stored.ok_or_else(|| {
+            ApplyError::denied(
+                "missing_open_transaction",
+                "source batch has no durable open transaction",
+            )
+        })?;
+        match stored.transaction.status {
+            SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
+                return Ok((parse_stored_result(&stored)?, false));
+            }
+            SourceBatchStatus::Aborted => {
+                return Err(ApplyError::denied(
+                    "batch_aborted",
+                    "matching source batch was durably aborted and cannot become success",
+                ));
+            }
+            SourceBatchStatus::Open => {}
+        }
+        let result_json = serde_json::to_string(result).map_err(ApplyError::storage)?;
         let updated = transaction.execute(
             "UPDATE sekai_source_batch_transactions
              SET status = 'COMMITTED', outcome = 'success', closed_at_ms = $1,
@@ -624,9 +735,27 @@ impl PostgresDb {
             &[&now_ms, &result_json, &prepared.transaction_id],
         )?;
         if updated != 1 {
-            return Err(ApplyError::storage(
-                "open source batch changed during atomic commit",
-            ));
+            let stored = load_batch_by_key(
+                &mut transaction,
+                &batch.namespace,
+                &batch.producer_identity,
+                &batch.idempotency_key,
+                true,
+            )?
+            .ok_or_else(|| {
+                ApplyError::denied(
+                    "missing_open_transaction",
+                    "source batch has no durable open transaction",
+                )
+            })?;
+            return match stored.transaction.status {
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined => {
+                    Ok((parse_stored_result(&stored)?, false))
+                }
+                _ => Err(ApplyError::storage(
+                    "open source batch changed during atomic commit",
+                )),
+            };
         }
         commit_generation_state(&mut transaction, &prepared.binding_id, batch, now_ms)?;
         transaction.execute(
@@ -680,7 +809,7 @@ impl PostgresDb {
             &[&now_ms, &prepared.binding_id],
         )?;
         transaction.commit()?;
-        Ok(result)
+        Ok((result.clone(), true))
     }
 
     pub fn get_source_identity_lineage(
@@ -990,30 +1119,20 @@ fn preflight_commit_state(
                         "source identity conflicts with its bound type or graph object",
                     ));
                 }
-                let mut projected_properties =
-                    serde_json::from_str::<HashMap<String, String>>(&record.properties_json)
-                        .map_err(|error| ApplyError::storage(error.to_string()))?;
-                if let Some(policy) = super::postgres_object_security::load_active_policy_postgres(
-                    transaction,
-                    &object.namespace,
-                    &object.kind,
-                )
-                .map_err(ApplyError::storage)?
-                {
-                    let mut projected = object.clone();
-                    projected.properties = projected_properties;
-                    policy.preserve_unwritable_properties(object, &mut projected);
-                    projected_properties = projected.properties;
-                }
-                if identity.source_version == record.object.source_version
-                    && (identity.payload_digest != record.object.payload_digest
+                if identity.source_version == record.object.source_version {
+                    let stored: crate::sekai::object_sync::SyncedObject =
+                        serde_json::from_str(&identity.synced_object_json)
+                            .map_err(|error| ApplyError::storage(error.to_string()))?;
+                    if identity.payload_digest != record.object.payload_digest
                         || object.name != record.display_name
-                        || object.properties != projected_properties)
-                {
-                    return Err(ApplyError::denied(
-                        "source_revision_conflict",
-                        "immutable source version is bound to different payload content",
-                    ));
+                        || stored.properties != record.object.properties
+                        || stored.tombstoned != record.object.tombstoned
+                    {
+                        return Err(ApplyError::denied(
+                            "source_revision_conflict",
+                            "immutable source version is bound to different payload content",
+                        ));
+                    }
                 }
             }
             (Some(_), None) | (None, Some(_)) => {
@@ -1317,7 +1436,7 @@ fn load_identity(
         .query_opt(
             &format!(
                 "SELECT binding_id, type_digest, type_name, object_id,
-                        source_version, payload_digest
+                        source_version, payload_digest, synced_object_json
                  FROM sekai_source_identities
                  WHERE namespace = $1 AND source_id = $2{suffix}"
             ),
@@ -1330,6 +1449,7 @@ fn load_identity(
             object_id: row.get(3),
             source_version: row.get(4),
             payload_digest: row.get(5),
+            synced_object_json: row.get(6),
         }))
 }
 
@@ -1456,18 +1576,157 @@ fn require_live_registered_descriptor(
     }
 }
 
+fn land_source_batch_dataset_rows_pg(
+    tx: &mut postgres::Transaction<'_>,
+    batch: &SourceBatch,
+    prepared: &PreparedBatch,
+    now_ms: i64,
+) -> Result<(), ApplyError> {
+    use crate::db::postgres_dataset::{
+        add_dataset_columns_tx, append_dataset_rows_tx, create_dataset_tx,
+    };
+    use crate::db::source_batch_dataset;
+    use crate::sekai::dataset::Dataset;
+
+    let mapper = source_batch_mapper(batch, || {
+        get_descriptor(tx, &batch.namespace, &batch.type_digest, RowLock::None)
+    })?;
+    let historical_jsons = unlanded_committed_source_batch_jsons_pg(tx, &prepared.binding_id)?;
+    let kinds = source_dataset_land_kinds(&mapper, &prepared.records, historical_jsons.clone())?;
+    let mut row_from = 0i64;
+    let mut row_to = 0i64;
+    for kind in kinds {
+        let dataset_id = source_batch_dataset::binding_dataset_id(&prepared.binding_id, &kind);
+        let columns = prepared_dataset_columns(&prepared.records, &kind)?;
+        let exists = tx
+            .query_opt("SELECT 1 FROM sekai_datasets WHERE id=$1", &[&dataset_id])
+            .map_err(ApplyError::storage)?
+            .is_some();
+        if !exists {
+            create_dataset_tx(
+                tx,
+                &Dataset {
+                    id: dataset_id.clone(),
+                    name: source_batch_dataset::dataset_name(&batch.source_instance, &kind),
+                    columns: columns.clone(),
+                    object_id: String::new(),
+                    created: now_ms,
+                    partition_keys: Vec::new(),
+                },
+            )
+            .map_err(ApplyError::storage)?;
+        } else {
+            add_dataset_columns_tx(tx, &dataset_id, &columns).map_err(ApplyError::storage)?;
+        }
+        backfill_source_dataset_from_committed_pg(
+            tx,
+            &mapper,
+            &dataset_id,
+            &kind,
+            &historical_jsons,
+        )?;
+        let rows = prepared_dataset_rows(&prepared.records, &kind)?;
+        if !rows.is_empty() {
+            let (from, to) =
+                append_dataset_rows_tx(tx, &dataset_id, &rows).map_err(ApplyError::storage)?;
+            if row_from == 0 {
+                row_from = from;
+            }
+            row_to = row_to.max(to);
+        }
+    }
+    tx.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET dataset_landed = TRUE
+         WHERE binding_id = $1 AND status = 'COMMITTED' AND COALESCE(dataset_landed, FALSE) = FALSE",
+        &[&prepared.binding_id],
+    )?;
+    tx.execute(
+        "UPDATE sekai_source_batch_transactions
+         SET dataset_landed = TRUE, dataset_row_from = $1, dataset_row_to = $2
+         WHERE transaction_id = $3 AND status = 'OPEN'",
+        &[&row_from, &row_to, &prepared.transaction_id],
+    )?;
+    Ok(())
+}
+
+fn transaction_dataset_landed(
+    client: &mut impl GenericClient,
+    transaction_id: &str,
+) -> Result<bool, ApplyError> {
+    Ok(client
+        .query_opt(
+            "SELECT COALESCE(dataset_landed, FALSE) FROM sekai_source_batch_transactions
+             WHERE transaction_id = $1",
+            &[&transaction_id],
+        )
+        .map_err(ApplyError::storage)?
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false))
+}
+
+fn unlanded_committed_source_batch_jsons_pg(
+    tx: &mut postgres::Transaction<'_>,
+    binding_id: &str,
+) -> Result<Vec<String>, ApplyError> {
+    let rows = tx
+        .query(
+            "SELECT current_cursor, proposed_next_cursor, batch_json
+             FROM sekai_source_batch_transactions
+             WHERE binding_id=$1 AND status='COMMITTED' AND COALESCE(dataset_landed, FALSE) = FALSE
+             ORDER BY COALESCE(closed_at_ms, opened_at_ms) ASC, transaction_id ASC",
+            &[&binding_id],
+        )
+        .map_err(ApplyError::storage)?
+        .into_iter()
+        .map(|row| crate::db::object_sync::CommittedSourceBatchRow {
+            current_cursor: row.get(0),
+            proposed_next_cursor: row.get(1),
+            batch_json: row.get(2),
+        })
+        .collect();
+    Ok(crate::db::object_sync::order_committed_source_batch_jsons(
+        rows,
+    ))
+}
+
+fn backfill_source_dataset_from_committed_pg(
+    tx: &mut postgres::Transaction<'_>,
+    mapper: &SourceBatchMapper,
+    dataset_id: &str,
+    kind: &str,
+    jsons: &[String],
+) -> Result<(), ApplyError> {
+    use crate::db::postgres_dataset::{add_dataset_columns_tx, append_dataset_rows_tx};
+
+    let (columns, rows) = committed_source_dataset_backfill(mapper, jsons.iter().cloned(), kind)?;
+    if !columns.is_empty() {
+        add_dataset_columns_tx(tx, dataset_id, &columns).map_err(ApplyError::storage)?;
+    }
+    if !rows.is_empty() {
+        append_dataset_rows_tx(tx, dataset_id, &rows).map_err(ApplyError::storage)?;
+    }
+    Ok(())
+}
+
 fn abort_open_source_batch(
     client: &mut impl GenericClient,
     prepared: &PreparedBatch,
     now_ms: i64,
     error: &ApplyError,
 ) -> Result<(), ApplyError> {
-    client.execute(
+    let updated = client.execute(
         "UPDATE sekai_source_batch_transactions
          SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
-         WHERE transaction_id = $3 AND status = 'OPEN'",
+         WHERE transaction_id = $3 AND status = 'OPEN' AND COALESCE(dataset_landed, FALSE) = FALSE",
         &[&now_ms, &error.to_string(), &prepared.transaction_id],
     )?;
+    if updated == 0 && transaction_dataset_landed(client, &prepared.transaction_id)? {
+        return Err(ApplyError::denied(
+            "dataset_landed",
+            "replay the open batch to commit; abort is refused after dataset land",
+        ));
+    }
     client.execute(
         "UPDATE sekai_source_bindings SET updated_at_ms = $1 WHERE binding_id = $2",
         &[&now_ms, &prepared.binding_id],

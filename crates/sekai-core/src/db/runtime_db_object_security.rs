@@ -209,12 +209,49 @@ impl RuntimeDb {
         }
     }
 
-    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+    pub fn list_kind_objects_outside_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<crate::domain::Object>, String> {
         match self {
-            Self::Sqlite(db) => db.count_visible_index_members(namespace, kind),
-            Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.count_visible_index_members(namespace, kind))
-            }
+            Self::Sqlite(db) => db.list_kind_objects_outside_index(namespace, kind, offset, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_kind_objects_outside_index(namespace, kind, offset, limit)
+            }),
+        }
+    }
+
+    pub fn list_index_member_object_ids(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_index_member_object_ids(namespace, kind),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_index_member_object_ids(namespace, kind)
+            }),
+        }
+    }
+
+    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+        self.count_visible_index_members_matching(namespace, kind, &[])
+    }
+
+    pub fn count_visible_index_members_matching(
+        &self,
+        namespace: &str,
+        kind: &str,
+        filters: &[crate::sekai::dataset::RowFilter],
+    ) -> Result<i32, String> {
+        match self {
+            Self::Sqlite(db) => db.count_visible_index_members_matching(namespace, kind, filters),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.count_visible_index_members_matching(namespace, kind, filters)
+            }),
         }
     }
 

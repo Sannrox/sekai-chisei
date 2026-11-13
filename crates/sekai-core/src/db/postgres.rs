@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use native_tls::Certificate;
@@ -223,6 +223,7 @@ const EMBEDDING_REBUILD_CURSOR_SCHEMA: &str =
     include_str!("postgres/0155_embedding_rebuild_cursor.sql");
 const OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA: &str =
     include_str!("postgres/0156_object_type_index_property_edits.sql");
+const SOURCE_BATCH_DATASET_SCHEMA: &str = include_str!("postgres/0157_source_batch_dataset.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1125,6 +1126,12 @@ const MIGRATIONS: &[Migration] = &[
         OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        156,
+        "source_batch_dataset",
+        SOURCE_BATCH_DATASET_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -1188,6 +1195,57 @@ pub fn lock_object_type_datasource(
     .map_err(|error| error.to_string())
 }
 
+const SOURCE_INDEX_DERIVE_LOCK_SEED: i64 = 668;
+
+/// Session lock plus in-process mutex so a delayed OPEN replay cannot
+/// overwrite a later committed batch's index after land releases its txn.
+/// The lock client is opened outside the work pool so derive still has
+/// every configured slot for registration and rematerialize.
+pub(crate) struct SourceIndexDeriveGuard<'a> {
+    _local: MutexGuard<'a, ()>,
+    connection: postgres::Client,
+    key: String,
+}
+
+impl Drop for SourceIndexDeriveGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.connection.query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1, $2))",
+            &[&self.key, &SOURCE_INDEX_DERIVE_LOCK_SEED],
+        );
+    }
+}
+
+impl PostgresDb {
+    pub(crate) fn lock_source_index_derive(
+        &self,
+        namespace: &str,
+        source: &str,
+        source_instance: &str,
+    ) -> Result<SourceIndexDeriveGuard<'_>, String> {
+        let local = self
+            .source_index_derive
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = format!("{namespace}\n{source}\n{source_instance}");
+        let mut connection = self
+            .lock_config
+            .connect(self.lock_tls.clone())
+            .map_err(|error| format!("connect PostgreSQL source-index lock: {error}"))?;
+        connection
+            .query_one(
+                "SELECT pg_advisory_lock(hashtextextended($1, $2))",
+                &[&key, &SOURCE_INDEX_DERIVE_LOCK_SEED],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(SourceIndexDeriveGuard {
+            _local: local,
+            connection,
+            key,
+        })
+    }
+}
+
 pub fn lock_dataset_rows(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
@@ -1213,6 +1271,9 @@ pub struct PostgresDb {
     schema_plane: SchemaPlane,
     chisei_schema: std::sync::OnceLock<()>,
     pub search_maintenance: Mutex<()>,
+    pub(crate) source_index_derive: Mutex<()>,
+    lock_config: PostgresConfig,
+    lock_tls: MakeTlsConnector,
     /// Identity extension an enterprise assembly injects (#1613), as on
     /// SQLite; `None` on the community runtime.
     enterprise_extension: Option<std::sync::Arc<dyn crate::enterprise::EnterpriseExtension>>,
@@ -1294,6 +1355,8 @@ impl PostgresDb {
             return Err("PostgreSQL pool size must be greater than zero".into());
         }
         let config = secure_config(database_url)?;
+        let lock_config = config.clone();
+        let lock_tls = tls.clone();
         let manager = PostgresConnectionManager::new(config, tls);
         let pool = Pool::builder()
             .max_size(max_connections)
@@ -1319,6 +1382,9 @@ impl PostgresDb {
             schema_plane,
             chisei_schema: std::sync::OnceLock::new(),
             search_maintenance: Mutex::new(()),
+            source_index_derive: Mutex::new(()),
+            lock_config,
+            lock_tls,
             enterprise_extension: None,
         };
         // Refuse populated legacy tenant state before any migration runs, so

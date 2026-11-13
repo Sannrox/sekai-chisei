@@ -31,6 +31,25 @@ An out-of-process adapter follows this loop:
 5. Remove the outbox entry only when the response commits the same idempotency
    key, batch digest, and proposed cursor.
 
+An accepted batch commits mapped rows to a dataset version bound to the source
+binding (`srcds:{binding_id}:{kind}`) and derives the type through
+`RegisterObjectTypeDatasource` plus `ReindexObjectType`. Ordinary dataset RPCs
+(`QueryRows`, `AppendRows`, `CreateDataset`, `UpdateDataset`) refuse those
+ids; land and reindex use the internal dataset path. Clerk objects and
+identities still write in the land transaction so `GetObject` stays on the
+existing source-sync ids. The checkpoint advances only after index apply.
+Exact replay of an `OPEN` batch after a crash between dataset land and index
+apply does not append the rows again. Index derive and commit finalize are
+serialized per source instance so a delayed replay cannot overwrite a later
+committed batch. SQLite serializes handles in-process and processes through
+a sidecar lock next to the store; PostgreSQL uses a session advisory lock
+outside the work pool. Abort is refused after dataset land;
+replay the stored batch to commit. A mapping change plus `full_rebuild`
+rematerializes members and mapped clerk properties from those rows without
+another source read. Unmapped payload is out of scope (#2281). Existing
+bindings backfill dataset rows from stored committed `batch_json` on the next
+apply, unioning historical columns into the dataset schema and identity mapping.
+
 The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
 perform no GitHub network requests.
@@ -326,10 +345,12 @@ identical batch would, and with nothing open it is a no-op. Concurrent
 resumes commit once. `RuntimeDb::abort_open_source_batch(..., reason, ...)`
 closes an open transaction that can no longer become valid as `ABORTED`
 (`aborted_by_producer: <reason>`). The checkpoint stays where it was, and the
-binding takes a fresh batch again. Both act only for the producer that opened
-the transaction (`open_transaction_producer_mismatch` otherwise), and both
-are idempotent. They are library calls for in-process connectors and
-replacement processes, not operator endpoints.
+binding takes a fresh batch again. After dataset land, abort is refused
+(`dataset_landed`); the producer replays the stored batch to commit. Both act
+only for the producer that opened the transaction
+(`open_transaction_producer_mismatch` otherwise), and both are idempotent.
+They are library calls for in-process connectors and replacement processes,
+not operator endpoints.
 
 ## Identity and deletion
 

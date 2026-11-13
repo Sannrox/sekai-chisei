@@ -72,6 +72,7 @@ impl PostgresDb {
             )
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
+        drop(connection);
         if existing
             .as_ref()
             .is_none_or(|previous| previous.changes_hop_generation(binding))
@@ -234,7 +235,8 @@ impl PostgresDb {
             }
         }
         let status = self.object_type_index_status(namespace, kind, now_ms)?;
-        let after_id = if full_rebuild {
+        let mut full_rebuild = full_rebuild;
+        let mut after_id = if full_rebuild {
             0
         } else {
             status
@@ -242,6 +244,23 @@ impl PostgresDb {
                 .map(|status| status.last_dataset_row_id)
                 .unwrap_or(0)
         };
+        if !full_rebuild && after_id > 0 && !binding.edits_only {
+            let source_members: i64 = self
+                .connection()?
+                .query_one(
+                    "SELECT COUNT(*) FROM sekai_object_type_index_member
+                     WHERE namespace=$1 AND kind=$2 AND from_edit=FALSE",
+                    &[&namespace, &kind],
+                )
+                .map(|row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if source_members == 0 {
+                // Interrupted full rebuild deleted source members before the
+                // status cursor advanced. Incremental would skip those rows.
+                full_rebuild = true;
+                after_id = 0;
+            }
+        }
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         if full_rebuild {
             self.connection()?
@@ -256,9 +275,18 @@ impl PostgresDb {
                     &[&namespace, &kind],
                 )
                 .map_err(|error| error.to_string())?;
+            self.connection()?
+                .execute(
+                    "UPDATE sekai_object_type_index_status
+                     SET last_dataset_row_id = 0
+                     WHERE namespace=$1 AND kind=$2",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?;
         }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
+        let mut touched_source_keys = Vec::new();
         let mut last_row_id = after_id;
         self.project_log_overlays_into_edits(namespace, kind)?;
         let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
@@ -273,15 +301,17 @@ impl PostgresDb {
                     continue;
                 }
                 last_row_id = last_row_id.max(row_id);
-                let Ok(member) = member_from_row(&binding, &data) else {
+                let Ok(mut member) = member_from_row(&binding, &data) else {
                     continue;
                 };
+                self.bind_index_member_object_id(namespace, &mut member)?;
                 members.insert(member.source_key.clone(), member);
             }
         }
         let processed: BTreeMap<String, ()> =
             members.keys().cloned().map(|key| (key, ())).collect();
         for (source_key, mut member) in members {
+            touched_source_keys.push(source_key.clone());
             if let Some(edit) = edits.get(&source_key) {
                 member = overlay_member(&binding, Some(member), edit)?;
             }
@@ -307,10 +337,18 @@ impl PostgresDb {
                 continue;
             }
             let source = sources.remove(source_key);
-            let member = overlay_member(&binding, source, edit)?;
+            let mut member = overlay_member(&binding, source, edit)?;
+            self.bind_index_member_object_id(namespace, &mut member)?;
             self.force_upsert_index_member(&member)?;
             rewritten += 1;
+            touched_source_keys.push(source_key.clone());
         }
+        let rematerialize_keys = if full_rebuild {
+            None
+        } else {
+            Some(touched_source_keys.as_slice())
+        };
+        self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
         let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
         self.stamp_datasource_to_published(namespace, kind)?;
@@ -334,6 +372,185 @@ impl PostgresDb {
             quarantined: false,
             quarantine_reason: String::new(),
         })
+    }
+
+    fn bind_index_member_object_id(
+        &self,
+        namespace: &str,
+        member: &mut ObjectTypeIndexMember,
+    ) -> Result<(), String> {
+        let object_id = self
+            .connection()?
+            .query_opt(
+                "SELECT object_id FROM sekai_source_identities
+                 WHERE namespace=$1 AND source_id=$2 AND type_name=$3",
+                &[&namespace, &member.source_key, &member.kind],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0));
+        if let Some(object_id) = object_id {
+            member.object_id = object_id;
+        }
+        Ok(())
+    }
+
+    fn rematerialize_source_objects_from_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        now_ms: i64,
+        source_keys: Option<&[String]>,
+    ) -> Result<(), String> {
+        if source_keys.is_some_and(|keys| keys.is_empty()) {
+            return Ok(());
+        }
+        let source_ids: Vec<String> = if let Some(keys) = source_keys {
+            keys.to_vec()
+        } else {
+            self.connection()?
+                .query(
+                    "SELECT source_key FROM sekai_object_type_index_member
+                     WHERE namespace = $1 AND kind = $2",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        for source_id in source_ids {
+            let mut connection = self.connection()?;
+            let mut tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let Some(locked_object_id) = tx
+                .query_opt(
+                    "SELECT object_id FROM sekai_source_identities
+                     WHERE namespace=$1 AND source_id=$2 AND type_name=$3",
+                    &[&namespace, &source_id, &kind],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| row.get::<_, String>(0))
+            else {
+                continue;
+            };
+            crate::db::postgres_audit::lock_object_lifecycle(&mut tx, &locked_object_id)?;
+            let Some(identity) = tx
+                .query_opt(
+                    "SELECT binding_id, type_digest, type_name, object_id, source_version,
+                            payload_digest, tombstoned, synced_object_json, lineage_json,
+                            last_transaction_id, updated_at_ms
+                     FROM sekai_source_identities
+                     WHERE namespace=$1 AND source_id=$2 AND type_name=$3 FOR UPDATE",
+                    &[&namespace, &source_id, &kind],
+                )
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let binding_id: String = identity.get(0);
+            let type_digest: String = identity.get(1);
+            let type_name: String = identity.get(2);
+            let object_id: String = identity.get(3);
+            let source_version: String = identity.get(4);
+            let payload_digest: String = identity.get(5);
+            let tombstoned: bool = identity.get(6);
+            let synced_object_json: String = identity.get(7);
+            let lineage_json: String = identity.get(8);
+            let last_transaction_id: String = identity.get(9);
+            let identity_updated_at_ms: i64 = identity.get(10);
+            if object_id != locked_object_id {
+                continue;
+            }
+            let Some(member_row) = tx
+                .query_opt(
+                    "SELECT properties, hidden FROM sekai_object_type_index_member
+                     WHERE namespace=$1 AND kind=$2 AND source_key=$3",
+                    &[&namespace, &kind, &source_id],
+                )
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let member_properties: String = member_row.get(0);
+            let hidden: bool = member_row.get(1);
+            let mapped: BTreeMap<String, String> =
+                serde_json::from_str(&member_properties).map_err(|error| error.to_string())?;
+            let Some(existing) = tx
+                .query_opt(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id=$1 FOR UPDATE",
+                    &[&object_id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(crate::db::postgres_audit::row_to_object)
+                .transpose()?
+            else {
+                continue;
+            };
+            if existing.kind != kind {
+                continue;
+            }
+            let mut object = existing.clone();
+            object.properties = crate::db::source_batch_dataset::merge_mapped_properties(
+                &existing.properties,
+                &mapped,
+                hidden,
+                crate::db::object_sync::RESERVED_SYNC_PROPERTIES,
+            );
+            if let Some(policy) = super::postgres_object_security::load_active_policy_postgres(
+                &mut tx, namespace, kind,
+            )? {
+                policy.coerce_granted_mutation(&existing, &mut object);
+            }
+            let properties_json = crate::domain::storage_properties_json(&object.properties)?;
+            object.updated = now_ms;
+            let changes = crate::sekai::audit::ChangeAttribution::source(&last_transaction_id)
+                .stamp(crate::sekai::audit::object_diff_changes(
+                    "",
+                    Some(&existing),
+                    Some(&object),
+                    now_ms,
+                ));
+            if !changes.is_empty() {
+                crate::db::postgres_audit::insert_changes(&mut tx, &changes)?;
+            }
+            tx.execute(
+                "DELETE FROM sekai_source_identities WHERE namespace=$1 AND source_id=$2",
+                &[&namespace, &source_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE sekai_objects SET properties=$1, updated=$2 WHERE id=$3",
+                &[&properties_json, &now_ms, &object_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_source_identities (
+                    namespace, source_id, binding_id, type_digest, type_name, object_id,
+                    source_version, payload_digest, tombstoned, synced_object_json,
+                    lineage_json, last_transaction_id, updated_at_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                &[
+                    &namespace,
+                    &source_id,
+                    &binding_id,
+                    &type_digest,
+                    &type_name,
+                    &object_id,
+                    &source_version,
+                    &payload_digest,
+                    &tombstoned,
+                    &synced_object_json,
+                    &lineage_json,
+                    &last_transaction_id,
+                    &identity_updated_at_ms,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn object_type_index_status(
@@ -451,13 +668,75 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+    pub fn list_kind_objects_outside_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        let offset = i64::from(offset.max(0));
+        let limit = i64::from(limit.max(0));
         self.connection()?
-            .query_one(
-                "SELECT COUNT(*)::INT FROM sekai_object_type_index_member
-                 WHERE namespace=$1 AND kind=$2 AND hidden=FALSE",
+            .query(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects o
+                 WHERE o.namespace = $1 AND o.kind = $2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM sekai_object_type_index_member m
+                     WHERE m.namespace = o.namespace AND m.kind = o.kind AND m.object_id = o.id
+                   )
+                 ORDER BY o.id
+                 LIMIT $3 OFFSET $4",
+                &[&namespace, &kind, &limit, &offset],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(crate::db::postgres_audit::row_to_object)
+            .collect()
+    }
+
+    pub fn list_index_member_object_ids(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<String>, String> {
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT object_id FROM sekai_object_type_index_member
+                 WHERE namespace=$1 AND kind=$2",
                 &[&namespace, &kind],
             )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    }
+
+    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+        self.count_visible_index_members_matching(namespace, kind, &[])
+    }
+
+    pub fn count_visible_index_members_matching(
+        &self,
+        namespace: &str,
+        kind: &str,
+        filters: &[crate::sekai::dataset::RowFilter],
+    ) -> Result<i32, String> {
+        let dialect = crate::sekai::object_type_index::IndexSqlDialect::Postgres;
+        let (filter_sql, filter_values) =
+            crate::sekai::object_type_index::member_filter_sql(dialect, filters)?;
+        let sql = format!(
+            "SELECT COUNT(*)::INT FROM sekai_object_type_index_member
+             WHERE namespace=$1 AND kind=$2 AND hidden=FALSE{filter_sql}"
+        );
+        let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&namespace, &kind];
+        for value in &filter_values {
+            params.push(value);
+        }
+        self.connection()?
+            .query_one(&sql, params.as_slice())
             .map(|row| row.get(0))
             .map_err(|error| error.to_string())
     }
@@ -565,15 +844,15 @@ impl PostgresDb {
         let existing = self
             .connection()?
             .query_opt(
-                "SELECT content_hash FROM sekai_object_type_index_member
+                "SELECT object_id, content_hash FROM sekai_object_type_index_member
                  WHERE namespace=$1 AND kind=$2 AND source_key=$3",
                 &[&member.namespace, &member.kind, &member.source_key],
             )
             .map_err(|error| error.to_string())?;
-        if existing
-            .as_ref()
-            .is_some_and(|row| row.get::<_, String>(0) == member.content_hash)
-        {
+        if existing.as_ref().is_some_and(|row| {
+            row.get::<_, String>(0) == member.object_id
+                && row.get::<_, String>(1) == member.content_hash
+        }) {
             return Ok(false);
         }
         self.force_upsert_index_member(member)?;

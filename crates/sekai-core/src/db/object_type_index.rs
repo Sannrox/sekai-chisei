@@ -5,7 +5,7 @@ use crate::sekai::object_type_index::{
     ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
     mapping_renames, member_from_row, overlay_member, parse_property_edit_times, schema_drift,
 };
-use rusqlite::params;
+use rusqlite::{TransactionBehavior, params};
 use std::collections::{BTreeMap, HashMap};
 
 impl SekaiDb {
@@ -377,7 +377,8 @@ impl SekaiDb {
             }
         }
         let status = self.object_type_index_status(namespace, kind, now_ms)?;
-        let after_id = if full_rebuild {
+        let mut full_rebuild = full_rebuild;
+        let mut after_id = if full_rebuild {
             0
         } else {
             status
@@ -385,6 +386,23 @@ impl SekaiDb {
                 .map(|status| status.last_dataset_row_id)
                 .unwrap_or(0)
         };
+        if !full_rebuild && after_id > 0 && !binding.edits_only {
+            let source_members: i64 = self
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sekai_object_type_index_member
+                     WHERE namespace = ?1 AND kind = ?2 AND from_edit = 0",
+                    params![namespace, kind],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if source_members == 0 {
+                // Interrupted full rebuild deleted source members before the
+                // status cursor advanced. Incremental would skip those rows.
+                full_rebuild = true;
+                after_id = 0;
+            }
+        }
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         if full_rebuild {
             self.conn()
@@ -399,9 +417,20 @@ impl SekaiDb {
                     params![namespace, kind],
                 )
                 .map_err(|error| error.to_string())?;
+            // Cursor 0 before recreate: a crash that left some members cannot
+            // resume from the previous high-water mark and skip deleted rows.
+            self.conn()
+                .execute(
+                    "UPDATE sekai_object_type_index_status
+                     SET last_dataset_row_id = 0
+                     WHERE namespace = ?1 AND kind = ?2",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
         }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
+        let mut touched_source_keys = Vec::new();
         let mut last_row_id = after_id;
         self.project_log_overlays_into_edits(namespace, kind)?;
         let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
@@ -417,15 +446,17 @@ impl SekaiDb {
                     continue;
                 }
                 last_row_id = last_row_id.max(row_id);
-                let Ok(member) = member_from_row(&binding, &data) else {
+                let Ok(mut member) = member_from_row(&binding, &data) else {
                     continue;
                 };
+                self.bind_index_member_object_id(namespace, &mut member)?;
                 members.insert(member.source_key.clone(), member);
             }
         }
         let processed: BTreeMap<String, ()> =
             members.keys().cloned().map(|key| (key, ())).collect();
         for (source_key, mut member) in members {
+            touched_source_keys.push(source_key.clone());
             if let Some(edit) = edits.get(&source_key) {
                 member = overlay_member(&binding, Some(member), edit)?;
             }
@@ -451,9 +482,11 @@ impl SekaiDb {
                 continue;
             }
             let source = sources.remove(source_key);
-            let member = overlay_member(&binding, source, edit)?;
+            let mut member = overlay_member(&binding, source, edit)?;
+            self.bind_index_member_object_id(namespace, &mut member)?;
             self.force_upsert_index_member(&member)?;
             rewritten += 1;
+            touched_source_keys.push(source_key.clone());
         }
         if !commit_joins {
             return Ok(ReindexReport {
@@ -463,6 +496,12 @@ impl SekaiDb {
                 quarantine_reason: String::new(),
             });
         }
+        let rematerialize_keys = if full_rebuild {
+            None
+        } else {
+            Some(touched_source_keys.as_slice())
+        };
+        self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
         let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
         self.stamp_datasource_to_published(namespace, kind)?;
@@ -480,6 +519,191 @@ impl SekaiDb {
             quarantined: false,
             quarantine_reason: String::new(),
         })
+    }
+
+    fn bind_index_member_object_id(
+        &self,
+        namespace: &str,
+        member: &mut ObjectTypeIndexMember,
+    ) -> Result<(), String> {
+        let object_id = self
+            .conn()
+            .query_row(
+                "SELECT object_id FROM sekai_source_identities
+                 WHERE namespace=?1 AND source_id=?2 AND type_name=?3",
+                params![namespace, member.source_key, member.kind],
+                |row| row.get::<_, String>(0),
+            )
+            .optional_row()
+            .map_err(|error| error.to_string())?;
+        if let Some(object_id) = object_id {
+            member.object_id = object_id;
+        }
+        Ok(())
+    }
+
+    fn rematerialize_source_objects_from_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        now_ms: i64,
+        source_keys: Option<&[String]>,
+    ) -> Result<(), String> {
+        if source_keys.is_some_and(|keys| keys.is_empty()) {
+            return Ok(());
+        }
+        let source_ids: Vec<String> = if let Some(keys) = source_keys {
+            keys.to_vec()
+        } else {
+            let conn = self.conn();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT source_key FROM sekai_object_type_index_member
+                     WHERE namespace = ?1 AND kind = ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            let mapped = stmt
+                .query_map(params![namespace, kind], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for source_id in source_ids {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let Some((
+                binding_id,
+                type_digest,
+                type_name,
+                object_id,
+                source_version,
+                payload_digest,
+                tombstoned,
+                synced_object_json,
+                lineage_json,
+                last_transaction_id,
+                identity_updated_at_ms,
+            )) = tx
+                .query_row(
+                    "SELECT binding_id, type_digest, type_name, object_id, source_version,
+                            payload_digest, tombstoned, synced_object_json, lineage_json,
+                            last_transaction_id, updated_at_ms
+                     FROM sekai_source_identities
+                     WHERE namespace=?1 AND source_id=?2 AND type_name=?3",
+                    params![namespace, source_id, kind],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, String>(9)?,
+                            row.get::<_, i64>(10)?,
+                        ))
+                    },
+                )
+                .optional_row()
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let Some((member_properties, hidden)) = tx
+                .query_row(
+                    "SELECT properties, hidden FROM sekai_object_type_index_member
+                     WHERE namespace=?1 AND kind=?2 AND source_key=?3",
+                    params![namespace, kind, source_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional_row()
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let mapped: BTreeMap<String, String> =
+                serde_json::from_str(&member_properties).map_err(|error| error.to_string())?;
+            let Some(existing) = tx
+                .query_row(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id=?1",
+                    params![object_id],
+                    crate::db::sekai::row_to_object,
+                )
+                .optional_row()
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if existing.kind != kind {
+                continue;
+            }
+            let mut object = existing.clone();
+            object.properties = crate::db::source_batch_dataset::merge_mapped_properties(
+                &existing.properties,
+                &mapped,
+                hidden != 0,
+                crate::db::object_sync::RESERVED_SYNC_PROPERTIES,
+            );
+            if let Some(policy) =
+                crate::db::object_security::load_active_policy_sqlite(&tx, namespace, kind)?
+            {
+                policy.coerce_granted_mutation(&existing, &mut object);
+            }
+            let properties_json = crate::domain::storage_properties_json(&object.properties)?;
+            object.updated = now_ms;
+            let changes = crate::sekai::audit::ChangeAttribution::source(&last_transaction_id)
+                .stamp(crate::sekai::audit::object_diff_changes(
+                    "",
+                    Some(&existing),
+                    Some(&object),
+                    now_ms,
+                ));
+            if !changes.is_empty() {
+                crate::sekai::audit::insert_object_changes(&tx, &changes)?;
+            }
+            tx.execute(
+                "DELETE FROM sekai_source_identities WHERE namespace=?1 AND source_id=?2",
+                params![namespace, source_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "UPDATE sekai_objects SET properties=?1, updated=?2 WHERE id=?3",
+                params![properties_json, now_ms, object_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO sekai_source_identities (
+                    namespace, source_id, binding_id, type_digest, type_name, object_id,
+                    source_version, payload_digest, tombstoned, synced_object_json,
+                    lineage_json, last_transaction_id, updated_at_ms
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    namespace,
+                    source_id,
+                    binding_id,
+                    type_digest,
+                    type_name,
+                    object_id,
+                    source_version,
+                    payload_digest,
+                    tombstoned,
+                    synced_object_json,
+                    lineage_json,
+                    last_transaction_id,
+                    identity_updated_at_ms
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn object_type_index_status(
@@ -610,14 +834,82 @@ impl SekaiDb {
         Ok(out)
     }
 
-    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
-        self.conn()
-            .query_row(
-                "SELECT COUNT(*) FROM sekai_object_type_index_member
-                 WHERE namespace = ?1 AND kind = ?2 AND hidden = 0",
-                params![namespace, kind],
-                |row| row.get(0),
+    pub fn list_kind_objects_outside_index(
+        &self,
+        namespace: &str,
+        kind: &str,
+        offset: i32,
+        limit: i32,
+    ) -> Result<Vec<crate::domain::Object>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                 FROM sekai_objects o
+                 WHERE o.namespace = ?1 AND o.kind = ?2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM sekai_object_type_index_member m
+                     WHERE m.namespace = o.namespace AND m.kind = o.kind AND m.object_id = o.id
+                   )
+                 ORDER BY o.id
+                 LIMIT ?3 OFFSET ?4",
             )
+            .map_err(|error| error.to_string())?;
+        let mapped = stmt
+            .query_map(
+                params![namespace, kind, limit.max(0), offset.max(0)],
+                crate::db::sekai::row_to_object,
+            )
+            .map_err(|error| error.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_index_member_object_ids(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT object_id FROM sekai_object_type_index_member
+                 WHERE namespace = ?1 AND kind = ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let mapped = stmt
+            .query_map(params![namespace, kind], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        mapped
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn count_visible_index_members(&self, namespace: &str, kind: &str) -> Result<i32, String> {
+        self.count_visible_index_members_matching(namespace, kind, &[])
+    }
+
+    pub fn count_visible_index_members_matching(
+        &self,
+        namespace: &str,
+        kind: &str,
+        filters: &[crate::sekai::dataset::RowFilter],
+    ) -> Result<i32, String> {
+        let dialect = crate::sekai::object_type_index::IndexSqlDialect::Sqlite;
+        let (filter_sql, filter_values) =
+            crate::sekai::object_type_index::member_filter_sql(dialect, filters)?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM sekai_object_type_index_member
+             WHERE namespace = ?1 AND kind = ?2 AND hidden = 0{filter_sql}"
+        );
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind];
+        for value in &filter_values {
+            params.push(value);
+        }
+        stmt.query_row(params.as_slice(), |row| row.get(0))
             .map_err(|error| error.to_string())
     }
 
@@ -729,17 +1021,19 @@ impl SekaiDb {
     }
 
     fn upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<bool, String> {
-        let existing: Option<String> = self
+        let existing: Option<(String, String)> = self
             .conn()
             .query_row(
-                "SELECT content_hash FROM sekai_object_type_index_member
+                "SELECT object_id, content_hash FROM sekai_object_type_index_member
                  WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
                 params![member.namespace, member.kind, member.source_key],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional_row()
             .map_err(|error| error.to_string())?;
-        if existing.as_deref() == Some(member.content_hash.as_str()) {
+        if existing.as_ref().is_some_and(|(object_id, content_hash)| {
+            object_id == &member.object_id && content_hash == &member.content_hash
+        }) {
             return Ok(false);
         }
         self.force_upsert_index_member(member)?;
@@ -1246,6 +1540,19 @@ mod tests {
         assert_eq!(first.rewritten_keys, 2);
         assert_eq!(
             db.count_visible_index_members("sales", "Customer").unwrap(),
+            1
+        );
+        assert_eq!(
+            db.count_visible_index_members_matching(
+                "sales",
+                "Customer",
+                &[RowFilter {
+                    column: "region".into(),
+                    op: "eq".into(),
+                    value: "eu".into(),
+                }],
+            )
+            .unwrap(),
             1
         );
         let visible = db

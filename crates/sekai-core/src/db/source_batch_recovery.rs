@@ -61,15 +61,35 @@ impl SekaiDb {
         reason: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
-        self.conn()
-            .execute(
-                "UPDATE sekai_source_batch_transactions
-                 SET status = 'ABORTED', outcome = 'denial', closed_at_ms = ?1, reason = ?2
-                 WHERE transaction_id = ?3 AND status = 'OPEN'",
-                rusqlite::params![now_ms, reason, transaction_id],
+        use rusqlite::OptionalExtension;
+
+        let conn = self.conn();
+        let row: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT status, COALESCE(dataset_landed, 0)
+                 FROM sekai_source_batch_transactions WHERE transaction_id = ?1",
+                rusqlite::params![transaction_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map(|updated| updated == 1)
-            .map_err(|error| error.to_string())
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((status, landed)) = row else {
+            return Ok(false);
+        };
+        if status != "OPEN" {
+            return Ok(false);
+        }
+        if landed != 0 {
+            return Err(DATASET_LANDED_ABORT.into());
+        }
+        conn.execute(
+            "UPDATE sekai_source_batch_transactions
+             SET status = 'ABORTED', outcome = 'denial', closed_at_ms = ?1, reason = ?2
+             WHERE transaction_id = ?3 AND status = 'OPEN' AND COALESCE(dataset_landed, 0) = 0",
+            rusqlite::params![now_ms, reason, transaction_id],
+        )
+        .map(|updated| updated == 1)
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -100,11 +120,31 @@ impl PostgresDb {
         reason: &str,
         now_ms: i64,
     ) -> Result<bool, String> {
-        self.connection()?
+        let mut connection = self.connection()?;
+        let row = connection
+            .query_opt(
+                "SELECT status, COALESCE(dataset_landed, FALSE)
+                 FROM sekai_source_batch_transactions WHERE transaction_id = $1",
+                &[&transaction_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let status: String = row.get(0);
+        let landed: bool = row.get(1);
+        if status != "OPEN" {
+            return Ok(false);
+        }
+        if landed {
+            return Err(DATASET_LANDED_ABORT.into());
+        }
+        connection
             .execute(
                 "UPDATE sekai_source_batch_transactions
                  SET status = 'ABORTED', outcome = 'denial', closed_at_ms = $1, reason = $2
-                 WHERE transaction_id = $3 AND status = 'OPEN'",
+                 WHERE transaction_id = $3 AND status = 'OPEN'
+                   AND COALESCE(dataset_landed, FALSE) = FALSE",
                 &[&now_ms, &reason, &transaction_id],
             )
             .map(|updated| updated == 1)
@@ -115,6 +155,9 @@ impl PostgresDb {
 /// The open transaction belongs to another producer.
 pub const PRODUCER_MISMATCH: &str =
     "open_transaction_producer_mismatch: the open batch belongs to another producer";
+/// Landed OPEN batches must replay to commit; abort would drop dataset rows.
+pub const DATASET_LANDED_ABORT: &str =
+    "dataset_landed: replay the open batch to commit; abort is refused after dataset land";
 const MAX_ABORT_REASON: usize = 1024;
 
 impl RuntimeDb {
@@ -158,7 +201,8 @@ impl RuntimeDb {
     /// Aborts the binding's open transaction with `reason`, for a batch that
     /// can no longer become valid; the checkpoint stays where it was. True
     /// when this call aborted it; false when there was nothing open (or a
-    /// concurrent call closed it first).
+    /// concurrent call closed it first). Refuses after dataset land: those
+    /// batches replay to commit.
     pub fn abort_open_source_batch(
         &self,
         namespace: &str,
