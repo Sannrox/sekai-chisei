@@ -597,6 +597,37 @@ impl RuntimeDb {
         }
     }
 
+    /// Open (`pending` or `claimed`) effects of `kind`, oldest first.
+    pub fn list_open_effects_page(
+        &self,
+        namespace: &str,
+        kind: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<crate::sekai::action_effect::ActionEffect>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_open_effects_page(namespace, kind, limit, cursor),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_open_effects_page(namespace, kind, limit, cursor)
+            }),
+        }
+    }
+
+    /// Reads `effect_id` and lets `decide` change it in one transaction;
+    /// written when `decide` returns `Ok(true)`. `None` for no such effect.
+    pub fn update_action_effect_with<E: From<String>>(
+        &self,
+        effect_id: &str,
+        decide: impl FnOnce(&mut crate::sekai::action_effect::ActionEffect) -> Result<bool, E>,
+    ) -> Result<Option<crate::sekai::action_effect::ActionEffect>, E> {
+        match self {
+            Self::Sqlite(db) => db.update_action_effect_with(effect_id, decide),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.update_action_effect_with(effect_id, decide))
+            }
+        }
+    }
+
     pub fn list_claimable_action_work(
         &self,
         namespace: &str,

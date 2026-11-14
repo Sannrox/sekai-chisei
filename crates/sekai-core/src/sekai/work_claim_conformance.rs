@@ -2,7 +2,9 @@
 //! (ADR 0149): claim, heartbeat, expiry, reclaim under a higher generation,
 //! a stale token refused on write-back, and failure after the lease-expiry
 //! limit. Each kind is driven through its own store entry points.
-//! Export delivery has no lease-expiry limit: retention bounds it.
+//! Export delivery has no lease-expiry limit: retention bounds it, and an
+//! external effect needs none, since a reclaim cannot redeem its permit
+//! again.
 //! Source sync fails the due bucket at the limit.
 
 use std::collections::{BTreeMap, HashMap};
@@ -13,6 +15,7 @@ use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
 use crate::sekai::data_export::export_receipt;
 use crate::sekai::dataset::{ColumnDef, Dataset};
 use crate::sekai::export_delivery::{self, DeliveryError};
+use crate::sekai::external_effect::{self, EffectError, EffectOutcome};
 use crate::sekai::governed_transform::{
     CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, STALE_TRANSFORM_CLAIM,
     TRANSFORM_WORK_FAILED, WriteTransformRunCommand,
@@ -117,6 +120,24 @@ impl Subject<'_> {
                 Err(SyncError::Claim(ClaimError::Held | ClaimError::LeaseLimit)) => None,
                 Err(error) => panic!("source sync claim failed: {error}"),
             },
+            WorkKind::ExternalEffect => match external_effect::claim(
+                self.db,
+                &self.namespace,
+                &self.id,
+                owner,
+                "op",
+                &source_labels(),
+                TTL_MS,
+                now_ms,
+            ) {
+                Ok(work) => Some(Held {
+                    owner: work.effect.claim_owner,
+                    generation: i64::try_from(work.effect.claim_generation).unwrap(),
+                    token: work.effect.claim_fencing_token,
+                }),
+                Err(EffectError::Claim(ClaimError::Held)) => None,
+                Err(error) => panic!("external effect claim failed: {error}"),
+            },
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -168,6 +189,16 @@ impl Subject<'_> {
                 &self.namespace,
                 &self.id,
                 held.fence(),
+                TTL_MS,
+                now_ms,
+            )
+            .is_ok(),
+            WorkKind::ExternalEffect => external_effect::heartbeat(
+                self.db,
+                &self.namespace,
+                &self.id,
+                held.fence(),
+                &source_labels(),
                 TTL_MS,
                 now_ms,
             )
@@ -253,6 +284,19 @@ impl Subject<'_> {
                 .unwrap_err()
                     == SyncError::Claim(ClaimError::FenceLost)
             }
+            WorkKind::ExternalEffect => {
+                external_effect::acknowledge(
+                    self.db,
+                    &self.namespace,
+                    &self.id,
+                    held.fence(),
+                    EffectOutcome::Completed,
+                    "",
+                    now_ms,
+                )
+                .unwrap_err()
+                    == EffectError::Claim(ClaimError::FenceLost)
+            }
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -328,6 +372,7 @@ fn admit<'a>(db: &'a RuntimeDb, kind: WorkKind, prefix: &str) -> Subject<'a> {
             db.tick_source_syncs(&namespace, 10 * 300_000).unwrap();
             "repo".into()
         }
+        WorkKind::ExternalEffect => external_effect::tests::admit_effect(db, &namespace),
         _ => unreachable!("not a kind under test"),
     };
     Subject {
@@ -462,8 +507,8 @@ fn claim_contract(db: &RuntimeDb, kind: WorkKind, prefix: &str) {
         "{kind}: the current claim still holds"
     );
 
-    if kind == WorkKind::ExportDelivery {
-        // No lease-expiry limit: retention bounds the reclaims.
+    if matches!(kind, WorkKind::ExportDelivery | WorkKind::ExternalEffect) {
+        // No lease-expiry limit.
         let third = work
             .claim("c", 5_000)
             .expect("a second lapse is reclaimable");
@@ -524,6 +569,11 @@ fn sqlite_source_sync_claim_conformance() {
 }
 
 #[test]
+fn sqlite_external_effect_claim_conformance() {
+    claim_contract(&RuntimeDb::memory(), WorkKind::ExternalEffect, "sqlite");
+}
+
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
 fn postgres_transform_claim_conformance() {
     claim_contract(
@@ -569,6 +619,16 @@ fn postgres_source_sync_claim_conformance() {
     claim_contract(
         &postgres(),
         WorkKind::SourceSync,
+        &format!("pg{}", std::process::id()),
+    );
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_external_effect_claim_conformance() {
+    claim_contract(
+        &postgres(),
+        WorkKind::ExternalEffect,
         &format!("pg{}", std::process::id()),
     );
 }

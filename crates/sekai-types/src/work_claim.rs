@@ -20,15 +20,19 @@ pub enum WorkKind {
     ExportDelivery,
     /// A Source's due sync bucket (ADR 0148).
     SourceSync,
+    /// An admitted `external_mutate` effect, applied through the Source
+    /// that owns its record (ADR 0148).
+    ExternalEffect,
 }
 
 impl WorkKind {
-    pub const ALL: [WorkKind; 5] = [
+    pub const ALL: [WorkKind; 6] = [
         WorkKind::Transform,
         WorkKind::Action,
         WorkKind::AgentTurn,
         WorkKind::ExportDelivery,
         WorkKind::SourceSync,
+        WorkKind::ExternalEffect,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -38,6 +42,7 @@ impl WorkKind {
             WorkKind::AgentTurn => "agent_turn",
             WorkKind::ExportDelivery => "export_delivery",
             WorkKind::SourceSync => "source_sync",
+            WorkKind::ExternalEffect => "external_effect",
         }
     }
 
@@ -278,7 +283,7 @@ mod tests {
         for kind in WorkKind::ALL {
             assert_eq!(WorkKind::from_wire_name(kind.wire_name()), Some(kind));
         }
-        assert_eq!(WorkKind::from_wire_name("external_effect"), None);
+        assert_eq!(WorkKind::from_wire_name("compensation"), None);
     }
 
     #[test]

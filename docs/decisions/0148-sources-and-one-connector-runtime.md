@@ -157,11 +157,36 @@ ways.
   delivery table, idempotent per receipt. Page reads need a registered
   type descriptor (ADR 0100) and are not built; a relational Source's
   syncs fail as `unsupported`.
-- **Not yet built.** `external_mutate` routing to a Source, GitHub
-  writeback through `apply`, and `external_effect` work and its health.
-  The Validation item for a writeback effect stays open until they land.
+- **Not yet built.** GitHub writeback through `apply` and `external_effect`
+  health. The Validation item for a writeback effect stays open until they
+  land.
 - **Unchanged.** The saved-export RPCs still refuse a tenant or machine
   caller context, as they did before this ADR.
+
+## Amendment 2026-11-14
+
+`external_effect` work (#2285) differs from the decision above in these ways.
+
+- **Routing.** An effect names no Source handle. Its object `source_id`
+  (`source:instance#external_id`) names the record, and the Source that
+  owns those `source` and `source_instance` tokens routes it. The effect is
+  claimable while that Source is active and its type supports `apply`, by a
+  runtime whose registered labels meet the Source's placement.
+- **Claims.** The claim record is the claim columns the effect row already
+  has; no table or migration is added. A live claim is never replayed, even
+  to its holder. A reclaim raises the generation and has no lease-expiry
+  limit.
+- **Single use.** The executor redeems the permit with an idempotency key
+  derived from the claim generation. A redemption the same claim retries
+  replays; a reclaimed claim finds the permit used and acknowledges
+  `outcome_unknown` instead of applying the change again. The kill switch
+  is enforced at redemption, so it stops work already claimed.
+- **Outcomes.** `completed`, `failed` and `outcome_unknown` are final for
+  the queue. Execution evidence settles an unknown outcome; the queue never
+  retries one.
+- **Disable.** Disabling or re-placing the Source ends a live claim at its
+  next heartbeat. An acknowledge needs only the live fence, so the outcome
+  of a change already applied is still recorded.
 
 ## Alternatives considered
 

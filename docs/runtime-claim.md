@@ -74,8 +74,9 @@ and does not embed credentials or provider routing.
 
 `ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim` and `AckWork` take a
 `kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`,
-`WORK_KIND_EXPORT_DELIVERY`, `WORK_KIND_SOURCE_SYNC`) and a `work_id` (the
-run, effect, turn, receipt or source id). Each call runs that kind's RPC
+`WORK_KIND_EXPORT_DELIVERY`, `WORK_KIND_SOURCE_SYNC`,
+`WORK_KIND_EXTERNAL_EFFECT`) and a `work_id` (the run, effect, turn, receipt
+or source id). Each call runs that kind's RPC
 above, with the same authorization, runtime-token binding and errors, and
 returns that RPC's response in a `oneof`. A claim taken through one family is
 heartbeated or acknowledged through the other, so a rolling deploy can mix
@@ -84,8 +85,8 @@ them. Kind options travel in the request: `AgentTurnWorkOptions` for
 `ActionAckOptions` or `AgentTurnAckOptions` on `AckWork`. Transform work has
 no `AckWork`; `WriteTransformRunResult` carries its output and acknowledges
 it. A runtime token reaches only its own kind on `HeartbeatWorkClaim` and
-`AckWork`, and transform and source-sync work stay closed to enterprise-scoped
-credentials.
+`AckWork`, and transform, source-sync and external-effect work stay closed to
+enterprise-scoped credentials.
 
 Export delivery has no claim RPCs of its own. Its claim, renewal and
 acknowledge (`ExportDeliveryAckOptions` with the digest, outcome
@@ -93,16 +94,26 @@ acknowledge (`ExportDeliveryAckOptions` with the digest, outcome
 [governed export](governed-export.md#saved-exports), runtime tokens are
 refused for it, and `sekai-client` has no per-kind fallback for it.
 
+External effects have no claim RPCs of their own either. A pending
+`external_mutate` effect is offered only to a runtime the Source that owns
+its record places (ADR 0148, amendment 2026-11-14), under what claiming
+Source sync work needs plus clearance for the Action's markings. A claim
+returns `ExternalEffectWork`: the effect with its fence, the Source, and the
+Action's parameters. A live claim is never replayed, even to its holder.
+`AckWork` takes `completed`, `failed` or `outcome_unknown`, each final.
+`ClaimActionWork` keeps refusing the effect.
+
 ## Lease rules (v1)
 
-Action work, transform work, agent turns and export deliveries share one
-claim engine
+Action work, transform work, agent turns, export deliveries, Source syncs
+and external effects share one claim engine
 (`sekai_types::work_claim`, ADR 0149): claiming, counting a lapsed lease,
 reclaiming under a higher generation, heartbeat and the fence check are the
 same code for every kind and on both stores. Each kind keeps its own row,
 token format and admission rules.
 
-- Only `runtime_dispatch` is claimable.
+- Only `runtime_dispatch` is claimable as Action work; `external_mutate` is
+  external-effect work.
 - The claim TTL defaults to 60 s and may not exceed 24 h, on SQLite and
   PostgreSQL alike.
 - Claim is exclusive while the lease is unexpired.

@@ -1375,7 +1375,7 @@ fn authorize_claimed_work_call(
 /// Work of a marked instance is claimed, renewed and acknowledged only by
 /// hosts cleared for its marking (#1706), so a revoked clearance also stops
 /// a held claim; to others the effect is missing.
-fn require_cleared_for_effect(
+pub(super) fn require_cleared_for_effect(
     service: &SekaiServiceImpl,
     principals: &[String],
     effect: &crate::sekai::action_effect::ActionEffect,

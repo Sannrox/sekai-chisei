@@ -6,7 +6,8 @@
 //! runs the saved-export delivery checks, and its deprecated list, fetch
 //! and acknowledge honor the claims taken here. Source sync has none
 //! either; it names its namespace on every call, since a Source id is only
-//! unique inside one.
+//! unique inside one. External effects (`external_effect_rpc.rs`) name it
+//! the same way.
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
@@ -20,22 +21,30 @@ impl SekaiServiceImpl {
         let kind = admitted_kind(&req, req.get_ref().kind)?;
         let (metadata, extensions, inner) = req.into_parts();
         let mismatched = || Status::invalid_argument("options do not match the work kind");
-        let (turn, source_sync, export_delivery) = match inner.options {
-            Some(list_claimable_work_request::Options::AgentTurn(turn)) => (Some(turn), None, None),
+        let (mut turn, mut source_sync, mut export_delivery, mut external_effect) =
+            (None, None, None, None);
+        match inner.options {
+            Some(list_claimable_work_request::Options::AgentTurn(options)) => turn = Some(options),
             Some(list_claimable_work_request::Options::SourceSync(options)) => {
                 if !matches!(kind, Kind::SourceSync) {
                     return Err(mismatched());
                 }
-                (None, Some(options), None)
+                source_sync = Some(options);
             }
             Some(list_claimable_work_request::Options::ExportDelivery(options)) => {
                 if !matches!(kind, Kind::ExportDelivery) {
                     return Err(mismatched());
                 }
-                (None, None, Some(options))
+                export_delivery = Some(options);
             }
-            None => (None, None, None),
-        };
+            Some(list_claimable_work_request::Options::ExternalEffect(options)) => {
+                if !matches!(kind, Kind::ExternalEffect) {
+                    return Err(mismatched());
+                }
+                external_effect = Some(options);
+            }
+            None => {}
+        }
         let payloads: Vec<claimable_work::Payload> = match kind {
             Kind::Transform => {
                 refuse_turn_options(turn)?;
@@ -114,6 +123,20 @@ impl SekaiServiceImpl {
                 )?
                 .into_iter()
                 .map(claimable_work::Payload::SourceSync)
+                .collect()
+            }
+            Kind::ExternalEffect => {
+                refuse_turn_options(turn)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                self.list_claimable_external_effects(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    inner.limit,
+                    external_effect.unwrap_or_default(),
+                )?
+                .into_iter()
+                .map(claimable_work::Payload::ExternalEffect)
                 .collect()
             }
             _ => return Err(unserved(kind)),
@@ -212,6 +235,18 @@ impl SekaiServiceImpl {
                     inner.ttl_ms,
                 )?)
             }
+            Kind::ExternalEffect => {
+                refuse_turn_options(turn)?;
+                refuse_request_id(&inner.request_id)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                claim_work_response::Payload::ExternalEffect(self.claim_external_effect(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    &inner.work_id,
+                    inner.ttl_ms,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(ClaimWorkResponse {
@@ -301,6 +336,23 @@ impl SekaiServiceImpl {
                     fence,
                     inner.ttl_ms,
                 )?)
+            }
+            Kind::ExternalEffect => {
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                heartbeat_work_claim_response::Payload::ExternalEffect(
+                    self.heartbeat_external_effect(
+                        &req,
+                        &inner.namespace,
+                        &inner.work_id,
+                        fence,
+                        inner.ttl_ms,
+                    )?,
+                )
             }
             _ => return Err(unserved(kind)),
         };
@@ -421,6 +473,25 @@ impl SekaiServiceImpl {
                     &inner.reason,
                 )?)
             }
+            Kind::ExternalEffect => {
+                if inner.options.is_some() {
+                    return Err(mismatched());
+                }
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                ack_work_response::Payload::ExternalEffect(self.ack_external_effect(
+                    &req,
+                    &inner.namespace,
+                    &inner.work_id,
+                    fence,
+                    &inner.outcome,
+                    &inner.reason,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(AckWorkResponse {
@@ -439,9 +510,10 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         Ok(WorkKind::AgentTurn) => Kind::AgentTurn,
         Ok(WorkKind::ExportDelivery) => Kind::ExportDelivery,
         Ok(WorkKind::SourceSync) => Kind::SourceSync,
+        Ok(WorkKind::ExternalEffect) => Kind::ExternalEffect,
         Ok(WorkKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument(
-                "kind must be transform, action, agent_turn, export_delivery or source_sync",
+                "kind must be transform, action, agent_turn, export_delivery, source_sync or external_effect",
             ));
         }
     };
@@ -461,7 +533,11 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         .metadata()
         .get(crate::grpc::AUTH_SOURCE_HEADER)
         .is_some_and(|source| source == "enterprise");
-    if matches!(kind, Kind::Transform | Kind::SourceSync) && enterprise_scoped {
+    if matches!(
+        kind,
+        Kind::Transform | Kind::SourceSync | Kind::ExternalEffect
+    ) && enterprise_scoped
+    {
         return Err(Status::permission_denied(
             "RPC is not available to enterprise-scoped credentials",
         ));

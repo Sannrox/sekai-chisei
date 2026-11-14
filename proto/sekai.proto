@@ -1447,6 +1447,16 @@ enum WorkKind {
   // offer it only to a runtime whose registered labels (see
   // RegisterTransformRuntime) satisfy the Source's placement.
   WORK_KIND_SOURCE_SYNC = 5;
+  // An admitted Action's pending external_mutate effect (ADR 0148). Its
+  // work_id is the effect_id; the request's namespace names the effect's
+  // namespace. The Source that owns the record the effect's source_id
+  // names routes it: listing and claiming offer it only while that Source
+  // is active and its type supports apply, to a runtime whose registered
+  // labels satisfy the Source's placement. A live claim is never replayed,
+  // even to its holder, so an executor keys permit redemption by
+  // claim_generation and acknowledges outcome_unknown when a reclaimed
+  // effect cannot redeem.
+  WORK_KIND_EXTERNAL_EFFECT = 6;
 }
 // A claimed Source sync: the Source as the claim granted it.
 message SourceSyncWork {
@@ -1466,6 +1476,13 @@ message ExportDeliveryWork {
   // Never later than the artifact's expires_at_ms.
   int64 claim_expires_at_ms = 5;
 }
+// A claimable or claimed external effect: the effect with its claim, the
+// Source that applies it, and the admitted Action's parameters.
+message ExternalEffectWork {
+  ActionEffect effect = 1;
+  ConnectorSource source = 2;
+  string parameters_json = 3;
+}
 // Options of a list or claim of agent turns.
 message AgentTurnWorkOptions {
   // When false, parked turns that would resume with a continuation are
@@ -1481,6 +1498,12 @@ message ConnectorTypeRef {
 message SourceSyncWorkOptions {
   // Lists only Sources of these types, the ones the runtime implements, so
   // Sources of other types never fill its page. Empty lists every type.
+  repeated ConnectorTypeRef connector_types = 1;
+}
+// Options of a list of external-effect work.
+message ExternalEffectWorkOptions {
+  // Lists only effects a Source of these types applies (empty means any
+  // type), so effects left to other runtimes never fill the page.
   repeated ConnectorTypeRef connector_types = 1;
 }
 // Options of a list of export-delivery work.
@@ -1501,6 +1524,7 @@ message ListClaimableWorkRequest {
     AgentTurnWorkOptions agent_turn = 10;
     SourceSyncWorkOptions source_sync = 11;
     ExportDeliveryWorkOptions export_delivery = 12;
+    ExternalEffectWorkOptions external_effect = 13;
   }
 }
 // One claimable item; the set field names its kind.
@@ -1511,6 +1535,7 @@ message ClaimableWork {
     AgentTurn agent_turn = 3;
     DeliverableExportArtifact export_delivery = 4;
     ConnectorSource source_sync = 5;
+    ExternalEffectWork external_effect = 6;
   }
 }
 message ListClaimableWorkResponse {
@@ -1539,6 +1564,7 @@ message ClaimWorkResponse {
     ClaimAgentTurnResponse agent_turn = 3;
     ExportDeliveryWork export_delivery = 4;
     SourceSyncWork source_sync = 5;
+    ExternalEffectWork external_effect = 6;
   }
 }
 message HeartbeatWorkClaimRequest {
@@ -1549,7 +1575,7 @@ message HeartbeatWorkClaimRequest {
   int64 claim_generation = 4;
   string fencing_token = 5;
   int64 ttl_ms = 6;
-  // Source sync: the Source's namespace.
+  // Source sync and external effects: the work's namespace.
   string namespace = 7;
 }
 message HeartbeatWorkClaimResponse {
@@ -1559,6 +1585,7 @@ message HeartbeatWorkClaimResponse {
     HeartbeatAgentTurnClaimResponse agent_turn = 3;
     ExportDeliveryWork export_delivery = 4;
     SourceSyncWork source_sync = 5;
+    ExternalEffectWork external_effect = 6;
   }
 }
 // Action-work fields of an acknowledge; see AckActionWorkRequest.
@@ -1593,10 +1620,12 @@ message AckWorkRequest {
   // to lapse so the artifact is retried. Source sync takes completed,
   // or failed with the failure class as reason: unavailable, unreachable,
   // auth_failed, permission_missing, invalid or unsupported. A failed sync
-  // waits for the next interval.
+  // waits for the next interval. An external effect takes completed,
+  // failed (the change did not apply) or outcome_unknown (the executor
+  // cannot tell); each is final, and reason is at most 1 KiB.
   string outcome = 6;
   string reason = 7;
-  // Source sync: the Source's namespace.
+  // Source sync and external effects: the work's namespace.
   string namespace = 8;
   oneof options {
     ActionAckOptions action = 10;
@@ -1610,6 +1639,7 @@ message AckWorkResponse {
     AckAgentTurnResponse agent_turn = 2;
     AcknowledgeExportDeliveryResponse export_delivery = 3;
     ConnectorSource source_sync = 4;
+    ActionEffect external_effect = 5;
   }
 }
 // Experimental (#1968). Live (not forgotten) working memory of one site
@@ -3633,7 +3663,8 @@ message ActionEffect {
   string operation_id = 4;
   // runtime_dispatch | notify | external_mutate
   string kind = 5;
-  // pending | claimed | sent | failed | skipped | completed | parked
+  // pending | claimed | sent | failed | skipped | completed | parked |
+  // outcome_unknown (external_mutate only)
   string status = 6;
   string payload_json = 7;
   string failure_reason = 8;

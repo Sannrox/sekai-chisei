@@ -5,7 +5,8 @@ use crate::sekai::action_effect::{
     AckStep, ClaimStep, normalize_ttl_ms, validate_ack_outcome, validate_claim_request,
 };
 use crate::sekai::action_effect::{
-    ActionEffect, EFFECT_STATUS_PENDING, runtime_id_is_blank, validate_no_nul,
+    ActionEffect, EFFECT_STATUS_CLAIMED, EFFECT_STATUS_PENDING, runtime_id_is_blank,
+    validate_no_nul,
 };
 use crate::sekai::governed_action_type::EFFECT_KIND_RUNTIME_DISPATCH;
 use crate::sekai::parked_work::{
@@ -894,6 +895,65 @@ impl PostgresDb {
             return Err("action effect not found".into());
         }
         Ok(effect.clone())
+    }
+
+    /// Up to `limit` open effects (`pending` or `claimed`) of `kind` in
+    /// `namespace`, oldest first, after `cursor`.
+    pub fn list_open_effects_page(
+        &self,
+        namespace: &str,
+        kind: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_effects
+                 WHERE namespace = $1 AND kind = $2 AND status IN ($3, $4)
+                   AND ($5::bigint IS NULL OR (created_at_ms, effect_id) > ($5, $6))
+                 ORDER BY created_at_ms, effect_id LIMIT $7",
+                &[
+                    &namespace,
+                    &kind,
+                    &EFFECT_STATUS_PENDING,
+                    &EFFECT_STATUS_CLAIMED,
+                    &cursor.map(|key| key.0),
+                    &cursor.map(|key| key.1),
+                    &limit,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        rows.into_iter()
+            .map(|row| parse_pg_json(row.get(0), "action effect"))
+            .collect()
+    }
+
+    /// Reads `effect_id` under a row lock and lets `decide` change it in the
+    /// same transaction; written when `decide` returns `Ok(true)`.
+    pub fn update_action_effect_with<E: From<String>>(
+        &self,
+        effect_id: &str,
+        decide: impl FnOnce(&mut ActionEffect) -> Result<bool, E>,
+    ) -> Result<Option<ActionEffect>, E> {
+        let mut conn = self.connection()?;
+        let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        let row = tx
+            .query_opt(
+                "SELECT body_json FROM sekai_action_effects WHERE effect_id=$1 FOR UPDATE",
+                &[&effect_id],
+            )
+            .map_err(|error| error.to_string())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut effect: ActionEffect = parse_pg_json(row.get(0), "action effect")?;
+        if decide(&mut effect)? {
+            pg_update_effect(&mut tx, &effect)?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        Ok(Some(effect))
     }
 
     pub fn list_claimable_action_work(

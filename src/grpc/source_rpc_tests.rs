@@ -1,5 +1,5 @@
-//! `sekai.source/v1` over gRPC: the admin RPCs, and Source sync through the
-//! claimable-work family.
+//! `sekai.source/v1` over gRPC: the admin RPCs, and Source sync and
+//! external effects through the claimable-work family.
 
 use super::*;
 use crate::sekai::security::Role;
@@ -381,4 +381,113 @@ async fn a_disable_fences_the_live_sync_claim() {
         .await
         .unwrap_err();
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+}
+
+/// A pending `external_mutate` effect on a record of the `repo` Source.
+fn admit_external_effect(svc: &SekaiServiceImpl) -> String {
+    let effect = crate::sekai::action_effect::plan_effects_for_admit(
+        "instance-1",
+        NS,
+        "operation-1",
+        &["external_mutate".into()],
+        r#"{"permit_id":"permit-1","source_id":"github:acme/repo#12"}"#,
+        10,
+        false,
+    )
+    .unwrap()
+    .remove(0);
+    svc.db
+        .runtime()
+        .put_action_effects(std::slice::from_ref(&effect))
+        .unwrap();
+    effect.effect_id
+}
+
+async fn claim_effect(
+    svc: &SekaiServiceImpl,
+    principal: &str,
+) -> Result<ExternalEffectWork, Status> {
+    match svc
+        .claim_work(as_principal(
+            ClaimWorkRequest {
+                kind: WorkKind::ExternalEffect.into(),
+                ..claim_request("")
+            },
+            principal,
+        ))
+        .await?
+        .into_inner()
+        .payload
+    {
+        Some(claim_work_response::Payload::ExternalEffect(work)) => Ok(work),
+        other => panic!("an external effect claim, not {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn only_a_placed_runtime_claims_an_external_effect_and_outcome_unknown_is_final() {
+    let svc = service();
+    put(&svc, 0).await;
+    let effect_id = admit_external_effect(&svc);
+
+    // The record's Source places the work: a misplaced runtime or a reader
+    // cannot take it.
+    register(&svc, "connector-a", "us").await;
+    assert_eq!(
+        claim_effect(&svc, "root").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    register(&svc, "connector-a", "eu").await;
+    assert!(claim_effect(&svc, "reader").await.is_err());
+    let work = claim_effect(&svc, "root").await.unwrap();
+    let effect = work.effect.unwrap();
+    assert_eq!(effect.effect_id, effect_id);
+    assert_eq!(
+        (effect.status.as_str(), effect.claim_generation),
+        ("claimed", 1)
+    );
+    assert_eq!(work.source.unwrap().source_id, "repo");
+
+    // The Action-work path stays closed to the effect.
+    assert!(
+        svc.claim_action_work(as_principal(
+            ClaimActionWorkRequest {
+                effect_id: effect_id.clone(),
+                runtime_id: "connector-a".into(),
+                request_id: "r1".into(),
+                ttl_ms: 60_000,
+            },
+            "root",
+        ))
+        .await
+        .is_err()
+    );
+
+    let ack = || AckWorkRequest {
+        kind: WorkKind::ExternalEffect.into(),
+        namespace: NS.into(),
+        work_id: effect_id.clone(),
+        runtime_id: effect.claim_owner.clone(),
+        claim_generation: i64::try_from(effect.claim_generation).unwrap(),
+        fencing_token: effect.claim_fencing_token.clone(),
+        outcome: "outcome_unknown".into(),
+        reason: "permit already redeemed".into(),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let acked = svc
+            .ack_work(as_principal(ack(), "root"))
+            .await
+            .unwrap()
+            .into_inner()
+            .payload;
+        let Some(ack_work_response::Payload::ExternalEffect(acked)) = acked else {
+            panic!("an external effect acknowledge, not {acked:?}");
+        };
+        assert_eq!(acked.status, "outcome_unknown");
+    }
+    assert_eq!(
+        claim_effect(&svc, "root").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
 }

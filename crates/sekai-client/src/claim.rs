@@ -40,11 +40,11 @@ use crate::protocol::sekai::{
     ApplyStreamingTransformBatchResponse, ClaimActionWorkRequest, ClaimActionWorkResponse,
     ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
     ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, ConnectorSource,
-    ConnectorTypeRef, DeliverableExportArtifact, ExportDeliveryWorkOptions,
-    HeartbeatActionClaimRequest, HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest,
-    HeartbeatAgentTurnClaimResponse, HeartbeatTransformClaimRequest,
-    HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest, HeartbeatWorkClaimResponse,
-    ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
+    ConnectorTypeRef, DeliverableExportArtifact, ExportDeliveryWorkOptions, ExternalEffectWork,
+    ExternalEffectWorkOptions, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
+    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
+    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest,
+    HeartbeatWorkClaimResponse, ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
     ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
@@ -586,6 +586,46 @@ impl<'a> RuntimeClaimClient<'a> {
             .collect())
     }
 
+    /// Lists external-effect work a Source of one of `connector_types`
+    /// (`(name, version)` pairs) applies and this runtime may take, so
+    /// effects left to other runtimes never fill its page.
+    pub async fn list_external_effect_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<ExternalEffectWork>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::ExternalEffect.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::ExternalEffect(
+                ExternalEffectWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::ExternalEffect(work)) => Some(work),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Lists export-delivery work a Source of one of `connector_types`
     /// delivers (`(name, version)` pairs) and this runtime may take, so
     /// artifacts left to other deliverers never fill its page. A plane
@@ -691,9 +731,10 @@ impl<'a> RuntimeClaimClient<'a> {
     }
 
     /// Ends the held claim `fence` with `outcome` (`completed`, `failed` or
-    /// `parked`). Transform work is acknowledged by its write-back instead.
-    /// Agent-turn, export-delivery and source-sync acknowledges replay, so
-    /// only they retry.
+    /// `parked`; an external effect also takes `outcome_unknown`). Transform
+    /// work is acknowledged by its write-back instead. Agent-turn,
+    /// export-delivery, source-sync and external-effect acknowledges replay,
+    /// so only they retry.
     pub async fn ack_work(
         &self,
         fence: &WorkFence,
@@ -714,7 +755,10 @@ impl<'a> RuntimeClaimClient<'a> {
         };
         let retryable = matches!(
             fence.kind,
-            WorkKind::AgentTurn | WorkKind::ExportDelivery | WorkKind::SourceSync
+            WorkKind::AgentTurn
+                | WorkKind::ExportDelivery
+                | WorkKind::SourceSync
+                | WorkKind::ExternalEffect
         );
         match self.call(ACK_WORK, request.clone(), retryable).await {
             Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
@@ -792,7 +836,10 @@ impl<'a> RuntimeClaimClient<'a> {
                     .await?;
                 listed.turns.into_iter().map(Payload::AgentTurn).collect()
             }
-            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+            WorkKind::Unspecified
+            | WorkKind::ExportDelivery
+            | WorkKind::SourceSync
+            | WorkKind::ExternalEffect => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -858,7 +905,10 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+            WorkKind::Unspecified
+            | WorkKind::ExportDelivery
+            | WorkKind::SourceSync
+            | WorkKind::ExternalEffect => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -921,7 +971,10 @@ impl<'a> RuntimeClaimClient<'a> {
                 )
                 .await?,
             ),
-            WorkKind::Unspecified | WorkKind::ExportDelivery | WorkKind::SourceSync => {
+            WorkKind::Unspecified
+            | WorkKind::ExportDelivery
+            | WorkKind::SourceSync
+            | WorkKind::ExternalEffect => {
                 return Err(SdkError::invalid_argument());
             }
         })
