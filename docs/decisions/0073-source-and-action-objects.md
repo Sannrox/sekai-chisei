@@ -36,8 +36,9 @@ second object authority. It does not forbid a rebuildable derived index.
    ([ADR 0020](0020-shared-type-revisions-and-object-sync.md)). Transforms may
    write datasets or snapshots; they must not mint object identity.
 4. Generic `CreateObject`, `UpdateObject`, `DeleteObject`, and `CreateLink`
-   remain the current escape hatch. They are not the destination write model.
-   Closing them is a later change set, not this ADR.
+   remain the escape hatch for untyped kinds. For a kind with a published
+   type revision they refuse and name `SubmitActionInstance` or source
+   sync (#2277).
 5. This ADR does not pick an indexer, per-type table layout, or query engine.
    The envelope is published in
    [docs/research/876-object-index-envelope.md](../research/876-object-index-envelope.md).
@@ -58,7 +59,8 @@ second object authority. It does not forbid a rebuildable derived index.
 ## Consequences
 
 The product write paths are sync and `SubmitActionInstance`. Source-owned
-objects already reject generic mutation. A later indexer, if measured, is a
+objects already reject generic mutation. Generic object and link RPCs refuse
+when the kind has a published type revision. A later indexer, if measured, is a
 projection rebuild. Control-plane SQLite and PostgreSQL stay dual
 ([ADR 0080](0080-dual-community-runtime-storage.md)); that pair is
 independent of this meaning rule.

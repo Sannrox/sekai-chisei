@@ -179,6 +179,24 @@ fn members_of(tree: &BTreeMap<String, Vec<u8>>) -> Vec<(String, String, String)>
 async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
     let server = LoopServer::spawn(&Backend::Sqlite);
     let dir = tempfile::tempdir().unwrap();
+    // Write the object while the kind is still untyped; publish after so export
+    // can prove it omits instance data of a published type.
+    server
+        .sekai()
+        .await
+        .create_object(Request::new(CreateObjectRequest {
+            object: Some(Object {
+                id: "incident-1".into(),
+                kind: "incident".into(),
+                name: OBJECT_DATA.into(),
+                namespace: "export-a".into(),
+                properties: [("severity".to_string(), OBJECT_DATA.to_string())].into(),
+                ..Default::default()
+            }),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("object: {error}\n{}", server.logs()));
     publish(
         &server,
         "export-a",
@@ -236,22 +254,6 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
         },
     )
     .await;
-    server
-        .sekai()
-        .await
-        .create_object(Request::new(CreateObjectRequest {
-            object: Some(Object {
-                id: "incident-1".into(),
-                kind: "incident".into(),
-                name: OBJECT_DATA.into(),
-                namespace: "export-a".into(),
-                properties: [("severity".to_string(), OBJECT_DATA.to_string())].into(),
-                ..Default::default()
-            }),
-            lease_precondition: None,
-        }))
-        .await
-        .unwrap_or_else(|error| panic!("object: {error}\n{}", server.logs()));
 
     let first = export(&server, "export-a", &dir.path().join("first"));
     let again = export(&server, "export-a", &dir.path().join("again"));

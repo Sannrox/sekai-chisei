@@ -57,8 +57,9 @@ Creates and deletes use lifecycle summaries; updates record changed scalar and
 property fields. A typed object is a fact of a type revision produced by a
 registered source mapping or a versioned Action. Graph rows persist those
 facts. A derived index is a rebuildable projection, not a second object
-authority. Generic object and link RPCs remain the current escape hatch, not
-the destination write model. See
+authority. Generic object and link RPCs remain only for untyped kinds; a
+published type revision writes through `SubmitActionInstance` or source
+sync. See
 [ADR 0073](decisions/0073-source-and-action-objects.md). Evaluate is intended
 to fail-closed dual-read a tagged in-process object-log library before any
 later cutover; see

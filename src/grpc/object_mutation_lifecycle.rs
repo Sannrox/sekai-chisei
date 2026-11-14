@@ -182,6 +182,10 @@ impl SekaiServiceImpl {
                 "this kind changes only through its governed Actions",
             ));
         }
+        self.refuse_generic_write_for_published_type(
+            &domain_object.namespace,
+            &domain_object.kind,
+        )?;
         let mut domain_object = domain_object;
         if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
             require_credential_admin(&principals)?;
@@ -468,6 +472,13 @@ impl SekaiServiceImpl {
                 "reserved governance kind; use the dedicated action RPCs",
             ));
         }
+        self.refuse_generic_write_for_published_type(
+            &domain_object.namespace,
+            &domain_object.kind,
+        )?;
+        if let Some(existing) = &existing {
+            self.refuse_generic_write_for_published_type(&existing.namespace, &existing.kind)?;
+        }
         if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
             domain_object.properties.insert(
                 markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
@@ -733,6 +744,7 @@ impl SekaiServiceImpl {
                     "object cannot be deleted through the guarded object API",
                 ));
             }
+            self.refuse_generic_write_for_published_type(&existing.namespace, &existing.kind)?;
         }
         let actor = principals.first().map(String::as_str).unwrap_or_default();
         let policy_generation = expected
@@ -767,6 +779,36 @@ impl SekaiServiceImpl {
         self.schema_definitions
             .ensure_kind_loaded(kind)
             .map_err(map_schema_definition_lifecycle_error)
+    }
+
+    /// Generic object and link writes stay the escape hatch for untyped kinds
+    /// (ADR 0073). A published `object_type` member is a type revision: those
+    /// facts go through `SubmitActionInstance` or source sync.
+    pub(super) fn refuse_generic_write_for_published_type(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<(), Status> {
+        let Some(published) = self
+            .db
+            .runtime()
+            .get_published_definition_revision(namespace)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+        else {
+            return Ok(());
+        };
+        if self
+            .db
+            .runtime()
+            .get_definition_member(namespace, &published.revision_digest, "object_type", kind)
+            .map_err(|_| Status::internal("definition revision unavailable"))?
+            .is_none()
+        {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(format!(
+            "kind {kind} has a published type revision; write it through SubmitActionInstance or source sync"
+        )))
     }
 }
 

@@ -600,7 +600,7 @@ pub async fn seed_graph(target: &str, doc: &SeedDocument) -> Result<SeedReport, 
                     eprintln!("warning: object {:?} already present: {msg}", obj.id);
                 } else {
                     return Err(format!(
-                        "create object {:?}: {msg}. Hint: kind must be a loaded schema type (use domain apply ensure_kind or a builtin kind such as component).",
+                        "create object {:?}: {msg}. Hint: untyped kinds use CreateObject; a published type revision writes through SubmitActionInstance or source sync.",
                         obj.id
                     )
                     .into());

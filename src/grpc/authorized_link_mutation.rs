@@ -71,6 +71,9 @@ impl SekaiServiceImpl {
             )?;
             endpoints.push(object);
         }
+        for object in &endpoints {
+            self.refuse_generic_write_for_published_type(&object.namespace, &object.kind)?;
+        }
         if self
             .db
             .runtime()
