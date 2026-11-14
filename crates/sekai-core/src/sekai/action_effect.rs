@@ -1,8 +1,10 @@
 //! Typed ActionInstance effects (#398 / research #395).
 //!
 //! Durable children of an admitted ActionInstance. Not silent log lines.
-//! Claim, heartbeat, and ack for `runtime_dispatch` live here;
-//! `external_mutate` stays on the permit path.
+//! Claim, heartbeat, and ack for `runtime_dispatch` live here. A pending
+//! `external_mutate` effect is `external_effect` work
+//! ([`crate::sekai::external_effect`]): its claim lives in the same row, and
+//! its redemption and outcome stay on the permit path.
 
 use crate::db::sekai::SekaiDb;
 use crate::sekai::governed_action_type::{
@@ -26,6 +28,9 @@ pub const EFFECT_STATUS_COMPLETED: &str = "completed";
 pub const EFFECT_STATUS_PARKED: &str = "parked";
 pub const EFFECT_STATUS_DEAD_LETTERED: &str = "dead_lettered";
 pub const EFFECT_STATUS_SUPERSEDED: &str = "superseded";
+/// An `external_mutate` effect whose executor cannot tell whether the change
+/// applied. Never claimed again; evidence settles it.
+pub const EFFECT_STATUS_OUTCOME_UNKNOWN: &str = "outcome_unknown";
 
 pub const EFFECT_LIFECYCLE_READY: &str = "ready";
 pub const EFFECT_LIFECYCLE_CLAIMED: &str = "claimed";
@@ -393,7 +398,8 @@ impl ActionEffect {
             | EFFECT_STATUS_COMPENSATING
             | EFFECT_STATUS_PARKED
             | EFFECT_STATUS_DEAD_LETTERED
-            | EFFECT_STATUS_SUPERSEDED => {}
+            | EFFECT_STATUS_SUPERSEDED
+            | EFFECT_STATUS_OUTCOME_UNKNOWN => {}
             other => return Err(format!("invalid effect status {other:?}")),
         }
         let payload: serde_json::Value = serde_json::from_str(&self.payload_json)
@@ -491,7 +497,7 @@ impl ActionEffect {
         }
     }
 
-    fn set_claim_record(&mut self, record: ClaimRecord) {
+    pub(crate) fn set_claim_record(&mut self, record: ClaimRecord) {
         self.claim_owner = record.owner;
         self.claim_generation = u64::try_from(record.generation).unwrap_or_default();
         self.claim_fencing_token = record.fencing_token;
@@ -1418,6 +1424,95 @@ impl SekaiDb {
             return Err("action effect not found".into());
         }
         Ok(effect.clone())
+    }
+
+    /// Up to `limit` open effects (`pending` or `claimed`) of `kind` in
+    /// `namespace`, oldest first, after `cursor`. Callers decide claimability.
+    pub fn list_open_effects_page(
+        &self,
+        namespace: &str,
+        kind: &str,
+        limit: usize,
+        cursor: Option<(i64, &str)>,
+    ) -> Result<Vec<ActionEffect>, String> {
+        self.migrate_action_effects()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT body_json FROM sekai_action_effects
+                 WHERE namespace = ?1 AND kind = ?2 AND status IN (?3, ?4)
+                   AND (?5 IS NULL OR (created_at_ms, effect_id) > (?5, ?6))
+                 ORDER BY created_at_ms, effect_id LIMIT ?7",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    namespace,
+                    kind,
+                    EFFECT_STATUS_PENDING,
+                    EFFECT_STATUS_CLAIMED,
+                    cursor.map(|key| key.0),
+                    cursor.map(|key| key.1),
+                    i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let body = row.map_err(|e| e.to_string())?;
+            serde_json::from_str(&body).map_err(|e| format!("corrupt action effect body: {e}"))
+        })
+        .collect()
+    }
+
+    /// Reads `effect_id` and lets `decide` change it in one transaction. The
+    /// effect is written when `decide` returns `Ok(true)`. `None` when there
+    /// is no such effect.
+    pub fn update_action_effect_with<E: From<String>>(
+        &self,
+        effect_id: &str,
+        decide: impl FnOnce(&mut ActionEffect) -> Result<bool, E>,
+    ) -> Result<Option<ActionEffect>, E> {
+        self.migrate_action_effects()?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let body: Option<String> = tx
+            .query_row(
+                "SELECT body_json FROM sekai_action_effects WHERE effect_id = ?1",
+                params![effect_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let mut effect: ActionEffect =
+            serde_json::from_str(&body).map_err(|e| format!("corrupt action effect body: {e}"))?;
+        if decide(&mut effect)? {
+            effect.validate_for_lifecycle_update()?;
+            let body_json = serde_json::to_string(&effect).map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE sekai_action_effects
+                 SET status = ?1, payload_json = ?2, failure_reason = ?3,
+                     updated_at_ms = ?4, body_json = ?5
+                 WHERE effect_id = ?6",
+                params![
+                    effect.status,
+                    effect.payload_json,
+                    effect.failure_reason,
+                    effect.updated_at_ms,
+                    body_json,
+                    effect.effect_id,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(Some(effect))
     }
 
     /// Claimable runtime_dispatch: pending/parked, or claimed with expired lease.

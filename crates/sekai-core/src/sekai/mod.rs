@@ -42,6 +42,7 @@ pub mod dataset;
 pub mod dataset_health;
 pub mod export_delivery;
 pub mod export_fingerprint;
+pub mod external_effect;
 pub use sekai_types::dataset_branch;
 pub use sekai_types::dataset_version;
 pub use sekai_types::transform_replay;

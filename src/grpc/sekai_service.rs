@@ -75,6 +75,8 @@ use scored_knowledge_admission::{
 };
 #[path = "sekai_service_db_work.rs"]
 mod db_work;
+#[path = "external_effect_rpc.rs"]
+mod external_effect_rpc;
 #[path = "ontology_health_rpc.rs"]
 mod ontology_health_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]

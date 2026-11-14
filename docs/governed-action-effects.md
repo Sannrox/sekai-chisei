@@ -18,7 +18,7 @@ failure does not rewrite the Action instance outcome.
 | --- | --- | --- |
 | `runtime_dispatch` | `pending` / semantic `ready` | Claimable by runtime hosts; intentional park waits for governed continuation (#399, #412) |
 | `notify` | best-effort `sent` or `failed` | Failure **does not** un-admit the instance |
-| `external_mutate` | `pending` when `permit_id` is present; otherwise `skipped` | Permit-backed write-back; completion, failure, and compensation stay on the permit path |
+| `external_mutate` | `pending` when `permit_id` is present; otherwise `skipped` | `external_effect` work for the Source that owns the record named by `source_id` (ADR 0148). Its executor acknowledges `completed`, `failed`, or `outcome_unknown`; each is final, and redemption, evidence, and compensation stay on the permit path |
 
 Unknown kinds are rejected at type registry time (#396) and at materialization.
 

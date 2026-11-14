@@ -4,7 +4,8 @@
 //!
 //! Put and disable need a namespace administrator; get and list need
 //! namespace read access, under the caller's tenant context when it has one.
-//! Claiming sync work needs what claiming transform work needs, and
+//! Claiming sync work, and external-effect work (`external_effect_rpc.rs`),
+//! needs what claiming transform work needs, and
 //! placement matches the labels the runtime registered with
 //! `RegisterTransformRuntime`.
 
@@ -263,7 +264,7 @@ pub(super) async fn disable_source(
 impl SekaiServiceImpl {
     /// The caller may run sync work in `namespace`: what claiming transform
     /// work needs.
-    fn source_sync_runtime<T: std::any::Any>(
+    pub(super) fn source_sync_runtime<T: std::any::Any>(
         &self,
         req: &Request<T>,
         namespace: &str,
@@ -281,7 +282,7 @@ impl SekaiServiceImpl {
         }
     }
 
-    fn runtime_labels(
+    pub(super) fn runtime_labels(
         &self,
         namespace: &str,
         runtime_id: &str,
