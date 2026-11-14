@@ -7,7 +7,6 @@ fn removed_top_level_aliases_fail_with_their_canonical_replacement() {
         ("team", "admin access team"),
         ("gateway", "admin gateway"),
         ("action", "admin governance action"),
-        ("memory", "admin governance memory"),
         ("gunshi", "admin governance gunshi"),
         ("governed-subject", "admin governance subject"),
         ("attest", "admin assurance attest"),

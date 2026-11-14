@@ -23,24 +23,13 @@ recommend model-vs-model evidence for this v1 follow-up.
 
 The checked-in example is
 [`promotion-gate-v1.json`](../tests/fixtures/lookup_first/promotion-gate-v1.json).
-It expects the reference `acme` graph from the lookup-first fixture seed. Run
-it against a trusted local control plane after loading the corresponding graph:
-
-```bash
-# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
-sekaictl admin evaluation lookup-first-gate run \
-  tests/fixtures/lookup_first/promotion-gate-v1.json \
-  --namespace acme \
-  --target ./data/sekai.sock
-```
-
-`RunLookupFirstPromotionGate` is classified `remove` and is rejected unless
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
-
-The command exits `0` only for `allow` and exits `7` for `deny`. JSON output is
-available with `--json`. The response contains case paths, refusal reasons,
-bounded details, the suite digest, and the audit decision id; it never returns
-the lookup answer or any provider content.
+It expects the reference `acme` graph from the lookup-first fixture seed.
+There is no public RPC or `sekaictl` command for this gate. Composition
+`lookup_first::run_lookup_promotion_gate` executes the suite against
+authorized graph state and records a bounded `lookup_first.gate` audit
+decision. The report contains case paths, refusal reasons, bounded details,
+the suite digest, and the audit decision id; it never returns the lookup
+answer or any provider content.
 
 Each case declares its evaluation principal. The server requires every declared
 principal to have read access to the suite namespace, then executes that case

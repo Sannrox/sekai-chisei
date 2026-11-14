@@ -308,21 +308,6 @@ pub const RPC_HANDLER_EVIDENCE_METHODS: &[(&str, &str, &[&str])] = &[
         "RedeemExternalActionPermit",
         &["redeem_permit"],
     ),
-    (
-        "ChiseiService",
-        "IssueGunshiRecommendations",
-        &["get_gunshi_allocation_state"],
-    ),
-    (
-        "ChiseiService",
-        "SetGunshiAllocationPolicy",
-        &["put_gunshi_allocation_state_cas"],
-    ),
-    (
-        "ChiseiService",
-        "GetGunshiAllocationStatus",
-        &["get_gunshi_allocation_state"],
-    ),
 ];
 
 /// RuntimeDb methods a public RPC may hit on the community store.

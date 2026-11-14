@@ -137,9 +137,9 @@ Deep link: `/console/n/{namespace}/policy`.
   budget limit count, action policy presence, Gunshi allocation status.
 - Historical dry-run: same pure engine as [the policy dry-run design](policy-dry-run.md)
   [policy-dry-run.md](policy-dry-run.md); records `policy.dry_run` audit.
-- Promote/rollback: write principals only; explicit confirm; promote requires
-  candidate + evaluation JSON (same contract as
-  `sekaictl admin governance gunshi promote`).
+- Install baseline, promote/rollback, and auto-dispatch opt-in: write
+  principals only; explicit confirm. Install requires snapshot + gate JSON.
+  Promote requires candidate + evaluation JSON.
 - Kill switch remains on the Pressure surface; status is visible here when
   auto-dispatch policy is installed.
 

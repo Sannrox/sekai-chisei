@@ -21,10 +21,8 @@ lives in the separate [research index](research/README.md).
 - [Bounded content execution](content-execution.md) — separate native
   text/image/audio/document descriptors, transient payload verification, and
   provider capability behavior.
-- [Sample observation readback](sample-observation-readback.md) — gated
-  `GetSampleObservation` projection of internally admitted scoring samples
-  (classified `remove`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or
-  `experimental-rpcs`; no public write RPC).
+- [Sample observation recording](sample-observation-readback.md) —
+  internally admitted scoring samples; no public read or write RPC.
 - [SDK facade](../sdk/README.md) — generated-client layering and capability
   code generation.
 - [Available models](available-models.md) — enumerate the governed routable

@@ -225,9 +225,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "report" => {
             sekai_chisei::report_cli::run_report_command(args.into_iter().skip(1).collect()).await
         }
-        "memory" => {
-            sekai_chisei::memory_cli::run_memory_command(args.into_iter().skip(1).collect()).await
-        }
         "inbox" => {
             sekai_chisei::launch::load_local_env();
             sekai_chisei::inbox_cli::run_inbox_command(args.into_iter().skip(1).collect()).await
@@ -252,110 +249,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("created {}", output.display());
                 Ok(())
             }
-            Some("issue") => {
-                let config =
-                    sekai_chisei::gunshi_cli::RecommendConfig::from_args(args.into_iter().skip(2))
-                        .map_err(std::io::Error::other)?;
-                let output = config.output.clone();
-                sekai_chisei::gunshi_cli::issue_recommendations(config).await?;
-                println!("created {}", output.display());
-                Ok(())
-            }
-            Some("scorecard") => {
-                let namespace = sekai_chisei::gunshi_cli::scorecard_namespace(&args[2..])
-                    .map_err(std::io::Error::other)?;
-                let scorecard = sekai_chisei::gunshi_cli::get_scorecard(namespace).await?;
-                println!("{}", serde_json::to_string_pretty(&scorecard)?);
-                Ok(())
-            }
-            Some("allocation-status") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let status = sekai_chisei::gunshi_cli::get_allocation_status(namespace).await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("install-baseline") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let snapshot = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--snapshot")
-                    .map_err(std::io::Error::other)?;
-                let gate = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--gate")
-                    .map_err(std::io::Error::other)?;
-                let status = sekai_chisei::gunshi_cli::install_baseline(
-                    namespace,
-                    snapshot.into(),
-                    gate.into(),
-                )
-                .await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("promote") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let candidate = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--candidate")
-                    .map_err(std::io::Error::other)?;
-                let baseline =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--baseline-eval")
-                        .map_err(std::io::Error::other)?;
-                let candidate_eval =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--candidate-eval")
-                        .map_err(std::io::Error::other)?;
-                let expected =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
-                        .map_err(std::io::Error::other)?;
-                let status = sekai_chisei::gunshi_cli::promote_policy(
-                    namespace,
-                    candidate.into(),
-                    baseline.into(),
-                    candidate_eval.into(),
-                    expected,
-                )
-                .await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("rollback") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let expected =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
-                        .map_err(std::io::Error::other)?;
-                let reason = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--reason")
-                    .map_err(std::io::Error::other)?;
-                let status =
-                    sekai_chisei::gunshi_cli::rollback_policy(namespace, expected, reason).await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("auto-opt-in") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let expected =
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--expected-revision")
-                        .map_err(std::io::Error::other)?;
-                let opt_in = !args[2..].iter().any(|arg| arg == "--off");
-                let status =
-                    sekai_chisei::gunshi_cli::set_auto_opt_in(namespace, opt_in, expected).await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
-            Some("kill-switch") => {
-                let namespace = sekai_chisei::gunshi_cli::require_flag(&args[2..], "--namespace")
-                    .map_err(std::io::Error::other)?;
-                let clear = args[2..].iter().any(|arg| arg == "--clear");
-                let reason = if clear {
-                    String::new()
-                } else {
-                    sekai_chisei::gunshi_cli::require_flag(&args[2..], "--reason")
-                        .map_err(std::io::Error::other)?
-                };
-                let status =
-                    sekai_chisei::gunshi_cli::set_kill_switch(namespace, !clear, reason).await?;
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                Ok(())
-            }
             _ => Err(std::io::Error::other(sekai_chisei::gunshi_cli::usage()).into()),
         },
         "governed-subject" => {
@@ -363,15 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         "evaluation-plan" => {
             match sekai_chisei::evaluation_plan_cli::run(args.into_iter().skip(1).collect()).await {
-                Ok(()) => Ok(()),
-                Err(error) => {
-                    eprintln!("{error}");
-                    std::process::exit(error.exit_code());
-                }
-            }
-        }
-        "lookup-first-gate" => {
-            match sekai_chisei::lookup_gate_cli::run(args.into_iter().skip(1).collect()).await {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     eprintln!("{error}");
@@ -521,11 +405,9 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("gateway"), _) => ("gateway", 2),
         (Some("governance"), Some("action")) => ("action", 3),
         (Some("governance"), Some("budget")) => ("budget", 3),
-        (Some("governance"), Some("memory")) => ("memory", 3),
         (Some("governance"), Some("gunshi")) => ("gunshi", 3),
         (Some("governance"), Some("subject")) => ("governed-subject", 3),
         (Some("evaluation"), Some("plan")) => ("evaluation-plan", 3),
-        (Some("evaluation"), Some("lookup-first-gate")) => ("lookup-first-gate", 3),
         (Some("assurance"), Some("attest")) => ("attest", 3),
         (Some("assurance"), Some("compliance")) => ("compliance", 3),
         (Some("assurance"), Some("receipts")) => ("receipts", 3),
@@ -720,11 +602,10 @@ fn print_admin_usage() {
            sekaictl admin gateway ...\n\
          \n\
          Governance:\n\
-           sekaictl admin governance <action|budget|memory|gunshi|subject> ...\n\
+           sekaictl admin governance <action|budget|gunshi|subject> ...\n\
          \n\
          Evaluation:\n\
            sekaictl admin evaluation plan ...\n\
-           sekaictl admin evaluation lookup-first-gate ...\n\
          \n\
          Assurance:\n\
            sekaictl admin assurance <attest|compliance|provenance|replay|receipts|probes> ...\n\
@@ -817,12 +698,10 @@ fn expert_usage(command: &str) -> Option<String> {
         "gateway" => Some(gateway_usage()),
         "action" => Some(sekai_chisei::action_cli::usage().to_string()),
         "budget" => Some(sekai_chisei::budget_cli::usage().to_string()),
-        "memory" => Some(sekai_chisei::memory_cli::usage().to_string()),
         "inbox" => Some(sekai_chisei::inbox_cli::usage().to_string()),
         "gunshi" => Some(sekai_chisei::gunshi_cli::usage().to_string()),
         "governed-subject" => Some(sekai_chisei::governed_subject_cli::usage().to_string()),
         "evaluation-plan" => Some(sekai_chisei::evaluation_plan_cli::usage().to_string()),
-        "lookup-first-gate" => Some(sekai_chisei::lookup_gate_cli::usage().to_string()),
         "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
         "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
         "receipts" => Some(sekai_chisei::receipt_chain_cli::usage().to_string()),
@@ -870,11 +749,9 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "team" => Some("admin access team"),
         "gateway" => Some("admin gateway"),
         "action" => Some("admin governance action"),
-        "memory" => Some("admin governance memory"),
         "gunshi" => Some("admin governance gunshi"),
         "governed-subject" => Some("admin governance subject"),
         "evaluation-plan" => Some("admin evaluation plan"),
-        "lookup-first-gate" => Some("admin evaluation lookup-first-gate"),
         "attest" => Some("admin assurance attest"),
         "compliance" => Some("admin assurance compliance"),
         "provenance" => Some("admin assurance provenance"),
@@ -933,11 +810,9 @@ mod tests {
             (vec!["gateway"], "gateway"),
             (vec!["governance", "action"], "action"),
             (vec!["governance", "budget"], "budget"),
-            (vec!["governance", "memory"], "memory"),
             (vec!["governance", "gunshi"], "gunshi"),
             (vec!["governance", "subject"], "governed-subject"),
             (vec!["evaluation", "plan"], "evaluation-plan"),
-            (vec!["evaluation", "lookup-first-gate"], "lookup-first-gate"),
             (vec!["assurance", "attest"], "attest"),
             (vec!["assurance", "compliance"], "compliance"),
             (vec!["assurance", "receipts"], "receipts"),
@@ -997,11 +872,9 @@ mod tests {
             "gateway",
             "action",
             "budget",
-            "memory",
             "gunshi",
             "governed-subject",
             "evaluation-plan",
-            "lookup-first-gate",
             "attest",
             "compliance",
             "receipts",
@@ -1042,11 +915,9 @@ mod tests {
             ("team", "admin access team"),
             ("gateway", "admin gateway"),
             ("action", "admin governance action"),
-            ("memory", "admin governance memory"),
             ("gunshi", "admin governance gunshi"),
             ("governed-subject", "admin governance subject"),
             ("evaluation-plan", "admin evaluation plan"),
-            ("lookup-first-gate", "admin evaluation lookup-first-gate"),
             ("attest", "admin assurance attest"),
             ("compliance", "admin assurance compliance"),
             ("provenance", "admin assurance provenance"),

@@ -1,10 +1,9 @@
 # Kioku evidence reassessment
 
 Kioku memory admission is outcome-driven, while later governed evidence can
-change the support basis of an active memory. `ReviewKiokuMemory` (classified
-`remove`; requires `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
-feature) with the `reassess` action records that change as a candidate
-successor; it never changes the active version.
+change the support basis of an active memory. The Kioku store records that
+change as a candidate successor; it never changes the active version. There
+is no public candidate-list or review RPC.
 
 Callers identify the active memory version, an idempotency key, and one or more
 KiokuEvidenceBasis JSON records. A basis record contains the exact evidence

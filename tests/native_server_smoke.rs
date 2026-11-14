@@ -28,9 +28,8 @@ use sekai_chisei::grpc::client::connect_sekai;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
     ChatMessage, ExecutePlanRequest, ExecutionInput, GetEffectivePolicySummaryRequest,
-    GetOperationReceiptRequest, ListKiokuCandidatesRequest, ListRoutingProfilesRequest,
-    PlanExecutionRequest, RecordUsageRequest, SetBudgetLimitRequest,
-    SetModelFamilyEnablementRequest,
+    GetOperationReceiptRequest, ListRoutingProfilesRequest, PlanExecutionRequest,
+    RecordUsageRequest, SetBudgetLimitRequest, SetModelFamilyEnablementRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
@@ -1427,35 +1426,6 @@ async fn spawned_binary_lists_models() {
     assert!(
         models_json.get("models").is_some(),
         "policy summary should expose models\n{models_json}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn spawned_binary_lists_memory_candidates() {
-    let (_fake, mut server) = mocked_server().await;
-    let candidates = server.sekaictl(&[
-        "admin",
-        "governance",
-        "memory",
-        "candidates",
-        "--namespace",
-        "demo",
-    ]);
-    assert_success(&candidates, "memory candidates", &server.logs());
-    let empty_memory = server
-        .chisei()
-        .await
-        .list_kioku_candidates(ListKiokuCandidatesRequest {
-            namespace: "demo".into(),
-            limit: 10,
-            ..Default::default()
-        })
-        .await
-        .unwrap_or_else(|error| panic!("list kioku: {error}\n{}", server.logs()))
-        .into_inner();
-    assert!(
-        empty_memory.candidates.is_empty(),
-        "fresh namespace should have no memory candidates"
     );
 }
 

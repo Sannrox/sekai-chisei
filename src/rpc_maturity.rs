@@ -2,8 +2,8 @@
 //!
 //! Classification is derived from proto services, dual-backend inventories,
 //! and known SDK / host / example consumers. It does not invent invocation
-//! authority. Experimental and remove RPCs stay on the wire but are rejected
-//! in the default build unless an explicit runtime flag or Cargo feature is on.
+//! authority. Experimental RPCs stay on the wire but are rejected in the
+//! default build unless an explicit runtime flag or Cargo feature is on.
 
 use crate::db::chisei_rpc_inventory::{
     CHISEI_SERVICE_PROTO, parse_service_rpcs as parse_named_service_rpcs,
@@ -287,7 +287,6 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.semantic.expand_relations" => Some("ExpandRelations"),
         "sekai.context.retrieve" => Some("RetrieveContext"),
         "sekai.semantic.explain_derivation" => Some("ExplainDerivation"),
-        "chisei.kioku.candidates.list" => Some("ListKiokuCandidates"),
         "sekai.links.get" => Some("GetLinks"),
         "sekai.links.create" => Some("CreateLink"),
         "chisei.evaluation.resolve" => Some("ResolveEvaluationPlan"),
@@ -632,12 +631,6 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            require_invokable("ListKiokuCandidates", false)
-                .unwrap_err()
-                .code(),
-            tonic::Code::FailedPrecondition
-        );
-        assert_eq!(
             require_invokable("GetDefinitionMember", false)
                 .unwrap_err()
                 .code(),
@@ -658,7 +651,6 @@ mod tests {
         assert!(require_invokable("GetAgentShadowReport", true).is_ok());
         assert!(require_invokable("GetDefinitionMember", true).is_ok());
         assert!(require_invokable("CreateFunction", true).is_ok());
-        assert!(require_invokable("ListKiokuCandidates", true).is_ok());
     }
 
     #[test]

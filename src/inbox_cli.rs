@@ -1,15 +1,12 @@
 //! `sekaictl inbox` (#2203): what waits on the caller in one namespace. The
 //! client merges each plane's own listing; neither plane aggregates the
 //! other. Sekai answers `ListPendingDecisions`, or, on a plane without it,
-//! `ListActionInstances` with `decidable_by_caller`. Chisei answers its open
-//! memory candidates, and the local Chisei store its proposed learning
-//! changes, as `admin learning list` reads them. A half whose service is not
-//! served is reported unavailable, so a single-plane deployment shows its own
-//! half.
+//! `ListActionInstances` with `decidable_by_caller`. Chisei answers proposed
+//! learning changes as `admin learning list` reads them. A half whose service
+//! is not served is reported unavailable, so a single-plane deployment shows
+//! its own half.
 
 use crate::grpc::client::{GatewayClient, connect_sekai};
-use crate::grpc::pb::chisei::ListKiokuCandidatesRequest;
-use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::{
     ListActionInstancesRequest, ListPendingDecisionsRequest, PendingDecision, PendingDecisionKind,
@@ -33,14 +30,7 @@ pub async fn run_inbox_command(args: Vec<String>) -> Result<(), BoxErr> {
         .or_else(|_| std::env::var("SEKAI_SOCKET"))
         .unwrap_or_else(|_| "./data/sekai.sock".into());
     let channel = connect_sekai(&target).await?;
-    let sekai = sekai_decisions(
-        &mut SekaiServiceClient::new(channel.clone()),
-        &namespace,
-        limit,
-    )
-    .await?;
-    let memory_candidates =
-        memory_candidates(&mut ChiseiServiceClient::new(channel), &namespace, limit).await?;
+    let sekai = sekai_decisions(&mut SekaiServiceClient::new(channel), &namespace, limit).await?;
     let learning_changes = match crate::learning_cli::proposed_changes(&namespace) {
         Ok(changes) => serde_json::to_value(changes)?,
         Err(_) => json!({ "unavailable": true }),
@@ -49,7 +39,7 @@ pub async fn run_inbox_command(args: Vec<String>) -> Result<(), BoxErr> {
         "namespace": namespace,
         "sekai": sekai,
         "chisei": {
-            "memory_candidates": memory_candidates,
+            "memory_candidates": { "unavailable": true },
             "learning_changes": learning_changes,
         },
     });
@@ -149,35 +139,6 @@ fn decision_json(decision: &PendingDecision) -> Value {
     })
 }
 
-/// Chisei's open memory candidates, or `{unavailable: true}` when the plane
-/// does not serve them; by default the maturity gate holds the RPC back.
-/// The RPC takes at most 100 per page.
-async fn memory_candidates(
-    client: &mut ChiseiServiceClient<GatewayClient>,
-    namespace: &str,
-    limit: u32,
-) -> Result<Value, BoxErr> {
-    match client
-        .list_kioku_candidates(ListKiokuCandidatesRequest {
-            namespace: namespace.into(),
-            operation_class: String::new(),
-            limit: limit.min(100),
-            page_token: String::new(),
-        })
-        .await
-    {
-        Ok(response) => Ok(response
-            .into_inner()
-            .candidates
-            .into_iter()
-            .map(|candidate| serde_json::from_str::<Value>(&candidate.memory_json))
-            .collect::<Result<Vec<_>, _>>()?
-            .into()),
-        Err(status) if unserved(&status) => Ok(json!({ "unavailable": true })),
-        Err(status) => Err(status.into()),
-    }
-}
-
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
@@ -235,11 +196,6 @@ mod tests {
         assert_eq!(decisions[0]["kind"], "action_instance");
         assert_eq!(decisions[0]["subject_id"], "parked-1");
         assert_eq!(decisions[0]["queue_id"], "risk");
-
-        let chisei = memory_candidates(&mut ChiseiServiceClient::new(channel), "acme", 10)
-            .await
-            .unwrap();
-        assert_eq!(chisei, json!({ "unavailable": true }));
         server.abort();
     }
 }

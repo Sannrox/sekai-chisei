@@ -11,9 +11,9 @@ that `sekaictl ontology` and the typed SDK helpers actually call
 `CreateObject`, `CreateLink`, `PlanExecution`, `ExecutePlanStream`,
 `GetOperationReceipt`). Other `stable` RPCs stay invokable on the default
 build; they are not “supported” integration sentences unless those callers
-exist. Experimental and `remove` RPCs stay behind
-`SEKAI_EXPERIMENTAL_RPCS=1` / `experimental-rpcs`. The ontology apply and
-seed steps run on both community backends.
+exist. Experimental RPCs stay behind `SEKAI_EXPERIMENTAL_RPCS=1` /
+`experimental-rpcs`. The ontology apply and seed steps run on both community
+backends.
 
 Machine-readable copy: [`tests/fixtures/rpc_maturity/v1.json`](../tests/fixtures/rpc_maturity/v1.json)
 (`sekai.rpc-maturity/v1`). A test compares this page and that fixture with
@@ -30,7 +30,7 @@ list grows. Port a surface, then remove it and lower `limit`.
 | --- | --- | --- |
 | `stable` | Real (non-fixture) backend and at least one SDK, host, or example consumer, or a required sibling of that public loop. | Invokable. |
 | `experimental` | Shipped with a real or incomplete backend but not part of the default public loop. | Rejected (`FAILED_PRECONDITION`) unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled. |
-| `remove` | Research or sample path with no SDK, host, or example consumer. Classification and deprecation notes only in this change set; deletion is a later major-version PR. | Same gate as experimental during the deprecation window. |
+| `remove` | Reserved class for RPCs scheduled for deletion. This table currently has no `remove` rows. | Not served. |
 
 `product_tier` (`core` / `advanced` / `experimental`) on capability catalogs
 and RPC inventories is **orthogonal**. Catalog visibility is not a grant.
@@ -52,7 +52,7 @@ the experimental RPC gate is on, matching `sekai.rpc.experimental`.
 Put/run/get/list and isolated-process claim RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
-and `remove` RPCs are omitted automatically.
+RPCs are omitted automatically.
 
 HTTP/JSON is a generated projection of the same `stable` unary RPCs
 ([ADR 0075](decisions/0075-http-ontology-projection.md)). Routes are
@@ -437,32 +437,25 @@ Edit the fixture, then regenerate with
 | `ChiseiService.ReportOperationEvent` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host, cli | `stable` |
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
-| `ChiseiService.ListKiokuCandidates` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.ReviewKiokuMemory` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.IssueGunshiRecommendations` | `chisei.learning, chisei.execution` | yes | none | `remove` |
-| `ChiseiService.SetGunshiAllocationPolicy` | `chisei.learning` | yes | none | `remove` |
-| `ChiseiService.GetGunshiAllocationStatus` | `chisei.learning` | yes | none | `remove` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
 | `ChiseiService.ResolveEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
 | `ChiseiService.GetEvaluationGateEvidence` | `chisei.evaluation` | yes | none | `experimental` |
-| `ChiseiService.RunLookupFirstPromotionGate` | `chisei.evaluation` | yes | none | `remove` |
-| `ChiseiService.GetSampleObservation` | `chisei.observations` | yes | none | `remove` |
 
 <!-- /rpc-maturity-rows -->
 
-## Deprecation notes (`remove`)
+## Removed calls
 
-These RPCs stay on the wire until a later major-version change set. Removal of
-any RPC that later gains an external consumer requires a Design Discussion.
+These public RPCs were deleted (#2278). Internal stores and composition stay
+where remaining product paths still use them.
 
-| RPC | Why classified `remove` |
+| RPC | Replacement |
 | --- | --- |
-| `ChiseiService.ListKiokuCandidates` | Learning-memory research path; no SDK, host, or example consumer. |
-| `ChiseiService.ReviewKiokuMemory` | Same Kioku review path; no first-class consumer. |
-| `ChiseiService.IssueGunshiRecommendations` | Allocation research path; no first-class consumer. |
-| `ChiseiService.SetGunshiAllocationPolicy` | Same Gunshi policy write; no first-class consumer. |
-| `ChiseiService.GetGunshiAllocationStatus` | Same Gunshi status read; no first-class consumer. |
-| `ChiseiService.GetSampleObservation` | Redacted sample-observation readback; no SDK, host, or example consumer. |
-| `ChiseiService.RunLookupFirstPromotionGate` | Lookup-first promotion research gate; no first-class consumer. |
+| `ChiseiService.ListKiokuCandidates` | none; Kioku remains an internal store |
+| `ChiseiService.ReviewKiokuMemory` | none; Kioku remains an internal store |
+| `ChiseiService.IssueGunshiRecommendations` | none; `sekaictl admin governance gunshi recommend` is local advisory JSON. PlanExecution still binds a durable in-process issuance |
+| `ChiseiService.SetGunshiAllocationPolicy` | operator console Gunshi tiles |
+| `ChiseiService.GetGunshiAllocationStatus` | operator console Gunshi tiles |
+| `ChiseiService.GetSampleObservation` | none; scoring still records observations internally |
+| `ChiseiService.RunLookupFirstPromotionGate` | in-process lookup-first composition |

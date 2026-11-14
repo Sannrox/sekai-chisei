@@ -369,39 +369,6 @@ message GetEvaluationGateEvidenceResponse {
   EvaluationGateEvidence evidence = 2;
 }
 
-// Runs the closed v1 lookup-vs-golden promotion gate against authorized graph
-// state. The server never calls a provider and never applies route policy.
-message RunLookupFirstPromotionGateRequest {
-  string contract_version = 1; // chisei.lookup-first-promotion-gate/v1
-  string namespace = 2;
-  // Canonical JSON for the operator-owned versioned gate suite.
-  string suite_json = 3;
-}
-message LookupFirstPromotionGateCaseResult {
-  string id = 1;
-  string answer_path = 2; // lookup_hit | model_path
-  string lookup_refusal = 3;
-  bool passed = 4;
-  string detail = 5;
-}
-message LookupFirstPromotionGateReport {
-  string contract_version = 1;
-  string suite_id = 2;
-  string namespace = 3;
-  string suite_digest = 4;
-  string audit_decision_id = 5;
-  string verdict = 6; // allow | deny
-  uint64 lookup_hits = 7;
-  uint64 model_path = 8;
-  uint64 lookup_refusals = 9;
-  uint64 passed = 10;
-  uint64 failed = 11;
-  repeated LookupFirstPromotionGateCaseResult cases = 12;
-}
-message RunLookupFirstPromotionGateResponse {
-  LookupFirstPromotionGateReport report = 1;
-}
-
 // Immutable, operator-controlled deterministic evaluator metadata. This
 // registers deployed implementation identity; it never uploads executable code.
 message EvaluatorResourceLimits {
@@ -1208,19 +1175,6 @@ message SampleObservation {
   string task_class = 11;
   int64 cost_usd_micros = 12;
 }
-message GetSampleObservationRequest {
-  string request_id = 1;
-  string namespace = 2;
-}
-message SampleObservationReadback {
-  string request_id = 1;
-  string namespace = 2;
-  string observation_digest = 3;
-  string state = 4;
-  int64 observed_at = 5;
-  int64 read_at = 6;
-}
-message GetSampleObservationResponse { SampleObservationReadback observation = 1; }
 // Binds one native execution to a previously issued Gunshi fleet allocation.
 // The server reloads the durable allocation and rejects caller-modified JSON.
 message GunshiAllocationBinding {
@@ -1498,79 +1452,6 @@ message GetOperationReceiptResponse {
   string receipt_json = 1;
   bool complete = 2;
   repeated string missing_surfaces = 3;
-}
-
-message ListKiokuCandidatesRequest {
-  string namespace = 1;
-  string operation_class = 2;
-  uint32 limit = 3;
-  string page_token = 4;
-}
-message KiokuCandidateRecord {
-  string memory_json = 1;
-  repeated string evidence_json = 2;
-  bool valid = 3;
-  repeated string validation_errors = 4;
-  uint32 supporting_evidence = 5;
-  uint32 contradicting_evidence = 6;
-}
-message ListKiokuCandidatesResponse {
-  repeated KiokuCandidateRecord candidates = 1;
-  string next_page_token = 2;
-}
-message ReviewKiokuMemoryRequest {
-  string memory_id = 1;
-  uint32 memory_version = 2;
-  string action = 3;
-  string rationale = 4;
-  string reassessment_key = 5;
-  repeated string evidence_basis_json = 6;
-}
-message ReviewKiokuMemoryResponse {
-  string memory_json = 1;
-  repeated string lifecycle_events_json = 2;
-  repeated string evidence_json = 3;
-  bool idempotent = 4;
-}
-message IssueGunshiRecommendationsRequest {
-  string input_json = 1;
-  string issuance_id = 2;
-}
-message IssueGunshiRecommendationsResponse {
-  string allocation_json = 1;
-  string issuance_id = 2;
-  // Entries align with allocation.plans. Authorization is evaluated as part
-  // of recommendation issuance so there is no second dispatch RPC.
-  repeated string auto_dispatch_authorization_json = 3;
-  repeated string receipt_attributes_json = 4;
-}
-// One declarative Gunshi allocation-policy mutation surface. `operation` is
-// install, promote, rollback, auto_opt_in, kill_switch, feedback, or
-// promote_feedback. Only fields required by the selected operation are
-// accepted.
-message SetGunshiAllocationPolicyRequest {
-  string namespace = 1;
-  string operation = 2;
-  string snapshot_json = 3;
-  string gate_json = 4;
-  string candidate_json = 5;
-  string baseline_evaluation_json = 6;
-  string candidate_evaluation_json = 7;
-  string expected_revision = 8;
-  string reason = 9;
-  bool enabled = 10;
-  string issuance_id = 11;
-  string allocation_json = 12;
-  string choice_json = 13;
-  string outcome_json = 14;
-  string suite_id = 15;
-  string allocation_id = 16;
-}
-message SetGunshiAllocationPolicyResponse { string status_json = 1; }
-message GetGunshiAllocationStatusRequest { string namespace = 1; }
-message GetGunshiAllocationStatusResponse {
-  string status_json = 1;
-  string scorecard_json = 2;
 }
 
 // --- Host-executed external-action authorization ---
@@ -2037,11 +1918,6 @@ service ChiseiService {
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
   rpc GetQualityTrend(GetQualityTrendRequest) returns (GetQualityTrendResponse);
-  rpc ListKiokuCandidates(ListKiokuCandidatesRequest) returns (ListKiokuCandidatesResponse);
-  rpc ReviewKiokuMemory(ReviewKiokuMemoryRequest) returns (ReviewKiokuMemoryResponse);
-  rpc IssueGunshiRecommendations(IssueGunshiRecommendationsRequest) returns (IssueGunshiRecommendationsResponse);
-  rpc SetGunshiAllocationPolicy(SetGunshiAllocationPolicyRequest) returns (SetGunshiAllocationPolicyResponse);
-  rpc GetGunshiAllocationStatus(GetGunshiAllocationStatusRequest) returns (GetGunshiAllocationStatusResponse);
   rpc ClaimGatewayDispatch(ClaimGatewayDispatchRequest) returns (ClaimGatewayDispatchResponse);
 
   // Eval
@@ -2049,7 +1925,5 @@ service ChiseiService {
   rpc PutEvaluationPlan(PutEvaluationPlanRequest) returns (PutEvaluationPlanResponse);
   rpc ResolveEvaluationPlan(ResolveEvaluationPlanRequest) returns (ResolveEvaluationPlanResponse);
   rpc GetEvaluationGateEvidence(GetEvaluationGateEvidenceRequest) returns (GetEvaluationGateEvidenceResponse);
-  rpc RunLookupFirstPromotionGate(RunLookupFirstPromotionGateRequest) returns (RunLookupFirstPromotionGateResponse);
-  rpc GetSampleObservation(GetSampleObservationRequest) returns (GetSampleObservationResponse);
 
 }
