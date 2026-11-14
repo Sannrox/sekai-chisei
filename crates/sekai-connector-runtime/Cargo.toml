@@ -9,6 +9,7 @@ publish = false
 # Never depend on the control-plane packages (sekai-chisei, sekai-core,
 # chisei-core): the runtime talks to the plane only over gRPC.
 [dependencies]
+bytes = "1"
 futures-util = "0.3"
 native-tls = "0.2"
 postgres = { version = "0.19", default-features = false }

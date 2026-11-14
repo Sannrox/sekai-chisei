@@ -18,8 +18,9 @@ use sekai_client::protocol::sekai::{
 };
 use sekai_client::{SdkError, SdkErrorCode};
 use sekai_source_sdk::{
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, SOURCE_GITHUB, SnapshotRead,
-    SourceAdapterConfig, SourceBatch, build_source_batch,
+    ConfigValue, GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, Operation,
+    SOURCE_GITHUB, SnapshotRead, SourceAdapterConfig, SourceBatch, build_registered_source_batch,
+    build_source_batch,
 };
 use std::sync::Arc;
 
@@ -67,17 +68,24 @@ impl Runtime {
         source: &ConnectorSource,
         prepared: Prepared,
     ) -> Result<(), SyncFailure> {
-        // The GitHub profile is code-owned; a registered type binds its
-        // descriptor digest when it reads pages.
-        if prepared.connector.fixed_source != Some(SOURCE_GITHUB) {
+        if !prepared.connector.supports(Operation::ReadPage) {
             return Err(SyncFailure::Unsupported);
         }
+        let github = prepared.connector.fixed_source == Some(SOURCE_GITHUB);
+        let type_digest = if github {
+            GITHUB_OBJECT_SYNC_TYPE_DIGEST.to_string()
+        } else {
+            match prepared.config.get("type_digest") {
+                Some(ConfigValue::Text(digest)) if !digest.is_empty() => digest.clone(),
+                _ => return Err(SyncFailure::Invalid),
+            }
+        };
         let client = &self.clients[index];
         let adapter = SourceAdapterConfig {
             namespace: source.namespace.clone(),
             producer_identity: client.config().principal.clone(),
             source_instance: source.source_instance.clone(),
-            type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+            type_digest,
         };
         let prepared = Arc::new(prepared);
         for _ in 0..MAX_PAGES {
@@ -131,13 +139,29 @@ impl Runtime {
                     Err(SyncFailure::Invalid)
                 };
             }
-            let batch = build_source_batch(
-                &adapter,
-                cursor.as_deref().unwrap_or_default(),
-                &page.proposed_next_cursor,
-                page.collected_at_ms,
-                page.records,
-            )
+            let batch = if github {
+                build_source_batch(
+                    &adapter,
+                    cursor.as_deref().unwrap_or_default(),
+                    &page.proposed_next_cursor,
+                    page.collected_at_ms,
+                    page.records,
+                )
+            } else {
+                let mut records = page.records;
+                for record in &mut records {
+                    record.source = source.source.clone();
+                    record.source_instance = source.source_instance.clone();
+                }
+                build_registered_source_batch(
+                    &adapter,
+                    &source.source,
+                    cursor.as_deref().unwrap_or_default(),
+                    &page.proposed_next_cursor,
+                    page.collected_at_ms,
+                    records,
+                )
+            }
             .map_err(|_| SyncFailure::Invalid)?;
             let applied: ApplySourceBatchResponse = client
                 .raw()
