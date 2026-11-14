@@ -74,6 +74,7 @@ MAX_SOURCE_CURSOR_BYTES
 MAX_SOURCE_DISPLAY_NAME_BYTES
 MAX_SOURCE_FEED_EPOCH_BYTES
 MAX_SOURCE_IDENTIFIER_BYTES
+MAX_SOURCE_PAYLOAD_BYTES
 MAX_SOURCE_PROPERTY_KEY_BYTES
 MAX_SOURCE_PROPERTY_VALUE_BYTES
 MAX_SOURCE_RECORD_PROPERTIES
@@ -91,6 +92,7 @@ RecordChange
 ReplayDisposition
 SDK_VERSION: &str
 SOURCE_BATCH_V2_VERSION
+SOURCE_BATCH_V3_VERSION
 SOURCE_BATCH_VERSION
 SOURCE_DISCOVERY_VERSION
 SOURCE_GITHUB
@@ -347,6 +349,7 @@ contract::MAX_SOURCE_CURSOR_BYTES: usize
 contract::MAX_SOURCE_DISPLAY_NAME_BYTES: usize
 contract::MAX_SOURCE_FEED_EPOCH_BYTES: usize
 contract::MAX_SOURCE_IDENTIFIER_BYTES: usize
+contract::MAX_SOURCE_PAYLOAD_BYTES: usize
 contract::MAX_SOURCE_PROPERTY_KEY_BYTES: usize
 contract::MAX_SOURCE_PROPERTY_VALUE_BYTES: usize
 contract::MAX_SOURCE_RECORD_PROPERTIES: usize
@@ -360,6 +363,7 @@ contract::ReplayDisposition
 contract::ReplayDisposition::ExactReplay
 contract::ReplayDisposition::NewBatch
 contract::SOURCE_BATCH_V2_VERSION: &str
+contract::SOURCE_BATCH_V3_VERSION: &str
 contract::SOURCE_BATCH_VERSION: &str
 contract::SOURCE_GITHUB: &str
 contract::SOURCE_TYPE_REVISION_VERSION: &str
@@ -463,6 +467,7 @@ contract::SourceRecord.deleted: bool
 contract::SourceRecord.display_name: String
 contract::SourceRecord.external_id: String
 contract::SourceRecord.observed_at_ms: i64
+contract::SourceRecord.payload: Option<String>
 contract::SourceRecord.payload_digest: String
 contract::SourceRecord.properties: BTreeMap<String,sekai_types::object_schema::PropertyValue>
 contract::SourceRecord.source: String
@@ -526,6 +531,7 @@ contract::contains_secret_like_text(&str) -> bool
 contract::detect_identity_conflict(&SyncedObject,&SyncedObject) -> Option<String>
 contract::is_schema_drift_denial(Option<&str>) -> bool
 contract::object_id_for(&str,&str) -> String
+contract::source_batch_uses_delivery(&str) -> bool
 contract::source_id(&str,&str,&str) -> String
 contract::sync_github_record(SourceRecord,&str) -> SyncDecision
 dataset_id_for
@@ -758,6 +764,7 @@ snapshot::SnapshotSourceFailure::Invalid
 snapshot::SnapshotSourceFailure::Unavailable
 snapshot::run_generation_snapshot_v2<T:SourceSyncTransport,S:GenerationSnapshotSource>(&SourceAdapterConfig,&SourceOutbox,&mut T,&mut S,SnapshotRunLimits) -> Result<SourceRunReport,SnapshotRunError>
 snapshot::run_snapshot<T:SourceSyncTransport,S:SnapshotPageSource>(&SourceAdapterConfig,&SourceOutbox,&mut T,&mut S,SnapshotRunLimits) -> Result<SnapshotRunOutcome,SnapshotRunError>
+source_batch_uses_delivery
 source_id
 sync_github_record
 translate_github_fixture

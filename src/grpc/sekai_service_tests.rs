@@ -3399,6 +3399,7 @@ fn source_batch(
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }],
         delivery: None,
     };
@@ -3433,6 +3434,7 @@ fn source_batch(
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,
@@ -3966,7 +3968,7 @@ async fn source_sync_maps_version_cursor_and_secret_failures() {
 
     let mut unknown_version =
         source_batch(namespace, producer, "", "cursor:ignored", "batch-version");
-    unknown_version.contract_version = "sekai.source-batch/v3".into();
+    unknown_version.contract_version = "sekai.source-batch/v4".into();
     let version_error = svc
         .apply_source_batch(with_named_principal(
             ApplySourceBatchRequest {

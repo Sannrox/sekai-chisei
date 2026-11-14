@@ -161,6 +161,7 @@ fn to_proto(batch: sekai_chisei::sekai::object_sync::SourceBatch) -> SourceBatch
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,

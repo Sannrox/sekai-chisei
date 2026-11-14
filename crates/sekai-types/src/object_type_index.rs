@@ -15,6 +15,11 @@ pub fn join_value_digest(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 
+/// Reserved dataset column that retains the original unmapped source body.
+pub const SOURCE_PAYLOAD_COLUMN: &str = "source_payload";
+/// Same bound as source-batch property values. Extracted payload cells cannot exceed it.
+const MAX_PAYLOAD_CELL_BYTES: usize = 4 * 1024;
+
 /// Keep only plan-needed properties from a stored member JSON map.
 /// `None` keeps the full map. An empty slice skips deserialize of unused keys
 /// by returning an empty map when `raw` is ignored by callers; when `raw` is
@@ -502,8 +507,12 @@ pub fn schema_drift(
             binding.key_column
         ));
     }
+    let payload_retained = names.contains(&SOURCE_PAYLOAD_COLUMN);
     for column in binding.property_mapping.values() {
         if !names.contains(&column.as_str()) {
+            if payload_retained {
+                continue;
+            }
             return Some(format!(
                 "datasource schema drift: missing mapped column {column}"
             ));
@@ -532,6 +541,8 @@ pub fn member_from_row(
     for (property, column) in &binding.property_mapping {
         if let Some(value) = row.get(column) {
             properties.insert(property.clone(), PropertyValue::String(value.clone()));
+        } else if let Some(value) = cell_from_retained_payload(row, column) {
+            properties.insert(property.clone(), PropertyValue::String(value));
         }
     }
     let hidden = if binding.hidden_column.is_empty() {
@@ -829,6 +840,30 @@ pub fn is_hidden_value(value: &str) -> bool {
     )
 }
 
+fn cell_from_retained_payload(row: &HashMap<String, String>, column: &str) -> Option<String> {
+    let raw = row.get(SOURCE_PAYLOAD_COLUMN)?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    payload_cell(value.as_object()?.get(column)?)
+}
+
+fn payload_cell(value: &serde_json::Value) -> Option<String> {
+    let text = match value {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::Bool(flag) => flag.to_string(),
+        _ => return None,
+    };
+    if text.len() > MAX_PAYLOAD_CELL_BYTES
+        || text
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        return None;
+    }
+    Some(text)
+}
+
 pub fn freshness_holds(status: &ObjectTypeIndexStatus, required_freshness_ms: i64) -> bool {
     if required_freshness_ms <= 0 {
         return true;
@@ -905,6 +940,60 @@ mod tests {
         )
         .unwrap();
         assert!(reason.contains("region"));
+    }
+
+    #[test]
+    fn retained_payload_covers_missing_mapped_columns() {
+        let columns = [
+            ColumnDef {
+                name: "customer_id".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+            ColumnDef {
+                name: "hidden".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+            ColumnDef {
+                name: SOURCE_PAYLOAD_COLUMN.into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            },
+        ];
+        assert!(schema_drift(&binding(), &columns).is_none());
+        let member = member_from_row(
+            &binding(),
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("hidden".into(), "0".into()),
+                (
+                    SOURCE_PAYLOAD_COLUMN.into(),
+                    r#"{"region":"eu","body":"later"}"#.into(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            member
+                .properties
+                .get("region")
+                .and_then(PropertyValue::as_str),
+            Some("eu")
+        );
+        let hidden = member_from_row(
+            &binding(),
+            &HashMap::from([
+                ("customer_id".into(), "c1".into()),
+                ("hidden".into(), "1".into()),
+                (
+                    SOURCE_PAYLOAD_COLUMN.into(),
+                    r#"{"region":"secret"}"#.into(),
+                ),
+            ]),
+        )
+        .unwrap();
+        assert!(hidden.hidden);
     }
 
     #[test]

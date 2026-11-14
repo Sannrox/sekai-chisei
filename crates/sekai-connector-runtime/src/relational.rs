@@ -476,6 +476,7 @@ fn record(
         deleted: false,
         observed_at_ms: now_ms,
         source_sequence: None,
+        payload: None,
     })
 }
 

@@ -12,9 +12,9 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::namespace_access::{is_safe_namespace, principal_can_access_namespace};
 use crate::sekai::object_sync::{
-    OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION, SourceBatchStatus,
-    SourceBinding, SourceCheckpoint, SourceSyncGenerationStatus, SourceSyncState,
-    contains_secret_like_text,
+    OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_V3_VERSION, SOURCE_BATCH_VERSION,
+    SourceBatchStatus, SourceBinding, SourceCheckpoint, SourceSyncGenerationStatus,
+    SourceSyncState, contains_secret_like_text,
 };
 
 pub const HEALTH_CONTRACT: &str = "sekai.source-health/v1";
@@ -335,7 +335,9 @@ fn validate_checkpoint(
 }
 
 fn known_batch_version(version: &str) -> bool {
-    version == SOURCE_BATCH_VERSION || version == SOURCE_BATCH_V2_VERSION
+    version == SOURCE_BATCH_VERSION
+        || version == SOURCE_BATCH_V2_VERSION
+        || version == SOURCE_BATCH_V3_VERSION
 }
 
 fn last_success_at(state: &SourceSyncState) -> Option<i64> {
@@ -642,6 +644,7 @@ mod tests {
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }
     }
 

@@ -61,6 +61,7 @@ fn delivery(namespace: &str, id: &str, seed: u8, key_id: &str) -> SourceWebhookD
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }],
         content_digest: String::new(),
         signature: None,
@@ -97,6 +98,7 @@ fn pager_batch(namespace: &str, digest: &str, current: &str, next: &str) -> Sour
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }],
         delivery: None,
     };

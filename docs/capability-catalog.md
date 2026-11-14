@@ -378,7 +378,9 @@ and the exact batch contracts and delivery modes the adapter can produce.
 `sekai.source-batch/v1` remains replay-compatible for opaque-checkpoint
 snapshots. `sekai.source-batch/v2` adds control-plane-owned synchronization
 generations, `snapshot` / `change_feed` delivery, a stable feed epoch, and
-contiguous offsets. The profile also publishes the only code-owned v1 type
+contiguous offsets. `sekai.source-batch/v3` may retain a bounded original
+payload with each record so a later mapping can rebuild without a source
+reread. The profile also publishes the only code-owned v1 type
 revision, `sekai.source-type-revision/v1` at digest
 `sha256:97a329c80d00af0525c6076aef9f8162471eee9c108cefae42f68a8309fb708a`.
 The adapter SDK resumes bounded snapshot pages or ordered ranges from the

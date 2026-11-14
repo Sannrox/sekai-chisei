@@ -1150,6 +1150,7 @@ fn source_batch_proto(
                 deleted: false,
                 observed_at_ms: 10,
                 source_sequence: None,
+                payload: None,
             }
         })
         .collect();
@@ -1204,6 +1205,7 @@ fn source_batch_proto(
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,

@@ -742,6 +742,7 @@ fn source_ingestion_record(number: u64, version: &str, hidden: bool) -> SourceRe
         deleted: false,
         observed_at_ms: 10,
         source_sequence: None,
+        payload: None,
     }
 }
 

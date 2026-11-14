@@ -4192,8 +4192,9 @@ message StructValue {
   map<string, PropertyValue> fields = 1;
 }
 
-// Bounded, adapter-normalized source records. No raw source payload or
-// credentials cross this contract.
+// Bounded, adapter-normalized source records. Credentials do not cross this
+// contract. v3 may retain the original unmapped payload; the plane does not
+// interpret it.
 message SourceRecord {
   string source = 1;
   string source_instance = 2;
@@ -4206,6 +4207,7 @@ message SourceRecord {
   bool deleted = 9;
   int64 observed_at_ms = 10;
   optional uint64 source_sequence = 11;
+  optional string payload = 12;
 }
 
 enum SourceDeliveryMode {

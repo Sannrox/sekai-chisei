@@ -731,6 +731,7 @@ fn source_batch(
                 deleted: false,
                 observed_at_ms: round as i64 + 1,
                 source_sequence: None,
+                payload: None,
             })
         })
         .collect::<Result<Vec<_>, SoakError>>()?;
@@ -785,6 +786,7 @@ fn source_batch(
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,

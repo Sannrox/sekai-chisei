@@ -236,6 +236,7 @@ fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,

@@ -1,6 +1,6 @@
 //! Source-batch contract types and validation shared by adapters and the plane.
 //!
-//! This module is the semver surface for `sekai.source-batch/v1` and `v2`.
+//! This module is the semver surface for `sekai.source-batch/v1`, `v2`, and `v3`.
 //! Control-plane apply logic stays in `sekai_chisei::sekai::object_sync`.
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 
 pub const SOURCE_BATCH_VERSION: &str = "sekai.source-batch/v1";
 pub const SOURCE_BATCH_V2_VERSION: &str = "sekai.source-batch/v2";
+pub const SOURCE_BATCH_V3_VERSION: &str = "sekai.source-batch/v3";
 pub const SOURCE_TYPE_REVISION_VERSION: &str = "sekai.source-type-revision/v1";
 pub const SOURCE_GITHUB: &str = "github";
 pub const FAMILY_OBJECT_SYNC: &str = "source_control.object_sync";
@@ -50,7 +51,13 @@ pub const MAX_SOURCE_IDENTIFIER_BYTES: usize = 512;
 pub const MAX_SOURCE_DISPLAY_NAME_BYTES: usize = 1024;
 pub const MAX_SOURCE_PROPERTY_KEY_BYTES: usize = 128;
 pub const MAX_SOURCE_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_SOURCE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_SOURCE_FEED_EPOCH_BYTES: usize = 128;
+
+/// Ordered batches (`v2` and `v3`) carry a delivery envelope.
+pub fn source_batch_uses_delivery(version: &str) -> bool {
+    version == SOURCE_BATCH_V2_VERSION || version == SOURCE_BATCH_V3_VERSION
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +129,9 @@ pub struct SourceRecord {
     pub observed_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sequence: Option<u64>,
+    /// Original unmapped source body. v3 may retain it; v1 and v2 omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
 }
 
 impl SourceRecord {
@@ -246,6 +256,12 @@ impl SourceBatch {
                         "v1 source batches cannot contain delivery metadata or source sequences",
                     ));
                 }
+                if self.records.iter().any(|record| record.payload.is_some()) {
+                    return Err(SourceBatchValidationError::new(
+                        "unexpected_payload",
+                        "v1 source batches cannot carry a retained payload",
+                    ));
+                }
                 serde_json::to_vec(&CanonicalSourceBatch {
                     contract_version: &self.contract_version,
                     namespace: &self.namespace,
@@ -262,11 +278,19 @@ impl SourceBatch {
                     records: &self.records,
                 })
             }
-            SOURCE_BATCH_V2_VERSION => {
+            SOURCE_BATCH_V2_VERSION | SOURCE_BATCH_V3_VERSION => {
+                if self.contract_version == SOURCE_BATCH_V2_VERSION
+                    && self.records.iter().any(|record| record.payload.is_some())
+                {
+                    return Err(SourceBatchValidationError::new(
+                        "unexpected_payload",
+                        "v2 source batches cannot carry a retained payload",
+                    ));
+                }
                 let delivery = self.delivery.as_ref().ok_or_else(|| {
                     SourceBatchValidationError::new(
                         "missing_delivery_metadata",
-                        "v2 source batches require a delivery envelope",
+                        "ordered source batches require a delivery envelope",
                     )
                 })?;
                 serde_json::to_vec(&CanonicalSourceBatchV2 {
@@ -700,13 +724,27 @@ fn validate_delivery_envelope(batch: &SourceBatch) -> Result<(), SourceBatchVali
                     "v1 source batches cannot contain delivery metadata or source sequences",
                 ));
             }
+            if batch.records.iter().any(|record| record.payload.is_some()) {
+                return Err(SourceBatchValidationError::new(
+                    "unexpected_payload",
+                    "v1 source batches cannot carry a retained payload",
+                ));
+            }
             Ok(())
         }
-        SOURCE_BATCH_V2_VERSION => {
+        SOURCE_BATCH_V2_VERSION | SOURCE_BATCH_V3_VERSION => {
+            if batch.contract_version == SOURCE_BATCH_V2_VERSION
+                && batch.records.iter().any(|record| record.payload.is_some())
+            {
+                return Err(SourceBatchValidationError::new(
+                    "unexpected_payload",
+                    "v2 source batches cannot carry a retained payload",
+                ));
+            }
             let delivery = batch.delivery.as_ref().ok_or_else(|| {
                 SourceBatchValidationError::new(
                     "missing_delivery_metadata",
-                    "v2 source batches require a delivery envelope",
+                    "ordered source batches require a delivery envelope",
                 )
             })?;
             if delivery.sync_generation == 0 {
@@ -784,13 +822,13 @@ fn validate_delivery_envelope(batch: &SourceBatch) -> Result<(), SourceBatchVali
 }
 
 fn validate_ordered_delivery(batch: &SourceBatch) -> Result<(), SourceBatchValidationError> {
-    if batch.contract_version == SOURCE_BATCH_VERSION {
+    if !source_batch_uses_delivery(&batch.contract_version) {
         return Ok(());
     }
     let delivery = batch.delivery.as_ref().ok_or_else(|| {
         SourceBatchValidationError::new(
             "missing_delivery_metadata",
-            "v2 source batches require a delivery envelope",
+            "ordered source batches require a delivery envelope",
         )
     })?;
     match delivery.mode {
@@ -962,6 +1000,40 @@ fn validate_record(
         &format!("records[{index}].payload_digest"),
         &record.payload_digest,
     )?;
+    if let Some(payload) = &record.payload {
+        if batch.contract_version != SOURCE_BATCH_V3_VERSION {
+            return Err(SourceBatchValidationError::new(
+                "unexpected_payload",
+                format!("records[{index}] cannot carry a retained payload on this version"),
+            ));
+        }
+        if payload.is_empty() {
+            return Err(SourceBatchValidationError::new(
+                "invalid_payload",
+                format!("records[{index}].payload must be omitted when empty"),
+            ));
+        }
+        if payload.len() > MAX_SOURCE_PAYLOAD_BYTES {
+            return Err(SourceBatchValidationError::new(
+                "payload_bounds",
+                format!("records[{index}].payload exceeds {MAX_SOURCE_PAYLOAD_BYTES} bytes"),
+            ));
+        }
+        require_bounded_text(
+            &format!("records[{index}].payload"),
+            payload,
+            MAX_SOURCE_PAYLOAD_BYTES,
+            false,
+        )?;
+        validate_retained_payload_cells(index, payload)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(payload.as_bytes()));
+        if digest != record.payload_digest {
+            return Err(SourceBatchValidationError::new(
+                "payload_digest_mismatch",
+                format!("records[{index}].payload_digest does not match the retained payload"),
+            ));
+        }
+    }
     if record.observed_at_ms <= 0 {
         return Err(SourceBatchValidationError::new(
             "invalid_timestamp",
@@ -978,6 +1050,46 @@ fn validate_record(
         validate_property_entry(index, key, value)?;
     }
     Ok(())
+}
+
+fn validate_retained_payload_cells(
+    index: usize,
+    payload: &str,
+) -> Result<(), SourceBatchValidationError> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for (key, cell) in object {
+        if is_secret_key(key) {
+            return Err(SourceBatchValidationError::new(
+                "secret_like_text",
+                format!("records[{index}].payload contains a credential-like key"),
+            ));
+        }
+        let Some(text) = json_payload_cell(cell) else {
+            continue;
+        };
+        require_bounded_text(
+            &format!("records[{index}].payload[{key}]"),
+            &text,
+            MAX_SOURCE_PROPERTY_VALUE_BYTES,
+            true,
+        )?;
+    }
+    Ok(())
+}
+
+fn json_payload_cell(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
 }
 
 fn validate_property_entry(
@@ -1282,6 +1394,7 @@ mod tests {
                 deleted: false,
                 observed_at_ms: 10,
                 source_sequence: None,
+                payload: None,
             }],
             delivery: None,
         };
@@ -1340,5 +1453,109 @@ mod tests {
         );
         let nested = batch.validate().unwrap_err();
         assert_eq!(nested.code, "invalid_property_value");
+    }
+
+    fn v3_snapshot(payload: Option<String>) -> SourceBatch {
+        let digest = match &payload {
+            Some(body) => format!("sha256:{:x}", Sha256::digest(body.as_bytes())),
+            None => {
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
+            }
+        };
+        let mut batch = github_batch(BTreeMap::from([("title".into(), "ok".into())]));
+        batch.contract_version = SOURCE_BATCH_V3_VERSION.into();
+        batch.records[0].payload_digest = digest;
+        batch.records[0].payload = payload;
+        batch.delivery = Some(SourceDeliveryWindow {
+            mode: SourceDeliveryMode::Snapshot,
+            sync_generation: 1,
+            source_feed_epoch: Some("epoch-1".into()),
+            offset_start: None,
+            offset_end: Some(40),
+            snapshot_complete: true,
+        });
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    #[test]
+    fn v3_batch_may_omit_payload() {
+        v3_snapshot(None).validate().unwrap();
+    }
+
+    #[test]
+    fn v3_payload_must_match_digest_and_size_bound() {
+        let body = r#"{"title":"ok","body":"later"}"#;
+        v3_snapshot(Some(body.into())).validate().unwrap();
+
+        let mut mismatch = v3_snapshot(Some(body.into()));
+        mismatch.records[0].payload = Some(r#"{"title":"ok","body":"other"}"#.into());
+        mismatch.batch_digest = mismatch.canonical_digest().unwrap();
+        assert_eq!(
+            mismatch.validate().unwrap_err().code,
+            "payload_digest_mismatch"
+        );
+
+        let oversized = "x".repeat(MAX_SOURCE_PAYLOAD_BYTES + 1);
+        let mut oversize = v3_snapshot(Some(oversized));
+        oversize.records[0].payload_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(oversize.records[0].payload.as_ref().unwrap().as_bytes())
+        );
+        oversize.batch_digest = oversize.canonical_digest().unwrap();
+        let error = oversize.validate().unwrap_err();
+        assert_eq!(error.code, "payload_bounds");
+        assert!(!error.message.contains("truncat"));
+    }
+
+    #[test]
+    fn v3_payload_refuses_secret_like_text_and_oversize_cells() {
+        let secret = r#"{"title":"ok","body":"ghp_abcdefghijklmnopqrstuvwxyz012345"}"#;
+        assert_eq!(
+            v3_snapshot(Some(secret.into()))
+                .validate()
+                .unwrap_err()
+                .code,
+            "secret_like_text"
+        );
+
+        let secret_key = r#"{"title":"ok","api_token":"later"}"#;
+        assert_eq!(
+            v3_snapshot(Some(secret_key.into()))
+                .validate()
+                .unwrap_err()
+                .code,
+            "secret_like_text"
+        );
+
+        let oversize_cell = format!(
+            r#"{{"title":"ok","body":"{}"}}"#,
+            "x".repeat(MAX_SOURCE_PROPERTY_VALUE_BYTES + 1)
+        );
+        assert_eq!(
+            v3_snapshot(Some(oversize_cell))
+                .validate()
+                .unwrap_err()
+                .code,
+            "text_bounds"
+        );
+    }
+
+    #[test]
+    fn v1_and_v2_refuse_retained_payload() {
+        let mut v1 = github_batch(BTreeMap::from([("title".into(), "ok".into())]));
+        v1.records[0].payload = Some(r#"{"title":"ok"}"#.into());
+        assert_eq!(
+            v1.canonical_digest().unwrap_err().code,
+            "unexpected_payload"
+        );
+
+        let mut v2 = v3_snapshot(Some(r#"{"title":"ok"}"#.into()));
+        v2.contract_version = SOURCE_BATCH_V2_VERSION.into();
+        v2.batch_digest = String::new();
+        assert_eq!(
+            v2.canonical_digest().unwrap_err().code,
+            "unexpected_payload"
+        );
     }
 }

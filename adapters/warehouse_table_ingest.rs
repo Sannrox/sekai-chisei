@@ -231,6 +231,7 @@ pub fn records(snapshot: TableSnapshot) -> Result<Vec<SourceRecord>, String> {
                 deleted: false,
                 observed_at_ms: committed_at_ms,
                 source_sequence: None,
+                payload: None,
             })
         })
         .collect::<Result<Vec<_>, &str>>()?;
@@ -248,6 +249,7 @@ pub fn records(snapshot: TableSnapshot) -> Result<Vec<SourceRecord>, String> {
             deleted: true,
             observed_at_ms: committed_at_ms,
             source_sequence: None,
+            payload: None,
         }
     });
     Ok(upserts.into_iter().chain(tombstones).collect())

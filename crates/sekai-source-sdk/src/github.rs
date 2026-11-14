@@ -135,6 +135,7 @@ pub fn translate(
         deleted: fixture.deleted,
         observed_at_ms: fixture.observed_at_ms,
         source_sequence: None,
+        payload: None,
     };
     Ok(record)
 }
