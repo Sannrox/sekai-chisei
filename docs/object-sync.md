@@ -46,9 +46,13 @@ a sidecar lock next to the store; PostgreSQL uses a session advisory lock
 outside the work pool. Abort is refused after dataset land;
 replay the stored batch to commit. A mapping change plus `full_rebuild`
 rematerializes members and mapped clerk properties from those rows without
-another source read. Unmapped payload is out of scope (#2281). Existing
-bindings backfill dataset rows from stored committed `batch_json` on the next
-apply, unioning historical columns into the dataset schema and identity mapping.
+another source read. `sekai.source-batch/v3` may retain the original unmapped
+payload with each landed row, bounded and digest-checked; a later mapping can
+read a previously ignored field from that payload during a full rebuild.
+Previous versions stay accepted without a payload. The plane does not interpret
+payloads. Existing bindings backfill dataset rows from stored committed
+`batch_json` on the next apply, unioning historical columns into the dataset
+schema and identity mapping.
 
 The offline helper and reference normalizer live under
 [`adapters/`](../adapters/README.md). They contain no source credentials and
@@ -116,6 +120,17 @@ representation in version 1. Snapshot completion does not imply
 tombstone-by-absence: deletions must remain explicit `deleted: true` records.
 Across pages, a later revision of the same source identity refreshes the same
 derived object id.
+
+## Version 3 retained payloads
+
+`sekai.source-batch/v3` keeps the v2 delivery envelope and lets a record carry
+the original unmapped payload, bounded at 64 KiB. When present, `payload_digest`
+must be the SHA-256 of those exact bytes; an oversize payload is refused and
+never truncated. The plane stores the payload on the binding-owned landed row
+under the same hidden/restricted visibility and retention as mapped properties.
+A mapping change plus `full_rebuild` may read a previously unmapped field from
+that JSON object. v1 and v2 stay accepted and cannot carry a payload. Adapters
+still map; the plane does not interpret payloads.
 
 ## Version 2 ordered synchronization
 

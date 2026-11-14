@@ -40,6 +40,7 @@ fn alert(key: &str, version: &str, payload: &str, deleted: bool) -> SourceRecord
         deleted,
         observed_at_ms: 10,
         source_sequence: None,
+        payload: None,
     }
 }
 

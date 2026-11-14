@@ -382,6 +382,7 @@ fn to_proto_batch(batch: DomainBatch) -> SourceBatch {
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
+                payload: record.payload,
             })
             .collect(),
         delivery: None,

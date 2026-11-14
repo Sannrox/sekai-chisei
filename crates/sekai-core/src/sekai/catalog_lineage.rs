@@ -604,6 +604,7 @@ mod tests {
                 deleted: false,
                 observed_at_ms: 10,
                 source_sequence: None,
+                payload: None,
             }],
             delivery: None,
         };

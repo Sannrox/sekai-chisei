@@ -13,11 +13,11 @@ use crate::sekai::object_schema::{
     ObjectType, PropertyValue, coerce_properties, property_maps_equivalent,
 };
 use crate::sekai::object_sync::{
-    GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch,
-    SourceBatchResult, SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint,
-    SourceDeliveryMode, SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus,
-    SourceSyncState, SyncDecision, SyncedObject, contains_secret_like_text, is_schema_drift_denial,
-    schema_quarantine_record_reason, sync_github_record,
+    GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SourceBatch, SourceBatchResult,
+    SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
+    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
+    SyncDecision, SyncedObject, contains_secret_like_text, is_schema_drift_denial,
+    schema_quarantine_record_reason, source_batch_uses_delivery, sync_github_record,
 };
 use crate::sekai::source_type_descriptor::{
     ProposedSourceTypeDescriptor, STATUS_LIVE, StoredSourceTypeDescriptor,
@@ -284,6 +284,7 @@ pub struct PreparedRecord {
     pub observed_at_ms: i64,
     pub properties_json: String,
     pub source_sequence: Option<u64>,
+    pub payload: Option<String>,
 }
 
 #[derive(Debug)]
@@ -490,7 +491,8 @@ impl PreparedBatch {
                 RESERVED_SYNC_PROPERTIES.contains(&key.as_str())
                     || (reject_dataset_keys
                         && (key == crate::db::source_batch_dataset::KEY_COLUMN
-                            || key == crate::db::source_batch_dataset::HIDDEN_COLUMN))
+                            || key == crate::db::source_batch_dataset::HIDDEN_COLUMN
+                            || key == crate::db::source_batch_dataset::PAYLOAD_COLUMN))
             }) {
                 return Err(ApplyError::denied(
                     "reserved_property",
@@ -542,6 +544,7 @@ impl PreparedBatch {
                 observed_at_ms: record.observed_at_ms,
                 properties_json,
                 source_sequence: record.source_sequence,
+                payload: record.payload.clone(),
             });
         }
 
@@ -1276,7 +1279,7 @@ impl SekaiDb {
             }
         };
 
-        if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        if !source_batch_uses_delivery(&batch.contract_version) {
             preflight_cursor_and_delivery(&transaction, &binding.binding, batch)?;
         }
 
@@ -2234,7 +2237,7 @@ fn preflight_delivery_state(
     batch: &SourceBatch,
 ) -> Result<(), ApplyError> {
     let current = load_current_generation(conn, &binding.binding_id)?;
-    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+    if !source_batch_uses_delivery(&batch.contract_version) {
         if current.is_some() {
             return Err(ApplyError::denied(
                 "legacy_batch_after_v2",
@@ -2246,7 +2249,7 @@ fn preflight_delivery_state(
     let delivery = batch.delivery.as_ref().ok_or_else(|| {
         ApplyError::denied(
             "missing_delivery_metadata",
-            "v2 source batches require delivery metadata",
+            "ordered source batches require delivery metadata",
         )
     })?;
     match delivery.mode {
@@ -2377,13 +2380,12 @@ fn commit_generation_state(
     batch: &SourceBatch,
     now_ms: i64,
 ) -> Result<(), ApplyError> {
-    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+    if !source_batch_uses_delivery(&batch.contract_version) {
         return Ok(());
     }
-    let delivery = batch
-        .delivery
-        .as_ref()
-        .ok_or_else(|| ApplyError::Storage("validated v2 batch has no delivery metadata".into()))?;
+    let delivery = batch.delivery.as_ref().ok_or_else(|| {
+        ApplyError::Storage("validated ordered batch has no delivery metadata".into())
+    })?;
     match delivery.mode {
         SourceDeliveryMode::Snapshot => {
             conn.execute(
@@ -3269,8 +3271,16 @@ pub(crate) fn prepared_dataset_columns(
                 .filter(|key| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str())),
         );
     }
-    Ok(crate::db::source_batch_dataset::columns_for_property_keys(
+    let retain_payload = records.iter().any(|record| {
+        record.object.type_name == kind
+            && record
+                .payload
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+    });
+    Ok(crate::db::source_batch_dataset::columns_for_record_keys(
         keys.iter().map(|key| key.as_str()),
+        retain_payload,
     ))
 }
 
@@ -3294,6 +3304,7 @@ pub(crate) fn prepared_dataset_rows(
             &record.source_id,
             record.object.tombstoned,
             &payload,
+            record.payload.as_deref(),
         ));
     }
     Ok(rows)
@@ -3585,9 +3596,10 @@ pub mod tests {
     };
     use crate::sekai::object_sync::{
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
-        GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
-        SOURCE_GITHUB, SourceBatchStatus, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
-        SourceSyncGenerationStatus, object_id_for, source_id,
+        GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_PAYLOAD_BYTES, SOURCE_BATCH_V2_VERSION,
+        SOURCE_BATCH_V3_VERSION, SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatchStatus,
+        SourceDeliveryMode, SourceDeliveryWindow, SourceRecord, SourceSyncGenerationStatus,
+        object_id_for, source_id,
     };
 
     pub const PRODUCER: &str = "connector/github-primary";
@@ -3657,6 +3669,7 @@ pub mod tests {
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }
     }
 
@@ -4218,7 +4231,7 @@ pub mod tests {
             },
             {
                 let mut batch = batch("", "cursor:1", "batch-1");
-                batch.contract_version = "sekai.source-batch/v3".into();
+                batch.contract_version = "sekai.source-batch/v4".into();
                 (batch, PRODUCER, "unsupported_version:")
             },
             {
@@ -4689,6 +4702,7 @@ pub mod tests {
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }
     }
 
@@ -5184,6 +5198,180 @@ pub mod tests {
             Some("Bounded sync")
         );
         assert!(!object.properties.contains_key("title"));
+    }
+
+    fn v3_snapshot_with_payload(key: &str, payload: &str, deleted: bool) -> SourceBatch {
+        let mut batch = snapshot_batch("", "cursor:1", key, 1, true, Some(40));
+        batch.contract_version = SOURCE_BATCH_V3_VERSION.into();
+        batch.records[0].deleted = deleted;
+        batch.records[0].payload = Some(payload.into());
+        batch.records[0].payload_digest =
+            format!("sha256:{:x}", Sha256::digest(payload.as_bytes()));
+        redigest(&mut batch);
+        batch
+    }
+
+    fn sqlite_dataset_row_maps(db: &RuntimeDb, dataset_id: &str) -> Vec<HashMap<String, String>> {
+        let RuntimeDb::Sqlite(db) = db else {
+            panic!("expected sqlite runtime");
+        };
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare("SELECT data FROM sekai_dataset_rows WHERE dataset_id=?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![dataset_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|data| serde_json::from_str(&data.unwrap()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn mapping_adds_property_from_retained_payload_on_full_rebuild() {
+        let payload = r#"{"state":"open","title":"Bounded sync","body":"from payload"}"#;
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("payload-map", payload, false),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert!(!object.properties.contains_key("body"));
+        let mut datasource = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .expect("auto-registered datasource");
+        datasource
+            .property_mapping
+            .insert("body".into(), "body".into());
+        db.register_object_type_datasource(&datasource, 200)
+            .unwrap();
+        db.apply_object_type_index("acme", "Issue", true, 300)
+            .unwrap();
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            members[0]
+                .properties
+                .get("body")
+                .and_then(crate::sekai::object_schema::PropertyValue::as_str),
+            Some("from payload")
+        );
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert_eq!(
+            object.properties.get("body").map(String::as_str),
+            Some("from payload")
+        );
+    }
+
+    #[test]
+    fn oversize_payload_is_refused_without_truncation() {
+        let payload = "x".repeat(MAX_SOURCE_PAYLOAD_BYTES + 1);
+        let db = RuntimeDb::memory();
+        let error = db
+            .apply_source_batch(
+                &v3_snapshot_with_payload("payload-oversize", &payload, false),
+                PRODUCER,
+                100,
+            )
+            .unwrap_err();
+        assert!(error.starts_with("payload_bounds:"), "{error}");
+        assert!(!error.contains("truncat"));
+        assert!(
+            db.get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hidden_record_payload_is_not_readable_through_visible_calls() {
+        let payload = r#"{"state":"open","title":"Bounded sync","extra":"hidden-payload-xyz"}"#;
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("payload-hidden", payload, true),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert!(members.is_empty());
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert!(
+            !object
+                .properties
+                .values()
+                .any(|value| value.contains("hidden-payload-xyz"))
+        );
+        assert!(!object.properties.contains_key("source_payload"));
+        assert!(!object.properties.contains_key("extra"));
+        let mapping = db
+            .get_object_type_datasource("acme", "Issue")
+            .unwrap()
+            .unwrap()
+            .property_mapping;
+        assert!(!mapping.contains_key("source_payload"));
+    }
+
+    #[test]
+    fn deleting_the_landed_row_removes_the_payload() {
+        let payload = r#"{"state":"open","title":"Bounded sync","body":"delete-me-payload"}"#;
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("payload-delete", payload, false),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        let dataset_id =
+            crate::db::source_batch_dataset::binding_dataset_id(&state.binding.binding_id, "Issue");
+        let rows = sqlite_dataset_row_maps(&db, &dataset_id);
+        assert!(rows.iter().any(
+            |row| row.get(crate::db::source_batch_dataset::PAYLOAD_COLUMN)
+                == Some(&payload.to_string())
+        ));
+        let RuntimeDb::Sqlite(sqlite) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        sqlite
+            .conn()
+            .execute(
+                "DELETE FROM sekai_dataset_rows WHERE dataset_id=?1",
+                params![dataset_id],
+            )
+            .unwrap();
+        assert!(sqlite_dataset_row_maps(&db, &dataset_id).is_empty());
+        let remaining: i64 = sqlite
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_dataset_rows WHERE data LIKE ?1",
+                params!["%delete-me-payload%"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        assert!(
+            !object
+                .properties
+                .values()
+                .any(|value| value.contains("delete-me-payload"))
+        );
     }
 
     #[test]
@@ -5875,6 +6063,17 @@ pub mod tests {
         redigest(&mut hidden_batch);
         assert_eq!(
             PreparedBatch::new(&hidden_batch, &SourceBatchMapper::Github)
+                .unwrap_err()
+                .code(),
+            Some("reserved_property")
+        );
+        let mut payload_batch = batch("", "cursor:1", "reserved-payload");
+        payload_batch.records[0]
+            .properties
+            .insert("source_payload".into(), "forged".into());
+        redigest(&mut payload_batch);
+        assert_eq!(
+            PreparedBatch::new(&payload_batch, &SourceBatchMapper::Github)
                 .unwrap_err()
                 .code(),
             Some("reserved_property")

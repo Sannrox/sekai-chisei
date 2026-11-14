@@ -394,6 +394,7 @@ mod tests {
             deleted,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }
     }
 
@@ -411,6 +412,7 @@ mod tests {
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         }
     }
 

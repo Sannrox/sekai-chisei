@@ -28,6 +28,7 @@ fn synthetic(source: &str, kind: &str, key: &str, version: &str, title: &str) ->
         deleted: false,
         observed_at_ms: 10,
         source_sequence: None,
+        payload: None,
     }
 }
 
@@ -67,6 +68,7 @@ fn two_local_kinds_do_not_collide_with_each_other_or_github() {
             deleted: false,
             observed_at_ms: 10,
             source_sequence: None,
+            payload: None,
         },
         GITHUB_OBJECT_SYNC_TYPE_DIGEST,
     ) {

@@ -1234,6 +1234,7 @@ pub(super) fn from_proto_source_batch(
                     deleted: record.deleted,
                     observed_at_ms: record.observed_at_ms,
                     source_sequence: record.source_sequence,
+                    payload: record.payload,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?,

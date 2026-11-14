@@ -6,11 +6,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::sekai::dataset::ColumnDef;
-use crate::sekai::object_type_index::{CONTRACT_VERSION, ObjectTypeDatasource};
+use crate::sekai::object_type_index::{
+    CONTRACT_VERSION, ObjectTypeDatasource, SOURCE_PAYLOAD_COLUMN,
+};
 use crate::sekai::schema::default_property_classification;
 
 pub const KEY_COLUMN: &str = "source_id";
 pub const HIDDEN_COLUMN: &str = "hidden";
+pub const PAYLOAD_COLUMN: &str = SOURCE_PAYLOAD_COLUMN;
 pub const DATASET_ID_PREFIX: &str = "srcds:";
 
 pub fn binding_dataset_id(binding_id: &str, kind: &str) -> String {
@@ -34,9 +37,19 @@ pub fn dataset_name(source_instance: &str, kind: &str) -> String {
 }
 
 pub fn columns_for_property_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Vec<ColumnDef> {
+    columns_for_record_keys(keys, false)
+}
+
+pub fn columns_for_record_keys<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+    retain_payload: bool,
+) -> Vec<ColumnDef> {
     let mut names = BTreeSet::new();
     names.insert(KEY_COLUMN.to_string());
     names.insert(HIDDEN_COLUMN.to_string());
+    if retain_payload {
+        names.insert(PAYLOAD_COLUMN.to_string());
+    }
     for key in keys {
         if !key.is_empty() {
             names.insert(key.to_string());
@@ -56,6 +69,7 @@ pub fn row_for_record(
     source_id: &str,
     tombstoned: bool,
     properties: &BTreeMap<String, crate::sekai::object_schema::PropertyValue>,
+    payload: Option<&str>,
 ) -> HashMap<String, String> {
     let mut row = HashMap::new();
     row.insert(KEY_COLUMN.into(), source_id.to_string());
@@ -63,8 +77,11 @@ pub fn row_for_record(
         HIDDEN_COLUMN.into(),
         if tombstoned { "1".into() } else { "0".into() },
     );
+    if let Some(payload) = payload.filter(|value| !value.is_empty()) {
+        row.insert(PAYLOAD_COLUMN.into(), payload.to_string());
+    }
     for (key, value) in properties {
-        if key == KEY_COLUMN || key == HIDDEN_COLUMN {
+        if key == KEY_COLUMN || key == HIDDEN_COLUMN || key == PAYLOAD_COLUMN {
             continue;
         }
         row.insert(key.clone(), value.as_cell());
@@ -75,7 +92,11 @@ pub fn row_for_record(
 pub fn identity_mapping(columns: &[ColumnDef]) -> BTreeMap<String, String> {
     columns
         .iter()
-        .filter(|column| column.name != KEY_COLUMN && column.name != HIDDEN_COLUMN)
+        .filter(|column| {
+            column.name != KEY_COLUMN
+                && column.name != HIDDEN_COLUMN
+                && column.name != PAYLOAD_COLUMN
+        })
         .map(|column| (column.name.clone(), column.name.clone()))
         .collect()
 }

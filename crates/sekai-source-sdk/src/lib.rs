@@ -39,15 +39,16 @@ pub use contract::{
     ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC, GITHUB_OBJECT_SYNC_RECORD_TYPES,
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, GITHUB_OBJECT_SYNC_TYPE_REVISION, MAX_SOURCE_BATCH_RECORDS,
     MAX_SOURCE_CURSOR_BYTES, MAX_SOURCE_DISPLAY_NAME_BYTES, MAX_SOURCE_FEED_EPOCH_BYTES,
-    MAX_SOURCE_IDENTIFIER_BYTES, MAX_SOURCE_PROPERTY_KEY_BYTES, MAX_SOURCE_PROPERTY_VALUE_BYTES,
-    MAX_SOURCE_RECORD_PROPERTIES, OperationOutcome, ReplayDisposition, SOURCE_BATCH_V2_VERSION,
-    SOURCE_BATCH_VERSION, SOURCE_GITHUB, SOURCE_TYPE_REVISION_VERSION, SourceBatch,
-    SourceBatchReplayMaterial, SourceBatchResult, SourceBatchStatus, SourceBatchTransaction,
-    SourceBatchValidationError, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
-    SourceDeliveryWindow, SourceRecord, SourceRecordResult, SourceSyncGeneration,
-    SourceSyncGenerationStatus, SourceSyncState, SourceTypeRevisionDescriptor, SyncDecision,
-    SyncedObject, contains_secret_like_text, detect_identity_conflict, is_schema_drift_denial,
-    object_id_for, source_id, sync_github_record,
+    MAX_SOURCE_IDENTIFIER_BYTES, MAX_SOURCE_PAYLOAD_BYTES, MAX_SOURCE_PROPERTY_KEY_BYTES,
+    MAX_SOURCE_PROPERTY_VALUE_BYTES, MAX_SOURCE_RECORD_PROPERTIES, OperationOutcome,
+    ReplayDisposition, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_V3_VERSION, SOURCE_BATCH_VERSION,
+    SOURCE_GITHUB, SOURCE_TYPE_REVISION_VERSION, SourceBatch, SourceBatchReplayMaterial,
+    SourceBatchResult, SourceBatchStatus, SourceBatchTransaction, SourceBatchValidationError,
+    SourceBinding, SourceCheckpoint, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
+    SourceTypeRevisionDescriptor, SyncDecision, SyncedObject, contains_secret_like_text,
+    detect_identity_conflict, is_schema_drift_denial, object_id_for, source_batch_uses_delivery,
+    source_id, sync_github_record,
 };
 pub use discover::{
     ColumnProfileHint, ConnectionFailure, DescriptorDraft, DiscoveredColumn, DiscoveredRecordKind,
@@ -100,6 +101,8 @@ pub fn conformance_suite_digest() -> String {
     hasher.update(b"\n");
     hasher.update(SOURCE_BATCH_V2_VERSION.as_bytes());
     hasher.update(b"\n");
+    hasher.update(SOURCE_BATCH_V3_VERSION.as_bytes());
+    hasher.update(b"\n");
     hasher.update(SOURCE_DISCOVERY_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(include_str!("conformance.rs").as_bytes());
@@ -138,6 +141,8 @@ mod tests {
         versions_only.update(SOURCE_BATCH_VERSION.as_bytes());
         versions_only.update(b"\n");
         versions_only.update(SOURCE_BATCH_V2_VERSION.as_bytes());
+        versions_only.update(b"\n");
+        versions_only.update(SOURCE_BATCH_V3_VERSION.as_bytes());
         versions_only.update(b"\n");
         let versions_only = format!("sha256:{:x}", versions_only.finalize());
         assert_ne!(

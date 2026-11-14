@@ -15,10 +15,10 @@ use crate::domain::Object;
 use crate::sekai::audit::object_diff_changes;
 use crate::sekai::object_lineage::ObjectLineage;
 use crate::sekai::object_sync::{
-    OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch, SourceBatchResult, SourceBatchStatus,
-    SourceBatchTransaction, SourceBinding, SourceCheckpoint, SourceDeliveryMode,
-    SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus, SourceSyncState,
-    SyncDecision, SyncedObject, is_schema_drift_denial, schema_quarantine_record_reason,
+    OperationOutcome, SourceBatch, SourceBatchResult, SourceBatchStatus, SourceBatchTransaction,
+    SourceBinding, SourceCheckpoint, SourceDeliveryMode, SourceRecordResult, SourceSyncGeneration,
+    SourceSyncGenerationStatus, SourceSyncState, SyncDecision, SyncedObject,
+    is_schema_drift_denial, schema_quarantine_record_reason, source_batch_uses_delivery,
 };
 
 const SOURCE_LOCK_SEED: i64 = 665;
@@ -283,7 +283,7 @@ impl PostgresDb {
             }
         };
 
-        if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+        if !source_batch_uses_delivery(&batch.contract_version) {
             preflight_cursor_and_delivery(&mut transaction, &binding.binding, batch)?;
         }
         let open_exists: bool = transaction
@@ -1202,7 +1202,7 @@ fn preflight_delivery_state(
     batch: &SourceBatch,
 ) -> Result<(), ApplyError> {
     let current = load_current_generation(transaction, &binding.binding_id)?;
-    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+    if !source_batch_uses_delivery(&batch.contract_version) {
         if current.is_some() {
             return Err(ApplyError::denied(
                 "legacy_batch_after_v2",
@@ -1214,7 +1214,7 @@ fn preflight_delivery_state(
     let delivery = batch.delivery.as_ref().ok_or_else(|| {
         ApplyError::denied(
             "missing_delivery_metadata",
-            "v2 source batches require delivery metadata",
+            "ordered source batches require delivery metadata",
         )
     })?;
     match delivery.mode {
@@ -1346,13 +1346,13 @@ fn commit_generation_state(
     batch: &SourceBatch,
     now_ms: i64,
 ) -> Result<(), ApplyError> {
-    if batch.contract_version != SOURCE_BATCH_V2_VERSION {
+    if !source_batch_uses_delivery(&batch.contract_version) {
         return Ok(());
     }
     let delivery = batch
         .delivery
         .as_ref()
-        .ok_or_else(|| ApplyError::storage("validated v2 batch has no delivery metadata"))?;
+        .ok_or_else(|| ApplyError::storage("validated ordered batch has no delivery metadata"))?;
     let generation = delivery.sync_generation as i64;
     match delivery.mode {
         SourceDeliveryMode::Snapshot => {
