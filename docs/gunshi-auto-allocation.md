@@ -19,10 +19,10 @@ Envelope research: [279-gunshi-auto-allocation-envelope.md](research/279-gunshi-
 2. Collect advisory outcomes and suite evaluations with attributable evidence.
 3. **Promote** a candidate revision when the gate passes (CAS on `expected_revision`).
 4. **Opt in** the namespace to live auto-dispatch.
-5. Read the aligned auto-dispatch decision and receipt attributes returned by
-   **IssueGunshiRecommendations** (classified `remove`; requires
-   `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` feature) before
-   dispatching.
+5. Bind one issued `AllocationPlan` on `PlanExecution` when a durable
+   `gunshi.recommendation_issued` row already exists. There is no public
+   issuance RPC. Local `sekaictl admin governance gunshi recommend` writes
+   advisory JSON only.
 6. **Kill switch** or **rollback** to return to advisory / prior revision.
 
 Promotion enforces a 60s cooldown per namespace to reduce thrash.
@@ -33,8 +33,8 @@ Gunshi is the outer allocation stage for fleet-managed native operations. It
 does not replace Chisei planning or execute provider calls:
 
 ```text
-IssueGunshiRecommendations
-  -> allocation plans + aligned dispatch decisions and receipt attributes
+in-process record_issued_recommendations
+  -> durable gunshi.recommendation_issued rows
   -> bind one issued AllocationPlan to PlanExecution
   -> Kioku and the remaining per-operation planning steps
   -> ExecutePlanStream
@@ -45,7 +45,8 @@ Send the issuance id and the exact issued `AllocationPlan` JSON in
 `PlanExecutionRequest.gunshi_allocation`. Chisei reloads the durable issuance
 and rejects changed JSON, stale policy versions, namespace or operation
 conflicts, mismatched priorities or tools, caller route conflicts, and live
-runtime/model resolution that no longer matches the allocation.
+runtime/model resolution that no longer matches the allocation. There is no
+public issuance RPC; a local recommend bundle cannot satisfy this bind.
 
 The resulting plan and receipt retain Gunshi's allocation id, agent, policy
 version, input fingerprint, budget ceiling, maximum attempts, and human-review
@@ -56,8 +57,8 @@ feedback.
 Kioku participates at two distinct scopes: Gunshi may consult governed outcome
 evidence while choosing fleet resources, and `PlanExecution` still runs Kioku
 as per-operation context enrichment after allocation. Automatic dispatch is
-evaluated during issuance against the durable allocation policy, calibration
-scorecard, capacity envelope, and residency policy. See
+evaluated from durable `gunshi_auto` policy, calibration scorecard, capacity
+envelope, and residency policy. See
 [ADR 0015](decisions/0015-gunshi-allocation-precedes-native-planning.md).
 
 ## Receipt attributes (auto path)
@@ -82,17 +83,14 @@ Denials set `auto_dispatch=false` and `dispatch_denial_reasons`.
 - Budget may only decrease within envelopes
 - Namespace and operation-class allow-lists are explicit (no `*`)
 
-## CLI
+## CLI and console
 
 ```text
-# Start the control plane with SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
-sekaictl admin governance gunshi install-baseline --namespace <ns> --snapshot <json> --gate <json>
-sekaictl admin governance gunshi promote --namespace <ns> --candidate <json> --baseline-eval <json> --candidate-eval <json> --expected-revision <id>
-sekaictl admin governance gunshi auto-opt-in --namespace <ns> --expected-revision <id>
-sekaictl admin governance gunshi kill-switch --namespace <ns> --reason <text>
-sekaictl admin governance gunshi rollback --namespace <ns> --expected-revision <id> --reason <text>
-sekaictl admin governance gunshi allocation-status --namespace <ns>
+sekaictl admin governance gunshi recommend <input.json> --output <recommendations.json>
 ```
+
+Install, promote, opt-in, kill switch, rollback, and status live on the
+operator console Gunshi tiles. They call `gunshi_auto` in-process.
 
 ## Feedback → eval suites (#300)
 
@@ -100,9 +98,8 @@ Authorized operator choices can be promoted into append-only suites whose ids
 start with `feedback-`. Case ids are deterministic from
 `(issuance_id, allocation_id)` so promotion is idempotent. Operator rationale is
 redacted in the stored case spec; promotion is audited. API clients submit
-feedback and promote it through the `feedback` and `promote_feedback`
-operations of `SetGunshiAllocationPolicy`; these lifecycle mutations do not
-need dedicated RPCs.
+feedback and promote it through the Gunshi auto-allocation store; these
+lifecycle mutations do not need dedicated RPCs.
 
 ## Persistence
 

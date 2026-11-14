@@ -5,7 +5,9 @@
 //! and write checks as gRPC.
 
 use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus, PromoteRequest};
-use crate::chisei::gunshi_policy::{AllocationPolicySnapshot, PolicyEvaluation};
+use crate::chisei::gunshi_policy::{
+    AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
+};
 use crate::chisei::policy::Policy;
 use crate::chisei::policy_dry_run::{self, PolicyDryRunReport};
 use crate::chisei_store::{ChiseiRuntimeDb, ChiseiStore};
@@ -223,6 +225,50 @@ pub fn run_console_dry_run(
     Ok(report)
 }
 
+pub fn console_install_baseline(
+    db: &RuntimeDb,
+    principal: &str,
+    namespace: &str,
+    snapshot_json: &str,
+    gate_json: &str,
+) -> Result<NamespaceAllocationStatus, String> {
+    if !principal_can_write_namespace(db, principal, namespace)? {
+        return Err("namespace write access denied".into());
+    }
+    let snapshot: AllocationPolicySnapshot =
+        serde_json::from_str(snapshot_json).map_err(|e| format!("invalid snapshot JSON: {e}"))?;
+    let gate: PolicyEvaluationGate =
+        serde_json::from_str(gate_json).map_err(|e| format!("invalid gate JSON: {e}"))?;
+    gunshi_auto::install_baseline(
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
+        principal,
+        namespace,
+        snapshot,
+        gate,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
+pub fn console_set_auto_opt_in(
+    db: &RuntimeDb,
+    principal: &str,
+    namespace: &str,
+    opt_in: bool,
+    expected_revision: &str,
+) -> Result<NamespaceAllocationStatus, String> {
+    if !principal_can_write_namespace(db, principal, namespace)? {
+        return Err("namespace write access denied".into());
+    }
+    gunshi_auto::set_auto_opt_in(
+        &ChiseiStore::from_shared_runtime(std::sync::Arc::new(db.clone())),
+        principal,
+        namespace,
+        opt_in,
+        expected_revision,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
 pub fn console_promote(
     db: &RuntimeDb,
     principal: &str,
@@ -360,16 +406,64 @@ pub fn render_policy_page(
     let start_default = now.saturating_sub(24 * 60 * 60 * 1000);
 
     let write_forms = if view.can_write {
-        let expected = view
-            .gunshi
-            .as_ref()
-            .map(|s| s.active_revision_id.as_str())
-            .unwrap_or("");
-        format!(
-            r#"
+        let ns = escape_html(&view.namespace);
+        match &view.gunshi {
+            None => format!(
+                r#"
+<section class="panel" aria-labelledby="install-heading">
+  <h2 id="install-heading">Install allocation baseline</h2>
+  <p class="meta">Requires write access, explicit confirm, snapshot JSON, and evaluation gate JSON. Baseline install forces advisory dispatch.</p>
+  <form method="post" action="/console/n/{ns}/policy/install">
+    <label><input type="checkbox" name="confirm" value="1" required> I confirm install for {ns}</label>
+    <label for="snapshot_json">Baseline snapshot JSON</label>
+    <textarea id="snapshot_json" name="snapshot_json" rows="6" required></textarea>
+    <label for="gate_json">Evaluation gate JSON</label>
+    <textarea id="gate_json" name="gate_json" rows="4" required></textarea>
+    <button type="submit">Install baseline</button>
+  </form>
+</section>"#,
+                ns = ns,
+            ),
+            Some(status) => {
+                let expected = escape_html(&status.active_revision_id);
+                let opt_in_form = if status.auto_opt_in {
+                    format!(
+                        r#"
+<section class="panel" aria-labelledby="optin-heading">
+  <h2 id="optin-heading">Auto-dispatch opt-in</h2>
+  <form method="post" action="/console/n/{ns}/policy/auto-opt-in">
+    <label><input type="checkbox" name="confirm" value="1" required> I confirm opting {ns} out of auto-dispatch</label>
+    <input type="hidden" name="opt_in" value="0">
+    <label for="opt_expected">Expected revision</label>
+    <input id="opt_expected" name="expected_revision" type="text" value="{expected}" required>
+    <button type="submit">Opt out</button>
+  </form>
+</section>"#,
+                        ns = ns,
+                        expected = expected,
+                    )
+                } else {
+                    format!(
+                        r#"
+<section class="panel" aria-labelledby="optin-heading">
+  <h2 id="optin-heading">Auto-dispatch opt-in</h2>
+  <form method="post" action="/console/n/{ns}/policy/auto-opt-in">
+    <label><input type="checkbox" name="confirm" value="1" required> I confirm opting {ns} into auto-dispatch</label>
+    <input type="hidden" name="opt_in" value="1">
+    <label for="opt_expected">Expected revision</label>
+    <input id="opt_expected" name="expected_revision" type="text" value="{expected}" required>
+    <button type="submit">Opt in</button>
+  </form>
+</section>"#,
+                        ns = ns,
+                        expected = expected,
+                    )
+                };
+                format!(
+                    r#"
 <section class="panel" aria-labelledby="promote-heading">
   <h2 id="promote-heading">Promote allocation policy</h2>
-  <p class="meta">Requires write access, explicit confirm, and eval-gated JSON matching <code>sekaictl admin governance gunshi promote</code>.</p>
+  <p class="meta">Requires write access, explicit confirm, and eval-gated candidate JSON.</p>
   <form method="post" action="/console/n/{ns}/policy/promote">
     <label><input type="checkbox" name="confirm" value="1" required> I confirm promote for {ns}</label>
     <label for="expected_revision">Expected revision</label>
@@ -393,12 +487,17 @@ pub fn render_policy_page(
     <input id="rb_reason" name="reason" type="text" required>
     <button type="submit">Rollback</button>
   </form>
-</section>"#,
-            ns = escape_html(&view.namespace),
-            expected = escape_html(expected),
-        )
+</section>
+{opt_in}
+"#,
+                    ns = ns,
+                    expected = expected,
+                    opt_in = opt_in_form,
+                )
+            }
+        }
     } else {
-        r#"<p class="stub">Promote/rollback require namespace editor/admin write access.</p>"#
+        r#"<p class="stub">Gunshi allocation mutations require namespace editor/admin write access.</p>"#
             .into()
     };
 
@@ -406,7 +505,7 @@ pub fn render_policy_page(
         r#"
 <section class="panel" aria-labelledby="policy-heading">
   <h1 id="policy-heading">Policy workspace</h1>
-  <p>Namespace <strong>{ns}</strong>. Inspect effective policy, dry-run a candidate route policy, and promote/rollback Gunshi allocations with confirmation.</p>
+  <p>Namespace <strong>{ns}</strong>. Inspect effective policy, dry-run a candidate route policy, and install/promote/rollback Gunshi allocations with confirmation.</p>
   {flash}
   <h2>Effective summary</h2>
   <ul>
@@ -569,7 +668,75 @@ mod tests {
         };
         let html = render_policy_page(&view, Some(&empty_report), None);
         assert!(html.contains("Dry-run result"));
-        assert!(html.contains("Promote allocation policy"));
+        assert!(html.contains("Install allocation baseline"));
+        assert!(!html.contains("Promote allocation policy"));
         assert!(!html.contains("beta"));
+    }
+
+    #[test]
+    fn install_baseline_then_opt_in_requires_a_promoted_revision() {
+        let db = test_db();
+        crate::chisei_store::apply_chisei_schema(&db);
+        seed_ns(&db, "alpha", "alice", Role::Editor);
+        let snapshot = serde_json::json!({
+            "revision_id": "rev-1",
+            "governance_policy_version": "governance-v1",
+            "dispatch": {
+                "policy_id": "auto-low-risk",
+                "version": "rev-1",
+                "governance_policy_version": "governance-v1",
+                "enabled": false,
+                "allowed_namespaces": ["alpha"],
+                "allowed_operation_classes": ["triage"],
+                "maximum_risk": "low",
+                "maximum_budget_usd_micros": 10_000,
+                "maximum_attempts": 1,
+                "require_governed_evidence": false,
+                "maximum_evidence_age_ms": 0,
+                "minimum_evidence_score": 0.0,
+                "minimum_advisory_comparisons": 1,
+                "minimum_observed_outcomes": 1,
+                "minimum_operator_acceptance_rate": 0.0
+            },
+            "optimization": {
+                "policy_id": "balanced",
+                "version": "rev-1",
+                "maximum_best_of_n": 2,
+                "maximum_fallbacks": 1,
+                "early_stop_quality": 0.8,
+                "speculative_uncertainty_threshold": 0.2,
+                "human_review_uncertainty_threshold": 0.4,
+                "maximum_human_attention_minutes": 5
+            }
+        });
+        let gate = serde_json::json!({
+            "gate_id": "fleet-promotion",
+            "version": "1",
+            "suite_id": "fleet-eval",
+            "minimum_samples": 1,
+            "minimum_success_rate": 0.0,
+            "minimum_operator_acceptance_rate": 0.0,
+            "minimum_mean_quality": 0.0,
+            "maximum_quality_regression": 1.0,
+            "maximum_cost_per_success_usd_micros": 1000000.0,
+            "maximum_cost_increase_usd_micros": 1000000.0,
+            "maximum_p95_latency_ms": 1000000.0,
+            "maximum_latency_increase_ms": 1000000.0
+        });
+        let status = console_install_baseline(
+            &db,
+            "alice",
+            "alpha",
+            &snapshot.to_string(),
+            &gate.to_string(),
+        )
+        .unwrap();
+        assert_eq!(status.active_revision_id, "rev-1");
+        let view = load_effective_policy_view(&db, "alice", "alpha").unwrap();
+        let html = render_policy_page(&view, None, None);
+        assert!(html.contains("Promote allocation policy"));
+        assert!(html.contains("Auto-dispatch opt-in"));
+        let err = console_set_auto_opt_in(&db, "alice", "alpha", true, "rev-1").unwrap_err();
+        assert!(err.contains("rollback snapshot") || err.contains("dispatch.enabled"));
     }
 }

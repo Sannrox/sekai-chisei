@@ -2949,51 +2949,6 @@
     },
     {
       "service": "ChiseiService",
-      "rpc": "ListKiokuCandidates",
-      "storage_path": "chisei.learning",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "ReviewKiokuMemory",
-      "storage_path": "chisei.learning",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "IssueGunshiRecommendations",
-      "storage_path": "chisei.learning, chisei.execution",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "SetGunshiAllocationPolicy",
-      "storage_path": "chisei.learning",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "GetGunshiAllocationStatus",
-      "storage_path": "chisei.learning",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
       "rpc": "ClaimGatewayDispatch",
       "storage_path": "gateway.governance, chisei.execution",
       "real_backend": "yes",
@@ -3035,24 +2990,6 @@
       "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "RunLookupFirstPromotionGate",
-      "storage_path": "chisei.evaluation",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "GetSampleObservation",
-      "storage_path": "chisei.observations",
-      "real_backend": "yes",
-      "consumer": "none",
-      "classification": "remove",
       "product_tier": "experimental"
     }
   ]

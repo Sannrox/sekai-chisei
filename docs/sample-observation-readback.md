@@ -1,35 +1,9 @@
-# Sample observation readback
+# Sample observation recording
 
 Sample observations are admitted internally through `put_sample_observation`
 during trusted `RecordUsage` and execution-lifecycle scoring. There is no
-public `RecordSampleObservation` RPC.
+public write or read RPC for this queue.
 
-A bounded readback is available through `GetSampleObservation` for the same
-service principals that are authorized for telemetry admission. That RPC is
-classified `remove` and is rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature is enabled. Non-`root`/`local` service
-principals must also hold a viewer grant on the requested namespace boundary.
-
-The request names both the observation `request_id` and its `namespace`. Chisei
-matches both identifiers exactly, preserving the existing v1 write and
-idempotency semantics; clients should use canonical identifiers without
-surrounding whitespace. It returns a non-sensitive projection containing:
-
-- the request and namespace identities;
-- a deterministic `sha256:` digest of the non-sensitive readback projection;
-- `recorded` state;
-- the original observation timestamp; and
-- the read timestamp.
-
-The RPC never returns the specification, model output, prompt, credentials,
-or provider diagnostics. After namespace authorization, a namespace mismatch
-and an absent observation both return `NOT_FOUND`, preventing cross-namespace
-enumeration. An unauthorized service principal receives `PERMISSION_DENIED`
-before the row query. The readback is a view of the bounded scoring-admission
-queue: after the scoring worker compacts a consumed row, the read returns
-`NOT_FOUND` rather than claiming historical evidence that is no longer present
-in this surface. Durable scored evidence is owned by the evaluation and
-receipt records.
-
-Recording and reading are separate authorization checks: a telemetry writer
-does not automatically receive namespace read access.
+The bounded scoring-admission row is an internal worker input. After the
+scoring worker consumes a row, it is gone from this surface. Durable scored
+evidence is owned by evaluation and receipt records.

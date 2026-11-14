@@ -38,7 +38,6 @@ use crate::chisei::receipt::{
     ReceiptEventKind, ReceiptSurface, UncoveredSurface,
 };
 use crate::chisei_store::ChiseiDecisionStore;
-use crate::composition::lookup_first;
 use crate::config::Config;
 use crate::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use crate::db::runtime_db::RuntimeDb;
@@ -61,8 +60,6 @@ mod external_action_admission;
 mod gateway_decide_lifecycle;
 mod gateway_receipt_admission;
 mod governed_subject_lifecycle;
-mod gunshi_issuance_lifecycle;
-mod kioku_candidate_governance;
 mod live_model;
 mod model_review_admission;
 mod native_execution_lifecycle;
@@ -201,15 +198,6 @@ struct EvaluationGateAssertionSnapshot {
     assert_type: String,
     #[prost(string, tag = "2")]
     value: String,
-}
-
-#[derive(serde::Serialize)]
-struct SampleObservationReadbackDigest<'a> {
-    version: &'static str,
-    request_id: &'a str,
-    namespace: &'a str,
-    state: &'a str,
-    observed_at: i64,
 }
 
 struct GatewayPipelineInput<'a> {
@@ -865,48 +853,6 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::execute_content_plan_stream(self, req).await
     }
 
-    async fn list_kioku_candidates(
-        &self,
-        req: Request<ListKiokuCandidatesRequest>,
-    ) -> Result<Response<ListKiokuCandidatesResponse>, Status> {
-        rpc_execution::list_kioku_candidates(self, req).await
-    }
-
-    async fn issue_gunshi_recommendations(
-        &self,
-        req: Request<IssueGunshiRecommendationsRequest>,
-    ) -> Result<Response<IssueGunshiRecommendationsResponse>, Status> {
-        rpc_execution::issue_gunshi_recommendations(self, req).await
-    }
-
-    async fn set_gunshi_allocation_policy(
-        &self,
-        req: Request<SetGunshiAllocationPolicyRequest>,
-    ) -> Result<Response<SetGunshiAllocationPolicyResponse>, Status> {
-        rpc_execution::set_gunshi_allocation_policy(self, req).await
-    }
-
-    async fn get_gunshi_allocation_status(
-        &self,
-        req: Request<GetGunshiAllocationStatusRequest>,
-    ) -> Result<Response<GetGunshiAllocationStatusResponse>, Status> {
-        rpc_execution::get_gunshi_allocation_status(self, req).await
-    }
-
-    async fn review_kioku_memory(
-        &self,
-        req: Request<ReviewKiokuMemoryRequest>,
-    ) -> Result<Response<ReviewKiokuMemoryResponse>, Status> {
-        rpc_execution::review_kioku_memory(self, req).await
-    }
-
-    async fn get_sample_observation(
-        &self,
-        req: Request<GetSampleObservationRequest>,
-    ) -> Result<Response<GetSampleObservationResponse>, Status> {
-        rpc_execution::get_sample_observation(self, req).await
-    }
-
     async fn report_operation_event(
         &self,
         req: Request<ReportOperationEventRequest>,
@@ -961,13 +907,6 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<GetEvaluationGateEvidenceRequest>,
     ) -> Result<Response<GetEvaluationGateEvidenceResponse>, Status> {
         rpc_execution::get_evaluation_gate_evidence(self, req).await
-    }
-
-    async fn run_lookup_first_promotion_gate(
-        &self,
-        req: Request<RunLookupFirstPromotionGateRequest>,
-    ) -> Result<Response<RunLookupFirstPromotionGateResponse>, Status> {
-        rpc_execution::run_lookup_first_promotion_gate(self, req).await
     }
 
     async fn execute_evaluation_manifest(

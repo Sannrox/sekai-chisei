@@ -4,7 +4,7 @@ use crate::chisei::evaluation_execution::{
 };
 use crate::chisei_store::{
     ChiseiBudgetStore, ChiseiDecisionStore, ChiseiEvaluationStore, ChiseiKiokuStore,
-    ChiseiObservationStore, ChiseiReceiptStore,
+    ChiseiReceiptStore,
 };
 use crate::domain::Object;
 use crate::sekai::security::{Grant, Role};
@@ -105,132 +105,6 @@ fn prepared_messages_do_not_add_an_empty_spec_message() {
         build_prepared_messages(&input, ""),
         vec![user_message("conversation context")]
     );
-}
-
-#[tokio::test]
-async fn gunshi_issuance_rejects_an_empty_authorization_scope() {
-    let svc = memory_service();
-    let input = serde_json::json!({
-        "contract_version": crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION,
-        "request": {
-            "capacity": {
-                "captured_at_ms": 1,
-                "policy_version": "policy",
-                "agents": [],
-                "model_profiles": [],
-                "budget_remaining_usd_micros": 0,
-                "max_parallel_attempts": 0,
-                "human_attention_minutes": 0
-            },
-            "operations": [],
-            "strategy": {
-                "strategy_id": "baseline",
-                "version": "1",
-                "baseline": "conservative"
-            }
-        },
-        "advisory_policy": {
-            "max_memory_age_ms": 0,
-            "min_score": 0.0,
-            "max_evidence_references": 1
-        },
-        "kioku_evidence": []
-    });
-    let mut request = Request::new(IssueGunshiRecommendationsRequest {
-        input_json: input.to_string(),
-        issuance_id: "empty-scope".into(),
-    });
-    request
-        .metadata_mut()
-        .insert("x-principal", "alice".parse().unwrap());
-
-    let error = svc.issue_gunshi_recommendations(request).await.unwrap_err();
-
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(
-        svc.db
-            .list_decisions(&Default::default())
-            .unwrap()
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn gunshi_issuance_returns_aligned_dispatch_decisions() {
-    let svc = memory_service();
-    let input = serde_json::json!({
-        "contract_version": crate::chisei::gunshi::RECOMMENDATION_INPUT_VERSION,
-        "request": {
-            "capacity": {
-                "captured_at_ms": 2_000,
-                "policy_version": "policy-v1",
-                "agents": [{
-                    "agent_id": "agent-a",
-                    "runtime": "native",
-                    "models": ["native-default"],
-                    "tools": ["search"],
-                    "operation_classes": ["triage"],
-                    "available_slots": 1,
-                    "healthy": true
-                }],
-                "model_profiles": [{
-                    "model": "native-default",
-                    "quality": 0.9,
-                    "cost_per_attempt_usd_micros": 20,
-                    "latency_ms": 30,
-                    "uncertainty": 0.1
-                }],
-                "budget_remaining_usd_micros": 40,
-                "max_parallel_attempts": 1,
-                "human_attention_minutes": 5
-            },
-            "operations": [{
-                "operation_id": "op-1",
-                "namespace": "support",
-                "operation_class": "triage",
-                "priority": 10,
-                "risk": "low",
-                "submitted_at_ms": 1_000,
-                "required_tools": ["search"],
-                "allowed_models": ["native-default"],
-                "max_attempts": 1,
-                "budget_ceiling_usd_micros": 40,
-                "acceptance_criteria": ["classified"],
-                "approval_required": false,
-                "human_attention_minutes_required": 0
-            }],
-            "strategy": {
-                "strategy_id": "priority",
-                "version": "1",
-                "baseline": "priority_first"
-            }
-        },
-        "advisory_policy": {
-            "max_memory_age_ms": 2_000,
-            "min_score": 0.5,
-            "max_evidence_references": 4
-        },
-        "kioku_evidence": []
-    });
-
-    let response = svc
-        .issue_gunshi_recommendations(Request::new(IssueGunshiRecommendationsRequest {
-            input_json: input.to_string(),
-            issuance_id: "aligned-dispatch".into(),
-        }))
-        .await
-        .unwrap()
-        .into_inner();
-    let allocation: crate::chisei::gunshi::BaselineAllocation =
-        serde_json::from_str(&response.allocation_json).unwrap();
-
-    assert_eq!(allocation.plans.len(), 1);
-    assert_eq!(response.auto_dispatch_authorization_json.len(), 1);
-    assert_eq!(response.receipt_attributes_json.len(), 1);
-    let authorization: crate::chisei::gunshi_dispatch::DispatchAuthorization =
-        serde_json::from_str(&response.auto_dispatch_authorization_json[0]).unwrap();
-    assert!(!authorization.authorized);
-    assert_eq!(authorization.operation_id, "op-1");
 }
 
 #[test]
@@ -1296,17 +1170,13 @@ fn gunshi_planning_service() -> ChiseiServiceImpl {
     )
 }
 
-fn issue_native_gunshi_plan(
-    service: &ChiseiServiceImpl,
-    issuance_id: &str,
-    policy_version: &str,
-) -> crate::chisei::gunshi::AllocationPlan {
+fn native_gunshi_plan(policy_version: &str) -> crate::chisei::gunshi::AllocationPlan {
     use crate::chisei::gunshi::{
         AgentCapacity, AllocationRequest, BaselineStrategy, CapacityEnvelope, ModelProfile,
         OperationRisk, PendingOperation, Strategy,
     };
 
-    let plan = crate::chisei::gunshi::recommend_baseline(&AllocationRequest {
+    crate::chisei::gunshi::recommend_baseline(&AllocationRequest {
         capacity: CapacityEnvelope {
             captured_at_ms: 1,
             policy_version: policy_version.into(),
@@ -1353,7 +1223,15 @@ fn issue_native_gunshi_plan(
     })
     .unwrap()
     .plans
-    .remove(0);
+    .remove(0)
+}
+
+fn issue_native_gunshi_plan(
+    service: &ChiseiServiceImpl,
+    issuance_id: &str,
+    policy_version: &str,
+) -> crate::chisei::gunshi::AllocationPlan {
+    let plan = native_gunshi_plan(policy_version);
     crate::chisei::gunshi_feedback::record_issued_recommendations(
         &service.db,
         "local",
@@ -5937,60 +5815,6 @@ fn run_test_gateway_pipeline(
 }
 
 #[tokio::test]
-async fn gunshi_scorecards_require_namespace_membership() {
-    let svc = memory_service();
-    svc.db
-        .runtime()
-        .ensure_team_namespace(
-            "acme",
-            "alice",
-            crate::sekai::security::Role::Viewer,
-            "local",
-        )
-        .unwrap();
-    let mut denied = Request::new(GetGunshiAllocationStatusRequest {
-        namespace: "acme".into(),
-    });
-    denied
-        .metadata_mut()
-        .insert("x-principal", "bob".parse().unwrap());
-    assert_eq!(
-        svc.get_gunshi_allocation_status(denied)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
-    );
-
-    let mut allowed = Request::new(GetGunshiAllocationStatusRequest {
-        namespace: "acme".into(),
-    });
-    allowed
-        .metadata_mut()
-        .insert("x-principal", "alice".parse().unwrap());
-    let scorecard: crate::chisei::gunshi::AdvisoryScorecard = serde_json::from_str(
-        &svc.get_gunshi_allocation_status(allowed)
-            .await
-            .unwrap()
-            .into_inner()
-            .scorecard_json,
-    )
-    .unwrap();
-    assert_eq!(scorecard.comparisons, 0);
-    assert!(require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme").is_err());
-    svc.db
-        .runtime()
-        .ensure_team_namespace(
-            "acme",
-            "alice",
-            crate::sekai::security::Role::Editor,
-            "local",
-        )
-        .unwrap();
-    require_namespace_write_access(svc.sekai_facts.reader(), "alice", "acme").unwrap();
-}
-
-#[tokio::test]
 async fn budget_usage_reads_are_authorized_like_set_budget_limit() {
     let svc = memory_service();
     let request = |principal: Option<&str>| {
@@ -7957,44 +7781,6 @@ async fn internal_eval_run_tracking_is_visible_to_gateway_reads() {
 #[tokio::test]
 async fn restored_read_contracts_return_bounded_projections() {
     let svc = memory_service();
-    svc.db
-        .put_sample_observation(&crate::chisei::scoring::SampleObservation {
-            request_id: "observation-1".into(),
-            namespace: "context-a".into(),
-            spec: "private spec".into(),
-            resolved_model: "native-default".into(),
-            output_content: "private output".into(),
-            sample_reason: "threshold".into(),
-            input_tokens: 1,
-            output_tokens: 2,
-            stop_reason: "stop".into(),
-            timestamp: 100,
-            scored: false,
-            task_class: "primary".into(),
-            cost_usd_micros: 3,
-        })
-        .unwrap();
-
-    let mut observation_request = Request::new(GetSampleObservationRequest {
-        request_id: "observation-1".into(),
-        namespace: "context-a".into(),
-    });
-    observation_request
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let observation = svc
-        .get_sample_observation(observation_request)
-        .await
-        .unwrap()
-        .into_inner()
-        .observation
-        .unwrap();
-    assert_eq!(observation.request_id, "observation-1");
-    assert_eq!(observation.namespace, "context-a");
-    assert_eq!(observation.state, "recorded");
-    assert_eq!(observation.observed_at, 100);
-    assert!(observation.observation_digest.starts_with("sha256:"));
-
     svc.eval
         .put_suite(crate::chisei::eval::Suite {
             id: "suite-read".into(),
@@ -8162,100 +7948,6 @@ async fn evaluation_gate_evidence_selects_latest_bound_run_and_redacts_details()
             .map(|result| (result.case_id.as_str(), result.passed))
             .collect::<Vec<_>>(),
         vec![("case-a", true), ("case-b", false)]
-    );
-}
-
-#[tokio::test]
-async fn lookup_first_promotion_gate_runs_offline_and_records_audit() {
-    let svc = memory_service();
-    lookup_first::seed_s1_fixture_graph(&shared_sekai_store(&svc.db)).unwrap();
-    svc.db
-        .runtime()
-        .ensure_team_namespace("acme", "alice", Role::Viewer, "local")
-        .unwrap();
-
-    let mut missing_source = Request::new(RunLookupFirstPromotionGateRequest {
-        contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
-        namespace: "acme".into(),
-        suite_json: include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json").into(),
-    });
-    missing_source
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    assert_eq!(
-        svc.run_lookup_first_promotion_gate(missing_source)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unauthenticated
-    );
-
-    let mut request = Request::new(RunLookupFirstPromotionGateRequest {
-        contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
-        namespace: "acme".into(),
-        suite_json: include_str!("../../tests/fixtures/lookup_first/promotion-gate-v1.json").into(),
-    });
-    request
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    request
-        .metadata_mut()
-        .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
-
-    let report = svc
-        .run_lookup_first_promotion_gate(request)
-        .await
-        .unwrap()
-        .into_inner()
-        .report
-        .unwrap();
-    assert_eq!(report.verdict, "allow");
-    assert_eq!(report.passed, 2);
-    assert_eq!(report.failed, 0);
-    assert!(!report.audit_decision_id.is_empty());
-    let decision = svc
-        .db
-        .get_decision(&report.audit_decision_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        decision.action,
-        lookup_first::LOOKUP_FIRST_GATE_AUDIT_ACTION
-    );
-    assert_eq!(decision.actor, "local");
-    assert!(!decision.evidence.contains_key("answer_json"));
-
-    let unauthorized_suite = serde_json::json!({
-        "contract_version": lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION,
-        "suite_id": "unauthorized-case-actor",
-        "namespace": "acme",
-        "cases": [{
-            "id": "inaccessible-actor",
-            "capability": crate::sekai::semantic::CAPABILITY_RESOLVE_REF,
-            "namespace": "acme",
-            "actor": "mallory",
-            "input": {"object_id": "does-not-exist"},
-            "expected_path": "model_path",
-            "expected_refusal": "incomplete"
-        }]
-    });
-    let mut unauthorized = Request::new(RunLookupFirstPromotionGateRequest {
-        contract_version: lookup_first::LOOKUP_FIRST_GATE_CONTRACT_VERSION.into(),
-        namespace: "acme".into(),
-        suite_json: unauthorized_suite.to_string(),
-    });
-    unauthorized
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    unauthorized
-        .metadata_mut()
-        .insert(AUTH_SOURCE_HEADER, "local".parse().unwrap());
-    assert_eq!(
-        svc.run_lookup_first_promotion_gate(unauthorized)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
     );
 }
 

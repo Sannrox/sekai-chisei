@@ -105,35 +105,6 @@ pub(super) fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> 
         ))
     }
 }
-pub(super) fn required_lookup_promotion_admin<T>(request: &Request<T>) -> Result<String, Status> {
-    let source = auth_source(request)
-        .ok_or_else(|| Status::unauthenticated("authenticated request source required"))?;
-    let metadata_actor = required_authenticated_actor(request)?;
-    let actor = if let Some(context) = request
-        .extensions()
-        .get::<crate::enterprise::AuthenticatedContext>()
-    {
-        if context.principal.subject != metadata_actor {
-            return Err(Status::unauthenticated(
-                "authenticated principal does not match request context",
-            ));
-        }
-        context.principal.subject.clone()
-    } else if source == "local" {
-        metadata_actor
-    } else {
-        return Err(Status::unauthenticated(
-            "authenticated request context required",
-        ));
-    };
-    if matches!(actor.as_str(), "root" | "local") {
-        Ok(actor)
-    } else {
-        Err(Status::permission_denied(
-            "evaluation mutation requires control-plane administration",
-        ))
-    }
-}
 pub(super) fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> Result<(), Status> {
     let actor = authenticated_actor(request);
     if matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
@@ -146,24 +117,6 @@ pub(super) fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> R
     } else {
         Err(Status::permission_denied(
             "evaluation reads require an authorized service principal",
-        ))
-    }
-}
-pub(super) fn require_telemetry_reader<T>(
-    request: &Request<T>,
-    config: &Config,
-) -> Result<String, Status> {
-    let actor = authenticated_actor(request);
-    let allowed = matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-        || config
-            .gateway_receipt_principals
-            .iter()
-            .any(|principal| principal == &actor);
-    if allowed {
-        Ok(actor)
-    } else {
-        Err(Status::permission_denied(
-            "telemetry readback requires an authorized service principal",
         ))
     }
 }
@@ -200,21 +153,6 @@ pub(super) fn content_version(value: &impl serde::Serialize) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-pub(super) fn sample_observation_readback_digest(
-    request_id: &str,
-    namespace: &str,
-    state: &str,
-    observed_at: i64,
-) -> String {
-    let projection = SampleObservationReadbackDigest {
-        version: "chisei.sample_observation.readback.v1",
-        request_id,
-        namespace,
-        state,
-        observed_at,
-    };
-    format!("sha256:{}", content_version(&projection))
 }
 pub(super) fn external_request_from_proto(
     request: ExternalActionRequest,
@@ -684,16 +622,6 @@ pub(super) fn require_external_project_access(
             "external-action project access denied",
         ))
     }
-}
-pub(super) fn require_team_namespace_access<T>(
-    db: &RuntimeDb,
-    facts: &dyn SekaiFactReader,
-    _config: &Config,
-    request: &Request<T>,
-    namespace: &str,
-) -> Result<(), Status> {
-    let actor = authenticated_actor(request);
-    require_team_namespace_actor_access(db, facts, &actor, namespace)
 }
 pub(super) fn require_team_namespace_actor_access(
     db: &RuntimeDb,

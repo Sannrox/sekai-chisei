@@ -51,7 +51,6 @@ impl SekaiServiceImpl {
         entries.push(expand_relations_capability(entailment));
         entries.push(retrieve_context_capability(entailment));
         entries.push(explain_derivation_capability(entailment));
-        entries.push(kioku_candidates_capability());
         // Search is stable (#2243), so discovery reports it active.
         entries.push(search_query_capability());
         entries.push(search_status_capability());
@@ -846,32 +845,6 @@ fn explain_derivation_capability(entailment: bool) -> CapabilityEntry {
         "explicit_rules_only".into(),
         "epistemic_descriptor_projection".into(),
     ];
-    entry
-}
-
-fn kioku_candidates_capability() -> CapabilityEntry {
-    let mut entry = base_capability(
-        "chisei.kioku.candidates.list".into(),
-        "List namespace-scoped Kioku candidates with their validation evidence.".into(),
-        "retrieval",
-        "chisei.ListKiokuCandidatesRequest",
-        "chisei.ListKiokuCandidatesResponse",
-    );
-    entry.required_scopes = vec!["namespace:read".into(), "memory:read".into()];
-    entry.policy_decision_points = vec![
-        "namespace_access".into(),
-        "memory_lifecycle".into(),
-        "classification".into(),
-    ];
-    entry.evidence_requirements = vec![
-        "attributable_evidence_link".into(),
-        "resolvable_source_operation".into(),
-        "candidate_validation".into(),
-    ];
-    entry.limits = vec![CapabilityLimit {
-        name: "max_results".into(),
-        value: 100,
-    }];
     entry
 }
 

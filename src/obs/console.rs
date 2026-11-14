@@ -116,12 +116,20 @@ pub fn router(state: ConsoleState) -> Router {
             post(policy_dry_run),
         )
         .route(
+            "/console/n/{namespace}/policy/install",
+            post(policy_install),
+        )
+        .route(
             "/console/n/{namespace}/policy/promote",
             post(policy_promote),
         )
         .route(
             "/console/n/{namespace}/policy/rollback",
             post(policy_rollback),
+        )
+        .route(
+            "/console/n/{namespace}/policy/auto-opt-in",
+            post(policy_auto_opt_in),
         )
         .with_state(state)
 }
@@ -1297,6 +1305,20 @@ async fn policy_dry_run(
 }
 
 #[derive(Debug, Deserialize)]
+struct InstallForm {
+    confirm: Option<String>,
+    snapshot_json: String,
+    gate_json: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoOptInForm {
+    confirm: Option<String>,
+    opt_in: String,
+    expected_revision: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PromoteForm {
     confirm: Option<String>,
     expected_revision: String,
@@ -1310,6 +1332,79 @@ struct RollbackForm {
     confirm: Option<String>,
     expected_revision: String,
     reason: String,
+}
+
+async fn policy_install(
+    State(state): State<ConsoleState>,
+    HtmlSession(session): HtmlSession,
+    Path(namespace): Path<String>,
+    Form(form): Form<InstallForm>,
+) -> Response {
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    if form.confirm.as_deref() != Some("1") {
+        return policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            "Confirmation checkbox is required for install.",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    match crate::obs::console_policy::console_install_baseline(
+        &state.db,
+        &session.principal,
+        &namespace,
+        &form.snapshot_json,
+        &form.gate_json,
+    ) {
+        Ok(_) => Redirect::to(&format!("/console/n/{namespace}/policy")).into_response(),
+        Err(error) => policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            &error,
+            StatusCode::FORBIDDEN,
+        ),
+    }
+}
+
+async fn policy_auto_opt_in(
+    State(state): State<ConsoleState>,
+    HtmlSession(session): HtmlSession,
+    Path(namespace): Path<String>,
+    Form(form): Form<AutoOptInForm>,
+) -> Response {
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    if form.confirm.as_deref() != Some("1") {
+        return policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            "Confirmation checkbox is required for auto-dispatch opt-in.",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let opt_in = form.opt_in == "1";
+    match crate::obs::console_policy::console_set_auto_opt_in(
+        &state.db,
+        &session.principal,
+        &namespace,
+        opt_in,
+        &form.expected_revision,
+    ) {
+        Ok(_) => Redirect::to(&format!("/console/n/{namespace}/policy")).into_response(),
+        Err(error) => policy_flash(
+            &state,
+            &session,
+            &namespaces,
+            &namespace,
+            &error,
+            StatusCode::FORBIDDEN,
+        ),
+    }
 }
 
 async fn policy_promote(
