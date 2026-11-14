@@ -16,7 +16,7 @@ use crate::sekai::object_type_index::{
 };
 use mikura::{
     Aggregate, Breakdown, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
-    ObjectSet, OverlayPatch, PropertyAcl, Store, VersionOrigin,
+    ObjectSet, OverlayPatch, Predicate, PropertyAcl, Store, VersionOrigin,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
@@ -299,10 +299,38 @@ pub fn should_fetch_canary_policies(
     if !config.take_sample() {
         return false;
     }
-    !matches!(
-        map_evaluate_request(descriptor, hops, aggregation, PropertyAcl::allow_all()),
-        Err(ObjectLogCompareError::Unsupported(_))
-    )
+    match map_evaluate_request(descriptor, hops, aggregation, PropertyAcl::allow_all()) {
+        Err(error @ ObjectLogCompareError::Unsupported(_)) => {
+            record_canary_outcome(&Err(error));
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Metric counting each sampled dual-read request by outcome.
+pub const CANARY_OUTCOMES_METRIC: &str = "sekai_object_log_dual_read_total";
+
+/// Label pair for a sampled canary result: `compared`, `mismatch`, `error`,
+/// or `skipped` with the reason the request could not be compared. Reasons
+/// are static, so the label set stays bounded.
+pub fn canary_outcome(result: &Result<(), ObjectLogCompareError>) -> (&'static str, &'static str) {
+    match result {
+        Ok(()) => ("compared", ""),
+        Err(ObjectLogCompareError::Unsupported(reason)) => ("skipped", reason),
+        Err(ObjectLogCompareError::GrantNarrowed) => {
+            ("skipped", "property grants narrow visibility")
+        }
+        Err(ObjectLogCompareError::Mismatch { .. }) => ("mismatch", ""),
+        Err(_) => ("error", ""),
+    }
+}
+
+/// Count one sampled canary result under [`CANARY_OUTCOMES_METRIC`].
+pub fn record_canary_outcome(result: &Result<(), ObjectLogCompareError>) {
+    let (outcome, reason) = canary_outcome(result);
+    metrics::counter!(CANARY_OUTCOMES_METRIC, "outcome" => outcome, "reason" => reason)
+        .increment(1);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,22 +384,18 @@ pub fn map_evaluate_request(
     aggregation: &ObjectSetAggregation,
     acl: PropertyAcl,
 ) -> Result<EvaluateRequest, ObjectLogCompareError> {
-    if !descriptor.property_filters.is_empty() {
-        return Err(ObjectLogCompareError::Unsupported(
-            "property filters are not expressible on the tagged object-log evaluate API",
-        ));
-    }
+    let predicate = map_root_filters(&descriptor.property_filters)?;
     if !descriptor.order_by.is_empty() {
         return Err(ObjectLogCompareError::Unsupported(
             "SQL object-set order_by is one key; the object-log sorts up to three keys",
         ));
     }
-    if !aggregation.group_by.is_empty() {
-        return Err(ObjectLogCompareError::Unsupported(
-            "SQL group_by falls back to the source key when the property is absent; the object-log uses an absent group",
-        ));
-    }
     let function = aggregation.function.to_ascii_lowercase();
+    let group_by = if aggregation.group_by.is_empty() {
+        Vec::new()
+    } else {
+        vec![aggregation.group_by.clone()]
+    };
     let uses_breakdown = matches!(function.as_str(), "min" | "max" | "avg" | "distinct");
     if function != "sum" && function != "count" && !uses_breakdown {
         return Err(ObjectLogCompareError::Unsupported(
@@ -405,24 +429,20 @@ pub fn map_evaluate_request(
     for hop in hops {
         let direction = hop.direction.trim();
         if !direction.is_empty() && !direction.eq_ignore_ascii_case("outgoing") {
+            // The indexed SQL hop path ignores direction (#2412), so it is no
+            // reference for an incoming hop yet.
             return Err(ObjectLogCompareError::Unsupported(
-                "hop direction is not expressible on the tagged object-log evaluate API",
+                "incoming hops are skipped until the indexed SQL path honours direction",
             ));
         }
     }
-    let breakdown = match function.as_str() {
-        "distinct" => Some(Breakdown {
-            group_by: Vec::new(),
-            max_groups: 0,
-            distinct: Some(sum_property.clone()),
-        }),
-        "min" | "max" | "avg" => Some(Breakdown {
-            group_by: Vec::new(),
-            max_groups: 0,
-            distinct: None,
-        }),
-        _ => None,
-    };
+    // SQL groups by root property; the log's breakdown does the same. Count
+    // and sum without grouping keep the plain top-level response.
+    let breakdown = (uses_breakdown || !group_by.is_empty()).then(|| Breakdown {
+        group_by,
+        max_groups: 0,
+        distinct: (function == "distinct").then(|| sum_property.clone()),
+    });
     Ok(EvaluateRequest {
         namespace: descriptor.namespace.clone(),
         root_kind: descriptor.kind.clone(),
@@ -441,19 +461,72 @@ pub fn map_evaluate_request(
         aggregate: Aggregate::CountAndSum,
         acl,
         breakdown,
-        // No filter, predicate, object bound, sort, or cursor. Extra
-        // aggregates use breakdown; count and sum keep the v0.1 shape.
+        predicate,
+        // No object bound, sort, or cursor.
         ..EvaluateRequest::default()
     })
 }
 
-#[derive(Debug)]
-struct SqlLogSignature {
+/// Map SQL root filters onto a log predicate when both stores provably agree.
+///
+/// The object-type index matches `eq` exactly on text cells but loosely on
+/// typed cells (a boolean `true` matches `"1"`, an integer `3` matches
+/// `"3"`), while the log compares stored strings exactly. A filter value that
+/// is neither numeric nor boolean can only match text exactly on both sides,
+/// so only those are compared. The index answers `neq` with no rows, and the
+/// log compares untyped ranges lexically where SQL compares numerically, so
+/// every other op is skipped.
+fn map_root_filters(
+    filters: &[crate::domain::PropertyFilter],
+) -> Result<Option<Predicate>, ObjectLogCompareError> {
+    let mut terms = filters
+        .iter()
+        .map(|filter| match filter.op.as_str() {
+            "eq" | "" if filter.value.parse::<f64>().is_ok() => {
+                Err(ObjectLogCompareError::Unsupported(
+                    "SQL eq coerces numeric filter values; the object-log compares strings",
+                ))
+            }
+            "eq" | "" if matches!(filter.value.as_str(), "true" | "false") => {
+                Err(ObjectLogCompareError::Unsupported(
+                    "SQL eq coerces boolean filter values; the object-log compares strings",
+                ))
+            }
+            "eq" | "" => Ok(Predicate::eq(&filter.key, &filter.value)),
+            "neq" => Err(ObjectLogCompareError::Unsupported(
+                "the object-type index answers neq with no rows",
+            )),
+            _ => Err(ObjectLogCompareError::Unsupported(
+                "SQL range filters compare numbers; the object-log compares untyped strings",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(match terms.len() {
+        0 => None,
+        1 => terms.pop(),
+        _ => Some(Predicate::And(terms)),
+    })
+}
+
+/// SQL measure over one group's paths, in the log's contribution rules.
+#[derive(Debug, Default)]
+struct SqlGroupFold {
     roots: usize,
     sum: i64,
     n: u64,
     min: Option<i64>,
     max: Option<i64>,
+}
+
+/// SQL paths folded the way the log's breakdown folds them, keyed like
+/// [`mikura::Group::key`]: empty without `group_by`, else one part that is
+/// `None` where the root lacks the property or holds `""`. SQL serves those
+/// roots under their own source key; the log puts them in one absent group.
+#[derive(Debug, Default)]
+struct SqlLogSignature {
+    roots: usize,
+    sum: i64,
+    groups: BTreeMap<Vec<Option<String>>, SqlGroupFold>,
 }
 
 /// i64 contribution table shared with mikura (ADR 0018). Values that parse as
@@ -478,11 +551,6 @@ fn sql_compare_signature(
     paths: &[Vec<&ObjectTypeIndexMember>],
     aggregation: &ObjectSetAggregation,
 ) -> Result<SqlLogSignature, ObjectLogCompareError> {
-    if !aggregation.group_by.is_empty() {
-        return Err(ObjectLogCompareError::Unsupported(
-            "SQL group_by falls back to the source key when the property is absent; the object-log uses an absent group",
-        ));
-    }
     let function = aggregation.function.to_ascii_lowercase();
     if function == "distinct" {
         return Err(ObjectLogCompareError::Unsupported(
@@ -490,40 +558,53 @@ fn sql_compare_signature(
         ));
     }
     let measure = matches!(function.as_str(), "sum" | "min" | "max" | "avg");
+    if measure && aggregation.property.is_empty() {
+        return Err(ObjectLogCompareError::Unsupported(if function == "sum" {
+            "sum compare requires aggregation.property"
+        } else {
+            "min, max, avg, and distinct compare require aggregation.property"
+        }));
+    }
     let mut roots = HashSet::new();
-    let mut sum = 0i64;
-    let mut n = 0u64;
-    let mut min = None;
-    let mut max = None;
+    let mut signature = SqlLogSignature::default();
     for path in paths {
-        if let Some(root) = path.first() {
-            roots.insert(root.source_key.as_str());
+        let Some(root) = path.first() else {
+            continue;
+        };
+        let key = if aggregation.group_by.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                root.properties
+                    .get(&aggregation.group_by)
+                    .map(|value| value.as_cell())
+                    .filter(|cell| !cell.is_empty()),
+            ]
+        };
+        let fold = signature.groups.entry(key).or_default();
+        if roots.insert(root.source_key.as_str()) {
+            fold.roots += 1;
         }
-        if measure {
-            if aggregation.property.is_empty() {
-                return Err(ObjectLogCompareError::Unsupported(if function == "sum" {
-                    "sum compare requires aggregation.property"
-                } else {
-                    "min, max, avg, and distinct compare require aggregation.property"
-                }));
+        if !measure {
+            continue;
+        }
+        let leaf = path.last().ok_or(ObjectLogCompareError::Unsupported(
+            "sum compare requires a leaf on every path",
+        ))?;
+        match leaf.properties.get(&aggregation.property) {
+            None if function == "sum" => {
+                return Err(ObjectLogCompareError::Unsupported(
+                    "sum property missing on a hop leaf; refusing vacuous compare",
+                ));
             }
-            let leaf = path.last().ok_or(ObjectLogCompareError::Unsupported(
-                "sum compare requires a leaf on every path",
-            ))?;
-            match leaf.properties.get(&aggregation.property) {
-                None if function == "sum" => {
-                    return Err(ObjectLogCompareError::Unsupported(
-                        "sum property missing on a hop leaf; refusing vacuous compare",
-                    ));
-                }
-                None => {}
-                Some(raw) => {
-                    if let Some(amount) = contributing_i64(&raw.as_cell())? {
-                        sum = sum.wrapping_add(amount);
-                        n += 1;
-                        min = Some(min.map_or(amount, |seen: i64| seen.min(amount)));
-                        max = Some(max.map_or(amount, |seen: i64| seen.max(amount)));
-                    }
+            None => {}
+            Some(raw) => {
+                if let Some(amount) = contributing_i64(&raw.as_cell())? {
+                    signature.sum = signature.sum.wrapping_add(amount);
+                    fold.sum = fold.sum.wrapping_add(amount);
+                    fold.n += 1;
+                    fold.min = Some(fold.min.map_or(amount, |seen: i64| seen.min(amount)));
+                    fold.max = Some(fold.max.map_or(amount, |seen: i64| seen.max(amount)));
                 }
             }
         }
@@ -533,13 +614,8 @@ fn sql_compare_signature(
             "path multiplicity is not expressible on the tagged object-log evaluate API",
         ));
     }
-    Ok(SqlLogSignature {
-        roots: roots.len(),
-        sum,
-        n,
-        min,
-        max,
-    })
+    signature.roots = roots.len();
+    Ok(signature)
 }
 
 /// One evaluated kind as the dual-read canary sees it: its active policy, the
@@ -656,42 +732,41 @@ fn compare_sql_to_log_with_cache(
             .map_err(|error| format!("{error:?}"))
     }) {
         Ok(log) => log,
-        Err(error) if matches!(function.as_str(), "min" | "max") && error.contains("Overflow") => {
+        // The breakdown checks its exact sum in i64 for every function; SQL
+        // aggregates in f64 and has no such bound, so a valid SQL answer is
+        // skipped rather than refused.
+        Err(error) if error.contains("Overflow") => {
             return Err(ObjectLogCompareError::Unsupported(
-                "SQL min/max do not share the object-log checked average overflow",
+                "SQL aggregates do not share the object-log checked breakdown overflow",
+            ));
+        }
+        Err(error) if error.contains("TooManyGroups") => {
+            return Err(ObjectLogCompareError::Unsupported(
+                "SQL groups exceed the object-log breakdown bound",
             ));
         }
         Err(error) => return Err(ObjectLogCompareError::Evaluate(error)),
     };
     let sql = sql_compare_signature(sql_paths, aggregation)?;
-    let matched = match function.as_str() {
-        "count" => sql.roots == log.two_hop_count,
-        "sum" => {
-            sql.roots == log.two_hop_count
-                && (request.sum_property.is_empty() || sql.sum == log.sum_amount)
-        }
-        "min" | "max" | "avg" => {
-            if sql.roots == 0 && log.two_hop_count == 0 && log.groups.is_empty() {
-                true
-            } else {
-                match log.groups.first().filter(|_| log.groups.len() == 1) {
-                    Some(group) => {
-                        let aggregate_matches = match function.as_str() {
-                            "min" => sql.min == group.min,
-                            "max" => sql.max == group.max,
-                            "avg" => (sql.sum, sql.n) == group.avg,
-                            _ => false,
-                        };
-                        sql.roots == log.two_hop_count
-                            && sql.roots == group.count
-                            && aggregate_matches
-                    }
-                    None => false,
-                }
+    let matched = sql.roots == log.two_hop_count
+        && match &request.breakdown {
+            None => request.sum_property.is_empty() || sql.sum == log.sum_amount,
+            Some(_) => {
+                log.groups.len() == sql.groups.len()
+                    && log.groups.iter().all(|group| {
+                        sql.groups.get(&group.key).is_some_and(|fold| {
+                            fold.roots == group.count
+                                && match function.as_str() {
+                                    "sum" => fold.sum == group.sum,
+                                    "min" => fold.min == group.min,
+                                    "max" => fold.max == group.max,
+                                    "avg" => (fold.sum, fold.n) == group.avg,
+                                    _ => true,
+                                }
+                        })
+                    })
             }
-        }
-        _ => false,
-    };
+        };
     if matched {
         return Ok(());
     }
@@ -2649,31 +2724,38 @@ mod tests {
     }
 
     #[test]
-    fn filters_fail_closed_instead_of_dropping() {
-        let descriptor = ObjectSetDescriptor {
-            kind: "Customer".into(),
-            property_filters: vec![crate::domain::PropertyFilter {
-                key: "region".into(),
-                op: "eq".into(),
-                value: "eu".into(),
-            }],
-            ..ObjectSetDescriptor::default()
+    fn filters_map_only_where_both_stores_agree() {
+        let filter = |op: &str, value: &str| crate::domain::PropertyFilter {
+            key: "region".into(),
+            op: op.into(),
+            value: value.into(),
         };
-        let err = map_evaluate_request(
-            &descriptor,
-            &[crate::sekai::object_set::ObjectSetTraversal {
-                far_kind: "Order".into(),
-                join_property: "customer_id".into(),
-                ..Default::default()
-            }],
-            &ObjectSetAggregation {
-                function: "count".into(),
-                ..Default::default()
-            },
-            PropertyAcl::allow_all(),
-        )
-        .unwrap_err();
-        assert!(matches!(err, ObjectLogCompareError::Unsupported(_)));
+        assert_eq!(
+            map_root_filters(&[filter("eq", "eu")]).unwrap(),
+            Some(Predicate::eq("region", "eu"))
+        );
+        assert_eq!(
+            map_root_filters(&[filter("", "eu"), filter("eq", "north")]).unwrap(),
+            Some(Predicate::And(vec![
+                Predicate::eq("region", "eu"),
+                Predicate::eq("region", "north"),
+            ]))
+        );
+        for (op, value, reason) in [
+            ("eq", "3", "numeric"),
+            ("eq", "1.5", "numeric"),
+            ("eq", "true", "boolean"),
+            ("neq", "eu", "neq"),
+            ("gte", "3", "range"),
+            ("lt", "3", "range"),
+            ("contains", "eu", "range"),
+        ] {
+            let err = map_root_filters(&[filter("eq", "eu"), filter(op, value)]).unwrap_err();
+            assert!(
+                matches!(err, ObjectLogCompareError::Unsupported(text) if text.contains(reason)),
+                "{op} {value}"
+            );
+        }
     }
 
     #[test]
@@ -2720,7 +2802,7 @@ mod tests {
     }
 
     #[test]
-    fn group_by_path_multiplicity_and_non_i64_sum_fail_closed() {
+    fn path_multiplicity_and_non_i64_sum_fail_closed() {
         let aggregation = ObjectSetAggregation {
             function: "sum".into(),
             property: "amount".into(),
@@ -2729,10 +2811,17 @@ mod tests {
         let customer = member("Customer", "c1", "region", "eu");
         let order = member("Order", "o1", "customer_id", "c1");
         let shipment = member("Shipment", "s1", "amount", "10");
-        let err =
-            sql_compare_signature(&[vec![&customer, &order, &shipment]], &aggregation).unwrap_err();
+        let extra = member("Shipment", "s2", "amount", "5");
+        let err = sql_compare_signature(
+            &[
+                vec![&customer, &order, &shipment],
+                vec![&customer, &order, &extra],
+            ],
+            &aggregation,
+        )
+        .unwrap_err();
         assert!(
-            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("group_by"))
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("multiplicity"))
         );
 
         let no_group = ObjectSetAggregation {
@@ -3060,44 +3149,98 @@ mod tests {
     }
 
     #[test]
-    fn fixture_group_by_and_h1_refuse_absent_key_fallback() {
+    fn fixture_group_by_matches_including_the_absent_group() {
+        let (_dir, log) = seed_shop_log("fixture-group-by.mikura");
+        let orders = shop_visible_orders();
+        // `region` is absent on every order and `owner` on some, so both
+        // exercise SQL's per-root source-key fallback against the log's one
+        // absent group.
         for group_by in ["status", "owner", "region"] {
-            let err = map_evaluate_request(
-                &shop_order_descriptor(),
-                &[],
-                &ObjectSetAggregation {
-                    function: "sum".into(),
-                    property: "amount".into(),
+            for (function, property) in [
+                ("count", ""),
+                ("sum", "amount"),
+                ("min", "amount"),
+                ("max", "amount"),
+                ("avg", "amount"),
+            ] {
+                let aggregation = ObjectSetAggregation {
+                    function: function.into(),
+                    property: property.into(),
                     group_by: group_by.into(),
-                },
+                };
+                compare_shop(&log, &aggregation, &orders, shop_view())
+                    .unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
+            }
+        }
+
+        // One root moved between groups keeps every total equal; only the
+        // per-group compare can see it.
+        let mut moved = orders.clone();
+        let open = moved
+            .iter_mut()
+            .find(|order| order.properties.get("status").is_some_and(|s| s == "open"))
+            .unwrap();
+        open.properties.insert("status".into(), "closed".into());
+        let by_status = ObjectSetAggregation {
+            function: "count".into(),
+            property: String::new(),
+            group_by: "status".into(),
+        };
+        let err = compare_shop(&log, &by_status, &moved, shop_view()).unwrap_err();
+        assert!(matches!(err, ObjectLogCompareError::Mismatch { .. }));
+    }
+
+    #[test]
+    fn fixture_eq_filter_matches_the_filtered_roots() {
+        let (_dir, log) = seed_shop_log("fixture-filter.mikura");
+        let mut descriptor = shop_order_descriptor();
+        descriptor.property_filters = vec![crate::domain::PropertyFilter {
+            key: "status".into(),
+            op: "eq".into(),
+            value: "open".into(),
+        }];
+        let orders = shop_visible_orders();
+        let open: Vec<Vec<&ObjectTypeIndexMember>> = orders
+            .iter()
+            .filter(|order| order.properties.get("status").is_some_and(|s| s == "open"))
+            .map(|order| vec![order])
+            .collect();
+        let all: Vec<Vec<&ObjectTypeIndexMember>> =
+            orders.iter().map(|order| vec![order]).collect();
+        let compare = |paths: &[Vec<&ObjectTypeIndexMember>]| {
+            let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+            compare_sql_to_log_with_cache(
+                &cache,
+                &log,
+                &descriptor,
+                &[],
+                &fixture_agg("sum", "amount"),
+                paths,
                 shop_view(),
             )
-            .unwrap_err();
-            assert!(
-                matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("absent group"))
-            );
-        }
-        let err = map_evaluate_request(
-            &ObjectSetDescriptor {
-                namespace: "shop".into(),
-                kind: "customer".into(),
-                ..ObjectSetDescriptor::default()
-            },
-            &[crate::sekai::object_set::ObjectSetTraversal {
-                far_kind: "order".into(),
-                join_property: "customer".into(),
-                ..Default::default()
-            }],
-            &ObjectSetAggregation {
-                function: "sum".into(),
-                property: "amount".into(),
-                group_by: "region".into(),
-            },
-            shop_view(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("absent group"))
+        };
+        compare(&open).unwrap();
+        // SQL that dropped the filter is a mismatch, not a pass.
+        assert!(matches!(
+            compare(&all).unwrap_err(),
+            ObjectLogCompareError::Mismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn canary_outcomes_label_every_result() {
+        assert_eq!(canary_outcome(&Ok(())), ("compared", ""));
+        assert_eq!(
+            canary_outcome(&Err(ObjectLogCompareError::Unsupported("why"))),
+            ("skipped", "why")
+        );
+        assert_eq!(
+            canary_outcome(&Err(ObjectLogCompareError::GrantNarrowed)).0,
+            "skipped"
+        );
+        assert_eq!(
+            canary_outcome(&Err(ObjectLogCompareError::Evaluate("boom".into()))),
+            ("error", "")
         );
     }
 
@@ -3125,7 +3268,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_o1_avg_overflows_and_o2_sum_wraps() {
+    fn fixture_o1_avg_overflow_skips_and_o2_sum_wraps() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("fixture-ovf.mikura");
         let mut store = Store::create(&log).unwrap();
@@ -3178,7 +3321,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, ObjectLogCompareError::Evaluate(message) if message.contains("Overflow"))
+            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("overflow"))
         );
         let err = compare_sql_to_log_with_cache(
             &cache,
@@ -3309,9 +3452,9 @@ mod tests {
         };
         let mut descriptor = canary_descriptor();
         descriptor.property_filters = vec![crate::domain::PropertyFilter {
-            key: "region".into(),
-            op: "eq".into(),
-            value: "eu".into(),
+            key: "amount".into(),
+            op: "gt".into(),
+            value: "3".into(),
         }];
         let mut policy_loads = 0u32;
         if should_fetch_canary_policies(&config, &descriptor, &canary_hops(), &canary_count(), 10) {
