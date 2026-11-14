@@ -240,8 +240,14 @@ items at the newest update time are read again by each sync until that
 time is five minutes old, so an update in the same second is not lost. Each
 page is one batch naming the Source. A title the GitHub profile refuses,
 such as secret-like text, is synced as `#number`.
-Relational Sources do not read pages yet: their syncs fail as
-`unsupported`.
+A `relational` Source pages one table after a live registered type
+descriptor: rows are ordered by a monotonic column, then the primary key.
+Each page starts after the last `(monotonic, key)` the previous page
+committed, so a runtime that dies mid-snapshot resumes without applying a
+row twice. A short page completes the scan; later syncs read rows whose
+monotonic value is greater, including updates. Credentials stay on the
+Source and never appear in a batch, receipt, or log. Connection always
+verifies TLS.
 
 The GitHub object-sync profile admits exactly one code-owned type revision:
 

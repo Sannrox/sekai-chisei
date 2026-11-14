@@ -313,7 +313,8 @@ async fn two_runtime_versions_split_the_work_during_a_rolling_deploy() {
     let (old_ran, new_ran) = tokio::join!(old.pass(), new.pass());
     let (old_ran, new_ran) = (old_ran.unwrap(), new_ran.unwrap());
     assert_eq!(old_ran.len() + new_ran.len(), 4, "each Source syncs once");
-    // Relational Sources do not read pages yet, so only GitHub reads ran.
+    // A delivery-only relational Source has no type_digest, so its sync is
+    // invalid rather than read.
     assert_eq!(
         old_runs.load(Ordering::SeqCst) + new_runs.load(Ordering::SeqCst),
         3
@@ -321,7 +322,7 @@ async fn two_runtime_versions_split_the_work_during_a_rolling_deploy() {
     let (runtime, failure, _) = plane.sync_of("orders");
     assert_eq!(
         (runtime.as_str(), failure.as_str()),
-        ("runtime-new", "unsupported")
+        ("runtime-new", "invalid")
     );
     assert!(
         old_ran

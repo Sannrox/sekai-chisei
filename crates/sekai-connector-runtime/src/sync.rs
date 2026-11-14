@@ -63,6 +63,8 @@ impl From<ConnectorFailure> for SyncFailure {
 #[derive(Debug)]
 pub struct Prepared {
     pub connector: &'static ConnectorType,
+    /// The Source's registered `source` token (`github`, `postgres.table`).
+    pub source: String,
     /// The Source's instance token, such as a GitHub `owner/repository`.
     pub source_instance: String,
     pub config: SourceConfig,
@@ -108,6 +110,7 @@ pub fn prepare(
         .map_err(|_| SyncFailure::Unavailable)?;
     Ok(Prepared {
         connector,
+        source: source.source.clone(),
         source_instance: source.source_instance.clone(),
         config,
         credentials,

@@ -167,6 +167,36 @@ pub const RELATIONAL_CONNECTOR: ConnectorType = ConnectorType {
             kind: ConfigFieldKind::Text,
             required: false,
         },
+        ConfigField {
+            name: "type_digest",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
+        ConfigField {
+            name: "record_kind",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
+        ConfigField {
+            name: "pk_columns",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
+        ConfigField {
+            name: "monotonic_column",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
+        ConfigField {
+            name: "display_column",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
+        ConfigField {
+            name: "version_column",
+            kind: ConfigFieldKind::Text,
+            required: false,
+        },
     ],
     credential_slots: &[CredentialSlot {
         name: "password",
@@ -660,6 +690,19 @@ mod tests {
             RELATIONAL_CONNECTOR.validate_config(&wrong),
             Err(ConfigError::WrongKind("table"))
         );
+
+        let mut pages = relational();
+        pages.insert(
+            "type_digest".into(),
+            text("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        pages.insert("record_kind".into(), text("Order"));
+        pages.insert("pk_columns".into(), text("id"));
+        pages.insert("monotonic_column".into(), text("updated_at"));
+        pages.insert("display_column".into(), text("name"));
+        pages.insert("version_column".into(), text("updated_at"));
+        pages.insert("table".into(), text("orders"));
+        RELATIONAL_CONNECTOR.validate_config(&pages).unwrap();
 
         for value in [
             "",

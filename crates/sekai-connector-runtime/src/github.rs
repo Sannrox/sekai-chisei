@@ -469,6 +469,7 @@ mod tests {
     fn settling(api_url: &str, settle_after_secs: i64) -> GitHub {
         let mut github = open_github(&Prepared {
             connector: &GITHUB_CONNECTOR,
+            source: "github".into(),
             source_instance: "acme/repo".into(),
             config: SourceConfig::from([("api_url".into(), ConfigValue::Text(api_url.into()))]),
             credentials: BTreeMap::from([("token".into(), Secret("t0k".into()))]),

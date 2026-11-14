@@ -2903,6 +2903,7 @@ dependencies = [
 name = "sekai-connector-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "native-tls",
  "postgres",
