@@ -219,13 +219,19 @@ pub(super) async fn put_object_type_index_edit(
             namespace: input.namespace,
             kind: input.kind,
             source_key: input.source_key,
-            properties: input.properties.into_iter().collect(),
+            properties: crate::grpc::property_map_from_proto(input.properties)?,
             hidden: input.hidden,
             action_id: input.idempotency_key,
             edited_at_ms: now_millis(),
             property_edited_at_ms: Default::default(),
         })
-        .map_err(Status::internal)?;
+        .map_err(|error| {
+            if error.starts_with("invalid_property_value:") {
+                Status::invalid_argument(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
     Ok(Response::new(PutObjectTypeIndexEditResponse {}))
 }
 

@@ -1,4 +1,4 @@
-# crate-version: 1.4.0
+# crate-version: 2.0.0
 ADAPTER_GITHUB_OBJECT_SYNC
 ADAPTER_GITHUB_OBJECT_SYNC_VERSION
 ADAPTER_REGISTERED_OBJECT_SYNC
@@ -83,6 +83,7 @@ OperationOutcome
 OutboxLimits
 PROFILE_RATIO_SCALE
 PositionFamily
+PropertyValue
 RELATIONAL_CONNECTOR
 RecordChange
 ReplayDisposition
@@ -459,7 +460,7 @@ contract::SourceRecord.display_name: String
 contract::SourceRecord.external_id: String
 contract::SourceRecord.observed_at_ms: i64
 contract::SourceRecord.payload_digest: String
-contract::SourceRecord.properties: BTreeMap<String,String>
+contract::SourceRecord.properties: BTreeMap<String,sekai_types::object_schema::PropertyValue>
 contract::SourceRecord.source: String
 contract::SourceRecord.source_instance: String
 contract::SourceRecord.source_sequence: Option<u64>
@@ -511,7 +512,7 @@ contract::SyncDecision::Upsert(SyncedObject)
 contract::SyncedObject
 contract::SyncedObject.object_id: String
 contract::SyncedObject.payload_digest: String
-contract::SyncedObject.properties: BTreeMap<String,String>
+contract::SyncedObject.properties: BTreeMap<String,sekai_types::object_schema::PropertyValue>
 contract::SyncedObject.source_id: String
 contract::SyncedObject.source_version: String
 contract::SyncedObject.tombstoned: bool
@@ -750,4 +751,3 @@ snapshot::run_snapshot<T:SourceSyncTransport,S:SnapshotPageSource>(&SourceAdapte
 source_id
 sync_github_record
 translate_github_fixture
-

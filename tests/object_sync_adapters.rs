@@ -1940,7 +1940,15 @@ fn canary_lifecycle_record(
         type_name: observation.type_name.clone(),
         display_name: observation.display_name.clone(),
         payload_digest: format!("sha256:{:x}", Sha256::digest(payload)),
-        properties,
+        properties: properties
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    sekai_chisei::sekai::object_schema::PropertyValue::from(value),
+                )
+            })
+            .collect(),
         deleted: observation.deleted,
         observed_at_ms: observation.observed_at_ms,
         source_sequence: None,

@@ -3,7 +3,8 @@ use crate::sekai::dataset::RowQuery;
 use crate::sekai::object_type_index::{
     HopProjectionAdmit, HopProjectionFence, ObjectTypeDatasource, ObjectTypeIndexEdit,
     ObjectTypeIndexMember, ObjectTypeIndexStatus, ReindexReport, admit_hop_projection_fence,
-    mapping_renames, member_from_row, overlay_member, parse_property_edit_times, schema_drift,
+    coerce_index_edit, coerce_index_member, mapping_renames, member_from_row, overlay_member,
+    parse_property_edit_times, schema_drift,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -145,11 +146,15 @@ impl PostgresDb {
     }
 
     pub fn put_object_type_index_edit(&self, edit: &ObjectTypeIndexEdit) -> Result<(), String> {
-        self.reserve_index_edit_identity(edit)?;
+        let edit = coerce_index_edit(self.get_object_type(&edit.kind)?.as_ref(), edit.clone())
+            .map_err(|error| format!("invalid_property_value: {}", error.message()))?;
+        self.reserve_index_edit_identity(&edit)?;
         let merged = crate::sekai::object_log::merge_and_apply_index_edit(
             self.get_object_type_index_edit(&edit.namespace, &edit.kind, &edit.source_key)?,
-            edit.clone(),
+            edit,
         )?;
+        let merged = coerce_index_edit(self.get_object_type(&merged.kind)?.as_ref(), merged)
+            .map_err(|error| format!("invalid_property_value: {}", error.message()))?;
         self.store_index_edit_projection(&merged)
     }
 
@@ -294,6 +299,7 @@ impl PostgresDb {
             .into_iter()
             .map(|edit| (edit.source_key.clone(), edit))
             .collect();
+        let object_type = self.get_object_type(kind)?;
         let mut members: BTreeMap<String, ObjectTypeIndexMember> = BTreeMap::new();
         if !binding.edits_only {
             for (row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
@@ -301,8 +307,11 @@ impl PostgresDb {
                     continue;
                 }
                 last_row_id = last_row_id.max(row_id);
-                let Ok(mut member) = member_from_row(&binding, &data) else {
-                    continue;
+                let mut member = match member_from_row(&binding, &data) {
+                    Ok(member) => {
+                        coerce_index_member(member.clone(), object_type.as_ref()).unwrap_or(member)
+                    }
+                    Err(_) => continue,
                 };
                 self.bind_index_member_object_id(namespace, &mut member)?;
                 members.insert(member.source_key.clone(), member);
@@ -474,8 +483,9 @@ impl PostgresDb {
             };
             let member_properties: String = member_row.get(0);
             let hidden: bool = member_row.get(1);
-            let mapped: BTreeMap<String, String> =
+            let mapped: BTreeMap<String, crate::sekai::object_schema::PropertyValue> =
                 serde_json::from_str(&member_properties).map_err(|error| error.to_string())?;
+            let mapped = crate::sekai::object_schema::properties_as_cells(&mapped);
             let Some(existing) = tx
                 .query_opt(
                     "SELECT id, kind, name, namespace, external_id, properties, created, updated
@@ -781,9 +791,13 @@ impl PostgresDb {
         if binding.edits_only || keys.is_empty() {
             return Ok(sources);
         }
+        let object_type = self.get_object_type(&binding.kind)?;
         for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
-            let Ok(member) = member_from_row(binding, &data) else {
-                continue;
+            let member = match member_from_row(binding, &data) {
+                Ok(member) => {
+                    coerce_index_member(member.clone(), object_type.as_ref()).unwrap_or(member)
+                }
+                Err(_) => continue,
             };
             if keys.contains_key(&member.source_key) {
                 sources.insert(member.source_key.clone(), member);
@@ -794,7 +808,10 @@ impl PostgresDb {
 
     fn project_log_overlays_into_edits(&self, namespace: &str, kind: &str) -> Result<(), String> {
         let keys = self.index_overlay_keys(namespace, kind)?;
+        let object_type = self.get_object_type(kind)?;
         for edit in crate::sekai::object_log::load_index_overlays(namespace, kind, &keys)? {
+            let edit = coerce_index_edit(object_type.as_ref(), edit)
+                .map_err(|error| format!("invalid_property_value: {}", error.message()))?;
             self.store_index_edit_projection(&edit)?;
         }
         Ok(())
@@ -975,7 +992,8 @@ impl PostgresDb {
         .map_err(|error| error.to_string())?;
         for member in &members {
             for (property, value) in &member.properties {
-                let digest = crate::sekai::object_type_index::join_value_digest(value);
+                let cell = value.as_cell();
+                let digest = crate::sekai::object_type_index::join_value_digest(&cell);
                 tx.execute(
                     "INSERT INTO sekai_object_type_index_join
                      (namespace, kind, property, value_digest, source_key, value)
@@ -987,7 +1005,7 @@ impl PostgresDb {
                         property,
                         &digest,
                         &member.source_key,
-                        value,
+                        &cell,
                     ],
                 )
                 .map_err(|error| error.to_string())?;

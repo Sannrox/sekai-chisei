@@ -777,7 +777,9 @@ impl SekaiServiceImpl {
             name: member.source_key.clone(),
             namespace: member.namespace.clone(),
             external_id: member.source_key.clone(),
-            properties: member.properties.clone().into_iter().collect(),
+            properties: crate::sekai::object_schema::properties_as_cells(&member.properties)
+                .into_iter()
+                .collect(),
             created: indexed_at_ms,
             updated: indexed_at_ms,
         };
@@ -1316,7 +1318,16 @@ impl SekaiServiceImpl {
             }
             for (mut member, object) in members.into_iter().zip(admitted) {
                 if let Some(object) = object {
-                    member.properties = object.properties.into_iter().collect();
+                    member.properties = object
+                        .properties
+                        .into_iter()
+                        .map(|(key, value)| {
+                            (
+                                key,
+                                crate::sekai::object_schema::PropertyValue::String(value),
+                            )
+                        })
+                        .collect();
                     visible.push(member);
                 }
                 meter.charge(0).map_err(map_object_set_error)?;
@@ -1394,14 +1405,14 @@ fn aggregate_path_row(
     let group = root
         .properties
         .get(&aggregation.group_by)
-        .cloned()
+        .map(|value| value.as_cell())
         .unwrap_or_else(|| root.source_key.clone());
     let value = if aggregation.function.eq_ignore_ascii_case("count") {
         Some(1.0)
     } else {
         leaf.properties
             .get(&aggregation.property)
-            .and_then(|raw| raw.parse().ok())
+            .and_then(|raw| raw.as_cell().parse().ok())
     };
     (group, value)
 }
@@ -1759,7 +1770,16 @@ fn index_member_from_object(
         kind: object.kind,
         source_key: object.id.clone(),
         object_id: object.id,
-        properties: object.properties.into_iter().collect(),
+        properties: object
+            .properties
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    crate::sekai::object_schema::PropertyValue::String(value),
+                )
+            })
+            .collect(),
         content_hash: String::new(),
         hidden: false,
         from_edit: false,

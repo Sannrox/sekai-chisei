@@ -1221,20 +1221,22 @@ pub(super) fn from_proto_source_batch(
         records: batch
             .records
             .into_iter()
-            .map(|record| source_sync_domain::SourceRecord {
-                source: record.source,
-                source_instance: record.source_instance,
-                external_id: record.external_id,
-                source_version: record.source_version,
-                type_name: record.type_name,
-                display_name: record.display_name,
-                payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
-                deleted: record.deleted,
-                observed_at_ms: record.observed_at_ms,
-                source_sequence: record.source_sequence,
+            .map(|record| {
+                Ok(source_sync_domain::SourceRecord {
+                    source: record.source,
+                    source_instance: record.source_instance,
+                    external_id: record.external_id,
+                    source_version: record.source_version,
+                    type_name: record.type_name,
+                    display_name: record.display_name,
+                    payload_digest: record.payload_digest,
+                    properties: crate::grpc::property_map_from_proto(record.properties)?,
+                    deleted: record.deleted,
+                    observed_at_ms: record.observed_at_ms,
+                    source_sequence: record.source_sequence,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, Status>>()?,
         delivery,
     })
 }
@@ -1331,7 +1333,11 @@ pub(super) fn to_proto_synced_object(object: &source_sync_domain::SyncedObject) 
         source_id: object.source_id.clone(),
         source_version: object.source_version.clone(),
         payload_digest: object.payload_digest.clone(),
-        properties: object.properties.clone().into_iter().collect(),
+        properties: object
+            .properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_cell()))
+            .collect(),
         tombstoned: object.tombstoned,
         type_digest: object.type_digest.clone(),
     }
@@ -1550,10 +1556,23 @@ pub(super) fn authorize_source_batch_object_policy(
             }
             authorized.push(existing.clone());
         }
-        let mut properties = record
-            .properties
+        let object_type = db
+            .get_object_type(&record.type_name)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        // Apply still refuses a new unfit batch. A committed exact replay
+        // must not fail closed on a later schema that would reject the
+        // original wire form.
+        let coerced_properties = match object_type.as_ref() {
+            Some(object_type) => crate::sekai::object_schema::coerce_properties(
+                object_type,
+                record.properties.clone(),
+            )
+            .unwrap_or_else(|_| record.properties.clone()),
+            None => record.properties.clone(),
+        };
+        let mut properties = coerced_properties
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
+            .map(|(key, value)| (key.clone(), value.as_cell()))
             .collect::<std::collections::HashMap<_, _>>();
         properties.insert("sync_source".into(), record.source.clone());
         properties.insert(
@@ -1596,11 +1615,11 @@ pub(super) fn authorize_source_batch_object_policy(
                 }
             }
             if policy.value_instance_grants_enforced() {
-                for (property, value) in &record.properties {
+                for (property, value) in &coerced_properties {
                     if !policy.allows_value_instance_access(
                         &object.id,
                         property,
-                        value,
+                        &value.as_cell(),
                         crate::sekai::object_security::PropertyGrantAccess::Write,
                     ) {
                         return Err(Status::permission_denied("access denied"));
@@ -1689,6 +1708,7 @@ pub(super) fn map_source_sync_apply_error(error: String) -> Status {
         | "invalid_feed_epoch"
         | "delivery_position_out_of_range"
         | "invalid_record" => Status::invalid_argument("invalid source batch"),
+        "invalid_property_value" => Status::invalid_argument(error),
         "storage_error" => Status::internal("source sync storage failure"),
         _ => Status::internal("source sync unavailable"),
     }

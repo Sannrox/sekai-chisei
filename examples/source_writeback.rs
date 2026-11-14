@@ -378,7 +378,7 @@ fn to_proto_batch(batch: DomainBatch) -> SourceBatch {
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
+                properties: sekai_chisei::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,

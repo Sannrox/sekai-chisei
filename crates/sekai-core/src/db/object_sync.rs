@@ -9,11 +9,14 @@ use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 use crate::domain::Object;
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 use crate::sekai::object_lineage::{ObjectLineage, bind_sync_lineage};
+use crate::sekai::object_schema::{
+    ObjectType, PropertyValue, coerce_properties, property_maps_equivalent,
+};
 use crate::sekai::object_sync::{
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, OperationOutcome, SOURCE_BATCH_V2_VERSION, SourceBatch,
     SourceBatchResult, SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint,
     SourceDeliveryMode, SourceRecordResult, SourceSyncGeneration, SourceSyncGenerationStatus,
-    SourceSyncState, SyncDecision, SyncedObject, is_schema_drift_denial,
+    SourceSyncState, SyncDecision, SyncedObject, contains_secret_like_text, is_schema_drift_denial,
     schema_quarantine_record_reason, sync_github_record,
 };
 use crate::sekai::source_type_descriptor::{
@@ -337,6 +340,105 @@ pub fn source_batch_mapper(
     ))
 }
 
+pub(crate) fn clerk_properties_from_json(
+    json: &str,
+) -> Result<HashMap<String, String>, ApplyError> {
+    let typed: BTreeMap<String, PropertyValue> =
+        serde_json::from_str(json).map_err(|error| ApplyError::Storage(error.to_string()))?;
+    Ok(typed
+        .into_iter()
+        .map(|(key, value)| (key, value.as_cell()))
+        .collect())
+}
+
+pub(crate) fn coerce_source_batch_records(
+    batch: &mut SourceBatch,
+    mut lookup: impl FnMut(&str) -> Result<Option<ObjectType>, String>,
+) -> Result<(), String> {
+    let mut cache = HashMap::new();
+    for record in &mut batch.records {
+        if !cache.contains_key(&record.type_name) {
+            let object_type = lookup(&record.type_name)?;
+            cache.insert(record.type_name.clone(), object_type);
+        }
+        if let Some(object_type) = cache.get(&record.type_name).and_then(Option::as_ref) {
+            record.properties =
+                coerce_properties(object_type, std::mem::take(&mut record.properties))
+                    .map_err(|error| format!("invalid_property_value: {error}"))?;
+            if source_properties_have_invalid_key(&record.properties) {
+                return Err(
+                    "invalid_property_key: coerced record properties contain a non-normalized key"
+                        .into(),
+                );
+            }
+            if source_properties_have_secret_key(&record.properties) {
+                return Err(
+                    "secret_like_text: coerced record properties contain a credential-like key"
+                        .into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_properties_have_invalid_key(properties: &BTreeMap<String, PropertyValue>) -> bool {
+    properties
+        .iter()
+        .any(|(key, value)| property_entry_has_invalid_key(key, value))
+}
+
+fn property_entry_has_invalid_key(key: &str, value: &PropertyValue) -> bool {
+    if !is_normalized_source_property_key(key) {
+        return true;
+    }
+    match value {
+        PropertyValue::Struct(fields) => fields
+            .iter()
+            .any(|(nested_key, nested)| property_entry_has_invalid_key(nested_key, nested)),
+        _ => false,
+    }
+}
+
+fn source_properties_have_secret_key(properties: &BTreeMap<String, PropertyValue>) -> bool {
+    properties
+        .iter()
+        .any(|(key, value)| property_entry_has_secret_key(key, value))
+}
+
+fn property_entry_has_secret_key(key: &str, value: &PropertyValue) -> bool {
+    if is_secret_property_key(key) {
+        return true;
+    }
+    match value {
+        PropertyValue::Struct(fields) => fields
+            .iter()
+            .any(|(nested_key, nested)| property_entry_has_secret_key(nested_key, nested)),
+        PropertyValue::String(text) => contains_secret_like_text(text),
+        other => contains_secret_like_text(&other.as_cell()),
+    }
+}
+
+fn is_normalized_source_property_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.trim() == key
+        && key.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-' | '.')
+        })
+}
+
+fn is_secret_property_key(key: &str) -> bool {
+    let normalized = key.replace('-', "_").to_ascii_lowercase();
+    normalized
+        .split(['.', '_'])
+        .any(|part| matches!(part, "secret" | "password" | "token" | "credential"))
+        || normalized.contains("api_key")
+        || normalized.contains("private_key")
+        || normalized.contains("authorization")
+}
+
 impl PreparedBatch {
     pub fn new(batch: &SourceBatch, mapper: &SourceBatchMapper) -> Result<Self, ApplyError> {
         Self::prepare(batch, mapper, true)
@@ -413,16 +515,22 @@ impl PreparedBatch {
             )
             .map_err(ApplyError::Storage)?;
             let mut properties = record.properties.clone();
-            properties.insert("sync_source".into(), record.source.clone());
+            properties.insert("sync_source".into(), record.source.clone().into());
             properties.insert(
                 "sync_source_instance".into(),
-                record.source_instance.clone(),
+                record.source_instance.clone().into(),
             );
-            properties.insert("sync_source_id".into(), object.source_id.clone());
-            properties.insert("sync_source_version".into(), record.source_version.clone());
-            properties.insert("sync_payload_digest".into(), record.payload_digest.clone());
-            properties.insert("sync_type_digest".into(), batch.type_digest.clone());
-            properties.insert("sync_tombstoned".into(), record.deleted.to_string());
+            properties.insert("sync_source_id".into(), object.source_id.clone().into());
+            properties.insert(
+                "sync_source_version".into(),
+                record.source_version.clone().into(),
+            );
+            properties.insert(
+                "sync_payload_digest".into(),
+                record.payload_digest.clone().into(),
+            );
+            properties.insert("sync_type_digest".into(), batch.type_digest.clone().into());
+            properties.insert("sync_tombstoned".into(), record.deleted.to_string().into());
             let properties_json = serde_json::to_string(&properties)
                 .map_err(|error| ApplyError::Storage(error.to_string()))?;
             records.push(PreparedRecord {
@@ -454,6 +562,14 @@ impl PreparedBatch {
                 .map_err(|error| ApplyError::Storage(error.to_string()))?,
             records,
         })
+    }
+
+    /// Durable recovery stores the original wire body. Coerced records are
+    /// a projection and must not rewrite `batch_json` / `batch_digest`.
+    pub fn retain_original_batch_json(&mut self, batch: &SourceBatch) -> Result<(), ApplyError> {
+        self.batch_json =
+            serde_json::to_string(batch).map_err(|error| ApplyError::Storage(error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -959,12 +1075,7 @@ impl SekaiDb {
         if now_ms <= 0 {
             return Err("invalid_timestamp: now_ms must be positive".into());
         }
-        let mapper = self
-            .source_batch_mapper(batch)
-            .map_err(|error| error.to_string())?;
-        #[cfg(test)]
-        take_after_source_batch_mapper_hook();
-        let existing = {
+        let existing_row = {
             let conn = self.conn();
             load_batch_by_key(
                 &conn,
@@ -973,9 +1084,44 @@ impl SekaiDb {
                 &batch.idempotency_key,
             )
             .map_err(|error| error.to_string())?
-            .map(|stored| stored.transaction.status)
         };
-        let prepared = PreparedBatch::for_apply(batch, &mapper, existing)
+        if let Some(stored) = existing_row.as_ref()
+            && stored.transaction.batch_digest == batch.batch_digest
+            && matches!(
+                stored.transaction.status,
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+            )
+        {
+            return parse_stored_result(stored).map_err(|error| error.to_string());
+        }
+        let matching_open = existing_row.as_ref().is_some_and(|stored| {
+            stored.transaction.batch_digest == batch.batch_digest
+                && stored.transaction.status == SourceBatchStatus::Open
+        });
+        // Durable batch_json stays the original wire form. OPEN replay retries
+        // coerce against the current schema and falls back to that wire form so
+        // crash recovery can finish; landed dataset cells stay the first
+        // successful projection.
+        let mut projected = batch.clone();
+        if let Err(error) =
+            coerce_source_batch_records(&mut projected, |kind| self.get_object_type(kind))
+        {
+            if matching_open {
+                projected = batch.clone();
+            } else {
+                return Err(error);
+            }
+        }
+        let mapper = self
+            .source_batch_mapper(&projected)
+            .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        take_after_source_batch_mapper_hook();
+        let existing = existing_row.map(|stored| stored.transaction.status);
+        let mut prepared = PreparedBatch::for_apply(&projected, &mapper, existing)
+            .map_err(|error| error.to_string())?;
+        prepared
+            .retain_original_batch_json(batch)
             .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
@@ -1333,12 +1479,7 @@ impl SekaiDb {
                     name: prepared_record.display_name.clone(),
                     namespace: batch.namespace.clone(),
                     external_id: prepared_record.source_id.clone(),
-                    properties: serde_json::from_str::<BTreeMap<String, String>>(
-                        &prepared_record.properties_json,
-                    )
-                    .map_err(|error| ApplyError::Storage(error.to_string()))?
-                    .into_iter()
-                    .collect::<HashMap<_, _>>(),
+                    properties: clerk_properties_from_json(&prepared_record.properties_json)?,
                     created: before
                         .as_ref()
                         .map(|object| object.created)
@@ -2051,7 +2192,7 @@ fn preflight_commit_state(
                             .map_err(|error| ApplyError::Storage(error.to_string()))?;
                     if identity.payload_digest != record.object.payload_digest
                         || object.name != record.display_name
-                        || stored.properties != record.object.properties
+                        || !property_maps_equivalent(&stored.properties, &record.object.properties)
                         || stored.tombstoned != record.object.tombstoned
                     {
                         return Err(ApplyError::denied(
@@ -2799,7 +2940,7 @@ fn persist_schema_quarantine(
                         .properties
                         .iter()
                         .filter(|(key, _)| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str()))
-                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .map(|(key, value)| (key.clone(), PropertyValue::String(value.clone())))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -3119,8 +3260,9 @@ pub(crate) fn prepared_dataset_columns(
         if record.object.type_name != kind {
             continue;
         }
-        let properties: BTreeMap<String, String> = serde_json::from_str(&record.properties_json)
-            .map_err(|error| ApplyError::Storage(error.to_string()))?;
+        let properties: BTreeMap<String, PropertyValue> =
+            serde_json::from_str(&record.properties_json)
+                .map_err(|error| ApplyError::Storage(error.to_string()))?;
         keys.extend(
             properties
                 .into_keys()
@@ -3141,8 +3283,9 @@ pub(crate) fn prepared_dataset_rows(
         if record.object.type_name != kind {
             continue;
         }
-        let properties: BTreeMap<String, String> = serde_json::from_str(&record.properties_json)
-            .map_err(|error| ApplyError::Storage(error.to_string()))?;
+        let properties: BTreeMap<String, PropertyValue> =
+            serde_json::from_str(&record.properties_json)
+                .map_err(|error| ApplyError::Storage(error.to_string()))?;
         let payload = properties
             .into_iter()
             .filter(|(key, _)| !RESERVED_SYNC_PROPERTIES.contains(&key.as_str()))
@@ -3437,6 +3580,9 @@ pub mod tests {
 
     use super::*;
     use crate::db::runtime_db::RuntimeDb;
+    use crate::sekai::object_schema::{
+        ObjectType, PropertyDef, PropertyType, PropertyValue, default_property_classification,
+    };
     use crate::sekai::object_sync::{
         ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
         GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_VERSION,
@@ -4897,7 +5043,10 @@ pub mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].object_id, issue_object_id());
         assert_eq!(
-            members[0].properties.get("title").map(String::as_str),
+            members[0]
+                .properties
+                .get("title")
+                .and_then(crate::sekai::object_schema::PropertyValue::as_str),
             Some("Bounded sync")
         );
         let object = db.get_object(&issue_object_id()).unwrap().unwrap();
@@ -5008,7 +5157,10 @@ pub mod tests {
             )
             .unwrap();
         assert_eq!(
-            members[0].properties.get("headline").map(String::as_str),
+            members[0]
+                .properties
+                .get("headline")
+                .and_then(crate::sekai::object_schema::PropertyValue::as_str),
             Some("Bounded sync")
         );
         assert!(!members[0].properties.contains_key("title"));
@@ -5112,6 +5264,373 @@ pub mod tests {
             stored.property_mapping.get("body").map(String::as_str),
             Some("body")
         );
+    }
+
+    fn property_def(name: &str, prop_type: PropertyType) -> PropertyDef {
+        PropertyDef {
+            name: name.into(),
+            prop_type,
+            required: false,
+            description: String::new(),
+            enum_values: if name == "status" {
+                vec!["open".into(), "closed".into()]
+            } else {
+                Vec::new()
+            },
+            link_kind: String::new(),
+            compute_expr: String::new(),
+            classification: default_property_classification(),
+            struct_fields: if name == "meta" {
+                vec![crate::sekai::object_schema::StructFieldDef {
+                    name: "label".into(),
+                    prop_type: PropertyType::String,
+                    required: true,
+                    description: String::new(),
+                    enum_values: Vec::new(),
+                }]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn apply_source_batch_coerces_typed_properties_and_refuses_unfit() {
+        let db = RuntimeDb::memory();
+        db.upsert_object_type(&ObjectType {
+            kind: "Issue".into(),
+            description: String::new(),
+            properties: vec![
+                property_def("state", PropertyType::String),
+                property_def("title", PropertyType::String),
+                property_def("count", PropertyType::Int),
+                property_def("ratio", PropertyType::Float),
+                property_def("ok", PropertyType::Bool),
+                property_def("status", PropertyType::Enum),
+                property_def("when", PropertyType::Timestamp),
+                property_def("assignee", PropertyType::Link),
+                property_def("meta", PropertyType::Struct),
+            ],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        let mut first = batch("", "cursor:1", "typed-props");
+        first.records[0]
+            .properties
+            .insert("count".into(), "12".into());
+        first.records[0]
+            .properties
+            .insert("ratio".into(), "12".into());
+        first.records[0]
+            .properties
+            .insert("ok".into(), "true".into());
+        first.records[0]
+            .properties
+            .insert("status".into(), "open".into());
+        first.records[0]
+            .properties
+            .insert("when".into(), "1970-01-01T00:00:00.100Z".into());
+        first.records[0]
+            .properties
+            .insert("assignee".into(), "user:1".into());
+        first.records[0].properties.insert(
+            "meta".into(),
+            PropertyValue::Struct(BTreeMap::from([("label".into(), "x".into())])),
+        );
+        redigest(&mut first);
+        db.apply_source_batch(&first, PRODUCER, 100).unwrap();
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        let properties = &members[0].properties;
+        assert_eq!(properties.get("count"), Some(&PropertyValue::Int(12)));
+        assert_eq!(properties.get("ratio"), Some(&PropertyValue::Float(12.0)));
+        assert_eq!(properties.get("ok"), Some(&PropertyValue::Bool(true)));
+        assert_eq!(
+            properties.get("status"),
+            Some(&PropertyValue::String("open".into()))
+        );
+        assert_eq!(properties.get("when"), Some(&PropertyValue::Int(100)));
+        assert_eq!(
+            properties.get("assignee"),
+            Some(&PropertyValue::String("user:1".into()))
+        );
+        assert_eq!(
+            properties.get("meta"),
+            Some(&PropertyValue::Struct(BTreeMap::from([(
+                "label".into(),
+                PropertyValue::String("x".into())
+            )])))
+        );
+        let RuntimeDb::Sqlite(store) = &db else {
+            panic!("expected sqlite runtime");
+        };
+        let stored_json: String = store
+            .conn()
+            .query_row(
+                "SELECT batch_json FROM sekai_source_batch_transactions
+                 WHERE idempotency_key=?1",
+                params!["typed-props"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_batch: SourceBatch = serde_json::from_str(&stored_json).unwrap();
+        assert_eq!(stored_batch.batch_digest, first.batch_digest);
+        assert_eq!(
+            stored_batch.records[0].properties.get("count"),
+            Some(&PropertyValue::String("12".into()))
+        );
+        let filtered = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery {
+                    filters: vec![crate::sekai::dataset::RowFilter {
+                        column: "count".into(),
+                        op: "gte".into(),
+                        value: "10".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        let equal = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery {
+                    filters: vec![crate::sekai::dataset::RowFilter {
+                        column: "count".into(),
+                        op: "eq".into(),
+                        value: "12".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(equal.len(), 1);
+        let integral_float = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery {
+                    filters: vec![crate::sekai::dataset::RowFilter {
+                        column: "ratio".into(),
+                        op: "eq".into(),
+                        value: "12".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(integral_float.len(), 1);
+        let truthy = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery {
+                    filters: vec![crate::sekai::dataset::RowFilter {
+                        column: "ok".into(),
+                        op: "eq".into(),
+                        value: "true".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(truthy.len(), 1);
+        let missed = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery {
+                    filters: vec![crate::sekai::dataset::RowFilter {
+                        column: "count".into(),
+                        op: "gt".into(),
+                        value: "12".into(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(missed.is_empty());
+        let mut bad = first.clone();
+        bad.idempotency_key = "typed-bad".into();
+        bad.records[0]
+            .properties
+            .insert("count".into(), "nope".into());
+        redigest(&mut bad);
+        let error = db.apply_source_batch(&bad, PRODUCER, 200).unwrap_err();
+        assert!(error.contains("count"), "{error}");
+        assert!(error.contains("invalid_property_value"), "{error}");
+        let mut secret = first.clone();
+        secret.idempotency_key = "typed-secret".into();
+        secret.current_cursor = first.proposed_next_cursor.clone();
+        secret.proposed_next_cursor = "cursor:secret".into();
+        secret.records[0].properties.insert(
+            "meta".into(),
+            PropertyValue::String(r#"{"password":"ordinary-secret","label":"x"}"#.into()),
+        );
+        redigest(&mut secret);
+        let error = db.apply_source_batch(&secret, PRODUCER, 210).unwrap_err();
+        assert!(error.contains("secret_like_text"), "{error}");
+        let mut escaped = first.clone();
+        escaped.idempotency_key = "typed-secret-escape".into();
+        escaped.current_cursor = first.proposed_next_cursor.clone();
+        escaped.proposed_next_cursor = "cursor:secret-escape".into();
+        escaped.records[0].properties.insert(
+            "meta".into(),
+            PropertyValue::String(r#"{"label":"\u0067hp_exampletokenvalue"}"#.into()),
+        );
+        redigest(&mut escaped);
+        let escaped_error = db.apply_source_batch(&escaped, PRODUCER, 220).unwrap_err();
+        assert!(
+            escaped_error.contains("secret_like_text"),
+            "{escaped_error}"
+        );
+        let mut mixed_key = first.clone();
+        mixed_key.idempotency_key = "typed-secret-password-key".into();
+        mixed_key.current_cursor = first.proposed_next_cursor.clone();
+        mixed_key.proposed_next_cursor = "cursor:secret-password-key".into();
+        mixed_key.records[0].properties.insert(
+            "meta".into(),
+            PropertyValue::String(r#"{"Password":"ordinary-secret","label":"x"}"#.into()),
+        );
+        redigest(&mut mixed_key);
+        let mixed_error = db
+            .apply_source_batch(&mixed_key, PRODUCER, 230)
+            .unwrap_err();
+        assert!(
+            mixed_error.contains("invalid_property_key")
+                || mixed_error.contains("secret_like_text"),
+            "{mixed_error}"
+        );
+        db.put_object_type_index_edit(&crate::sekai::object_type_index::ObjectTypeIndexEdit {
+            namespace: "acme".into(),
+            kind: "Issue".into(),
+            source_key: members[0].source_key.clone(),
+            properties: BTreeMap::from([("count".into(), PropertyValue::String("nope".into()))]),
+            hidden: false,
+            action_id: "bad-edit".into(),
+            edited_at_ms: 300,
+            property_edited_at_ms: Default::default(),
+        })
+        .unwrap_err();
+    }
+
+    #[test]
+    fn apply_source_batch_upgrades_string_identities_without_revision_conflict() {
+        let db = RuntimeDb::memory();
+        let mut first = batch("", "cursor:1", "typed-upgrade");
+        first.records[0]
+            .properties
+            .insert("count".into(), "12".into());
+        redigest(&mut first);
+        db.apply_source_batch(&first, PRODUCER, 100).unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "Issue".into(),
+            description: String::new(),
+            properties: vec![
+                property_def("state", PropertyType::String),
+                property_def("title", PropertyType::String),
+                property_def("count", PropertyType::Int),
+            ],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        let mut second = first.clone();
+        second.idempotency_key = "typed-upgrade-2".into();
+        second.current_cursor = first.proposed_next_cursor.clone();
+        second.proposed_next_cursor = "cursor:2".into();
+        redigest(&mut second);
+        db.apply_source_batch(&second, PRODUCER, 150).unwrap();
+        let members = db
+            .list_visible_index_members(
+                "acme",
+                "Issue",
+                &crate::sekai::dataset::RowQuery::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            members[0].properties.get("count"),
+            Some(&PropertyValue::Int(12))
+        );
+    }
+
+    #[test]
+    fn exact_replay_returns_committed_result_after_schema_rejects_wire_form() {
+        let db = RuntimeDb::memory();
+        let mut first = batch("", "cursor:1", "typed-replay");
+        first.records[0]
+            .properties
+            .insert("count".into(), "unknown".into());
+        redigest(&mut first);
+        let committed = db.apply_source_batch(&first, PRODUCER, 100).unwrap();
+        db.upsert_object_type(&ObjectType {
+            kind: "Issue".into(),
+            description: String::new(),
+            properties: vec![
+                property_def("state", PropertyType::String),
+                property_def("title", PropertyType::String),
+                property_def("count", PropertyType::Int),
+            ],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        let replayed = db.apply_source_batch(&first, PRODUCER, 200).unwrap();
+        assert_eq!(replayed, committed);
+        let mut next = first.clone();
+        next.idempotency_key = "typed-replay-2".into();
+        next.current_cursor = first.proposed_next_cursor.clone();
+        next.proposed_next_cursor = "cursor:2".into();
+        redigest(&mut next);
+        let error = db.apply_source_batch(&next, PRODUCER, 250).unwrap_err();
+        assert!(error.contains("invalid_property_value"), "{error}");
+        assert!(error.contains("count"), "{error}");
+    }
+
+    #[test]
+    fn open_replay_finishes_after_schema_rejects_wire_form() {
+        let db = RuntimeDb::memory();
+        let mut first = batch("", "cursor:1", "typed-open-replay");
+        first.records[0]
+            .properties
+            .insert("count".into(), "unknown".into());
+        redigest(&mut first);
+        AFTER_SOURCE_BATCH_DATASET_LAND.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(|| panic!("dataset land crash")));
+        });
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.apply_source_batch(&first, PRODUCER, 100)
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            batch_status_for(&db, "typed-open-replay").as_deref(),
+            Some("OPEN")
+        );
+        db.upsert_object_type(&ObjectType {
+            kind: "Issue".into(),
+            description: String::new(),
+            properties: vec![
+                property_def("state", PropertyType::String),
+                property_def("title", PropertyType::String),
+                property_def("count", PropertyType::Int),
+            ],
+            is_builtin: false,
+            implements: Vec::new(),
+        })
+        .unwrap();
+        let replayed = db.apply_source_batch(&first, PRODUCER, 200).unwrap();
+        assert_eq!(replayed.transaction.status, SourceBatchStatus::Committed);
     }
 
     #[test]

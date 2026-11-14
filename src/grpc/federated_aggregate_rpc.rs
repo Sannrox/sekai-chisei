@@ -81,7 +81,9 @@ fn federation_snapshot(
         name: member.source_key.clone(),
         namespace: member.namespace.clone(),
         external_id: member.source_key.clone(),
-        properties: member.properties.clone().into_iter().collect(),
+        properties: crate::sekai::object_schema::properties_as_cells(&member.properties)
+            .into_iter()
+            .collect(),
         created: indexed_at_ms,
         updated: indexed_at_ms,
     }
@@ -233,9 +235,25 @@ fn parse_request(request: FederatedAggregateRequest) -> Result<ParsedQuery, Stat
     })
 }
 
-fn number(raw: Option<&String>) -> Option<f64> {
-    raw.and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
+fn number(raw: Option<&crate::sekai::object_schema::PropertyValue>) -> Option<f64> {
+    let value = raw?;
+    match value {
+        crate::sekai::object_schema::PropertyValue::Int(int) => Some(*int as f64),
+        crate::sekai::object_schema::PropertyValue::Float(float) if float.is_finite() => {
+            Some(*float)
+        }
+        crate::sekai::object_schema::PropertyValue::String(text) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| parsed.is_finite()),
+        _ => value
+            .as_cell()
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|parsed| parsed.is_finite()),
+    }
 }
 
 /// A namespace's rows from the members the federation principal may read:
@@ -265,7 +283,12 @@ fn rows_from_members(
             let key = query
                 .dimensions
                 .iter()
-                .map(|dimension| member.properties.get(dimension).cloned())
+                .map(|dimension| {
+                    member
+                        .properties
+                        .get(dimension)
+                        .map(|value| value.as_cell())
+                })
                 .collect::<Option<Vec<String>>>()?;
             let values = summed
                 .iter()
@@ -1704,11 +1727,9 @@ mod tests {
         let member = crate::sekai::object_type_index::ObjectTypeIndexMember {
             object_id: "Shipment:n-1".into(),
             properties: std::collections::BTreeMap::from([
-                ("region".to_string(), "eu".to_string()),
-                ("weight".to_string(), "1".to_string()),
-            ])
-            .into_iter()
-            .collect(),
+                ("region".into(), "eu".into()),
+                ("weight".into(), "1".into()),
+            ]),
             ..Default::default()
         };
         let parsed = parse_request(request(&["north"], vec![measure("count", "")])).unwrap();

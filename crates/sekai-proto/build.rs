@@ -22,6 +22,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .generate_default_stubs(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute(".", "#[serde(rename_all = \"camelCase\")]")
+        // HTTP proto JSON keeps the previous untagged property cells
+        // (`{"title":"hello"}`) alongside the generated oneof form.
+        .type_attribute(
+            "sekai.PropertyValue",
+            "#[serde(from = \"crate::property_json::Wire\", into = \"crate::property_json::Wire\")]",
+        )
         // Nested inputs of stable RPCs on the HTTP/JSON projection: proto3
         // JSON may omit any default-valued field, and the projection only
         // fills defaults for the top-level request (#2266).

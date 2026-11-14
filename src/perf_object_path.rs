@@ -900,16 +900,28 @@ fn seed_two_hop_index(
                     graph_id(namespace, "item", index),
                     BTreeMap::from([(
                         "region".into(),
-                        if index.is_multiple_of(2) { "eu" } else { "us" }.into(),
+                        crate::sekai::object_schema::PropertyValue::from(
+                            if index.is_multiple_of(2) { "eu" } else { "us" },
+                        ),
                     )]),
                 ),
                 "Order" => (
                     graph_id(namespace, "order", index),
-                    BTreeMap::from([("item_id".into(), graph_id(namespace, "item", index))]),
+                    BTreeMap::from([(
+                        "item_id".into(),
+                        crate::sekai::object_schema::PropertyValue::from(graph_id(
+                            namespace, "item", index,
+                        )),
+                    )]),
                 ),
                 "Shipment" => (
                     graph_id(namespace, "shipment", index),
-                    BTreeMap::from([("order_id".into(), graph_id(namespace, "order", index))]),
+                    BTreeMap::from([(
+                        "order_id".into(),
+                        crate::sekai::object_schema::PropertyValue::from(graph_id(
+                            namespace, "order", index,
+                        )),
+                    )]),
                 ),
                 _ => continue,
             };
@@ -1167,7 +1179,7 @@ fn source_batch_proto(
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
+                properties: crate::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
