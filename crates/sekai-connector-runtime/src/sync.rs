@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, ExportArtifact,
-    Operation, SnapshotRead, SourceConfig, connector_type,
+    Operation, RecordChange, SnapshotRead, SourceConfig, connector_type,
 };
 
 use crate::credentials::{CredentialBindings, Credentials};
@@ -31,6 +31,11 @@ pub enum SyncFailure {
     Invalid,
     /// This runtime has no implementation of the type or operation.
     Unsupported,
+    /// The remote record changed since the version a change was decided
+    /// against; nothing was written.
+    Conflict,
+    /// Chisei refused to redeem the change's permit; nothing was applied.
+    Refused,
 }
 
 impl SyncFailure {
@@ -42,6 +47,8 @@ impl SyncFailure {
             Self::PermissionMissing => "permission_missing",
             Self::Invalid => "invalid",
             Self::Unsupported => "unsupported",
+            Self::Conflict => "conflict",
+            Self::Refused => "refused",
         }
     }
 }
@@ -53,6 +60,7 @@ impl From<ConnectorFailure> for SyncFailure {
             ConnectorFailure::Unreachable => Self::Unreachable,
             ConnectorFailure::AuthFailed => Self::AuthFailed,
             ConnectorFailure::PermissionMissing => Self::PermissionMissing,
+            ConnectorFailure::Conflict => Self::Conflict,
             _ => Self::Invalid,
         }
     }
@@ -152,12 +160,12 @@ impl Connectors {
         self.0.keys().copied()
     }
 
-    /// The registered types that deliver saved exports.
-    pub fn delivery_types(&self) -> Vec<(&'static str, &'static str)> {
+    /// The registered types that declare `operation`, such as delivering
+    /// saved exports or applying external effects.
+    pub fn types_for(&self, operation: Operation) -> Vec<(&'static str, &'static str)> {
         self.types()
             .filter(|(name, version)| {
-                connector_type(name, version)
-                    .is_some_and(|connector| connector.supports(Operation::Deliver))
+                connector_type(name, version).is_some_and(|connector| connector.supports(operation))
             })
             .collect()
     }
@@ -171,13 +179,13 @@ impl Connectors {
         })
     }
 
-    /// Whether this runtime delivers saved exports through Sources of the
-    /// type the spec names.
-    pub fn delivers(&self, source: &ConnectorSource) -> bool {
+    /// Whether this runtime runs `operation` for Sources of the type the
+    /// spec names.
+    pub fn runs(&self, source: &ConnectorSource, operation: Operation) -> bool {
         self.implements(source)
             && source.spec.as_ref().is_some_and(|spec| {
                 connector_type(&spec.connector_type, &spec.connector_version)
-                    .is_some_and(|connector| connector.supports(Operation::Deliver))
+                    .is_some_and(|connector| connector.supports(operation))
             })
     }
 
@@ -223,6 +231,15 @@ impl Connectors {
         }
         self.open(prepared)?.deliver(artifact)?;
         Ok(())
+    }
+
+    /// Applies one permit-bound change to a record of a prepared Source and
+    /// returns the record's new version. Blocking.
+    pub fn apply(&self, prepared: &Prepared, change: &RecordChange) -> Result<String, SyncFailure> {
+        if !prepared.connector.supports(Operation::Apply) {
+            return Err(SyncFailure::Unsupported);
+        }
+        Ok(self.open(prepared)?.apply(change)?)
     }
 }
 

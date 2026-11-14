@@ -19,18 +19,25 @@
 //! restarts the scan: re-read records keep their ids and versions, so they
 //! change nothing.
 //!
+//! An applied change sets the `title`, `body` or `state` of one issue or
+//! pull request, addressed by its number. GitHub offers no conditional
+//! write for them, so the version check is a read just before the write:
+//! the item's update time must still be the version the change was
+//! decided against, or nothing is written. After a write the update time
+//! has moved, so a replay finds a conflict rather than writing twice.
+//!
 //! The client follows no redirect and no proxy, so it connects only to the
 //! `api_url` the egress allowlist admitted.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use reqwest::blocking::{Client, Response};
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::ACCEPT;
 use reqwest::redirect::Policy;
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, GitHubObjectFixture, MAX_SOURCE_DISPLAY_NAME_BYTES,
-    SnapshotPage, SnapshotRead, SourceRecord, translate_github_fixture,
+    RecordChange, SnapshotPage, SnapshotRead, SourceRecord, translate_github_fixture,
 };
 use serde::Deserialize;
 
@@ -84,11 +91,16 @@ fn open_github(prepared: &Prepared) -> Result<GitHub, ConnectorFailure> {
     })
 }
 
+/// The item fields a change may set.
+const WRITABLE: [&str; 3] = ["title", "body", "state"];
+
 impl GitHub {
     fn get(&self, path: &str) -> Result<Response, ConnectorFailure> {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.api_url))
+        self.send(self.http.get(format!("{}{path}", self.api_url)))
+    }
+
+    fn send(&self, request: RequestBuilder) -> Result<Response, ConnectorFailure> {
+        let response = request
             .bearer_auth(&self.token)
             .header(ACCEPT, "application/vnd.github+json")
             .send()
@@ -136,6 +148,35 @@ impl GitHub {
 impl Connector for GitHub {
     fn check(&mut self) -> Result<(), ConnectorFailure> {
         self.get(&format!("/repos/{}", self.repository)).map(|_| ())
+    }
+
+    fn apply(&mut self, change: &RecordChange) -> Result<String, ConnectorFailure> {
+        let number: u64 = change.key.parse().map_err(|_| ConnectorFailure::Invalid)?;
+        if change
+            .change
+            .keys()
+            .any(|field| !WRITABLE.contains(&field.as_str()))
+        {
+            return Err(ConnectorFailure::Invalid);
+        }
+        let path = format!("/repos/{}/issues/{number}", self.repository);
+        let current: Item = self
+            .get(&path)?
+            .json()
+            .map_err(|_| ConnectorFailure::Invalid)?;
+        if current.updated_at != change.expected_version {
+            return Err(ConnectorFailure::Conflict);
+        }
+        let updated: Item = self
+            .send(
+                self.http
+                    .patch(format!("{}{path}", self.api_url))
+                    .json(&change.change),
+            )?
+            .json()
+            // The write was accepted; only its reply is lost.
+            .map_err(|_| ConnectorFailure::Unreachable)?;
+        Ok(updated.updated_at)
     }
 
     fn read_page(
@@ -766,6 +807,52 @@ mod tests {
             github(&url).read_page(None, 10),
             Err(ConnectorFailure::Invalid)
         );
+    }
+
+    #[test]
+    fn a_change_is_written_only_while_the_item_has_the_decided_version() {
+        let change = |version: &str| RecordChange {
+            idempotency_key: "effect-1".into(),
+            key: "12".into(),
+            expected_version: version.into(),
+            change: BTreeMap::from([("state".to_string(), "closed".to_string())]),
+        };
+        // The first request reads the item, the second writes it.
+        let calls = Arc::new(Mutex::new(0));
+        let counted = calls.clone();
+        let (url, seen) = fake_api(move |_| {
+            let mut calls = counted.lock().unwrap();
+            *calls += 1;
+            let updated_at = if *calls == 1 {
+                "2026-01-01T00:00:00Z"
+            } else {
+                "2026-01-02T00:00:00Z"
+            };
+            (200, item(12, updated_at, false).to_string())
+        });
+        assert_eq!(
+            github(&url).apply(&change("2026-01-01T00:00:00Z")),
+            Ok("2026-01-02T00:00:00Z".into())
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // A moved item is a conflict, and nothing is written.
+        let (url, seen) = fake_api(|_| (200, item(12, "2026-01-03T00:00:00Z", false).to_string()));
+        assert_eq!(
+            github(&url).apply(&change("2026-01-01T00:00:00Z")),
+            Err(ConnectorFailure::Conflict)
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        // Only the writable fields, and only a numbered item.
+        let mut labels = change("2026-01-01T00:00:00Z");
+        labels.change = BTreeMap::from([("labels".to_string(), "x".to_string())]);
+        let mut unnumbered = change("2026-01-01T00:00:00Z");
+        unnumbered.key = "pull/12".into();
+        for refused in [labels, unnumbered] {
+            assert_eq!(github(&url).apply(&refused), Err(ConnectorFailure::Invalid));
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     #[test]

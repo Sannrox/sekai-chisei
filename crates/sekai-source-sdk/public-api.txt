@@ -332,6 +332,7 @@ connector::RecordChange.change: BTreeMap<String,String>
 connector::RecordChange.expected_version: String
 connector::RecordChange.idempotency_key: String
 connector::RecordChange.key: String
+connector::RecordChange::arguments_digest(&self,&str) -> String
 connector::SourceConfig = BTreeMap<String,ConfigValue>
 connector::connector_type(&str,&str) -> Option<&ConnectorType>
 connector_type

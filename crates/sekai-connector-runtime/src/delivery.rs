@@ -17,7 +17,7 @@ use sekai_client::protocol::sekai::{
     ExportObjectSetChunk, FetchExportArtifactRequest, GetSourceRequest, GetSourceResponse,
     ack_work_request, claim_work_response,
 };
-use sekai_source_sdk::ExportArtifact;
+use sekai_source_sdk::{ExportArtifact, Operation};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{LIST_LIMIT, Ran, Runtime};
@@ -44,9 +44,9 @@ impl Runtime {
             )
             .await
             .ok()?;
-        response
-            .source
-            .filter(|source| source.status == "active" && self.connectors.delivers(source))
+        response.source.filter(|source| {
+            source.status == "active" && self.connectors.runs(source, Operation::Deliver)
+        })
     }
 
     /// Claims the next deliverable artifact in the namespace at `index`
@@ -59,7 +59,7 @@ impl Runtime {
         // other deliverers take never starve this runtime. An empty list
         // would mean any type, so a runtime that delivers nothing asks for
         // nothing.
-        let types = self.connectors.delivery_types();
+        let types = self.connectors.types_for(Operation::Deliver);
         if types.is_empty() {
             return Ok(None);
         }

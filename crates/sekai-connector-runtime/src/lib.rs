@@ -9,12 +9,14 @@
 //!
 //! A sync applies the Source's snapshot pages as source batches
 //! ([`pages`]). The runtime also delivers saved exports whose definition
-//! names a Source of a type it implements ([`delivery`]). The connector
-//! types are [`github`] (sync) and [`relational`] (snapshot pages and
-//! delivery).
+//! names a Source of a type it implements ([`delivery`]), and applies
+//! admitted Actions' external changes to a Source's records ([`effect`]).
+//! The connector types are [`github`] (sync and apply) and [`relational`]
+//! (snapshot pages, delivery and apply).
 
 pub mod credentials;
 pub mod delivery;
+pub mod effect;
 pub mod github;
 pub mod pages;
 pub mod relational;
@@ -22,5 +24,6 @@ pub mod runtime;
 pub mod sync;
 
 pub use credentials::{CredentialBinding, CredentialBindings, Credentials, Secret, SlotSource};
+pub use effect::Effected;
 pub use runtime::{Ran, Runtime, RuntimeOptions};
 pub use sync::{Connectors, Open, Prepared, SyncFailure, prepare};

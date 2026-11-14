@@ -56,6 +56,32 @@ An executor refuses the action when any requirement is unsupported. Shared tests
 exercise both filesystem-style (`atomic_rename`) and HTTP-style
 (`conditional_request`) executors.
 
+### Connector runtime executor
+
+The connector runtime executes `external_mutate` effects for the Source that
+owns the record (ADR 0148, amendment 2026-11-14). The Action's parameters are
+all strings:
+
+| Parameter | Meaning |
+| --- | --- |
+| `permit_id` | The permit's id |
+| `permit` | The signed permit, in the protocol's JSON form |
+| `source_id` | The record's object source id, `source:instance#external_id`, owned by the claimed Source |
+| `record_kind` | The kind the Source projects the record as; execution evidence targets that object |
+| `change` | A JSON object of field to new value |
+
+The permit's `record_version` precondition is the version the change was
+decided against. The permit must require `version_checked_write` and allow
+exactly one invocation; the runtime fails any other permit as invalid, because
+a takeover could redeem a second invocation and write again. The
+runtime does not call `verify_for_executor`: it computes the redemption from
+the change, and Chisei verifies the permit against it. Execution evidence is
+submitted as `host_executor` from `<principal>:external-effect`, so the
+runtime's principal needs an evidence producer capability for that instance,
+the namespace, and the record's kind. A redemption refused under a reclaimed
+claim is acknowledged `outcome_unknown`, because an earlier holder may have
+written.
+
 The versioned, CI-runnable certification profile is
 [host-executor-permit-conformance.md](host-executor-permit-conformance.md)
 (`sekai.host-executor-permit-conformance/v1`).

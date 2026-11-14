@@ -130,7 +130,8 @@ pub const GITHUB_CONNECTOR: ConnectorType = ConnectorType {
 };
 
 /// The reference relational source (ADR 0100): snapshot pages from one
-/// table, and saved-export delivery into a delivery table.
+/// table, saved-export delivery into a delivery table, and permit-bound
+/// changes to that table's rows.
 pub const RELATIONAL_CONNECTOR: ConnectorType = ConnectorType {
     name: "relational",
     version: "1",
@@ -140,6 +141,7 @@ pub const RELATIONAL_CONNECTOR: ConnectorType = ConnectorType {
         Operation::Discover,
         Operation::ReadPage,
         Operation::Deliver,
+        Operation::Apply,
     ],
     config: &[
         ConfigField {
@@ -570,6 +572,21 @@ pub struct RecordChange {
     /// The record version the change was decided against.
     pub expected_version: String,
     pub change: BTreeMap<String, String>,
+}
+
+impl RecordChange {
+    /// The canonical arguments digest an `external_mutate` permit binds for
+    /// this change to `resource`, the record's object source id. The
+    /// authorizer and the executor compute it alike, so redemption compares
+    /// the authorized change against the one about to be applied.
+    pub fn arguments_digest(&self, resource: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let change = serde_json::to_string(&self.change).unwrap_or_default();
+        format!(
+            "sha256:{:x}",
+            Sha256::digest(format!("{resource}\n{}\n{change}\n", self.expected_version).as_bytes())
+        )
+    }
 }
 
 /// One connected Source of some connector type. The runtime opens it with
