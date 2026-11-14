@@ -370,6 +370,14 @@ impl ObjectPathHarness {
         if parsed.kind == ObjectPathKind::ActionApply {
             seed_action_type(store.runtime(), &namespace)?;
         }
+        if matches!(
+            parsed.kind,
+            ObjectPathKind::CreateObject | ObjectPathKind::UpdateObject
+        ) {
+            store
+                .runtime()
+                .create_object(&perf_row_object(&namespace))?;
+        }
         let chisei = ChiseiStore::from_shared_runtime(store.runtime_arc());
         let budget = Arc::new(BudgetTracker::new(chisei.clone()));
         budget.set_limit("action:governed", 1_000_000_000, PeriodType::Daily)?;
@@ -638,13 +646,13 @@ impl ObjectPathHarness {
         Ok(())
     }
 
-    /// Create one additional object through the gRPC handler.
+    /// Create one additional untyped object through the gRPC handler.
     pub fn create_object(&self) -> Result<(), String> {
         let step = self.sequence.fetch_add(1, Ordering::Relaxed);
         let id = format!("{}-created-{step}", self.inner.namespace);
         let response = self.block_on(self.inner.service.create_object(with_principal(
             CreateObjectRequest {
-                object: Some(proto_item(&self.inner.namespace, &id, 0)),
+                object: Some(proto_perf_row(&self.inner.namespace, &id)),
                 lease_precondition: None,
             },
             READER,
@@ -655,10 +663,10 @@ impl ObjectPathHarness {
         Ok(())
     }
 
-    /// Update the seeded target object's name through the gRPC handler.
+    /// Update the seeded untyped object's name through the gRPC handler.
     pub fn update_object(&self) -> Result<(), String> {
         let step = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let mut object = proto_item(&self.inner.namespace, &self.inner.target_id, 0);
+        let mut object = proto_perf_row(&self.inner.namespace, &perf_row_id(&self.inner.namespace));
         object.name = format!("updated-{step}");
         let response = self.block_on(self.inner.service.update_object(with_principal(
             UpdateObjectRequest {
@@ -1010,18 +1018,31 @@ fn shipment_object(namespace: &str, index: usize) -> Object {
     }
 }
 
-fn proto_item(namespace: &str, id: &str, rank: usize) -> crate::grpc::pb::sekai::Object {
+fn perf_row_id(namespace: &str) -> String {
+    graph_id(namespace, "perf-row", 0)
+}
+
+fn perf_row_object(namespace: &str) -> Object {
+    Object {
+        id: perf_row_id(namespace),
+        kind: "perf_row".into(),
+        name: "perf-row".into(),
+        namespace: namespace.into(),
+        external_id: format!("{namespace}:perf-row"),
+        properties: HashMap::new(),
+        created: 1,
+        updated: 1,
+    }
+}
+
+fn proto_perf_row(namespace: &str, id: &str) -> crate::grpc::pb::sekai::Object {
     crate::grpc::pb::sekai::Object {
         id: id.into(),
-        kind: "Item".into(),
+        kind: "perf_row".into(),
         name: id.into(),
         namespace: namespace.into(),
         external_id: format!("{namespace}:{id}"),
-        properties: HashMap::from([
-            ("region".into(), "eu".into()),
-            ("rank".into(), rank.to_string()),
-            ("visibility".into(), "visible".into()),
-        ]),
+        properties: HashMap::new(),
         created: 1,
         updated: 1,
     }

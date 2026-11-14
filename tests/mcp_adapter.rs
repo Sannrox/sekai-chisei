@@ -715,7 +715,6 @@ async fn evaluate_set_receipt_replays_the_read_at_recorded_versions() {
 
     surface
         .mutate_object_color(&surface.object_id, "green")
-        .await
         .expect("mutate");
 
     let live = handle_message(

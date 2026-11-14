@@ -1956,21 +1956,19 @@ async fn definition_package_round_trips_between_namespaces_and_refuses_tampering
         vec![member("Ticket"), member("Incident")],
     )
     .await;
-    svc.create_object(with_principal(CreateObjectRequest {
-        object: Some(Object {
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
             id: "ticket-1".into(),
             kind: "Ticket".into(),
             name: "ticket".into(),
             namespace: "pkg-a".into(),
             external_id: "ticket:1".into(),
             properties: HashMap::from([("title".into(), "object-data-marker".into())]),
-            created: 0,
-            updated: 0,
-        }),
-        lease_precondition: None,
-    }))
-    .await
-    .unwrap();
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
     let export = |namespace: &str| {
         export_definition_package_as(
             &svc,
@@ -10137,6 +10135,145 @@ async fn untyped_kind_still_writes_and_schema_types_list() {
             .iter()
             .any(|object_type| object_type.kind == "namespace" && object_type.is_builtin)
     );
+}
+
+#[tokio::test]
+async fn published_type_revision_refuses_generic_object_and_link_writes() {
+    let svc = service();
+    seed_definition_parent(&svc, "typed-ns");
+
+    let typed = Object {
+        id: "ticket-generic".into(),
+        kind: "Ticket".into(),
+        name: "ticket".into(),
+        namespace: "typed-ns".into(),
+        external_id: "ticket:generic".into(),
+        properties: HashMap::from([("title".into(), "opened".into())]),
+        created: 0,
+        updated: 0,
+    };
+    let created = svc
+        .create_object(with_principal(CreateObjectRequest {
+            object: Some(typed.clone()),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(created.code(), tonic::Code::FailedPrecondition);
+    assert!(created.message().contains("SubmitActionInstance"));
+    assert!(created.message().contains("source sync"));
+
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(Object {
+            id: "loose-typed-ns".into(),
+            kind: "loose".into(),
+            name: "loose".into(),
+            namespace: "typed-ns".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        }),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+
+    svc.db
+        .runtime()
+        .create_object(&from_proto_obj(&typed))
+        .unwrap();
+    let updated = svc
+        .update_object(with_principal(UpdateObjectRequest {
+            object: Some(typed.clone()),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(updated.code(), tonic::Code::FailedPrecondition);
+    assert!(updated.message().contains("SubmitActionInstance"));
+
+    let deleted = svc
+        .delete_object(with_principal(DeleteObjectRequest {
+            id: typed.id.clone(),
+            lease_precondition: None,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(deleted.code(), tonic::Code::FailedPrecondition);
+    assert!(deleted.message().contains("source sync"));
+
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "ticket-peer".into(),
+            kind: "Ticket".into(),
+            name: "peer".into(),
+            namespace: "typed-ns".into(),
+            external_id: "ticket:peer".into(),
+            properties: HashMap::from([("title".into(), "peer".into())]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let linked = svc
+        .create_link(with_principal(CreateLinkRequest {
+            fail_if_exists: false,
+            link: Some(Link {
+                id: String::new(),
+                from_id: typed.id.clone(),
+                to_id: "ticket-peer".into(),
+                relation: "related".into(),
+                created: 0,
+            }),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(linked.code(), tonic::Code::FailedPrecondition);
+    assert!(linked.message().contains("SubmitActionInstance"));
+
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(Object {
+            id: "loose-from".into(),
+            kind: "loose".into(),
+            name: "from".into(),
+            namespace: "typed-ns".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        }),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(Object {
+            id: "loose-to".into(),
+            kind: "loose".into(),
+            name: "to".into(),
+            namespace: "typed-ns".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        }),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+    svc.create_link(with_principal(CreateLinkRequest {
+        fail_if_exists: false,
+        link: Some(Link {
+            id: String::new(),
+            from_id: "loose-from".into(),
+            to_id: "loose-to".into(),
+            relation: "related".into(),
+            created: 0,
+        }),
+    }))
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

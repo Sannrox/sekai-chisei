@@ -15,9 +15,8 @@ use crate::domain::{self, ListFilter};
 use crate::grpc::chisei_service::ChiseiServiceImpl;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    CreateLinkRequest, CreateObjectRequest, CreateSchemaTypeRequest, DiscoverCapabilitiesRequest,
-    GetObjectRequest, GovernedActionType, Link, Object, ObjectType, PropertyDef,
-    PutGovernedActionTypeRequest, UpdateObjectRequest,
+    CreateSchemaTypeRequest, DiscoverCapabilitiesRequest, GovernedActionType, ObjectType,
+    PropertyDef, PutGovernedActionTypeRequest,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::action_policy::ActionPolicy;
@@ -179,82 +178,52 @@ impl InProcessSurface {
             ))
             .await
             .map_err(|error| error.message().to_string())?;
-        for (id, name, color) in [
-            (&self.object_id, "spinner", "blue"),
-            (&self.peer_object_id, "gear", "red"),
+        for (id, name, color, namespace) in [
+            (&self.object_id, "spinner", "blue", self.namespace.as_str()),
+            (&self.peer_object_id, "gear", "red", self.namespace.as_str()),
+            (
+                &self.foreign_object_id,
+                "foreign-spinner",
+                "green",
+                FOREIGN_NAMESPACE,
+            ),
+            (
+                &self.foreign_peer_object_id,
+                "foreign-gear",
+                "yellow",
+                FOREIGN_NAMESPACE,
+            ),
         ] {
-            self.sekai
-                .create_object(with_identity(
-                    CreateObjectRequest {
-                        object: Some(Object {
-                            id: id.clone(),
-                            kind: "widget".into(),
-                            name: name.into(),
-                            namespace: self.namespace.clone(),
-                            external_id: String::new(),
-                            properties: HashMap::from([
-                                ("name".into(), name.into()),
-                                ("color".into(), color.into()),
-                            ]),
-                            created: 0,
-                            updated: 0,
-                        }),
-                        lease_precondition: None,
+            self.db
+                .create_object_with_audit(
+                    &domain::Object {
+                        id: id.clone(),
+                        kind: "widget".into(),
+                        name: name.into(),
+                        namespace: namespace.into(),
+                        external_id: String::new(),
+                        properties: HashMap::from([
+                            ("name".into(), name.into()),
+                            ("color".into(), color.into()),
+                        ]),
+                        created: 1,
+                        updated: 1,
                     },
                     &self.principal,
-                    &self.namespace,
-                ))
-                .await
-                .map_err(|error| error.message().to_string())?;
+                )
+                .map_err(|error| error.to_string())?;
         }
-        for (id, name, color) in [
-            (&self.foreign_object_id, "foreign-spinner", "green"),
-            (&self.foreign_peer_object_id, "foreign-gear", "yellow"),
-        ] {
-            self.sekai
-                .create_object(with_identity(
-                    CreateObjectRequest {
-                        object: Some(Object {
-                            id: id.clone(),
-                            kind: "widget".into(),
-                            name: name.into(),
-                            namespace: FOREIGN_NAMESPACE.into(),
-                            external_id: String::new(),
-                            properties: HashMap::from([
-                                ("name".into(), name.into()),
-                                ("color".into(), color.into()),
-                            ]),
-                            created: 0,
-                            updated: 0,
-                        }),
-                        lease_precondition: None,
-                    },
-                    &self.principal,
-                    FOREIGN_NAMESPACE,
-                ))
-                .await
-                .map_err(|error| error.message().to_string())?;
-        }
-        // A native create without session namespace can still persist a
-        // cross-namespace link. MCP get must not disclose the foreign id.
-        let mut leak = Request::new(CreateLinkRequest {
-            link: Some(Link {
-                id: String::new(),
+        // Persist a cross-namespace link on the store path. MCP get must not
+        // disclose the foreign id.
+        self.db
+            .create_link(&domain::Link {
+                id: "mcp-leak".into(),
                 from_id: self.object_id.clone(),
                 to_id: self.foreign_object_id.clone(),
                 relation: "leaks_to".into(),
-                created: 0,
-            }),
-            fail_if_exists: false,
-        });
-        leak.metadata_mut().insert(
-            "x-principal",
-            MetadataValue::try_from(self.principal.as_str()).expect("principal"),
-        );
-        self.sekai
-            .create_link(leak)
-            .await
-            .map_err(|error| error.message().to_string())?;
+                created: 1,
+            })
+            .map_err(|error| error.to_string())?;
         self.sekai
             .put_governed_action_type(with_identity(
                 PutGovernedActionTypeRequest {
@@ -381,32 +350,16 @@ impl InProcessSurface {
     }
 
     /// Change one object's color after a query so receipt replay can be checked.
-    pub async fn mutate_object_color(&self, id: &str, color: &str) -> Result<(), String> {
-        let current = self
-            .sekai
-            .get_object(with_identity(
-                GetObjectRequest { id: id.into() },
-                &self.principal,
-                &self.namespace,
-            ))
-            .await
-            .map_err(|error| error.message().to_string())?
-            .into_inner()
-            .object
+    pub fn mutate_object_color(&self, id: &str, color: &str) -> Result<(), String> {
+        let mut object = self
+            .db
+            .get_object(id)
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| "object missing".to_string())?;
-        let mut object = current;
         object.properties.insert("color".into(), color.into());
-        self.sekai
-            .update_object(with_identity(
-                UpdateObjectRequest {
-                    object: Some(object),
-                    lease_precondition: None,
-                },
-                &self.principal,
-                &self.namespace,
-            ))
-            .await
-            .map_err(|error| error.message().to_string())?;
+        self.db
+            .update_object_with_audit(&object, &self.principal)
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
