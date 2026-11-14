@@ -37017,7 +37017,9 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
         .unwrap();
     let tick = || async {
         svc.tick_governed_transforms(with_named_principal(
-            TickGovernedTransformsRequest { now_ms: 0 },
+            // A fixed clock keeps every tick in one debounce window. now_ms=0
+            // would use wall time and admit a second turn across an epoch.
+            TickGovernedTransformsRequest { now_ms: 60_000 },
             "local",
         ))
         .await

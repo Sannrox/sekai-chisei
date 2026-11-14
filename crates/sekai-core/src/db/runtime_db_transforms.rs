@@ -997,4 +997,76 @@ impl RuntimeDb {
             }),
         }
     }
+
+    pub fn put_transform_chain(
+        &self,
+        chain: &crate::sekai::transform_chain::TransformChain,
+        created_at_ms: i64,
+    ) -> Result<crate::sekai::transform_chain::TransformChain, String> {
+        match self {
+            Self::Sqlite(db) => db.put_transform_chain(chain, created_at_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_transform_chain(chain, created_at_ms))
+            }
+        }
+    }
+
+    pub fn run_transform_chain(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+        idempotency_key: &str,
+        tenant_id: &str,
+        now_ms: i64,
+    ) -> Result<(crate::sekai::transform_chain::TransformChainRun, bool), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.run_transform_chain(namespace, chain_id, idempotency_key, tenant_id, now_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.run_transform_chain(namespace, chain_id, idempotency_key, tenant_id, now_ms)
+            }),
+        }
+    }
+
+    pub fn peek_transform_chain_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<crate::sekai::transform_chain::TransformChainRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.peek_transform_chain_run(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.peek_transform_chain_run(run_id))
+            }
+        }
+    }
+
+    pub fn peek_transform_chain_run_by_identity(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+        identity: &str,
+    ) -> Result<Option<crate::sekai::transform_chain::TransformChainRun>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.peek_transform_chain_run_by_identity(namespace, chain_id, identity)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.peek_transform_chain_run_by_identity(namespace, chain_id, identity)
+            }),
+        }
+    }
+
+    pub fn get_transform_chain_run(
+        &self,
+        run_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<crate::sekai::transform_chain::TransformChainRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_transform_chain_run(run_id, now_ms),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_transform_chain_run(run_id, now_ms))
+            }
+        }
+    }
 }

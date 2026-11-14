@@ -65,6 +65,7 @@ impl SekaiServiceImpl {
         entries.push(scheduler_transform_capability(experimental));
         entries.push(preview_transform_capability(experimental));
         entries.push(adhoc_transform_capability(experimental));
+        entries.push(transform_chain_capability(experimental));
         entries.push(object_set_inputs_capability(experimental));
         entries.push(agent_turn_runtime_token_capability(experimental));
         entries.push(agent_turn_parked_capability(experimental));
@@ -438,6 +439,21 @@ fn isolated_transform_capability(enabled: bool) -> CapabilityEntry {
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
     entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry
+}
+
+fn transform_chain_capability(enabled: bool) -> CapabilityEntry {
+    let mut entry = base_capability(
+        crate::sekai::transform_chain::CHAIN_COMPUTE_CAPABILITY.into(),
+        "Static DAG of governed transforms executed as one receipted operation. Discovery is not a grant.".into(),
+        "transform",
+        "sekai.RunTransformChainRequest",
+        "sekai.RunTransformChainResponse",
+    );
+    entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
+    entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
+    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.product_tier = "experimental".into();
     entry
 }
 
@@ -985,6 +1001,22 @@ mod tests {
         );
         let on = isolated_transform_capability(true);
         assert_eq!(on.lifecycle_state, "active");
+    }
+
+    #[test]
+    fn transform_chain_capability_follows_the_experimental_gate() {
+        let off = transform_chain_capability(false);
+        assert_eq!(off.lifecycle_state, "disabled");
+        assert_eq!(
+            off.name,
+            crate::sekai::transform_chain::CHAIN_COMPUTE_CAPABILITY
+        );
+        assert_eq!(off.product_tier, "experimental");
+        assert_eq!(
+            crate::rpc_maturity::capability_backing_rpc(&off.name),
+            Some("RunTransformChain")
+        );
+        assert_eq!(transform_chain_capability(true).lifecycle_state, "active");
     }
 
     #[test]

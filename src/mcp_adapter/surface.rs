@@ -49,6 +49,8 @@ pub enum NativeRpc {
     ReportDefinitionConsumerImpact,
     CreateDefinitionProposal,
     Search,
+    RunTransformChain,
+    GetTransformChainRun,
 }
 
 impl NativeRpc {
@@ -71,6 +73,8 @@ impl NativeRpc {
             Self::ReportDefinitionConsumerImpact => "ReportDefinitionConsumerImpact",
             Self::CreateDefinitionProposal => "CreateDefinitionProposal",
             Self::Search => "Search",
+            Self::RunTransformChain => "RunTransformChain",
+            Self::GetTransformChainRun => "GetTransformChainRun",
         }
     }
 }
@@ -112,6 +116,9 @@ pub trait NativeSurface: Send + Sync {
         rpc: NativeRpc,
         invocation: SdkInvocation,
     ) -> Result<Value, AdapterError>;
+    fn experimental_tools(&self) -> bool {
+        false
+    }
 }
 
 pub async fn dispatch_native(
@@ -327,6 +334,12 @@ pub async fn dispatch_native(
                 .map_err(status_error)?
                 .into_inner(),
         )),
+        NativeRpc::RunTransformChain => {
+            dispatch_sekai_json(sekai.run_transform_chain(bind_json(&invocation)?).await)
+        }
+        NativeRpc::GetTransformChainRun => {
+            dispatch_sekai_json(sekai.get_transform_chain_run(bind_json(&invocation)?).await)
+        }
     }
 }
 
@@ -643,6 +656,18 @@ impl NativeSurface for FixtureSurface {
                     ..Default::default()
                 }))
             }
+            NativeRpc::RunTransformChain => Err(projected(
+                "permission_denied",
+                "access denied",
+                &invocation.capability,
+                &invocation.operation_id,
+            )),
+            NativeRpc::GetTransformChainRun => Err(projected(
+                "not_found",
+                "transform chain run not found",
+                &invocation.capability,
+                &invocation.operation_id,
+            )),
         }
     }
 }
@@ -959,7 +984,33 @@ impl NativeSurface for SdkSurface {
                 .await?;
                 Ok(search_references(response))
             }
+            NativeRpc::RunTransformChain => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.run_transform_chain(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::GetTransformChainRun => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.get_transform_chain_run(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
         }
+    }
+
+    fn experimental_tools(&self) -> bool {
+        crate::rpc_maturity::experimental_rpcs_enabled()
     }
 }
 

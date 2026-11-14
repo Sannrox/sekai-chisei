@@ -945,6 +945,10 @@ impl NativeSurface for HttpMcpSurface {
         )
         .await
     }
+
+    fn experimental_tools(&self) -> bool {
+        experimental_rpcs_enabled()
+    }
 }
 
 fn bind_identity<T>(request: &mut Request<T>, principal: &str, namespace: &str) {

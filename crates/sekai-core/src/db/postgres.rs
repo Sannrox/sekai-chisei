@@ -224,6 +224,7 @@ const EMBEDDING_REBUILD_CURSOR_SCHEMA: &str =
 const OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA: &str =
     include_str!("postgres/0156_object_type_index_property_edits.sql");
 const SOURCE_BATCH_DATASET_SCHEMA: &str = include_str!("postgres/0157_source_batch_dataset.sql");
+const TRANSFORM_CHAINS_SCHEMA: &str = include_str!("postgres/0158_transform_chains.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1130,6 +1131,12 @@ const MIGRATIONS: &[Migration] = &[
         156,
         "source_batch_dataset",
         SOURCE_BATCH_DATASET_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        157,
+        "transform_chains",
+        TRANSFORM_CHAINS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

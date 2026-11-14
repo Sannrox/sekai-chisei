@@ -1587,6 +1587,24 @@ impl SekaiService for SekaiServiceImpl {
     ) -> Result<Response<GetTransformOutputStateResponse>, Status> {
         rpc_data::get_transform_output_state(self, req).await
     }
+    async fn put_transform_chain(
+        &self,
+        req: Request<PutTransformChainRequest>,
+    ) -> Result<Response<PutTransformChainResponse>, Status> {
+        rpc_data::put_transform_chain(self, req).await
+    }
+    async fn run_transform_chain(
+        &self,
+        req: Request<RunTransformChainRequest>,
+    ) -> Result<Response<RunTransformChainResponse>, Status> {
+        rpc_data::run_transform_chain(self, req).await
+    }
+    async fn get_transform_chain_run(
+        &self,
+        req: Request<GetTransformChainRunRequest>,
+    ) -> Result<Response<GetTransformChainRunResponse>, Status> {
+        rpc_data::get_transform_chain_run(self, req).await
+    }
     async fn cancel_governed_transform_run(
         &self,
         req: Request<CancelGovernedTransformRunRequest>,

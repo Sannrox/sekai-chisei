@@ -1030,6 +1030,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PreviewGovernedTransform"
             | "RunAdHocGovernedTransform"
             | "PutGovernedTransform"
+            | "PutTransformChain"
+            | "GetTransformChainRun"
             | "ListDatasets"
             // Dataset rows, versions, rollback, health (#2097), catalog
             // writes (#2105) and branches (#2104): each handler authorizes
@@ -3385,12 +3387,15 @@ mod tests {
             "PreviewGovernedTransform",
             "RunAdHocGovernedTransform",
             "PutGovernedTransform",
+            "PutTransformChain",
+            "GetTransformChainRun",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));
         }
         for method in [
             "RunGovernedTransform",
+            "RunTransformChain",
             "RunGovernedTransformOnBranch",
             "ReplayGovernedTransform",
             "ShadowGovernedTransform",
