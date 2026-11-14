@@ -50,6 +50,9 @@ use crate::sync::Prepared;
 /// The PostgreSQL port an endpoint without one connects to.
 const DEFAULT_PORT: u16 = 5432;
 
+/// ADR 0100 source token stamped on connector-local records.
+const SOURCE_POSTGRES_TABLE: &str = "postgres.table";
+
 /// How long one connection or statement may take.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -118,7 +121,7 @@ pub fn open(
         config,
         tls: tls.clone(),
         delivery_table,
-        source: prepared.source.clone(),
+        source: SOURCE_POSTGRES_TABLE.into(),
         source_instance: prepared.source_instance.clone(),
         fields: prepared.config.clone(),
     }))
@@ -972,7 +975,6 @@ mod tests {
     fn prepared(config: &[(&str, &str)], password: Option<&str>) -> Prepared {
         Prepared {
             connector: &RELATIONAL_CONNECTOR,
-            source: "postgres.table".into(),
             source_instance: "sys/db/public/orders".into(),
             config: config
                 .iter()

@@ -148,13 +148,18 @@ impl Runtime {
                     page.records,
                 )
             } else {
+                let mut records = page.records;
+                for record in &mut records {
+                    record.source = source.source.clone();
+                    record.source_instance = source.source_instance.clone();
+                }
                 build_registered_source_batch(
                     &adapter,
                     &source.source,
                     cursor.as_deref().unwrap_or_default(),
                     &page.proposed_next_cursor,
                     page.collected_at_ms,
-                    page.records,
+                    records,
                 )
             }
             .map_err(|_| SyncFailure::Invalid)?;
