@@ -599,3 +599,30 @@ fn discovery_profiles_missing_cells_as_null_and_empty_cells_as_values() {
         (6_666, 3_333)
     );
 }
+
+/// #2276: a warehouse table returns a plane-capped peek of visible cells.
+/// Hidden columns never leave, and a kind the table does not offer is
+/// typed unsupported.
+#[test]
+fn discovery_sample_returns_visible_rows_capped_by_the_plane() {
+    let mut table = snapshot("orders-snapshot-1.json");
+    while table.rows.len() <= sekai_source_sdk::MAX_DISCOVERY_SAMPLE_ROWS {
+        let mut row = table.rows[0].clone();
+        row.insert("order_id".into(), format!("{}", 2000 + table.rows.len()));
+        table.rows.push(row);
+    }
+    let expected_first = table.rows[0].get("order_id").cloned();
+    let mut store = warehouse_table_ingest::TableStore::new(table).unwrap();
+    let sekai_source_sdk::DiscoverySample::Rows { cells } =
+        sekai_source_sdk::SourceInspector::sample_rows(&mut store, "Order").unwrap()
+    else {
+        panic!("warehouse tables can sample");
+    };
+    assert_eq!(cells.len(), sekai_source_sdk::MAX_DISCOVERY_SAMPLE_ROWS);
+    assert!(cells.iter().all(|row| !row.contains_key("customer_email")));
+    assert_eq!(cells[0].get("order_id"), expected_first.as_ref());
+    assert_eq!(
+        sekai_source_sdk::SourceInspector::sample_rows(&mut store, "Account").unwrap(),
+        sekai_source_sdk::DiscoverySample::Unsupported
+    );
+}

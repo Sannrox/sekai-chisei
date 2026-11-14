@@ -39,9 +39,10 @@ use postgres::error::SqlState;
 use postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 use postgres_native_tls::MakeTlsConnector;
 use sekai_source_sdk::{
-    ConfigValue, Connector, ConnectorFailure, Destination, ExportArtifact,
-    MAX_SOURCE_DISPLAY_NAME_BYTES, PropertyValue, SnapshotPage, SnapshotRead, SourceRecord,
-    column_name_suggests_sensitive, contains_secret_like_text,
+    ConfigValue, Connector, ConnectorFailure, Destination, DiscoverySample, ExportArtifact,
+    MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES, PropertyValue, SnapshotPage,
+    SnapshotRead, SourceRecord, cap_discovery_sample, column_name_suggests_sensitive,
+    contains_secret_like_text,
 };
 use sha2::{Digest, Sha256};
 
@@ -137,6 +138,21 @@ impl Connector for Relational {
     fn check(&mut self) -> Result<(), ConnectorFailure> {
         self.connect()?.simple_query("SELECT 1").map_err(failure)?;
         Ok(())
+    }
+
+    fn sample_rows(&mut self, record_kind: &str) -> Result<DiscoverySample, ConnectorFailure> {
+        let spec = ReadSpec::parse(&self.fields)?;
+        if spec.record_kind != record_kind {
+            return Ok(DiscoverySample::Unsupported);
+        }
+        let sql = spec.select_sql(false, MAX_DISCOVERY_SAMPLE_ROWS);
+        let mut client = self.connect()?;
+        let rows = query_after(&mut client, &sql, None)?;
+        let fetched = rows
+            .iter()
+            .map(MemRow::from_postgres)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(discovery_sample(&spec.record_kind, record_kind, &fetched))
     }
 
     fn read_page(
@@ -286,7 +302,30 @@ impl ReadSpec {
             version_name,
         })
     }
+}
 
+fn discovery_sample(expected_kind: &str, record_kind: &str, rows: &[MemRow]) -> DiscoverySample {
+    if expected_kind != record_kind {
+        return DiscoverySample::Unsupported;
+    }
+    let cells = rows
+        .iter()
+        .take(MAX_DISCOVERY_SAMPLE_ROWS)
+        .map(|row| {
+            row.cells
+                .iter()
+                .filter(|(name, cell)| {
+                    !column_name_suggests_sensitive(name)
+                        && !contains_secret_like_text(&cell.as_text())
+                })
+                .map(|(name, cell)| (name.clone(), cell.as_text()))
+                .collect()
+        })
+        .collect();
+    cap_discovery_sample(DiscoverySample::Rows { cells })
+}
+
+impl ReadSpec {
     fn select_sql(&self, after: bool, limit: usize) -> String {
         let order = self.order_sql.join(", ");
         let mut sql = format!("SELECT * FROM {} ", self.table);
@@ -1005,6 +1044,25 @@ mod tests {
 
     fn spec() -> ReadSpec {
         ReadSpec::parse(&prepared(&PAGE, Some("pw")).config).unwrap()
+    }
+
+    #[test]
+    fn discovery_sample_caps_rows_and_omits_sensitive_columns() {
+        let spec = spec();
+        let rows: Vec<MemRow> = (0..=MAX_DISCOVERY_SAMPLE_ROWS as i64)
+            .map(|id| row(id, id, &format!("n{id}")))
+            .collect();
+        let DiscoverySample::Rows { cells } = discovery_sample(&spec.record_kind, "Order", &rows)
+        else {
+            panic!("configured table samples");
+        };
+        assert_eq!(cells.len(), MAX_DISCOVERY_SAMPLE_ROWS);
+        assert!(cells.iter().all(|row| !row.contains_key("password")));
+        assert_eq!(cells[0].get("name").map(String::as_str), Some("n0"));
+        assert_eq!(
+            discovery_sample(&spec.record_kind, "Account", &rows),
+            DiscoverySample::Unsupported
+        );
     }
 
     fn row(id: i64, updated_at: i64, name: &str) -> MemRow {

@@ -16,7 +16,7 @@ use crate::contract::{
     SOURCE_GITHUB, contains_secret_like_text, require_bounded_identifier,
     require_registered_record_token, validate_github_repository,
 };
-use crate::discover::SourceDiscovery;
+use crate::discover::{DiscoverySample, SourceDiscovery};
 use crate::feed::ChangeFeedPage;
 use crate::snapshot::SnapshotRead;
 use serde::{Deserialize, Serialize};
@@ -591,6 +591,12 @@ pub trait Connector {
         Err(ConnectorFailure::Unsupported)
     }
 
+    /// Bounded peek at values for one discovered record kind. The size cap
+    /// is plane-owned. Types that do not sample keep this default.
+    fn sample_rows(&mut self, _record_kind: &str) -> Result<DiscoverySample, ConnectorFailure> {
+        Err(ConnectorFailure::Unsupported)
+    }
+
     fn read_page(
         &mut self,
         _committed_cursor: Option<&str>,
@@ -885,6 +891,10 @@ mod tests {
                 expected_version: "v1".into(),
                 change: BTreeMap::new(),
             }),
+            Err(ConnectorFailure::Unsupported)
+        );
+        assert_eq!(
+            connector.sample_rows("Order"),
             Err(ConnectorFailure::Unsupported)
         );
         assert!(GITHUB_CONNECTOR.supports(Operation::Apply));

@@ -23,10 +23,11 @@
 //! ([`crate::sekai::source_sync`]). A disable raises the claim generation
 //! and ends the claim; a put that changes `every_ms` restarts the schedule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use sekai_source_sdk::{
-    ConnectorType, EgressAllowlist, SourceConfig, connector_type, contains_secret_like_text,
+    ConnectorType, DiscoverySample, EgressAllowlist, SourceConfig, connector_type,
+    contains_secret_like_text,
 };
 use sekai_types::governed_transform::validate_placement_labels;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
+use crate::sekai::audit::Decision;
 use crate::sekai::source_sync::{SyncError, SyncState};
 use crate::sekai::work_claim::ClaimRecord;
 
@@ -44,6 +46,43 @@ pub const MAX_SOURCE_MARKINGS: usize = 32;
 pub const MAX_LIST_SOURCES: usize = 500;
 /// The shortest sync interval; 0 means the Source has no schedule.
 pub const MIN_SOURCE_EVERY_MS: i64 = 60_000;
+/// Audit action for a source-admin discovery sample. Evidence is metadata
+/// only: never cell values.
+pub const SOURCE_DISCOVERY_SAMPLE_ACTION: &str = "source_discovery_sample";
+
+/// Record that `actor` sampled `record_kind` on `source_id`. The sample
+/// itself is not stored: evidence carries namespace, source, kind, and
+/// row count. Callers must already have authorized a source administrator.
+pub fn record_source_discovery_sample(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    source_id: &str,
+    record_kind: &str,
+    sample: &DiscoverySample,
+    now_ms: i64,
+) -> Result<(), String> {
+    let (outcome, row_count) = match sample {
+        DiscoverySample::Unsupported => ("unsupported", 0usize),
+        DiscoverySample::Rows { cells } => ("sampled", cells.len()),
+        _ => ("unsupported", 0),
+    };
+    db.record_decision(&Decision {
+        id: format!("source-discovery-sample:{namespace}:{source_id}:{record_kind}:{now_ms}"),
+        timestamp: now_ms,
+        actor: actor.into(),
+        action: SOURCE_DISCOVERY_SAMPLE_ACTION.into(),
+        reason: format!("source discovery sample {outcome}"),
+        evidence: HashMap::from([
+            ("namespace".into(), namespace.into()),
+            ("source_id".into(), source_id.into()),
+            ("record_kind".into(), record_kind.into()),
+            ("row_count".into(), row_count.to_string()),
+        ]),
+        target_id: source_id.into(),
+        outcome: outcome.into(),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1370,6 +1409,64 @@ pub(crate) mod tests {
     #[test]
     fn sqlite_sources_put_get_list_and_disable() {
         contract(Arc::new(RuntimeDb::memory()), "acme");
+    }
+
+    #[test]
+    fn discovery_sample_audit_records_actor_and_count_without_cell_values() {
+        use crate::sekai::audit::DecisionFilter;
+        let db = RuntimeDb::memory();
+        let secret_cell = "hunter2-not-for-audit";
+        let sampled = DiscoverySample::Rows {
+            cells: vec![BTreeMap::from([("summary".into(), secret_cell.into())])],
+        };
+        record_source_discovery_sample(
+            &db,
+            "ops/admin",
+            "sales",
+            "warehouse-orders",
+            "Order",
+            &sampled,
+            1_000,
+        )
+        .unwrap();
+        record_source_discovery_sample(
+            &db,
+            "ops/admin",
+            "sales",
+            "github-issues",
+            "Issue",
+            &DiscoverySample::Unsupported,
+            2_000,
+        )
+        .unwrap();
+        let listed = db
+            .list_decisions(&DecisionFilter {
+                action: Some(SOURCE_DISCOVERY_SAMPLE_ACTION.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        let sampled_row = listed.iter().find(|row| row.outcome == "sampled").unwrap();
+        assert_eq!(sampled_row.actor, "ops/admin");
+        assert_eq!(
+            sampled_row.evidence.get("row_count").map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            sampled_row
+                .evidence
+                .values()
+                .all(|value| !value.contains(secret_cell)),
+            "sample cells must not appear in audit evidence"
+        );
+        let unsupported = listed
+            .iter()
+            .find(|row| row.outcome == "unsupported")
+            .unwrap();
+        assert_eq!(
+            unsupported.evidence.get("row_count").map(String::as_str),
+            Some("0")
+        );
     }
 
     #[test]

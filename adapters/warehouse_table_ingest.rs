@@ -17,17 +17,20 @@
 //!   plane quarantines the batch and the last consistent objects stay.
 //! - Columns marked `hidden` never leave the connector: they are not in record
 //!   properties, payload digests, display names, or discovery output.
-//! - `TableStore` implements the SDK check and discover operations (#1408),
-//!   so a discovered table drafts the descriptor its batches admit under.
+//! - `TableStore` implements the SDK check, discover, and bounded sample
+//!   operations (#1408, #2276), so a discovered table drafts the descriptor
+//!   its batches admit under and can return a plane-capped peek at visible
+//!   rows. Hidden columns never leave.
 
 use sekai_chisei::sekai::source_type_descriptor::{
     ProposedSourceTypeDescriptor, registered_source_id,
 };
 use sekai_source_sdk::{
     ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, ColumnProfileHint,
-    ConnectionFailure, DiscoveredColumn, DiscoveredRecordKind, FAMILY_OBJECT_SYNC,
-    PROFILE_RATIO_SCALE, SOURCE_BATCH_VERSION, SOURCE_DISCOVERY_VERSION, SourceBatch,
-    SourceDiscovery, SourceInspector, SourceRecord, column_name_suggests_sensitive, object_id_for,
+    ConnectionFailure, DiscoveredColumn, DiscoveredRecordKind, DiscoverySample, FAMILY_OBJECT_SYNC,
+    MAX_DISCOVERY_SAMPLE_ROWS, PROFILE_RATIO_SCALE, SOURCE_BATCH_VERSION, SOURCE_DISCOVERY_VERSION,
+    SourceBatch, SourceDiscovery, SourceInspector, SourceRecord, cap_discovery_sample,
+    column_name_suggests_sensitive, contains_secret_like_text, object_id_for,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -421,6 +424,37 @@ impl SourceInspector for TableStore {
                 key_candidates: vec![vec![snapshot.key_column.clone()]],
             }],
         })
+    }
+
+    /// Visible columns of the first plane-capped rows. Hidden and
+    /// secret-like cells stay inside the connector.
+    fn sample_rows(&mut self, record_kind: &str) -> Result<DiscoverySample, ConnectionFailure> {
+        let snapshot = self.snapshot();
+        if snapshot.record_kind != record_kind {
+            return Ok(DiscoverySample::Unsupported);
+        }
+        let visible: Vec<&str> = snapshot
+            .columns
+            .iter()
+            .filter(|column| !column.hidden && !column_name_suggests_sensitive(&column.name))
+            .map(|column| column.name.as_str())
+            .collect();
+        let cells = snapshot
+            .rows
+            .iter()
+            .take(MAX_DISCOVERY_SAMPLE_ROWS)
+            .map(|row| {
+                visible
+                    .iter()
+                    .filter_map(|name| {
+                        let value = row.get(*name)?;
+                        (!contains_secret_like_text(value))
+                            .then(|| ((*name).to_string(), value.clone()))
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok(cap_discovery_sample(DiscoverySample::Rows { cells }))
     }
 }
 
