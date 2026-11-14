@@ -5,13 +5,20 @@
 //! candidates, and optional per-column profile hints. A discovery only drafts
 //! source-type descriptors (ADR 0060) and onboarding input; admission and
 //! sensitivity marking stay reviewable control-plane acts.
+//!
+//! `sample_rows` is optional on the same contract: a plane-capped peek at
+//! values for one record kind, read with the adapter's credentials. Sources
+//! that cannot sample answer [`DiscoverySample::Unsupported`]. Samples are
+//! never part of the discovery document, so they are not persisted with it.
 
 use crate::contract::{MAX_SOURCE_IDENTIFIER_BYTES, contains_secret_like_text};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SOURCE_DISCOVERY_VERSION: &str = "sekai.source-discovery/v1";
 pub const MAX_DISCOVERED_RECORD_KINDS: usize = 1024;
 pub const MAX_DISCOVERED_COLUMNS: usize = 1024;
+/// Plane-owned sample size. Callers cannot request a larger peek.
+pub const MAX_DISCOVERY_SAMPLE_ROWS: usize = 8;
 /// Profile ratios are basis points so discoveries stay exact and comparable.
 pub const PROFILE_RATIO_SCALE: u16 = 10_000;
 
@@ -44,6 +51,35 @@ pub trait SourceInspector {
     /// List record kinds in ascending `record_kind` order. Must be
     /// deterministic for an unchanged source.
     fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure>;
+    /// Bounded peek at values for one discovered record kind. The size cap
+    /// is plane-owned; a source that cannot sample returns
+    /// [`DiscoverySample::Unsupported`].
+    fn sample_rows(&mut self, _record_kind: &str) -> Result<DiscoverySample, ConnectionFailure> {
+        Ok(DiscoverySample::Unsupported)
+    }
+}
+
+/// Values from one record kind, or a typed refusal when the source cannot
+/// sample. Never stored on [`SourceDiscovery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DiscoverySample {
+    Unsupported,
+    Rows {
+        cells: Vec<BTreeMap<String, String>>,
+    },
+}
+
+/// Truncate a sample to [`MAX_DISCOVERY_SAMPLE_ROWS`]. Adapters that ignore
+/// the constant still cannot return a larger peek through this helper.
+pub fn cap_discovery_sample(sample: DiscoverySample) -> DiscoverySample {
+    match sample {
+        DiscoverySample::Rows { mut cells } => {
+            cells.truncate(MAX_DISCOVERY_SAMPLE_ROWS);
+            DiscoverySample::Rows { cells }
+        }
+        other => other,
+    }
 }
 
 /// Optional per-column hints computed by the connector, never by the plane.
@@ -274,5 +310,35 @@ mod tests {
         let mut keyless = discovery(&["Event"]);
         keyless.record_kinds[0].key_candidates.clear();
         keyless.validate().unwrap();
+    }
+
+    struct SchemaOnly;
+
+    impl SourceInspector for SchemaOnly {
+        fn check(&mut self) -> Result<(), ConnectionFailure> {
+            Ok(())
+        }
+
+        fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+            Ok(discovery(&["Account"]))
+        }
+    }
+
+    #[test]
+    fn sample_defaults_to_unsupported_and_the_plane_caps_rows() {
+        assert_eq!(
+            SchemaOnly.sample_rows("Account").unwrap(),
+            DiscoverySample::Unsupported
+        );
+
+        let extra = (0..=MAX_DISCOVERY_SAMPLE_ROWS)
+            .map(|index| BTreeMap::from([("id".into(), index.to_string())]))
+            .collect();
+        let DiscoverySample::Rows { cells } =
+            cap_discovery_sample(DiscoverySample::Rows { cells: extra })
+        else {
+            panic!("capped rows stay rows");
+        };
+        assert_eq!(cells.len(), MAX_DISCOVERY_SAMPLE_ROWS);
     }
 }

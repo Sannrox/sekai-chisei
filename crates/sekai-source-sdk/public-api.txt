@@ -32,6 +32,7 @@ Destination
 DirectFeedCapability
 DiscoveredColumn
 DiscoveredRecordKind
+DiscoverySample
 DriftHandling
 EgressAllowlist
 ExportArtifact
@@ -64,6 +65,7 @@ MAX_CONFIG_FIELDS
 MAX_CONFIG_VALUE_BYTES
 MAX_DISCOVERED_COLUMNS
 MAX_DISCOVERED_RECORD_KINDS
+MAX_DISCOVERY_SAMPLE_ROWS
 MAX_EGRESS_RULES
 MAX_GITHUB_FIXTURE_BYTES
 MAX_QUARANTINE_REASON_BYTES
@@ -143,6 +145,7 @@ bind_writeback
 build_registered_source_batch
 build_source_batch
 build_source_batch_v2
+cap_discovery_sample
 change_capture::CHANGE_CAPTURE_CONFORMANCE_VERSION: &str
 change_capture::CaptureEvent
 change_capture::CaptureEvent::Change(CapturedChange)
@@ -271,6 +274,7 @@ connector::Connector::deliver(&mut self,&ExportArtifact<'_>) -> Result<(),Connec
 connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFailure>
 connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
+connector::Connector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectorFailure>
 connector::ConnectorFailure
 connector::ConnectorFailure::AuthFailed
 connector::ConnectorFailure::Conflict
@@ -549,8 +553,12 @@ discover::DiscoveredRecordKind.columns: Vec<DiscoveredColumn>
 discover::DiscoveredRecordKind.key_candidates: Vec<Vec<String>>
 discover::DiscoveredRecordKind.record_kind: String
 discover::DiscoveredRecordKind.schema_revision: String
+discover::DiscoverySample
+discover::DiscoverySample::Rows{cells:Vec<BTreeMap<String,String>>}
+discover::DiscoverySample::Unsupported
 discover::MAX_DISCOVERED_COLUMNS: usize
 discover::MAX_DISCOVERED_RECORD_KINDS: usize
+discover::MAX_DISCOVERY_SAMPLE_ROWS: usize
 discover::PROFILE_RATIO_SCALE: u16
 discover::SOURCE_DISCOVERY_VERSION: &str
 discover::SourceDiscovery
@@ -562,6 +570,8 @@ discover::SourceDiscovery::validate(&self) -> Result<(),String>
 discover::SourceInspector
 discover::SourceInspector::check(&mut self) -> Result<(),ConnectionFailure>
 discover::SourceInspector::discover(&mut self) -> Result<SourceDiscovery,ConnectionFailure>
+discover::SourceInspector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectionFailure>
+discover::cap_discovery_sample(DiscoverySample) -> DiscoverySample
 discover::column_name_suggests_sensitive(&str) -> bool
 feed::ChangeFeedPage
 feed::ChangeFeedPage.caught_up: bool

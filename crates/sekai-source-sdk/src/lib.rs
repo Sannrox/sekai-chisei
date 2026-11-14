@@ -51,8 +51,9 @@ pub use contract::{
 };
 pub use discover::{
     ColumnProfileHint, ConnectionFailure, DescriptorDraft, DiscoveredColumn, DiscoveredRecordKind,
-    MAX_DISCOVERED_COLUMNS, MAX_DISCOVERED_RECORD_KINDS, PROFILE_RATIO_SCALE,
-    SOURCE_DISCOVERY_VERSION, SourceDiscovery, SourceInspector, column_name_suggests_sensitive,
+    DiscoverySample, MAX_DISCOVERED_COLUMNS, MAX_DISCOVERED_RECORD_KINDS,
+    MAX_DISCOVERY_SAMPLE_ROWS, PROFILE_RATIO_SCALE, SOURCE_DISCOVERY_VERSION, SourceDiscovery,
+    SourceInspector, cap_discovery_sample, column_name_suggests_sensitive,
 };
 pub use feed::{
     ChangeFeedPage, ChangeFeedRunError, ChangeFeedSource, ChangeFeedSourceFailure, run_change_feed,

@@ -312,6 +312,7 @@ fn contains_secret_like_text(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::conformance::{assert_deterministic_discovery, run_check_conformance};
+    use crate::discover::DiscoverySample;
 
     #[test]
     fn check_validates_repository_without_reading_records() {
@@ -349,6 +350,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Issue", "PullRequest"],
             "onboarding drafts exist; catalog admission stays code-owned"
+        );
+        assert_eq!(source.records_read(), 0);
+    }
+
+    #[test]
+    fn discovery_sample_is_unsupported() {
+        let mut source = GitHubSource::new("sannrox/sekai-chisei");
+        assert_eq!(
+            source.sample_rows("Issue").unwrap(),
+            DiscoverySample::Unsupported
         );
         assert_eq!(source.records_read(), 0);
     }
