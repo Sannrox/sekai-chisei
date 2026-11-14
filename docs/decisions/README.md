@@ -176,4 +176,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0148: Sources are first-class; one connector runtime runs source integrations](0148-sources-and-one-connector-runtime.md)
 - [ADR 0149: One claimable work queue, with typed kinds](0149-one-claimable-work-queue.md)
 - [ADR 0150: Keep operator console sessions process-local across failover](0150-process-local-console-sessions.md)
+- [ADR 0151: Chisei admits every model call](0151-chisei-admits-every-model-call.md)
 <!-- adr-index:end -->

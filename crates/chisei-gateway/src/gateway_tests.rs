@@ -5473,6 +5473,44 @@ async fn fail_closed_blocks_when_chisei_preflight_is_unavailable() {
 }
 
 #[tokio::test]
+async fn caller_provider_credentials_do_not_reach_upstream_without_admission() {
+    let (upstream_base, requests) = spawn_fake_upstream(
+        r#"{"id":"resp_1","status":"completed"}"#,
+        "application/json",
+    )
+    .await;
+    let gateway_base = spawn_gateway_with_config(GatewayConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        openai_base_url: upstream_base,
+        openai_api_key: Some("real-openai-key".to_string()),
+        anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+        ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+        native_base_url: None,
+        anthropic_api_key: Some("real-anthropic-key".to_string()),
+        chisei_grpc_target: None,
+        default_project: "default".to_string(),
+        gateway_keys: HashMap::new(),
+        allow_auth_passthrough: true,
+        rewrite_openai_passthrough_auth: false,
+        pricing: HashMap::new(),
+        allow_cross_provider: false,
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_base}/v1/responses"))
+        .bearer_auth("sk-caller-openai")
+        .header(X_CHISEI_AGENT.as_str(), "codex-app")
+        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn available_models_endpoint_is_authenticated_filterable_and_redacted() {
     let (upstream_base, _) =
         spawn_fake_upstream(r#"{"data":[{"id":"gpt-5.5"}]}"#, "application/json").await;
