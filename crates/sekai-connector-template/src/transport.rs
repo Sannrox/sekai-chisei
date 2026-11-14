@@ -213,6 +213,7 @@ fn property_value_to_proto(value: &sekai_source_sdk::PropertyValue) -> pb::Prope
                     .map(|(key, nested)| (key.clone(), property_value_to_proto(nested)))
                     .collect(),
             }),
+            other => Kind::StringValue(other.as_cell()),
         }),
     }
 }

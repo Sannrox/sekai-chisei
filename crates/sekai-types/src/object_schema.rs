@@ -122,6 +122,7 @@ pub fn is_valid_property_classification(value: &str) -> bool {
 /// string and accepts numbers/bools/objects untagged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum PropertyValue {
     Bool(bool),
     Int(i64),

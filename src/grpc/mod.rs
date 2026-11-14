@@ -63,6 +63,7 @@ pub fn property_value_to_proto(
                     .map(|(key, nested)| (key.clone(), property_value_to_proto(nested)))
                     .collect(),
             }),
+            other => Kind::StringValue(other.as_cell()),
         }),
     }
 }
