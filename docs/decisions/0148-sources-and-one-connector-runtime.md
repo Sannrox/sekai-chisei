@@ -157,9 +157,8 @@ ways.
   delivery table, idempotent per receipt. Page reads need a registered
   type descriptor (ADR 0100) and are not built; a relational Source's
   syncs fail as `unsupported`.
-- **Not yet built.** GitHub writeback through `apply` and `external_effect`
-  health. The Validation item for a writeback effect stays open until they
-  land.
+- **Writeback.** The GitHub and relational types apply external effects
+  (amendment 2026-11-14). `external_effect` health is not yet built.
 - **Unchanged.** The saved-export RPCs still refuse a tenant or machine
   caller context, as they did before this ADR.
 
@@ -187,6 +186,16 @@ ways.
 - **Disable.** Disabling or re-placing the Source ends a live claim at its
   next heartbeat. An acknowledge needs only the live fence, so the outcome
   of a change already applied is still recorded.
+- **Executor.** The connector runtime claims effects after its deliveries,
+  redeems as the principal it authenticates as, applies through the
+  Source's connector, reports execution evidence and acknowledges. Chisei
+  verifies the permit at redemption against what the runtime is about to
+  do, so the runtime keeps no permit key. Each apply offers the
+  `version_checked_write` host capability: the record must still have the
+  version the change was decided against. Relational checks it under a row
+  lock; GitHub, which has no conditional write, reads just before the
+  write, so a write racing that read is not detected. The parameter
+  contract is in [external-action-execution.md](../external-action-execution.md).
 
 ## Alternatives considered
 

@@ -1,6 +1,7 @@
 //! The claim loop: Source sync work from the plane's one work queue
 //! (ADR 0149), run under a heartbeated lease and acknowledged with its
-//! outcome. Saved-export delivery runs the same way ([`crate::delivery`]).
+//! outcome. Saved-export delivery ([`crate::delivery`]) and external
+//! effects ([`crate::effect`]) run the same way.
 //!
 //! The plane holds every piece of state. A runtime that dies mid-sync
 //! leaves a lease that lapses; another runtime then claims the Source under
@@ -33,7 +34,7 @@ pub struct RuntimeOptions {
     pub lease: Duration,
 }
 
-/// The end of one claimed sync or delivery.
+/// The end of one claimed sync, delivery or external effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Ran {
@@ -54,6 +55,15 @@ pub enum Ran {
     /// The delivery claim was lost, or the bytes could not be fetched under
     /// it; the claim lapses and the artifact is delivered again.
     DeliveryLost { receipt_id: String },
+    /// An external effect, acknowledged with its outcome.
+    Effect {
+        effect_id: String,
+        outcome: crate::Effected,
+    },
+    /// The effect's claim was lost, or Chisei could not be reached to
+    /// redeem; nothing was acknowledged. The next holder cannot redeem a
+    /// permit this one redeemed, so it records `outcome_unknown`.
+    EffectLost { effect_id: String },
 }
 
 /// One connector runtime, serving a fixed set of namespaces.
@@ -207,8 +217,8 @@ impl Runtime {
     }
 
     /// One pass: claims and runs every due Source sync, then every
-    /// deliverable artifact of a Source this runtime can run, in each
-    /// namespace in turn.
+    /// deliverable artifact and every pending external effect of a Source
+    /// this runtime can run, in each namespace in turn.
     pub async fn pass(&self) -> Result<Vec<Ran>, RuntimeClaimError> {
         let mut ran = Vec::new();
         for index in 0..self.clients.len() {
@@ -217,6 +227,9 @@ impl Runtime {
             }
             while let Some((source, work)) = self.claim_delivery(index).await? {
                 ran.push(self.deliver(index, source, work).await?);
+            }
+            while let Some(work) = self.claim_effect(index).await? {
+                ran.push(self.apply(index, work).await?);
             }
         }
         Ok(ran)

@@ -22,6 +22,17 @@
 //! text), `namespace`, `definition_id`, `content_digest` (text) and
 //! `content` (bytea).
 //!
+//! An applied change updates one row of the snapshot `table`, addressed
+//! by the record's `external_id`, in one transaction: the row is locked,
+//! its `version_column` (the monotonic column by default) must still read
+//! the version the change was decided against, and the change's columns
+//! are then set, cast by PostgreSQL to their column types. A changed or
+//! missing row is a conflict and nothing is written. Setting the same
+//! values again is a no-op, so a replay never writes anything new. Primary
+//! keys are matched in their text form, which covers integer, boolean and
+//! text keys. A change may not touch a primary-key column or a column whose
+//! name suggests a secret.
+//!
 //! The connection always uses TLS and verifies the server's certificate
 //! against the system roots plus an optional operator CA. It goes to the
 //! `endpoint` the egress allowlist admitted, parsed the same way. When the
@@ -40,8 +51,8 @@ use postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 use postgres_native_tls::MakeTlsConnector;
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, Destination, DiscoverySample, ExportArtifact,
-    MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES, PropertyValue, SnapshotPage,
-    SnapshotRead, SourceRecord, cap_discovery_sample, column_name_suggests_sensitive,
+    MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES, PropertyValue, RecordChange,
+    SnapshotPage, SnapshotRead, SourceRecord, cap_discovery_sample, column_name_suggests_sensitive,
     contains_secret_like_text,
 };
 use sha2::{Digest, Sha256};
@@ -226,6 +237,92 @@ impl Connector for Relational {
         } else {
             Err(ConnectorFailure::Invalid)
         }
+    }
+
+    fn apply(&mut self, change: &RecordChange) -> Result<String, ConnectorFailure> {
+        let mut client = self.connect()?;
+        self.apply_change(&mut client, change)
+    }
+}
+
+impl Relational {
+    /// The row `change` addresses, updated while its version is still the
+    /// one the change was decided against. Returns the row's new version.
+    fn apply_change(
+        &self,
+        client: &mut postgres::Client,
+        change: &RecordChange,
+    ) -> Result<String, ConnectorFailure> {
+        let spec = ReadSpec::parse(&self.fields)?;
+        let key = change
+            .key
+            .split('~')
+            .map(percent_decode)
+            .collect::<Option<Vec<_>>>()
+            .filter(|key| key.len() == spec.pk_names.len())
+            .ok_or(ConnectorFailure::Invalid)?;
+        // The values are keyed by the column names the SET clause uses, so
+        // a name in another case cannot read as an absent (NULL) value.
+        let mut columns = Vec::with_capacity(change.change.len());
+        let mut values = BTreeMap::new();
+        for (name, value) in &change.change {
+            let name = column_name(name)?;
+            if spec.pk_names.contains(&name) || column_name_suggests_sensitive(&name) {
+                return Err(ConnectorFailure::Invalid);
+            }
+            columns.push(quoted_ident(&name).ok_or(ConnectorFailure::Invalid)?);
+            if values.insert(name, value).is_some() {
+                return Err(ConnectorFailure::Invalid);
+            }
+        }
+        let version = quoted_ident(&spec.version_name).ok_or(ConnectorFailure::Invalid)?;
+        let table = &spec.table;
+        let row_of = spec
+            .pk_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                quoted_ident(name)
+                    .map(|name| format!("t.{name}::text = ${}", index + 1))
+                    .ok_or(ConnectorFailure::Invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" AND ");
+        let values = serde_json::to_string(&values).map_err(|_| ConnectorFailure::Invalid)?;
+        let mut params: Vec<&(dyn ToSql + Sync)> =
+            key.iter().map(|part| part as &(dyn ToSql + Sync)).collect();
+        let mut tx = client.transaction().map_err(failure)?;
+        let current = tx
+            .query_opt(
+                &format!("SELECT t.{version} FROM {table} AS t WHERE {row_of} FOR UPDATE"),
+                &params,
+            )
+            .map_err(failure)?
+            .ok_or(ConnectorFailure::Conflict)?;
+        let current = cell_from(&current, 0)?.ok_or(ConnectorFailure::Invalid)?;
+        if current.as_text() != change.expected_version {
+            return Err(ConnectorFailure::Conflict);
+        }
+        let set = columns
+            .iter()
+            .map(|column| format!("{column} = r.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        params.push(&values);
+        let updated = tx
+            .query_one(
+                &format!(
+                    "UPDATE {table} AS t SET {set} \
+                     FROM json_populate_record(NULL::{table}, ${}::text::json) AS r \
+                     WHERE {row_of} RETURNING t.{version}",
+                    params.len()
+                ),
+                &params,
+            )
+            .map_err(failure)?;
+        let updated = cell_from(&updated, 0)?.ok_or(ConnectorFailure::Invalid)?;
+        tx.commit().map_err(failure)?;
+        Ok(updated.as_text())
     }
 }
 
@@ -1592,6 +1689,93 @@ mod tests {
         );
         admin
             .batch_execute(&format!("DROP TABLE {table}; DROP TABLE {misshaped}"))
+            .unwrap();
+    }
+    /// Applies changes to a real PostgreSQL row over TLS. Run through
+    /// `scripts/postgres-conformance.sh`.
+    #[test]
+    #[ignore = "requires PostgreSQL; run scripts/postgres-conformance.sh"]
+    fn postgres_apply_writes_only_the_decided_version() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL").expect("SEKAI_TEST_POSTGRES_URL");
+        let ca = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT")
+            .map(|path| std::fs::read(path).expect("read CA certificate"))
+            .ok();
+        let tls = tls(ca.as_deref()).unwrap();
+        let target: postgres::Config = url.parse().unwrap();
+        let host = match &target.get_hosts()[0] {
+            postgres::config::Host::Tcp(host) if host == "localhost" => "127.0.0.1".to_string(),
+            postgres::config::Host::Tcp(host) => host.clone(),
+            #[cfg(unix)]
+            postgres::config::Host::Unix(_) => panic!("a TCP URL"),
+        };
+        let password = String::from_utf8(target.get_password().unwrap().to_vec()).unwrap();
+        let table = format!(
+            "apply_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut admin = target.connect(tls.clone()).unwrap();
+        // The application bumps the version on every write, as a trigger.
+        admin
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int PRIMARY KEY, status text NOT NULL, \
+                 qty int NOT NULL, updated_at bigint NOT NULL, password text); \
+                 INSERT INTO {table} VALUES (1, 'open', 1, 10, 'secret'); \
+                 CREATE FUNCTION {table}_bump() RETURNS trigger LANGUAGE plpgsql AS \
+                 $$ BEGIN NEW.updated_at := OLD.updated_at + 1; RETURN NEW; END $$; \
+                 CREATE TRIGGER {table}_bump BEFORE UPDATE ON {table} \
+                 FOR EACH ROW EXECUTE FUNCTION {table}_bump();"
+            ))
+            .unwrap();
+        let endpoint = format!("{host}:{}", target.get_ports()[0]);
+        let config = [
+            ("endpoint", endpoint.as_str()),
+            ("database", target.get_dbname().unwrap()),
+            ("user", target.get_user().unwrap()),
+            ("table", table.as_str()),
+            ("record_kind", "Order"),
+            ("pk_columns", "id"),
+            ("monotonic_column", "updated_at"),
+        ];
+        let mut relational = open(&prepared(&config, Some(&password)), &tls).unwrap();
+        let change = |version: &str, change: &[(&str, &str)]| RecordChange {
+            idempotency_key: "effect-1".into(),
+            key: "1".into(),
+            expected_version: version.into(),
+            change: change
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        };
+        // Column names fold to lower case, as unquoted SQL names do.
+        let shipped = change("10", &[("Status", "shipped"), ("qty", "3")]);
+        assert_eq!(relational.apply(&shipped), Ok("11".into()));
+        // A replay finds the version moved and writes nothing.
+        assert_eq!(relational.apply(&shipped), Err(ConnectorFailure::Conflict));
+        for refused in [
+            change("11", &[("id", "2")]),
+            change("11", &[("password", "x")]),
+            change("11", &[("missing", "x")]),
+            change("11", &[("status", "a"), ("STATUS", "b")]),
+        ] {
+            assert_eq!(relational.apply(&refused), Err(ConnectorFailure::Invalid));
+        }
+        let mut gone = change("11", &[("status", "closed")]);
+        gone.key = "9".into();
+        assert_eq!(relational.apply(&gone), Err(ConnectorFailure::Conflict));
+        let row = admin
+            .query_one(&format!("SELECT status, qty, updated_at FROM {table}"), &[])
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "shipped");
+        assert_eq!(row.get::<_, i32>(1), 3);
+        assert_eq!(row.get::<_, i64>(2), 11);
+        admin
+            .batch_execute(&format!(
+                "DROP TABLE {table}; DROP FUNCTION {table}_bump();"
+            ))
             .unwrap();
     }
 }

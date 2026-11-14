@@ -45,7 +45,6 @@ use sekai_chisei::sekai::execution_evidence::{
     verify_for_executor,
 };
 use sekai_chisei::sekai::governed_action_type::EFFECT_KIND_EXTERNAL_MUTATE;
-use sha2::{Digest, Sha256};
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 
@@ -132,11 +131,13 @@ pub fn arguments_digest(
     expected_version: &str,
     change: &BTreeMap<String, String>,
 ) -> String {
-    let change = serde_json::to_string(change).expect("string map serializes");
-    format!(
-        "sha256:{:x}",
-        Sha256::digest(format!("{resource}\n{expected_version}\n{change}\n").as_bytes())
-    )
+    sekai_source_sdk::RecordChange {
+        idempotency_key: String::new(),
+        key: String::new(),
+        expected_version: expected_version.into(),
+        change: change.clone(),
+    }
+    .arguments_digest(resource)
 }
 
 impl WritebackProfile {
