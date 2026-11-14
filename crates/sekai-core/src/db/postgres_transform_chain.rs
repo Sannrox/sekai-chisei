@@ -442,6 +442,54 @@ mod tests {
     use sekai_types::receipt_chain::{SigningKeySet, verify_bundle};
     use std::collections::HashMap;
 
+    // Family DDL lives in chisei persist. Shared scratch applies the empty
+    // sekai-core receipt_chain migration, so tests that export a bundle create
+    // the tables the dest pair would apply on Chisei open.
+    const RECEIPT_CHAIN_DDL: &str = "
+CREATE TABLE IF NOT EXISTS chisei_receipt_chain (
+    namespace TEXT NOT NULL,
+    seq BIGINT NOT NULL,
+    kind TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    prev_hash TEXT NOT NULL,
+    entry_hash TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (namespace, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_chisei_receipt_chain_receipt
+    ON chisei_receipt_chain(namespace, receipt_id);
+CREATE TABLE IF NOT EXISTS chisei_receipt_chain_checkpoints (
+    namespace TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    head_seq BIGINT NOT NULL,
+    head_hash TEXT NOT NULL,
+    entry_count BIGINT NOT NULL,
+    key_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (namespace, kind, head_seq)
+);
+CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
+    key_id TEXT PRIMARY KEY,
+    public_key_hex TEXT NOT NULL,
+    created_at_ms BIGINT NOT NULL,
+    retired_at_ms BIGINT
+);
+";
+
+    fn connect_with_receipts(scratch: &ScratchDatabase) -> PostgresDb {
+        let db = scratch.connect();
+        {
+            let mut conn = db.connection().expect("scratch connection");
+            conn.batch_execute(RECEIPT_CHAIN_DDL)
+                .expect("receipt chain tables");
+        }
+        db
+    }
+
     fn dataset(id: &str) -> Dataset {
         Dataset {
             id: id.into(),
@@ -631,7 +679,7 @@ mod tests {
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_three_step_chain_completes_and_receipts_verify() {
         let scratch = ScratchDatabase::create();
-        let db = scratch.connect();
+        let db = connect_with_receipts(&scratch);
         let keys = SigningKeySet::from_seed_hex(
             "0000000000000000000000000000000000000000000000000000000000000001",
             1,
