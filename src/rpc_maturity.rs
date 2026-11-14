@@ -297,6 +297,8 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.definitions.diff" => Some("CompareDefinitionRevisions"),
         "sekai.definitions.impact" => Some("ReportDefinitionConsumerImpact"),
         "sekai.definitions.proposal.create" => Some("CreateDefinitionProposal"),
+        "sekai.transforms.chain" | "sekai.transforms.chain.run" => Some("RunTransformChain"),
+        "sekai.transforms.chain.status" => Some("GetTransformChainRun"),
         other if other.starts_with("sekai.objects.query.") => Some("ListObjects"),
         other if other.starts_with("sekai.actions.") || other.starts_with("sekai.action.") => {
             Some("SubmitActionInstance")

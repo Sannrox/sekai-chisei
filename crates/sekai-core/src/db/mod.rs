@@ -54,6 +54,7 @@ pub mod source_batch_dataset;
 pub mod source_batch_recovery;
 pub(crate) mod sqlite_manager;
 pub mod sync_scope;
+pub mod transform_chain;
 pub mod transform_replay;
 pub mod transform_shadow;
 #[cfg(any(test, feature = "gateway-test-support"))]
@@ -107,6 +108,7 @@ pub mod postgres_service_principal;
 pub mod postgres_source_registry;
 pub mod postgres_sync_scope;
 pub mod postgres_team_namespace;
+pub mod postgres_transform_chain;
 pub mod postgres_workflow_action;
 pub mod postgres_write_freeze;
 pub mod schema_plane;

@@ -29,6 +29,9 @@ pub const CREATE_DEFINITION_PROPOSAL_TOOL: &str = "sekai.definitions.proposal.cr
 /// Hybrid search (#1683): object references under the Search RPC's read
 /// policy and fusion profile, never vectors. The backing RPC is stable (#2243).
 pub const SEARCH_TOOL: &str = "sekai.search.query";
+/// Experimental (#2119). Listed only when experimental RPCs are enabled.
+pub const RUN_TRANSFORM_CHAIN_TOOL: &str = "sekai.transforms.chain.run";
+pub const GET_TRANSFORM_CHAIN_RUN_TOOL: &str = "sekai.transforms.chain.status";
 
 const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "authorization",
@@ -81,6 +84,8 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         IMPACT_DEFINITIONS_TOOL => Some(NativeRpc::ReportDefinitionConsumerImpact),
         CREATE_DEFINITION_PROPOSAL_TOOL => Some(NativeRpc::CreateDefinitionProposal),
         SEARCH_TOOL => Some(NativeRpc::Search),
+        RUN_TRANSFORM_CHAIN_TOOL => Some(NativeRpc::RunTransformChain),
+        GET_TRANSFORM_CHAIN_RUN_TOOL => Some(NativeRpc::GetTransformChainRun),
         _ => None,
     }
 }
@@ -141,7 +146,11 @@ where
     S: NativeSurface,
 {
     let snapshot = surface.refresh_catalog().await.map_err(adapter_error)?;
-    let tools = well_known_entries()
+    let mut entries = well_known_entries();
+    if surface.experimental_tools() {
+        entries.extend(experimental_entries());
+    }
+    let tools = entries
         .into_iter()
         .map(|entry| {
             ProjectedCapability::new(&entry, snapshot.context.clone())
@@ -205,8 +214,9 @@ where
     input = bind_session_input(rpc, input, &snapshot.context, operation_id)?;
     let entry = well_known_entries()
         .into_iter()
+        .chain(experimental_entries())
         .find(|entry| entry.name == name)
-        .expect("allowlisted tool has a catalog entry");
+        .ok_or_else(|| json!({"code":-32602,"message":"unsupported RPC mapping"}))?;
     let projected = ProjectedCapability::new(&entry, snapshot.context.clone())
         .map_err(|error| json!({"code":-32000,"message": error.to_string()}))?;
     let invocation = projected
@@ -277,6 +287,7 @@ fn bind_session_input(
                 object.insert("operation_id".into(), json!(operation_id));
             }
         }
+        NativeRpc::GetTransformChainRun => {}
         NativeRpc::Search => {
             // Only these fields cross the adapter. The session fixes the
             // namespace; the tool always searches objects, hybrid by default.
@@ -388,6 +399,32 @@ fn bind_session_input(
                 }));
             }
             object.insert("namespace".into(), json!(context.namespace));
+        }
+        NativeRpc::RunTransformChain => {
+            if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"chain namespace must match the authenticated adapter session"
+                }));
+            }
+            let supplied = object
+                .get("idempotency_key")
+                .or_else(|| object.get("idempotencyKey"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(key) = supplied
+                && key != operation_id
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"RunTransformChain idempotency_key must equal operation_id"
+                }));
+            }
+            object.insert("namespace".into(), json!(context.namespace));
+            object.insert("idempotencyKey".into(), json!(operation_id));
         }
     }
     Ok(input)
@@ -573,6 +610,27 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "query",
             "sekai.SearchRequest",
             "sekai.SearchResponse",
+            "read",
+        ),
+    ]
+}
+
+fn experimental_entries() -> Vec<CapabilityEntry> {
+    vec![
+        capability_entry(
+            RUN_TRANSFORM_CHAIN_TOOL,
+            "Run one registered transform chain as a governed, receipted operation.",
+            "action",
+            "sekai.RunTransformChainRequest",
+            "sekai.RunTransformChainResponse",
+            "write",
+        ),
+        capability_entry(
+            GET_TRANSFORM_CHAIN_RUN_TOOL,
+            "Read the status and receipt of one transform chain run.",
+            "query",
+            "sekai.GetTransformChainRunRequest",
+            "sekai.GetTransformChainRunResponse",
             "read",
         ),
     ]
@@ -872,6 +930,72 @@ mod tests {
                 .discover_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn run_transform_chain_binds_operation_id_as_idempotency_key() {
+        let fixture = surface();
+        let call = |id: i64, input: Value| {
+            json!({
+                "jsonrpc":"2.0",
+                "id":id,
+                "method":"tools/call",
+                "params":{
+                    "name": RUN_TRANSFORM_CHAIN_TOOL,
+                    "arguments":{"operation_id":"op-chain-1","input":input}
+                }
+            })
+        };
+        let conflict = handle_message(
+            &fixture,
+            call(1, json!({"chainId":"c1","idempotencyKey":"other"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflict["error"]["code"], -32602, "{conflict}");
+        assert!(
+            conflict["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("idempotency_key"),
+            "{conflict}"
+        );
+
+        let snake_conflict = handle_message(
+            &fixture,
+            call(2, json!({"chain_id":"c1","idempotency_key":"other"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snake_conflict["error"]["code"], -32602, "{snake_conflict}");
+
+        let foreign = handle_message(
+            &fixture,
+            call(3, json!({"namespace":"other","chainId":"c1"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(foreign["error"]["code"], -32602, "{foreign}");
+
+        let denied = handle_message(&fixture, call(4, json!({"chainId":"c1"})))
+            .await
+            .unwrap();
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+        assert_eq!(
+            denied["result"]["structuredContent"]["code"],
+            "permission_denied"
+        );
+
+        let matching = handle_message(
+            &fixture,
+            call(5, json!({"chainId":"c1","idempotencyKey":"op-chain-1"})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            matching["result"]["structuredContent"]["code"], "permission_denied",
+            "{matching}"
         );
     }
 }

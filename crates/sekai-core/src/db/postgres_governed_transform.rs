@@ -766,12 +766,17 @@ impl PostgresDb {
         run_id: &str,
         now_ms: i64,
     ) -> Result<TransformRun, String> {
-        let mut connection = self.connection()?;
-        let mut tx = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let run = cancel_governed_transform_run_pg(&mut tx, run_id, now_ms)?;
-        tx.commit().map_err(|error| error.to_string())?;
+        let run = {
+            let mut connection = self.connection()?;
+            let mut tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let run = cancel_governed_transform_run_pg(&mut tx, run_id, now_ms)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            run
+        };
+        // Transform write already committed. Run/Get reconcile chain state.
+        let _ = crate::db::transform_chain::on_transform_run_written(self, &run, now_ms);
         Ok(run)
     }
 
@@ -1729,14 +1734,19 @@ impl PostgresDb {
         command: WriteTransformRunCommand,
         now_ms: i64,
     ) -> Result<TransformRun, String> {
-        let mut connection = self.connection()?;
-        let mut tx = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let namespace = peek_transform_work_namespace(&mut tx, &command.run_id)?;
-        lock_transform_work_namespace(&mut tx, &namespace)?;
-        let run = write_transform_run_pg(&mut tx, &command, now_ms)?;
-        tx.commit().map_err(|error| error.to_string())?;
+        let run = {
+            let mut connection = self.connection()?;
+            let mut tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            let namespace = peek_transform_work_namespace(&mut tx, &command.run_id)?;
+            lock_transform_work_namespace(&mut tx, &namespace)?;
+            let run = write_transform_run_pg(&mut tx, &command, now_ms)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            run
+        };
+        // Transform write already committed. Run/Get reconcile chain state.
+        let _ = crate::db::transform_chain::on_transform_run_written(self, &run, now_ms);
         Ok(run)
     }
 

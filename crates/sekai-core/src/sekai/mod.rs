@@ -83,6 +83,7 @@ pub mod geospatial;
 pub mod governed_action_type;
 pub mod governed_facts;
 pub mod governed_transform;
+pub use sekai_types::transform_chain;
 pub mod handoff;
 pub mod handoff_lifecycle;
 pub mod hosted_session;

@@ -2925,6 +2925,301 @@ pub(super) async fn get_governed_transform_run(
         )?),
     }))
 }
+
+pub(super) async fn put_transform_chain(
+    service: &SekaiServiceImpl,
+    req: Request<PutTransformChainRequest>,
+) -> Result<Response<PutTransformChainResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let proto = req
+        .into_inner()
+        .chain
+        .ok_or_else(|| Status::invalid_argument("chain required"))?;
+    let chain = transform_chain_from_proto(proto)
+        .prepare()
+        .map_err(|error| Status::invalid_argument(error.message()))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &chain.namespace,
+            true,
+        )?;
+    }
+    check_team_namespace(service.db.runtime(), &principals, &chain.namespace, true)?;
+    let stored = service
+        .db
+        .runtime()
+        .put_transform_chain(&chain, now_millis())
+        .map_err(|error| {
+            if error.contains("not found") || error.contains("named chain edge") {
+                Status::invalid_argument(error)
+            } else {
+                Status::internal(error)
+            }
+        })?;
+    Ok(Response::new(PutTransformChainResponse {
+        chain: Some(to_proto_transform_chain(&stored)),
+    }))
+}
+
+pub(super) async fn run_transform_chain(
+    service: &SekaiServiceImpl,
+    req: Request<RunTransformChainRequest>,
+) -> Result<Response<RunTransformChainResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let actor = principals.first().cloned().unwrap_or_default();
+    let input = req.into_inner();
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &input.namespace,
+            true,
+        )?;
+    }
+    check_team_namespace(service.db.runtime(), &principals, &input.namespace, true)?;
+    let existing = if input.idempotency_key.trim().is_empty() {
+        None
+    } else {
+        service
+            .db
+            .runtime()
+            .peek_transform_chain_run_by_identity(
+                &input.namespace,
+                &input.chain_id,
+                &crate::sekai::transform_chain::chain_run_identity(&input.idempotency_key),
+            )
+            .map_err(Status::internal)?
+    };
+    let admit = !matches!(
+        existing.as_ref().map(|run| run.status.as_str()),
+        Some(crate::sekai::transform_chain::CHAIN_WORK_COMPLETED)
+            | Some(crate::sekai::transform_chain::CHAIN_WORK_RUNNING)
+    );
+    let quota = service.quota_runtime();
+    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let held = if admit {
+        admit_tenant_transform(
+            quota.as_ref(),
+            &gate,
+            tenant_context.as_ref(),
+            &format!(
+                "transform-chain:{}:{}:{}",
+                input.namespace, input.chain_id, input.idempotency_key
+            ),
+            false,
+        )?
+    } else {
+        None
+    };
+    let owner_tenant = tenant_context
+        .as_ref()
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+        .unwrap_or("");
+    let (run, replayed) = match service.db.runtime().run_transform_chain(
+        &input.namespace,
+        &input.chain_id,
+        &input.idempotency_key,
+        owner_tenant,
+        now_millis(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+            return Err(if error.contains("not found") {
+                Status::not_found(error)
+            } else {
+                Status::internal(error)
+            });
+        }
+    };
+    if replayed {
+        abandon_tenant_transform(service.db.runtime(), &gate, held.as_ref())?;
+    } else if run.is_terminal() {
+        let receipt = crate::sekai::transform_chain::chain_receipt(&run, "", "");
+        let recorded = record_tenant_transform_usage(
+            quota.as_ref(),
+            Some(owner_tenant).filter(|tenant| !tenant.is_empty()),
+            &receipt,
+            &actor,
+            now_millis(),
+        );
+        release_tenant_transform(service.db.runtime(), &gate, &run.run_id, held.as_ref())?;
+        if recorded? {
+            ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
+        }
+    } else {
+        release_tenant_transform(service.db.runtime(), &gate, &run.run_id, held.as_ref())?;
+    }
+    Ok(Response::new(RunTransformChainResponse {
+        run: Some(to_proto_transform_chain_run(service, &principals, &run)?),
+        replayed,
+    }))
+}
+
+pub(super) async fn get_transform_chain_run(
+    service: &SekaiServiceImpl,
+    req: Request<GetTransformChainRunRequest>,
+) -> Result<Response<GetTransformChainRunResponse>, Status> {
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let run_id = req.into_inner().run_id;
+    let peeked = service
+        .db
+        .runtime()
+        .peek_transform_chain_run(&run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("not found"))?;
+    if let Some(context) = tenant_context.as_ref() {
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            Some(context),
+            &peeked.namespace,
+            false,
+        )
+        .map_err(|_| Status::not_found("not found"))?;
+    }
+    check_team_namespace(service.db.runtime(), &principals, &peeked.namespace, false)?;
+    let run = if peeked.status == crate::sekai::transform_chain::CHAIN_WORK_RUNNING {
+        service
+            .db
+            .runtime()
+            .get_transform_chain_run(&run_id, now_millis())
+            .map_err(Status::internal)?
+            .unwrap_or(peeked)
+    } else {
+        peeked
+    };
+    Ok(Response::new(GetTransformChainRunResponse {
+        run: Some(to_proto_transform_chain_run(service, &principals, &run)?),
+    }))
+}
+
+fn transform_chain_from_proto(
+    proto: TransformChain,
+) -> crate::sekai::transform_chain::TransformChain {
+    crate::sekai::transform_chain::TransformChain {
+        contract_version: proto.contract_version,
+        namespace: proto.namespace,
+        chain_id: proto.chain_id,
+        steps: proto
+            .steps
+            .into_iter()
+            .map(|step| crate::sekai::transform_chain::ChainStep {
+                name: step.name,
+                transform_id: step.transform_id,
+                transform_digest: step.transform_digest,
+                assertions: step
+                    .assertions
+                    .into_iter()
+                    .map(|assertion| crate::sekai::transform_chain::ChainAssertion {
+                        kind: assertion.kind,
+                        column: assertion.column,
+                        value: assertion.value,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        edges: proto
+            .edges
+            .into_iter()
+            .map(|edge| crate::sekai::transform_chain::ChainEdge {
+                from_step: edge.from_step,
+                output: edge.output,
+                to_step: edge.to_step,
+                input: edge.input,
+            })
+            .collect(),
+        definition_digest: proto.definition_digest,
+    }
+}
+
+fn to_proto_transform_chain(
+    chain: &crate::sekai::transform_chain::TransformChain,
+) -> TransformChain {
+    TransformChain {
+        contract_version: chain.contract_version.clone(),
+        namespace: chain.namespace.clone(),
+        chain_id: chain.chain_id.clone(),
+        steps: chain
+            .steps
+            .iter()
+            .map(|step| TransformChainStep {
+                name: step.name.clone(),
+                transform_id: step.transform_id.clone(),
+                transform_digest: step.transform_digest.clone(),
+                assertions: step
+                    .assertions
+                    .iter()
+                    .map(|assertion| TransformChainAssertion {
+                        kind: assertion.kind.clone(),
+                        column: assertion.column.clone(),
+                        value: assertion.value.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        edges: chain
+            .edges
+            .iter()
+            .map(|edge| TransformChainEdge {
+                from_step: edge.from_step.clone(),
+                output: edge.output.clone(),
+                to_step: edge.to_step.clone(),
+                input: edge.input.clone(),
+            })
+            .collect(),
+        definition_digest: chain.definition_digest.clone(),
+    }
+}
+
+fn to_proto_transform_chain_run(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    run: &crate::sekai::transform_chain::TransformChainRun,
+) -> Result<TransformChainRun, Status> {
+    let mut proto = TransformChainRun {
+        run_id: run.run_id.clone(),
+        namespace: run.namespace.clone(),
+        chain_id: run.chain_id.clone(),
+        definition_digest: run.definition_digest.clone(),
+        status: run.status.clone(),
+        failed_step: run.failed_step.clone(),
+        error: run.error.clone(),
+        steps: run
+            .steps
+            .iter()
+            .map(|step| TransformChainStepRun {
+                step: step.step.clone(),
+                transform_run_id: step.transform_run_id.clone(),
+                status: step.status.clone(),
+            })
+            .collect(),
+        created_at_ms: run.created_at_ms,
+        completed_at_ms: run.completed_at_ms,
+        receipt: None,
+    };
+    if run.is_terminal() {
+        let receipt = crate::sekai::transform_chain::chain_receipt(
+            run,
+            &run.input_digest,
+            &run.output_digest,
+        );
+        let reveal = caller_can_read_run_datasets(service, principals, &receipt);
+        proto.receipt = Some(to_proto_transform_run(&receipt, reveal));
+    }
+    Ok(proto)
+}
+
 pub(super) async fn list_governed_transforms(
     service: &SekaiServiceImpl,
     req: Request<ListGovernedTransformsRequest>,

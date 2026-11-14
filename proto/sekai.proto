@@ -1166,6 +1166,70 @@ message GetGovernedTransformRunRequest {
 message GetGovernedTransformRunResponse {
   TransformRun run = 1;
 }
+message TransformChainAssertion {
+  string kind = 1;
+  string column = 2;
+  string value = 3;
+}
+message TransformChainStep {
+  string name = 1;
+  string transform_id = 2;
+  repeated TransformChainAssertion assertions = 3;
+  string transform_digest = 4;
+}
+message TransformChainEdge {
+  string from_step = 1;
+  string output = 2;
+  string to_step = 3;
+  string input = 4;
+}
+message TransformChain {
+  string contract_version = 1;
+  string namespace = 2;
+  string chain_id = 3;
+  repeated TransformChainStep steps = 4;
+  repeated TransformChainEdge edges = 5;
+  string definition_digest = 6;
+}
+message TransformChainStepRun {
+  string step = 1;
+  string transform_run_id = 2;
+  string status = 3;
+}
+message TransformChainRun {
+  string run_id = 1;
+  string namespace = 2;
+  string chain_id = 3;
+  string definition_digest = 4;
+  string status = 5;
+  string failed_step = 6;
+  string error = 7;
+  repeated TransformChainStepRun steps = 8;
+  int64 created_at_ms = 9;
+  int64 completed_at_ms = 10;
+  TransformRun receipt = 11;
+}
+message PutTransformChainRequest {
+  TransformChain chain = 1;
+}
+message PutTransformChainResponse {
+  TransformChain chain = 1;
+}
+message RunTransformChainRequest {
+  string namespace = 1;
+  string chain_id = 2;
+  string idempotency_key = 3;
+}
+message RunTransformChainResponse {
+  TransformChainRun run = 1;
+  bool replayed = 2;
+}
+message GetTransformChainRunRequest {
+  string run_id = 1;
+}
+message GetTransformChainRunResponse {
+  TransformChainRun run = 1;
+}
 message ListGovernedTransformsRequest {
   string namespace = 1;
 }
@@ -5631,6 +5695,12 @@ service SekaiService {
   rpc TickGovernedTransforms(TickGovernedTransformsRequest) returns (TickGovernedTransformsResponse);
   rpc GetTransformOutputState(GetTransformOutputStateRequest) returns (GetTransformOutputStateResponse);
   rpc CancelGovernedTransformRun(CancelGovernedTransformRunRequest) returns (CancelGovernedTransformRunResponse);
+  // Experimental (#2119): a static DAG of governed transforms executed as one
+  // receipted operation. Named edges compile at Put; Run walks claims in
+  // dependency order through the existing transform runner.
+  rpc PutTransformChain(PutTransformChainRequest) returns (PutTransformChainResponse);
+  rpc RunTransformChain(RunTransformChainRequest) returns (RunTransformChainResponse);
+  rpc GetTransformChainRun(GetTransformChainRunRequest) returns (GetTransformChainRunResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);

@@ -508,6 +508,10 @@ impl NativeSurface for InProcessSurface {
         )
         .await
     }
+
+    fn experimental_tools(&self) -> bool {
+        self.experimental_rpcs
+    }
 }
 
 fn property(name: &str, required: bool) -> PropertyDef {
