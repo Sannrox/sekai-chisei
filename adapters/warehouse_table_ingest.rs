@@ -221,7 +221,10 @@ pub fn records(snapshot: TableSnapshot) -> Result<Vec<SourceRecord>, String> {
                 type_name: record_kind.clone(),
                 display_name,
                 payload_digest: digest,
-                properties: row,
+                properties: row
+                    .into_iter()
+                    .map(|(key, value)| (key, sekai_source_sdk::PropertyValue::from(value)))
+                    .collect(),
                 deleted: false,
                 observed_at_ms: committed_at_ms,
                 source_sequence: None,

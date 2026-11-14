@@ -498,10 +498,21 @@ fn prepare_property_filter(
         ObjectSetError::InvalidArgument("unknown object-set property".into()),
     )?;
     validate_property_value(&property_type, &filter.value)?;
+    let value = if property_type == "timestamp" {
+        crate::sekai::object_schema::parse_timestamp_millis(&filter.value)
+            .map(|millis| millis.to_string())
+            .ok_or_else(|| {
+                ObjectSetError::InvalidArgument(
+                    "object-set property value has the wrong type".into(),
+                )
+            })?
+    } else {
+        filter.value.clone()
+    };
     Ok(PropertyFilter {
         key: filter.key.clone(),
         op,
-        value: filter.value.clone(),
+        value,
     })
 }
 
@@ -618,7 +629,7 @@ fn declared_property_type(object_type: &DefinitionMember, key: &str) -> Option<S
 
 fn validate_property_value(property_type: &str, value: &str) -> Result<(), ObjectSetError> {
     match property_type {
-        "integer" | "int" | "number" => {
+        "integer" | "int" | "number" | "float" => {
             if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
                 Ok(())
             } else {
@@ -636,7 +647,16 @@ fn validate_property_value(property_type: &str, value: &str) -> Result<(), Objec
                 ))
             }
         }
-        "string" | "text" => Ok(()),
+        "timestamp" => {
+            if crate::sekai::object_schema::parse_timestamp_millis(value).is_some() {
+                Ok(())
+            } else {
+                Err(ObjectSetError::InvalidArgument(
+                    "object-set property value has the wrong type".into(),
+                ))
+            }
+        }
+        "string" | "text" | "enum" | "link" | "computed" | "struct" => Ok(()),
         _ => Err(ObjectSetError::Unsupported(
             "unsupported object-set property type",
         )),
@@ -774,6 +794,49 @@ mod tests {
         assert!(
             matches!(error, ObjectSetError::LimitExceeded(message) if message == "cost limit: max_rows_scanned")
         );
+    }
+
+    #[test]
+    fn timestamp_property_filters_canonicalize_to_millis() {
+        let member = member_input(
+            "Event",
+            r#"{"name":"Event","properties":{"when":{"type":"timestamp"}}}"#,
+        );
+        let revision = prepare_revision(
+            "sales",
+            "",
+            std::iter::once(DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            }),
+            true,
+            "author",
+            1,
+        )
+        .unwrap();
+        let descriptor = ObjectSetDescriptor {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Event".into(),
+            definition_digest: revision.revision_digest.clone(),
+            property_filters: vec![PropertyFilter {
+                key: "when".into(),
+                op: "gte".into(),
+                value: "1970-01-01T00:00:00.100Z".into(),
+            }],
+            order_by: String::new(),
+            descending: false,
+            limit: 2,
+            traversal: None,
+            hops: Vec::new(),
+            aggregation: None,
+            cost_limit: ObjectSetCostLimit::default(),
+        };
+        let bound = descriptor
+            .prepare(&revision.revision_digest, std::slice::from_ref(&member))
+            .unwrap();
+        assert_eq!(bound.filter.property_filters[0].value, "100");
     }
 
     #[test]

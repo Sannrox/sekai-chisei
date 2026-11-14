@@ -69,10 +69,9 @@ pub fn join_paths_nested<'a>(
         let parent = path[path.len() - 1];
         for child in children {
             meter.charge(1)?;
-            let matched = child
-                .properties
-                .get(join_property)
-                .is_some_and(|value| value == &parent.source_key || value == &parent.object_id);
+            let matched = child.properties.get(join_property).is_some_and(|value| {
+                value.as_cell() == parent.source_key || value.as_cell() == parent.object_id
+            });
             if matched {
                 meter.charge(1)?;
                 let mut joined = path.clone();
@@ -92,10 +91,10 @@ pub fn join_paths_hash<'a>(
     if join_property.is_empty() {
         return Vec::new();
     }
-    let mut by_value: HashMap<&str, Vec<&ObjectTypeIndexMember>> = HashMap::new();
+    let mut by_value: HashMap<String, Vec<&ObjectTypeIndexMember>> = HashMap::new();
     for child in children {
         if let Some(value) = child.properties.get(join_property) {
-            by_value.entry(value.as_str()).or_default().push(child);
+            by_value.entry(value.as_cell()).or_default().push(child);
         }
     }
     let mut next = Vec::new();

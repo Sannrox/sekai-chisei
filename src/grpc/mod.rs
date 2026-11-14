@@ -45,6 +45,85 @@ const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
 /// authority-bearing. Tenant hints are stripped and therefore absent here.
 pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization", "x-principal"];
 
+/// Wire form of a schema-typed property cell.
+pub fn property_value_to_proto(
+    value: &crate::sekai::object_schema::PropertyValue,
+) -> pb::sekai::PropertyValue {
+    use crate::sekai::object_schema::PropertyValue;
+    use pb::sekai::property_value::Kind;
+    pb::sekai::PropertyValue {
+        kind: Some(match value {
+            PropertyValue::String(text) => Kind::StringValue(text.clone()),
+            PropertyValue::Int(int) => Kind::IntValue(*int),
+            PropertyValue::Float(float) => Kind::FloatValue(*float),
+            PropertyValue::Bool(flag) => Kind::BoolValue(*flag),
+            PropertyValue::Struct(fields) => Kind::StructValue(pb::sekai::StructValue {
+                fields: fields
+                    .iter()
+                    .map(|(key, nested)| (key.clone(), property_value_to_proto(nested)))
+                    .collect(),
+            }),
+            other => Kind::StringValue(other.as_cell()),
+        }),
+    }
+}
+
+pub fn property_map_to_proto(
+    properties: impl IntoIterator<Item = (String, crate::sekai::object_schema::PropertyValue)>,
+) -> std::collections::HashMap<String, pb::sekai::PropertyValue> {
+    properties
+        .into_iter()
+        .map(|(key, value)| (key, property_value_to_proto(&value)))
+        .collect()
+}
+
+pub fn property_value_from_proto(
+    property: &str,
+    value: pb::sekai::PropertyValue,
+) -> Result<crate::sekai::object_schema::PropertyValue, Status> {
+    use crate::sekai::object_schema::PropertyValue;
+    use pb::sekai::property_value::Kind;
+    match value.kind {
+        Some(Kind::StringValue(text)) => Ok(PropertyValue::String(text)),
+        Some(Kind::IntValue(int)) => Ok(PropertyValue::Int(int)),
+        Some(Kind::FloatValue(float)) => {
+            if !float.is_finite() {
+                return Err(Status::invalid_argument(format!(
+                    "property {property}: float must be finite"
+                )));
+            }
+            Ok(PropertyValue::Float(float))
+        }
+        Some(Kind::BoolValue(flag)) => Ok(PropertyValue::Bool(flag)),
+        Some(Kind::StructValue(nested)) => {
+            let mut fields = std::collections::BTreeMap::new();
+            for (key, child) in nested.fields {
+                fields.insert(
+                    key.clone(),
+                    property_value_from_proto(&format!("{property}.{key}"), child)?,
+                );
+            }
+            Ok(PropertyValue::Struct(fields))
+        }
+        None => Err(Status::invalid_argument(format!(
+            "property {property}: missing value"
+        ))),
+    }
+}
+
+pub fn property_map_from_proto(
+    properties: std::collections::HashMap<String, pb::sekai::PropertyValue>,
+) -> Result<std::collections::BTreeMap<String, crate::sekai::object_schema::PropertyValue>, Status>
+{
+    properties
+        .into_iter()
+        .map(|(key, value)| {
+            let typed = property_value_from_proto(&key, value)?;
+            Ok((key, typed))
+        })
+        .collect()
+}
+
 pub(crate) fn write_freeze_status(err: crate::sekai::write_freeze::WriteFreezeError) -> Status {
     match err {
         crate::sekai::write_freeze::WriteFreezeError::Frozen(reason) => {

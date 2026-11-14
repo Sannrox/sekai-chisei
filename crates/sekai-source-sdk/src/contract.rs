@@ -115,9 +115,9 @@ pub struct SourceRecord {
     pub type_name: String,
     pub display_name: String,
     pub payload_digest: String,
-    /// Stable, adapter-normalized scalar properties used by object projection.
+    /// Stable, adapter-normalized properties used by object projection.
     #[serde(default)]
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, sekai_types::object_schema::PropertyValue>,
     pub deleted: bool,
     pub observed_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -584,7 +584,7 @@ pub struct SyncedObject {
     pub source_version: String,
     pub payload_digest: String,
     #[serde(default)]
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, sekai_types::object_schema::PropertyValue>,
     pub tombstoned: bool,
     pub type_digest: String,
 }
@@ -975,32 +975,54 @@ fn validate_record(
         ));
     }
     for (key, value) in &record.properties {
-        if key.is_empty()
-            || key.len() > MAX_SOURCE_PROPERTY_KEY_BYTES
-            || key.trim() != key
-            || key.chars().any(|character| {
-                !(character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || matches!(character, '_' | '-' | '.'))
-            })
-        {
-            return Err(SourceBatchValidationError::new(
-                "invalid_property_key",
-                format!("records[{index}].properties contains a non-normalized key"),
-            ));
+        validate_property_entry(index, key, value)?;
+    }
+    Ok(())
+}
+
+fn validate_property_entry(
+    index: usize,
+    key: &str,
+    value: &sekai_types::object_schema::PropertyValue,
+) -> Result<(), SourceBatchValidationError> {
+    if key.is_empty()
+        || key.len() > MAX_SOURCE_PROPERTY_KEY_BYTES
+        || key.trim() != key
+        || key.chars().any(|character| {
+            !(character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-' | '.'))
+        })
+    {
+        return Err(SourceBatchValidationError::new(
+            "invalid_property_key",
+            format!("records[{index}].properties contains a non-normalized key"),
+        ));
+    }
+    if is_secret_key(key) {
+        return Err(SourceBatchValidationError::new(
+            "secret_like_text",
+            format!("records[{index}].properties contains a credential-like key"),
+        ));
+    }
+    if let sekai_types::object_schema::PropertyValue::Float(float) = value
+        && !float.is_finite()
+    {
+        return Err(SourceBatchValidationError::new(
+            "invalid_property_value",
+            format!("records[{index}].properties[{key}] float must be finite"),
+        ));
+    }
+    require_bounded_text(
+        &format!("records[{index}].properties[{key}]"),
+        &value.as_cell(),
+        MAX_SOURCE_PROPERTY_VALUE_BYTES,
+        true,
+    )?;
+    if let sekai_types::object_schema::PropertyValue::Struct(fields) = value {
+        for (nested_key, nested) in fields {
+            validate_property_entry(index, nested_key, nested)?;
         }
-        if is_secret_key(key) {
-            return Err(SourceBatchValidationError::new(
-                "secret_like_text",
-                format!("records[{index}].properties contains a credential-like key"),
-            ));
-        }
-        require_bounded_text(
-            &format!("records[{index}].properties[{key}]"),
-            value,
-            MAX_SOURCE_PROPERTY_VALUE_BYTES,
-            true,
-        )?;
     }
     Ok(())
 }
@@ -1224,4 +1246,99 @@ pub fn contains_secret_like_text(value: &str) -> bool {
         || (value.starts_with("AKIA")
             && value.len() >= 20
             && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sekai_types::object_schema::PropertyValue;
+
+    fn github_batch(properties: BTreeMap<String, PropertyValue>) -> SourceBatch {
+        let mut batch = SourceBatch {
+            contract_version: SOURCE_BATCH_VERSION.into(),
+            namespace: "acme".into(),
+            producer_identity: "connector/github-primary".into(),
+            source: SOURCE_GITHUB.into(),
+            source_instance: "acme/ops".into(),
+            family: FAMILY_OBJECT_SYNC.into(),
+            adapter_id: ADAPTER_GITHUB_OBJECT_SYNC.into(),
+            adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+            type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+            current_cursor: String::new(),
+            proposed_next_cursor: "cursor:1".into(),
+            idempotency_key: "batch-1".into(),
+            batch_digest: String::new(),
+            collected_at_ms: 20,
+            records: vec![SourceRecord {
+                source: SOURCE_GITHUB.into(),
+                source_instance: "acme/ops".into(),
+                external_id: "12".into(),
+                source_version: "node-v1".into(),
+                type_name: "Issue".into(),
+                display_name: "Bounded sync".into(),
+                payload_digest:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                properties,
+                deleted: false,
+                observed_at_ms: 10,
+                source_sequence: None,
+            }],
+            delivery: None,
+        };
+        batch.batch_digest = batch.canonical_digest().unwrap();
+        batch
+    }
+
+    #[test]
+    fn nested_struct_credential_keys_are_refused() {
+        let batch = github_batch(BTreeMap::from([
+            ("title".into(), PropertyValue::String("ok".into())),
+            (
+                "meta".into(),
+                PropertyValue::Struct(BTreeMap::from([(
+                    "password".into(),
+                    PropertyValue::String("ordinary-secret".into()),
+                )])),
+            ),
+        ]));
+        let error = batch.validate().unwrap_err();
+        assert_eq!(error.code, "secret_like_text");
+    }
+
+    #[test]
+    fn nested_struct_ordinary_keys_are_accepted() {
+        let batch = github_batch(BTreeMap::from([
+            ("title".into(), PropertyValue::String("ok".into())),
+            (
+                "meta".into(),
+                PropertyValue::Struct(BTreeMap::from([(
+                    "label".into(),
+                    PropertyValue::String("ordinary".into()),
+                )])),
+            ),
+        ]));
+        batch.validate().unwrap();
+    }
+
+    #[test]
+    fn non_finite_float_cells_are_refused() {
+        let mut batch = github_batch(BTreeMap::from([(
+            "title".into(),
+            PropertyValue::String("ok".into()),
+        )]));
+        batch.records[0]
+            .properties
+            .insert("ratio".into(), PropertyValue::Float(f64::NAN));
+        let error = batch.validate().unwrap_err();
+        assert_eq!(error.code, "invalid_property_value");
+        batch.records[0].properties.insert(
+            "ratio".into(),
+            PropertyValue::Struct(BTreeMap::from([(
+                "inner".into(),
+                PropertyValue::Float(f64::INFINITY),
+            )])),
+        );
+        let nested = batch.validate().unwrap_err();
+        assert_eq!(nested.code, "invalid_property_value");
+    }
 }

@@ -128,7 +128,10 @@ pub fn translate(
         type_name: fixture.kind,
         display_name: fixture.title,
         payload_digest: format!("sha256:{:x}", Sha256::digest(payload)),
-        properties,
+        properties: properties
+            .into_iter()
+            .map(|(key, value)| (key, crate::PropertyValue::String(value)))
+            .collect(),
         deleted: fixture.deleted,
         observed_at_ms: fixture.observed_at_ms,
         source_sequence: None,

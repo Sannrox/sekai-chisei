@@ -29,6 +29,35 @@ use crate::sync::{Prepared, SyncFailure, blocking};
 /// Pages one sync applies at most; the rest waits for the next interval.
 const MAX_PAGES: usize = 100;
 
+fn property_value_to_proto(value: &sekai_source_sdk::PropertyValue) -> pb::PropertyValue {
+    use pb::property_value::Kind;
+    use sekai_source_sdk::PropertyValue;
+    pb::PropertyValue {
+        kind: Some(match value {
+            PropertyValue::String(text) => Kind::StringValue(text.clone()),
+            PropertyValue::Int(int) => Kind::IntValue(*int),
+            PropertyValue::Float(float) => Kind::FloatValue(*float),
+            PropertyValue::Bool(flag) => Kind::BoolValue(*flag),
+            PropertyValue::Struct(fields) => Kind::StructValue(pb::StructValue {
+                fields: fields
+                    .iter()
+                    .map(|(key, nested)| (key.clone(), property_value_to_proto(nested)))
+                    .collect(),
+            }),
+            other => Kind::StringValue(other.as_cell()),
+        }),
+    }
+}
+
+fn property_map_to_proto(
+    properties: impl IntoIterator<Item = (String, sekai_source_sdk::PropertyValue)>,
+) -> std::collections::HashMap<String, pb::PropertyValue> {
+    properties
+        .into_iter()
+        .map(|(key, value)| (key, property_value_to_proto(&value)))
+        .collect()
+}
+
 impl Runtime {
     /// Reads and applies the Source's pages from the committed cursor
     /// until the Source reports them complete.
@@ -179,7 +208,7 @@ fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
+                properties: property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,

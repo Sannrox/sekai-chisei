@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+use crate::object_schema::{ObjectType, PropertyValue, coerce_properties};
+
 pub fn join_value_digest(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -20,7 +22,7 @@ pub fn join_value_digest(value: &str) -> String {
 pub fn project_member_properties(
     raw: &str,
     needed: Option<&[String]>,
-) -> Result<BTreeMap<String, String>, String> {
+) -> Result<BTreeMap<String, PropertyValue>, String> {
     match needed {
         None => serde_json::from_str(raw).map_err(|error| error.to_string()),
         Some([]) => Ok(BTreeMap::new()),
@@ -32,8 +34,11 @@ pub fn project_member_properties(
             };
             let mut properties = BTreeMap::new();
             for key in keys {
-                if let Some(serde_json::Value::String(text)) = object.get(key) {
-                    properties.insert(key.clone(), text.clone());
+                match object.get(key) {
+                    Some(cell) if !cell.is_null() => {
+                        properties.insert(key.clone(), PropertyValue::from_json(cell)?);
+                    }
+                    _ => {}
                 }
             }
             Ok(properties)
@@ -76,32 +81,115 @@ pub fn member_filter_sql(
             "eq" | "" => {
                 values.push(filter.value.clone());
                 param += 1;
-                format!("{extract} = {placeholder}")
+                eq_predicate(
+                    dialect,
+                    &extract,
+                    &placeholder,
+                    &filter.column,
+                    &filter.value,
+                )
             }
             "gt" | "lt" | "gte" | "lte" => {
-                let cmp = match filter.op.as_str() {
-                    "gt" => ">",
-                    "lt" => "<",
-                    "gte" => ">=",
-                    _ => "<=",
-                };
-                values.push(filter.value.clone());
-                param += 1;
-                match dialect {
-                    IndexSqlDialect::Sqlite => format!(
-                        "({extract} IS NOT NULL AND {extract} GLOB '*[0-9]*' AND {extract} NOT GLOB '*[A-Za-z]*' AND CAST({extract} AS REAL) {cmp} CAST({placeholder} AS REAL))"
-                    ),
-                    IndexSqlDialect::Postgres => format!(
-                        "({extract} IS NOT NULL AND {extract} ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::float8 {cmp} ({placeholder})::float8)"
-                    ),
+                if filter
+                    .value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|float| float.is_finite())
+                    .is_none()
+                {
+                    "1=0".into()
+                } else {
+                    let cmp = match filter.op.as_str() {
+                        "gt" => ">",
+                        "lt" => "<",
+                        "gte" => ">=",
+                        _ => "<=",
+                    };
+                    let integer_range = filter.value.parse::<i64>().is_ok();
+                    values.push(filter.value.clone());
+                    param += 1;
+                    match dialect {
+                        IndexSqlDialect::Sqlite => {
+                            let typed = format!("json_extract(properties, '$.{}')", filter.column);
+                            if integer_range {
+                                format!(
+                                    "({typed} IS NOT NULL AND ((typeof({typed}) = 'integer' AND {typed} {cmp} CAST({placeholder} AS INTEGER)) OR (typeof({typed}) = 'real' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {typed} GLOB '*[0-9]*' AND {typed} NOT GLOB '*[A-Za-z]*' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
+                                )
+                            } else {
+                                format!(
+                                    "({typed} IS NOT NULL AND ((typeof({typed}) IN ('integer', 'real') AND {typed} {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {typed} GLOB '*[0-9]*' AND {typed} NOT GLOB '*[A-Za-z]*' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
+                                )
+                            }
+                        }
+                        IndexSqlDialect::Postgres => {
+                            let json_num = format!("(properties::json -> '{}')", filter.column);
+                            format!(
+                                "({json_num} IS NOT NULL AND ((jsonb_typeof({json_num}::jsonb) = 'number' AND ({json_num} #>> '{{}}')::numeric {cmp} ({placeholder})::numeric) OR (jsonb_typeof({json_num}::jsonb) = 'string' AND ({extract}) ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::numeric {cmp} ({placeholder})::numeric)))"
+                            )
+                        }
+                    }
                 }
             }
-            _ => "0".into(),
+            _ => "1=0".into(),
         };
         clause.push_str(" AND ");
         clause.push_str(&pred);
     }
     Ok((clause, values))
+}
+
+fn eq_predicate(
+    dialect: IndexSqlDialect,
+    extract: &str,
+    placeholder: &str,
+    column: &str,
+    value: &str,
+) -> String {
+    let integer_eq = value.parse::<i64>().is_ok();
+    let float_eq = !integer_eq
+        && value
+            .parse::<f64>()
+            .ok()
+            .filter(|float| float.is_finite())
+            .is_some();
+    match dialect {
+        IndexSqlDialect::Sqlite => {
+            let json_type = format!("json_type(properties, '$.{column}')");
+            let mut sql = format!(
+                "({extract} = {placeholder} OR (typeof({extract}) IN ('integer', 'real') AND CAST({extract} AS TEXT) = {placeholder})"
+            );
+            if integer_eq {
+                sql.push_str(&format!(
+                    " OR (typeof({extract}) IN ('integer', 'real') AND {extract} = CAST({placeholder} AS INTEGER) AND {extract} = CAST({extract} AS INTEGER))"
+                ));
+            } else if float_eq {
+                sql.push_str(&format!(
+                    " OR (typeof({extract}) = 'real' AND CAST({extract} AS REAL) = CAST({placeholder} AS REAL))"
+                ));
+            }
+            sql.push_str(&format!(
+                " OR ({json_type} = 'true' AND {placeholder} IN ('true', '1')) OR ({json_type} = 'false' AND {placeholder} IN ('false', '0')))"
+            ));
+            sql
+        }
+        IndexSqlDialect::Postgres => {
+            let json_num = format!("(properties::json -> '{column}')");
+            let mut sql = format!("({extract} = {placeholder}");
+            if integer_eq {
+                sql.push_str(&format!(
+                    " OR ({json_num} IS NOT NULL AND jsonb_typeof({json_num}::jsonb) = 'number' AND ({json_num} #>> '{{}}')::numeric = ({placeholder})::numeric)"
+                ));
+            } else if float_eq {
+                sql.push_str(&format!(
+                    " OR ({json_num} IS NOT NULL AND jsonb_typeof({json_num}::jsonb) = 'number' AND ({json_num} #>> '{{}}') ~ '[.eE]' AND ({json_num} #>> '{{}}')::float8 = ({placeholder})::float8)"
+                ));
+            }
+            sql.push_str(&format!(
+                " OR ({json_num} IS NOT NULL AND jsonb_typeof({json_num}::jsonb) = 'boolean' AND (({placeholder} IN ('true', '1') AND ({json_num} #>> '{{}}') = 'true') OR ({placeholder} IN ('false', '0') AND ({json_num} #>> '{{}}') = 'false'))))"
+            ));
+            sql
+        }
+    }
 }
 
 /// SQL expression for the member properties column. `None` keeps the stored
@@ -128,7 +216,11 @@ pub fn member_properties_sql(
         IndexSqlDialect::Sqlite => {
             let pairs = keys
                 .iter()
-                .map(|key| format!("'{key}', json_extract(properties, '$.{key}')"))
+                .map(|key| {
+                    format!(
+                        "'{key}', CASE json_type(properties, '$.{key}') WHEN 'true' THEN json('true') WHEN 'false' THEN json('false') ELSE json_extract(properties, '$.{key}') END"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("json_object({pairs})")
@@ -312,7 +404,7 @@ pub struct ObjectTypeIndexMember {
     pub kind: String,
     pub source_key: String,
     pub object_id: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, PropertyValue>,
     pub content_hash: String,
     pub hidden: bool,
     pub from_edit: bool,
@@ -323,7 +415,7 @@ pub struct ObjectTypeIndexEdit {
     pub namespace: String,
     pub kind: String,
     pub source_key: String,
-    pub properties: BTreeMap<String, String>,
+    pub properties: BTreeMap<String, PropertyValue>,
     pub hidden: bool,
     /// Overlay retry key. Empty until an Action or `PutObjectTypeIndexEdit` names one.
     #[serde(default)]
@@ -439,7 +531,7 @@ pub fn member_from_row(
     let mut properties = BTreeMap::new();
     for (property, column) in &binding.property_mapping {
         if let Some(value) = row.get(column) {
-            properties.insert(property.clone(), value.clone());
+            properties.insert(property.clone(), PropertyValue::String(value.clone()));
         }
     }
     let hidden = if binding.hidden_column.is_empty() {
@@ -458,6 +550,36 @@ pub fn member_from_row(
         hidden,
         from_edit: false,
     })
+}
+
+/// Coerce index cells with the declared object type. Missing schema keeps
+/// the inbound values.
+pub fn coerce_index_properties(
+    object_type: Option<&ObjectType>,
+    properties: BTreeMap<String, PropertyValue>,
+) -> Result<BTreeMap<String, PropertyValue>, ObjectTypeIndexError> {
+    match object_type {
+        Some(object_type) => coerce_properties(object_type, properties)
+            .map_err(ObjectTypeIndexError::InvalidArgument),
+        None => Ok(properties),
+    }
+}
+
+pub fn coerce_index_member(
+    mut member: ObjectTypeIndexMember,
+    object_type: Option<&ObjectType>,
+) -> Result<ObjectTypeIndexMember, ObjectTypeIndexError> {
+    member.properties = coerce_index_properties(object_type, member.properties)?;
+    member.content_hash = content_hash(&member.properties, member.hidden);
+    Ok(member)
+}
+
+pub fn coerce_index_edit(
+    object_type: Option<&ObjectType>,
+    mut edit: ObjectTypeIndexEdit,
+) -> Result<ObjectTypeIndexEdit, ObjectTypeIndexError> {
+    edit.properties = coerce_index_properties(object_type, edit.properties)?;
+    Ok(edit)
 }
 
 pub fn member_from_edit(
@@ -502,7 +624,7 @@ pub fn overlay_member(
     let source_ts = member
         .properties
         .get(&binding.source_timestamp_property)
-        .cloned();
+        .and_then(PropertyValue::timestamp_millis);
     let mut from_edit = member.from_edit;
     for (property, value) in &edit.properties {
         if property.starts_with("__sekai_index_") {
@@ -519,7 +641,7 @@ pub fn overlay_member(
                         .get(property)
                         .copied()
                         .unwrap_or(edit.edited_at_ms);
-                    edit_is_newer(edit_ts, source_ts.as_deref())?
+                    edit_is_newer(edit_ts, source_ts)?
                 }
             }
         };
@@ -638,7 +760,7 @@ pub fn carry_index_edits(
             let Some(value) = edit.properties.get(property).cloned() else {
                 continue;
             };
-            match recast_edit_value(&value, prop_type.clone()) {
+            match recast_edit_value(value, prop_type.clone()) {
                 Ok(canonical) => {
                     edit.properties.insert(property.clone(), canonical);
                 }
@@ -656,145 +778,45 @@ pub fn carry_index_edits(
 }
 
 fn recast_edit_value(
-    value: &str,
+    value: PropertyValue,
     prop_type: crate::object_schema::PropertyType,
-) -> Result<String, ()> {
-    match prop_type {
-        crate::object_schema::PropertyType::String | crate::object_schema::PropertyType::Enum => {
-            Ok(value.to_string())
-        }
-        crate::object_schema::PropertyType::Int => value
-            .parse::<i64>()
-            .map(|parsed| parsed.to_string())
-            .map_err(|_| ()),
-        crate::object_schema::PropertyType::Float => value
-            .parse::<f64>()
-            .map(|parsed| parsed.to_string())
-            .map_err(|_| ()),
-        crate::object_schema::PropertyType::Bool => {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" => Ok("true".into()),
-                "0" | "false" | "no" => Ok("false".into()),
-                _ => Err(()),
-            }
-        }
-        crate::object_schema::PropertyType::Timestamp => {
-            if value.parse::<i64>().is_ok() || looks_like_rfc3339(value) {
-                Ok(value.to_string())
-            } else {
-                Err(())
-            }
-        }
-        crate::object_schema::PropertyType::Link
-        | crate::object_schema::PropertyType::Computed
-        | crate::object_schema::PropertyType::Struct => Ok(value.to_string()),
+) -> Result<PropertyValue, ()> {
+    // Recast is given only a PropertyType, not the enum membership list.
+    // Keep enum strings as cells; later schema validation owns allowed values.
+    if prop_type == crate::object_schema::PropertyType::Enum {
+        return Ok(match value {
+            PropertyValue::String(text) => PropertyValue::String(text),
+            other => PropertyValue::String(other.as_cell()),
+        });
     }
+    let declared = crate::object_schema::PropertyDef {
+        name: String::new(),
+        prop_type,
+        required: false,
+        description: String::new(),
+        enum_values: Vec::new(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+        classification: crate::object_schema::default_property_classification(),
+        struct_fields: Vec::new(),
+    };
+    crate::object_schema::coerce_property_value("", &declared, value).map_err(|_| ())
 }
 
-fn edit_is_newer(edited_at_ms: i64, source_ts: Option<&str>) -> Result<bool, ObjectTypeIndexError> {
-    let Some(source_ts) = source_ts.filter(|value| !value.trim().is_empty()) else {
+fn edit_is_newer(edited_at_ms: i64, source_ts: Option<i64>) -> Result<bool, ObjectTypeIndexError> {
+    let Some(source_ms) = source_ts else {
         return Err(ObjectTypeIndexError::InvalidArgument(
             "newest conflict requires source timestamp".into(),
         ));
     };
-    let source_ms = parse_source_timestamp_ms(source_ts).ok_or_else(|| {
-        ObjectTypeIndexError::InvalidArgument("newest conflict requires source timestamp".into())
-    })?;
     Ok(edited_at_ms >= source_ms)
-}
-
-fn parse_source_timestamp_ms(raw: &str) -> Option<i64> {
-    let trimmed = raw.trim();
-    if let Ok(ms) = trimmed.parse::<i64>() {
-        return Some(ms);
-    }
-    parse_rfc3339_ms(trimmed)
-}
-
-fn looks_like_rfc3339(raw: &str) -> bool {
-    parse_rfc3339_ms(raw).is_some()
-}
-
-/// Minimal RFC3339 parser for `YYYY-MM-DDTHH:MM:SS[.sss]Z` or `±HH:MM`.
-fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    let (datetime, offset_ms) = if let Some(prefix) = raw.strip_suffix('Z') {
-        (prefix, 0i64)
-    } else if raw.len() >= 6 {
-        let sign_at = raw.len() - 6;
-        let sign = raw.as_bytes().get(sign_at)?;
-        if *sign != b'+' && *sign != b'-' {
-            return None;
-        }
-        let (hours, minutes) = raw[sign_at + 1..].split_once(':')?;
-        let hours: i64 = hours.parse().ok()?;
-        let minutes: i64 = minutes.parse().ok()?;
-        if hours > 23 || minutes > 59 {
-            return None;
-        }
-        let mut offset_ms = (hours * 60 + minutes) * 60 * 1000;
-        if *sign == b'+' {
-            offset_ms = -offset_ms;
-        }
-        (&raw[..sign_at], offset_ms)
-    } else {
-        return None;
-    };
-    let (date, time) = datetime.split_once('T')?;
-    let mut date = date.split('-');
-    let year: i64 = date.next()?.parse().ok()?;
-    let month: i64 = date.next()?.parse().ok()?;
-    let day: i64 = date.next()?.parse().ok()?;
-    let (hms, frac) = match time.split_once('.') {
-        Some((hms, frac)) => (hms, frac),
-        None => (time, "0"),
-    };
-    let mut hms = hms.split(':');
-    let hour: i64 = hms.next()?.parse().ok()?;
-    let minute: i64 = hms.next()?.parse().ok()?;
-    let second: i64 = hms.next()?.parse().ok()?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    let mut digits: String = frac
-        .chars()
-        .filter(|ch| ch.is_ascii_digit())
-        .take(3)
-        .collect();
-    if digits.is_empty() {
-        return None;
-    }
-    while digits.len() < 3 {
-        digits.push('0');
-    }
-    let millis: i64 = digits.parse().ok()?;
-    let days = days_from_civil(year, month, day)?;
-    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis + offset_ms)
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
-    let mut y = year;
-    let m = month;
-    if m <= 2 {
-        y -= 1;
-    }
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400);
-    let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146097 + doe - 719468)
 }
 
 pub fn sourced_object_id(kind: &str, source_key: &str) -> String {
     format!("{kind}:{source_key}")
 }
 
-pub fn content_hash(properties: &BTreeMap<String, String>, hidden: bool) -> String {
+pub fn content_hash(properties: &BTreeMap<String, PropertyValue>, hidden: bool) -> String {
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(&(properties, hidden)).unwrap_or_default());
     format!("sha256:{:x}", hasher.finalize())
@@ -1196,6 +1218,13 @@ mod tests {
         }];
         carry_index_edits(&mut edits, &[("region".into(), "area".into())], &[]).unwrap();
         assert_eq!(edits[0].properties.get("area").unwrap(), "eu");
+        carry_index_edits(
+            &mut edits,
+            &[],
+            &[("area".into(), crate::object_schema::PropertyType::Enum)],
+        )
+        .unwrap();
+        assert_eq!(edits[0].properties.get("area").unwrap(), "eu");
         let mut bad = [ObjectTypeIndexEdit {
             namespace: "sales".into(),
             kind: "Customer".into(),
@@ -1233,6 +1262,11 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(project_member_properties(raw, None).unwrap().len(), 3);
+        let with_null = r#"{"region":"eu","amount":null}"#;
+        assert_eq!(
+            project_member_properties(with_null, Some(&needed)).unwrap(),
+            BTreeMap::from([("region".into(), "eu".into())])
+        );
     }
 
     #[test]
@@ -1253,10 +1287,76 @@ mod tests {
         assert!(sqlite.contains("json_extract(properties, '$.tier')"));
         assert!(sqlite.contains("CAST("));
         assert!(sqlite.contains("json_extract(properties, '$.region') = ?4"));
+        assert!(sqlite.contains("CAST("));
+        assert!(sqlite.contains("json_type(properties, '$.region')"));
         assert_eq!(values, ["2".to_string(), "eu".into()]);
         let (postgres, _) = member_filter_sql(IndexSqlDialect::Postgres, &filters).unwrap();
         assert!(postgres.contains("properties::json ->> 'tier'"));
-        assert!(postgres.contains("::float8"));
+        assert!(postgres.contains("::numeric"));
+        assert!(!postgres.contains("::float8"));
+    }
+
+    #[test]
+    fn member_filter_sql_eq_numeric_casts_follow_operand_shape() {
+        let text = [crate::dataset::RowFilter {
+            column: "region".into(),
+            op: "eq".into(),
+            value: "eu".into(),
+        }];
+        let (sqlite_text, _) = member_filter_sql(IndexSqlDialect::Sqlite, &text).unwrap();
+        assert!(sqlite_text.contains("json_extract(properties, '$.region') = ?3"));
+        assert!(!sqlite_text.contains("AS REAL"));
+        assert!(!sqlite_text.contains("AS INTEGER"));
+        let (postgres_text, _) = member_filter_sql(IndexSqlDialect::Postgres, &text).unwrap();
+        assert!(!postgres_text.contains("::float8"));
+        assert!(!postgres_text.contains("::numeric"));
+
+        let integer = [crate::dataset::RowFilter {
+            column: "count".into(),
+            op: "eq".into(),
+            value: "12".into(),
+        }];
+        let (sqlite_int, _) = member_filter_sql(IndexSqlDialect::Sqlite, &integer).unwrap();
+        assert!(sqlite_int.contains("AS INTEGER"));
+        assert!(!sqlite_int.contains("AS REAL"));
+        let (postgres_int, _) = member_filter_sql(IndexSqlDialect::Postgres, &integer).unwrap();
+        assert!(postgres_int.contains("::numeric"));
+        assert!(!postgres_int.contains("::float8"));
+
+        let float = [crate::dataset::RowFilter {
+            column: "ratio".into(),
+            op: "eq".into(),
+            value: "12.5".into(),
+        }];
+        let (sqlite_float, _) = member_filter_sql(IndexSqlDialect::Sqlite, &float).unwrap();
+        assert!(sqlite_float.contains("AS REAL"));
+        assert!(sqlite_float.contains("typeof(json_extract(properties, '$.ratio')) = 'real'"));
+        let (postgres_float, _) = member_filter_sql(IndexSqlDialect::Postgres, &float).unwrap();
+        assert!(postgres_float.contains("::float8"));
+        assert!(postgres_float.contains("[.eE]"));
+
+        let nonsense = [crate::dataset::RowFilter {
+            column: "count".into(),
+            op: "gt".into(),
+            value: "abc".into(),
+        }];
+        let (sqlite_gt, _) = member_filter_sql(IndexSqlDialect::Sqlite, &nonsense).unwrap();
+        assert_eq!(sqlite_gt, " AND 1=0");
+        let (postgres_gt, _) = member_filter_sql(IndexSqlDialect::Postgres, &nonsense).unwrap();
+        assert_eq!(postgres_gt, " AND 1=0");
+
+        let integer_range = [crate::dataset::RowFilter {
+            column: "count".into(),
+            op: "gt".into(),
+            value: "12".into(),
+        }];
+        let (sqlite_int_gt, _) =
+            member_filter_sql(IndexSqlDialect::Sqlite, &integer_range).unwrap();
+        assert!(sqlite_int_gt.contains("AS INTEGER"));
+        let (postgres_int_gt, _) =
+            member_filter_sql(IndexSqlDialect::Postgres, &integer_range).unwrap();
+        assert!(postgres_int_gt.contains("::numeric"));
+        assert!(!postgres_int_gt.contains("::float8"));
     }
 
     #[test]
@@ -1265,7 +1365,7 @@ mod tests {
         let sqlite_props = member_properties_sql(IndexSqlDialect::Sqlite, Some(&needed)).unwrap();
         assert_eq!(
             sqlite_props,
-            "json_object('region', json_extract(properties, '$.region'))"
+            "json_object('region', CASE json_type(properties, '$.region') WHEN 'true' THEN json('true') WHEN 'false' THEN json('false') ELSE json_extract(properties, '$.region') END)"
         );
         let postgres_props =
             member_properties_sql(IndexSqlDialect::Postgres, Some(&needed)).unwrap();

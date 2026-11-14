@@ -985,7 +985,7 @@ message PutObjectTypeIndexEditRequest {
   string namespace = 1;
   string kind = 2;
   string source_key = 3;
-  map<string, string> properties = 4;
+  map<string, PropertyValue> properties = 4;
   bool hidden = 5;
   string idempotency_key = 6;
 }
@@ -4111,6 +4111,23 @@ message CreateHandoffResponse { HandoffManifest manifest = 1; }
 message RevokeHandoffRequest { string manifest_id = 1; string reason = 2; string request_id = 3; }
 message RevokeHandoffResponse { HandoffManifest manifest = 1; }
 
+// Schema-typed property cell. FILE-breaking replacement of the previous
+// string map at the same field numbers. Domain, SDK, and HTTP proto JSON
+// still accept untagged string/number/bool/object cells and coerce them
+// through the declared type; dual field numbers stay rejected.
+message PropertyValue {
+  oneof kind {
+    string string_value = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    bool bool_value = 4;
+    StructValue struct_value = 5;
+  }
+}
+message StructValue {
+  map<string, PropertyValue> fields = 1;
+}
+
 // Bounded, adapter-normalized source records. No raw source payload or
 // credentials cross this contract.
 message SourceRecord {
@@ -4121,7 +4138,7 @@ message SourceRecord {
   string type_name = 5;
   string display_name = 6;
   string payload_digest = 7;
-  map<string, string> properties = 8;
+  map<string, PropertyValue> properties = 8;
   bool deleted = 9;
   int64 observed_at_ms = 10;
   optional uint64 source_sequence = 11;

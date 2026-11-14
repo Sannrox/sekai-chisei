@@ -55,7 +55,7 @@ pub fn columns_for_property_keys<'a>(keys: impl IntoIterator<Item = &'a str>) ->
 pub fn row_for_record(
     source_id: &str,
     tombstoned: bool,
-    properties: &BTreeMap<String, String>,
+    properties: &BTreeMap<String, crate::sekai::object_schema::PropertyValue>,
 ) -> HashMap<String, String> {
     let mut row = HashMap::new();
     row.insert(KEY_COLUMN.into(), source_id.to_string());
@@ -67,7 +67,7 @@ pub fn row_for_record(
         if key == KEY_COLUMN || key == HIDDEN_COLUMN {
             continue;
         }
-        row.insert(key.clone(), value.clone());
+        row.insert(key.clone(), value.as_cell());
     }
     row
 }

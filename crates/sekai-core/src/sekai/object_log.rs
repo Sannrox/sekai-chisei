@@ -7,6 +7,7 @@
 //! projection.
 
 use crate::domain::Object;
+use crate::sekai::object_schema::{PropertyValue, property_values_equivalent};
 use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::{
@@ -517,7 +518,7 @@ fn sql_compare_signature(
                 }
                 None => {}
                 Some(raw) => {
-                    if let Some(amount) = contributing_i64(raw)? {
+                    if let Some(amount) = contributing_i64(&raw.as_cell())? {
                         sum = sum.wrapping_add(amount);
                         n += 1;
                         min = Some(min.map_or(amount, |seen: i64| seen.min(amount)));
@@ -892,10 +893,11 @@ fn merge_and_apply_on_host(
                 let latest =
                     load_index_overlay(&incoming.namespace, &incoming.kind, &incoming.source_key)?;
                 if latest.as_ref().is_some_and(|edit| {
-                    incoming_props
-                        .iter()
-                        .all(|(key, value)| edit.properties.get(key) == Some(value))
-                        && edit.hidden == incoming_hidden
+                    incoming_props.iter().all(|(key, value)| {
+                        edit.properties
+                            .get(key)
+                            .is_some_and(|stored| property_values_equivalent(stored, value))
+                    }) && edit.hidden == incoming_hidden
                 }) {
                     return Ok(merged);
                 }
@@ -907,9 +909,12 @@ fn merge_and_apply_on_host(
                 // the live overlay.
                 if overlay.as_ref().is_some_and(|stored| {
                     stored.hidden == incoming_hidden
-                        && incoming_props
-                            .iter()
-                            .all(|(key, value)| stored.properties.get(key) == Some(value))
+                        && incoming_props.iter().all(|(key, value)| {
+                            stored
+                                .properties
+                                .get(key)
+                                .is_some_and(|cell| property_values_equivalent(cell, value))
+                        })
                 }) {
                     return Ok(overlay.or(sql_stored).unwrap_or(incoming));
                 }
@@ -950,10 +955,11 @@ fn incoming_matches_committed_action(
         .map(|value| value == "1")
         .unwrap_or(version.record.hidden);
     Ok(hidden == incoming.hidden
-        && incoming
-            .properties
-            .iter()
-            .all(|(key, value)| version.record.props.get(key) == Some(value)))
+        && incoming.properties.iter().all(|(key, value)| {
+            version.record.props.get(key).is_some_and(|raw| {
+                property_values_equivalent(&overlay_property_value(raw.clone()), value)
+            })
+        }))
 }
 
 /// Append the accumulated per-property overlay for an index edit.
@@ -1098,7 +1104,11 @@ pub fn property_history(
             .map(|version| PropertyEditVersion {
                 generation: version.record.r#gen,
                 action_id: version.record.action_id.clone().unwrap_or_default(),
-                value: version.record.props.get(property).cloned(),
+                value: version
+                    .record
+                    .props
+                    .get(property)
+                    .map(|raw| overlay_property_display(raw)),
                 origin: match version.origin {
                     VersionOrigin::Source => "source",
                     VersionOrigin::Edit => "edit",
@@ -1139,6 +1149,16 @@ fn rename_overlay_action_id(
     )
 }
 
+fn overlay_property_value(raw: String) -> PropertyValue {
+    // OverlayPatch.props are clerk cells. Declared types are restored by
+    // coerce_index_edit before the SQL index persists the merged edit.
+    PropertyValue::String(raw)
+}
+
+fn overlay_property_display(raw: &str) -> String {
+    raw.to_string()
+}
+
 fn overlay_patch_from_edit(edit: &ObjectTypeIndexEdit) -> Result<OverlayPatch, String> {
     overlay_patch_from_edit_cleared(edit, Vec::new())
 }
@@ -1161,7 +1181,10 @@ fn overlay_patch_from_edit_cleared(
     edit: &ObjectTypeIndexEdit,
     cleared: Vec<String>,
 ) -> Result<OverlayPatch, String> {
-    let mut props: HashMap<String, String> = edit.properties.clone().into_iter().collect();
+    let mut props = HashMap::new();
+    for (key, value) in &edit.properties {
+        props.insert(key.clone(), value.as_cell());
+    }
     props.insert(
         INDEX_HIDDEN_PROP.into(),
         if edit.hidden { "1" } else { "0" }.into(),
@@ -1205,6 +1228,10 @@ fn edit_from_overlay(patch: OverlayPatch) -> Result<ObjectTypeIndexEdit, String>
         Some(raw) => parse_property_edit_times(&raw)?,
         None => BTreeMap::new(),
     };
+    let properties = properties
+        .into_iter()
+        .map(|(key, value)| (key, overlay_property_value(value)))
+        .collect();
     Ok(ObjectTypeIndexEdit {
         namespace: patch.namespace,
         kind: patch.kind,
@@ -1763,6 +1790,30 @@ fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_cells_keep_legacy_literals_and_round_trip_typed_values() {
+        assert_eq!(
+            overlay_property_value(r#""hello""#.into()),
+            PropertyValue::String(r#""hello""#.into())
+        );
+        assert_eq!(
+            overlay_property_value("edited".into()),
+            PropertyValue::String("edited".into())
+        );
+        assert_eq!(
+            overlay_property_value("true".into()),
+            PropertyValue::String("true".into())
+        );
+        assert_eq!(PropertyValue::Bool(true).as_cell(), "true");
+        assert_eq!(PropertyValue::Int(12).as_cell(), "12");
+        assert!(property_values_equivalent(
+            &overlay_property_value("12".into()),
+            &PropertyValue::Int(12)
+        ));
+        assert_eq!(overlay_property_display("edited"), "edited");
+        assert_eq!(overlay_property_display("12"), "12");
+    }
 
     #[test]
     fn a_configured_host_keeps_the_canary_off_the_local_log() {

@@ -188,8 +188,16 @@ pub fn assert_lifecycle_report(report: &LifecycleConformanceReport) -> Result<()
 
     for (projection, observation) in report.projections.iter().zip(&fixture.observations) {
         let expected_payload_digest = expected_github_payload_digest(observation)?;
-        let mut expected_properties = observation.properties.clone();
-        expected_properties.insert("state".into(), observation.state.clone());
+        let mut expected_properties: std::collections::BTreeMap<String, crate::PropertyValue> =
+            observation
+                .properties
+                .iter()
+                .map(|(key, value)| (key.clone(), crate::PropertyValue::String(value.clone())))
+                .collect();
+        expected_properties.insert(
+            "state".into(),
+            crate::PropertyValue::String(observation.state.clone()),
+        );
         if projection.stage != observation.stage
             || projection.record.source != SOURCE_GITHUB
             || projection.record.source_instance != observation.source_instance

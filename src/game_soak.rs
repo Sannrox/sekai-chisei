@@ -724,7 +724,10 @@ fn source_batch(
                 type_name: EVENT_KIND.into(),
                 display_name: format!("Battle {round}.{index}"),
                 payload_digest: format!("sha256:{digest:x}"),
-                properties,
+                properties: properties
+                    .into_iter()
+                    .map(|(key, value)| (key, sekai_source_sdk::PropertyValue::from(value)))
+                    .collect(),
                 deleted: false,
                 observed_at_ms: round as i64 + 1,
                 source_sequence: None,
@@ -778,7 +781,7 @@ fn source_batch(
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
+                properties: crate::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,

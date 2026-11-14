@@ -3431,7 +3431,7 @@ fn source_batch(
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: record.properties.into_iter().collect(),
+                properties: crate::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
@@ -3657,9 +3657,10 @@ async fn source_sync_authorized_success_replay_and_state_are_exact() {
     page_2.records[0].payload_digest =
         "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into();
     page_2.records[0].display_name = "Bounded sync, page 2".into();
-    page_2.records[0]
-        .properties
-        .insert("title".into(), "Bounded sync, page 2".into());
+    page_2.records[0].properties.insert(
+        "title".into(),
+        crate::grpc::property_value_to_proto(&"Bounded sync, page 2".into()),
+    );
     page_2.records[0].observed_at_ms = 20;
     redigest_source_batch(&mut page_2);
 
@@ -4110,9 +4111,10 @@ async fn source_sync_maps_version_cursor_and_secret_failures() {
     assert!(!cursor_error.message().contains("foreign"));
 
     let mut secret = source_batch(namespace, producer, "cursor:1", "cursor:2", "batch-secret");
-    secret.records[0]
-        .properties
-        .insert("access_token".into(), "redacted".into());
+    secret.records[0].properties.insert(
+        "access_token".into(),
+        crate::grpc::property_value_to_proto(&"redacted".into()),
+    );
     redigest_source_batch(&mut secret);
     let secret_error = svc
         .apply_source_batch(with_named_principal(

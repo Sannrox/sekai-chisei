@@ -1,5 +1,3 @@
-use std::collections::{BTreeMap, HashMap};
-
 use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
@@ -85,11 +83,7 @@ impl PostgresDb {
         if now_ms <= 0 {
             return Err("invalid_timestamp: now_ms must be positive".into());
         }
-        let mapper = source_batch_mapper(batch, || {
-            self.get_source_type_descriptor(&batch.namespace, &batch.type_digest)
-        })
-        .map_err(|error| error.to_string())?;
-        let existing = {
+        let existing_row = {
             let mut connection = self.connection().map_err(|error| error.to_string())?;
             load_batch_by_key(
                 &mut *connection,
@@ -99,9 +93,45 @@ impl PostgresDb {
                 false,
             )
             .map_err(|error| error.to_string())?
-            .map(|stored| stored.transaction.status)
         };
-        let prepared = PreparedBatch::for_apply(batch, &mapper, existing)
+        if let Some(stored) = existing_row.as_ref()
+            && stored.transaction.batch_digest == batch.batch_digest
+            && matches!(
+                stored.transaction.status,
+                SourceBatchStatus::Committed | SourceBatchStatus::Quarantined
+            )
+        {
+            return parse_stored_result(stored).map_err(|error| error.to_string());
+        }
+        let matching_open = existing_row.as_ref().is_some_and(|stored| {
+            stored.transaction.batch_digest == batch.batch_digest
+                && stored.transaction.status == SourceBatchStatus::Open
+        });
+        // Durable batch_json stays the original wire form. OPEN replay retries
+        // coerce against the current schema and falls back to that wire form so
+        // crash recovery can finish; landed dataset cells stay the first
+        // successful projection.
+        let mut projected = batch.clone();
+        if let Err(error) =
+            crate::db::object_sync::coerce_source_batch_records(&mut projected, |kind| {
+                self.get_object_type(kind)
+            })
+        {
+            if matching_open {
+                projected = batch.clone();
+            } else {
+                return Err(error);
+            }
+        }
+        let mapper = source_batch_mapper(&projected, || {
+            self.get_source_type_descriptor(&batch.namespace, &batch.type_digest)
+        })
+        .map_err(|error| error.to_string())?;
+        let existing = existing_row.map(|stored| stored.transaction.status);
+        let mut prepared = PreparedBatch::for_apply(&projected, &mapper, existing)
+            .map_err(|error| error.to_string())?;
+        prepared
+            .retain_original_batch_json(batch)
             .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
             .persist_source_batch_open(batch, &prepared, now_ms)
@@ -458,12 +488,9 @@ impl PostgresDb {
                     name: prepared_record.display_name.clone(),
                     namespace: batch.namespace.clone(),
                     external_id: prepared_record.source_id.clone(),
-                    properties: serde_json::from_str::<BTreeMap<String, String>>(
+                    properties: crate::db::object_sync::clerk_properties_from_json(
                         &prepared_record.properties_json,
-                    )
-                    .map_err(ApplyError::storage)?
-                    .into_iter()
-                    .collect::<HashMap<_, _>>(),
+                    )?,
                     created: before
                         .as_ref()
                         .map(|object| object.created)
@@ -1125,7 +1152,10 @@ fn preflight_commit_state(
                             .map_err(|error| ApplyError::storage(error.to_string()))?;
                     if identity.payload_digest != record.object.payload_digest
                         || object.name != record.display_name
-                        || stored.properties != record.object.properties
+                        || !crate::sekai::object_schema::property_maps_equivalent(
+                            &stored.properties,
+                            &record.object.properties,
+                        )
                         || stored.tombstoned != record.object.tombstoned
                     {
                         return Err(ApplyError::denied(
@@ -1983,7 +2013,12 @@ fn persist_schema_quarantine(
                             !crate::db::object_sync::RESERVED_SYNC_PROPERTIES
                                 .contains(&key.as_str())
                         })
-                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .map(|(key, value)| {
+                            (
+                                key.clone(),
+                                crate::sekai::object_schema::PropertyValue::String(value.clone()),
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),

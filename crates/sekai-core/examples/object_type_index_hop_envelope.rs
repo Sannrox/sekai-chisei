@@ -277,11 +277,11 @@ fn hash_two_hop(
     orders: &[ObjectTypeIndexMember],
     shipments: &[ObjectTypeIndexMember],
 ) -> usize {
-    let mut orders_by_customer: HashMap<&str, Vec<&ObjectTypeIndexMember>> = HashMap::new();
+    let mut orders_by_customer: HashMap<String, Vec<&ObjectTypeIndexMember>> = HashMap::new();
     for order in orders {
         if let Some(customer_id) = order.properties.get("customer_id") {
             orders_by_customer
-                .entry(customer_id.as_str())
+                .entry(customer_id.as_cell())
                 .or_default()
                 .push(order);
         }
@@ -289,18 +289,18 @@ fn hash_two_hop(
     let mut orders_with_shipment = HashSet::new();
     for shipment in shipments {
         if let Some(order_id) = shipment.properties.get("order_id") {
-            orders_with_shipment.insert(order_id.as_str());
+            orders_with_shipment.insert(order_id.as_cell());
         }
     }
     customers
         .iter()
         .filter(|customer| {
             orders_by_customer
-                .get(customer.source_key.as_str())
+                .get(&customer.source_key)
                 .is_some_and(|orders| {
                     orders
                         .iter()
-                        .any(|order| orders_with_shipment.contains(order.source_key.as_str()))
+                        .any(|order| orders_with_shipment.contains(&order.source_key))
                 })
         })
         .count()
