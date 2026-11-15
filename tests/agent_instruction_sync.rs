@@ -1,16 +1,7 @@
-//! `CLAUDE.md` is a compatibility copy of `AGENTS.md`. Keep them identical.
+//! `AGENTS.md` and the current-facing docs stay in step with the workspace.
+//! `CLAUDE.md` is a symlink to `AGENTS.md`, so it needs no check of its own.
 
 use std::path::{Path, PathBuf};
-
-#[test]
-fn claude_md_matches_agents_md() {
-    let agents = include_str!("../AGENTS.md");
-    let claude = include_str!("../CLAUDE.md");
-    assert_eq!(
-        agents, claude,
-        "CLAUDE.md drifted from AGENTS.md; copy AGENTS.md over CLAUDE.md"
-    );
-}
 
 #[test]
 fn agents_md_names_every_workspace_crate() {
