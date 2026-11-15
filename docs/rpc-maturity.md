@@ -82,8 +82,9 @@ An `experimental` RPC moves to `stable` only when it meets the
 5. **Bounded cost.** List and query RPCs page, and the upper limits on input,
    results, and index size are enforced and documented.
 
-Search (#2243) and the governed-document RPCs (#2266) met these criteria
-and are `stable`. Status of the remaining experimental embedding-spec RPCs:
+Search (#2243), the governed-document RPCs (#2266), and the datasource
+index RPCs (#2282) met these criteria and are `stable`. Status of the
+remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
 | --- | --- | --- |
@@ -186,15 +187,15 @@ Edit the fixture, then regenerate with
 | `SekaiService.ListDeliverableExportArtifacts` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.FetchExportArtifact` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.AcknowledgeExportDelivery` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.RegisterObjectTypeDatasource` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.ReindexObjectType` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.GetObjectTypeIndexStatus` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.Search` | `sekai.graph` | yes | mcp | `stable` |
 | `SekaiService.GetSearchIndexStatus` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.PutEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
-| `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunAdHocGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |

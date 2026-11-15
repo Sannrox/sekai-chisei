@@ -693,8 +693,8 @@
       "rpc": "RegisterObjectTypeDatasource",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -702,8 +702,8 @@
       "rpc": "ReindexObjectType",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -711,8 +711,8 @@
       "rpc": "GetObjectTypeIndexStatus",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -765,8 +765,8 @@
       "rpc": "PutObjectTypeIndexEdit",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {

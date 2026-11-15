@@ -124,3 +124,17 @@ the shrink-only SQLite-only list.
   and PostgreSQL (#2266). `native_server_smoke` consumes all seven on the
   spawned binary, as for `DecideActionInstance` (#1314). The HTTP/JSON
   projection and generated stable SDKs pick them up as unary stables.
+- 2026-11-14, Issue [#2282](https://github.com/Sannrox/sekai-chisei/issues/2282):
+  `RegisterObjectTypeDatasource`, `ReindexObjectType`,
+  `GetObjectTypeIndexStatus`, and `PutObjectTypeIndexEdit` become `stable`
+  after meeting the #2089 promotion criteria: namespace and credential-admin
+  authorization, typed `PropertyValue` cells on index edits (#2283), and
+  RPC-level tests on SQLite and PostgreSQL. Request and response names stay
+  as frozen: `PutObjectTypeIndexEditRequest.properties` is
+  `map<string, PropertyValue>`; `PutObjectTypeIndexEditResponse` is empty
+  and callers read status; `RegisterObjectTypeDatasourceRequest.idempotency_key`
+  remains on the wire for growth through `..Default::default()`.
+  `native_server_smoke` consumes all four on the spawned binary. They are
+  required siblings of `EvaluateObjectSet` once objects derive from datasets.
+  The HTTP/JSON projection and generated stable SDKs pick them up as unary
+  stables.
