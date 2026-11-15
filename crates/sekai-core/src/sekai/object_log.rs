@@ -15,8 +15,8 @@ use crate::sekai::object_type_index::{
     parse_property_edit_times,
 };
 use mikura::{
-    Aggregate, Breakdown, EvaluateRequest, EvaluateResponse, Hop, LocalCompute, ObjectRecord,
-    ObjectSet, OverlayPatch, Predicate, PropertyAcl, Store, VersionOrigin,
+    Aggregate, Breakdown, ComputeError, EvaluateRequest, EvaluateResponse, Hop, LocalCompute,
+    ObjectRecord, ObjectSet, OverlayPatch, Predicate, PropertyAcl, Store, VersionOrigin,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
@@ -717,10 +717,26 @@ fn compare_sql_to_log_with_cache(
     }
     let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
     let function = aggregation.function.to_ascii_lowercase();
+    let unknown_namespace = format!("unknown namespace {}", request.namespace);
     let log = match with_object_log_store_cache(cache, path, |store| {
         ObjectSet::new(LocalCompute)
             .evaluate(store, &request)
-            .map_err(|error| format!("{error:?}"))
+            .or_else(|error| match error {
+                // The log fails closed on a namespace it holds no record for.
+                // This log is opened without tenant keys, so that only means
+                // it never saw the namespace: its answer is the empty set, and
+                // a non-empty SQL answer still mismatches (#2419).
+                ComputeError::Load(message) if message == unknown_namespace => {
+                    Ok(EvaluateResponse {
+                        two_hop_count: 0,
+                        sum_amount: 0,
+                        objects: Vec::new(),
+                        cursor: None,
+                        groups: Vec::new(),
+                    })
+                }
+                error => Err(format!("{error:?}")),
+            })
     }) {
         Ok(log) => log,
         // The breakdown checks its exact sum in i64 for every function; SQL
@@ -3300,6 +3316,45 @@ mod tests {
                 PropertyAcl::allow_all(),
             )
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_namespace_the_log_never_saw_compares_as_empty() {
+        let (_dir, log) = seed_shop_log("fixture-unseen.mikura");
+        let cache: Mutex<Option<CachedObjectLogStore>> = Mutex::new(None);
+        let descriptor = ObjectSetDescriptor {
+            namespace: "unseen".into(),
+            ..shop_order_descriptor()
+        };
+        let compare = |paths: &[Vec<&ObjectTypeIndexMember>], group_by: &str| {
+            compare_sql_to_log_with_cache(
+                &cache,
+                &log,
+                &descriptor,
+                &[],
+                &ObjectSetAggregation {
+                    group_by: group_by.into(),
+                    ..fixture_agg("count", "")
+                },
+                paths,
+                PropertyAcl::allow_all(),
+            )
+        };
+        for group_by in ["", "status"] {
+            compare(&[], group_by).unwrap();
+        }
+        let orders = shop_visible_orders();
+        let paths: Vec<Vec<&ObjectTypeIndexMember>> =
+            orders.iter().map(|order| vec![order]).collect();
+        for group_by in ["", "status"] {
+            assert!(
+                matches!(
+                    compare(&paths, group_by),
+                    Err(ObjectLogCompareError::Mismatch { .. })
+                ),
+                "{group_by:?}"
+            );
         }
     }
 

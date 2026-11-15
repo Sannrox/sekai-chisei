@@ -57,6 +57,10 @@ const FIXED_SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 4711];
 const REGRESSION_CASES: &[(&str, u64, usize)] = &[
     // An incoming hop compared as outgoing (#989, #2412).
     ("incoming hop follows the near row's join property", 8, 2),
+    // A namespace the log never saw refused the evaluate (#2419), in the
+    // first namespace and in the second.
+    ("unseen namespace compares as empty", 3, 1),
+    ("unseen second namespace compares as empty", 4711, 1),
 ];
 /// Writes per case in the default run.
 const DEFAULT_OPS: usize = 40;
