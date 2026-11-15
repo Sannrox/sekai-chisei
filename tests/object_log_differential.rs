@@ -52,6 +52,12 @@ use tonic::metadata::MetadataValue;
 /// Seeds the default run checks. A seed that once found a defect joins this
 /// list once the defect is fixed.
 const FIXED_SEEDS: &[u64] = &[1, 2, 3, 4, 5, 6, 7, 8, 4711];
+/// Named regression cases: what each one caught, its seed, and its writes.
+/// The default run checks these alongside the fixed seeds.
+const REGRESSION_CASES: &[(&str, u64, usize)] = &[
+    // An incoming hop compared as outgoing (#989, #2412).
+    ("incoming hop follows the near row's join property", 8, 2),
+];
 /// Writes per case in the default run.
 const DEFAULT_OPS: usize = 40;
 /// Requests run after every this many writes, and after the last.
@@ -725,20 +731,24 @@ fn env_number(name: &str) -> Option<u64> {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_object_log_agrees_with_the_relational_projection() {
     let ops = env_number("SEKAI_DIFF_OPS").map_or(DEFAULT_OPS, |ops| ops as usize);
-    let seeds: Vec<u64> = match (
+    let cases: Vec<(u64, usize)> = match (
         env_number("SEKAI_DIFF_SEED"),
         env_number("SEKAI_DIFF_CASES"),
     ) {
-        (Some(seed), None) => vec![seed],
+        (Some(seed), None) => vec![(seed, ops)],
         (start, Some(cases)) => {
             let start = start.unwrap_or(1);
-            (start..start + cases).collect()
+            (start..start + cases).map(|seed| (seed, ops)).collect()
         }
-        (None, None) => FIXED_SEEDS.to_vec(),
+        (None, None) => FIXED_SEEDS
+            .iter()
+            .map(|&seed| (seed, ops))
+            .chain(REGRESSION_CASES.iter().map(|&(_, seed, ops)| (seed, ops)))
+            .collect(),
     };
     let mut tally = Tally::default();
     let mut failures = Vec::new();
-    for seed in seeds {
+    for (seed, ops) in cases {
         let case = Case::generate(seed, ops);
         if let Some(report) = check(&case, &mut tally).await {
             failures.push(report);

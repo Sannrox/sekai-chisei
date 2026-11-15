@@ -1320,6 +1320,50 @@ impl SekaiDb {
         Ok(out)
     }
 
+    /// `(source_key, value)` of each `source_keys` member's `property` in the
+    /// join projection: the far keys an incoming hop follows from these near
+    /// members (#2412).
+    pub fn list_index_join_values(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        source_keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if source_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        if source_keys.len() > 400 {
+            let mut out = Vec::new();
+            for chunk in source_keys.chunks(400) {
+                out.extend(self.list_index_join_values(namespace, kind, property, chunk)?);
+            }
+            return Ok(out);
+        }
+        let conn = self.conn();
+        let placeholders = vec!["?"; source_keys.len()].join(",");
+        let sql = format!(
+            "SELECT source_key, value FROM sekai_object_type_index_join
+             WHERE namespace = ?1 AND kind = ?2 AND property = ?3 AND source_key IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|error| error.to_string())?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&namespace, &kind, &property];
+        for key in source_keys {
+            params.push(key);
+        }
+        let mut rows = stmt
+            .query(params.as_slice())
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            out.push((
+                row.get(0).map_err(|error| error.to_string())?,
+                row.get(1).map_err(|error| error.to_string())?,
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn list_index_members_by_keys(
         &self,
         namespace: &str,
@@ -3041,6 +3085,17 @@ mod tests {
         let digest = crate::sekai::object_type_index::join_value_digest("eu");
         assert!(
             db.list_index_join_children("sales", "Customer", "region", &[digest])
+                .unwrap()
+                .is_empty()
+        );
+        // The reverse lookup an incoming hop takes: a member's own value.
+        assert_eq!(
+            db.list_index_join_values("sales", "Customer", "region", &["c1".into()])
+                .unwrap(),
+            vec![("c1".into(), "eu".into())]
+        );
+        assert!(
+            db.list_index_join_values("sales", "Customer", "region", &["eu".into()])
                 .unwrap()
                 .is_empty()
         );

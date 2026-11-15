@@ -83,6 +83,38 @@ pub fn join_paths_nested<'a>(
     Ok(next)
 }
 
+/// [`join_paths_nested`] for an incoming hop: a path extends to each child
+/// whose source key the parent's `join_property` holds (#2412). Like the
+/// object log, the far side matches on its key only.
+pub fn join_paths_nested_incoming<'a>(
+    paths: Vec<Vec<&'a ObjectTypeIndexMember>>,
+    children: &'a [ObjectTypeIndexMember],
+    join_property: &str,
+    meter: &mut CostMeter,
+) -> Result<Vec<Vec<&'a ObjectTypeIndexMember>>, ObjectSetError> {
+    if join_property.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut next = Vec::new();
+    for path in &paths {
+        let parent = path[path.len() - 1];
+        let target = parent
+            .properties
+            .get(join_property)
+            .map(|value| value.as_cell());
+        for child in children {
+            meter.charge(1)?;
+            if target.as_deref() == Some(child.source_key.as_str()) {
+                meter.charge(1)?;
+                let mut joined = path.clone();
+                joined.push(child);
+                next.push(joined);
+            }
+        }
+    }
+    Ok(next)
+}
+
 pub fn join_paths_hash<'a>(
     paths: Vec<Vec<&'a ObjectTypeIndexMember>>,
     children: &'a [ObjectTypeIndexMember],
@@ -147,10 +179,32 @@ impl HopKey {
 
 /// Extend key paths from join-table edges `(parent_value, child_source_key)`.
 /// Child identity comes from `child_by_key`; child properties are not read.
+/// A parent matches an edge by its source key or its object id.
 pub fn join_key_paths(
     paths: Vec<Vec<HopKey>>,
     edges: &[(String, String)],
     child_by_key: &HashMap<String, HopKey>,
+) -> Vec<Vec<HopKey>> {
+    extend_key_paths(paths, edges, child_by_key, true)
+}
+
+/// [`join_key_paths`] for an incoming hop's edges
+/// `(parent_source_key, child_source_key)`: a parent matches by its source
+/// key only, so a parent whose object id equals another's key never takes
+/// that parent's edges (#2412).
+pub fn join_key_paths_incoming(
+    paths: Vec<Vec<HopKey>>,
+    edges: &[(String, String)],
+    child_by_key: &HashMap<String, HopKey>,
+) -> Vec<Vec<HopKey>> {
+    extend_key_paths(paths, edges, child_by_key, false)
+}
+
+fn extend_key_paths(
+    paths: Vec<Vec<HopKey>>,
+    edges: &[(String, String)],
+    child_by_key: &HashMap<String, HopKey>,
+    by_object_id: bool,
 ) -> Vec<Vec<HopKey>> {
     if edges.is_empty() || child_by_key.is_empty() {
         return Vec::new();
@@ -166,7 +220,8 @@ pub fn join_key_paths(
     for path in paths {
         let parent = path.last().expect("path");
         let mut seen_keys = HashSet::new();
-        for key in [&parent.source_key, &parent.object_id] {
+        let keys = [&parent.source_key, &parent.object_id];
+        for key in &keys[..if by_object_id { 2 } else { 1 }] {
             if !seen_keys.insert(key.as_str()) {
                 continue;
             }
@@ -232,6 +287,57 @@ mod tests {
         assert_eq!(path_signature(&nested), path_signature(&hashed));
         assert_eq!(nested.len(), 1);
         assert!(join_paths_hash(vec![vec![&customers[0]]], &orders, "").is_empty());
+    }
+
+    #[test]
+    fn an_incoming_join_follows_the_parent_property_to_the_child_key() {
+        let orders = [
+            member("Order", "o1", "customer_id", "c1"),
+            member("Order", "o2", "customer_id", "c-missing"),
+        ];
+        let customers = [
+            member("Customer", "c1", "region", "eu"),
+            // Holds the parent's value as a property, not as its key.
+            member("Customer", "c2", "customer_id", "c1"),
+        ];
+        let joined = join_paths_nested_incoming(
+            orders.iter().map(|member| vec![member]).collect(),
+            &customers,
+            "customer_id",
+            &mut CostMeter::new(Default::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            path_signature(&joined),
+            vec![vec!["Order:o1".to_string(), "Customer:c1".into()]]
+        );
+    }
+
+    #[test]
+    fn incoming_key_paths_match_the_parent_source_key_only() {
+        let parent = |key: &str, object_id: &str| HopKey {
+            kind: "Order".into(),
+            source_key: key.into(),
+            object_id: object_id.into(),
+        };
+        let customer = |key: &str| HopKey {
+            kind: "Customer".into(),
+            source_key: key.into(),
+            object_id: format!("Customer:{key}"),
+        };
+        // Order a's object id is order b's source key.
+        let paths = vec![vec![parent("a", "b")], vec![parent("b", "Order:b")]];
+        let edges = vec![("a".into(), "c1".into()), ("b".into(), "c2".into())];
+        let child_by_key =
+            HashMap::from([("c1".into(), customer("c1")), ("c2".into(), customer("c2"))]);
+        let joined = join_key_paths_incoming(paths.clone(), &edges, &child_by_key);
+        let pairs: Vec<(&str, &str)> = joined
+            .iter()
+            .map(|path| (path[0].source_key.as_str(), path[1].source_key.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("a", "c1"), ("b", "c2")]);
+        // Outgoing edges still match by object id too.
+        assert_eq!(join_key_paths(paths, &edges, &child_by_key).len(), 3);
     }
 
     #[test]

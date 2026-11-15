@@ -330,6 +330,21 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_index_join_values(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        source_keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_index_join_values(namespace, kind, property, source_keys),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_index_join_values(namespace, kind, property, source_keys)
+            }),
+        }
+    }
+
     pub fn list_index_members_by_keys(
         &self,
         namespace: &str,
