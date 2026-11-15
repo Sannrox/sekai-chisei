@@ -95,4 +95,15 @@ impl SekaiServiceImpl {
         self.site_id = site_id.into();
         self
     }
+
+    /// Replaces the object-log dual-read configuration read from the
+    /// environment at construction, so a caller can point the gate at its
+    /// own log without process-wide variables.
+    pub fn with_object_log_dual_read(
+        mut self,
+        dual_read: crate::sekai::object_log::ObjectLogDualRead,
+    ) -> Self {
+        self.object_log_dual_read = dual_read;
+        self
+    }
 }

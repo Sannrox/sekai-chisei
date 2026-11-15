@@ -143,6 +143,7 @@ const SEPARATE_TARGETS: &[&str] = &[
     "epistemic_replication_example",
     "feedback_adapters",
     "gateway_cache_signals",
+    "object_log_differential",
     "object_sync_adapters",
     "observability",
     "resilience_load",

@@ -161,6 +161,10 @@ name = "it"
 path = "tests/it.rs"
 
 [[test]]
+name = "object_log_differential"
+path = "tests/object_log_differential.rs"
+
+[[test]]
 name = "chisei_runtime_db_ratchet"
 path = "tests/chisei_runtime_db_ratchet.rs"
 
