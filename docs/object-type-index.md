@@ -67,7 +67,9 @@ tagged in-process object-log library on a sample of requests
 (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1` for CI) and fails
 closed on mismatch, missing log, or a missing `max_rows_scanned`. Roots that
 lack the `group_by` property (SQL groups each under its source key) compare
-against the library's one absent group. Root `eq` filters compare when the
+against the library's one absent group. A namespace the log holds no record for
+compares as the empty set, so any SQL answer there is a mismatch, not an
+error. Root `eq` filters compare when the
 value is neither numeric nor boolean, because only then do both stores
 match strings exactly.
 
