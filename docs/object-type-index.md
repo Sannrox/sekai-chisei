@@ -10,7 +10,7 @@ See [ADR 0073](decisions/0073-source-and-action-objects.md), the published
 
 ## Operator path
 
-Experimental RPCs (`SEKAI_EXPERIMENTAL_RPCS=1`):
+Operator RPCs (stable; served on the default build):
 
 1. `RegisterObjectTypeDatasource` — namespace, kind, type-revision digest,
    dataset id, key column, property mapping, optional hidden column.

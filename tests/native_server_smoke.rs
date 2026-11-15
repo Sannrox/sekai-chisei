@@ -31,16 +31,20 @@ use sekai_chisei::grpc::pb::chisei::{
     GetOperationReceiptRequest, ListRoutingProfilesRequest, PlanExecutionRequest,
     RecordUsageRequest, SetBudgetLimitRequest, SetModelFamilyEnablementRequest,
 };
+use sekai_chisei::grpc::pb::sekai::property_value::Kind;
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    AcquireLeaseRequest, AdmitGovernedDocumentRequest, AttachGovernedDocumentRenditionRequest,
-    ContentReference, CreateObjectRequest, DecideActionInstanceRequest,
-    DeleteGovernedDocumentRequest, DocumentRenditionAttachment, EnsureTeamNamespaceRequest,
-    ExpireGovernedDocumentRequest, GetActionInstanceRequest, GetGovernedDocumentRequest,
-    GetLeaseRequest, GetLinkedObjectsRequest, GetObjectRequest, GovernedActionType,
+    AcquireLeaseRequest, AdmitGovernedDocumentRequest, AppendRowsRequest,
+    AttachGovernedDocumentRenditionRequest, ColumnDef, ContentReference, CreateDatasetRequest,
+    CreateObjectRequest, Dataset, DecideActionInstanceRequest, DeleteGovernedDocumentRequest,
+    DocumentRenditionAttachment, EnsureTeamNamespaceRequest, ExpireGovernedDocumentRequest,
+    GetActionInstanceRequest, GetGovernedDocumentRequest, GetLeaseRequest, GetLinkedObjectsRequest,
+    GetObjectRequest, GetObjectTypeIndexStatusRequest, GovernedActionType,
     GovernedDocumentAdmission, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
-    ListFilter, ListObjectsRequest, Object, PutActionBindingRequest, PutGovernedActionTypeRequest,
-    ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, RunActionBindingRequest,
+    ListFilter, ListObjectsRequest, Object, ObjectTypeDatasource, PropertyValue,
+    PutActionBindingRequest, PutGovernedActionTypeRequest, PutObjectTypeIndexEditRequest,
+    RegisterObjectTypeDatasourceRequest, ReindexObjectTypeRequest,
+    ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, Row, RunActionBindingRequest,
     SubmitActionInstanceRequest, TraverseRequest, UpdateObjectRequest,
 };
 use sekai_chisei::sekai::semantic::CAPABILITY_RESOLVE_REF;
@@ -2200,4 +2204,120 @@ async fn spawned_binary_mirrors_document_cli_failures_over_rpcs() {
         "governed document is unavailable",
         "deleted document",
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_serves_datasource_index_rpcs() {
+    let mut server = NativeServer::spawn();
+    let mut sekai = server.sekai().await;
+    let foreign = server.create_principal_token("index-intruder");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let namespace = format!("sales-{suffix}");
+    let dataset_id = format!("ds-customers-{suffix}");
+
+    sekai
+        .create_dataset(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: dataset_id.clone(),
+                name: "customers".into(),
+                columns: ["customer_id", "region", "hidden"]
+                    .map(|name| ColumnDef {
+                        name: name.into(),
+                        r#type: "string".into(),
+                        classification: "public".into(),
+                    })
+                    .to_vec(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create dataset: {error}\n{}", server.logs()));
+    sekai
+        .append_rows(AppendRowsRequest {
+            dataset_id: dataset_id.clone(),
+            rows: vec![Row {
+                values: HashMap::from([
+                    ("customer_id".into(), "c1".into()),
+                    ("region".into(), "eu".into()),
+                    ("hidden".into(), "0".into()),
+                ]),
+            }],
+        })
+        .await
+        .unwrap_or_else(|error| panic!("append rows: {error}\n{}", server.logs()));
+
+    let registered = sekai
+        .register_object_type_datasource(RegisterObjectTypeDatasourceRequest {
+            datasource: Some(ObjectTypeDatasource {
+                contract_version: sekai_chisei::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: namespace.clone(),
+                kind: "Customer".into(),
+                definition_digest: format!("sha256:customer-{suffix}"),
+                dataset_id,
+                key_column: "customer_id".into(),
+                property_mapping: HashMap::from([("region".into(), "region".into())]),
+                hidden_column: "hidden".into(),
+                ..Default::default()
+            }),
+            idempotency_key: format!("reg-{suffix}"),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("register: {error}\n{}", server.logs()))
+        .into_inner()
+        .datasource
+        .expect("registered datasource");
+    assert_eq!(registered.key_column, "customer_id");
+
+    let foreign_register = sekai
+        .register_object_type_datasource(bearer(
+            &foreign,
+            RegisterObjectTypeDatasourceRequest {
+                datasource: Some(registered.clone()),
+                idempotency_key: format!("reg-foreign-{suffix}"),
+            },
+        ))
+        .await
+        .expect_err("foreign principal is not credential admin");
+    assert_eq!(foreign_register.code(), Code::PermissionDenied);
+    assert_eq!(foreign_register.message(), "credential admin required");
+
+    let reindexed = sekai
+        .reindex_object_type(ReindexObjectTypeRequest {
+            namespace: namespace.clone(),
+            kind: "Customer".into(),
+            full_rebuild: true,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("reindex: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(!reindexed.quarantined, "{reindexed:?}");
+
+    let indexed = sekai
+        .get_object_type_index_status(GetObjectTypeIndexStatusRequest {
+            namespace: namespace.clone(),
+            kind: "Customer".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("status: {error}\n{}", server.logs()))
+        .into_inner()
+        .status
+        .expect("index status");
+    assert_eq!(indexed.member_count, 1);
+
+    sekai
+        .put_object_type_index_edit(PutObjectTypeIndexEditRequest {
+            namespace,
+            kind: "Customer".into(),
+            source_key: "c1".into(),
+            properties: HashMap::from([(
+                "region".into(),
+                PropertyValue {
+                    kind: Some(Kind::StringValue("west".into())),
+                },
+            )]),
+            hidden: false,
+            idempotency_key: format!("edit-{suffix}"),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put edit: {error}\n{}", server.logs()));
 }
