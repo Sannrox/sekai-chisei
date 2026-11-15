@@ -62,19 +62,28 @@ assigns each `(kind, key)` its plane namespace from this projection and
 from clerk objects.
 The SQL index is the serving backend.
 `SEKAI_OBJECT_LOG_DUAL_READ=1` with `SEKAI_OBJECT_LOG` is a canary: it
-compares hop/count/sum/min/max/avg answers to a tagged
-in-process object-log library on a sample of requests
+compares hop/count/sum/min/max/avg answers, per `group_by` group, to a
+tagged in-process object-log library on a sample of requests
 (`SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE`, default 32; `1` for CI) and fails
-closed on mismatch, missing log, or a missing `max_rows_scanned`. A
-descriptor that library cannot compare without a silent rule mismatch
-(property filters, `group_by`, multi-key sort, distinct, path
-multiplicity, a non-i64 measure, or incoming hop direction) keeps the SQL
-answer and skips the canary. After #980 every production multi-hop has
-`group_by`, so those evaluates skip rather than turning the flag into a kill
-switch. Whole-set min/max/avg without `group_by` compare when the reconstructed
-i64 measures match the object-log; the SQL aggregation contract itself is
-unchanged. Tagged `v0.1.0` is outbound-only;
-incoming hops skip instead of comparing as outbound. Unsampled
+closed on mismatch, missing log, or a missing `max_rows_scanned`. Roots that
+lack the `group_by` property (SQL groups each under its source key) compare
+against the library's one absent group. Root `eq` filters compare when the
+value is neither numeric nor boolean, because only then do both stores
+match strings exactly.
+
+A descriptor the library cannot compare without a silent rule mismatch keeps
+the SQL answer and skips the canary:
+
+- `eq` on a numeric or boolean value, `neq`, and `gt`/`gte`/`lt`/`lte`
+  filters;
+- multi-key sort and distinct;
+- path multiplicity, a non-i64 measure, and a measure whose exact sum
+  overflows i64;
+- incoming hops, until the indexed SQL path honours hop direction (#2412).
+
+Each sampled request increments `sekai_object_log_dual_read_total` with
+`outcome` `compared`, `skipped`, `mismatch`, or `error`. A skip carries the
+cause in `reason`, so the skip rate and its largest cause are visible. Unsampled
 requests keep the SQL answer and do not open the log. First soak
 uses that library's allow-all property deny-list. Clerk
 grants stay compiled on the SQL path; when a kind's property-grant

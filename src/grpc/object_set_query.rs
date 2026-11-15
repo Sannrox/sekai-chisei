@@ -1167,7 +1167,7 @@ impl SekaiServiceImpl {
                         .map_err(Status::internal)?,
                 );
             }
-            match crate::sekai::object_log::project_object_log_acl(
+            let canary = crate::sekai::object_log::project_object_log_acl(
                 kinds.iter().zip(policies.iter()).map(|(kind, policy)| {
                     crate::sekai::object_log::ObjectLogAclKind {
                         kind,
@@ -1182,41 +1182,32 @@ impl SekaiServiceImpl {
                         read_properties: read.get(kind).cloned().unwrap_or_default(),
                     }
                 }),
-            ) {
-                Ok(acl) => {
-                    let sql_paths: Vec<
-                        Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>,
-                    > = if let Some(projected) = projected.as_ref() {
+            )
+            .and_then(|acl| {
+                let sql_paths: Vec<Vec<&crate::sekai::object_type_index::ObjectTypeIndexMember>> =
+                    if let Some(projected) = projected.as_ref() {
                         projected.iter().map(|path| path.iter().collect()).collect()
                     } else {
                         paths.clone()
                     };
-                    let log_path =
-                        self.object_log_dual_read
-                            .log_path
-                            .as_deref()
-                            .ok_or_else(|| {
-                                Status::failed_precondition(
-                                    crate::sekai::object_log::ObjectLogCompareError::MissingLog
-                                        .message(),
-                                )
-                            })?;
-                    match crate::sekai::object_log::compare_sql_to_log_path(
-                        log_path,
-                        &bound.descriptor,
-                        hops,
-                        &aggregation,
-                        &sql_paths,
-                        acl,
-                    ) {
-                        Ok(())
-                        | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
-                        Err(error) => {
-                            return Err(Status::failed_precondition(error.message()));
-                        }
-                    }
-                }
-                Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed)
+                let log_path = self
+                    .object_log_dual_read
+                    .log_path
+                    .as_deref()
+                    .ok_or(crate::sekai::object_log::ObjectLogCompareError::MissingLog)?;
+                crate::sekai::object_log::compare_sql_to_log_path(
+                    log_path,
+                    &bound.descriptor,
+                    hops,
+                    &aggregation,
+                    &sql_paths,
+                    acl,
+                )
+            });
+            crate::sekai::object_log::record_canary_outcome(&canary);
+            match canary {
+                Ok(())
+                | Err(crate::sekai::object_log::ObjectLogCompareError::GrantNarrowed)
                 | Err(crate::sekai::object_log::ObjectLogCompareError::Unsupported(_)) => {}
                 Err(error) => {
                     return Err(Status::failed_precondition(error.message()));
@@ -4027,7 +4018,7 @@ mod tests {
         seed_indexed_customer_order_shipment(&svc, &digest);
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
-        seed_mikura_customer_order_shipment(&log);
+        seed_mikura_customer_order_shipment(&log, "eu");
         svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
             enabled: true,
             log_path: Some(log.clone()),
@@ -4080,6 +4071,17 @@ mod tests {
             page.source,
             crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION
         );
+
+        // Same roots and sum, different group: only a grouped compare fails.
+        let regrouped = dir.path().join("regrouped.mikura");
+        seed_mikura_customer_order_shipment(&regrouped, "us");
+        svc.object_log_dual_read.log_path = Some(regrouped);
+        let err = svc
+            .evaluate_object_set(with_named_principal(request.clone(), "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("mismatch"), "{}", err.message());
 
         svc.object_log_dual_read.enabled = false;
         let off = svc
@@ -4445,7 +4447,8 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_mikura_customer_order_shipment(path: &std::path::Path) {
+    /// Mirror of the indexed sales fixture, with customer `c1` in `region`.
+    fn seed_mikura_customer_order_shipment(path: &std::path::Path, region: &str) {
         let mut store = mikura::Store::create(path).unwrap();
         mikura_ingest::BatchIngest::run(
             &mut store,
@@ -4457,7 +4460,7 @@ mod tests {
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
-                    props: std::collections::HashMap::from([("region".into(), "eu".into())]),
+                    props: std::collections::HashMap::from([("region".into(), region.into())]),
                     schema_version: 1,
                 },
                 mikura::ObjectRecord {
