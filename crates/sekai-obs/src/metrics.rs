@@ -61,6 +61,11 @@ pub fn set_embedding_index_lag_ms(lag_ms: u64) {
     gauge!("sekai_embedding_index_lag_ms").set(lag_ms as f64);
 }
 
+/// Admitted objects still waiting to reach the object log (#2289).
+pub fn set_object_log_ingest_backlog(intents: u64) {
+    gauge!("sekai_object_log_ingest_backlog").set(intents as f64);
+}
+
 pub fn search_index_lag_ms() -> u64 {
     SEARCH_INDEX_LAG_MS.load(Ordering::Relaxed)
 }

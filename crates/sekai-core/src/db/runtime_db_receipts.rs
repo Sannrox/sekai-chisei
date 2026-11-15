@@ -13,6 +13,21 @@ impl RuntimeDb {
         }
     }
 
+    /// [`Self::put_operation_receipt`] that also makes instance `ingest`'s
+    /// object-log intent ready in the same transaction (#2289).
+    pub fn put_operation_receipt_ingesting(
+        &self,
+        receipt: &OperationReceipt,
+        ingest: Option<&str>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_operation_receipt_ingesting(receipt, ingest),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_operation_receipt_ingesting(receipt, ingest)
+            }),
+        }
+    }
+
     pub fn get_operation_receipt(
         &self,
         operation_id: &str,

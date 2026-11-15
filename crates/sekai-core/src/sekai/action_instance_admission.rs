@@ -22,7 +22,7 @@ use crate::sekai::action_type_criteria::{
     evaluate_submission_criteria, invoker_context,
 };
 use crate::sekai::object_security::PrincipalPolicyContext;
-use crate::sekai::{action_effect, action_object_mutation, action_policy, audit, object_log};
+use crate::sekai::{action_effect, action_object_mutation, action_policy, audit};
 use sekai_domain::receipt::{
     OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
 };
@@ -1940,9 +1940,33 @@ impl<'a> ActionInstanceAdmission<'a> {
         if existing.status == STATUS_ADMITTED
             && let Some(object) = object_for_admitted_instance(self.db, &existing)?
         {
-            // Clerk admission is already durable. Log catch-up is best-effort so
-            // a transient object-log error cannot fail an idempotent replay.
-            catch_up_object_log(&existing.operation_id, &object.id, &object.kind, &object);
+            // The receipt made this write's intent ready; drain it again in
+            // case the admitting request could not (#2289). A receipt an
+            // older binary wrote left any intent unready: make it ready,
+            // with its write's `seq` and snapshot. A write an older binary
+            // made has none: record one while the object still holds
+            // exactly this admission's write and the log lacks it. The log
+            // never fails an idempotent replay.
+            if let Err(error) = self
+                .db
+                .mark_object_log_ingest_intent_ready(&existing.instance_id)
+            {
+                tracing::error!(instance_id = %existing.instance_id, %error, "object-log ingest intent not made ready");
+            }
+            if let Some(committed) = existing
+                .admission_lease
+                .as_ref()
+                .and_then(|lease| lease.written_object_digest.as_deref())
+                && !crate::sekai::object_log::configured_log_shows(&object).unwrap_or(false)
+                && let Err(error) = self.db.record_object_log_ingest_intent_if_current(
+                    &existing.instance_id,
+                    &object.id,
+                    committed,
+                )
+            {
+                tracing::error!(instance_id = %existing.instance_id, %error, "object-log ingest intent not recorded");
+            }
+            crate::sekai::object_log_ingest::drain_instance(self.db, &existing.instance_id);
             action_object_mutation::complete_object_write(
                 self.db,
                 &object,
@@ -2181,6 +2205,12 @@ impl<'a> ActionInstanceAdmission<'a> {
                 .and_then(|()| self.db.put_action_instance(&taken).map(|_| ()))
                 .map_err(ActionInstanceAdmissionError::Internal)?;
         }
+        // An admitted object write owes the object log an ingest: the
+        // receipt makes the intent its write recorded ready, so a crash
+        // after it cannot lose it (#2289). The intent holds the write's
+        // snapshot, so a recovered write the object has since moved past
+        // still readies it; a write that recorded none readies nothing.
+        let ingest = applied_object.is_some() && stored.status == STATUS_ADMITTED;
         // The admission receipt is fenced on the reservation's lease; a
         // decision on a parked instance records its receipt unfenced.
         match (approval, stored.admission_lease.as_ref()) {
@@ -2199,7 +2229,13 @@ impl<'a> ActionInstanceAdmission<'a> {
                 };
                 match self
                     .db
-                    .put_admission_receipt_checked(&stored.instance_id, lease, &receipt, check)
+                    .put_admission_receipt_checked_ingesting(
+                        &stored.instance_id,
+                        lease,
+                        &receipt,
+                        check,
+                        ingest,
+                    )
                     .map_err(ActionInstanceAdmissionError::Internal)?
                 {
                     crate::sekai::action_instance::FencedAdmissionWrite::Applied(()) => {}
@@ -2218,7 +2254,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             _ => self
                 .db
-                .put_operation_receipt(&receipt)
+                .put_operation_receipt_ingesting(
+                    &receipt,
+                    ingest.then_some(stored.instance_id.as_str()),
+                )
                 .map_err(ActionInstanceAdmissionError::Internal)?,
         }
 
@@ -2248,21 +2287,10 @@ impl<'a> ActionInstanceAdmission<'a> {
             planned_effects,
             approval.is_some(),
         )?;
-        if stored.status == STATUS_ADMITTED
-            && let Some(applied) = applied_object.filter(|applied| applied.object_present)
-        {
-            // #1115: the operation receipt above is already durable, so a
-            // transient object-log failure here must not fail this
-            // already-succeeded admission back to the caller — that was
-            // the bug: this path used `?` while the replay catch-up path
-            // (completed_replay) already treated the identical failure as
-            // best-effort. Both now go through the same helper.
-            catch_up_object_log(
-                operation_id,
-                &applied.object_id,
-                &applied.object_kind,
-                &applied.object,
-            );
+        if ingest {
+            // The receipt carries the intent, so a failure here never fails
+            // the admission: the intent stays for a replay or the sweep.
+            crate::sekai::object_log_ingest::drain_instance(self.db, &stored.instance_id);
         }
         Ok(())
     }
@@ -2659,31 +2687,6 @@ fn approval_attributes(approval: &ApprovalRequirement) -> Vec<(&'static str, Str
     .collect()
 }
 
-/// #1115: post-receipt object-log ingest is best-effort by design (ADR
-/// 0081) — once the operation receipt is durable, a transient ingest
-/// failure must never fail an already-succeeded admission back to the
-/// caller. It must not go silent either: an operator or a dual-read
-/// consumer has no other signal that this identity is missing from the
-/// configured log until catch-up succeeds, so log one structured,
-/// greppable event instead of swallowing the error outright.
-fn catch_up_object_log(
-    operation_id: &str,
-    object_id: &str,
-    object_kind: &str,
-    object: &crate::domain::Object,
-) {
-    if let Err(error) = object_log::ensure_admitted_object_in_configured_log(object) {
-        tracing::error!(
-            operation_id = %operation_id,
-            object_id = %object_id,
-            object_kind = %object_kind,
-            error = %error,
-            "post-receipt object-log ingest failed; admission is durable but the \
-             configured object log is missing this identity until catch-up succeeds"
-        );
-    }
-}
-
 /// What a takeover found for an abandoned reservation.
 enum Abandoned {
     /// Not abandoned (receipt recorded, lease live, legacy row, or another
@@ -2738,7 +2741,7 @@ fn plan_admission_effects(
 }
 
 /// The `object_id` parameter of `instance`, empty when it names none.
-fn admitted_object_id(instance: &ActionInstance) -> String {
+pub(crate) fn admitted_object_id(instance: &ActionInstance) -> String {
     serde_json::from_str::<serde_json::Value>(&instance.parameters_json)
         .ok()
         .and_then(|value| {
@@ -4919,9 +4922,12 @@ mod tests {
                     .is_some()
             );
             assert!(!log.exists());
+            // #2289: the receipt kept the ingest as a backlog intent.
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 1);
 
             let replay = admission.admit(request, "alice", 20).unwrap();
             assert!(replay.replay);
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 0);
             crate::sekai::object_log::release_process_object_log_cache();
             let store = mikura::Store::open(&log).unwrap();
             assert_eq!(
@@ -4934,6 +4940,138 @@ mod tests {
                 .unwrap(),
                 1
             );
+        });
+    }
+
+    #[test]
+    fn crash_after_receipt_is_ingested_once_by_the_sweep_after_restart() {
+        // #2289: the process dies after the receipt commits and before the
+        // ingest. No client replays; a sweep on the restarted plane drains
+        // the intent the receipt recorded, and a second sweep appends
+        // nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-crash","name":"Crash"}"#,
+        );
+        request.idempotency_key = "record-crash-log".into();
+        request.request_id = "operation-crash-log".into();
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            crash_next_admission(CrashPoint::AfterReceipt);
+            assert!(
+                ActionInstanceAdmission::new(&db, None)
+                    .admit(request, "alice", 10)
+                    .is_err()
+            );
+            assert!(!log.exists());
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 1);
+
+            assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 1);
+            assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 0);
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 0);
+            crate::sekai::object_log::release_process_object_log_cache();
+            let store = mikura::Store::open(&log).unwrap();
+            assert_eq!(
+                crate::sekai::object_log::identity_generation(
+                    &store,
+                    "acme",
+                    "customer_record",
+                    "rec-crash"
+                )
+                .unwrap(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn a_drain_appends_the_receipted_write_not_a_later_unreceipted_one() {
+        // Autoreview on #2289: a later write that has no receipt yet, and
+        // may still roll back or be compensated, never reaches the log
+        // through this intent; the intent carries the state its own
+        // admission wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-pending","name":"Committed"}"#,
+        );
+        request.idempotency_key = "record-pending-log".into();
+        request.request_id = "operation-pending-log".into();
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            crash_next_admission(CrashPoint::AfterReceipt);
+            assert!(
+                ActionInstanceAdmission::new(&db, None)
+                    .admit(request, "alice", 10)
+                    .is_err()
+            );
+            let committed = db.get_object("rec-pending").unwrap().unwrap();
+            let mut pending = committed.clone();
+            pending
+                .properties
+                .insert("pending".into(), "uncommitted".into());
+            pending.updated += 1;
+            db.update_object(&pending).unwrap();
+
+            assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 1);
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 0);
+            crate::sekai::object_log::release_process_object_log_cache();
+            let store = mikura::Store::open(&log).unwrap();
+            let record = store
+                .load(
+                    "acme",
+                    "customer_record",
+                    "rec-pending",
+                    &mikura::PropertyAcl::allow_all(),
+                )
+                .unwrap();
+            assert_eq!(record.props, committed.properties);
+        });
+    }
+
+    #[test]
+    fn the_sweep_readies_an_intent_an_older_binary_receipted() {
+        // Autoreview on #2289: an older binary recorded the receipt of this
+        // binary's write without readying its intent; no replay follows.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        let db = setup();
+        ensure_record_kind(&db);
+        db.put_governed_action_type(record_type("create"), "operator", 1)
+            .unwrap();
+        let mut request = record_request(
+            "customer.record.create",
+            r#"{"object_id":"rec-legacy-receipt","name":"Committed"}"#,
+        );
+        request.idempotency_key = "record-legacy-receipt".into();
+        request.request_id = "operation-legacy-receipt".into();
+        crate::sekai::object_log::with_test_log_path(&log, || {
+            crash_next_admission(CrashPoint::AfterReceipt);
+            assert!(
+                ActionInstanceAdmission::new(&db, None)
+                    .admit(request, "alice", 10)
+                    .is_err()
+            );
+            let RuntimeDb::Sqlite(sqlite) = &db else {
+                unreachable!()
+            };
+            sqlite
+                .conn()
+                .execute("UPDATE sekai_object_log_ingest_intents SET ready = 0", [])
+                .unwrap();
+            assert_eq!(db.count_object_log_ingest_intents().unwrap(), 0);
+            assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 1);
+            let committed = db.get_object("rec-legacy-receipt").unwrap().unwrap();
+            assert!(crate::sekai::object_log::configured_log_shows(&committed).unwrap());
         });
     }
 
@@ -5999,7 +6137,6 @@ mod tests {
             )
             .unwrap();
         let one_grant = change_count(&sequential, "rec-22") - unchanged;
-
         let db = std::sync::Arc::new(setup());
         let parked = parked_update(&db, "rec-22");
         let before = change_count(&db, "rec-22");

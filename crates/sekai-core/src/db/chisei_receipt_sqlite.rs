@@ -11,6 +11,16 @@ use sekai_domain::receipt::{
 
 impl SekaiDb {
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        self.put_operation_receipt_ingesting(receipt, None)
+    }
+
+    /// [`Self::put_operation_receipt`] that also makes instance `ingest`'s
+    /// object-log intent ready, in the same transaction (#2289).
+    pub fn put_operation_receipt_ingesting(
+        &self,
+        receipt: &OperationReceipt,
+        ingest: Option<&str>,
+    ) -> Result<(), String> {
         let _span = tracing::info_span!(
             "stage",
             stage = crate::obs::correlation::Stage::Persistence.as_str(),
@@ -22,6 +32,9 @@ impl SekaiDb {
             .map_err(|error| error.to_string())?;
         upsert_operation_receipt(&tx, receipt)?;
         crate::db::receipt_chain::append_operation_receipt_chain(&tx, receipt)?;
+        if let Some(instance_id) = ingest {
+            crate::db::object_log_ingest::sqlite_mark_ready(&tx, instance_id)?;
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -59,6 +72,20 @@ impl SekaiDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
         check: crate::sekai::action_instance::CommitCheck,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        self.put_admission_receipt_checked_ingesting(instance_id, lease, receipt, check, false)
+    }
+
+    /// [`Self::put_admission_receipt_checked`] whose receipt, with `ingest`,
+    /// also makes the intent to ingest the admitted object into the object
+    /// log ready (#2289).
+    pub fn put_admission_receipt_checked_ingesting(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check: crate::sekai::action_instance::CommitCheck,
+        ingest: bool,
     ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
         use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.conn();
@@ -100,6 +127,9 @@ impl SekaiDb {
             rusqlite::params![instance_id],
         )
         .map_err(|error| error.to_string())?;
+        if ingest {
+            crate::db::object_log_ingest::sqlite_mark_ready(&tx, instance_id)?;
+        }
         // The turn's lease runs on while the receipt is recorded (ADR 0142).
         if check != CommitCheck::None
             && crate::sekai::action_instance::sqlite_turn_fence_refusal(&tx, instance_id)?.is_some()
