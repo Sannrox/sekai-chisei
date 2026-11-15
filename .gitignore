@@ -17,6 +17,7 @@
 !.agents/skills/verify-change/
 !.agents/skills/technical-documentation/
 !.agents/skills/refactor-docs/
+!.agents/skills/ci-audit/
 .claude/*
 !.claude/skills
 data/*.db
