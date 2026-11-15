@@ -853,23 +853,46 @@ impl SekaiServiceImpl {
             crate::sekai::object_type_index::ObjectTypeIndexMember,
         > = std::collections::HashMap::new();
         for (hop_index, hop) in hops.iter().enumerate() {
+            let incoming = hop.is_incoming();
             let mut parent_keys = std::collections::HashSet::new();
             for path in &key_paths {
                 let parent = path.last().expect("path");
                 parent_keys.insert(parent.source_key.clone());
-                parent_keys.insert(parent.object_id.clone());
+                if !incoming {
+                    parent_keys.insert(parent.object_id.clone());
+                }
             }
             let parent_keys: Vec<String> = parent_keys.into_iter().collect();
-            let pairs = self
-                .db
-                .runtime()
-                .list_index_join_children(
+            // Edges `(parent key, child source key)`. Outgoing: far rows whose
+            // join property names the parent. Incoming: the parent's own join
+            // property names the far key (#2412).
+            let pairs = if incoming && hop_index == 0 {
+                // Roots are loaded with their join property and include
+                // members outside the index, which the join table lacks.
+                Ok(roots
+                    .iter()
+                    .filter_map(|root| {
+                        root.properties
+                            .get(&hop.join_property)
+                            .map(|value| (root.source_key.clone(), value.as_cell()))
+                    })
+                    .collect())
+            } else if incoming {
+                self.db.runtime().list_index_join_values(
+                    &bound.descriptor.namespace,
+                    &hops[hop_index - 1].far_kind,
+                    &hop.join_property,
+                    &parent_keys,
+                )
+            } else {
+                self.db.runtime().list_index_join_children(
                     &bound.descriptor.namespace,
                     &hop.far_kind,
                     &hop.join_property,
                     &parent_keys,
                 )
-                .map_err(Status::internal)?;
+            }
+            .map_err(Status::internal)?;
             let mut child_keys = std::collections::HashSet::new();
             for (_, source_key) in &pairs {
                 child_keys.insert(source_key.clone());
@@ -926,8 +949,12 @@ impl SekaiServiceImpl {
                     })
                     .collect()
             };
-            key_paths =
-                crate::sekai::object_index_engine::join_key_paths(key_paths, &pairs, &child_by_key);
+            let extend = if incoming {
+                crate::sekai::object_index_engine::join_key_paths_incoming
+            } else {
+                crate::sekai::object_index_engine::join_key_paths
+            };
+            key_paths = extend(key_paths, &pairs, &child_by_key);
             meter
                 .charge(key_paths.len() as i32)
                 .map_err(map_object_set_error)?;
@@ -999,8 +1026,13 @@ impl SekaiServiceImpl {
         let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
             Status::invalid_argument("object-set aggregation required for multi-hop evaluate")
         })?;
+        // An incoming first hop reads its join property on the root.
+        let root_hops = hops
+            .first()
+            .filter(|hop| hop.is_incoming())
+            .map_or(&[][..], std::slice::from_ref);
         let needed_root =
-            aggregate_plan_properties(&aggregation, &bound.descriptor.property_filters, &[]);
+            aggregate_plan_properties(&aggregation, &bound.descriptor.property_filters, root_hops);
         let needed_leaf = aggregate_plan_properties(&aggregation, &[], &[]);
         let needed_nested = aggregate_plan_properties(&aggregation, &[], hops);
         let read_properties = aggregate_read_properties(
@@ -1118,7 +1150,12 @@ impl SekaiServiceImpl {
             || dual_read
         {
             for (hop_index, hop) in hops.iter().enumerate() {
-                paths = crate::sekai::object_index_engine::join_paths_nested(
+                let join = if hop.is_incoming() {
+                    crate::sekai::object_index_engine::join_paths_nested_incoming
+                } else {
+                    crate::sekai::object_index_engine::join_paths_nested
+                };
+                paths = join(
                     paths,
                     &layers[hop_index + 1],
                     &hop.join_property,
@@ -1344,11 +1381,22 @@ fn aggregate_read_properties<'a>(
     if !aggregation.group_by.is_empty() {
         root.insert(aggregation.group_by.clone());
     }
+    let mut near_kind = root_kind;
     for hop in hops {
-        let properties = read.entry(hop.far_kind.as_str()).or_default();
+        read.entry(hop.far_kind.as_str()).or_default();
         if !hop.join_property.is_empty() {
-            properties.insert(hop.join_property.clone());
+            // The join property lives on the far kind for an outgoing hop and
+            // on the near kind for an incoming one.
+            let owner = if hop.is_incoming() {
+                near_kind
+            } else {
+                hop.far_kind.as_str()
+            };
+            read.entry(owner)
+                .or_default()
+                .insert(hop.join_property.clone());
         }
+        near_kind = hop.far_kind.as_str();
     }
     if !aggregation.function.eq_ignore_ascii_case("count") && !aggregation.property.is_empty() {
         let leaf_kind = hops.last().map_or(root_kind, |hop| hop.far_kind.as_str());
@@ -4090,6 +4138,160 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(off.aggregates, page.aggregates);
+    }
+
+    #[tokio::test]
+    async fn indexed_hops_honour_direction() {
+        exercise_indexed_hop_direction(service()).await;
+    }
+
+    /// #2412 on PostgreSQL: the indexed hop path takes the same direction.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_indexed_hops_honour_direction() {
+        let scratch = crate::db::ScratchDatabase::create();
+        let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_indexed_hop_direction(SekaiServiceImpl::new(
+                crate::db::store::SekaiStore::from_shared_runtime(db.clone()),
+            )));
+        drop(db);
+    }
+
+    /// Incoming hops follow the near row's join property to the far key,
+    /// alone and mixed with outgoing hops (#2412). Both SQL engines and the
+    /// object log answer every request: either dual-read fails it on any
+    /// disagreement.
+    async fn exercise_indexed_hop_direction(mut svc: SekaiServiceImpl) {
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        seed_mikura_customer_order_shipment(&log, "eu");
+        svc.object_index_dual_read = true;
+        svc.object_log_dual_read = crate::sekai::object_log::ObjectLogDualRead {
+            enabled: true,
+            log_path: Some(log),
+            sample_n: 1,
+        };
+        let hop = |relation: &str, direction: &str, far_kind: &str, join_property: &str| {
+            ObjectSetTraversal {
+                relation: relation.into(),
+                direction: direction.into(),
+                far_kind: far_kind.into(),
+                join_property: join_property.into(),
+            }
+        };
+        let evaluate = |root: &str, group_by: &str, hops: Vec<ObjectSetTraversal>| {
+            with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: root.into(),
+                        definition_digest: digest.clone(),
+                        hops,
+                        aggregation: Some(ObjectSetAggregation {
+                            function: "count".into(),
+                            group_by: group_by.into(),
+                            ..Default::default()
+                        }),
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            )
+        };
+        let groups = |page: &EvaluateObjectSetResponse| -> Vec<(String, i64)> {
+            page.aggregates
+                .iter()
+                .map(|group| (group.group_key.clone(), group.count))
+                .collect()
+        };
+        for (root, group_by, hops, expected) in [
+            // Each order reaches the customer its `customer_id` names.
+            (
+                "Order",
+                "customer_id",
+                vec![hop("placed", "incoming", "Customer", "customer_id")],
+                vec![("c1", 1)],
+            ),
+            // Two incoming hops; the hidden shipment stays out.
+            (
+                "Shipment",
+                "amount",
+                vec![
+                    hop("ships", "incoming", "Order", "order_id"),
+                    hop("placed", "incoming", "Customer", "customer_id"),
+                ],
+                vec![("10", 1)],
+            ),
+            // Incoming then outgoing: back to the customer's orders.
+            (
+                "Order",
+                "customer_id",
+                vec![
+                    hop("placed", "incoming", "Customer", "customer_id"),
+                    hop("placed", "outgoing", "Order", "customer_id"),
+                ],
+                vec![("c1", 1)],
+            ),
+            // A customer has no `customer_id` of its own, so an incoming hop
+            // reaches nothing; read as outgoing it would reach order o1.
+            (
+                "Customer",
+                "region",
+                vec![hop("placed", "incoming", "Order", "customer_id")],
+                vec![],
+            ),
+        ] {
+            let page = svc
+                .evaluate_object_set(evaluate(root, group_by, hops))
+                .await
+                .unwrap_or_else(|status| panic!("{root}: {status}"))
+                .into_inner();
+            let expected: Vec<(String, i64)> = expected
+                .into_iter()
+                .map(|(key, count)| (key.to_string(), count))
+                .collect();
+            assert_eq!(groups(&page), expected, "{root}");
+        }
+
+        // A root outside the index follows its own join property too. The
+        // log holds only indexed rows, so only the SQL engines compare here.
+        svc.object_log_dual_read.enabled = false;
+        svc.db
+            .runtime()
+            .create_object(&object(
+                "o-clerk",
+                "Order",
+                "Clerk order",
+                &[("customer_id", "c1")],
+                30,
+            ))
+            .unwrap();
+        let page = svc
+            .evaluate_object_set(evaluate(
+                "Order",
+                "customer_id",
+                vec![hop("placed", "incoming", "Customer", "customer_id")],
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(groups(&page), vec![("c1".to_string(), 2)]);
     }
 
     #[tokio::test]

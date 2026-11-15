@@ -78,8 +78,7 @@ the SQL answer and skips the canary:
   filters;
 - multi-key sort and distinct;
 - path multiplicity, a non-i64 measure, and a measure whose exact sum
-  overflows i64;
-- incoming hops, until the indexed SQL path honours hop direction (#2412).
+  overflows i64.
 
 Each sampled request increments `sekai_object_log_dual_read_total` with
 `outcome` `compared`, `skipped`, `mismatch`, or `error`. A skip carries the
@@ -102,7 +101,9 @@ A failing quality rule quarantines the batch and leaves the previous
 output queryable.
 
 `sekai.object-set/v2` can group count/sum/min/max/avg/distinct across bounded
-index hops (`join_property`). Cost limits (`max_rows_scanned`, `max_depth`,
+index hops (`join_property`). An `outgoing` hop reaches far rows whose
+`join_property` holds the near row's key or object id; an `incoming` hop
+follows the near row's `join_property` to the far row with that key. Cost limits (`max_rows_scanned`, `max_depth`,
 `max_time_ms`) fail closed with the limit named. `SEKAI_OBJECT_INDEX_ENGINE`
 selects `hop-projection` (default) or `nested-loop`. Hop-projection is a
 rebuildable join-key projection, not object authority. Evaluate walks those

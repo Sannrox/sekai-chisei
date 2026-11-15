@@ -164,3 +164,10 @@ Combined now depends on the published `v0.5.0` tag of `mikura`,
 with neither `SEKAI_OBJECT_LOG` nor `SEKAI_OBJECT_LOG_HOST`, they open
 `<SEKAI_DATA_DIR>/objects.mikura`. A deployment that ran without a log is
 backfilled once from recorded objects and admitted Action receipts.
+
+## Amendment: compare incoming hops (#2412)
+
+The indexed SQL hop path now honours `direction`: an `incoming` hop follows
+the near row's join property to the far row with that key. The canary maps
+such a hop to `incoming: true` and compares it; outgoing hops keep
+`incoming: false`.

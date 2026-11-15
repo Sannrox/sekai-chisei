@@ -60,6 +60,15 @@ pub struct ObjectSetTraversal {
     pub join_property: String,
 }
 
+impl ObjectSetTraversal {
+    /// An incoming hop follows the near row's `join_property` to the far row
+    /// with that key. An outgoing (or unset) hop takes far rows whose
+    /// `join_property` names the near row.
+    pub fn is_incoming(&self) -> bool {
+        self.direction.trim() == "incoming"
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectSetAggregation {
     pub function: String,

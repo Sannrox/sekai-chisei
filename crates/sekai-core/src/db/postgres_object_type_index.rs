@@ -1131,6 +1131,29 @@ impl PostgresDb {
             .collect()
     }
 
+    /// See the SQLite store (#2412).
+    pub fn list_index_join_values(
+        &self,
+        namespace: &str,
+        kind: &str,
+        property: &str,
+        source_keys: &[String],
+    ) -> Result<Vec<(String, String)>, String> {
+        if source_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.connection()?
+            .query(
+                "SELECT source_key, value FROM sekai_object_type_index_join
+                 WHERE namespace=$1 AND kind=$2 AND property=$3 AND source_key = ANY($4)",
+                &[&namespace, &kind, &property, &source_keys],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| Ok((row.get(0), row.get(1))))
+            .collect()
+    }
+
     pub fn list_index_members_by_keys(
         &self,
         namespace: &str,

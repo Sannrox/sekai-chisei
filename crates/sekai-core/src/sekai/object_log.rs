@@ -426,16 +426,6 @@ pub fn map_evaluate_request(
         .last()
         .map(|hop| hop.far_kind.clone())
         .unwrap_or_else(|| descriptor.kind.clone());
-    for hop in hops {
-        let direction = hop.direction.trim();
-        if !direction.is_empty() && !direction.eq_ignore_ascii_case("outgoing") {
-            // The indexed SQL hop path ignores direction (#2412), so it is no
-            // reference for an incoming hop yet.
-            return Err(ObjectLogCompareError::Unsupported(
-                "incoming hops are skipped until the indexed SQL path honours direction",
-            ));
-        }
-    }
     // SQL groups by root property; the log's breakdown does the same. Count
     // and sum without grouping keep the plain top-level response.
     let breakdown = (uses_breakdown || !group_by.is_empty()).then(|| Breakdown {
@@ -451,8 +441,9 @@ pub fn map_evaluate_request(
             .map(|hop| Hop {
                 far_kind: hop.far_kind.clone(),
                 join_property: hop.join_property.clone(),
-                // v0.1 joined far rows whose join property names the frontier
-                // key; `incoming: false` keeps that direction.
+                // Both stores follow an incoming hop from the frontier's join
+                // property to the far key (#2412).
+                incoming: hop.is_incoming(),
                 ..Hop::default()
             })
             .collect(),
@@ -2976,46 +2967,30 @@ mod tests {
     }
 
     #[test]
-    fn incoming_hop_fails_closed_instead_of_outbound() {
+    fn an_incoming_hop_maps_to_an_incoming_log_hop() {
         let descriptor = ObjectSetDescriptor {
             namespace: "sales".into(),
             kind: "Customer".into(),
             ..ObjectSetDescriptor::default()
         };
-        let err = map_evaluate_request(
-            &descriptor,
-            &[crate::sekai::object_set::ObjectSetTraversal {
-                far_kind: "Order".into(),
-                join_property: "customer_id".into(),
-                direction: "incoming".into(),
-                ..Default::default()
-            }],
-            &ObjectSetAggregation {
-                function: "count".into(),
-                ..Default::default()
-            },
-            PropertyAcl::allow_all(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, ObjectLogCompareError::Unsupported(reason) if reason.contains("direction"))
-        );
-
-        map_evaluate_request(
-            &descriptor,
-            &[crate::sekai::object_set::ObjectSetTraversal {
-                far_kind: "Order".into(),
-                join_property: "customer_id".into(),
-                direction: "outgoing".into(),
-                ..Default::default()
-            }],
-            &ObjectSetAggregation {
-                function: "count".into(),
-                ..Default::default()
-            },
-            PropertyAcl::allow_all(),
-        )
-        .unwrap();
+        for (direction, incoming) in [("incoming", true), ("outgoing", false), ("", false)] {
+            let request = map_evaluate_request(
+                &descriptor,
+                &[crate::sekai::object_set::ObjectSetTraversal {
+                    far_kind: "Order".into(),
+                    join_property: "customer_id".into(),
+                    direction: direction.into(),
+                    ..Default::default()
+                }],
+                &ObjectSetAggregation {
+                    function: "count".into(),
+                    ..Default::default()
+                },
+                PropertyAcl::allow_all(),
+            )
+            .unwrap();
+            assert_eq!(request.hops[0].incoming, incoming, "{direction:?}");
+        }
     }
 
     #[test]
