@@ -577,7 +577,9 @@ impl SekaiDb {
                     'site_agent.memory.forget'
                 );",
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        conn.execute_batch(crate::db::object_log_ingest::SQLITE_SCHEMA)
+            .map_err(|e| e.to_string())
     }
 
     /// Empty leftover `content` on writer Actions (and decision memory) for
@@ -954,6 +956,27 @@ impl SekaiDb {
             ),
             None => None,
         };
+        if let Some(object) = written {
+            // The object-log ingest intent the grant's receipt makes ready
+            // (#2289), with the state as persisted.
+            let persisted = tx
+                .query_row(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id = ?1",
+                    params![object.id],
+                    crate::db::sekai::row_to_object,
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(persisted) = persisted.as_ref() {
+                crate::db::object_log_ingest::sqlite_record_written(
+                    &tx,
+                    &stored.instance_id,
+                    persisted,
+                    crate::db::object_log_ingest::Writer::Grant,
+                )?;
+            }
+        }
         sqlite_redact_if_forgotten_writer(&tx, &mut stored)?;
         if sqlite_stored_writer_already_redacted(Some(&existing_params), &stored) {
             crate::sekai::site_agent_memory::redact_writer_instance(&mut stored)?;
@@ -1134,6 +1157,14 @@ impl SekaiDb {
             .optional()
             .map_err(|error| error.to_string())?;
         let written = object_state_digest(persisted.as_ref())?;
+        if let Some(object) = persisted.as_ref() {
+            crate::db::object_log_ingest::sqlite_record_written(
+                &tx,
+                instance_id,
+                object,
+                crate::db::object_log_ingest::Writer::Admission,
+            )?;
+        }
         // The turn's lease runs on while the write is made; check it again
         // before the marker that would exempt this write from it.
         if sqlite_turn_fence_refusal(&tx, instance_id)?.is_some() {

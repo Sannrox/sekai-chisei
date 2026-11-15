@@ -25,7 +25,7 @@ pub mod obs {
     pub mod metrics {
         pub use sekai_obs::metrics::{
             db_lock_poisoned_total, record_db_lock_poisoned, search_index_lag_ms,
-            set_embedding_index_lag_ms, set_search_index_lag_ms,
+            set_embedding_index_lag_ms, set_object_log_ingest_backlog, set_search_index_lag_ms,
         };
 
         pub fn handle() -> &'static sekai_obs::metrics::PrometheusHandle {

@@ -379,12 +379,33 @@ impl RuntimeDb {
         receipt: &OperationReceipt,
         check: crate::sekai::action_instance::CommitCheck,
     ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        self.put_admission_receipt_checked_ingesting(instance_id, lease, receipt, check, false)
+    }
+
+    pub fn put_admission_receipt_checked_ingesting(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check: crate::sekai::action_instance::CommitCheck,
+        ingest: bool,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
         match self {
-            Self::Sqlite(db) => {
-                db.put_admission_receipt_checked(instance_id, lease, receipt, check)
-            }
+            Self::Sqlite(db) => db.put_admission_receipt_checked_ingesting(
+                instance_id,
+                lease,
+                receipt,
+                check,
+                ingest,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.put_admission_receipt_checked(instance_id, lease, receipt, check)
+                db.put_admission_receipt_checked_ingesting(
+                    instance_id,
+                    lease,
+                    receipt,
+                    check,
+                    ingest,
+                )
             }),
         }
     }

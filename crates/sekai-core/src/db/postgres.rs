@@ -225,6 +225,8 @@ const OBJECT_TYPE_INDEX_PROPERTY_EDITS_SCHEMA: &str =
     include_str!("postgres/0156_object_type_index_property_edits.sql");
 const SOURCE_BATCH_DATASET_SCHEMA: &str = include_str!("postgres/0157_source_batch_dataset.sql");
 const TRANSFORM_CHAINS_SCHEMA: &str = include_str!("postgres/0158_transform_chains.sql");
+const OBJECT_LOG_INGEST_INTENTS_SCHEMA: &str =
+    include_str!("postgres/0159_object_log_ingest_intents.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1137,6 +1139,12 @@ const MIGRATIONS: &[Migration] = &[
         157,
         "transform_chains",
         TRANSFORM_CHAINS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        158,
+        "object_log_ingest_intents",
+        OBJECT_LOG_INGEST_INTENTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

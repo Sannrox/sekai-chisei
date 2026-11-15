@@ -321,6 +321,14 @@ impl PostgresDb {
             .map(row_to_object)
             .transpose()?;
         let written = object_state_digest(persisted.as_ref())?;
+        if let Some(object) = persisted.as_ref() {
+            crate::db::object_log_ingest::postgres_record_written(
+                &mut tx,
+                instance_id,
+                object,
+                crate::db::object_log_ingest::Writer::Admission,
+            )?;
+        }
         // Object locks taken above may have blocked past the turn's lease;
         // check it again before the marker that would exempt this write from
         // it. The turn row is then share-locked to commit (ADR 0142).
@@ -734,6 +742,28 @@ impl PostgresDb {
             ),
             None => None,
         };
+        if let Some(object) = write.map(|write| match write {
+            ParkedGrantWrite::Create(object) | ParkedGrantWrite::Update(object) => object,
+        }) {
+            // See the SQLite store (#2289).
+            let persisted = transaction
+                .query_opt(
+                    "SELECT id, kind, name, namespace, external_id, properties, created, updated
+                     FROM sekai_objects WHERE id = $1",
+                    &[&object.id],
+                )
+                .map_err(|error| error.to_string())?
+                .map(row_to_object)
+                .transpose()?;
+            if let Some(persisted) = persisted.as_ref() {
+                crate::db::object_log_ingest::postgres_record_written(
+                    &mut transaction,
+                    &stored.instance_id,
+                    persisted,
+                    crate::db::object_log_ingest::Writer::Grant,
+                )?;
+            }
+        }
         postgres_redact_if_forgotten_writer(&mut transaction, &mut stored)?;
         if crate::sekai::site_agent_memory::stored_writer_already_redacted(
             Some(&existing_params),

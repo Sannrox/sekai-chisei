@@ -48,9 +48,28 @@ counts.
    Action receipts and the object-log.
 3. **Action apply does not write the SQL index.** `SubmitActionInstance`
    records the clerk receipt, then ingests the admitted object into the
-   configured log. A denied or unadmitted Action does not append. Catch-up
-   after a post-receipt ingest failure stays best-effort (ADR 0081 amendment
-   #1116).
+   configured log. A denied or unadmitted Action does not append. Amended
+   by #2289: the transaction that writes the object records an ingest
+   intent with a snapshot of the write and its order among the object's
+   writes, and the receipt's transaction makes it ready, so a crash or log
+   failure after the receipt cannot lose the ingest and a write without a
+   receipt never reaches the log. The admitting request, a replay, or any
+   replica's sweep drains the intent. A drain appends the snapshot, merged
+   with the identity's overlay as source ingest would, under an Action id
+   that names the write, fenced on the identity's log generation; a
+   write no newer than the one the log holds appends nothing, so the log
+   never goes back to an older write. A record an older replica appended
+   names no write; a drain replaces it only while its snapshot's content
+   is the committed content, and otherwise keeps the intent for a retry.
+   The host has no fenced write that carries an overlay conflict audit, so
+   on the host such a merge keeps its intent in the backlog. A completed
+   drain raises the object's watermark with the intent's deletion, so a
+   write at or below it retires even after an overlay rematerialized the
+   record. The sweep readies an intent whose receipt an older binary
+   recorded, from the receipt's durable marker.
+   The admission never waits on the
+   log, and `sekai_object_log_ingest_backlog` reports the ready intents not
+   yet drained.
 4. **`EvaluateObjectSet` keeps the SQL projection as its serving index.**
    The page already reports `authority=false`. Dual-read remains the canary
    against the object-log. The clerk does not answer namespace-scoped

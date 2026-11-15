@@ -1890,6 +1890,7 @@ fn spawn_service_background_tasks(
         spawn_export_sweeper(db.clone());
         spawn_consumer_violation_sweeper(db.clone());
         spawn_criticality_outbox_sweeper(db.clone());
+        spawn_object_log_ingest_sweeper(db.clone());
         spawn_retention_tick(db.clone(), stores.clone());
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
@@ -2139,6 +2140,29 @@ fn spawn_criticality_outbox_sweeper(db: Arc<RuntimeDb>) {
                 Ok(Ok(_)) => {}
                 Ok(Err(error)) => tracing::error!(%error, "criticality outbox sweep failed"),
                 Err(error) => tracing::error!(%error, "criticality outbox sweep task failed"),
+            }
+        }
+    });
+}
+
+/// Every ten seconds, ingest admitted objects whose receipt recorded an
+/// object-log ingest intent that no drain completed yet, and report the
+/// backlog (#2289). Safe on every instance at once: each intent is claimed
+/// under a lease before its ingest.
+fn spawn_object_log_ingest_sweeper(db: Arc<RuntimeDb>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let result =
+                tokio::task::spawn_blocking(move || crate::sekai::object_log_ingest::sweep(&db))
+                    .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::error!(%error, "object-log ingest sweep failed"),
+                Err(error) => tracing::error!(%error, "object-log ingest sweep task failed"),
             }
         }
     });

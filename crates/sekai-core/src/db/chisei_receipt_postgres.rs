@@ -11,10 +11,22 @@ use sekai_domain::receipt::{
 
 impl PostgresDb {
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
+        self.put_operation_receipt_ingesting(receipt, None)
+    }
+
+    /// See the SQLite store (#2289).
+    pub fn put_operation_receipt_ingesting(
+        &self,
+        receipt: &OperationReceipt,
+        ingest: Option<&str>,
+    ) -> Result<(), String> {
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         self.upsert_operation_receipt_on(&mut tx, receipt)?;
         crate::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, receipt)?;
+        if let Some(instance_id) = ingest {
+            crate::db::object_log_ingest::postgres_mark_ready(&mut tx, instance_id)?;
+        }
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -48,6 +60,18 @@ impl PostgresDb {
         lease: &crate::sekai::action_instance::AdmissionLease,
         receipt: &OperationReceipt,
         check: crate::sekai::action_instance::CommitCheck,
+    ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
+        self.put_admission_receipt_checked_ingesting(instance_id, lease, receipt, check, false)
+    }
+
+    /// See the SQLite store (#2289).
+    pub fn put_admission_receipt_checked_ingesting(
+        &self,
+        instance_id: &str,
+        lease: &crate::sekai::action_instance::AdmissionLease,
+        receipt: &OperationReceipt,
+        check: crate::sekai::action_instance::CommitCheck,
+        ingest: bool,
     ) -> Result<crate::sekai::action_instance::FencedAdmissionWrite<()>, String> {
         use crate::sekai::action_instance::FencedAdmissionWrite;
         let mut conn = self.connection()?;
@@ -108,6 +132,9 @@ impl PostgresDb {
             &[&instance_id],
         )
         .map_err(|error| error.to_string())?;
+        if ingest {
+            crate::db::object_log_ingest::postgres_mark_ready(&mut tx, instance_id)?;
+        }
         // The receipt chain may have waited on its own lock; check the lease
         // again before committing.
         if !crate::db::postgres_action_instance::postgres_admission_fence_holds(

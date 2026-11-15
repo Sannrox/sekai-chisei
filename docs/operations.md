@@ -77,6 +77,10 @@ curl --fail http://127.0.0.1:9464/metrics
 - `/metrics` exports Prometheus metrics. On a process serving Sekai, each
   scrape also reads the transform work queue gauges from the store; see
   [governed-transforms.md](governed-transforms.md).
+  `sekai_object_log_ingest_backlog` counts admitted objects whose object-log
+  ingest has not completed yet; every Sekai replica drains it about every ten
+  seconds. A backlog that keeps growing means the object log is unreachable
+  or refusing records; the error log names each failed operation.
 - `/console/*` is the authenticated operator shell (principal Bearer login,
   HttpOnly session cookie, namespace context). It always fails closed without a
   valid session. After failover onto a replica that did not mint the cookie,

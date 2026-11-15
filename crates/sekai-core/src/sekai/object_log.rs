@@ -788,24 +788,241 @@ fn compare_sql_to_log_with_cache(
 /// (`SEKAI_OBJECT_LOG_HOST`, ADR 0088) owns the log instead: admits go
 /// through it, and it is exclusive with a local log.
 pub fn ensure_admitted_object_in_configured_log(object: &Object) -> Result<Option<u64>, String> {
-    let host = configured_log_host()?;
-    let path = configured_log_path();
-    let path = match (host, path) {
-        (Some(_), Some(_)) => {
-            return Err(format!(
-                "{LOG_PATH_ENV} and {} are mutually exclusive",
-                crate::sekai::object_log_host::HOST_ENV
-            ));
-        }
-        (Some(host), None) => return host.admit(object_record(object)).map(Some),
-        (None, None) => return Ok(None),
-        (None, Some(path)) => path,
+    match configured_log()? {
+        ConfiguredLog::Unconfigured => Ok(None),
+        ConfiguredLog::Host(host) => host.admit(object_record(object)).map(Some),
+        ConfiguredLog::Path(path) => ensure_admitted_object_in_log(&path, object).map(Some),
+    }
+}
+
+/// The object log this process writes, from `SEKAI_OBJECT_LOG_HOST` or
+/// `SEKAI_OBJECT_LOG`; both at once is a configuration error.
+enum ConfiguredLog {
+    Unconfigured,
+    Host(crate::sekai::object_log_host::ObjectLogHost),
+    Path(PathBuf),
+}
+
+fn configured_log() -> Result<ConfiguredLog, String> {
+    match (configured_log_host()?, configured_log_path()) {
+        (Some(_), Some(_)) => Err(format!(
+            "{LOG_PATH_ENV} and {} are mutually exclusive",
+            crate::sekai::object_log_host::HOST_ENV
+        )),
+        (Some(host), None) => Ok(ConfiguredLog::Host(host)),
+        (None, Some(path)) => Ok(ConfiguredLog::Path(path)),
+        (None, None) => Ok(ConfiguredLog::Unconfigured),
+    }
+}
+
+/// Action id prefix of an ingest-intent append, followed by the intent's
+/// `seq` and the generation it was appended over.
+const INGEST_ACTION_PREFIX: &str = "sekai.object-log-ingest:";
+
+/// The Action id that appends ingest intent `seq` over `generation`
+/// (#2289). It names the write, so the record says which write it holds,
+/// and it is new on every generation, so a retry after another writer
+/// replaced the record appends instead of replaying the committed id.
+fn ingest_action_id(seq: i64, generation: u64) -> String {
+    format!("{INGEST_ACTION_PREFIX}{seq}:{generation}")
+}
+
+/// The ingest intent `seq` an [`ingest_action_id`] names.
+fn ingested_seq(action_id: &str) -> Option<i64> {
+    action_id
+        .strip_prefix(INGEST_ACTION_PREFIX)?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// One identity as a drain read it from the configured log (#2289). A
+/// fenced append succeeds only while the identity is still at this
+/// generation, so an append the drain did not see refuses it.
+pub struct LogFence {
+    /// The identity's generation, hidden or not; 0 when the log lacks it.
+    generation: u64,
+    /// Whether the identity is hidden; a hidden one merges no overlay.
+    hidden: bool,
+    /// The `seq` of the ingest intent the record was appended for; `None`
+    /// when the log lacks the identity or another writer appended it.
+    pub ingested_seq: Option<i64>,
+}
+
+impl LogFence {
+    /// Whether the log holds a record no ingest intent appended: an older
+    /// replica's during a rolling deploy, or one an index edit's overlay
+    /// rematerialized under its own Action id. It carries no write order,
+    /// so `seq` cannot say whether a snapshot is newer.
+    pub fn holds_unordered_record(&self) -> bool {
+        self.generation > 0 && self.ingested_seq.is_none()
+    }
+}
+
+/// Reads `object`'s identity from the configured log; `None` when no log
+/// is configured.
+pub fn configured_log_fence(object: &Object) -> Result<Option<LogFence>, String> {
+    let record = match configured_log()? {
+        ConfiguredLog::Unconfigured => return Ok(None),
+        ConfiguredLog::Host(host) => host.load(&object.namespace, &object.kind, &object.id)?,
+        ConfiguredLog::Path(path) if !path.exists() => None,
+        ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+            Ok(live_record(
+                store,
+                &object.namespace,
+                &object.kind,
+                &object.id,
+            ))
+        })?,
     };
+    Ok(Some(LogFence {
+        generation: record.as_ref().map_or(0, |record| record.r#gen),
+        hidden: record.as_ref().is_some_and(|record| record.hidden),
+        ingested_seq: record
+            .and_then(|record| record.action_id)
+            .and_then(|id| ingested_seq(&id)),
+    }))
+}
+
+/// Whether the configured log shows `object`'s identity, visible, at its
+/// current properties. `true` with no log configured.
+pub fn configured_log_shows(object: &Object) -> Result<bool, String> {
+    let record = match configured_log()? {
+        ConfiguredLog::Unconfigured => return Ok(true),
+        ConfiguredLog::Host(host) => host.load(&object.namespace, &object.kind, &object.id)?,
+        ConfiguredLog::Path(path) if !path.exists() => None,
+        ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+            Ok(live_record(
+                store,
+                &object.namespace,
+                &object.kind,
+                &object.id,
+            ))
+        })?,
+    };
+    Ok(record.is_some_and(|record| !record.hidden && record.props == object.properties))
+}
+
+/// Kind of the hidden record that opens a namespace on the log, so the
+/// fenced append of a namespace's first object never needs an unfenced one.
+const NAMESPACE_MARKER_KIND: &str = "sekai.namespace";
+
+fn namespace_marker(namespace: &str) -> ObjectRecord {
+    ObjectRecord {
+        r#gen: 0,
+        namespace: namespace.to_string(),
+        kind: NAMESPACE_MARKER_KIND.to_string(),
+        key: "opened".to_string(),
+        hidden: true,
+        action_id: None,
+        props: HashMap::new(),
+        schema_version: 1,
+    }
+}
+
+/// `Some(applied)` for a committed or stale append, `None` when the log
+/// has not opened the namespace yet.
+fn fenced_outcome(result: Result<(), String>) -> Result<Option<bool>, String> {
+    match result {
+        Ok(()) => Ok(Some(true)),
+        Err(error) if error.contains("stale generation") => Ok(Some(false)),
+        Err(error) if error.contains("unknown namespace") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// `props` as the host's source ingest would store them: merged with the
+/// identity's visible overlay under its schema's conflict plan. The host's
+/// only fenced write is an Action, a whole-record replace, so the drain
+/// merges first. An overlay change rematerializes the identity, so the
+/// fence refuses an append merged with an overlay that changed since. A
+/// merge whose plan logs a conflict audit fails closed: no fenced host
+/// write can carry that row, and an unfenced one could overwrite a newer
+/// write. Its intent stays in the backlog.
+fn merged_with_overlay(
+    object: &Object,
+    fence: &LogFence,
+    props: HashMap<String, String>,
+    visible: impl Fn(&str, &str) -> Result<Option<ObjectRecord>, String>,
+) -> Result<HashMap<String, String>, String> {
+    if fence.hidden {
+        return Ok(props);
+    }
+    let Some(overlay) = visible(
+        mikura::OVERLAY_KIND,
+        &OverlayPatch::identity_key(&object.kind, &object.id),
+    )?
+    else {
+        return Ok(props);
+    };
+    let plan = visible(mikura::SCHEMA_KIND, &object.kind)?
+        .map(|record| mikura::SchemaDescriptor::from_record(&record))
+        .transpose()?
+        .map(|schema| schema.conflict_plan());
+    match OverlayPatch::from_record(&overlay)?.apply_with(props, plan.as_ref())? {
+        (merged, None) => Ok(merged),
+        (_, Some(_)) => Err(format!(
+            "object-log host has no fenced write for the overlay conflict audit of {}/{}; \
+             its ingest stays in the backlog",
+            object.kind, object.id
+        )),
+    }
+}
+
+/// Appends `object` for ingest intent `seq`, merged with its overlay, while
+/// its identity is still at `fence`'s generation (#2289). `Ok(false)` when
+/// another write moved the identity since the fence was read; a repeat
+/// over the same fence appends nothing. On the host, a namespace it has
+/// never seen is opened with a hidden marker record, then the fenced
+/// append runs.
+pub fn apply_fenced_to_configured_log(
+    seq: i64,
+    object: &Object,
+    fence: &LogFence,
+) -> Result<bool, String> {
     #[cfg(test)]
     if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
         return Err("injected object-log ingest failure".into());
     }
-    ensure_admitted_object_in_log(&path, object).map(Some)
+    let action_id = ingest_action_id(seq, fence.generation);
+    let unopened = || format!("object log did not open namespace {}", object.namespace);
+    let namespace = object.namespace.as_str();
+    match configured_log()? {
+        ConfiguredLog::Unconfigured => Ok(true),
+        ConfiguredLog::Host(host) => {
+            let mut record = object_record(object);
+            record.props = merged_with_overlay(object, fence, record.props, |kind, key| {
+                Ok(host
+                    .load(namespace, kind, key)?
+                    .filter(|record| !record.hidden))
+            })?;
+            let apply = || host.apply_action(&action_id, &record, fence.generation);
+            if let Some(applied) = fenced_outcome(apply())? {
+                return Ok(applied);
+            }
+            host.ingest_batch(&[namespace_marker(namespace)])?;
+            fenced_outcome(apply())?.ok_or_else(unopened)
+        }
+        // This process holds the local log's single-writer lock and reaches
+        // the store only under its mutex, so nothing lands between the
+        // generation check and the batch: a source ingest under the fence,
+        // which merges the overlay and writes its conflict audit with it.
+        ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+            let live = live_record(store, namespace, &object.kind, &object.id);
+            if live.map_or(0, |record| record.r#gen) != fence.generation {
+                return Ok(false);
+            }
+            run_batch(
+                store,
+                vec![ObjectRecord {
+                    action_id: Some(action_id),
+                    ..object_record(object)
+                }],
+            )?;
+            Ok(true)
+        }),
+    }
 }
 
 fn configured_log_host() -> Result<Option<crate::sekai::object_log_host::ObjectLogHost>, String> {
@@ -3850,5 +4067,147 @@ mod tests {
         )
         .unwrap_err();
         assert!(unknown.contains("unknown"), "{unknown}");
+    }
+
+    /// #2289: a drain's append is fenced on the generation it read, names
+    /// the ingest intent it holds, and keeps the identity's overlay. Runs
+    /// against a local log and a real host.
+    fn fenced_append_contract() {
+        let fence = |object: &Object| configured_log_fence(object).unwrap().unwrap();
+        let logged = |object: &Object| match configured_log().unwrap() {
+            ConfiguredLog::Host(host) => host
+                .load(&object.namespace, &object.kind, &object.id)
+                .unwrap()
+                .unwrap(),
+            ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+                Ok(live_record(store, &object.namespace, &object.kind, &object.id).unwrap())
+            })
+            .unwrap(),
+            ConfiguredLog::Unconfigured => unreachable!(),
+        };
+        // A namespace's first object: the log has never seen the namespace.
+        let first = sample_object("fence-1", "eu");
+        let opened = fence(&first);
+        assert_eq!((opened.generation, opened.ingested_seq), (0, None));
+        assert!(apply_fenced_to_configured_log(1, &first, &opened).unwrap());
+        assert_eq!(fence(&first).ingested_seq, Some(1));
+        // A repeat over the fence of its first append appends nothing.
+        let generation = fence(&first).generation;
+        apply_fenced_to_configured_log(1, &first, &opened).unwrap();
+        assert_eq!(fence(&first).generation, generation);
+        // A stale drain read the fence, then a newer append landed: the
+        // stale append is refused and the log keeps the newer write.
+        let stale = fence(&first);
+        let newer = sample_object("fence-1", "us");
+        assert!(apply_fenced_to_configured_log(3, &newer, &stale).unwrap());
+        assert!(!apply_fenced_to_configured_log(2, &first, &stale).unwrap());
+        assert_eq!(fence(&newer).ingested_seq, Some(3));
+        // Autoreview on #2289: an index edit's overlay survives the append.
+        let patch = OverlayPatch {
+            namespace: newer.namespace.clone(),
+            kind: newer.kind.clone(),
+            key: newer.id.clone(),
+            props: HashMap::from([("note".into(), "acked".into())]),
+            ..Default::default()
+        };
+        match configured_log().unwrap() {
+            ConfiguredLog::Host(host) => host.apply_overlay(&patch, "edit-1", None).unwrap(),
+            ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+                store.apply_overlay(patch, "edit-1".into(), None)
+            })
+            .unwrap(),
+            ConfiguredLog::Unconfigured => unreachable!(),
+        }
+        assert!(apply_fenced_to_configured_log(4, &newer, &fence(&newer)).unwrap());
+        let record = logged(&newer);
+        assert_eq!(ingested_seq(record.action_id.as_deref().unwrap()), Some(4));
+        assert_eq!(record.props["note"], "acked");
+        // Autoreview on #2289: an older replica replaced the drain's record
+        // before the drain completed; its retry appends again, not a replay.
+        match configured_log().unwrap() {
+            ConfiguredLog::Host(host) => host.ingest_batch(&[object_record(&first)]).unwrap(),
+            ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+                run_batch(store, vec![object_record(&first)])
+            })
+            .unwrap(),
+            ConfiguredLog::Unconfigured => unreachable!(),
+        }
+        assert_eq!(fence(&newer).ingested_seq, None);
+        assert!(apply_fenced_to_configured_log(4, &newer, &fence(&newer)).unwrap());
+        let record = logged(&newer);
+        assert_eq!(ingested_seq(record.action_id.as_deref().unwrap()), Some(4));
+        assert_eq!(record.props["region"], "us");
+    }
+
+    #[test]
+    fn a_drain_on_a_local_log_records_the_overlay_conflict_audit() {
+        // Autoreview on #2289: a conflict plan's merge appends with its audit.
+        let dir = tempfile::tempdir().unwrap();
+        with_test_log_path(&dir.path().join("objects.mikura"), || {
+            let object = sample_object("audited", "eu");
+            let fence = |object: &Object| configured_log_fence(object).unwrap().unwrap();
+            assert!(apply_fenced_to_configured_log(1, &object, &fence(&object)).unwrap());
+            let path = configured_log_path().unwrap();
+            with_cached_object_log_store(&path, |store| {
+                store.append(
+                    mikura::SchemaDescriptor {
+                        kind: object.kind.clone(),
+                        properties: vec!["region".into()],
+                        conflict: Some(mikura::ConflictStrategy::User),
+                        ..Default::default()
+                    }
+                    .to_record(object.namespace.clone())?,
+                )?;
+                store.apply_overlay(
+                    OverlayPatch {
+                        namespace: object.namespace.clone(),
+                        kind: object.kind.clone(),
+                        key: object.id.clone(),
+                        props: HashMap::from([("region".into(), "edited".into())]),
+                        ..Default::default()
+                    },
+                    "edit-1".into(),
+                    None,
+                )
+            })
+            .unwrap();
+            let moved = sample_object("audited", "us");
+            assert!(apply_fenced_to_configured_log(2, &moved, &fence(&moved)).unwrap());
+            with_cached_object_log_store(&path, |store| {
+                let record = live_record(store, "sales", "Customer", "audited").unwrap();
+                assert_eq!(ingested_seq(record.action_id.as_deref().unwrap()), Some(2));
+                assert_eq!(record.props["region"], "edited");
+                let audit = live_record(
+                    store,
+                    "sales",
+                    mikura::OVERLAY_KIND,
+                    &OverlayPatch::identity_key("Customer", "audited"),
+                )
+                .unwrap();
+                assert_eq!(OverlayPatch::recorded_conflict(&audit), Some("region:user"));
+                Ok(())
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_stale_drain_cannot_overwrite_a_newer_log_write() {
+        let dir = tempfile::tempdir().unwrap();
+        with_test_log_path(&dir.path().join("objects.mikura"), fenced_append_contract);
+    }
+
+    #[test]
+    fn a_stale_drain_cannot_overwrite_a_newer_host_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = mikura_host::Host::open(&dir.path().join("objects.mikura"), 64).unwrap();
+        let listener = mikura_host::Host::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = host.serve(listener);
+        });
+        let client =
+            crate::sekai::object_log_host::ObjectLogHost::new(&addr.to_string(), None).unwrap();
+        with_test_log_host(client, fenced_append_contract);
     }
 }

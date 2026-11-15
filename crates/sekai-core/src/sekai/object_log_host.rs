@@ -210,6 +210,29 @@ impl ObjectLogHost {
         Ok(committed.r#gen)
     }
 
+    /// Appends `record`'s properties under Action `action_id` while the
+    /// identity is still at `expected_gen` (0: absent). A repeat of a
+    /// committed id is a no-op. Errors carry the host's text, so a stale
+    /// generation reads as `stale generation` and an unopened namespace as
+    /// `unknown namespace`.
+    pub fn apply_action(
+        &self,
+        action_id: &str,
+        record: &ObjectRecord,
+        expected_gen: u64,
+    ) -> Result<(), String> {
+        Self::require_ok(self.call(json!({
+            "op": "apply_action",
+            "id": action_id,
+            "namespace": record.namespace,
+            "kind": record.kind,
+            "key": record.key,
+            "props": record.props,
+            "expected_gen": expected_gen,
+        }))?)
+        .map(|_| ())
+    }
+
     /// Admits a property overlay on the host (ADR 0009).
     pub fn apply_overlay(
         &self,
