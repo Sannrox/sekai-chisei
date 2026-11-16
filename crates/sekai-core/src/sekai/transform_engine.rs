@@ -77,8 +77,15 @@ impl Drop for EngineAllocGuard {
 /// Wrap SQLite's allocator before `sqlite3_initialize` so engine threads can
 /// refuse allocations that exceed the JobSpec envelope without a process-wide
 /// heap limit.
+///
+/// Also turns SQLite's memory-status tracking off. With it on, every
+/// allocation by any connection in the process takes one global mutex, so
+/// parallel in-memory databases serialize on it. Nothing here reads SQLite's
+/// statistics: the engine budget below is thread-local. The setting must be
+/// applied before `sqlite3_initialize`, like the allocator.
 pub fn install_engine_allocator() {
     ALLOC_INSTALL.call_once(|| unsafe {
+        let _ = rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as c_int);
         let mut original: rusqlite::ffi::sqlite3_mem_methods = std::mem::zeroed();
         let got =
             rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_GETMALLOC, &mut original);
@@ -506,6 +513,17 @@ mod tests {
             rows,
             columns,
         }
+    }
+
+    /// #2516: memory-status tracking is one process-wide lock on every SQLite
+    /// allocation. When it is off, SQLite reports no tracked memory.
+    #[test]
+    fn sqlite_memory_status_tracking_is_off() {
+        install_engine_allocator();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+            .unwrap();
+        assert_eq!(unsafe { rusqlite::ffi::sqlite3_memory_used() }, 0);
     }
 
     #[test]
