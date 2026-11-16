@@ -38,9 +38,17 @@ pub struct ProjectedCapability {
     pub replacement_capability: String,
     pub input_type: String,
     pub output_type: String,
+    /// Empty means the projection cannot state the scopes, and the field is
+    /// left out of the serialized form rather than reported as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_scopes: Vec<String>,
+    /// Empty means unstated; see `required_scopes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_decision_points: Vec<String>,
     pub risk_class: String,
+    /// Empty means the projection cannot say whether the call parks for
+    /// approval; `"none"` is a statement that it never does.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub approval_behavior: String,
     pub limits: BTreeMap<String, u64>,
     pub evidence_requirements: Vec<String>,
