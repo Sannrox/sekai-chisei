@@ -598,6 +598,56 @@ impl SekaiDb {
         Ok((version, rows))
     }
 
+    /// One page of a version's rows in `row_id` order: up to `limit + 1` rows
+    /// after `after_row_id`, so the caller can tell whether more follow. A
+    /// row keeps its `row_id` when another row of the version is erased.
+    pub fn load_dataset_version_page(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+        after_row_id: Option<i64>,
+        limit: usize,
+    ) -> Result<DatasetVersionPage, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let version = get_dataset_version_tx(&tx, dataset_id, version_id, as_of_ms)?;
+        if version.purged {
+            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        let rows = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT row_id, data FROM sekai_dataset_version_rows
+                     WHERE dataset_id = ?1 AND version_id = ?2 AND row_id > ?3
+                     ORDER BY row_id LIMIT ?4",
+                )
+                .map_err(|error| error.to_string())?;
+            let mapped = stmt
+                .query_map(
+                    params![
+                        dataset_id,
+                        version.version_id,
+                        after_row_id.unwrap_or(i64::MIN),
+                        i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let mut rows = Vec::new();
+            for row in mapped {
+                let (row_id, data) = row.map_err(|error| error.to_string())?;
+                rows.push((
+                    row_id,
+                    serde_json::from_str(&data).map_err(|error| error.to_string())?,
+                ));
+            }
+            rows
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((version, rows))
+    }
+
     pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
         if request.restore_from_version_id.trim().is_empty() {
             return Err(dataset_version::DATASET_ROLLBACK_REQUIRES_RESTORE.into());
@@ -993,6 +1043,9 @@ fn map_dataset_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetV
         purged: row.get::<_, i64>(9)? != 0,
     })
 }
+
+/// A dataset version and one page of its rows, each with its stable `row_id`.
+pub type DatasetVersionPage = (DatasetVersion, Vec<(i64, HashMap<String, String>)>);
 
 pub fn query_dataset_version_rows_tx(
     tx: &Transaction<'_>,

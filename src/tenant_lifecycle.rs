@@ -298,7 +298,7 @@ impl TenantLifecycleController {
         }
         // Ensure no secret material patterns.
         let joined = stores.values().cloned().collect::<Vec<_>>().join("\n");
-        if joined.contains("sk-") || joined.contains("\"secret\"") {
+        if holds_secret_material(&joined) {
             return Err(LifecycleError::Invalid(
                 "export sanitizer blocked secret material".into(),
             ));
@@ -415,6 +415,18 @@ impl TenantLifecycleController {
     }
 }
 
+/// Whether exported text carries a provider key or a `"secret"` field. A key
+/// prefix counts unless a plain letter precedes it, so ids such as `task-42`
+/// pass. A JSON (`\n`, `\u000B`) or percent (`%3D`) escape before it still
+/// counts as a boundary.
+fn holds_secret_material(text: &str) -> bool {
+    static KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[^A-Za-z]|\\[nrtbf]|\\u[0-9A-Fa-f]{4}|%[0-9A-Fa-f]{2})sk-")
+            .expect("valid key pattern")
+    });
+    KEY.is_match(text) || text.contains("\"secret\"")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +443,26 @@ mod tests {
             Arc::new(MemoryTenantProviderCredentialResolver::new()),
             Arc::new(FakeBillingAdapter::new()),
         )
+    }
+
+    // #2467
+    #[test]
+    fn sanitizer_refuses_keys_but_not_ids_that_contain_sk() {
+        assert!(!holds_secret_material(r#"{"operation_id":"task-42"}"#));
+        assert!(holds_secret_material(r#"{"key":"sk-abcd1234efgh"}"#));
+        assert!(holds_secret_material(r#"{"key":"sk-ant-api03-abcd1234"}"#));
+        assert!(holds_secret_material(r#"{"key":"sk-proj-abcd1234efgh"}"#));
+        assert!(holds_secret_material("Bearer%20sk-abcd1234efgh"));
+        assert!(holds_secret_material("api_key%3Dsk-proj-abcd1234"));
+        assert!(holds_secret_material("sk-short"));
+        assert!(holds_secret_material("token_sk-abcd1234efgh"));
+        assert!(holds_secret_material(
+            r#"{"note":"line1\nsk-proj-abcd1234"}"#
+        ));
+        assert!(holds_secret_material(
+            r#"{"note":"a\u000Bsk-abcd1234efgh"}"#
+        ));
+        assert!(holds_secret_material(r#"{"secret":null}"#));
     }
 
     #[test]

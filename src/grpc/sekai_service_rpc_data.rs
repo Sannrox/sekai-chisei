@@ -258,6 +258,58 @@ pub(super) async fn update_dataset(
         dataset: Some(to_proto_dataset(&updated)),
     }))
 }
+/// Largest page the dataset list calls return; a `page_size` of 0 means this
+/// (#2532).
+const DATASET_PAGE_MAX: usize = 100;
+
+fn dataset_page_size(page_size: i32) -> Result<usize, Status> {
+    match usize::try_from(page_size) {
+        Ok(0) => Ok(DATASET_PAGE_MAX),
+        Ok(size) => Ok(size.min(DATASET_PAGE_MAX)),
+        Err(_) => Err(Status::invalid_argument("page_size must not be negative")),
+    }
+}
+
+/// One page of `items`, which must already be in ascending `key` order: the
+/// items whose key is after `after`, at most `page_size` of them, and the key
+/// of the last one returned when more follow.
+fn keyed_page<T, K: Ord>(
+    items: impl IntoIterator<Item = T>,
+    page_size: usize,
+    after: Option<&K>,
+    key: impl Fn(&T) -> K,
+) -> (Vec<T>, Option<K>) {
+    let mut page = items
+        .into_iter()
+        .filter(|item| after.is_none_or(|after| key(item) > *after))
+        .take(page_size + 1)
+        .collect::<Vec<_>>();
+    if page.len() <= page_size {
+        return (page, None);
+    }
+    page.truncate(page_size);
+    let next = page.last().map(&key);
+    (page, next)
+}
+
+/// The resume position in a page token that holds one number: a sequence or
+/// a position in an append-only or immutable list.
+fn numeric_page_token<N: std::str::FromStr>(token: &str) -> Result<Option<N>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    token
+        .parse()
+        .map(Some)
+        .map_err(|_| Status::invalid_argument("page_token is invalid"))
+}
+
+/// The items of an append-only or immutable list paired with their position,
+/// so a page token can resume after a position.
+fn positioned<T>(items: Vec<T>) -> impl Iterator<Item = (usize, T)> {
+    items.into_iter().enumerate()
+}
+
 pub(super) async fn list_datasets(
     service: &SekaiServiceImpl,
     req: Request<ListDatasetsRequest>,
@@ -265,36 +317,45 @@ pub(super) async fn list_datasets(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let datasets = service
+    let inner = req.get_ref();
+    let page_size = dataset_page_size(inner.page_size)?;
+    let after = (!inner.page_token.is_empty()).then(|| inner.page_token.clone());
+    let mut datasets = service
         .db
         .runtime()
         .list_datasets()
-        .map_err(Status::internal)?
-        .into_iter()
-        .filter(|dataset| {
-            // Scratch outputs of ad-hoc runs are not catalog entries.
-            !crate::sekai::adhoc_transform::is_scratch_dataset(dataset)
-                && check_dataset_access(
-                    service.db.runtime(),
-                    &service.security,
-                    &principals,
-                    dataset,
-                    false,
-                )
-                .is_ok()
-                && catalog_binding_discoverable(
-                    service.db.runtime(),
-                    &service.security,
-                    tenant_context.as_ref(),
-                    &dataset.object_id,
-                    &principals,
-                )
-        })
-        .collect::<Vec<_>>()
-        .iter()
-        .map(to_proto_dataset)
-        .collect();
-    Ok(Response::new(ListDatasetsResponse { datasets }))
+        .map_err(Status::internal)?;
+    // Sorted here, not by the store, so the order and the token comparison
+    // agree on both backends.
+    datasets.sort_by(|a, b| a.id.cmp(&b.id));
+    // Access filtering runs before the page limit, so a hidden dataset never
+    // takes a slot.
+    let visible = datasets.into_iter().filter(|dataset| {
+        // Scratch outputs of ad-hoc runs are not catalog entries.
+        !crate::sekai::adhoc_transform::is_scratch_dataset(dataset)
+            && check_dataset_access(
+                service.db.runtime(),
+                &service.security,
+                &principals,
+                dataset,
+                false,
+            )
+            .is_ok()
+            && catalog_binding_discoverable(
+                service.db.runtime(),
+                &service.security,
+                tenant_context.as_ref(),
+                &dataset.object_id,
+                &principals,
+            )
+    });
+    let (page, next) = keyed_page(visible, page_size, after.as_ref(), |dataset| {
+        dataset.id.clone()
+    });
+    Ok(Response::new(ListDatasetsResponse {
+        datasets: page.iter().map(to_proto_dataset).collect(),
+        next_page_token: next.unwrap_or_default(),
+    }))
 }
 pub(super) async fn append_rows(
     service: &SekaiServiceImpl,
@@ -505,14 +566,17 @@ pub(super) async fn list_dataset_versions(
         .runtime()
         .list_dataset_versions(&inner.dataset_id)
         .map_err(map_dataset_version_error)?;
-    let versions = if inner.as_of_ms > 0 {
+    let page_size = dataset_page_size(inner.page_size)?;
+    let after = numeric_page_token::<i64>(&inner.page_token)?;
+    // The store returns versions in ascending `seq`.
+    let (versions, next) = keyed_page(
         versions
             .into_iter()
-            .filter(|version| version.created_at_ms <= inner.as_of_ms)
-            .collect::<Vec<_>>()
-    } else {
-        versions
-    };
+            .filter(|version| inner.as_of_ms <= 0 || version.created_at_ms <= inner.as_of_ms),
+        page_size,
+        after.as_ref(),
+        |version| version.seq,
+    );
     let version_retention_count = service
         .db
         .runtime()
@@ -521,6 +585,7 @@ pub(super) async fn list_dataset_versions(
     Ok(Response::new(ListDatasetVersionsResponse {
         versions: versions.iter().map(to_proto_dataset_version).collect(),
         version_retention_count,
+        next_page_token: next.map(|seq| seq.to_string()).unwrap_or_default(),
     }))
 }
 pub(super) async fn get_dataset_version(
@@ -545,11 +610,37 @@ pub(super) async fn get_dataset_version(
         false,
     )?;
     let readable = readable_columns(service, &dataset, &access)?;
-    let (version, mut rows) = service
+    let page_size = dataset_page_size(inner.page_size)?;
+    // The token pins the version the first page resolved, so a write between
+    // pages cannot switch an empty `version_id` to a newer snapshot.
+    let (version_id, after) = match version_row_page_token(&inner.page_token)? {
+        Some((pinned, _)) if !inner.version_id.is_empty() && pinned != inner.version_id => {
+            return Err(Status::invalid_argument("page_token is invalid"));
+        }
+        Some((pinned, row_id)) => (pinned, Some(row_id)),
+        None => (inner.version_id.clone(), None),
+    };
+    let (version, mut page) = service
         .db
         .runtime()
-        .load_dataset_version(&inner.dataset_id, &inner.version_id, inner.as_of_ms)
+        .load_dataset_version_page(
+            &inner.dataset_id,
+            &version_id,
+            inner.as_of_ms,
+            after,
+            page_size,
+        )
         .map_err(map_dataset_version_error)?;
+    // The store reads one row past the page to tell whether more follow; the
+    // token resumes after the stored row_id, which erasing another row of the
+    // version does not shift.
+    let next = (page.len() > page_size).then(|| {
+        page.truncate(page_size);
+        page.last()
+            .map(|(row_id, _)| format!("{}\n{row_id}", version.version_id))
+            .unwrap_or_default()
+    });
+    let mut rows = page.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
     hold_rows_to(&mut rows, readable.as_deref());
     let version_retention_count = service
         .db
@@ -560,7 +651,19 @@ pub(super) async fn get_dataset_version(
         version: Some(to_proto_dataset_version(&version)),
         rows: rows.into_iter().map(|values| Row { values }).collect(),
         version_retention_count,
+        next_page_token: next.unwrap_or_default(),
     }))
+}
+
+/// The version and last `row_id` a GetDatasetVersion page token resumes from.
+fn version_row_page_token(token: &str) -> Result<Option<(String, i64)>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || Status::invalid_argument("page_token is invalid");
+    let (version_id, row_id) = token.rsplit_once('\n').ok_or_else(invalid)?;
+    let row_id = row_id.parse().map_err(|_| invalid())?;
+    Ok(Some((version_id.into(), row_id)))
 }
 pub(super) async fn rollback_dataset(
     service: &SekaiServiceImpl,
@@ -584,7 +687,7 @@ pub(super) async fn rollback_dataset(
         true,
     )?;
     // Decided before the rollback writes, so a refusal changes nothing.
-    let readable = readable_columns(service, &dataset, &access)?;
+    readable_columns(service, &dataset, &access)?;
     let actor = principals
         .first()
         .cloned()
@@ -619,15 +722,11 @@ pub(super) async fn rollback_dataset(
             tenant,
         })
         .map_err(map_dataset_version_error)?;
-    let mut rows = service
-        .db
-        .runtime()
-        .query_dataset_version_rows(&inner.dataset_id, &version.version_id, 0)
-        .map_err(map_dataset_version_error)?;
-    hold_rows_to(&mut rows, readable.as_deref());
+    // The restored rows are read page by page through GetDatasetVersion
+    // (#2532); `rows` stays empty.
     Ok(Response::new(RollbackDatasetResponse {
         version: Some(to_proto_dataset_version(&version)),
-        rows: rows.into_iter().map(|values| Row { values }).collect(),
+        ..Default::default()
     }))
 }
 
@@ -695,13 +794,22 @@ pub(super) async fn list_dataset_health_checks(
         &dataset,
         false,
     )?;
-    let checks = service
+    let page_size = dataset_page_size(inner.page_size)?;
+    let after = (!inner.page_token.is_empty()).then(|| inner.page_token.clone());
+    let mut checks = service
         .db
         .runtime()
         .list_dataset_health_checks(&inner.dataset_id)
         .map_err(Status::internal)?;
+    // Sorted here, not by the store, so the order matches the token
+    // comparison whatever the database collation.
+    checks.sort_by(|a, b| a.check_id.cmp(&b.check_id));
+    let (checks, next) = keyed_page(checks, page_size, after.as_ref(), |check| {
+        check.check_id.clone()
+    });
     Ok(Response::new(ListDatasetHealthChecksResponse {
         checks: checks.iter().map(to_proto_health_check).collect(),
+        next_page_token: next.unwrap_or_default(),
     }))
 }
 
@@ -726,11 +834,17 @@ pub(super) async fn list_dataset_health_results(
         &dataset,
         false,
     )?;
-    let results = service
+    let page_size = dataset_page_size(inner.page_size)?;
+    let after = health_result_page_token(&inner.page_token)?;
+    let mut results = service
         .db
         .runtime()
         .list_dataset_health_results(&inner.dataset_id, &inner.version_id)
         .map_err(Status::internal)?;
+    // (judged_at_ms, version_id, check_id) is unique per dataset. Sorted here
+    // because the store orders by judged_at_ms and check_id only.
+    results.sort_by_key(health_result_key);
+    let (results, next) = keyed_page(results, page_size, after.as_ref(), health_result_key);
     let state = service
         .db
         .runtime()
@@ -740,7 +854,37 @@ pub(super) async fn list_dataset_health_results(
         results: results.iter().map(to_proto_health_result).collect(),
         last_healthy_version_id: state.last_healthy_version_id,
         quarantined: state.quarantined,
+        next_page_token: next
+            .map(|(judged_at_ms, version_id, check_id)| {
+                format!("{judged_at_ms}\n{version_id}\n{check_id}")
+            })
+            .unwrap_or_default(),
     }))
+}
+
+fn health_result_key(
+    result: &crate::sekai::dataset_health::DatasetHealthResult,
+) -> (i64, String, String) {
+    (
+        result.judged_at_ms,
+        result.version_id.clone(),
+        result.check_id.clone(),
+    )
+}
+
+fn health_result_page_token(token: &str) -> Result<Option<(i64, String, String)>, Status> {
+    if token.is_empty() {
+        return Ok(None);
+    }
+    let invalid = || Status::invalid_argument("page_token is invalid");
+    let mut parts = token.splitn(3, '\n');
+    let judged_at_ms = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(invalid)?;
+    let version_id = parts.next().ok_or_else(invalid)?;
+    let check_id = parts.next().ok_or_else(invalid)?;
+    Ok(Some((judged_at_ms, version_id.into(), check_id.into())))
 }
 
 pub(super) async fn run_dataset_health_checks(
@@ -800,13 +944,23 @@ pub(super) async fn list_dataset_alerts(
         &dataset,
         false,
     )?;
+    let page_size = dataset_page_size(inner.page_size)?;
+    let after = numeric_page_token::<usize>(&inner.page_token)?;
+    // Alerts are append-only and only removed with their whole dataset; the
+    // store returns them in insertion order, so a position resumes the same
+    // list.
     let alerts = service
         .db
         .runtime()
         .list_dataset_alerts(&inner.dataset_id)
         .map_err(Status::internal)?;
+    let (alerts, next) = keyed_page(positioned(alerts), page_size, after.as_ref(), |(at, _)| *at);
     Ok(Response::new(ListDatasetAlertsResponse {
-        alerts: alerts.iter().map(to_proto_dataset_alert).collect(),
+        alerts: alerts
+            .iter()
+            .map(|(_, alert)| to_proto_dataset_alert(alert))
+            .collect(),
+        next_page_token: next.map(|at| at.to_string()).unwrap_or_default(),
     }))
 }
 

@@ -123,6 +123,24 @@ impl RuntimeDb {
         }
     }
 
+    pub fn load_dataset_version_page(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+        after_row_id: Option<i64>,
+        limit: usize,
+    ) -> Result<crate::sekai::dataset::DatasetVersionPage, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.load_dataset_version_page(dataset_id, version_id, as_of_ms, after_row_id, limit)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.load_dataset_version_page(dataset_id, version_id, as_of_ms, after_row_id, limit)
+            }),
+        }
+    }
+
     pub fn create_dataset_branch(
         &self,
         request: &crate::sekai::dataset_branch::CreateDatasetBranch,

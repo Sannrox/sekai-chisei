@@ -132,6 +132,16 @@ fn exercise_datasets(db: &dyn DatasetBackend, prefix: &str) {
         .query_dataset_version_rows(&versioned_id, &first.version_id, 0)
         .unwrap();
     assert_eq!(live, restored_rows);
+    // Row pages resume after a stored row_id and read one row past the page.
+    let latest = &versions[2];
+    let (_, head) = db
+        .load_dataset_version_page(&versioned_id, &latest.version_id, 0, None, 2)
+        .unwrap();
+    assert_eq!(head.len(), 3);
+    let (_, tail) = db
+        .load_dataset_version_page(&versioned_id, &latest.version_id, 0, Some(head[1].0), 2)
+        .unwrap();
+    assert_eq!(tail, head[2..]);
     let as_of = db
         .get_dataset_version(&versioned_id, "", first.created_at_ms)
         .unwrap();
