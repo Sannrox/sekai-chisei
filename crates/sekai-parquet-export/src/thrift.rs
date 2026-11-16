@@ -153,7 +153,9 @@ impl<'a> CompactReader<'a> {
         let id = if delta == 0 {
             unzigzag_i16(self.read_varint()?)
         } else {
-            self.last_id + i16::from(delta)
+            self.last_id
+                .checked_add(i16::from(delta))
+                .ok_or(DecodeError("thrift field id overflow"))?
         };
         self.last_id = id;
         Ok(Some((id, ty)))
@@ -341,6 +343,17 @@ fn unzigzag_i64(value: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_id_overflow_is_a_decode_error() {
+        // Long-form header sets id 32767, then a short-form delta of 1.
+        let mut reader = CompactReader::new(&[0x05, 0xFE, 0xFF, 0x03, 0x00, 0x15, 0x00]);
+        reader.begin_struct();
+        let (id, ty) = reader.next_field().unwrap().unwrap();
+        assert_eq!(id, i16::MAX);
+        reader.skip_value(ty).unwrap();
+        assert!(reader.next_field().is_err());
+    }
 
     #[test]
     fn skip_rejects_a_list_longer_than_the_input() {
