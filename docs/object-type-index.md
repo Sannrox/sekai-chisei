@@ -105,7 +105,9 @@ output queryable.
 `sekai.object-set/v2` can group count/sum/min/max/avg/distinct across bounded
 index hops (`join_property`). An `outgoing` hop reaches far rows whose
 `join_property` holds the near row's key or object id; an `incoming` hop
-follows the near row's `join_property` to the far row with that key. Cost limits (`max_rows_scanned`, `max_depth`,
+follows the near row's `join_property` to the far row with that key. A hop
+names a declared link: an `outgoing` hop goes from its `from` kind to its `to`
+kind, an `incoming` hop the reverse. Cost limits (`max_rows_scanned`, `max_depth`,
 `max_time_ms`) fail closed with the limit named. `SEKAI_OBJECT_INDEX_ENGINE`
 selects `hop-projection` (default) or `nested-loop`. Hop-projection is a
 rebuildable join-key projection, not object authority. Evaluate walks those

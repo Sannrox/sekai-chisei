@@ -582,21 +582,24 @@ fn prepare_traversal(
     };
     let value: Value = serde_json::from_str(&link.definition_json)
         .map_err(|_| ObjectSetError::InvalidArgument("declared link is invalid".into()))?;
-    if let Some(from) = value.get("from").and_then(Value::as_str)
-        && from != near_kind
-        && direction != "incoming"
-    {
-        return Err(ObjectSetError::InvalidArgument(
-            "object-set traversal does not match the declared link".into(),
-        ));
-    }
-    if let Some(to) = value.get("to").and_then(Value::as_str)
-        && to != traversal.far_kind
-        && direction != "incoming"
-    {
-        return Err(ObjectSetError::InvalidArgument(
-            "object-set traversal does not match the declared link".into(),
-        ));
+    // An incoming hop walks the declared link backwards: the near kind is its
+    // `to` end and the far kind its `from` end.
+    let (near_end, far_end) = if direction == "incoming" {
+        ("to", "from")
+    } else {
+        ("from", "to")
+    };
+    for (end, kind) in [
+        (near_end, near_kind),
+        (far_end, traversal.far_kind.as_str()),
+    ] {
+        if let Some(declared) = value.get(end).and_then(Value::as_str)
+            && declared != kind
+        {
+            return Err(ObjectSetError::InvalidArgument(
+                "object-set traversal does not match the declared link".into(),
+            ));
+        }
     }
     Ok(traversal.far_kind.clone())
 }
@@ -731,6 +734,44 @@ mod tests {
         )
         .unwrap();
         (revision.revision_digest, all)
+    }
+
+    #[test]
+    fn hops_must_match_the_declared_link_endpoints_in_either_direction() {
+        let mut members = vec![
+            member_input("Customer", r#"{"name":"Customer"}"#),
+            member_input("Order", r#"{"name":"Order"}"#),
+            member_input("Shipment", r#"{"name":"Shipment"}"#),
+        ];
+        members.push(
+            DefinitionMemberInput {
+                member_kind: "link_type".into(),
+                member_id: "places".into(),
+                definition_json: r#"{"name":"places","from":"Customer","to":"Order"}"#.into(),
+                member_digest: String::new(),
+            }
+            .prepare("sales")
+            .unwrap(),
+        );
+        let hop = |direction: &str, far_kind: &str| ObjectSetTraversal {
+            relation: "places".into(),
+            direction: direction.into(),
+            far_kind: far_kind.into(),
+            join_property: String::new(),
+        };
+
+        assert!(prepare_traversal(&members, "Customer", &hop("outgoing", "Order")).is_ok());
+        assert!(prepare_traversal(&members, "Order", &hop("incoming", "Customer")).is_ok());
+        for (near, far) in [
+            ("Order", "Shipment"),
+            ("Customer", "Order"),
+            ("Shipment", "Customer"),
+        ] {
+            assert!(
+                prepare_traversal(&members, near, &hop("incoming", far)).is_err(),
+                "incoming hop {near} -> {far} was accepted"
+            );
+        }
     }
 
     fn member_input(id: &str, json: &str) -> DefinitionMember {

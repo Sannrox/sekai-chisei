@@ -4248,14 +4248,6 @@ mod tests {
                 ],
                 vec![("c1", 1)],
             ),
-            // A customer has no `customer_id` of its own, so an incoming hop
-            // reaches nothing; read as outgoing it would reach order o1.
-            (
-                "Customer",
-                "region",
-                vec![hop("placed", "incoming", "Order", "customer_id")],
-                vec![],
-            ),
         ] {
             let page = svc
                 .evaluate_object_set(evaluate(root, group_by, hops))
@@ -4268,6 +4260,18 @@ mod tests {
                 .collect();
             assert_eq!(groups(&page), expected, "{root}");
         }
+
+        // `placed` runs Customer to Order, so an incoming hop from a customer
+        // does not match the declared link and is refused (#2455).
+        let status = svc
+            .evaluate_object_set(evaluate(
+                "Customer",
+                "region",
+                vec![hop("placed", "incoming", "Order", "customer_id")],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
         // A root outside the index follows its own join property too. The
         // log holds only indexed rows, so only the SQL engines compare here.
