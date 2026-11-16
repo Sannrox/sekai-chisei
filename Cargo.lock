@@ -303,6 +303,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "metrics",
+ "metrics-util",
  "postgres",
  "regex",
  "reqwest 0.12.28",
@@ -1580,7 +1581,9 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.16.1",
+ "indexmap",
  "metrics",
+ "ordered-float",
  "quanta",
  "rand 0.9.4",
  "rand_xoshiro",
@@ -1838,6 +1841,15 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror",
+]
+
+[[package]]
+name = "ordered-float"
+version = "5.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f59006ce1e204c30956638535b74d317bca99477b9356dfaec54c37f6f600ab"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
