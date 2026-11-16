@@ -733,6 +733,28 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    /// Loads one authorization by id, revoked or not, so a caller can check
+    /// its namespace before acting on it.
+    pub fn get_purpose_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<crate::sekai::purpose_authorization::PurposeAuthorization>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT authorization_id, contract_version, actor, purpose, namespace, kind,
+                        not_before_ms, not_after_ms, policy_activation_digest, created_by,
+                        created_at_ms, revoked_at_ms
+                 FROM sekai_purpose_authorizations
+                 WHERE authorization_id = ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_row(params![authorization_id], row_to_purpose_authorization)
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn find_purpose_authorization(
         &self,
         actor: &str,

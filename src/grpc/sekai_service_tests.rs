@@ -316,6 +316,61 @@ fn with_tenant_context<T>(payload: T) -> Request<T> {
     req
 }
 
+#[tokio::test]
+async fn revoke_purpose_authorization_hides_other_tenants_authorizations() {
+    let svc = enterprise_service();
+    let now = now_millis();
+    for (id, namespace) in [("pa-allowed", "allowed"), ("pa-denied", "denied")] {
+        let authorization = crate::sekai::purpose_authorization::PurposeAuthorization {
+            contract_version: crate::sekai::purpose_authorization::PURPOSE_AUTHORIZATION_VERSION
+                .into(),
+            authorization_id: id.into(),
+            actor: "alice".into(),
+            purpose: "incident-response".into(),
+            namespace: namespace.into(),
+            kind: "document".into(),
+            not_before_ms: now.saturating_sub(1_000),
+            not_after_ms: now.saturating_add(60_000),
+            policy_activation_digest: "d".repeat(64),
+            created_by: "root".into(),
+            created_at_ms: now,
+            revoked_at_ms: 0,
+        };
+        authorization.prepare().unwrap();
+        svc.db
+            .runtime()
+            .put_purpose_authorization(&authorization)
+            .unwrap();
+    }
+    // A credential admin with write scope; only the tenant context differs
+    // between the two namespaces.
+    let revoke = |id: &str| {
+        let mut req = with_named_principal(
+            RevokePurposeAuthorizationRequest {
+                authorization_id: id.into(),
+            },
+            "root",
+        );
+        let mut context = test_tenant_context();
+        context.principal.subject = "root".into();
+        context.tenant.as_mut().unwrap().subject = "root".into();
+        context.scopes.push("sekai.write".into());
+        req.extensions_mut().insert(context);
+        svc.revoke_purpose_authorization(req)
+    };
+
+    revoke("pa-allowed").await.unwrap();
+    let err = revoke("pa-denied").await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::NotFound);
+    let stored = svc
+        .db
+        .runtime()
+        .get_purpose_authorization("pa-denied")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.revoked_at_ms, 0);
+}
+
 fn seed_lineage_object(svc: &SekaiServiceImpl, id: &str, namespace: &str) {
     svc.db
         .runtime()

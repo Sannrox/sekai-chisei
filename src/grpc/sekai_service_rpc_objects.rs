@@ -444,7 +444,26 @@ pub(super) async fn revoke_purpose_authorization(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     require_credential_admin(&principals)?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let authorization_id = req.into_inner().authorization_id;
+    // Same namespace checks as put. Any denial answers not_found, like an
+    // unknown id, so a caller cannot probe other tenants' authorization ids.
+    let existing = service
+        .db
+        .runtime()
+        .get_purpose_authorization(&authorization_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::not_found("not found"))?;
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &existing.namespace,
+        true,
+    )
+    .and_then(|()| {
+        check_team_namespace(service.db.runtime(), &principals, &existing.namespace, true)
+    })
+    .map_err(|_| Status::not_found("not found"))?;
     let stored = service
         .db
         .runtime()
