@@ -3,7 +3,8 @@
 //! Projects authorized operation receipts into the shell using the same
 //! `OperationReport` / `causal_operation_view` surfaces as `sekaictl report`.
 //! Visibility matches `GetOperationReceipt`: initiator or bootstrap principal
-//! (`root` / `local` / `chisei-gateway`). Cross-namespace IDs fail closed.
+//! (`root` / `local` / `chisei-gateway`). Cross-namespace and invisible IDs
+//! answer as not found.
 
 use crate::chisei::receipt::OperationReceipt;
 use crate::db::runtime_db::RuntimeDb;
@@ -34,8 +35,6 @@ pub enum WorkspaceError {
     InvalidNamespace,
     NamespaceDenied,
     NotFound,
-    ReceiptForbidden,
-    CrossNamespace,
     Internal,
 }
 
@@ -44,9 +43,7 @@ impl WorkspaceError {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
             Self::InvalidNamespace => StatusCode::BAD_REQUEST,
-            Self::NamespaceDenied | Self::ReceiptForbidden | Self::CrossNamespace => {
-                StatusCode::FORBIDDEN
-            }
+            Self::NamespaceDenied => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -58,10 +55,6 @@ impl WorkspaceError {
             Self::InvalidNamespace => "Invalid namespace identifier.",
             Self::NamespaceDenied => "Namespace access denied.",
             Self::NotFound => "Operation receipt not found.",
-            Self::ReceiptForbidden => "Operation receipt is not visible to this principal.",
-            Self::CrossNamespace => {
-                "Operation belongs to a different namespace; no foreign data was loaded."
-            }
             Self::Internal => "Failed to load operation workspace.",
         }
     }
@@ -123,12 +116,21 @@ pub fn load_authorized_report(
         .get_operation_receipt(operation_id)
         .map_err(|_| WorkspaceError::Internal)?
         .ok_or(WorkspaceError::NotFound)?;
+    // A receipt in another namespace, or one this principal may not view,
+    // answers exactly as an unknown id; only the server log tells them apart.
     if receipt.namespace != namespace {
-        // Fail closed: do not disclose that the id exists in another namespace.
-        return Err(WorkspaceError::CrossNamespace);
+        tracing::info!(
+            operation_id,
+            "operation workspace: receipt in another namespace"
+        );
+        return Err(WorkspaceError::NotFound);
     }
     if !principal_can_view_receipt(principal, &receipt) {
-        return Err(WorkspaceError::ReceiptForbidden);
+        tracing::info!(
+            operation_id,
+            "operation workspace: receipt not visible to principal"
+        );
+        return Err(WorkspaceError::NotFound);
     }
     Ok(scrub_report_secrets(
         OperationReport::from_authorized_receipt(&receipt),
@@ -503,27 +505,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_namespace_fails_closed_without_not_found_leak_for_other_ns() {
-        let db = test_db();
-        seed_ns(&db, "alpha", "alice");
-        seed_ns(&db, "beta", "alice");
-        db.put_operation_receipt(&sample_receipt("beta", "op-secret", "alice"))
-            .unwrap();
-
-        let err = load_authorized_report(&db, "alice", "alpha", "op-secret").unwrap_err();
-        assert_eq!(err, WorkspaceError::CrossNamespace);
-    }
-
-    #[test]
-    fn foreign_principal_cannot_read_receipt() {
+    fn foreign_and_invisible_receipts_answer_as_an_unknown_id() {
         let db = test_db();
         seed_ns(&db, "alpha", "alice");
         seed_ns(&db, "alpha", "bob");
-        db.put_operation_receipt(&sample_receipt("alpha", "op-1", "alice"))
+        seed_ns(&db, "beta", "alice");
+        db.put_operation_receipt(&sample_receipt("beta", "op-other-ns", "alice"))
+            .unwrap();
+        db.put_operation_receipt(&sample_receipt("alpha", "op-alices", "alice"))
             .unwrap();
 
-        let err = load_authorized_report(&db, "bob", "alpha", "op-1").unwrap_err();
-        assert_eq!(err, WorkspaceError::ReceiptForbidden);
+        let unknown = load_authorized_report(&db, "alice", "alpha", "op-random").unwrap_err();
+        let other_namespace =
+            load_authorized_report(&db, "alice", "alpha", "op-other-ns").unwrap_err();
+        let not_the_initiator =
+            load_authorized_report(&db, "bob", "alpha", "op-alices").unwrap_err();
+        assert_eq!(unknown, WorkspaceError::NotFound);
+        assert_eq!(other_namespace, unknown);
+        assert_eq!(not_the_initiator, unknown);
     }
 
     #[test]
