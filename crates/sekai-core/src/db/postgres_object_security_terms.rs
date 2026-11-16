@@ -87,6 +87,25 @@ impl PostgresDb {
         row_to_authorization(&row)
     }
 
+    /// Loads one authorization by id, revoked or not.
+    pub fn get_purpose_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<PurposeAuthorization>, String> {
+        self.connection()?
+            .query_opt(
+                &format!(
+                    "SELECT {AUTHORIZATION_COLUMNS}
+                     FROM sekai_purpose_authorizations
+                     WHERE authorization_id = $1"
+                ),
+                &[&authorization_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row_to_authorization(&row))
+            .transpose()
+    }
+
     pub fn find_purpose_authorization(
         &self,
         actor: &str,
