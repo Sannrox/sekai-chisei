@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::db::object_sync::BatchHistoryCursor;
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::namespace_access::{
@@ -320,7 +321,51 @@ pub fn apply_corrected_source_batch(
             checkpoint_advanced: false,
             observed_at_ms: now_ms,
         };
-        audit_apply(db, actor, &report)?;
+        audit_apply(db, actor, &batch.producer_identity, &report)?;
+        return Ok(report);
+    }
+    // Apply re-admits a quarantined source only. The store enforces the
+    // binding, its producer and the checkpoint cursor; this gate adds the
+    // requirement that the binding's latest result is quarantined. A retry of
+    // a batch the binding already recorded goes to the store, which replays
+    // it idempotently, so a lost response or failed audit stays recoverable
+    // even after later batches commit. A new batch must continue the
+    // checkpoint observed while quarantined. This check runs before the store
+    // transaction: a concurrent apply that clears the quarantine without
+    // moving the cursor can still let a second batch through. Closing that
+    // needs the precondition inside the store transaction.
+    let state = db
+        .get_source_sync_state(&query.namespace, &query.source_instance, &query.type_digest)
+        .map_err(|_| "source quarantine identity is unavailable".to_string())?;
+    let refusal = match &state {
+        None => Some(REASON_ABSENT),
+        Some(state) if !identities_match(state, &query) => Some(REASON_FOREIGN_IDENTITY),
+        Some(state) => {
+            let quarantined = latest_quarantined_result(state).is_some();
+            if (quarantined && continues_checkpoint(state, batch))
+                || is_recorded_batch(db, &query, batch)?
+            {
+                None
+            } else if quarantined {
+                Some(REASON_STALE_CHECKPOINT)
+            } else {
+                Some(REASON_NOT_QUARANTINED)
+            }
+        }
+    };
+    if let Some(reason) = refusal {
+        let report = SourceBatchApplyReport {
+            contract_version: APPLY_CONTRACT.into(),
+            namespace: query.namespace.clone(),
+            source_instance: query.source_instance.clone(),
+            type_digest: query.type_digest.clone(),
+            status: STATUS_UNAVAILABLE.into(),
+            outcome: OUTCOME_DENIAL.into(),
+            reason_code: reason.into(),
+            checkpoint_advanced: false,
+            observed_at_ms: now_ms,
+        };
+        audit_apply(db, actor, &batch.producer_identity, &report)?;
         return Ok(report);
     }
     match db.apply_source_batch(batch, &batch.producer_identity, now_ms) {
@@ -336,7 +381,7 @@ pub fn apply_corrected_source_batch(
                 checkpoint_advanced: result.checkpoint_advanced,
                 observed_at_ms: now_ms,
             };
-            audit_apply(db, actor, &report)?;
+            audit_apply(db, actor, &batch.producer_identity, &report)?;
             Ok(report)
         }
         Err(error) => {
@@ -351,7 +396,7 @@ pub fn apply_corrected_source_batch(
                 checkpoint_advanced: false,
                 observed_at_ms: now_ms,
             };
-            audit_apply(db, actor, &report)?;
+            audit_apply(db, actor, &batch.producer_identity, &report)?;
             Ok(report)
         }
     }
@@ -385,6 +430,57 @@ fn identities_match(state: &SourceSyncState, query: &SourceQuarantineQuery) -> b
     state.binding.namespace == query.namespace
         && state.binding.source_instance == query.source_instance
         && state.binding.type_digest == query.type_digest
+}
+
+/// Whether `batch` starts from the binding's committed checkpoint.
+fn continues_checkpoint(state: &SourceSyncState, batch: &SourceBatch) -> bool {
+    match &state.checkpoint {
+        Some(checkpoint) => checkpoint.cursor == batch.current_cursor,
+        None => batch.current_cursor.is_empty(),
+    }
+}
+
+/// Whether the binding's batch history already holds a transaction for this
+/// producer and idempotency key. Walks the history page by page; apply is a
+/// rare operator action, so the full walk is acceptable here.
+fn is_recorded_batch(
+    db: &RuntimeDb,
+    query: &SourceQuarantineQuery,
+    batch: &SourceBatch,
+) -> Result<bool, String> {
+    const PAGE: usize = 500;
+    let mut before: Option<BatchHistoryCursor> = None;
+    loop {
+        let Some(page) = db
+            .list_source_batch_transactions(
+                &query.namespace,
+                &query.source_instance,
+                &query.type_digest,
+                before.as_ref(),
+                PAGE,
+            )
+            .map_err(|_| "source batch history is unavailable".to_string())?
+        else {
+            return Ok(false);
+        };
+        if page.transactions.iter().any(|transaction| {
+            transaction.producer_identity == batch.producer_identity
+                && transaction.idempotency_key == batch.idempotency_key
+        }) {
+            return Ok(true);
+        }
+        let Some(last) = page
+            .transactions
+            .last()
+            .filter(|_| page.transactions.len() == PAGE)
+        else {
+            return Ok(false);
+        };
+        before = Some(BatchHistoryCursor {
+            opened_at_ms: last.opened_at_ms,
+            transaction_id: last.transaction_id.clone(),
+        });
+    }
 }
 
 fn latest_quarantined_result(state: &SourceSyncState) -> Option<&SourceBatchResult> {
@@ -523,6 +619,7 @@ fn audit_inspect(
         actor,
         QuarantineAudit {
             action: "source.quarantine.inspect",
+            producer: None,
             contract: INSPECT_CONTRACT,
             namespace: &report.namespace,
             source_instance: &report.source_instance,
@@ -541,6 +638,7 @@ fn audit_preview(db: &RuntimeDb, actor: &str, report: &SourceBatchPreview) -> Re
         actor,
         QuarantineAudit {
             action: "source.quarantine.preview",
+            producer: None,
             contract: PREVIEW_CONTRACT,
             namespace: &report.namespace,
             source_instance: &report.source_instance,
@@ -553,11 +651,19 @@ fn audit_preview(db: &RuntimeDb, actor: &str, report: &SourceBatchPreview) -> Re
     )
 }
 
-fn audit_apply(db: &RuntimeDb, actor: &str, report: &SourceBatchApplyReport) -> Result<(), String> {
+/// Apply audits record the operator (`actor`) and the batch's producer
+/// separately, so a re-admission names both who ran it and whose data it was.
+fn audit_apply(
+    db: &RuntimeDb,
+    actor: &str,
+    producer: &str,
+    report: &SourceBatchApplyReport,
+) -> Result<(), String> {
     record_quarantine_audit(
         db,
         actor,
         QuarantineAudit {
+            producer: Some(producer),
             action: "source.quarantine.apply",
             contract: APPLY_CONTRACT,
             namespace: &report.namespace,
@@ -573,6 +679,7 @@ fn audit_apply(db: &RuntimeDb, actor: &str, report: &SourceBatchApplyReport) -> 
 
 struct QuarantineAudit<'a> {
     action: &'a str,
+    producer: Option<&'a str>,
     contract: &'a str,
     namespace: &'a str,
     source_instance: &'a str,
@@ -589,6 +696,17 @@ fn record_quarantine_audit(
     audit: QuarantineAudit<'_>,
 ) -> Result<(), String> {
     let identity = identity_digest(audit.namespace, audit.source_instance, audit.type_digest);
+    let mut evidence = HashMap::from([
+        ("contract_version".into(), audit.contract.into()),
+        ("namespace".into(), audit.namespace.into()),
+        ("class".into(), audit.class.into()),
+        ("reason_code".into(), audit.reason_code.into()),
+        ("outcome".into(), audit.outcome.into()),
+        ("write_authority".into(), "false".into()),
+    ]);
+    if let Some(producer) = audit.producer.filter(|value| !identity_looks_secret(value)) {
+        evidence.insert("producer_identity".into(), producer.into());
+    }
     db.record_decisions_idempotently(&[Decision {
         id: format!(
             "{}:{}:{}:{actor}:{}",
@@ -601,14 +719,7 @@ fn record_quarantine_audit(
             "recorded {} authorized source quarantine observation",
             audit.contract
         ),
-        evidence: HashMap::from([
-            ("contract_version".into(), audit.contract.into()),
-            ("namespace".into(), audit.namespace.into()),
-            ("class".into(), audit.class.into()),
-            ("reason_code".into(), audit.reason_code.into()),
-            ("outcome".into(), audit.outcome.into()),
-            ("write_authority".into(), "false".into()),
-        ]),
+        evidence,
         target_id: audit.namespace.into(),
         outcome: audit.outcome.into(),
     }])
@@ -810,7 +921,7 @@ mod tests {
 
         let applied = apply_corrected_source_batch(&db, "root", &stale, 600).unwrap();
         assert!(!applied.checkpoint_advanced);
-        assert_eq!(applied.reason_code, "stale_cursor");
+        assert_eq!(applied.reason_code, REASON_STALE_CHECKPOINT);
         let state = db
             .get_source_sync_state("acme", "acme/ops", GITHUB_OBJECT_SYNC_TYPE_DIGEST)
             .unwrap()
@@ -892,6 +1003,38 @@ mod tests {
         let encoded = serde_json::to_string(&preview).unwrap();
         assert!(!encoded.contains("access_token"));
         assert!(!encoded.contains("redacted"));
+    }
+
+    #[test]
+    fn apply_refuses_a_source_that_is_not_quarantined() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(&batch("", "cursor:1", "batch-1"), PRODUCER, 100)
+            .unwrap();
+        let next = batch("cursor:1", "cursor:2", "batch-2");
+        let applied = apply_corrected_source_batch(&db, "root", &next, 200).unwrap();
+        assert_eq!(applied.reason_code, REASON_NOT_QUARANTINED);
+        assert!(!applied.checkpoint_advanced);
+        let state = db
+            .get_source_sync_state("acme", "acme/ops", GITHUB_OBJECT_SYNC_TYPE_DIGEST)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.checkpoint.as_ref().unwrap().cursor, "cursor:1");
+        let audit = latest_audit(&db, "source.quarantine.apply", "acme")
+            .unwrap()
+            .unwrap();
+        assert_eq!(audit.actor, "root");
+        assert_eq!(audit.evidence["producer_identity"], PRODUCER);
+    }
+
+    #[test]
+    fn retried_apply_replays_after_a_later_batch_commits() {
+        let (db, _) = quarantine_db();
+        let repair = repair_batch();
+        apply_corrected_source_batch(&db, "root", &repair, 400).unwrap();
+        db.apply_source_batch(&batch("cursor:2", "cursor:3", "batch-3"), PRODUCER, 450)
+            .unwrap();
+        let retry = apply_corrected_source_batch(&db, "root", &repair, 500).unwrap();
+        assert_eq!(retry.status, "committed");
     }
 
     #[test]

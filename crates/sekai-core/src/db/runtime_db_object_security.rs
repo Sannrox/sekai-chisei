@@ -397,6 +397,18 @@ impl RuntimeDb {
         }
     }
 
+    pub fn get_purpose_authorization(
+        &self,
+        authorization_id: &str,
+    ) -> Result<Option<crate::sekai::purpose_authorization::PurposeAuthorization>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_purpose_authorization(authorization_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_purpose_authorization(authorization_id))
+            }
+        }
+    }
+
     pub fn revoke_purpose_authorization(
         &self,
         authorization_id: &str,
