@@ -398,6 +398,15 @@ impl SekaiServiceImpl {
         &self,
         req: Request<FindByExternalIdRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || service.find_visible_by_external_id_blocking(req))
+            .await
+    }
+
+    fn find_visible_by_external_id_blocking(
+        &self,
+        req: Request<FindByExternalIdRequest>,
+    ) -> Result<Response<GetObjectResponse>, Status> {
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
@@ -514,6 +523,15 @@ impl SekaiServiceImpl {
         Err(Status::not_found("not found"))
     }
     pub(super) async fn find_visible_by_property(
+        &self,
+        req: Request<FindByPropertyRequest>,
+    ) -> Result<Response<ListObjectsResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || service.find_visible_by_property_blocking(req))
+            .await
+    }
+
+    fn find_visible_by_property_blocking(
         &self,
         req: Request<FindByPropertyRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
