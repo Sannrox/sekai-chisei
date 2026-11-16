@@ -201,7 +201,7 @@ pub fn verify_device_proof(
     .map_err(|_| DeviceProofReject::Invalid)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AssertionAuthority {
     pub issuer: String,
     pub audience: String,
@@ -245,6 +245,21 @@ impl ReplayCache {
         self.expiry_order
             .push(Reverse((retain_until, nonce.to_owned())));
         true
+    }
+}
+
+/// Omits the HMAC key and the replay cache.
+impl std::fmt::Debug for AssertionAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssertionAuthority")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("has_hmac_key", &self.key.is_some())
+            .field("accept_hmac_assertions", &self.accept_hmac_assertions)
+            .field("ed25519_keys", &self.ed25519_keys)
+            .field("clock_skew_secs", &self.clock_skew_secs)
+            .field("allowed_scopes", &self.allowed_scopes)
+            .finish_non_exhaustive()
     }
 }
 
@@ -590,6 +605,20 @@ impl std::fmt::Debug for Ed25519AssertionSigner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #2487: the HMAC key never reaches logs through `{:?}`.
+    #[test]
+    fn authority_debug_omits_the_hmac_key() {
+        let authority = AssertionAuthority::new(
+            "issuer",
+            "audience",
+            b"sixteen-byte-key-material-0123456".to_vec(),
+        );
+        let printed = format!("{authority:?}");
+        assert!(printed.contains("issuer"), "{printed}");
+        assert!(!printed.contains("115, 105, 120"), "{printed}");
+        assert!(!printed.contains("sixteen-byte"), "{printed}");
+    }
 
     fn authority() -> AssertionAuthority {
         AssertionAuthority::new(
