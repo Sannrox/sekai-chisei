@@ -531,15 +531,19 @@ impl ProviderState {
         if self.kek_revoked {
             return Err(KeyError::Revoked);
         }
-        if let Some((_, mut previous)) = self.previous.take() {
-            previous.zeroize();
-        }
+        self.forget_previous_kek();
         Ok(())
     }
 
     fn revoke_kek(&mut self) {
         self.kek_revoked = true;
         self.kek.zeroize();
+        self.forget_previous_kek();
+    }
+
+    /// Zeroizes the previous KEK where it is stored, then drops it. Taking
+    /// the `Copy` array out first would zeroize only the copy.
+    fn forget_previous_kek(&mut self) {
         if let Some((_, previous)) = &mut self.previous {
             previous.zeroize();
         }
