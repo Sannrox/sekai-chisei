@@ -206,6 +206,13 @@ impl Config {
             Some("0") => false,
             Some(_) => return Err("SEKAI_ASSERTION_ACCEPT_HMAC must be 0 or 1".into()),
         };
+        if let Some(key) = &hmac_key
+            && key.len() < MIN_ASSERTION_HMAC_KEY_BYTES
+        {
+            return Err(format!(
+                "SEKAI_ASSERTION_HMAC_KEY must be at least {MIN_ASSERTION_HMAC_KEY_BYTES} bytes"
+            ));
+        }
         let ed25519_keys = ed25519_keys
             .map(AssertionVerifyingKeys::parse)
             .transpose()?;
@@ -263,6 +270,9 @@ impl Config {
         }
     }
 }
+
+/// Shortest `SEKAI_ASSERTION_HMAC_KEY` the assertion authority accepts.
+pub const MIN_ASSERTION_HMAC_KEY_BYTES: usize = 32;
 
 fn security_i64_env(name: &str, default: i64, invalid: i64) -> i64 {
     match std::env::var(name) {
@@ -385,6 +395,8 @@ fn identity_csv_env(key: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    const TEST_HMAC_KEY: &str = "test-hmac-key-of-at-least-32-bytes";
+
     fn test_config() -> Config {
         let mut config = Config::from_env();
         config.sekai_bind = None;
@@ -456,13 +468,31 @@ mod tests {
         assert!(config.assertion_authority_with(None, None).is_err());
         config.assertion_audience = Some("https://sekai.test".into());
         assert!(config.assertion_authority_with(None, None).is_err());
-        config.assertion_hmac_key = Some("test-hmac-key".into());
+        config.assertion_hmac_key = Some(TEST_HMAC_KEY.into());
         let authority = config
             .assertion_authority_with(None, None)
             .unwrap()
             .expect("installed");
         assert_eq!(authority.issuer, "https://issuer.test");
         assert_eq!(authority.audience, "https://sekai.test");
+    }
+
+    #[test]
+    fn assertion_authority_refuses_a_short_hmac_key() {
+        let mut config = test_config();
+        config.assertion_issuer = Some("https://issuer.test".into());
+        config.assertion_audience = Some("https://sekai.test".into());
+        config.assertion_hmac_key = Some("k".repeat(MIN_ASSERTION_HMAC_KEY_BYTES - 1));
+        let error = config.assertion_authority_with(None, None).unwrap_err();
+        assert!(error.contains("SEKAI_ASSERTION_HMAC_KEY"), "{error}");
+
+        config.assertion_hmac_key = Some("k".repeat(MIN_ASSERTION_HMAC_KEY_BYTES));
+        assert!(
+            config
+                .assertion_authority_with(None, None)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -484,7 +514,7 @@ mod tests {
             .expect("installed");
         assert!(ed25519_only.seal("srt1.", b"{}").is_err());
 
-        config.assertion_hmac_key = Some("test-hmac-key".into());
+        config.assertion_hmac_key = Some(TEST_HMAC_KEY.into());
         assert!(config.assertion_authority_with(None, Some("0")).is_err());
         assert!(
             config
