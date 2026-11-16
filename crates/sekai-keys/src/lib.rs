@@ -577,8 +577,22 @@ fn write_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), KeyError> {
     Ok(())
 }
 
-fn encode_state(state: &ProviderState) -> Result<Vec<u8>, KeyError> {
-    let mut out = Vec::new();
+/// Exact byte length of `encode_state`'s output, so the buffer is allocated
+/// once and never reallocates (a reallocation would leave an unwiped copy of
+/// the key material behind).
+fn encoded_state_len(state: &ProviderState) -> usize {
+    let previous = state
+        .previous
+        .as_ref()
+        .map_or(0, |(id, _)| 2 + id.as_str().len() + 32);
+    let revoked: usize = state.dek_revoked.iter().map(|id| 2 + id.len()).sum();
+    FILE_MAGIC.len() + 1 + 1 + 2 + state.kek_id.as_str().len() + 32 + previous + 4 + revoked
+}
+
+/// Serializes provider state into a pre-sized zeroizing buffer. Key bytes are
+/// written straight from the state; no stack copy of a key is made.
+fn encode_state(state: &ProviderState) -> Result<Zeroizing<Vec<u8>>, KeyError> {
+    let mut out = Zeroizing::new(Vec::with_capacity(encoded_state_len(state)));
     out.extend_from_slice(FILE_MAGIC);
     out.push(FILE_VERSION);
     let mut flags = 0u8;
@@ -590,16 +604,10 @@ fn encode_state(state: &ProviderState) -> Result<Vec<u8>, KeyError> {
     }
     out.push(flags);
     write_len_bytes(&mut out, state.kek_id.as_str().as_bytes())?;
-    let kek = if state.kek_revoked {
-        [0u8; 32]
-    } else {
-        state.kek
-    };
-    out.extend_from_slice(&kek);
+    write_key(&mut out, &state.kek, state.kek_revoked);
     if let Some((id, key)) = &state.previous {
         write_len_bytes(&mut out, id.as_str().as_bytes())?;
-        let key = if state.kek_revoked { [0u8; 32] } else { *key };
-        out.extend_from_slice(&key);
+        write_key(&mut out, key, state.kek_revoked);
     }
     write_u32(
         &mut out,
@@ -609,6 +617,15 @@ fn encode_state(state: &ProviderState) -> Result<Vec<u8>, KeyError> {
         write_len_bytes(&mut out, dek_id.as_bytes())?;
     }
     Ok(out)
+}
+
+/// Writes a key, or zeros in its place once the KEK is revoked.
+fn write_key(out: &mut Vec<u8>, key: &[u8; 32], revoked: bool) {
+    if revoked {
+        out.extend_from_slice(&[0u8; 32]);
+    } else {
+        out.extend_from_slice(key);
+    }
 }
 
 fn take_bytes<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8], KeyError> {
@@ -654,14 +671,13 @@ fn decode_state(bytes: &[u8]) -> Result<ProviderState, KeyError> {
     let kek_revoked = flags & FILE_FLAG_KEK_REVOKED != 0;
     let has_previous = flags & FILE_FLAG_HAS_PREVIOUS != 0;
     let kek_id = KeyId::new(take_len_string(&mut cur)?)?;
-    let kek_bytes = take_bytes(&mut cur, 32)?;
-    let mut kek = [0u8; 32];
-    kek.copy_from_slice(kek_bytes);
+    // Key locals are zeroizing so every early error below wipes them.
+    let mut kek = Zeroizing::new([0u8; 32]);
+    kek.copy_from_slice(take_bytes(&mut cur, 32)?);
     let previous = if has_previous {
         let id = KeyId::new(take_len_string(&mut cur)?)?;
-        let prev_bytes = take_bytes(&mut cur, 32)?;
-        let mut prev = [0u8; 32];
-        prev.copy_from_slice(prev_bytes);
+        let mut prev = Zeroizing::new([0u8; 32]);
+        prev.copy_from_slice(take_bytes(&mut cur, 32)?);
         Some((id, prev))
     } else {
         None
@@ -679,8 +695,8 @@ fn decode_state(bytes: &[u8]) -> Result<ProviderState, KeyError> {
     }
     Ok(ProviderState {
         kek_id,
-        kek,
-        previous,
+        kek: *kek,
+        previous: previous.map(|(id, key)| (id, *key)),
         dek_revoked,
         kek_revoked,
     })
@@ -836,7 +852,7 @@ fn is_owned_tmp_name(name: &str, prefix: &str) -> bool {
 }
 
 fn persist_atomic(path: &Path, state: &ProviderState) -> Result<(), KeyError> {
-    let encoded = Zeroizing::new(encode_state(state)?);
+    let encoded = encode_state(state)?;
     let file_name = path
         .file_name()
         .ok_or(KeyError::WrapFailed)?
@@ -1212,6 +1228,22 @@ pub mod conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_encoding_fills_its_presized_buffer_exactly() {
+        let mut state = ProviderState::new(random_key_id("kek"), [7u8; 32]);
+        state.previous = Some((random_key_id("kek"), [9u8; 32]));
+        state.dek_revoked.insert("dek-a".to_string());
+        state.dek_revoked.insert("dek-bb".to_string());
+        let encoded = encode_state(&state).expect("encode");
+        assert_eq!(encoded.len(), encoded_state_len(&state));
+        let decoded = decode_state(&encoded).expect("decode");
+        assert_eq!(decoded.kek, state.kek);
+        assert_eq!(
+            decoded.previous.as_ref().map(|(_, key)| *key),
+            Some([9u8; 32])
+        );
+    }
 
     fn tenant() -> TenantId {
         TenantId::new("tenant-a").expect("tenant")
