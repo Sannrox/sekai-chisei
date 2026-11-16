@@ -636,6 +636,12 @@ fn experimental_entries() -> Vec<CapabilityEntry> {
     ]
 }
 
+/// One adapter tool as a catalog entry. A read tool states the namespace read
+/// scope and no approval. A writing tool leaves scopes, decision points, and
+/// approval behavior empty, so `_meta` omits them: the generic tool has no
+/// native catalog entry, and whether a write needs a further scope or parks
+/// for approval depends on the Action type and namespace policy that the
+/// server enforces on the call.
 fn capability_entry(
     name: &str,
     description: &str,
@@ -644,6 +650,7 @@ fn capability_entry(
     output_type: &str,
     risk_class: &str,
 ) -> CapabilityEntry {
+    let read_only = risk_class == "read";
     CapabilityEntry {
         name: name.into(),
         description: description.into(),
@@ -655,10 +662,18 @@ fn capability_entry(
         replacement_capability: String::new(),
         input_type: input_type.into(),
         output_type: output_type.into(),
-        required_scopes: vec!["namespace:read".into()],
-        policy_decision_points: vec!["namespace_access".into()],
+        required_scopes: if read_only {
+            vec!["namespace:read".into()]
+        } else {
+            vec![]
+        },
+        policy_decision_points: if read_only {
+            vec!["namespace_access".into()]
+        } else {
+            vec![]
+        },
         risk_class: risk_class.into(),
-        approval_behavior: "none".into(),
+        approval_behavior: if read_only { "none" } else { "" }.into(),
         limits: vec![],
         object_type: None,
         evidence_requirements: vec![],
@@ -771,6 +786,51 @@ mod tests {
         .unwrap();
         assert_eq!(newer["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert!(newer.get("error").is_none());
+    }
+
+    /// A writing tool must not report a read scope or "never needs approval"
+    /// (#2431); a read tool keeps stating both.
+    #[tokio::test]
+    async fn writing_tools_do_not_report_a_read_scope_or_no_approval() {
+        let listed = handle_message(
+            &surface(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await
+        .unwrap();
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let meta_of = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is listed"))["_meta"]
+                .clone()
+        };
+        for tool in tools {
+            let meta = &tool["_meta"];
+            if tool["annotations"]["readOnlyHint"] == false {
+                assert_eq!(meta["risk_class"], "write", "{}", tool["name"]);
+                for field in [
+                    "required_scopes",
+                    "policy_decision_points",
+                    "approval_behavior",
+                ] {
+                    assert!(
+                        meta.get(field).is_none(),
+                        "{} reports {field}",
+                        tool["name"]
+                    );
+                }
+            }
+        }
+        let read = meta_of(GET_OBJECT_TOOL);
+        assert_eq!(read["required_scopes"], json!(["namespace:read"]));
+        assert_eq!(read["approval_behavior"], "none");
+        assert!(
+            meta_of(SUBMIT_ACTION_TOOL)
+                .get("approval_behavior")
+                .is_none()
+        );
     }
 
     #[tokio::test]

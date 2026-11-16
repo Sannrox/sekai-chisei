@@ -415,7 +415,11 @@ principal, contract version, and catalog snapshot that produced it.
 The MCP projection exposes the canonical capability name as the tool name. Its
 `_meta` field carries the complete projected contract, including native input
 and output types, embedded object or action schemas, required scopes, decision
-points, limits, lifecycle state, and compatibility bounds. MCP annotations are
+points, limits, lifecycle state, and compatibility bounds. `_meta` omits
+`required_scopes`, `policy_decision_points`, and `approval_behavior` when the
+projection cannot state them: the `sekai-mcp` writing tools leave all three
+out, because the scopes and approval a write needs depend on the Action type and
+namespace policy the server applies to the call. MCP annotations are
 only descriptive hints and never grant authority. Tool calls require an
 explicit `operation_id` and are rebound to the native RPC rather than executed
 by an independent MCP policy path.
