@@ -1131,7 +1131,7 @@ fn verify_hop_signature(hop: &ProvenanceHop) -> Result<(), String> {
     if hop.signature_hex.trim().is_empty() {
         return Err("provenance hop is not signed".into());
     }
-    let public_bytes = decode_hex(&hop.public_key_hex)?;
+    let public_bytes = sekai_types::hex::decode(hop.public_key_hex.trim())?;
     let public_key = VerifyingKey::from_bytes(
         public_bytes
             .as_slice()
@@ -1142,7 +1142,7 @@ fn verify_hop_signature(hop: &ProvenanceHop) -> Result<(), String> {
     let mut unsigned = hop.clone();
     unsigned.signature_hex.clear();
     let bytes = shomei::canonical_json(&unsigned)?;
-    let signature_bytes = decode_hex(&hop.signature_hex)?;
+    let signature_bytes = sekai_types::hex::decode(hop.signature_hex.trim())?;
     let signature_array: [u8; 64] = signature_bytes
         .as_slice()
         .try_into()
@@ -1257,7 +1257,7 @@ fn verify_signature(
     bundle: &NamespaceSnapshotBundle,
     signature: &NamespaceSnapshotSignature,
 ) -> Result<(), String> {
-    let public_bytes = decode_hex(&signature.public_key_hex)?;
+    let public_bytes = sekai_types::hex::decode(signature.public_key_hex.trim())?;
     let public_key = VerifyingKey::from_bytes(
         public_bytes
             .as_slice()
@@ -1271,7 +1271,7 @@ fn verify_signature(
         ..signature.clone()
     });
     let bytes = shomei::canonical_json(&unsigned)?;
-    let signature_bytes = decode_hex(&signature.signature_hex)?;
+    let signature_bytes = sekai_types::hex::decode(signature.signature_hex.trim())?;
     let signature_array: [u8; 64] = signature_bytes
         .as_slice()
         .try_into()
@@ -1517,20 +1517,6 @@ fn audit_import(
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
-        return Err("hex length must be even".into());
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .map_err(|_| format!("invalid hex at offset {index}"))
-        })
-        .collect()
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

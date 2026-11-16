@@ -536,25 +536,11 @@ fn validate_policy_pack(pin: &PolicyPackPin) -> Result<(), String> {
 }
 
 fn validate_ed25519_hex(hex: &str) -> Result<(), String> {
-    let bytes = decode_hex(hex)?;
+    let bytes = sekai_types::hex::decode(hex.trim())?;
     if bytes.len() != 32 {
         return Err("public key must be 32-byte ed25519 key hex".into());
     }
     Ok(())
-}
-
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
-        return Err("public key hex length must be even".into());
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .map_err(|_| format!("invalid hex at offset {index}"))
-        })
-        .collect()
 }
 
 fn normalize_hex(hex: &str) -> String {
@@ -576,6 +562,13 @@ mod tests {
 
     fn db() -> RuntimeDb {
         RuntimeDb::memory()
+    }
+
+    #[test]
+    fn non_ascii_peer_key_hex_is_an_error_not_a_panic() {
+        for bad in ["aéb", "aé1aé1"] {
+            assert!(validate_ed25519_hex(bad).is_err(), "{bad}");
+        }
     }
 
     fn public_key_hex(seed: u8) -> String {
