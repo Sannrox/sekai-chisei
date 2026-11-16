@@ -46,7 +46,51 @@ pub(super) async fn list_functions(
         .collect();
     Ok(Response::new(ListFunctionsResponse { functions }))
 }
+/// Server-side ceilings on a caller's `InvokeFunction` budget. A `repeat`
+/// step ticks once per step, so the step ceiling also bounds loops.
+const MAX_FUNCTION_TIME_MS: u64 = 1_000;
+const MAX_FUNCTION_OUTPUT_BYTES: usize = 4 * 1_048_576;
+const MAX_FUNCTION_STEPS: u32 = 1_024;
+
+/// The budget an invocation runs under: zero fields take the defaults, and
+/// every field is clamped to the server ceiling.
+fn function_budget(requested: Option<FunctionBudget>) -> crate::sekai::function::FunctionBudget {
+    let defaults = crate::sekai::function::FunctionBudget::default();
+    let Some(requested) = requested else {
+        return defaults;
+    };
+    let or_default = |value: u64, default: u64| if value == 0 { default } else { value };
+    crate::sekai::function::FunctionBudget {
+        max_time_ms: or_default(requested.max_time_ms, defaults.max_time_ms)
+            .min(MAX_FUNCTION_TIME_MS),
+        max_output_bytes: usize::try_from(or_default(
+            requested.max_output_bytes,
+            defaults.max_output_bytes as u64,
+        ))
+        .unwrap_or(usize::MAX)
+        .min(MAX_FUNCTION_OUTPUT_BYTES),
+        max_steps: if requested.max_steps == 0 {
+            defaults.max_steps
+        } else {
+            requested.max_steps
+        }
+        .min(MAX_FUNCTION_STEPS),
+    }
+}
+
+/// Runs the invocation on the database worker pool: a function evaluates
+/// store reads and steps synchronously, which must not hold an async worker.
 pub(super) async fn invoke_function(
+    service: &SekaiServiceImpl,
+    req: Request<InvokeFunctionRequest>,
+) -> Result<Response<InvokeFunctionResponse>, Status> {
+    let owned = service.clone();
+    service
+        .spawn_db(move || invoke_function_blocking(&owned, req))
+        .await
+}
+
+fn invoke_function_blocking(
     service: &SekaiServiceImpl,
     req: Request<InvokeFunctionRequest>,
 ) -> Result<Response<InvokeFunctionResponse>, Status> {
@@ -72,26 +116,7 @@ pub(super) async fn invoke_function(
             crate::sekai::function::LLM_FUNCTION_REQUIRES_GATE,
         ));
     }
-    let budget = input
-        .budget
-        .map(|budget| crate::sekai::function::FunctionBudget {
-            max_time_ms: if budget.max_time_ms == 0 {
-                50
-            } else {
-                budget.max_time_ms
-            },
-            max_output_bytes: if budget.max_output_bytes == 0 {
-                1_048_576
-            } else {
-                budget.max_output_bytes as usize
-            },
-            max_steps: if budget.max_steps == 0 {
-                32
-            } else {
-                budget.max_steps
-            },
-        })
-        .unwrap_or_default();
+    let budget = function_budget(input.budget);
     let host = crate::sekai::function::FunctionHost {
         now_ms: if input.now_ms == 0 {
             now_millis()
@@ -6758,4 +6783,35 @@ pub(super) fn check_backfill_columns(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod function_budget_tests {
+    use super::*;
+
+    #[test]
+    fn caller_budget_is_clamped_to_the_server_ceiling() {
+        let budget = function_budget(Some(FunctionBudget {
+            max_time_ms: u64::MAX,
+            max_output_bytes: u64::MAX,
+            max_steps: u32::MAX,
+        }));
+
+        assert_eq!(budget.max_time_ms, MAX_FUNCTION_TIME_MS);
+        assert_eq!(budget.max_output_bytes, MAX_FUNCTION_OUTPUT_BYTES);
+        assert_eq!(budget.max_steps, MAX_FUNCTION_STEPS);
+    }
+
+    #[test]
+    fn zero_or_missing_budget_fields_take_the_defaults() {
+        let defaults = crate::sekai::function::FunctionBudget::default();
+        let zero = function_budget(Some(FunctionBudget::default()));
+        let missing = function_budget(None);
+
+        for budget in [zero, missing] {
+            assert_eq!(budget.max_time_ms, defaults.max_time_ms);
+            assert_eq!(budget.max_output_bytes, defaults.max_output_bytes);
+            assert_eq!(budget.max_steps, defaults.max_steps);
+        }
+    }
 }
