@@ -48,7 +48,7 @@ Pool invariant: sum of member `max_amount` values must not exceed the pool ceili
 | Transfer under `regional_pinned` or `single_region` | Denied |
 | Transfer while `SEKAI_BUDGET_PARTITION_SIMULATED=1` | Refused row + audit decision; no capacity move |
 | Member limits sum &gt; pool ceiling | `set_limit` / transfer **denied** |
-| Unknown topology / global SC mode | Config parse **error** (server falls back to single_region with a warning if loaded via env) |
+| Unknown topology / global SC mode | Config parse **error**; the control plane refuses boot |
 
 Under partition, regional scopes spend only their **local allocation**. Because capacity is pre-split (and only moved by audited transfer), the sum of local spends cannot exceed the combined pool ceiling even when regions cannot coordinate.
 

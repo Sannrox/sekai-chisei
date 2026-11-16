@@ -310,6 +310,31 @@ fn optional_env(key: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Refuses boot when `SEKAI_SITE_ID` or the budget topology is set but
+/// invalid. `Config::from_env` stays infallible for CLI callers and falls back
+/// to the default with a warning; the process entry point calls this first so
+/// a present but invalid value never runs under a silently different site.
+pub fn require_valid_site_env() -> Result<(), String> {
+    let site_id = match env::var("SEKAI_SITE_ID") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("unreadable SEKAI_SITE_ID: {error}")),
+    };
+    require_valid_site_id(site_id.as_deref())?;
+    BudgetTopologyConfig::from_env()
+        .map(drop)
+        .map_err(|error| format!("invalid budget topology: {error}"))
+}
+
+fn require_valid_site_id(raw: Option<&str>) -> Result<(), String> {
+    match raw {
+        Some(raw) => validate_site_id(raw)
+            .map(drop)
+            .map_err(|error| format!("invalid SEKAI_SITE_ID: {error}")),
+        None => Ok(()),
+    }
+}
+
 /// Resolve and validate `SEKAI_SITE_ID` (non-empty, no wildcards).
 fn site_id_env(key: &str, default: &str) -> String {
     let raw = env::var(key).unwrap_or_else(|_| default.to_string());
@@ -405,6 +430,15 @@ mod tests {
         config.assertion_audience = None;
         config.assertion_hmac_key = None;
         config
+    }
+
+    // #2468
+    #[test]
+    fn a_present_but_invalid_site_id_refuses_boot_while_an_absent_one_does_not() {
+        assert!(require_valid_site_id(Some("eu*")).is_err());
+        assert!(require_valid_site_id(Some("")).is_err());
+        assert!(require_valid_site_id(Some("eu-west-1")).is_ok());
+        assert!(require_valid_site_id(None).is_ok());
     }
 
     #[test]

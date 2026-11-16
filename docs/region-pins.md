@@ -27,8 +27,9 @@ SEKAI_SITE_ID=local
 # SEKAI_SITE_ID=us-east-1
 ```
 
-Validation rejects empty values and `*` / `?` wildcards. Invalid values fall
-back to `"local"` with a warning at process start.
+Validation rejects empty values and `*` / `?` wildcards. A present but invalid
+value refuses boot; the `"local"` default applies only when the variable is
+absent.
 
 ## Visibility
 
