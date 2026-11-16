@@ -2425,6 +2425,16 @@ fn exercise_dataset_attachments(
             tenant: "t1".into(),
             reason: String::new(),
         };
+        // Another tenant cannot tell an attached proposal from a guessed id.
+        let foreign = |proposal_id: &str| MergeDatasetBranch {
+            proposal_id: proposal_id.into(),
+            tenant: "t2".into(),
+            ..standalone.clone()
+        };
+        assert_eq!(
+            db.merge_dataset_branch(&foreign(&dataset.id)).unwrap_err(),
+            db.merge_dataset_branch(&foreign("guessed")).unwrap_err()
+        );
         assert_eq!(
             db.merge_dataset_branch(&standalone).unwrap_err(),
             dataset_branch::PROPOSAL_ATTACHED
