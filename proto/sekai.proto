@@ -2576,9 +2576,9 @@ message CreateFunctionResponse { Function function = 1; }
 message ListFunctionsRequest {}
 message ListFunctionsResponse { repeated Function functions = 1; }
 message FunctionBudget {
-  uint64 max_time_ms = 1;
-  uint64 max_output_bytes = 2;
-  uint32 max_steps = 3;
+  uint64 max_time_ms = 1; // 0 defaults to 50; capped at 1000
+  uint64 max_output_bytes = 2; // 0 defaults to 1 MiB; capped at 4 MiB
+  uint32 max_steps = 3; // 0 defaults to 32; capped at 1024
 }
 message InvokeFunctionRequest {
   string name = 1;
