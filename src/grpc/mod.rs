@@ -2679,7 +2679,7 @@ mod tests {
         crate::identity_assertion::AssertionAuthority::new(
             "https://issuer.test",
             "https://sekai.test",
-            b"test-hmac-key",
+            b"test-hmac-key-of-at-least-32-bytes",
         )
     }
 
@@ -3083,7 +3083,7 @@ mod tests {
         let mut config = base_config();
         config.assertion_issuer = Some("https://issuer.test".into());
         config.assertion_audience = Some("https://sekai.test".into());
-        config.assertion_hmac_key = Some("test-hmac-key".into());
+        config.assertion_hmac_key = Some("test-hmac-key-of-at-least-32-bytes".into());
         let mut interceptor = TokenAuthInterceptor::from_config(
             Arc::new(PrincipalCredentialStore::new()),
             crate::db::store::SekaiStore::from_shared_runtime(in_memory_db()),
