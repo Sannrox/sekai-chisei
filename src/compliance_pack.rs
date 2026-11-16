@@ -464,10 +464,13 @@ pub fn verify_pack_report(
         }
     };
 
+    let signer_trusted =
+        signature_ok && report.signature.is_some() && trusted_public_key_hex.is_some();
     ComplianceVerifyReport {
         ok: errors.is_empty() && content_digest_ok && signature_ok,
         content_digest_ok,
         signature_ok,
+        signer_trusted,
         errors,
     }
 }

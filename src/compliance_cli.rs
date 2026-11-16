@@ -192,6 +192,16 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+/// An ok verdict without a trusted signer proves self-consistency only; say so.
+fn warn_untrusted_signer(signer_trusted: bool) {
+    if !signer_trusted {
+        eprintln!(
+            "warning: signer not trusted (no signature verified against --trusted-key); \
+             a re-signed bundle also passes this check"
+        );
+    }
+}
+
 fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
     let trusted = match &config.trusted_key {
@@ -201,12 +211,14 @@ fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
     let report = verify_compliance_export(&bundle, trusted.as_deref());
     if report.ok {
         println!(
-            "ok content_digest_ok={} signature_ok={} receipts={} decisions={}",
+            "ok content_digest_ok={} signature_ok={} signer_trusted={} receipts={} decisions={}",
             report.content_digest_ok,
             report.signature_ok,
+            report.signer_trusted,
             bundle.manifest.receipt_count,
             bundle.manifest.decision_count
         );
+        warn_untrusted_signer(report.signer_trusted);
         Ok(())
     } else {
         for error in &report.errors {
@@ -311,12 +323,14 @@ fn report_verify(config: ReportVerifyConfig) -> Result<(), BoxErr> {
     let result = verify_pack_report(&report, &bundle, trusted.as_deref());
     if result.ok {
         println!(
-            "ok content_digest_ok={} signature_ok={} pack={} controls={}",
+            "ok content_digest_ok={} signature_ok={} signer_trusted={} pack={} controls={}",
             result.content_digest_ok,
             result.signature_ok,
+            result.signer_trusted,
             report.manifest.pack_id,
             report.controls.len()
         );
+        warn_untrusted_signer(result.signer_trusted);
         Ok(())
     } else {
         for error in &result.errors {
