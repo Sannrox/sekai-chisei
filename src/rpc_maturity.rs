@@ -106,6 +106,10 @@ impl RpcMaturityTable {
         }
         let proto = proto_rpc_keys()?;
         let mut seen = BTreeSet::new();
+        // Runtime lookup (`classification_of`, `require_path`) keys on the
+        // method name alone, so a name shared by two services would classify
+        // one service's RPC by the other's entry.
+        let mut names = BTreeSet::new();
         for entry in &self.entries {
             if entry.rpc.trim().is_empty() || entry.rpc != entry.rpc.trim() {
                 return Err("maturity table contains an empty or padded rpc name".into());
@@ -131,6 +135,12 @@ impl RpcMaturityTable {
             let key = rpc_key(&entry.service, &entry.rpc);
             if !seen.insert(key.clone()) {
                 return Err(format!("duplicate maturity rpc {key}"));
+            }
+            if !names.insert(entry.rpc.as_str()) {
+                return Err(format!(
+                    "maturity rpc {} is in more than one service; lookup is by method name",
+                    entry.rpc
+                ));
             }
             if !proto.contains(&key) {
                 return Err(format!("maturity rpc {key} is not in proto"));
@@ -540,6 +550,21 @@ mod tests {
         twice.entries.push(twice.entries[0].clone());
         let error = twice.validate().expect_err("rpc classified twice");
         assert!(error.contains(&twice.entries[0].rpc), "{error}");
+    }
+
+    // #2459
+    #[test]
+    fn a_method_name_shared_by_two_services_fails_validation() {
+        let mut table = RpcMaturityTable::load().expect("maturity table");
+        let mut twin = table.entries[0].clone();
+        twin.service = match twin.service.as_str() {
+            "SekaiService" => "ChiseiService",
+            _ => "SekaiService",
+        }
+        .into();
+        table.entries.push(twin);
+        let error = table.validate().expect_err("shared method name");
+        assert!(error.contains("more than one service"), "{error}");
     }
 
     #[test]
