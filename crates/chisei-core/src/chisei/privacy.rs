@@ -365,8 +365,7 @@ pub fn check_payload(
         }
     }
     for entity in entities {
-        let pattern = format!(r"(?i)\b{}\b", regex::escape(entity));
-        if let Ok(regex) = Regex::new(&pattern) {
+        if let Ok(regex) = Regex::new(&known_entity_pattern(entity)) {
             let count = regex.find_iter(payload).count();
             if count > 0 {
                 findings.push(LeakFinding {
@@ -378,6 +377,21 @@ pub fn check_payload(
         }
     }
     findings
+}
+
+/// Case-insensitive pattern for a known-entity literal. A word boundary is
+/// added only on a side where the literal starts or ends with a word
+/// character: `\b` next to punctuation, such as after `Acme Inc.`, never
+/// matches before a space or the end of text, so the check would fail open.
+fn known_entity_pattern(entity: &str) -> String {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = if entity.starts_with(is_word) {
+        r"\b"
+    } else {
+        ""
+    };
+    let end = if entity.ends_with(is_word) { r"\b" } else { "" };
+    format!("(?i){start}{}{end}", regex::escape(entity))
 }
 
 #[cfg(test)]
@@ -472,6 +486,25 @@ mod tests {
         assert_eq!(findings[0].rule_label, "account_id");
         assert_eq!(findings[0].match_count, 1);
         assert_eq!(findings[1].rule_label, "known_entity:SecretCo");
+    }
+
+    #[test]
+    fn known_entity_ending_in_punctuation_is_flagged() {
+        let entities = ["Acme Inc.".to_string()];
+        for payload in ["Contract with Acme Inc. today", "Contract with Acme Inc."] {
+            let findings = check_payload(payload, &[], &entities, false);
+            assert_eq!(
+                findings
+                    .iter()
+                    .map(|f| f.rule_label.as_str())
+                    .collect::<Vec<_>>(),
+                ["known_entity:Acme Inc."],
+                "{payload}"
+            );
+        }
+        // A word character on the literal's edge still needs a word boundary.
+        let findings = check_payload("SecretCorp signed", &[], &["SecretCo".into()], false);
+        assert!(findings.is_empty());
     }
 
     #[test]
