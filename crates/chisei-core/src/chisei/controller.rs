@@ -7,7 +7,8 @@
 //! `ActivePromotions`).
 //!
 //! Every promotion and rollback is recorded as a `chisei.promotion` audit decision — the same
-//! durable, queryable log every other stage of this loop writes to.
+//! durable, queryable log every other stage of this loop writes to. A promotion or rollback whose
+//! decision cannot be written does not take effect.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -90,17 +91,20 @@ impl ActivePromotions {
 /// Promote one `gate_passed` candidate: atomically (via `CandidateStore::transition`) advance its
 /// status to `promoted`, activate its routing-bias override if it's a `KIND_ROUTING_BIAS`
 /// candidate, and record a `chisei.promotion` audit decision. Returns `None` if the candidate
-/// doesn't exist, isn't `gate_passed`, a concurrent writer already moved it, or (for a routing-bias
-/// candidate) its payload doesn't parse — in every `None` case except the parse failure, nothing
-/// is written; a parse failure is recorded as an immediate rollback instead of being left silently
-/// `promoted` with no override installed (which would make the audit log claim a live effect that
-/// doesn't exist).
+/// doesn't exist, isn't `gate_passed`, a concurrent writer already moved it, the decision ledger
+/// write fails, or (for a routing-bias candidate) its payload doesn't parse. In every `None` case
+/// except the parse failure, nothing is changed; a parse failure is recorded as an immediate
+/// rollback instead of being left silently `promoted` with no override installed (which would
+/// make the audit log claim a live effect that doesn't exist).
+///
+/// Status changes are only kept once their decisions are written (see `commit`), so a failed
+/// ledger write leaves the candidate `gate_passed` and live routing unchanged.
 ///
 /// `ActivePromotions` holds exactly one override per (namespace, task_class): promoting a
 /// candidate for a key that already has a different `promoted` candidate rolls that other one back
-/// first, keeping candidate status consistent with the registry's single-active-value reality
-/// (otherwise an older promoted candidate would silently lose its live effect while its status
-/// still read `promoted`).
+/// in the same ledger write, keeping candidate status consistent with the registry's
+/// single-active-value reality (otherwise an older promoted candidate would silently lose its live
+/// effect while its status still read `promoted`).
 pub fn promote_candidate(
     store: &CandidateStore,
     active: &ActivePromotions,
@@ -109,38 +113,49 @@ pub fn promote_candidate(
 ) -> Option<()> {
     let promoted = store.transition(candidate_id, STATUS_GATE_PASSED, STATUS_PROMOTED)?;
 
-    if promoted.kind == KIND_ROUTING_BIAS {
-        let Ok(payload) = serde_json::from_str::<RoutingBiasPayload>(&promoted.payload) else {
-            store.transition(&promoted.id, STATUS_PROMOTED, STATUS_ROLLED_BACK);
-            record(
-                db,
-                "rolled_back",
-                &promoted,
-                "unparseable routing-bias payload; promotion reverted",
-            );
-            return None;
-        };
-
-        for other in store.list_by_status(STATUS_PROMOTED) {
-            if other.id != promoted.id
-                && other.kind == KIND_ROUTING_BIAS
-                && other.namespace == promoted.namespace
-                && other.task_class == promoted.task_class
-                && let Some(superseded) =
-                    store.transition(&other.id, STATUS_PROMOTED, STATUS_ROLLED_BACK)
-            {
-                record(
-                    db,
-                    "rolled_back",
-                    &superseded,
-                    "superseded by a newer promotion for the same (namespace, task_class)",
-                );
-            }
-        }
-        active.set(&promoted.namespace, &promoted.task_class, &payload.bias);
+    if promoted.kind != KIND_ROUTING_BIAS {
+        let decision = promotion_decision("promoted", &promoted, "promoted candidate to live");
+        return commit(store, db, &[decision], &[(promoted, STATUS_GATE_PASSED)]);
     }
 
-    record(db, "promoted", &promoted, "promoted candidate to live");
+    let Ok(payload) = serde_json::from_str::<RoutingBiasPayload>(&promoted.payload) else {
+        if let Some(rolled) = store.transition(&promoted.id, STATUS_PROMOTED, STATUS_ROLLED_BACK) {
+            let decision = promotion_decision(
+                "rolled_back",
+                &rolled,
+                "unparseable routing-bias payload; promotion reverted",
+            );
+            commit(store, db, &[decision], &[(rolled, STATUS_GATE_PASSED)]);
+        }
+        return None;
+    };
+
+    let mut decisions = Vec::new();
+    let mut moved = Vec::new();
+    for other in store.list_by_status(STATUS_PROMOTED) {
+        if other.id != promoted.id
+            && other.kind == KIND_ROUTING_BIAS
+            && other.namespace == promoted.namespace
+            && other.task_class == promoted.task_class
+            && let Some(superseded) =
+                store.transition(&other.id, STATUS_PROMOTED, STATUS_ROLLED_BACK)
+        {
+            decisions.push(promotion_decision(
+                "rolled_back",
+                &superseded,
+                "superseded by a newer promotion for the same (namespace, task_class)",
+            ));
+            moved.push((superseded, STATUS_PROMOTED));
+        }
+    }
+    decisions.push(promotion_decision(
+        "promoted",
+        &promoted,
+        "promoted candidate to live",
+    ));
+    moved.push((promoted.clone(), STATUS_GATE_PASSED));
+    commit(store, db, &decisions, &moved)?;
+    active.set(&promoted.namespace, &promoted.task_class, &payload.bias);
     Some(())
 }
 
@@ -148,7 +163,8 @@ pub fn promote_candidate(
 /// eval regression right now. A promoted `"cheap"` bias is rolled back (regression means the
 /// evidence that justified routing cheap no longer holds); a promoted `"capable"` revert is left
 /// alone — it already *is* the safe state a regression calls for, so there's nothing to revert.
-/// Returns the number of candidates rolled back.
+/// A rollback whose decision cannot be written stays `promoted` with its override live, and the
+/// next scan retries it. Returns the number of candidates rolled back.
 pub fn check_rollbacks(
     store: &CandidateStore,
     active: &ActivePromotions,
@@ -179,25 +195,49 @@ pub fn check_rollbacks(
         else {
             continue;
         };
-        active.clear_if(&rolled.namespace, &rolled.task_class, "cheap");
-        record(
-            db,
+        let decision = promotion_decision(
             "rolled_back",
             &rolled,
             "auto-rolled back: task-class quality regression detected while promoted",
         );
+        if commit(store, db, &[decision], &[(rolled.clone(), STATUS_PROMOTED)]).is_none() {
+            continue;
+        }
+        active.clear_if(&rolled.namespace, &rolled.task_class, "cheap");
         rolled_back += 1;
     }
     rolled_back
 }
 
-fn record(db: &ChiseiStore, outcome: &str, candidate: &Candidate, reason: &str) {
+/// Write `decisions` in one ledger transaction. On failure, move each candidate in `moved` back
+/// to the status it held before this call, so no status change outlives a missing decision.
+fn commit(
+    store: &CandidateStore,
+    db: &ChiseiStore,
+    decisions: &[crate::chisei::decision_ledger::Decision],
+    moved: &[(Candidate, &str)],
+) -> Option<()> {
+    let Err(error) = db.record_decisions_idempotently(decisions) else {
+        return Some(());
+    };
+    for (candidate, previous) in moved {
+        store.transition(&candidate.id, &candidate.status, previous);
+    }
+    tracing::warn!(%error, "chisei.promotion decision write failed; status change reverted");
+    None
+}
+
+fn promotion_decision(
+    outcome: &str,
+    candidate: &Candidate,
+    reason: &str,
+) -> crate::chisei::decision_ledger::Decision {
     let mut evidence = HashMap::new();
     evidence.insert("kind".to_string(), candidate.kind.clone());
     evidence.insert("namespace".to_string(), candidate.namespace.clone());
     evidence.insert("task_class".to_string(), candidate.task_class.clone());
     evidence.insert("payload".to_string(), candidate.payload.clone());
-    let _ = db.record_decision(&crate::chisei::decision_ledger::Decision {
+    crate::chisei::decision_ledger::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: "chisei.promotion".into(),
@@ -206,7 +246,7 @@ fn record(db: &ChiseiStore, outcome: &str, candidate: &Candidate, reason: &str) 
         evidence,
         target_id: candidate.id.clone(),
         outcome: outcome.into(),
-    });
+    }
 }
 
 #[cfg(test)]
@@ -240,41 +280,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn promoting_a_cheap_candidate_activates_the_override() {
-        let (db, _eval, store, active) = setup();
-        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
-        store.upsert(candidate.clone());
-
-        assert!(promote_candidate(&store, &active, &db, &candidate.id).is_some());
-        assert_eq!(store.get(&candidate.id).unwrap().status, STATUS_PROMOTED);
-        assert_eq!(
-            active.active_bias("acme", "background"),
-            Some("cheap".to_string())
-        );
-    }
-
-    #[test]
-    fn only_gate_passed_candidates_can_be_promoted() {
-        let (db, _eval, store, active) = setup();
-        let mut candidate = gate_passed_routing_candidate("acme", "background", "cheap");
-        candidate.status = crate::chisei::promotion::STATUS_PROPOSED.to_string();
-        store.upsert(candidate.clone());
-
-        assert!(promote_candidate(&store, &active, &db, &candidate.id).is_none());
-        assert!(active.active_bias("acme", "background").is_none());
-    }
-
-    #[test]
-    fn regressed_namespace_rolls_back_a_promoted_cheap_bias() {
-        let (db, eval, store, active) = setup();
-        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
-        store.upsert(candidate.clone());
-        promote_candidate(&store, &active, &db, &candidate.id).unwrap();
-        assert!(!active.capable_override_active("acme", "background"));
-        assert!(active.active_bias("acme", "background").is_some());
-
-        // Drive a regression signal for the namespace directly against EvalStore.
+    /// Drive a regression signal for namespace `acme` directly against `EvalStore`.
+    fn drive_acme_regression(eval: &EvalStore) {
         let suite_id = "sampling-acme".to_string();
         eval.create_suite(crate::chisei::eval::Suite {
             id: suite_id.clone(),
@@ -325,6 +332,93 @@ mod tests {
         eval.track_iteration(&suite_id, &bad.id, "sampling/acme", "d2")
             .unwrap();
         assert!(eval.namespace_regression_signal("acme").unwrap().regressed);
+    }
+
+    /// Make every later decision-ledger write on the SQLite file at `path` fail.
+    fn fail_decision_writes(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_decision_write BEFORE INSERT ON sekai_decisions
+                 BEGIN SELECT RAISE(ABORT, 'injected decision write failure'); END;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn promotion_fails_and_keeps_the_route_when_its_decision_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chisei.db");
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        let (store, active) = (CandidateStore::new(), ActivePromotions::new());
+        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
+        store.upsert(candidate.clone());
+        fail_decision_writes(&path);
+
+        assert!(promote_candidate(&store, &active, &db, &candidate.id).is_none());
+        assert_eq!(store.get(&candidate.id).unwrap().status, STATUS_GATE_PASSED);
+        assert!(active.active_bias("acme", "background").is_none());
+    }
+
+    #[test]
+    fn rollback_fails_and_keeps_the_promotion_when_its_decision_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chisei.db");
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        let (eval, store, active) = (
+            EvalStore::new(),
+            CandidateStore::new(),
+            ActivePromotions::new(),
+        );
+        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
+        store.upsert(candidate.clone());
+        promote_candidate(&store, &active, &db, &candidate.id).unwrap();
+        drive_acme_regression(&eval);
+        fail_decision_writes(&path);
+
+        assert_eq!(check_rollbacks(&store, &active, &eval, &db), 0);
+        assert_eq!(store.get(&candidate.id).unwrap().status, STATUS_PROMOTED);
+        assert_eq!(
+            active.active_bias("acme", "background"),
+            Some("cheap".to_string())
+        );
+    }
+
+    #[test]
+    fn promoting_a_cheap_candidate_activates_the_override() {
+        let (db, _eval, store, active) = setup();
+        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
+        store.upsert(candidate.clone());
+
+        assert!(promote_candidate(&store, &active, &db, &candidate.id).is_some());
+        assert_eq!(store.get(&candidate.id).unwrap().status, STATUS_PROMOTED);
+        assert_eq!(
+            active.active_bias("acme", "background"),
+            Some("cheap".to_string())
+        );
+    }
+
+    #[test]
+    fn only_gate_passed_candidates_can_be_promoted() {
+        let (db, _eval, store, active) = setup();
+        let mut candidate = gate_passed_routing_candidate("acme", "background", "cheap");
+        candidate.status = crate::chisei::promotion::STATUS_PROPOSED.to_string();
+        store.upsert(candidate.clone());
+
+        assert!(promote_candidate(&store, &active, &db, &candidate.id).is_none());
+        assert!(active.active_bias("acme", "background").is_none());
+    }
+
+    #[test]
+    fn regressed_namespace_rolls_back_a_promoted_cheap_bias() {
+        let (db, eval, store, active) = setup();
+        let candidate = gate_passed_routing_candidate("acme", "background", "cheap");
+        store.upsert(candidate.clone());
+        promote_candidate(&store, &active, &db, &candidate.id).unwrap();
+        assert!(!active.capable_override_active("acme", "background"));
+        assert!(active.active_bias("acme", "background").is_some());
+
+        drive_acme_regression(&eval);
 
         let rolled_back = check_rollbacks(&store, &active, &eval, &db);
         assert_eq!(rolled_back, 1);
