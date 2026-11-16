@@ -222,25 +222,11 @@ fn validate_trust_root(root: &PeerTrustRoot) -> Result<(), String> {
     if root.created_at_ms < 0 {
         return Err("trust root created_at_ms must be non-negative".into());
     }
-    let bytes = decode_hex(&root.public_key_hex)?;
+    let bytes = sekai_types::hex::decode(root.public_key_hex.trim())?;
     if bytes.len() != 32 {
         return Err("public key must be 32-byte ed25519 key hex".into());
     }
     Ok(())
-}
-
-fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
-        return Err("public key hex length must be even".into());
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16)
-                .map_err(|_| format!("invalid hex at offset {index}"))
-        })
-        .collect()
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {

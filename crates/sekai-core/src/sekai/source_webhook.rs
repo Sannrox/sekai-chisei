@@ -83,7 +83,7 @@ pub fn pin_source_webhook_key(
     required("namespace", namespace)?;
     required("source instance", source_instance)?;
     required("key id", key_id)?;
-    decode_hex(public_key_hex)?;
+    sekai_types::hex::decode(public_key_hex.trim())?;
     if now_ms < 0 {
         return Err("pin timestamp must be non-negative".into());
     }
@@ -253,7 +253,7 @@ fn verify_signature(
     delivery: &SourceWebhookDelivery,
     signature: &SourceWebhookSignature,
 ) -> Result<(), String> {
-    let public_bytes = decode_hex(&signature.public_key_hex)?;
+    let public_bytes = sekai_types::hex::decode(signature.public_key_hex.trim())?;
     let public_key = VerifyingKey::from_bytes(
         public_bytes
             .as_slice()
@@ -267,7 +267,7 @@ fn verify_signature(
         ..signature.clone()
     });
     let bytes = shomei::canonical_json(&unsigned)?;
-    let signature_bytes = decode_hex(&signature.signature_hex)?;
+    let signature_bytes = sekai_types::hex::decode(signature.signature_hex.trim())?;
     let signature_array: [u8; 64] = signature_bytes
         .as_slice()
         .try_into()
@@ -296,20 +296,6 @@ fn required(label: &str, value: &str) -> Result<(), String> {
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    let trimmed = input.trim();
-    if !trimmed.len().is_multiple_of(2) {
-        return Err("hex string must have even length".into());
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&trimmed[index..index + 2], 16)
-                .map_err(|error| format!("invalid hex: {error}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -374,6 +360,22 @@ mod tests {
         let mut delivery = unsigned_delivery(id, now_ms);
         sign_source_webhook(&mut delivery, &signing_key(seed), "k1").unwrap();
         delivery
+    }
+
+    #[test]
+    fn non_ascii_public_key_hex_is_an_error_not_a_panic() {
+        for bad in ["aéb", "aé1aé1"] {
+            let pinned = pin_source_webhook_key(
+                &db(),
+                "admin",
+                "ops",
+                "sekai-project/sekai-chisei",
+                "k1",
+                bad,
+                0,
+            );
+            assert!(pinned.is_err(), "{bad}");
+        }
     }
 
     fn pin(db: &RuntimeDb, seed: u8, now_ms: i64) {

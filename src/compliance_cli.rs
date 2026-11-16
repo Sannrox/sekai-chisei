@@ -768,7 +768,7 @@ fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
     let seed = if bytes.len() == 32 {
         bytes
     } else {
-        decode_hex(String::from_utf8_lossy(&bytes).trim())?
+        sekai_types::hex::decode(String::from_utf8_lossy(&bytes).trim())?
     };
     let array: [u8; 32] = seed
         .as_slice()
@@ -782,7 +782,7 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, String> {
     let key = if bytes.len() == 32 {
         bytes
     } else {
-        decode_hex(String::from_utf8_lossy(&bytes).trim())?
+        sekai_types::hex::decode(String::from_utf8_lossy(&bytes).trim())?
     };
     let array: [u8; 32] = key
         .as_slice()
@@ -793,20 +793,6 @@ fn load_verifying_key(path: &Path) -> Result<VerifyingKey, String> {
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    let trimmed = input.trim();
-    if !trimmed.len().is_multiple_of(2) {
-        return Err("hex string must have even length".into());
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&trimmed[index..index + 2], 16)
-                .map_err(|error| format!("invalid hex: {error}"))
-        })
-        .collect()
 }
 
 #[cfg(test)]

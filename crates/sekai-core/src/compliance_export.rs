@@ -454,7 +454,7 @@ fn verify_signature(
             signature.algorithm
         ));
     }
-    let key_bytes = decode_hex(public_key_hex)?;
+    let key_bytes = sekai_types::hex::decode(public_key_hex.trim())?;
     let key_array: [u8; 32] = key_bytes
         .as_slice()
         .try_into()
@@ -465,11 +465,15 @@ fn verify_signature(
         && signature.public_key_hex != public_key_hex
     {
         // Allow either the embedded key or the trusted key when they match bytes.
-        if decode_hex(&signature.public_key_hex).ok().as_deref() != Some(key_array.as_slice()) {
+        if sekai_types::hex::decode(signature.public_key_hex.trim())
+            .ok()
+            .as_deref()
+            != Some(key_array.as_slice())
+        {
             return Err("bundle public key does not match trusted key".into());
         }
     }
-    let sig_bytes = decode_hex(&signature.signature_hex)?;
+    let sig_bytes = sekai_types::hex::decode(signature.signature_hex.trim())?;
     let sig_array: [u8; 64] = sig_bytes
         .as_slice()
         .try_into()
@@ -584,20 +588,6 @@ fn redact_decision_record(decision: &mut ComplianceDecisionRecord) {
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
-    let trimmed = input.trim();
-    if !trimmed.len().is_multiple_of(2) {
-        return Err("hex string must have even length".into());
-    }
-    (0..trimmed.len())
-        .step_by(2)
-        .map(|index| {
-            u8::from_str_radix(&trimmed[index..index + 2], 16)
-                .map_err(|error| format!("invalid hex: {error}"))
-        })
-        .collect()
 }
 
 /// Load receipts/decisions from the runtime store and build an export bundle.
@@ -852,6 +842,31 @@ mod tests {
         let bad = verify_compliance_export(&tampered, Some(&public));
         assert!(!bad.ok);
         assert!(!bad.content_digest_ok);
+    }
+
+    #[test]
+    fn non_ascii_signature_hex_is_an_error_not_a_panic() {
+        let request = ComplianceExportRequest {
+            namespace: "ns".into(),
+            start_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+            redaction: RedactionMode::Full,
+            actor: "auditor".into(),
+            request_id: "export-hex".into(),
+        };
+        let mut bundle =
+            build_compliance_export(&request, vec![sample_receipt("op-1", 150)], vec![], 1_000)
+                .unwrap();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        sign_compliance_export(&mut bundle, &signing, "auditor-key", "k1", 2_000).unwrap();
+        for bad in ["aéb", "aé1aé1"] {
+            let mut key = bundle.clone();
+            key.signature.as_mut().unwrap().public_key_hex = bad.into();
+            assert!(!verify_compliance_export(&key, None).ok);
+            let mut sig = bundle.clone();
+            sig.signature.as_mut().unwrap().signature_hex = bad.into();
+            assert!(!verify_compliance_export(&sig, None).ok);
+        }
     }
 
     #[test]
