@@ -35866,6 +35866,23 @@ async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
         own("denied").await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
+    // #2451: Get applies the same tenant check as List. The own tenant's
+    // namespace gets past it to the missing type; the other tenant's is refused.
+    let get = |namespace: &'static str| {
+        let svc = &svc;
+        async move {
+            svc.get_governed_action_type(with_tenant_context(GetGovernedActionTypeRequest {
+                namespace: namespace.into(),
+                type_id: "t".into(),
+                version: "1".into(),
+            }))
+            .await
+            .unwrap_err()
+            .code()
+        }
+    };
+    assert_eq!(get("allowed").await, tonic::Code::NotFound);
+    assert_eq!(get("denied").await, tonic::Code::PermissionDenied);
 }
 
 /// A site agent instance is an ordinary object to reads: one the caller may
