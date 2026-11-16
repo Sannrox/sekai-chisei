@@ -8,11 +8,12 @@ use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use std::path::{Path, PathBuf};
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin model-release-evidence trust-set --file <roots.json>\n  sekaictl admin model-release-evidence trust-get\n  sekaictl admin model-release-evidence ingest --file <runtime.json>\n  sekaictl admin model-release-evidence get --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri>\n  sekaictl admin model-release-evidence export --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --suite <id> --baseline <run> --candidate <run> --eval-run <id> [--signing-key-hex <64 hex>] [--actor <principal>]\n  sekaictl admin model-release-evidence feedback --namespace <ns> --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --note <text> [--actor <principal>]"
+    "sekaictl admin model-release-evidence trust-set --file <roots.json>\n  sekaictl admin model-release-evidence trust-get\n  sekaictl admin model-release-evidence ingest --file <runtime.json>\n  sekaictl admin model-release-evidence get --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri>\n  sekaictl admin model-release-evidence export --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --suite <id> --baseline <run> --candidate <run> --eval-run <id> [--signing-key <file>] [--actor <principal>]\n  sekaictl admin model-release-evidence feedback --namespace <ns> --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --note <text> [--actor <principal>]"
 }
 
 pub async fn run_model_release_evidence_command(args: Vec<String>) -> Result<(), BoxErr> {
@@ -64,18 +65,26 @@ struct ExportArgs {
     baseline: String,
     candidate: String,
     eval_run: String,
-    signing_key_hex: Option<String>,
+    signing_key_file: Option<PathBuf>,
     actor: String,
 }
 
 fn parse_export(args: &[String]) -> Result<ExportArgs, BoxErr> {
+    // Key material on the command line shows in process listings and shell
+    // history (#2462). The value is never echoed back.
+    if args.iter().any(|arg| arg == "--signing-key-hex") {
+        return Err(std::io::Error::other(
+            "--signing-key-hex is no longer accepted; pass --signing-key <file> or set SEKAI_MODEL_EVALUATION_SIGNING_KEY",
+        )
+        .into());
+    }
     Ok(ExportArgs {
         identity: parse_identity(args)?,
         suite: flag(args, "--suite")?,
         baseline: flag(args, "--baseline")?,
         candidate: flag(args, "--candidate")?,
         eval_run: flag(args, "--eval-run")?,
-        signing_key_hex: optional_flag(args, "--signing-key-hex"),
+        signing_key_file: optional_flag(args, "--signing-key").map(PathBuf::from),
         actor: optional_flag(args, "--actor").unwrap_or_else(|| "root".into()),
     })
 }
@@ -96,9 +105,11 @@ fn parse_feedback(args: &[String]) -> Result<FeedbackArgs, BoxErr> {
     })
 }
 
-fn signing_key(hex: Option<String>) -> Result<SigningKey, BoxErr> {
-    let raw = match hex {
-        Some(value) => value,
+/// The evaluation signing key: 64 hex characters read from `file` when given,
+/// otherwise from `SEKAI_MODEL_EVALUATION_SIGNING_KEY`.
+fn signing_key(file: Option<&Path>) -> Result<SigningKey, BoxErr> {
+    let raw = match file {
+        Some(path) => std::fs::read_to_string(path)?.trim().to_string(),
         None => std::env::var("SEKAI_MODEL_EVALUATION_SIGNING_KEY")
             .map_err(|_| std::io::Error::other("signing key is required"))?,
     };
@@ -161,7 +172,7 @@ async fn get(identity: ModelReleaseIdentity) -> Result<(), BoxErr> {
 
 async fn export(args: ExportArgs) -> Result<(), BoxErr> {
     let db = open_store()?;
-    let key = signing_key(args.signing_key_hex)?;
+    let key = signing_key(args.signing_key_file.as_deref())?;
     let evidence = model_release_evidence::export_evaluation_from_compare(
         &db,
         args.identity,
@@ -207,5 +218,57 @@ mod tests {
         assert!(usage.contains("ingest"));
         assert!(usage.contains("export"));
         assert!(usage.contains("feedback"));
+    }
+
+    fn export_args(extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "--provider",
+            "openai",
+            "--model",
+            "m",
+            "--profile-version",
+            "1",
+            "--digest",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "--endpoint",
+            "https://models.example/v1",
+            "--suite",
+            "s",
+            "--baseline",
+            "b",
+            "--candidate",
+            "c",
+            "--eval-run",
+            "e",
+        ]
+        .map(String::from)
+        .to_vec();
+        args.extend(extra.iter().map(|value| value.to_string()));
+        args
+    }
+
+    #[test]
+    fn export_refuses_key_material_on_the_command_line() {
+        let key = "11".repeat(32);
+        let error = parse_export(&export_args(&["--signing-key-hex", &key]))
+            .err()
+            .expect("argv key is refused");
+        let message = error.to_string();
+        assert!(message.contains("--signing-key <file>"), "{message}");
+        assert!(!message.contains(&key), "{message}");
+    }
+
+    #[test]
+    fn export_reads_the_signing_key_from_a_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("evaluation.hex");
+        std::fs::write(&path, format!("{}\n", "11".repeat(32))).expect("key file");
+        let args = parse_export(&export_args(&[
+            "--signing-key",
+            path.to_str().expect("utf-8"),
+        ]))
+        .expect("export args");
+        let key = signing_key(args.signing_key_file.as_deref()).expect("key from file");
+        assert_eq!(key.to_bytes(), [0x11; 32]);
     }
 }
