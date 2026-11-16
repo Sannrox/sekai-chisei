@@ -181,6 +181,9 @@ impl SekaiServiceImpl {
             )?;
             endpoints.push(object);
         }
+        for object in &endpoints {
+            self.refuse_generic_write_for_published_type(&object.namespace, &object.kind)?;
+        }
         let from_generation =
             object_security_generation(self.db.runtime(), &endpoints[0].namespace)?;
         let to_generation = object_security_generation(self.db.runtime(), &endpoints[1].namespace)?;

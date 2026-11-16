@@ -10289,6 +10289,28 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
     assert_eq!(linked.code(), tonic::Code::FailedPrecondition);
     assert!(linked.message().contains("SubmitActionInstance"));
 
+    // A link that reached the store another way (source sync) is still
+    // refused on the generic delete path, like create.
+    svc.db
+        .runtime()
+        .create_link(&crate::domain::Link {
+            id: "typed-link".into(),
+            from_id: typed.id.clone(),
+            to_id: "ticket-peer".into(),
+            relation: "related".into(),
+            created: 0,
+        })
+        .unwrap();
+    let unlinked = svc
+        .delete_link(with_principal(DeleteLinkRequest {
+            id: "typed-link".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unlinked.code(), tonic::Code::FailedPrecondition);
+    assert!(unlinked.message().contains("SubmitActionInstance"));
+    assert!(svc.db.runtime().get_link("typed-link").unwrap().is_some());
+
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
             id: "loose-from".into(),
