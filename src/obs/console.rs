@@ -958,9 +958,7 @@ async fn screen_operation_workspace(
                 crate::obs::console_workspace::WorkspaceError::InvalidNamespace => {
                     StatusCode::BAD_REQUEST
                 }
-                crate::obs::console_workspace::WorkspaceError::NamespaceDenied
-                | crate::obs::console_workspace::WorkspaceError::ReceiptForbidden
-                | crate::obs::console_workspace::WorkspaceError::CrossNamespace => {
+                crate::obs::console_workspace::WorkspaceError::NamespaceDenied => {
                     StatusCode::FORBIDDEN
                 }
                 crate::obs::console_workspace::WorkspaceError::Unauthenticated => {
