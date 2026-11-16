@@ -130,15 +130,51 @@ fn sorted(value: Value) -> Value {
 /// Keys whose string value is a credential or a reference to one. Matched on
 /// whole underscore-separated words, so `max_tokens` or `tokens` stay readable.
 fn credential_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase().replace('-', "_");
+    let key = snake_words(key);
     key.contains("api_key")
         || key.contains("private_key")
         || key.split('_').any(|word| {
             matches!(
                 word,
-                "token" | "secret" | "password" | "passwd" | "credential" | "apikey"
+                // `tokens` stays out: `max_tokens` and `input_tokens` are counts.
+                "token"
+                    | "secret"
+                    | "secrets"
+                    | "password"
+                    | "passwords"
+                    | "passwd"
+                    | "credential"
+                    | "credentials"
+                    | "apikey"
+                    | "apikeys"
             )
         })
+}
+
+/// Lowercases a key and splits it into `_`-joined words on `-`, `_` and
+/// camelCase boundaries (`clientSecret` and `APIKey` become `client_secret`
+/// and `api_key`).
+fn snake_words(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let mut out = String::with_capacity(key.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '-' {
+            out.push('_');
+            continue;
+        }
+        if c.is_ascii_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
+            if prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
 }
 
 /// Redacts credential values: everything beneath a credential-shaped key. Governed
@@ -458,6 +494,25 @@ mod tests {
         }
         assert_eq!(body.matches(CREDENTIAL_PLACEHOLDER).count(), 3);
         assert!(body.contains("\"timeout\": 3"));
+    }
+
+    #[test]
+    fn camel_case_and_plural_credential_keys_are_redacted() {
+        let tree = build_tree(
+            &[member(
+                "function",
+                "sync",
+                r#"{"accessToken":"v1","clientSecret":"v2","privateKey":"v3","credentials":{"u":"v4"},"secrets":["v5"],"APIKey":"v6","db-password":"v7","maxTokens":9}"#,
+            )],
+            None,
+        )
+        .unwrap();
+        let body = &tree["function/sync.json"];
+        for leaked in ["v1", "v2", "v3", "v4", "v5", "v6", "v7"] {
+            assert!(!body.contains(leaked), "{leaked} leaked: {body}");
+        }
+        assert_eq!(body.matches(CREDENTIAL_PLACEHOLDER).count(), 7);
+        assert!(body.contains("\"maxTokens\": 9"));
     }
 
     #[test]

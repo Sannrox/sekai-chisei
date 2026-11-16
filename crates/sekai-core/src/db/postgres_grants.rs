@@ -214,20 +214,21 @@ impl PostgresDb {
                 &[&principal],
             )
             .map_err(|error| error.to_string())?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(|row| {
                 let external_id: String = row.get(0);
                 let role: String = row.get(1);
-                (
+                let role = Role::parse(&role)
+                    .ok_or_else(|| format!("unsupported role {role:?} for {external_id}"))?;
+                Ok((
                     external_id
                         .strip_prefix("namespace:")
                         .unwrap_or(&external_id)
                         .to_string(),
-                    Role::parse(&role).unwrap_or(Role::Viewer),
-                )
+                    role,
+                ))
             })
-            .collect())
+            .collect()
     }
 
     fn query_grants(
@@ -239,14 +240,7 @@ impl PostgresDb {
             .connection()?
             .query(sql, params)
             .map_err(|error| error.to_string())?;
-        let mut grants = Vec::with_capacity(rows.len());
-        for row in rows {
-            match row_to_grant(row) {
-                Ok(grant) => grants.push(grant),
-                Err(error) => tracing::warn!(%error, "invalid PostgreSQL grant; skipping row"),
-            }
-        }
-        Ok(grants)
+        rows.into_iter().map(row_to_grant).collect()
     }
 }
 
