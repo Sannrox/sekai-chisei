@@ -4,6 +4,12 @@
 //! authorization in [`crate::chisei::gunshi_dispatch`]. Default posture is
 //! advisory-only until a promoted revision is installed **and** the namespace
 //! opts in; a kill switch immediately forces advisory mode.
+//!
+//! Every audited change records its decision before it saves the new state.
+//! The decision ledger can live in another store than this state (ADR 0083),
+//! so the two writes cannot share a transaction: a failed audit write leaves
+//! the state unchanged, and a revision race lost after the audit write returns
+//! an error with the attempt on record.
 
 use std::collections::BTreeMap;
 
@@ -191,7 +197,6 @@ pub fn install_baseline(
         last_promoted_evaluation: None,
     };
     state.validate()?;
-    persist(db, &state, None)?;
     audit(
         db,
         actor,
@@ -201,6 +206,9 @@ pub fn install_baseline(
         "installed",
         now_ms,
     )?;
+    if !persist(db, &state, None)? {
+        return Err("namespace already has an allocation policy revision".into());
+    }
     Ok(state.status())
 }
 
@@ -257,9 +265,6 @@ pub fn promote(
     state.last_promoted_evaluation = Some(request.candidate_evaluation);
     // Promote does not auto-enable live dispatch; opt-in remains explicit.
     state.validate()?;
-    if !persist(db, &state, Some(&previous))? {
-        return Err("allocation policy revision race during promote".into());
-    }
     audit(
         db,
         &request.actor,
@@ -269,6 +274,9 @@ pub fn promote(
         "promoted",
         request.now_ms,
     )?;
+    if !persist(db, &state, Some(&previous))? {
+        return Err("allocation policy revision race during promote".into());
+    }
     Ok(state.status())
 }
 
@@ -333,9 +341,6 @@ pub fn rollback(
     // Manual rollback disables live auto until re-opt-in.
     state.auto_opt_in = false;
     state.validate()?;
-    if !persist(db, &state, Some(&from))? {
-        return Err("allocation policy revision race during rollback".into());
-    }
     audit(
         db,
         actor,
@@ -345,6 +350,9 @@ pub fn rollback(
         "rolled_back",
         now_ms,
     )?;
+    if !persist(db, &state, Some(&from))? {
+        return Err("allocation policy revision race during rollback".into());
+    }
     Ok(state.status())
 }
 
@@ -378,9 +386,6 @@ pub fn monitor(
     }
     state.validate()?;
     if changed {
-        if !persist(db, &state, Some(&previous))? {
-            return Err("allocation policy revision race during monitor".into());
-        }
         if rolled {
             audit(
                 db,
@@ -391,6 +396,9 @@ pub fn monitor(
                 "rolled_back",
                 now_ms,
             )?;
+        }
+        if !persist(db, &state, Some(&previous))? {
+            return Err("allocation policy revision race during monitor".into());
         }
     }
     Ok(state.status())
@@ -436,9 +444,6 @@ pub fn set_auto_opt_in(
         state.policy.changed_at_ms = now_ms;
     }
     state.validate()?;
-    if !persist(db, &state, Some(&previous))? {
-        return Err("allocation policy revision race during auto opt-in".into());
-    }
     audit(
         db,
         actor,
@@ -452,6 +457,9 @@ pub fn set_auto_opt_in(
         if opt_in { "opted_in" } else { "opted_out" },
         now_ms,
     )?;
+    if !persist(db, &state, Some(&previous))? {
+        return Err("allocation policy revision race during auto opt-in".into());
+    }
     Ok(state.status())
 }
 
@@ -483,9 +491,6 @@ pub fn set_kill_switch(
         state.policy.changed_at_ms = now_ms;
     }
     state.validate()?;
-    if !persist(db, &state, Some(&previous))? {
-        return Err("allocation policy revision race during kill switch".into());
-    }
     audit(
         db,
         actor,
@@ -503,6 +508,9 @@ pub fn set_kill_switch(
         },
         now_ms,
     )?;
+    if !persist(db, &state, Some(&previous))? {
+        return Err("allocation policy revision race during kill switch".into());
+    }
     Ok(state.status())
 }
 
@@ -641,9 +649,10 @@ fn audit(
     let status_json = serde_json::to_string(&state.status())
         .map_err(|error| format!("encode allocation status: {error}"))?;
     let decision = Decision {
+        // The outcome keeps on and off toggles at one revision and millisecond apart.
         id: format!(
-            "gunshi-alloc:{}:{}:{}:{}",
-            state.namespace, action, state.policy.active.revision_id, now_ms
+            "gunshi-alloc:{}:{}:{}:{}:{}",
+            state.namespace, action, outcome, state.policy.active.revision_id, now_ms
         ),
         timestamp: now_ms,
         actor: actor.into(),
@@ -665,7 +674,8 @@ fn audit(
         target_id: state.namespace.clone(),
         outcome: outcome.into(),
     };
-    db.record_decision(&decision)
+    // A retry of the same change at the same instant finds its row and succeeds.
+    db.record_decisions_idempotently(&[decision])
 }
 
 fn required(name: &str, value: &str) -> Result<(), String> {
@@ -759,6 +769,77 @@ mod tests {
             maximum_p95_latency_ms: 750.0,
             maximum_latency_increase_ms: 100.0,
         }
+    }
+
+    /// Make every later decision-ledger write on the SQLite file at `path` fail.
+    fn fail_decision_writes(path: &std::path::Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_decision_write BEFORE INSERT ON sekai_decisions
+                 BEGIN SELECT RAISE(ABORT, 'injected decision write failure'); END;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_audit_write_keeps_the_state_change_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chisei.db");
+        let db = ChiseiStore::open_sqlite(path.to_str().unwrap());
+        install_baseline(
+            &db,
+            "admin",
+            "support",
+            snapshot("v1", false),
+            gate(),
+            1_000,
+        )
+        .unwrap();
+        fail_decision_writes(&path);
+
+        assert!(set_kill_switch(&db, "admin", "support", true, "incident", 2_000).is_err());
+        let state = load_state(&db, "support").unwrap().unwrap();
+        assert!(!state.kill_switch);
+        assert_eq!(state.policy.changed_at_ms, 1_000);
+        assert!(
+            install_baseline(
+                &db,
+                "admin",
+                "billing",
+                snapshot("v1", false),
+                gate(),
+                2_000
+            )
+            .is_err()
+        );
+        assert!(load_state(&db, "billing").unwrap().is_none());
+    }
+
+    #[test]
+    fn on_and_off_in_the_same_millisecond_get_their_own_audit_rows() {
+        let db = db();
+        install_baseline(
+            &db,
+            "admin",
+            "support",
+            snapshot("v1", false),
+            gate(),
+            1_000,
+        )
+        .unwrap();
+        set_kill_switch(&db, "admin", "support", true, "incident", 2_000).unwrap();
+        set_kill_switch(&db, "admin", "support", false, "", 2_000).unwrap();
+
+        let outcomes: Vec<String> = db
+            .list_decisions_for_action_namespace(AUDIT_KILL, "support")
+            .unwrap()
+            .into_iter()
+            .map(|decision| decision.outcome)
+            .collect();
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert!(outcomes.contains(&"kill_switch_on".to_string()));
+        assert!(outcomes.contains(&"kill_switch_off".to_string()));
     }
 
     #[test]

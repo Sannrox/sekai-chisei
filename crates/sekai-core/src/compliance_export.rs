@@ -113,6 +113,11 @@ pub struct ComplianceVerifyReport {
     pub ok: bool,
     pub content_digest_ok: bool,
     pub signature_ok: bool,
+    /// True only when a signature verified against a caller-supplied trusted
+    /// key. Without one, `signature_ok` proves self-consistency alone: a
+    /// re-signed tampered bundle passes it.
+    #[serde(default)]
+    pub signer_trusted: bool,
     pub errors: Vec<String>,
 }
 
@@ -431,10 +436,13 @@ pub fn verify_compliance_export(
         }
     };
 
+    let signer_trusted =
+        signature_ok && bundle.signature.is_some() && trusted_public_key_hex.is_some();
     ComplianceVerifyReport {
         ok: errors.is_empty() && content_digest_ok && signature_ok,
         content_digest_ok,
         signature_ok,
+        signer_trusted,
         errors,
     }
 }
@@ -842,6 +850,40 @@ mod tests {
         let bad = verify_compliance_export(&tampered, Some(&public));
         assert!(!bad.ok);
         assert!(!bad.content_digest_ok);
+    }
+
+    #[test]
+    fn only_a_trusted_key_makes_the_signer_trusted() {
+        let request = ComplianceExportRequest {
+            namespace: "ns".into(),
+            start_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+            redaction: RedactionMode::Full,
+            actor: "auditor".into(),
+            request_id: "export-trust".into(),
+        };
+        let mut bundle =
+            build_compliance_export(&request, vec![sample_receipt("op-1", 150)], vec![], 1_000)
+                .unwrap();
+        let real = SigningKey::from_bytes(&[11u8; 32]);
+        sign_compliance_export(&mut bundle, &real, "auditor-key", "k1", 2_000).unwrap();
+        let real_public = encode_hex(real.verifying_key().as_bytes());
+        assert!(verify_compliance_export(&bundle, Some(&real_public)).signer_trusted);
+
+        // Tampered, then re-signed with a fresh key: self-consistent, not trusted.
+        let mut forged = bundle.clone();
+        forged.signature = None;
+        forged.receipts[0].operation_class = "tampered".into();
+        forged.manifest.content_digest = content_digest_for(&forged).unwrap();
+        let attacker = SigningKey::from_bytes(&[12u8; 32]);
+        sign_compliance_export(&mut forged, &attacker, "auditor-key", "k1", 2_000).unwrap();
+        let untrusted = verify_compliance_export(&forged, None);
+        assert!(untrusted.ok && !untrusted.signer_trusted, "{untrusted:?}");
+        assert!(!verify_compliance_export(&forged, Some(&real_public)).ok);
+
+        // Unsigned bundles have no signer to trust.
+        bundle.signature = None;
+        assert!(!verify_compliance_export(&bundle, None).signer_trusted);
     }
 
     #[test]
