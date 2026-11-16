@@ -966,6 +966,12 @@ mod tests {
             callback_step(runtime, "integrator", &wrong_callback, &digest(9), 3_200).unwrap_err(),
             WORKFLOW_UNAVAILABLE
         );
+        let mut diverged = envelope.clone();
+        diverged.parameters_json = conflicting.parameters_json.clone();
+        assert_eq!(
+            callback_step(runtime, "integrator", &diverged, &digest(9), 3_300).unwrap_err(),
+            WORKFLOW_UNAVAILABLE
+        );
         envelope.cursor = 2;
         let cancelled = cancel_step(runtime, "integrator", &envelope, 4_000).unwrap();
         assert_eq!(cancelled.status, STATUS_CANCELLED);
