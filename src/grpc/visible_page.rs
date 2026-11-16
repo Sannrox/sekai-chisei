@@ -1,5 +1,9 @@
 //! Bounded pagination over rows whose visibility is known only after loading.
 
+/// Server-side ceiling on raw rows one page request may scan, whatever limit
+/// and offset the caller sends.
+pub(crate) const MAX_SCAN_ROWS: usize = 10_000;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum VisiblePageError<E> {
     Fetch(E),
@@ -10,8 +14,9 @@ pub(crate) enum VisiblePageError<E> {
 /// short page look like the end of storage.
 ///
 /// `fetch` receives a raw storage limit and offset. The scan budget bounds the
-/// work performed when most rows are invisible; exhausting it before filling
-/// the requested page fails closed.
+/// work performed when most rows are invisible and never exceeds
+/// [`MAX_SCAN_ROWS`]; exhausting it before filling the requested page fails
+/// closed.
 pub(crate) fn scan_visible_page<T, E>(
     visible_limit: usize,
     visible_offset: usize,
@@ -22,7 +27,7 @@ pub(crate) fn scan_visible_page<T, E>(
     let max_scan = visible_offset
         .saturating_add(visible_limit)
         .saturating_mul(10)
-        .max(200);
+        .clamp(200, MAX_SCAN_ROWS);
     // RPC page limits are positive i32 values but are not globally capped.
     // Reserve at most one bounded fetch batch so a large caller-supplied limit
     // cannot force an eager, process-sized allocation.
@@ -32,7 +37,8 @@ pub(crate) fn scan_visible_page<T, E>(
     let mut scan_offset = 0i32;
 
     while visible.len() < visible_limit && scanned < max_scan {
-        let batch = fetch(batch_size as i32, scan_offset).map_err(VisiblePageError::Fetch)?;
+        let take = batch_size.min(max_scan - scanned);
+        let batch = fetch(take as i32, scan_offset).map_err(VisiblePageError::Fetch)?;
         if batch.is_empty() {
             break;
         }
@@ -172,5 +178,29 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, VisiblePageError::ScanBudgetExhausted);
+    }
+
+    #[test]
+    fn caller_limit_and_offset_cannot_raise_the_scan_ceiling() {
+        for (limit, offset) in [(i32::MAX as usize, 0), (1, i32::MAX as usize)] {
+            let mut scanned = 0usize;
+            let error = scan_visible_page(
+                limit,
+                offset,
+                |limit, offset| {
+                    scanned += limit as usize;
+                    // Stop a runaway scan so a missing ceiling fails fast.
+                    if scanned > MAX_SCAN_ROWS {
+                        return Err(());
+                    }
+                    Ok((offset..offset.saturating_add(limit)).collect::<Vec<i32>>())
+                },
+                |_| false,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, VisiblePageError::ScanBudgetExhausted);
+            assert!(scanned <= MAX_SCAN_ROWS, "scanned {scanned} rows");
+        }
     }
 }
