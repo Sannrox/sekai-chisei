@@ -21,5 +21,7 @@ artifact digest, and endpoint.
   `experimental-rpcs` feature)
 
 Install trust roots, push signed runtime JSON, then opt the hosted profile
-in. Export uses `SEKAI_MODEL_EVALUATION_SIGNING_KEY` (32-byte hex). Refusals
-are `model_release.missing`, `model_release.stale`, or `model_release.invalid`.
+in. Export reads the signing key (32-byte hex) from `--signing-key <file>`
+or `SEKAI_MODEL_EVALUATION_SIGNING_KEY`; it never takes key material as an
+argument. Refusals are `model_release.missing`, `model_release.stale`, or
+`model_release.invalid`.
