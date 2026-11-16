@@ -332,7 +332,10 @@ pub async fn run_setup(
     println!("  user_id: agent:{}", config.agent);
     println!("  tier: {}", config.tier);
     println!("  gateway key name: {}", config.gateway_key_name);
-    println!("  virtual key: {}", config.gateway_key_secret);
+    println!(
+        "  virtual key: {}",
+        displayed_virtual_key(&config.gateway_key_name, &config.gateway_key_secret)
+    );
     println!(
         "  budget: {} tokens per {}",
         config.budget_tokens, config.budget_period
@@ -416,6 +419,17 @@ fn first_non_empty(primary: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         primary.to_string()
+    }
+}
+
+/// Text the setup summary shows for the virtual key. The default key is derived
+/// from the key name and printed so clients can be configured; an
+/// operator-supplied secret is never echoed, since setup output ends up in logs.
+fn displayed_virtual_key(name: &str, secret: &str) -> String {
+    if secret == default_virtual_key(name) {
+        secret.to_string()
+    } else {
+        "******** (operator-supplied, not shown)".to_string()
     }
 }
 
@@ -1002,6 +1016,15 @@ mod tests {
     use sekai_proto::sekai::sekai_service_server::SekaiServiceServer;
     use std::sync::Arc;
     use tonic::transport::Server;
+
+    #[test]
+    fn summary_masks_operator_supplied_virtual_key() {
+        assert!(!displayed_virtual_key("codex-app", "s3cr3t").contains("s3cr3t"));
+        assert_eq!(
+            displayed_virtual_key("codex-app", &default_virtual_key("codex-app")),
+            "sk-chisei-codex-app"
+        );
+    }
 
     #[test]
     fn parses_setup_args() {
