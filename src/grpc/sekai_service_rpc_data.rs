@@ -908,15 +908,19 @@ pub(super) async fn run_dataset_health_checks(
         &dataset,
         true,
     )?;
-    let now_ms = if inner.now_ms > 0 {
-        inner.now_ms
-    } else {
-        crate::sekai::dataset_version::now_ms()
-    };
+    // A caller-chosen time could pass a stale dataset or lift a quarantine,
+    // so only the server clock judges (#2533). Refused before the run writes.
+    #[allow(deprecated)]
+    let supplied_now_ms = inner.now_ms;
+    if supplied_now_ms != 0 {
+        return Err(Status::invalid_argument(
+            "now_ms is not accepted; health runs use the server clock",
+        ));
+    }
     let results = service
         .db
         .runtime()
-        .run_dataset_health_checks(&inner.dataset_id, now_ms)
+        .run_dataset_health_checks(&inner.dataset_id, crate::sekai::dataset_version::now_ms())
         .map_err(Status::internal)?;
     Ok(Response::new(RunDatasetHealthChecksResponse {
         results: results.iter().map(to_proto_health_result).collect(),

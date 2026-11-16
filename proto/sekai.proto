@@ -2959,7 +2959,9 @@ message ListDatasetHealthResultsResponse {
 }
 message RunDatasetHealthChecksRequest {
   string dataset_id = 1;
-  int64 now_ms = 2;
+  // Must be 0. A non-zero value is refused with INVALID_ARGUMENT: health runs
+  // judge freshness against the server clock, not a time the caller picks.
+  int64 now_ms = 2 [deprecated = true];
 }
 message RunDatasetHealthChecksResponse { repeated DatasetHealthResult results = 1; }
 message DatasetAlert {

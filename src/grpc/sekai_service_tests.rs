@@ -8141,7 +8141,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             "RunDatasetHealthChecks",
             RunDatasetHealthChecksRequest {
                 dataset_id: dataset_id(),
-                now_ms: 0,
+                ..Default::default()
             }
         ))
     );
@@ -8350,6 +8350,81 @@ async fn dataset_versions_and_version_rows_page() {
         rows("not-a-position").await.unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
+}
+
+/// #2533: RunDatasetHealthChecks refuses a caller-supplied time and records
+/// nothing; without one it judges freshness against the server clock.
+#[tokio::test]
+async fn run_dataset_health_checks_uses_the_server_clock() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "clocked".into(),
+            name: "clocked".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "clocked".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "clocked".into(),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: 3_600_000,
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    let results = || {
+        svc.list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
+            dataset_id: "clocked".into(),
+            ..Default::default()
+        }))
+    };
+
+    // A time far past the version would fail freshness if it were honored.
+    #[allow(deprecated)]
+    let supplied = RunDatasetHealthChecksRequest {
+        dataset_id: "clocked".into(),
+        now_ms: i64::MAX / 2,
+    };
+    let refused = svc
+        .run_dataset_health_checks(with_principal(supplied))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(refused.message().contains("now_ms"));
+    assert!(results().await.unwrap().into_inner().results.is_empty());
+
+    let judged = svc
+        .run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+            dataset_id: "clocked".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .results;
+    assert_eq!(judged.len(), 1);
+    assert!(judged[0].passed, "{}", judged[0].detail);
+    assert_eq!(results().await.unwrap().into_inner().results.len(), 1);
 }
 
 #[tokio::test]
@@ -8575,18 +8650,16 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
     }))
     .await
     .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 5_000,
-    }))
-    .await
-    .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 7_000,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 5_000)
+        .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 7_000)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
@@ -8602,12 +8675,11 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .collect();
     assert_eq!(late.len(), 1);
     assert_eq!(late[0].state, "firing");
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 7_500,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 7_500)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
@@ -8621,12 +8693,11 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         alerts.iter().filter(|alert| alert.reason == "late").count(),
         1
     );
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 8_000,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 8_000)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
@@ -8824,12 +8895,11 @@ async fn freshness_violations_notify_bound_consumers_and_hide_unread_evidence() 
         .map(|version| version.created_at_ms)
         .max()
         .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "notify-orders".into(),
-        now_ms: created.saturating_add(10_000),
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("notify-orders", created.saturating_add(10_000))
+        .unwrap();
 
     let alice = svc
         .list_consumer_violation_notifications(with_named_principal(
