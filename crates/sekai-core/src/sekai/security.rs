@@ -153,13 +153,25 @@ impl SecurityChecker {
     }
 }
 
+/// Reads a persisted role, refusing an unknown name instead of defaulting to
+/// a role the row never named.
+fn role_from_column(index: usize, role: &str) -> rusqlite::Result<Role> {
+    Role::parse(role).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            format!("unsupported grant role {role:?}").into(),
+        )
+    })
+}
+
 fn grant_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Grant> {
     let role: String = row.get(3)?;
     Ok(Grant {
         id: row.get(0)?,
         object_id: row.get(1)?,
         principal: row.get(2)?,
-        role: Role::parse(&role).unwrap_or(Role::Viewer),
+        role: role_from_column(3, &role)?,
         created: row.get(4)?,
         purpose: row.get(5)?,
         not_after_ms: row.get(6)?,
@@ -263,7 +275,7 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params![object_id], grant_from_row)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
     /// Keyed grant load (`object_id IN (...)`) for a page of members.
@@ -299,7 +311,9 @@ impl SekaiDb {
             let rows = statement
                 .query_map(params.as_slice(), grant_from_row)
                 .map_err(|error| error.to_string())?;
-            grants.extend(rows.filter_map(|row| row.ok()));
+            for row in rows {
+                grants.push(row.map_err(|error| error.to_string())?);
+            }
         }
         Ok(grants)
     }
@@ -314,7 +328,7 @@ impl SekaiDb {
         let rows = stmt
             .query_map([], grant_from_row)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())
     }
 
     pub fn set_namespace_grant_policy(
@@ -407,7 +421,7 @@ impl SekaiDb {
                         .strip_prefix("namespace:")
                         .unwrap_or(&external_id)
                         .to_string(),
-                    Role::parse(&role).unwrap_or(Role::Viewer),
+                    role_from_column(1, &role)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
@@ -616,6 +630,40 @@ mod tests {
             created: 1,
             updated: 1,
         }
+    }
+
+    #[test]
+    fn a_grant_row_with_an_unknown_role_is_refused_not_read_as_viewer() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_object(&crate::domain::Object {
+            id: "ns-ops".into(),
+            kind: "namespace".into(),
+            name: "ops".into(),
+            namespace: "ops".into(),
+            external_id: "namespace:ops".into(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.create_grant(&Grant {
+            id: "g1".into(),
+            object_id: "ns-ops".into(),
+            principal: "alice".into(),
+            role: Role::Editor,
+            created: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        db.conn()
+            .execute("UPDATE sekai_grants SET role = 'owner' WHERE id = 'g1'", [])
+            .unwrap();
+        assert!(db.get_grant("g1").is_err());
+        assert!(db.list_namespace_roles_for_principal("alice").is_err());
+        // Listings must fail, not return an empty ACL that reads as "no restrictions".
+        assert!(db.list_grants("ns-ops").is_err());
+        assert!(db.list_grants_for_object_ids(&["ns-ops".into()]).is_err());
+        assert!(db.list_all_grants().is_err());
     }
 
     #[test]

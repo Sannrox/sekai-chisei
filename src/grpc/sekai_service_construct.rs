@@ -15,7 +15,13 @@ impl SekaiServiceImpl {
         gateway_schema_principals: Vec<String>,
     ) -> Self {
         let security = Arc::new(SecurityChecker::new());
-        let grants = db.runtime().list_all_grants().unwrap_or_default();
+        // An empty ACL cache allows every object without a cached grant, so an
+        // unreadable grant table (for example an unsupported persisted role)
+        // refuses startup instead of loading no grants.
+        let grants = db
+            .runtime()
+            .list_all_grants()
+            .expect("load persisted grants into the access cache");
         security.load(&grants);
         let schema_definitions = SchemaDefinitionLifecycle::load(db.runtime_arc());
         let object_query_cursor_key = db
@@ -105,5 +111,47 @@ impl SekaiServiceImpl {
     ) -> Self {
         self.object_log_dual_read = dual_read;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SekaiServiceImpl;
+    use crate::sekai::security::{Grant, Role};
+
+    /// One unreadable grant row must refuse startup: loading no grants would
+    /// leave every protected object with an empty, permissive ACL cache.
+    #[test]
+    #[should_panic(expected = "load persisted grants into the access cache")]
+    fn startup_refuses_a_grant_table_with_an_unsupported_role() {
+        let store = crate::db::store::SekaiStore::memory();
+        let runtime = store.runtime();
+        runtime
+            .create_object(&crate::domain::Object {
+                id: "ns-ops".into(),
+                kind: "namespace".into(),
+                name: "ops".into(),
+                namespace: "ops".into(),
+                external_id: "namespace:ops".into(),
+                properties: Default::default(),
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        runtime
+            .create_grant(&Grant {
+                id: "g1".into(),
+                object_id: "ns-ops".into(),
+                principal: "alice".into(),
+                role: Role::Editor,
+                created: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        runtime
+            .conn()
+            .execute("UPDATE sekai_grants SET role = 'owner' WHERE id = 'g1'", [])
+            .unwrap();
+        let _ = SekaiServiceImpl::new(store);
     }
 }
