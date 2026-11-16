@@ -32785,6 +32785,56 @@ mod spawn_db_tests {
         .expect("spawn_db blocked the Tokio worker")
         .unwrap();
     }
+
+    /// Both find RPCs run their store work through the limiter like get and
+    /// list: with every permit held they wait, and they finish once one frees.
+    #[tokio::test(flavor = "current_thread")]
+    async fn find_rpcs_wait_for_a_store_work_permit() {
+        let service = SekaiServiceImpl::new(SekaiStore::memory());
+        let all = service.db_work.available_permits() as u32;
+        let held = service
+            .db_work
+            .clone()
+            .acquire_many_owned(all)
+            .await
+            .unwrap();
+        let wait = Duration::from_millis(200);
+        let by_id = || FindByExternalIdRequest {
+            external_id: "missing".into(),
+        };
+        let by_property = || FindByPropertyRequest {
+            kind: "document".into(),
+            key: "k".into(),
+            value: "v".into(),
+        };
+        tokio::time::timeout(
+            wait,
+            service.find_by_external_id(with_named_principal(by_id(), "alice")),
+        )
+        .await
+        .expect_err("find_by_external_id ran without a store work permit");
+        tokio::time::timeout(
+            wait,
+            service.find_by_property(with_named_principal(by_property(), "alice")),
+        )
+        .await
+        .expect_err("find_by_property ran without a store work permit");
+        drop(held);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.find_by_external_id(with_named_principal(by_id(), "alice")),
+        )
+        .await
+        .expect("find_by_external_id finishes once a permit is free")
+        .unwrap_err();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.find_by_property(with_named_principal(by_property(), "alice")),
+        )
+        .await
+        .expect("find_by_property finishes once a permit is free")
+        .ok();
+    }
 }
 
 /// Stores three one-step Action types on `cust-plan` in `acme`: `plan.a`
