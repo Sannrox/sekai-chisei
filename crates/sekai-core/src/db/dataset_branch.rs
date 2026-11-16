@@ -553,11 +553,15 @@ impl SekaiDb {
     ) -> Result<DatasetBranchProposal, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        // Only an open proposal is held; a merged one still replays.
-        if load_proposal(&tx, &request.dataset_id, &request.proposal_id)
-            .is_ok_and(|proposal| proposal.status == dataset_branch::STATUS_OPEN)
-            && attached_to_open_definition_proposal(&tx, &request.dataset_id, &request.proposal_id)?
-        {
+        // Only an open proposal of the caller's tenant is held; a merged one
+        // still replays, and a foreign one reads as missing below.
+        if load_proposal(&tx, &request.dataset_id, &request.proposal_id).is_ok_and(|proposal| {
+            proposal.status == dataset_branch::STATUS_OPEN && proposal.tenant == request.tenant
+        }) && attached_to_open_definition_proposal(
+            &tx,
+            &request.dataset_id,
+            &request.proposal_id,
+        )? {
             return Err(dataset_branch::PROPOSAL_ATTACHED.into());
         }
         let proposal = merge_dataset_branch_tx(&tx, request, check)?;

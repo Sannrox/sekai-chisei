@@ -467,15 +467,17 @@ impl PostgresDb {
         // Under the rows lock, which an attaching definition merge also takes.
         // A definition proposal created meanwhile may still attach this one;
         // its merge then fails as stale, writing nothing. Only an open
-        // proposal is held; a merged one still replays.
-        if load_proposal(&mut tx, &request.dataset_id, &request.proposal_id, false)
-            .is_ok_and(|proposal| proposal.status == dataset_branch::STATUS_OPEN)
-            && attached_to_open_definition_proposal(
-                &mut tx,
-                &request.dataset_id,
-                &request.proposal_id,
-            )?
-        {
+        // proposal of the caller's tenant is held; a merged one still
+        // replays, and a foreign one reads as missing below.
+        if load_proposal(&mut tx, &request.dataset_id, &request.proposal_id, false).is_ok_and(
+            |proposal| {
+                proposal.status == dataset_branch::STATUS_OPEN && proposal.tenant == request.tenant
+            },
+        ) && attached_to_open_definition_proposal(
+            &mut tx,
+            &request.dataset_id,
+            &request.proposal_id,
+        )? {
             return Err(dataset_branch::PROPOSAL_ATTACHED.into());
         }
         let proposal = merge_dataset_branch_pg(&mut tx, request, check)?;
