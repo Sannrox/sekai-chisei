@@ -43,8 +43,12 @@ pub fn decode(bytes: &[u8]) -> Result<Table, DecodeError> {
         .first()
         .is_some_and(|leaf| leaf.name == "id" && leaf.required);
     let mut rows = Vec::new();
+    // The cap bounds rows across the whole file, not each group, so many
+    // small-footprint row groups cannot multiply it.
+    let mut rows_left = count_cap(bytes.len());
     for group in &meta.groups {
-        let num_rows = bound_count(group.num_rows, count_cap(bytes.len()))?;
+        let num_rows = bound_count(group.num_rows, rows_left)?;
+        rows_left -= num_rows;
         if group.columns.len() != meta.leaves.len() {
             return Err(DecodeError("column count"));
         }
@@ -344,4 +348,49 @@ fn read_uleb128(data: &[u8]) -> Result<(u64, &[u8]), DecodeError> {
         }
     }
     Err(DecodeError("truncated varint"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::thrift::CompactWriter;
+
+    /// A file with a root-only schema and `groups` column-less row groups,
+    /// each claiming `rows_per_group` rows.
+    fn column_less_file(groups: usize, rows_per_group: i64) -> Vec<u8> {
+        let mut meta = CompactWriter::new();
+        meta.begin_struct();
+        meta.begin_list_field(2, T_STRUCT, 1);
+        meta.begin_struct();
+        meta.write_str_field(4, "schema");
+        meta.end_struct();
+        meta.begin_list_field(4, T_STRUCT, groups);
+        for _ in 0..groups {
+            meta.begin_struct();
+            meta.begin_list_field(1, T_STRUCT, 0);
+            meta.write_i64_field(3, rows_per_group);
+            meta.end_struct();
+        }
+        meta.end_struct();
+        let mut file = MAGIC.to_vec();
+        file.extend(&meta.buf);
+        file.extend((meta.buf.len() as u32).to_le_bytes());
+        file.extend(MAGIC);
+        file
+    }
+
+    #[test]
+    fn rows_are_bounded_across_row_groups() {
+        let groups = 4;
+        // 1000 and the cap below share a varint width, so the size is stable.
+        let len = column_less_file(groups, 1000).len();
+        let per_group = count_cap(len) as i64;
+        let file = column_less_file(groups, per_group);
+        assert_eq!(file.len(), len, "row counts must not change the file size");
+
+        assert_eq!(
+            decode(&file).err().map(|error| error.0),
+            Some("count exceeds input")
+        );
+    }
 }
