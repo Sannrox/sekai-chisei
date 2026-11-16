@@ -440,3 +440,68 @@ fn context_is_one_line_of_plain_text() {
 fn postgres_surface_is_explicitly_unavailable() {
     assert!(POSTGRES_UNAVAILABLE.contains("PostgreSQL"));
 }
+
+/// #2472: each transition writes its record, then its audit. When the audit
+/// write fails, the retry finds the record in place; it must still leave
+/// exactly one audit for that transition.
+#[test]
+fn a_retry_after_an_audit_failure_records_the_audit_once() {
+    let db = db();
+    // The guard is dropped at the end of the statement: the memory store has
+    // one connection, and every transition below takes it again.
+    let audits_fail = |fail: bool| {
+        db.runtime()
+            .conn()
+            .execute_batch(if fail {
+                "CREATE TRIGGER fail_decision_write BEFORE INSERT ON sekai_decisions
+                 BEGIN SELECT RAISE(ABORT, 'injected decision write failure'); END;"
+            } else {
+                "DROP TRIGGER fail_decision_write;"
+            })
+            .unwrap();
+    };
+    record_candidate(&db);
+    let request = ProposeLearningChange {
+        namespace: "payments".into(),
+        learning_id: "learning-1".into(),
+        evidence_digest: evidence(),
+    };
+    // (action, first actor, retrying actor, step). A lease loss may be
+    // retried by another instance; its audit still names the first actor.
+    type Step<'a> = &'a dyn Fn(&str, i64) -> Result<LearningChange, String>;
+    let steps: [(&str, &str, &str, Step); 5] = [
+        (PROPOSE_ACTION, "operator", "operator", &|actor, at| {
+            propose_change(&db, actor, &request, at)
+        }),
+        (APPROVE_ACTION, "reviewer", "reviewer", &|actor, at| {
+            approve_change(&db, actor, "payments", "learning-1", at)
+        }),
+        (ACTIVATE_ACTION, "operator", "operator", &|actor, at| {
+            activate_change(&db, actor, "payments", "learning-1", at)
+        }),
+        (ROLLBACK_ACTION, "operator", "operator", &|actor, at| {
+            rollback_change(&db, actor, "payments", "learning-1", at)
+        }),
+        (RECONCILE_ACTION, "operator", "recovery", &|actor, at| {
+            note_lease_loss(&db, actor, "payments", "learning-1", at)
+        }),
+    ];
+    for (index, (action, first, retrying, step)) in steps.iter().enumerate() {
+        let at = 1_000 * (index as i64 + 1);
+        audits_fail(true);
+        assert!(step(first, at).is_err(), "{action}: the audit write fails");
+        audits_fail(false);
+        for retry in 1..=2 {
+            step(retrying, at + retry).unwrap();
+        }
+        let audits = db
+            .list_decisions_for_action_namespace(action, "payments")
+            .unwrap();
+        assert_eq!(audits.len(), 1, "{action}: {audits:?}");
+        assert_eq!(
+            (audits[0].timestamp, audits[0].actor.as_str()),
+            (at, *first),
+            "{action}"
+        );
+    }
+}

@@ -25,6 +25,8 @@ pub const APPROVE_ACTION: &str = "learning.change_approve";
 pub const ACTIVATE_ACTION: &str = "learning.change_activate";
 pub const ROLLBACK_ACTION: &str = "learning.change_rollback";
 pub const RECONCILE_ACTION: &str = "learning.change_reconcile";
+/// Lineage action of a lease loss; it keeps who noted it for audit repair.
+const LEASE_LOST_LINEAGE: &str = "lease_lost";
 
 const STATUS_PROPOSED: &str = "proposed";
 const STATUS_APPROVED: &str = "approved";
@@ -126,6 +128,7 @@ pub fn propose_change(
             && existing.baseline_digest == baseline_digest
             && existing.status == STATUS_PROPOSED
         {
+            reaudit(db, actor, PROPOSE_ACTION, "proposed", &existing)?;
             return Ok(existing);
         }
         existing.baseline_digest = baseline_digest;
@@ -202,6 +205,7 @@ pub fn approve_change(
             .as_ref()
             .is_some_and(|item| item.approved_by == actor)
     {
+        reaudit(db, actor, APPROVE_ACTION, "approved", &record)?;
         return Ok(record);
     }
     if record.status != STATUS_PROPOSED && record.status != STATUS_APPROVED {
@@ -233,6 +237,7 @@ pub fn activate_change(
     let mut record = get_change(db, namespace, learning_id)?;
     deny_if_unusable(&record)?;
     if record.status == STATUS_ACTIVE {
+        reaudit(db, actor, ACTIVATE_ACTION, "activated", &record)?;
         return Ok(record);
     }
     require_current_candidate(facts, &record)?;
@@ -268,6 +273,7 @@ pub fn rollback_change(
     let mut record = get_change(db, namespace, learning_id)?;
     deny_if_unusable(&record)?;
     if record.status == STATUS_ROLLED_BACK {
+        reaudit(db, actor, ROLLBACK_ACTION, "rolled_back", &record)?;
         return Ok(record);
     }
     if record.status != STATUS_ACTIVE {
@@ -300,9 +306,16 @@ pub fn note_lease_loss(
     }
     let mut record = get_change(db, namespace, learning_id)?;
     if record.reconciliation == RECONCILE_LEASE_LOST {
+        reaudit(db, actor, RECONCILE_ACTION, "lease_lost", &record)?;
         return Ok(record);
     }
     record.reconciliation = RECONCILE_LEASE_LOST.into();
+    record.lineage.push(LearningChangeLineageEntry {
+        action: LEASE_LOST_LINEAGE.into(),
+        actor: actor.into(),
+        at_ms: now_ms,
+        restored_change_id: None,
+    });
     record.updated_at_ms = now_ms;
     db.put_learning_change(&record)?;
     audit(db, actor, RECONCILE_ACTION, "lease_lost", &record, now_ms)?;
@@ -573,6 +586,45 @@ fn audit(
     now_ms: i64,
 ) -> Result<(), String> {
     db.record_decision(&decision(actor, action, outcome, record, now_ms))
+}
+
+/// Record the audit of the transition `record` already holds, unless it is
+/// there. A transition writes its record, then its audit; when the audit
+/// write fails, the retry finds the record in place and returns early, so it
+/// repairs the audit here (#2472). The audit id and actor come from what the
+/// record stored for that transition, so a repeat adds nothing, whoever
+/// retries.
+fn reaudit(
+    db: &ChiseiStore,
+    caller: &str,
+    action: &str,
+    outcome: &str,
+    record: &LearningChange,
+) -> Result<(), String> {
+    let (actor, at_ms) = match action {
+        APPROVE_ACTION => record
+            .approval
+            .as_ref()
+            .map(|approval| (approval.approved_by.as_str(), approval.approved_at_ms))
+            .ok_or_else(|| UNAVAILABLE.to_string())?,
+        // A lease loss recorded before it entered the lineage stored no
+        // actor; only then does the repair name the caller.
+        RECONCILE_ACTION => record
+            .lineage
+            .iter()
+            .rfind(|entry| entry.action == LEASE_LOST_LINEAGE)
+            .map(|entry| (entry.actor.as_str(), entry.at_ms))
+            .unwrap_or((caller, record.updated_at_ms)),
+        _ => record
+            .lineage
+            .last()
+            .map(|entry| (entry.actor.as_str(), entry.at_ms))
+            .unwrap_or((record.proposed_by.as_str(), record.proposed_at_ms)),
+    };
+    let requested = decision(actor, action, outcome, record, at_ms);
+    db.record_decisions_idempotently_by(&[requested], |existing, requested| {
+        existing.id == requested.id
+    })
 }
 
 fn decision(
