@@ -428,6 +428,11 @@ fn family_enabled_in_other_region(
     })
 }
 
+/// Counts route refusals whose decision-ledger write failed.
+const ADMISSION_AUDIT_FAILED_METRIC: &str = "chisei_model_admission_audit_failed_total";
+
+/// Write a refusal to the decision ledger. The refusal stands either way; a
+/// failed write is logged and counted so a lost audit is visible (#2473).
 fn audit_admission_refusal(
     db: &ChiseiStore,
     actor: &str,
@@ -435,8 +440,8 @@ fn audit_admission_refusal(
     namespace: &str,
     region: &str,
     refusal: &AdmissionRefusal,
-) -> Result<(), String> {
-    db.record_decision(&Decision {
+) {
+    let written = db.record_decision(&Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: actor.to_string(),
@@ -464,11 +469,15 @@ fn audit_admission_refusal(
             region
         ),
         outcome: "denied".into(),
-    })
+    });
+    if let Err(error) = written {
+        tracing::error!(%error, namespace, provider = %identity.provider, model = %identity.model, region, "failed to audit model route refusal");
+        metrics::counter!(ADMISSION_AUDIT_FAILED_METRIC).increment(1);
+    }
 }
 
 /// Default-deny route admission: only `enabled` proceeds. Every refusal is
-/// written to the decision ledger.
+/// written to the decision ledger, or logged and counted when that write fails.
 pub fn admit_enabled_route(
     db: &ChiseiStore,
     namespace: &str,
@@ -488,7 +497,7 @@ pub fn admit_enabled_route(
         Ok(state) => state,
         Err(_) => {
             let refusal = refusal_for(ModelReviewStatus::Disallowed, REFUSAL_NOT_ENABLED);
-            let _ = audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
+            audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
             return Err(refusal);
         }
     };
@@ -502,7 +511,7 @@ pub fn admit_enabled_route(
         REFUSAL_NOT_ENABLED
     };
     let refusal = refusal_for(status, reason);
-    let _ = audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
+    audit_admission_refusal(db, actor, identity, namespace, region, &refusal);
     Err(refusal)
 }
 
@@ -2070,3 +2079,7 @@ mod tests {
         .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "model_review_tests.rs"]
+mod ledger_failure_tests;

@@ -49,6 +49,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 sekai-adapters = { path = "../sekai-adapters" }
 sekai-proto = { version = "3.0.0", path = "../sekai-proto" }
 sekai-core = { version = "4.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
