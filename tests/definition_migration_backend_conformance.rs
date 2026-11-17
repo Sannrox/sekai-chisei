@@ -434,6 +434,11 @@ fn sqlite_rollback_requires_stored_revision_identity() {
 }
 
 #[test]
+fn sqlite_committed_migration_id_cannot_be_reused() {
+    exercise_migration_id_reuse(sqlite_db(), "fact-mig-reuse");
+}
+
+#[test]
 fn sqlite_fact_migration_omits_hidden_and_preserves_ungranted_properties() {
     exercise_object_security_and_property_grants(sqlite_db(), "fact-mig-auth");
 }
@@ -445,9 +450,55 @@ fn postgres_definition_fact_migration_conformance() {
     let db = RuntimeDb::Postgres(Arc::new(postgres()));
     exercise(db.clone(), &prefix);
     exercise_rollback_mismatch(db.clone(), &format!("{prefix}-mismatch"));
+    exercise_migration_id_reuse(db.clone(), &format!("{prefix}-reuse"));
     exercise_object_security_and_property_grants(db.clone(), &format!("{prefix}-auth"));
     exercise_rollback_denied_when_snapshot_hidden(db.clone(), &format!("{prefix}-hidden-rb"));
     exercise_rollback_denied_when_ungranted_property_differs(db, &format!("{prefix}-grant-rb"));
+}
+
+/// A request that reuses a committed migration id is refused and leaves the
+/// committed record, so the migration still rolls back.
+fn exercise_migration_id_reuse(db: RuntimeDb, namespace: &str) {
+    let (from, to) = publish_breaking(&db, namespace);
+    db.create_object(&object(namespace, "open", "hello", Some("classified")))
+        .unwrap();
+    let request = |mode: &str, key: &str| ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m-reuse".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: mode.into(),
+        idempotency_key: key.into(),
+    };
+    let committed = db
+        .execute_definition_fact_migration(
+            &request(MODE_EXECUTE, "run"),
+            "author",
+            &ctx("author"),
+            9,
+        )
+        .unwrap();
+    assert_eq!(committed.status, STATUS_COMMITTED);
+    for (mode, key) in [(MODE_DRY_RUN, "again-dry"), (MODE_EXECUTE, "again-run")] {
+        let error = db
+            .execute_definition_fact_migration(&request(mode, key), "author", &ctx("author"), 10)
+            .unwrap_err();
+        assert!(error.starts_with("fact_migration_id_in_use"), "{error}");
+    }
+    let stored = db
+        .get_definition_fact_migration(namespace, "m-reuse")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.status, STATUS_COMMITTED);
+    let rolled_back = db
+        .execute_definition_fact_migration(
+            &request(MODE_ROLLBACK, "undo"),
+            "author",
+            &ctx("author"),
+            11,
+        )
+        .unwrap();
+    assert_eq!(rolled_back.status, STATUS_ROLLED_BACK);
 }
 
 fn exercise_rollback_mismatch(db: RuntimeDb, namespace: &str) {
