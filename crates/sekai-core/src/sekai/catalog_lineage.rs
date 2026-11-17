@@ -4,7 +4,7 @@
 //! have no lineage. A node whose target the caller cannot discover is a
 //! redacted placeholder: kind only.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::domain::Object;
@@ -92,47 +92,10 @@ pub fn walk_lineage(
             next_page_token: String::new(),
         });
     };
-    let entries = list_catalog_entries(db, &start.namespace)?;
-    let transforms = db
-        .list_governed_transforms(&start.namespace)
-        .map_err(CatalogError::Storage)?;
-    let datasets = db.list_datasets().map_err(CatalogError::Storage)?;
-    let mut type_links = Vec::new();
-    for dataset in &datasets {
-        for (namespace, kind) in db
-            .dataset_bindings(&dataset.id)
-            .map_err(CatalogError::Storage)?
-        {
-            if namespace == start.namespace {
-                type_links.push((dataset.id.clone(), kind));
-            }
-        }
-    }
-    let mut source_datasets = Vec::new();
-    for entry in &entries {
-        let Some(binding) = binding_from_entry(entry) else {
-            continue;
-        };
-        if binding.kind != BindingKind::Source {
-            continue;
-        }
-        let Some(lineage) = db
-            .get_source_identity_lineage(&start.namespace, &binding.target_id)
-            .map_err(CatalogError::Storage)?
-        else {
-            continue;
-        };
-        source_datasets.push((binding.target_id, lineage.dataset_id));
-    }
+    let graph = LineageGraph::load(db, &start.namespace)?;
     let start_core = CoreRef {
         kind: start_binding.kind,
         id: start_binding.target_id.clone(),
-    };
-    let graph = LineageGraph {
-        entries: &entries,
-        transforms: &transforms,
-        type_links: &type_links,
-        source_datasets: &source_datasets,
     };
     let upstream = collect_direction(
         &start_core,
@@ -189,50 +152,13 @@ pub fn reachable_data_markings(
     let Some(start_binding) = binding_from_entry(start) else {
         return Ok(Vec::new());
     };
-    let entries = list_catalog_entries(db, &start.namespace)?;
-    let transforms = db
-        .list_governed_transforms(&start.namespace)
-        .map_err(CatalogError::Storage)?;
-    let datasets = db.list_datasets().map_err(CatalogError::Storage)?;
-    let mut type_links = Vec::new();
-    for dataset in &datasets {
-        for (namespace, kind) in db
-            .dataset_bindings(&dataset.id)
-            .map_err(CatalogError::Storage)?
-        {
-            if namespace == start.namespace {
-                type_links.push((dataset.id.clone(), kind));
-            }
-        }
-    }
-    let mut source_datasets = Vec::new();
-    for entry in &entries {
-        let Some(binding) = binding_from_entry(entry) else {
-            continue;
-        };
-        if binding.kind != BindingKind::Source {
-            continue;
-        }
-        let Some(lineage) = db
-            .get_source_identity_lineage(&start.namespace, &binding.target_id)
-            .map_err(CatalogError::Storage)?
-        else {
-            continue;
-        };
-        source_datasets.push((binding.target_id, lineage.dataset_id));
-    }
+    let graph = LineageGraph::load(db, &start.namespace)?;
     let start_core = CoreRef {
         kind: start_binding.kind,
         id: start_binding.target_id.clone(),
     };
-    let graph = LineageGraph {
-        entries: &entries,
-        transforms: &transforms,
-        type_links: &type_links,
-        source_datasets: &source_datasets,
-    };
     let mut markings = Vec::new();
-    for entry in entries_for(&start_core, &entries) {
+    for entry in graph.entries_for(&start_core) {
         if is_data_entry(entry)
             && let Some(marking) = marking_of(entry)
         {
@@ -267,31 +193,85 @@ enum Direction {
     Downstream,
 }
 
-struct LineageGraph<'a> {
-    entries: &'a [Object],
-    transforms: &'a [GovernedTransform],
-    type_links: &'a [(String, String)],
-    source_datasets: &'a [(String, String)],
+/// One namespace's lineage graph. `load` reads it with a fixed number of
+/// store queries for the datasets and transforms, plus one receipt lookup per
+/// bound source entry; walks then stay in memory.
+struct LineageGraph {
+    entries: Vec<Object>,
+    /// Indexes into `entries`, keyed by each entry's binding.
+    entries_by_core: HashMap<CoreRef, Vec<usize>>,
+    transforms: Vec<GovernedTransform>,
+    /// (dataset id, object type kind) for each object type backed by a dataset.
+    type_links: Vec<(String, String)>,
+    /// (source id, dataset id) for each bound source with a receipt.
+    source_datasets: Vec<(String, String)>,
+}
+
+impl LineageGraph {
+    fn load(db: &RuntimeDb, namespace: &str) -> Result<Self, CatalogError> {
+        let entries = list_catalog_entries(db, namespace)?;
+        let transforms = db
+            .list_governed_transforms(namespace)
+            .map_err(CatalogError::Storage)?;
+        let type_links = db
+            .list_object_type_datasources(namespace)
+            .map_err(CatalogError::Storage)?
+            .into_iter()
+            .map(|datasource| (datasource.dataset_id, datasource.kind))
+            .collect();
+        let mut entries_by_core = HashMap::<CoreRef, Vec<usize>>::new();
+        let mut source_datasets = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(binding) = binding_from_entry(entry) else {
+                continue;
+            };
+            if binding.kind == BindingKind::Source
+                && let Some(lineage) = db
+                    .get_source_identity_lineage(namespace, &binding.target_id)
+                    .map_err(CatalogError::Storage)?
+            {
+                source_datasets.push((binding.target_id.clone(), lineage.dataset_id));
+            }
+            entries_by_core
+                .entry(CoreRef {
+                    kind: binding.kind,
+                    id: binding.target_id,
+                })
+                .or_default()
+                .push(index);
+        }
+        Ok(Self {
+            entries,
+            entries_by_core,
+            transforms,
+            type_links,
+            source_datasets,
+        })
+    }
+
+    /// Catalog entries bound to `core`, in listing order.
+    fn entries_for<'a>(&'a self, core: &CoreRef) -> impl Iterator<Item = &'a Object> {
+        self.entries_by_core
+            .get(core)
+            .into_iter()
+            .flatten()
+            .map(|&index| &self.entries[index])
+    }
 }
 
 fn collect_direction(
     start: &CoreRef,
     direction: Direction,
     depth: usize,
-    graph: &LineageGraph<'_>,
+    graph: &LineageGraph,
     readable: &impl Fn(&Object) -> bool,
     discoverable: &impl Fn(&CatalogBinding) -> bool,
 ) -> Vec<LineageNode> {
     let mut nodes = Vec::new();
     let mut seen_cores = HashSet::from([start.clone()]);
     let mut seen_entries = HashSet::from([graph
-        .entries
-        .iter()
-        .find(|entry| {
-            binding_from_entry(entry)
-                .map(|binding| binding.kind == start.kind && binding.target_id == start.id)
-                .unwrap_or(false)
-        })
+        .entries_for(start)
+        .next()
         .map(|entry| entry.id.clone())
         .unwrap_or_default()]);
     let mut queue = VecDeque::from([(start.clone(), 0usize)]);
@@ -304,7 +284,7 @@ fn collect_direction(
                 continue;
             }
             queue.push_back((neighbor.clone(), hops + 1));
-            for entry in entries_for(&neighbor, graph.entries) {
+            for entry in graph.entries_for(&neighbor) {
                 if !seen_entries.insert(entry.id.clone()) {
                     continue;
                 }
@@ -333,11 +313,11 @@ fn collect_direction(
     nodes
 }
 
-fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> Vec<CoreRef> {
+fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph) -> Vec<CoreRef> {
     let mut out = Vec::new();
     match (core.kind, direction) {
         (BindingKind::Dataset, Direction::Upstream) => {
-            for transform in graph.transforms {
+            for transform in &graph.transforms {
                 if transform.output_dataset_id == core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Transform,
@@ -345,7 +325,7 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
                     });
                 }
             }
-            for (source_id, dataset_id) in graph.source_datasets {
+            for (source_id, dataset_id) in &graph.source_datasets {
                 if dataset_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Source,
@@ -355,7 +335,7 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
             }
         }
         (BindingKind::Dataset, Direction::Downstream) => {
-            for transform in graph.transforms {
+            for transform in &graph.transforms {
                 if transform.consumes_dataset(&core.id) {
                     out.push(CoreRef {
                         kind: BindingKind::Transform,
@@ -363,7 +343,7 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
                     });
                 }
             }
-            for (dataset_id, object_type_id) in graph.type_links {
+            for (dataset_id, object_type_id) in &graph.type_links {
                 if dataset_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::ObjectType,
@@ -395,7 +375,7 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
             }
         }
         (BindingKind::ObjectType, Direction::Upstream) => {
-            for (dataset_id, object_type_id) in graph.type_links {
+            for (dataset_id, object_type_id) in &graph.type_links {
                 if object_type_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Dataset,
@@ -407,7 +387,7 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
         (BindingKind::ObjectType, Direction::Downstream) => {}
         (BindingKind::Source, Direction::Upstream) => {}
         (BindingKind::Source, Direction::Downstream) => {
-            for (source_id, dataset_id) in graph.source_datasets {
+            for (source_id, dataset_id) in &graph.source_datasets {
                 if source_id == &core.id {
                     out.push(CoreRef {
                         kind: BindingKind::Dataset,
@@ -418,17 +398,6 @@ fn neighbors(core: &CoreRef, direction: Direction, graph: &LineageGraph<'_>) -> 
         }
     }
     out
-}
-
-fn entries_for<'a>(core: &CoreRef, entries: &'a [Object]) -> Vec<&'a Object> {
-    entries
-        .iter()
-        .filter(|entry| {
-            binding_from_entry(entry)
-                .map(|binding| binding.kind == core.kind && binding.target_id == core.id)
-                .unwrap_or(false)
-        })
-        .collect()
 }
 
 fn list_catalog_entries(db: &RuntimeDb, namespace: &str) -> Result<Vec<Object>, CatalogError> {
@@ -763,6 +732,87 @@ mod tests {
                 true
             }
         }));
+    }
+
+    thread_local! {
+        static STATEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn count_statement(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(..) = event {
+            STATEMENTS.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    fn bind_object_type(db: &RuntimeDb, dataset_id: &str) {
+        db.create_dataset(&dataset(dataset_id, "")).unwrap();
+        db.register_object_type_datasource(
+            &crate::sekai::object_type_index::ObjectTypeDatasource {
+                contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+                namespace: "acme".into(),
+                kind: format!("Kind{dataset_id}"),
+                definition_digest: "sha256:kind".into(),
+                dataset_id: dataset_id.into(),
+                key_column: "id".into(),
+                property_mapping: Default::default(),
+                hidden_column: String::new(),
+                edits_only: false,
+                conflict_rule: String::new(),
+                source_timestamp_property: String::new(),
+            }
+            .prepare()
+            .unwrap(),
+            1,
+        )
+        .unwrap();
+    }
+
+    fn statements_per_walk(db: &RuntimeDb, start: &Object) -> usize {
+        STATEMENTS.with(|count| count.set(0));
+        walk_lineage(db, start, 8, 32, 0, |_| true, |_| true).unwrap();
+        reachable_data_markings(db, start).unwrap();
+        STATEMENTS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_walk_reads_the_store_a_fixed_number_of_times_however_many_datasets_exist() {
+        let db = db();
+        bind_object_type(&db, "d0");
+        let start = register(
+            &db,
+            entry(
+                EntryKind::Dataset,
+                "d0",
+                CatalogBinding {
+                    kind: BindingKind::Dataset,
+                    target_id: "d0".into(),
+                    source_type_descriptor_id: String::new(),
+                },
+            ),
+            "svc",
+            1,
+            None,
+            |_, _| Ok(()),
+        )
+        .unwrap()
+        .entry;
+        let RuntimeDb::Sqlite(sqlite) = &db else {
+            unreachable!("the test store is SQLite")
+        };
+        sqlite
+            .conn()
+            .trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(count_statement),
+            )
+            .unwrap();
+        let few = statements_per_walk(&db, &start);
+        for index in 1..=12 {
+            bind_object_type(&db, &format!("d{index}"));
+        }
+        let many = statements_per_walk(&db, &start);
+        assert!(few > 0);
+        assert_eq!(few, many);
     }
 
     #[test]
