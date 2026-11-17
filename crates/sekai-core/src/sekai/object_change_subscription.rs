@@ -102,6 +102,16 @@ pub struct CommittedObjectMutation {
     pub object_namespace: String,
 }
 
+/// What a strict reader may learn of beyond the visible objects it was
+/// resolved: see [`read_object_change_subscription_for_reader`].
+#[derive(Debug, Clone, Default)]
+pub struct ReaderVisibility {
+    /// Live ids the reader may read now, in or out of the scope's filters.
+    pub readable_ids: BTreeSet<String>,
+    /// Deleted ids whose history the reader may read.
+    pub readable_deletes: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ObjectChangeStreamState {
     kind: String,
@@ -199,6 +209,62 @@ pub fn read_object_change_subscription_with_resolved_objects<F>(
 ) -> Result<ObjectChangePage, String>
 where
     F: FnOnce(&[String]) -> Result<Vec<Object>, String>,
+{
+    read_object_changes(
+        db,
+        actor,
+        request,
+        now_ms,
+        resolved_visible,
+        |object_ids, _| Ok((resolve_visible(object_ids)?, None)),
+        authorization_pin,
+    )
+}
+
+/// Reads a page for a reader that may learn of no object it cannot read.
+/// `resolve` gets the live and the deleted ids a page would name and returns
+/// the visible objects plus what else the reader may read. A change to any
+/// other object restarts the subscription: the page is `resnapshot_required`,
+/// names no object, and the next read with the new revision continues it.
+pub fn read_object_change_subscription_for_reader<F>(
+    db: &RuntimeDb,
+    actor: &str,
+    request: &ObjectChangeReadRequest,
+    now_ms: i64,
+    resolved_visible: &mut Vec<Object>,
+    resolve: F,
+    authorization_pin: &str,
+) -> Result<ObjectChangePage, String>
+where
+    F: FnOnce(&[String], &[String]) -> Result<(Vec<Object>, ReaderVisibility), String>,
+{
+    read_object_changes(
+        db,
+        actor,
+        request,
+        now_ms,
+        resolved_visible,
+        |object_ids, deleted_ids| {
+            let (visible, reader) = resolve(object_ids, deleted_ids)?;
+            Ok((visible, Some(reader)))
+        },
+        authorization_pin,
+    )
+}
+
+/// `resolve` returns the visible objects and, for a strict reader, what else
+/// it may read; `None` keeps the lenient projection.
+fn read_object_changes<F>(
+    db: &RuntimeDb,
+    actor: &str,
+    request: &ObjectChangeReadRequest,
+    now_ms: i64,
+    resolved_visible: &mut Vec<Object>,
+    resolve: F,
+    authorization_pin: &str,
+) -> Result<ObjectChangePage, String>
+where
+    F: FnOnce(&[String], &[String]) -> Result<(Vec<Object>, Option<ReaderVisibility>), String>,
 {
     resolved_visible.clear();
     required("actor", actor)?;
@@ -308,14 +374,20 @@ where
             .collect(),
     )?;
     let object_ids = object_ids_for_projection(&scope, &raw);
-    *resolved_visible = resolve_visible(&object_ids)?;
-    let events = project_events(
+    let deleted_ids = deleted_ids_for_projection(&scope, &raw);
+    let (visible, reader) = resolve(&object_ids, &deleted_ids)?;
+    *resolved_visible = visible;
+    let Some(events) = project(
         &scope,
         resolved_visible,
+        reader.as_ref(),
         &raw,
         subscription.cursor.committed_offset,
         &operation_ids,
-    )?;
+    )?
+    else {
+        return restart_for_resnapshot(db, &subscription, now_ms, live_revision);
+    };
     let limit = page_limit(request.limit);
     let page_events = events.into_iter().take(limit).collect::<Vec<_>>();
     if page_events.is_empty() {
@@ -495,9 +567,20 @@ fn ensure_subscription(
                 && subscription.definition_digest == stream.definition_digest
                 && !idle_past_retention(&subscription, now_ms) =>
         {
-            if !subscription.cursor.feed_epoch.is_empty()
-                && subscription.cursor.feed_epoch != request.snapshot_revision
-            {
+            if subscription.cursor.feed_epoch.is_empty() {
+                // Restarted for a resnapshot: the first read pins its revision.
+                let admitted = EventSubscription {
+                    cursor: EventSubscriptionCursor {
+                        feed_epoch: request.snapshot_revision.clone(),
+                        admitted_at_ms: now_ms,
+                        ..subscription.cursor.clone()
+                    },
+                    ..subscription
+                };
+                db.put_event_subscription(&admitted)?;
+                return Ok(admitted);
+            }
+            if subscription.cursor.feed_epoch != request.snapshot_revision {
                 return Err("object-change snapshot revision is stale".into());
             }
             Ok(subscription)
@@ -587,6 +670,20 @@ pub fn project_events(
     prior_offset: u64,
     operation_ids: &HashMap<String, String>,
 ) -> Result<Vec<ObjectChangeEvent>, String> {
+    Ok(project(scope, visible, None, mutations, prior_offset, operation_ids)?.unwrap_or_default())
+}
+
+/// [`project_events`]; with `reader`, a change to an object the reader may not
+/// read (or, deleted, whose history it may not read) yields `None`: the page
+/// must restart instead of naming that object.
+fn project(
+    scope: &ObjectChangeScope,
+    visible: &[Object],
+    reader: Option<&ReaderVisibility>,
+    mutations: &[CommittedObjectMutation],
+    prior_offset: u64,
+    operation_ids: &HashMap<String, String>,
+) -> Result<Option<Vec<ObjectChangeEvent>>, String> {
     let mut events = Vec::new();
     let mut offset = prior_offset;
     let pinned: BTreeSet<&str> = scope.object_ids.iter().map(String::as_str).collect();
@@ -621,11 +718,22 @@ pub fn project_events(
             continue;
         }
         // A live object the caller cannot see was never theirs to learn of.
+        let object_id = mutation.change.object_id.as_str();
         if mutation.change.field == "_created"
-            && !visible_ids.contains(mutation.change.object_id.as_str())
-            && !deleted_ids.contains(mutation.change.object_id.as_str())
+            && !visible_ids.contains(object_id)
+            && !deleted_ids.contains(object_id)
         {
             continue;
+        }
+        if let Some(reader) = reader {
+            let attributable = if deleted_ids.contains(object_id) {
+                reader.readable_deletes.contains(object_id)
+            } else {
+                visible_ids.contains(object_id) || reader.readable_ids.contains(object_id)
+            };
+            if !attributable {
+                return Ok(None);
+            }
         }
         let op = if mutation.change.field == "_created" {
             OP_CREATE
@@ -655,7 +763,7 @@ pub fn project_events(
                 .unwrap_or_default(),
         });
     }
-    Ok(events)
+    Ok(Some(events))
 }
 
 fn object_ids_for_projection(
@@ -679,6 +787,52 @@ fn object_ids_for_projection(
     object_ids.sort_unstable();
     object_ids.dedup();
     object_ids
+}
+
+/// Ids of the scope's objects that `mutations` delete.
+fn deleted_ids_for_projection(
+    scope: &ObjectChangeScope,
+    mutations: &[CommittedObjectMutation],
+) -> Vec<String> {
+    let pinned: BTreeSet<&str> = scope.object_ids.iter().map(String::as_str).collect();
+    let mut object_ids = mutations
+        .iter()
+        .filter(|mutation| {
+            mutation.change.field == "_deleted"
+                && mutation_kind(mutation) == scope.kind
+                && (pinned.is_empty() || pinned.contains(mutation.change.object_id.as_str()))
+        })
+        .map(|mutation| mutation.change.object_id.clone())
+        .collect::<Vec<_>>();
+    object_ids.sort_unstable();
+    object_ids.dedup();
+    object_ids
+}
+
+/// Clears the subscription's revision and cursor so the next read pins the
+/// revision the client resnapshots at; a retry of this read restarts again.
+fn restart_for_resnapshot(
+    db: &RuntimeDb,
+    subscription: &EventSubscription,
+    now_ms: i64,
+    live_revision: String,
+) -> Result<ObjectChangePage, String> {
+    let restarted = EventSubscription {
+        cursor: EventSubscriptionCursor {
+            generation: 1,
+            feed_epoch: String::new(),
+            committed_offset: 0,
+            last_page_digest: String::new(),
+            admitted_at_ms: now_ms,
+        },
+        ..subscription.clone()
+    };
+    db.put_event_subscription(&restarted)?;
+    Ok(resnapshot_page(
+        &restarted.subscription_id,
+        &restarted.stream_id,
+        live_revision,
+    ))
 }
 
 fn mutation_kind(mutation: &CommittedObjectMutation) -> String {
@@ -1220,6 +1374,116 @@ mod tests {
             .map(|event| (event.object_id.as_str(), event.op.as_str()))
             .collect();
         assert_eq!(ids, [("c-seen", OP_CREATE)]);
+    }
+
+    fn read_strict(
+        runtime: &RuntimeDb,
+        snapshot: &str,
+        visible: &[&str],
+        readable: &[&str],
+        readable_deletes: &[&str],
+        now: i64,
+    ) -> ObjectChangePage {
+        let objects = visible_customers(visible);
+        let set = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect();
+        read_object_change_subscription_for_reader(
+            runtime,
+            "alice",
+            &ObjectChangeReadRequest {
+                subscription_id: "sales-customers".into(),
+                scope: scope(),
+                snapshot_revision: snapshot.into(),
+                limit: 32,
+                retention_ms: DEFAULT_RETENTION_MS,
+                last_page_digest: String::new(),
+                revoke: false,
+            },
+            now,
+            &mut Vec::new(),
+            |object_ids, _| {
+                let object_ids = object_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>();
+                Ok((
+                    objects
+                        .iter()
+                        .filter(|object| object_ids.contains(object.id.as_str()))
+                        .cloned()
+                        .collect(),
+                    ReaderVisibility {
+                        readable_ids: set(readable),
+                        readable_deletes: set(readable_deletes),
+                    },
+                ))
+            },
+            "sha256:auth",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn strict_readers_learn_only_of_objects_they_may_read() {
+        let runtime = db();
+        for (id, ts) in [
+            ("c-eu", 10),
+            ("c-hidden", 11),
+            ("c-gone", 12),
+            ("c-out", 13),
+        ] {
+            runtime
+                .create_object_with_audit(&customer(id, id, "eu", ts), "alice")
+                .unwrap();
+        }
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read_strict(&runtime, &revision, &["c-eu"], &[], &[], 20);
+
+        // A delete whose history the reader may read, and a readable object
+        // outside the scope, are named as before.
+        runtime.delete_object_with_audit("c-gone", "alice").unwrap();
+        let mut out = customer("c-out", "c-out", "us", 13);
+        out.updated = 21;
+        runtime.update_object_with_audit(&out, "alice").unwrap();
+        let page = read_strict(&runtime, &revision, &["c-eu"], &["c-out"], &["c-gone"], 22);
+        let ops: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| (event.object_id.as_str(), event.op.as_str()))
+            .collect();
+        assert_eq!(ops, [("c-gone", OP_DELETE), ("c-out", OP_INVALIDATE)]);
+
+        // A change to an object the reader may not read names nothing and
+        // restarts the subscription; a retry restarts again.
+        let mut hidden = customer("c-hidden", "c-hidden", "us", 11);
+        hidden.updated = 23;
+        runtime.update_object_with_audit(&hidden, "alice").unwrap();
+        for now in [24, 25] {
+            let restarted = read_strict(&runtime, &revision, &["c-eu"], &[], &[], now);
+            assert_eq!(restarted.outcome, OUTCOME_RESNAPSHOT);
+            assert!(restarted.events.is_empty());
+        }
+
+        // The next read at the new revision continues the same subscription.
+        let fresh =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        let resumed = read_strict(&runtime, &fresh, &["c-eu"], &[], &[], 26);
+        assert_eq!(resumed.outcome, OUTCOME_PAGE);
+        assert!(resumed.events.is_empty());
+        let mut seen = customer("c-eu", "c-eu", "apac", 10);
+        seen.updated = 27;
+        runtime.update_object_with_audit(&seen, "alice").unwrap();
+        let next = read_strict(&runtime, &fresh, &["c-eu"], &[], &[], 28);
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].op, OP_UPDATE);
+
+        // A delete whose history the reader may not read names nothing either.
+        runtime
+            .delete_object_with_audit("c-hidden", "alice")
+            .unwrap();
+        let refused = read_strict(&runtime, &fresh, &["c-eu"], &[], &[], 29);
+        assert_eq!(refused.outcome, OUTCOME_RESNAPSHOT);
+        assert!(refused.events.is_empty());
     }
 
     #[test]

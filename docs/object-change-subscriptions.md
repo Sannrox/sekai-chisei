@@ -24,7 +24,15 @@ name object identity, op, and changed field. They do not carry source
 credentials or newly hidden values. Visibility loss emits `invalidate`
 without field names. A `create` is delivered only for an object the caller can
 read. Property filters pass the same restricted-property and property-grant
-query checks as a listing filter. Revoke with `revoke=true` to end delivery.
+query checks as a listing filter.
+
+A page names only objects the caller can read, or deleted objects whose history
+the caller may read under the `ListObjectChanges` rule: in a namespace with
+object security activated, and for tenant callers, deleted history fails
+closed; otherwise the object ACL decides. A change to any other object returns
+`resnapshot_required` and names no object. Take a new snapshot at the returned
+revision and read again with the same subscription id. The restart says only
+that something in scope changed. Revoke with `revoke=true` to end delivery.
 
 ## Backpressure
 
