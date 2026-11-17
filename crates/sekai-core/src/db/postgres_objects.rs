@@ -934,7 +934,8 @@ impl PostgresDb {
             max_nodes,
             |id, direction| self.get_links(id, "", direction),
             |id| self.get_object(id),
-            |_| Ok(true),
+            |_, _| Ok(Vec::new()),
+            |_, _| Ok(true),
         )
     }
 
@@ -952,7 +953,8 @@ impl PostgresDb {
             max_nodes,
             |id, direction| self.get_links_with_policy_context(id, "", direction, context),
             |id| self.get_object_with_policy_context(id, context),
-            |_| Ok(true),
+            |_, _| Ok(Vec::new()),
+            |_, _| Ok(true),
         )
     }
 

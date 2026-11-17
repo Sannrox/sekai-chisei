@@ -1052,7 +1052,17 @@ impl SekaiServiceImpl {
                 db.get_object_with_policy_context(id, &policy_context)
                     .map_err(Status::internal)
             },
-            |object| {
+            |node, ephemeral| lineage_upstream(db, node, ephemeral),
+            |object, ephemeral| {
+                if ephemeral {
+                    return Ok(ephemeral_lineage_node_visible(
+                        db,
+                        &self.security,
+                        &principals,
+                        tenant_context.as_ref(),
+                        object,
+                    ));
+                }
                 Ok(object_is_visible(
                     db,
                     &self.security,
@@ -1068,21 +1078,32 @@ impl SekaiServiceImpl {
                 )?)
             },
         )?;
-        let objects = self.resolve_computed_for_responses_with_policy(
-            res.nodes.iter().map(|node| node.object.clone()).collect(),
-            &principals,
-            Some(&policy_context),
-            tenant_context.as_ref(),
-            purpose.as_ref(),
-        )?;
+        // Ephemeral nodes carry no properties, so only objects resolve
+        // computed properties.
+        let mut objects = self
+            .resolve_computed_for_responses_with_policy(
+                res.nodes
+                    .iter()
+                    .filter(|node| !node.ephemeral)
+                    .map(|node| node.object.clone())
+                    .collect(),
+                &principals,
+                Some(&policy_context),
+                tenant_context.as_ref(),
+                purpose.as_ref(),
+            )?
+            .into_iter();
         let nodes = res
             .nodes
             .iter()
-            .zip(objects.iter())
-            .map(|(n, object)| LineageNode {
-                object: Some(to_proto_obj(object)),
-                role: n.role.clone(),
-                ephemeral: n.ephemeral,
+            .map(|n| {
+                // One resolved object per non-ephemeral node, in order.
+                let resolved = (!n.ephemeral).then(|| objects.next()).flatten();
+                LineageNode {
+                    object: Some(to_proto_obj(resolved.as_ref().unwrap_or(&n.object))),
+                    role: n.role.clone(),
+                    ephemeral: n.ephemeral,
+                }
             })
             .collect::<Vec<_>>();
         let edges = res
@@ -1102,6 +1123,138 @@ impl SekaiServiceImpl {
             }),
         }))
     }
+}
+
+/// Kinds of the non-object nodes `GetLineage` returns.
+const LINEAGE_DATASET: &str = "dataset";
+const LINEAGE_SOURCE: &str = "source";
+const LINEAGE_TRANSFORM: &str = "transform";
+
+/// A non-object lineage node: id, kind, namespace and `external_id` only.
+/// `external_id` is the resource id; `id` is `<kind>:<namespace>/<resource>`,
+/// the node's identity in the answer. When an object in the answer already
+/// holds that id, the walk gives the ephemeral node the first free
+/// `<id>#<n>` instead.
+///
+/// A dataset is a node per namespace it is reached from: its producers are
+/// the transforms of that namespace, as in catalog lineage. A transform in
+/// another namespace writing the same dataset is not walked.
+fn ephemeral_lineage_node(resource_id: &str, kind: &str, namespace: &str) -> domain::Object {
+    let id = format!("{kind}:{namespace}/{resource_id}");
+    domain::Object {
+        id,
+        kind: kind.into(),
+        name: String::new(),
+        namespace: namespace.into(),
+        external_id: resource_id.into(),
+        properties: HashMap::new(),
+        created: 0,
+        updated: 0,
+    }
+}
+
+/// The non-object nodes `node` came from: the dataset behind a
+/// dataset-backed object type, the source binding that lands a source-owned
+/// dataset, the transforms that write a dataset, and every dataset input of
+/// a transform.
+fn lineage_upstream(
+    db: &RuntimeDb,
+    node: &domain::Object,
+    ephemeral: bool,
+) -> Result<Vec<domain::Object>, Status> {
+    if !ephemeral {
+        let datasource = db
+            .get_object_type_datasource(&node.namespace, &node.kind)
+            .map_err(Status::internal)?;
+        return Ok(datasource
+            .filter(|datasource| !datasource.edits_only)
+            .map(|datasource| {
+                ephemeral_lineage_node(&datasource.dataset_id, LINEAGE_DATASET, &node.namespace)
+            })
+            .into_iter()
+            .collect());
+    }
+    let resource_id = node.external_id.as_str();
+    match node.kind.as_str() {
+        LINEAGE_DATASET => {
+            let mut upstream = Vec::new();
+            if let Some((binding_id, _kind)) = resource_id
+                .strip_prefix(crate::db::source_batch_dataset::DATASET_ID_PREFIX)
+                .and_then(|rest| rest.rsplit_once(':'))
+            {
+                upstream.push(ephemeral_lineage_node(
+                    binding_id,
+                    LINEAGE_SOURCE,
+                    &node.namespace,
+                ));
+            }
+            let transforms = db
+                .list_governed_transforms(&node.namespace)
+                .map_err(Status::internal)?;
+            upstream.extend(
+                transforms
+                    .iter()
+                    .filter(|transform| transform.output_dataset_id == resource_id)
+                    .map(|transform| {
+                        ephemeral_lineage_node(
+                            &transform.transform_id,
+                            LINEAGE_TRANSFORM,
+                            &transform.namespace,
+                        )
+                    }),
+            );
+            Ok(upstream)
+        }
+        LINEAGE_TRANSFORM => Ok(db
+            .get_governed_transform(&node.namespace, resource_id)
+            .map_err(Status::internal)?
+            .map(|transform| {
+                transform
+                    .input_bindings()
+                    .into_iter()
+                    .map(|(_alias, dataset_id)| {
+                        ephemeral_lineage_node(&dataset_id, LINEAGE_DATASET, &transform.namespace)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Whether the caller may see a non-object lineage node. A dataset needs the
+/// dataset read and discovery checks `ListDatasets` applies; a source, a transform or a
+/// source-owned dataset needs read access to its namespace, as
+/// `ListGovernedTransforms` does. A failed check hides the node.
+fn ephemeral_lineage_node_visible(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    node: &domain::Object,
+) -> bool {
+    if enforce_namespace_tenant_context(db, tenant_context, &node.namespace, false).is_err() {
+        return false;
+    }
+    // A source-owned dataset is closed to dataset APIs; it is as visible as
+    // the namespace its source binding lands into.
+    if node.kind == LINEAGE_DATASET
+        && !crate::db::source_batch_dataset::is_source_owned_dataset_id(&node.external_id)
+    {
+        return matches!(
+            db.get_dataset(&node.external_id),
+            Ok(Some(dataset))
+                if check_dataset_access(db, security, principals, &dataset, false).is_ok()
+                    && catalog_binding_discoverable(
+                        db,
+                        security,
+                        tenant_context,
+                        &dataset.object_id,
+                        principals,
+                    )
+        );
+    }
+    check_team_namespace(db, principals, &node.namespace, false).is_ok()
 }
 
 fn hop_marking_permitted(
