@@ -142,10 +142,37 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "UpdateDataset";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "ListDatasets";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "AppendRows";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "QueryRows";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListDatasetVersions";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetDatasetVersion";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RollbackDataset";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "PutDatasetHealthCheck";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListDatasetHealthChecks";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListDatasetHealthResults";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RunDatasetHealthChecks";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListDatasetAlerts";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateGrant";

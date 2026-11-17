@@ -841,7 +841,9 @@ pub(super) fn to_proto_dataset_version(
 }
 
 pub(super) fn map_dataset_version_error(error: String) -> Status {
-    if error == crate::sekai::dataset_version::DATASET_VERSION_PAST_RETENTION {
+    if error == crate::sekai::dataset_version::DATASET_VERSION_PAST_RETENTION
+        || error.starts_with(crate::sekai::dataset_version::DATASET_ROLLBACK_BACKS_INDEX)
+    {
         Status::failed_precondition(error)
     } else if error == crate::sekai::dataset_version::DATASET_VERSION_NOT_FOUND
         || error == crate::sekai::dataset_version::DATASET_NOT_FOUND

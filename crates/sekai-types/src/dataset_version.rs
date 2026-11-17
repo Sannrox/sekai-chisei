@@ -9,6 +9,17 @@ pub const DATASET_VERSION_PAST_RETENTION: &str = "dataset version is past retent
 pub const DATASET_VERSION_NOT_FOUND: &str = "dataset version not found";
 pub const DATASET_NOT_FOUND: &str = "dataset not found";
 pub const DATASET_ROLLBACK_REQUIRES_RESTORE: &str = "restore_from_version_id is required";
+/// Prefix of the refusal for rolling back a dataset that an object type index
+/// derives objects from (#2415): the index would keep the rolled-back rows.
+pub const DATASET_ROLLBACK_BACKS_INDEX: &str = "dataset backs an object type index";
+
+/// The refusal naming the object type index a rollback would leave behind.
+pub fn rollback_backs_index_error(namespace: &str, kind: &str) -> String {
+    format!(
+        "{DATASET_ROLLBACK_BACKS_INDEX} ({namespace}/{kind}); rollback would leave its \
+         derived objects on the rolled-back rows"
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct DatasetVersion {

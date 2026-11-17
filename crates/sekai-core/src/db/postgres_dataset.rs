@@ -602,6 +602,21 @@ impl PostgresDb {
         if restored.purged {
             return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
         }
+        // Checked inside the rollback transaction, as on SQLite.
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT namespace, kind FROM sekai_object_type_datasource
+                 WHERE dataset_id = $1 AND NOT edits_only
+                 ORDER BY namespace, kind LIMIT 1",
+                &[&request.dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err(dataset_version::rollback_backs_index_error(
+                &row.get::<_, String>(0),
+                &row.get::<_, String>(1),
+            ));
+        }
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
             &[&request.dataset_id],
