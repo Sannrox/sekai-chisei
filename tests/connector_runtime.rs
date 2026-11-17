@@ -267,13 +267,25 @@ async fn a_crashed_runtime_is_taken_over_and_its_fence_refused() {
     assert!(b.claim(0).await.unwrap().is_none());
 
     // After the lease lapses, B takes over under a new generation and syncs.
+    // A loaded runner can stretch B's pass past one lease period, so B may
+    // report `Lost` before its connector starts (the pre-work fence check
+    // refuses) and then reclaim. Only the final outcome is asserted: B
+    // finishes the sync, and the connector still runs exactly once.
     tokio::time::sleep(LEASE * 2).await;
+    let pass = b.pass().await.unwrap();
+    let (finished, lost_before) = pass.split_last().expect("B's pass reports an outcome");
     assert_eq!(
-        b.pass().await.unwrap(),
-        [Ran::Finished {
+        finished,
+        &Ran::Finished {
             source_id: "repo".into(),
             outcome: Ok(())
-        }]
+        }
+    );
+    assert!(
+        lost_before
+            .iter()
+            .all(|ran| matches!(ran, Ran::Lost { .. })),
+        "{lost_before:?}"
     );
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     let (last_runtime, last_failure, generation) = plane.sync_of("repo");
