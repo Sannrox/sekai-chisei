@@ -369,6 +369,7 @@ pub(super) fn gateway_recovery_llm_values(
         ),
         ("agent".into(), identity.agent.clone()),
         ("project".into(), identity.project.clone()),
+        ("data_class".into(), context.data_class.clone()),
         ("user_id".into(), identity.user_id.clone()),
         (
             "provider".into(),
@@ -412,6 +413,14 @@ pub(super) fn gateway_recovery_llm_values(
     };
     if let Some(terminal) = terminal {
         values.insert("terminal_outcome".into(), terminal.into());
+    }
+    // The live row records pipeline sampling only for a completed call.
+    if terminal.is_none()
+        && let Some(observation) = &context.pipeline_observation
+    {
+        values.insert("pipeline_sampled".into(), observation.sampled.to_string());
+        values.insert("sample_reason".into(), observation.reason.clone());
+        values.insert("sample_rate".into(), observation.rate.to_string());
     }
     if let Some(usage) = usage {
         insert_normalized_usage_values(&mut values, usage);

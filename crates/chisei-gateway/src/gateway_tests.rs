@@ -1268,6 +1268,89 @@ fn gateway_success_receipt_uses_canonical_complete_shape() {
 }
 
 #[test]
+fn recovery_llm_row_carries_the_live_rows_data_class_and_pipeline_fields() {
+    let identity = GatewayIdentity {
+        agent: "agent:gateway-test".into(),
+        project: "project-a".into(),
+        user_id: "user-a".into(),
+        key_id: "key-a".into(),
+        tier: DEFAULT_GATEWAY_TIER.into(),
+    };
+    let context = UsageContext {
+        request_id: "gateway-op-denied".into(),
+        lookup_request_id: None,
+        caller_scope: "scope-a".into(),
+        operation_id: "gateway-op-denied".into(),
+        parent_operation_id: None,
+        turn_id: None,
+        attempt: 1,
+        provider_ordinal: 1,
+        cycle_id: None,
+        traceparent: None,
+        responses_profile: true,
+        responses_terminal_required: true,
+        provider: ProviderKind::OpenAi(OpenAiRuntime::OpenAi),
+        requested_model: Some("gpt-5.5".into()),
+        resolved_model: None,
+        route_override: None,
+        requested_alias: Some("gpt-5.5".into()),
+        profile_version: Some("openai.builtin/v3".into()),
+        capability_snapshot_version: Some(CAPABILITY_MATRIX_VERSION.into()),
+        pricing_snapshot_version: Some("openai.unpriced/v1".into()),
+        governance_metadata_status: Some("unknown".into()),
+        work_unit_id: Some("legacy-work-unit".into()),
+        pipeline_observation: Some(GatewayPipelineObservation {
+            sampled: true,
+            reason: "rate".into(),
+            rate: 0.5,
+            prepared_spec: String::new(),
+        }),
+        request_bytes: 42,
+        started_ms: 100,
+        route_bias: None,
+        policy_scope: None,
+        policy_version: None,
+        context_admission_policy_version: None,
+        context_admission_descriptor_version: None,
+        context_admission_decision: None,
+        context_admission_reasons: Vec::new(),
+        task_class: "primary".into(),
+        data_class: "internal".into(),
+        request_hash: "request-hash".into(),
+        budget_subject: None,
+        budget_status: "not_evaluated".into(),
+        egress_applied: false,
+        cache_requested: false,
+    };
+    let config = routing_config();
+    let row = |outcome: &GatewayUsageOutcome| {
+        gateway_recovery_llm_values(
+            &config,
+            &identity,
+            &context,
+            StatusCode::OK,
+            outcome,
+            None,
+            5,
+        )
+    };
+
+    let completed = row(&GatewayUsageOutcome::Success(StatusCode::OK));
+    assert_eq!(completed["data_class"], "internal");
+    assert_eq!(completed["pipeline_sampled"], "true");
+    assert_eq!(completed["sample_reason"], "rate");
+    assert_eq!(completed["sample_rate"], "0.5");
+
+    // The live row drops pipeline sampling for a call that did not complete.
+    let failed = row(&GatewayUsageOutcome::TerminalFailure(
+        StatusCode::BAD_GATEWAY,
+        "upstream".into(),
+    ));
+    assert_eq!(failed["data_class"], "internal");
+    assert!(!failed.contains_key("pipeline_sampled"));
+}
+
+#[test]
 fn gateway_refusal_receipt_is_terminal_and_complete() {
     let identity = GatewayIdentity {
         agent: "agent:gateway-test".into(),
