@@ -6,6 +6,7 @@
 use crate::contract::{
     MAX_SOURCE_DISPLAY_NAME_BYTES, MAX_SOURCE_IDENTIFIER_BYTES, MAX_SOURCE_PROPERTY_KEY_BYTES,
     MAX_SOURCE_PROPERTY_VALUE_BYTES, MAX_SOURCE_RECORD_PROPERTIES, SOURCE_GITHUB, SourceRecord,
+    contains_secret_like_text,
 };
 use crate::discover::{
     ConnectionFailure, DiscoveredColumn, DiscoveredRecordKind, SOURCE_DISCOVERY_VERSION,
@@ -291,24 +292,6 @@ impl SourceInspector for GitHubSource {
     }
 }
 
-fn contains_secret_like_text(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("-----begin private key-----")
-        || lower.contains("authorization: bearer ")
-        || lower.contains("x-api-key:")
-        || lower.contains("api_key=")
-        || lower.contains("api-key=")
-        || lower.contains("access_token=")
-        || lower.contains("client_secret=")
-        || lower.contains("password=")
-        || lower.contains("private_key=")
-        || lower.contains("github_pat_")
-        || lower.contains("ghp_")
-        || lower.contains("gho_")
-        || lower.contains("ghs_")
-        || lower.contains("ghu_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,5 +346,13 @@ mod tests {
             DiscoverySample::Unsupported
         );
         assert_eq!(source.records_read(), 0);
+    }
+
+    #[test]
+    fn rsa_private_key_headers_and_aws_key_ids_are_secret_like() {
+        for value in ["-----BEGIN RSA PRIVATE KEY-----", "AKIAABCDEFGHIJKLMNOP"] {
+            assert!(validate_text("property value", value, 256, true).is_err());
+        }
+        assert!(validate_text("property value", "plain text", 256, true).is_ok());
     }
 }
