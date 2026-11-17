@@ -127,8 +127,8 @@ if grep -F 'merged:<=' scripts/release-package.sh >/dev/null; then
 fi
 grep -F -- "--match 'v*' --exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
   || fail "changelog-draft.sh must start from the last final tag, never an rc or beta tag"
-grep -F "python3 scripts/check-semver.py pr" .github/workflows/ci.yml >/dev/null \
-  || fail "ci.yml Semver job must run scripts/check-semver.py pr"
+grep -F "python3 scripts/check-semver.py pr" .github/workflows/semver.yml >/dev/null \
+  || fail "semver.yml must run scripts/check-semver.py pr"
 grep -F "python3 scripts/check-semver.py release" "$workflow" >/dev/null \
   || fail "${workflow} must run scripts/check-semver.py release on a tagged release"
 grep -F "Public API vs last final tag" "$workflow" >/dev/null \

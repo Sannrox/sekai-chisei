@@ -1,0 +1,47 @@
+name: Semver
+
+# Its own workflow so a docs-only pull request skips it with paths-ignore
+# (#2571). Not a required check, so a skipped run does not block merging.
+on:
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+
+concurrency:
+  group: semver-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Public API of the library crates against the pull request base and the
+  # last final v* tag (scripts/check-semver.py). Versions are release-owned,
+  # so a pull request never bumps them: a reported major vs the base passes
+  # only when the pull request is marked breaking (`type!:` subject or a
+  # Breaking/Upgrade heading, as scripts/changelog-draft.sh reads it) and
+  # labelled `risk:breaking`. A major vs the tag that is already on the base
+  # is a notice; release prep is the version bump. New public enums need
+  # #[non_exhaustive].
+  semver:
+    name: Semver
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # rust-toolchain.toml picks the version.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          # Bump with the toolchain: each release reads a range of rustdoc JSON formats.
+          tool: cargo-semver-checks@0.51.0
+      - name: cargo-semver-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/check-semver.py pr

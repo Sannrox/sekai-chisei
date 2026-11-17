@@ -1,9 +1,13 @@
 name: Performance
 
 # Adoption workloads stay on the weekly schedule. Object-path workloads also
-# run a wide-budget smoke subset on pull requests (#1437).
+# run a wide-budget smoke subset on pull requests (#1437) that change a
+# non-docs path (#2571).
 on:
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   schedule:
     - cron: "41 4 * * 2"
   workflow_dispatch:
