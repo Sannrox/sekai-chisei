@@ -141,13 +141,42 @@ pub(super) async fn cache_gateway_key_identity(
     key_hash: String,
     identity: Option<GatewayIdentity>,
 ) {
-    state.runtime.key_cache.write().await.insert(
+    insert_bounded_key_cache_entry(
+        &mut *state.runtime.key_cache.write().await,
+        state.runtime.key_cache_ttl,
+        KEY_CACHE_CAPACITY,
         key_hash,
         KeyCacheEntry {
             identity,
             cached_at: Instant::now(),
         },
     );
+}
+
+/// Most entries the gateway key cache holds. Unknown keys are cached too, so
+/// without a bound random bearer keys would grow it for the process lifetime.
+pub(super) const KEY_CACHE_CAPACITY: usize = 10_000;
+
+/// Inserts `entry`, keeping the cache at or below `capacity`. A full cache
+/// first drops expired entries, then negative ones; if it is still full the
+/// entry is not cached and the next lookup asks the key store again.
+pub(super) fn insert_bounded_key_cache_entry(
+    cache: &mut HashMap<String, KeyCacheEntry>,
+    ttl: Duration,
+    capacity: usize,
+    key_hash: String,
+    entry: KeyCacheEntry,
+) {
+    if cache.len() >= capacity && !cache.contains_key(&key_hash) {
+        cache.retain(|_, cached| cached.cached_at.elapsed() < ttl);
+        if cache.len() >= capacity {
+            cache.retain(|_, cached| cached.identity.is_some());
+        }
+        if cache.len() >= capacity {
+            return;
+        }
+    }
+    cache.insert(key_hash, entry);
 }
 pub(super) fn client_key(headers: &HeaderMap) -> Option<&str> {
     headers
