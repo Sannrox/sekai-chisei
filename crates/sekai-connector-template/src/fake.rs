@@ -75,6 +75,7 @@ impl SourceInspector for FakeSource {
                 schema_revision: SCHEMA_REVISION.into(),
                 columns: vec![column("id"), column("name")],
                 key_candidates: vec![vec!["id".into()]],
+                references: Vec::new(),
             }],
         })
     }

@@ -49,6 +49,7 @@ impl SourceInspector for FakeSource {
             schema_revision: "v1".into(),
             columns: vec![column("id", false), column("name", true)],
             key_candidates: vec![vec!["id".into()]],
+            references: Vec::new(),
         };
         if self.drift && self.discoveries > 1 {
             account.columns.push(column("tier", true));

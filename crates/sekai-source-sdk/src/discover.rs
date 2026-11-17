@@ -10,6 +10,14 @@
 //! values for one record kind, read with the adapter's credentials. Sources
 //! that cannot sample answer [`DiscoverySample::Unsupported`]. Samples are
 //! never part of the discovery document, so they are not persisted with it.
+//!
+//! [`attach_references`] adds reference candidates between record kinds
+//! (#2294): the references a source declares, plus single-column references
+//! inferred from the bounded samples. It makes at most one
+//! [`SourceInspector::declared_references`] call and one
+//! [`SourceInspector::sample_rows`] call per record kind, so the cost does not
+//! grow with the number of column pairs. Sample values are compared in memory;
+//! only counts leave this module.
 
 use crate::contract::{MAX_SOURCE_IDENTIFIER_BYTES, contains_secret_like_text};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +29,9 @@ pub const MAX_DISCOVERED_COLUMNS: usize = 1024;
 pub const MAX_DISCOVERY_SAMPLE_ROWS: usize = 8;
 /// Profile ratios are basis points so discoveries stay exact and comparable.
 pub const PROFILE_RATIO_SCALE: u16 = 10_000;
+/// Plane-owned floor for inferred references: the share of non-null sampled
+/// values, in basis points, that must appear among the target's sampled keys.
+pub const MIN_INFERRED_REFERENCE_MATCH_BP: u16 = 8_000;
 
 /// Why a source could not be checked or discovered. Value-free by design:
 /// diagnostics never carry credentials, hosts, or remote response bodies.
@@ -57,6 +68,29 @@ pub trait SourceInspector {
     fn sample_rows(&mut self, _record_kind: &str) -> Result<DiscoverySample, ConnectionFailure> {
         Ok(DiscoverySample::Unsupported)
     }
+    /// References the source itself declares between its record kinds. A
+    /// source that cannot report them keeps the default.
+    fn declared_references(&mut self) -> Result<DeclaredReferences, ConnectionFailure> {
+        Ok(DeclaredReferences::Unsupported)
+    }
+}
+
+/// References a source declares, or a typed refusal when it cannot report them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeclaredReferences {
+    Unsupported,
+    Declared(Vec<DeclaredReference>),
+}
+
+/// One source-declared reference. `target_key` must be a key candidate of
+/// `target_record_kind` and as long as `columns`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredReference {
+    pub record_kind: String,
+    pub columns: Vec<String>,
+    pub target_record_kind: String,
+    pub target_key: Vec<String>,
 }
 
 /// Values from one record kind, or a typed refusal when the source cannot
@@ -108,6 +142,44 @@ pub struct DiscoveredRecordKind {
     /// Each candidate is an ordered column list; composite keys have several.
     /// Empty when the record kind has no usable key.
     pub key_candidates: Vec<Vec<String>>,
+    /// Reference candidates, ordered by columns then target. Empty until
+    /// [`attach_references`] runs; older consumers ignore it.
+    pub references: Vec<ReferenceCandidate>,
+}
+
+/// Why a reference candidate is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferenceBasis {
+    /// The source declares the reference.
+    Declared,
+    /// No declaration; sampled values and names suggest it.
+    Inferred,
+}
+
+/// Counts from the bounded sample behind a candidate. No values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReferenceEvidence {
+    /// Sampled rows of the referencing record kind.
+    pub sampled: u32,
+    /// Sampled rows whose referencing columns match a sampled target key.
+    pub matched: u32,
+    /// Sampled rows with a missing referencing value, in basis points.
+    pub null_ratio_bp: u16,
+    /// Whether the source allows the referencing columns to be null.
+    pub nullable: bool,
+}
+
+/// Columns of one record kind that point at a key candidate of another (or
+/// the same) record kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceCandidate {
+    pub columns: Vec<String>,
+    pub target_record_kind: String,
+    pub target_key: Vec<String>,
+    pub basis: ReferenceBasis,
+    /// `None` when the source cannot sample the record kind.
+    pub evidence: Option<ReferenceEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,7 +213,40 @@ impl SourceDiscovery {
                 return Err("record kinds must be unique and in ascending order".into());
             }
         }
-        self.record_kinds.iter().try_for_each(validate_record_kind)
+        self.record_kinds
+            .iter()
+            .try_for_each(validate_record_kind)?;
+        self.record_kinds
+            .iter()
+            .try_for_each(|kind| self.validate_references(kind))
+    }
+
+    fn validate_references(&self, kind: &DiscoveredRecordKind) -> Result<(), String> {
+        let mut seen = BTreeSet::new();
+        for reference in &kind.references {
+            let target = self
+                .record_kinds
+                .iter()
+                .find(|target| target.record_kind == reference.target_record_kind)
+                .ok_or("reference targets an unknown record kind")?;
+            let columns_exist = reference
+                .columns
+                .iter()
+                .all(|name| kind.columns.iter().any(|column| &column.name == name));
+            if reference.columns.is_empty()
+                || !columns_exist
+                || reference.columns.len() != reference.target_key.len()
+                || !target.key_candidates.contains(&reference.target_key)
+            {
+                return Err(
+                    "reference must pair existing columns with a target key candidate".into(),
+                );
+            }
+            if !seen.insert((&reference.columns, &reference.target_record_kind)) {
+                return Err("references must be unique".into());
+            }
+        }
+        Ok(())
     }
 
     /// One draft per record kind, in discovery order. Mechanical conversion
@@ -158,6 +263,211 @@ impl SourceDiscovery {
             })
             .collect())
     }
+}
+
+/// Whether the source reported references at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferenceSupport {
+    /// The source neither declares references nor samples values.
+    Unsupported,
+    Attached,
+}
+
+/// Fill `references` on every record kind of `discovery`: the declared
+/// references, then single-column references inferred from the samples whose
+/// names are compatible and whose sampled values match at least
+/// [`MIN_INFERRED_REFERENCE_MATCH_BP`] of the target's sampled keys. The
+/// result is deterministic for unchanged data.
+pub fn attach_references<S: SourceInspector>(
+    inspector: &mut S,
+    discovery: &mut SourceDiscovery,
+) -> Result<ReferenceSupport, ConnectionFailure> {
+    discovery
+        .validate()
+        .map_err(|_| ConnectionFailure::PermissionMissing)?;
+    let declared = match inspector.declared_references()? {
+        DeclaredReferences::Declared(declared) => Some(declared),
+        _ => None,
+    };
+    let mut samples = BTreeMap::new();
+    for kind in &discovery.record_kinds {
+        if let DiscoverySample::Rows { cells } =
+            cap_discovery_sample(inspector.sample_rows(&kind.record_kind)?)
+        {
+            samples.insert(kind.record_kind.clone(), cells);
+        }
+    }
+    if declared.is_none() && samples.is_empty() {
+        return Ok(ReferenceSupport::Unsupported);
+    }
+
+    let mut found: Vec<(usize, ReferenceCandidate)> = Vec::new();
+    for reference in declared.iter().flatten() {
+        if let Some(index) = discovery
+            .record_kinds
+            .iter()
+            .position(|kind| kind.record_kind == reference.record_kind)
+        {
+            let nullable = nullable(&discovery.record_kinds[index], &reference.columns);
+            let evidence = samples
+                .get(&reference.record_kind)
+                .zip(samples.get(&reference.target_record_kind))
+                .map(|(rows, targets)| {
+                    evidence(
+                        rows,
+                        &reference.columns,
+                        targets,
+                        &reference.target_key,
+                        nullable,
+                    )
+                });
+            found.push((
+                index,
+                ReferenceCandidate {
+                    columns: reference.columns.clone(),
+                    target_record_kind: reference.target_record_kind.clone(),
+                    target_key: reference.target_key.clone(),
+                    basis: ReferenceBasis::Declared,
+                    evidence,
+                },
+            ));
+        }
+    }
+    for (index, kind) in discovery.record_kinds.iter().enumerate() {
+        let Some(rows) = samples.get(&kind.record_kind) else {
+            continue;
+        };
+        for column in &kind.columns {
+            let own_key = kind
+                .key_candidates
+                .iter()
+                .any(|key| key == std::slice::from_ref(&column.name));
+            if own_key {
+                continue;
+            }
+            for target in &discovery.record_kinds {
+                let Some(targets) = samples.get(&target.record_kind) else {
+                    continue;
+                };
+                for key in target.key_candidates.iter().filter(|key| key.len() == 1) {
+                    if !name_compatible(&column.name, &target.record_kind, &key[0]) {
+                        continue;
+                    }
+                    let columns = vec![column.name.clone()];
+                    let evidence = evidence(rows, &columns, targets, key, column.nullable);
+                    let present = evidence.sampled - nulls(rows, &columns);
+                    if evidence.matched == 0
+                        || u64::from(evidence.matched) * u64::from(PROFILE_RATIO_SCALE)
+                            < u64::from(present) * u64::from(MIN_INFERRED_REFERENCE_MATCH_BP)
+                    {
+                        continue;
+                    }
+                    found.push((
+                        index,
+                        ReferenceCandidate {
+                            columns,
+                            target_record_kind: target.record_kind.clone(),
+                            target_key: key.clone(),
+                            basis: ReferenceBasis::Inferred,
+                            evidence: Some(evidence),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for kind in &mut discovery.record_kinds {
+        kind.references.clear();
+    }
+    for (index, candidate) in found {
+        let references = &mut discovery.record_kinds[index].references;
+        // A declaration wins over an inference of the same reference.
+        if !references.iter().any(|known| {
+            known.columns == candidate.columns
+                && known.target_record_kind == candidate.target_record_kind
+        }) {
+            references.push(candidate);
+        }
+    }
+    for kind in &mut discovery.record_kinds {
+        kind.references.sort_by(|a, b| {
+            (&a.columns, &a.target_record_kind).cmp(&(&b.columns, &b.target_record_kind))
+        });
+    }
+    Ok(ReferenceSupport::Attached)
+}
+
+fn nullable(kind: &DiscoveredRecordKind, columns: &[String]) -> bool {
+    kind.columns
+        .iter()
+        .any(|column| column.nullable && columns.contains(&column.name))
+}
+
+/// A cell is missing when the column is absent or empty.
+fn cell<'a>(row: &'a BTreeMap<String, String>, column: &str) -> Option<&'a str> {
+    row.get(column)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn tuple<'a>(row: &'a BTreeMap<String, String>, columns: &[String]) -> Option<Vec<&'a str>> {
+    columns.iter().map(|column| cell(row, column)).collect()
+}
+
+fn nulls(rows: &[BTreeMap<String, String>], columns: &[String]) -> u32 {
+    rows.iter()
+        .filter(|row| tuple(row, columns).is_none())
+        .count() as u32
+}
+
+fn evidence(
+    rows: &[BTreeMap<String, String>],
+    columns: &[String],
+    targets: &[BTreeMap<String, String>],
+    target_key: &[String],
+    nullable: bool,
+) -> ReferenceEvidence {
+    let keys: BTreeSet<Vec<&str>> = targets
+        .iter()
+        .filter_map(|row| tuple(row, target_key))
+        .collect();
+    let sampled = rows.len() as u32;
+    let matched = rows
+        .iter()
+        .filter_map(|row| tuple(row, columns))
+        .filter(|values| keys.contains(values))
+        .count() as u32;
+    let null_ratio_bp = if sampled == 0 {
+        0
+    } else {
+        (u64::from(nulls(rows, columns)) * u64::from(PROFILE_RATIO_SCALE) / u64::from(sampled))
+            as u16
+    };
+    ReferenceEvidence {
+        sampled,
+        matched,
+        null_ratio_bp,
+        nullable,
+    }
+}
+
+/// Whether a column name suggests the key of a record kind: the key's own
+/// name, or the record kind's name with or without the key (`account_id`,
+/// `account`). Case and separators do not matter.
+fn name_compatible(column: &str, record_kind: &str, key: &str) -> bool {
+    let normalize = |text: &str| {
+        text.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<String>()
+    };
+    let (column, kind, key) = (normalize(column), normalize(record_kind), normalize(key));
+    let kind_stem = kind.trim_end_matches('s');
+    column == key
+        || [kind.as_str(), kind_stem]
+            .iter()
+            .any(|stem| column == *stem || column == format!("{stem}{key}"))
 }
 
 /// Name-only sensitivity hint for connectors that have no catalog marking.
@@ -252,6 +562,7 @@ mod tests {
                     schema_revision: "v1".into(),
                     columns: vec![column("id"), column("region")],
                     key_candidates: vec![vec!["id".into()], vec!["region".into(), "id".into()]],
+                    references: Vec::new(),
                 })
                 .collect(),
         }
@@ -340,5 +651,206 @@ mod tests {
             panic!("capped rows stay rows");
         };
         assert_eq!(cells.len(), MAX_DISCOVERY_SAMPLE_ROWS);
+    }
+
+    /// Declares `Contact.account_id`; the other links are left to inference.
+    struct Crm {
+        declares: bool,
+        samples: bool,
+    }
+
+    fn rows(columns: &[&str], data: &[&[&str]]) -> Vec<BTreeMap<String, String>> {
+        data.iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .zip(row.iter())
+                    .map(|(column, value)| ((*column).into(), (*value).into()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    impl SourceInspector for Crm {
+        fn check(&mut self) -> Result<(), ConnectionFailure> {
+            Ok(())
+        }
+
+        fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+            let kind = |name: &str, columns: &[(&str, bool)]| DiscoveredRecordKind {
+                record_kind: name.into(),
+                schema_revision: "v1".into(),
+                columns: columns
+                    .iter()
+                    .map(|(name, nullable)| DiscoveredColumn {
+                        nullable: *nullable,
+                        ..column(name)
+                    })
+                    .collect(),
+                key_candidates: vec![vec!["id".into()]],
+                references: Vec::new(),
+            };
+            Ok(SourceDiscovery {
+                contract_version: SOURCE_DISCOVERY_VERSION.into(),
+                source: "fake.crm".into(),
+                record_kinds: vec![
+                    kind("Account", &[("id", false)]),
+                    kind("Contact", &[("id", false), ("account_id", false)]),
+                    kind("Invoice", &[("id", false), ("account_id", false)]),
+                    kind(
+                        "Order",
+                        &[("id", false), ("account_id", false), ("contact_id", true)],
+                    ),
+                ],
+            })
+        }
+
+        fn sample_rows(&mut self, record_kind: &str) -> Result<DiscoverySample, ConnectionFailure> {
+            if !self.samples {
+                return Ok(DiscoverySample::Unsupported);
+            }
+            let cells = match record_kind {
+                "Account" => rows(&["id"], &[&["a1"], &["a2"], &["a3"]]),
+                "Contact" => rows(&["id", "account_id"], &[&["c1", "a1"], &["c2", "a2"]]),
+                // Shares a name with Account's key; the values are unrelated.
+                "Invoice" => rows(&["id", "account_id"], &[&["i1", "x9"], &["i2", "x8"]]),
+                "Order" => rows(
+                    &["id", "account_id", "contact_id"],
+                    &[
+                        &["o1", "a1", "c1"],
+                        &["o2", "a3", ""],
+                        &["o3", "a1", "c2"],
+                        &["o4", "a2", ""],
+                    ],
+                ),
+                _ => return Ok(DiscoverySample::Unsupported),
+            };
+            Ok(DiscoverySample::Rows { cells })
+        }
+
+        fn declared_references(&mut self) -> Result<DeclaredReferences, ConnectionFailure> {
+            Ok(if self.declares {
+                DeclaredReferences::Declared(vec![DeclaredReference {
+                    record_kind: "Contact".into(),
+                    columns: vec!["account_id".into()],
+                    target_record_kind: "Account".into(),
+                    target_key: vec!["id".into()],
+                }])
+            } else {
+                DeclaredReferences::Unsupported
+            })
+        }
+    }
+
+    fn attached(inspector: &mut Crm) -> (ReferenceSupport, Vec<(String, ReferenceCandidate)>) {
+        let mut discovery = inspector.discover().unwrap();
+        let support = attach_references(inspector, &mut discovery).unwrap();
+        discovery.validate().unwrap();
+        let all = discovery
+            .record_kinds
+            .into_iter()
+            .flat_map(|kind| {
+                kind.references
+                    .into_iter()
+                    .map(move |reference| (kind.record_kind.clone(), reference))
+            })
+            .collect();
+        (support, all)
+    }
+
+    #[test]
+    fn references_are_declared_or_inferred_with_counts_and_skip_look_alikes() {
+        let (support, found) = attached(&mut Crm {
+            declares: true,
+            samples: true,
+        });
+        assert_eq!(support, ReferenceSupport::Attached);
+        let summary: Vec<_> = found
+            .iter()
+            .map(|(kind, reference)| {
+                let evidence = reference.evidence.unwrap();
+                (
+                    kind.as_str(),
+                    reference.columns[0].as_str(),
+                    reference.target_record_kind.as_str(),
+                    reference.basis,
+                    (
+                        evidence.sampled,
+                        evidence.matched,
+                        evidence.null_ratio_bp,
+                        evidence.nullable,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    "Contact",
+                    "account_id",
+                    "Account",
+                    ReferenceBasis::Declared,
+                    (2, 2, 0, false)
+                ),
+                (
+                    "Order",
+                    "account_id",
+                    "Account",
+                    ReferenceBasis::Inferred,
+                    (4, 4, 0, false)
+                ),
+                (
+                    "Order",
+                    "contact_id",
+                    "Contact",
+                    ReferenceBasis::Inferred,
+                    (4, 2, 5_000, true)
+                ),
+            ],
+            "Invoice.account_id shares a name but no values, so it is not reported"
+        );
+        assert_eq!(
+            attached(&mut Crm {
+                declares: true,
+                samples: true
+            })
+            .1,
+            found
+        );
+    }
+
+    #[test]
+    fn references_need_a_declaration_or_a_sample_and_fail_closed_otherwise() {
+        let (support, found) = attached(&mut Crm {
+            declares: false,
+            samples: false,
+        });
+        assert_eq!((support, found.len()), (ReferenceSupport::Unsupported, 0));
+
+        // A declaration alone is reported, without evidence.
+        let (_, found) = attached(&mut Crm {
+            declares: true,
+            samples: false,
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.evidence, None);
+
+        let mut discovery = Crm {
+            declares: false,
+            samples: true,
+        }
+        .discover()
+        .unwrap();
+        discovery.record_kinds[1]
+            .references
+            .push(ReferenceCandidate {
+                columns: vec!["account_id".into()],
+                target_record_kind: "Account".into(),
+                target_key: vec!["name".into()],
+                basis: ReferenceBasis::Declared,
+                evidence: None,
+            });
+        assert!(discovery.validate().is_err());
     }
 }

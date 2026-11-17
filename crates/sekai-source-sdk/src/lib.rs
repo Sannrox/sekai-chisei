@@ -51,10 +51,12 @@ pub use contract::{
     source_id, sync_github_record,
 };
 pub use discover::{
-    ColumnProfileHint, ConnectionFailure, DescriptorDraft, DiscoveredColumn, DiscoveredRecordKind,
-    DiscoverySample, MAX_DISCOVERED_COLUMNS, MAX_DISCOVERED_RECORD_KINDS,
-    MAX_DISCOVERY_SAMPLE_ROWS, PROFILE_RATIO_SCALE, SOURCE_DISCOVERY_VERSION, SourceDiscovery,
-    SourceInspector, cap_discovery_sample, column_name_suggests_sensitive,
+    ColumnProfileHint, ConnectionFailure, DeclaredReference, DeclaredReferences, DescriptorDraft,
+    DiscoveredColumn, DiscoveredRecordKind, DiscoverySample, MAX_DISCOVERED_COLUMNS,
+    MAX_DISCOVERED_RECORD_KINDS, MAX_DISCOVERY_SAMPLE_ROWS, MIN_INFERRED_REFERENCE_MATCH_BP,
+    PROFILE_RATIO_SCALE, ReferenceBasis, ReferenceCandidate, ReferenceEvidence, ReferenceSupport,
+    SOURCE_DISCOVERY_VERSION, SourceDiscovery, SourceInspector, attach_references,
+    cap_discovery_sample, column_name_suggests_sensitive,
 };
 pub use feed::{
     ChangeFeedPage, ChangeFeedRunError, ChangeFeedSource, ChangeFeedSourceFailure, run_change_feed,
