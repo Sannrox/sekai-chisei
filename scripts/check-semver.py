@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Public-API gates for pull requests and release prep.
 
-Pull requests: cargo-semver-checks against the PR base and the last final v*
-tag, plus a lint that new public enums carry ``#[non_exhaustive]``. A reported
-major vs the base (or a major vs the tag that this change introduces) passes
-only with the breaking waiver. A major vs the tag that is already on the base
-is a notice: versions are release-owned, so later PRs must not need the waiver
-until release prep bumps the crate major.
+Pull requests: cargo-semver-checks against the PR base only, plus a lint that
+new public enums carry ``#[non_exhaustive]``. A reported major vs the base
+passes only with the breaking waiver. Versions are release-owned: release mode
+owns the comparison against the last final v* tag, so pull requests do not
+repeat it.
 
 Release prep: cargo-semver-checks against the previous final v* tag. A major
 fails when the crate version did not major. No waiver at release time.
@@ -140,18 +139,11 @@ def new_enums_missing_non_exhaustive(
 
 def evaluate_pr(
     vs_base: dict[str, str],
-    vs_tag: dict[str, str],
     waived: bool,
     missing_enums: list[str],
 ) -> int:
     """Return the process exit code; print GitHub annotations."""
-    errors = sorted(
-        {
-            name
-            for name, kind in {**vs_base, **vs_tag}.items()
-            if kind == "error"
-        }
-    )
+    errors = sorted(name for name, kind in vs_base.items() if kind == "error")
     if errors:
         error(
             "cargo-semver-checks failed without reporting an API break for: "
@@ -162,22 +154,9 @@ def evaluate_pr(
     introduced = sorted(
         name for name, kind in vs_base.items() if kind == "major"
     )
-    inherited = sorted(
-        name
-        for name, kind in vs_tag.items()
-        if kind == "major" and vs_base.get(name) != "major"
-    )
     for name, kind in sorted(vs_base.items()):
         if kind == "minor":
             notice(f"{name}: minor-level API change vs the pull request base (compatible).")
-    for name, kind in sorted(vs_tag.items()):
-        if kind == "minor" and vs_base.get(name) != "minor":
-            notice(f"{name}: minor-level API change vs the last final tag (compatible).")
-    for name in inherited:
-        notice(
-            f"{name}: public API vs the last final tag still requires a new major "
-            "(already on the pull request base; release prep must bump the crate major)."
-        )
     failed = False
     if introduced:
         print("API break reported in: " + " ".join(introduced))
@@ -379,11 +358,7 @@ def run_pr() -> int:
         fail("pr mode needs BASE and PR")
     metadata = cargo_metadata()
     packages = library_packages(metadata, ROOT)
-    tag = last_final_tag(base)
-    if tag is None:
-        notice("No final v* tag yet; comparing public API against the pull request base only.")
     vs_base: dict[str, str] = {}
-    vs_tag: dict[str, str] = {}
     src_dirs: list[pathlib.Path] = []
     rel_files: list[str] = []
     for name, manifest, src in packages:
@@ -396,11 +371,6 @@ def run_pr() -> int:
         vs_base[name] = classify_package(name, base)
         if vs_base[name] == "error":
             return 1
-        if tag is None or not git_exists(tag, manifest):
-            continue
-        vs_tag[name] = classify_package(name, tag)
-        if vs_tag[name] == "error":
-            return 1
     head_enums: dict[tuple[str, str], bool] = {}
     for src_dir in src_dirs:
         head_enums.update(enums_in_tree(src_dir, ROOT))
@@ -408,7 +378,7 @@ def run_pr() -> int:
     missing = new_enums_missing_non_exhaustive(base_enums, head_enums)
     title, body, labels = load_pr(pr, repo)
     waived = breaking_waiver(title, body, labels)
-    return evaluate_pr(vs_base, vs_tag, waived, missing)
+    return evaluate_pr(vs_base, waived, missing)
 
 
 def run_release() -> int:
@@ -509,47 +479,17 @@ def self_test() -> None:
         with contextlib.redirect_stdout(io.StringIO()):
             return fn(*args, **kwargs)
 
-    rc = quiet(
-        evaluate_pr,
-        {"demo": "major"},
-        {"demo": "major"},
-        waived=False,
-        missing_enums=[],
-    )
+    rc = quiet(evaluate_pr, {"demo": "major"}, waived=False, missing_enums=[])
     assert rc == 1
-    rc = quiet(
-        evaluate_pr,
-        {"demo": "major"},
-        {"demo": "major"},
-        waived=True,
-        missing_enums=[],
-    )
+    rc = quiet(evaluate_pr, {"demo": "major"}, waived=True, missing_enums=[])
     assert rc == 0
     rc = quiet(
-        evaluate_pr,
-        {"demo": "ok"},
-        {"demo": "major"},
-        waived=False,
-        missing_enums=[],
-    )
-    assert rc == 0, "inherited tag-major must not fail a later pull request"
-    rc = quiet(
-        evaluate_pr,
-        {"demo": "ok"},
-        {},
-        waived=False,
-        missing_enums=["src/lib.rs::New"],
+        evaluate_pr, {"demo": "ok"}, waived=False, missing_enums=["src/lib.rs::New"]
     )
     assert rc == 1
-    rc = quiet(evaluate_pr, {"demo": "error"}, {}, waived=False, missing_enums=[])
+    rc = quiet(evaluate_pr, {"demo": "error"}, waived=False, missing_enums=[])
     assert rc == 1
-    rc = quiet(
-        evaluate_pr,
-        {"demo": "minor"},
-        {"demo": "minor"},
-        waived=False,
-        missing_enums=[],
-    )
+    rc = quiet(evaluate_pr, {"demo": "minor"}, waived=False, missing_enums=[])
     assert rc == 0
 
     rc = quiet(

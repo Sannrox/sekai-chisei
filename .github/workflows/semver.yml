@@ -13,14 +13,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Public API of the library crates against the pull request base and the
-  # last final v* tag (scripts/check-semver.py). Versions are release-owned,
-  # so a pull request never bumps them: a reported major vs the base passes
-  # only when the pull request is marked breaking (`type!:` subject or a
-  # Breaking/Upgrade heading, as scripts/changelog-draft.sh reads it) and
-  # labelled `risk:breaking`. A major vs the tag that is already on the base
-  # is a notice; release prep is the version bump. New public enums need
-  # #[non_exhaustive].
+  # Public API of the library crates against the pull request base
+  # (scripts/check-semver.py). Versions are release-owned, so a pull request
+  # never bumps them: a reported major vs the base passes only when the pull
+  # request is marked breaking (`type!:` subject or a Breaking/Upgrade
+  # heading, as scripts/changelog-draft.sh reads it) and labelled
+  # `risk:breaking`. The comparison against the last final v* tag runs at
+  # release prep (`check-semver.py release`, release.yml), which owns the
+  # version bump. New public enums need #[non_exhaustive].
   semver:
     name: Semver
     runs-on: ubuntu-latest
@@ -31,7 +31,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-          fetch-tags: true
       # rust-toolchain.toml picks the version.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
