@@ -75,39 +75,7 @@ impl Provider for OpenAI {
         if !status.is_success() {
             return Err(format!("openai {}: {}", status, text));
         }
-
-        let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let choice = &v["choices"][0]["message"];
-        let content = choice["content"].as_str().unwrap_or("").to_string();
-        let tool_calls = choice["tool_calls"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|tc| ToolCall {
-                        id: tc["id"].as_str().unwrap_or("").into(),
-                        name: tc["function"]["name"].as_str().unwrap_or("").into(),
-                        args: serde_json::from_str(
-                            tc["function"]["arguments"].as_str().unwrap_or("{}"),
-                        )
-                        .unwrap_or_default(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(ChatResponse {
-            content,
-            tool_calls,
-            input_tokens: v["usage"]["prompt_tokens"].as_i64().unwrap_or(0) as i32,
-            output_tokens: v["usage"]["completion_tokens"].as_i64().unwrap_or(0) as i32,
-            stop_reason: choice
-                .get("finish_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("stop")
-                .to_string(),
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-        })
+        parse_openai_chat_response(&text)
     }
 
     async fn content_chat(&self, req: &ContentChatRequest) -> Result<ChatResponse, String> {
@@ -921,6 +889,29 @@ mod tests {
                 .is_err()
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_reports_the_providers_finish_reason() {
+        // #2370: finish_reason sits on the choice, not inside its message.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::Json(json!({
+                    "choices": [{"message": {"content": "trunc"}, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAI::with_timeouts("", Some(&base_url), test_timeouts());
+        let response = provider.chat(&test_chat_request("acme-1")).await.unwrap();
+        assert_eq!(response.stop_reason, "length");
     }
 
     async fn spawn_delayed_openai() -> String {
