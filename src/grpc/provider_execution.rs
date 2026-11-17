@@ -614,26 +614,29 @@ fn domain_chunk_to_execution(chunk: llm::ChatStreamChunk) -> ProviderExecutionCh
     }
 }
 
+/// Token estimate a chat request reserves against the budget before it runs:
+/// about four bytes per token of prompt, plus the requested output allowance.
+/// Never negative, so a reservation can only add usage.
 pub fn estimate_chat_request(r: &ProviderExecutionRequest) -> i32 {
-    let system_tokens = r.system.len() as i32 / 4;
-    let message_tokens = r
-        .messages
-        .iter()
-        .map(|m| {
-            let tool_calls_size = m
-                .tool_calls
-                .iter()
-                .map(|tc| tc.id.len() + tc.name.len() + tc.args_json.len())
-                .sum::<usize>();
-            ((m.role.len() + m.content.len() + m.tool_call_id.len() + tool_calls_size) as i32) / 4
-        })
-        .sum::<i32>();
-    let tool_defs_tokens = r
-        .tools
-        .iter()
-        .map(|t| ((t.name.len() + t.description.len() + t.input_schema_json.len()) as i32) / 4)
-        .sum::<i32>();
-    system_tokens + message_tokens + tool_defs_tokens + r.max_tokens
+    let bytes = r.system.len()
+        + r.messages
+            .iter()
+            .map(|m| {
+                let tool_calls_size = m
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.id.len() + tc.name.len() + tc.args_json.len())
+                    .sum::<usize>();
+                m.role.len() + m.content.len() + m.tool_call_id.len() + tool_calls_size
+            })
+            .sum::<usize>()
+        + r.tools
+            .iter()
+            .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+            .sum::<usize>();
+    i32::try_from(bytes / 4)
+        .unwrap_or(i32::MAX)
+        .saturating_add(r.max_tokens.max(0))
 }
 
 fn estimate_content_request(request: &ProviderContentExecutionRequest) -> i32 {
@@ -1111,6 +1114,21 @@ mod tests {
             eligible_prompt_cache_intent(&registry, &request, requested).unwrap(),
             llm::PromptCacheIntent::default()
         );
+    }
+
+    #[test]
+    fn chat_estimate_never_goes_negative() {
+        let request = ProviderExecutionRequest {
+            system: "s".repeat(400),
+            max_tokens: -1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(estimate_chat_request(&request), 100);
+        let request = ProviderExecutionRequest {
+            max_tokens: i32::MAX,
+            ..request
+        };
+        assert_eq!(estimate_chat_request(&request), i32::MAX);
     }
 
     #[test]
