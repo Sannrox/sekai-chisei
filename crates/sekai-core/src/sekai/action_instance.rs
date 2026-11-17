@@ -566,6 +566,8 @@ impl SekaiDb {
                 ON sekai_action_instances(operation_id);
             CREATE INDEX IF NOT EXISTS idx_action_instances_type
                 ON sekai_action_instances(namespace, type_id, version);
+            CREATE INDEX IF NOT EXISTS idx_action_instances_principal_status_decided
+                ON sekai_action_instances(namespace, type_id, principal, status, decided_at_ms);
             CREATE INDEX IF NOT EXISTS idx_action_instances_writer_object
                 ON sekai_action_instances (
                     namespace,
@@ -765,6 +767,65 @@ impl SekaiDb {
             .map(|body| {
                 serde_json::from_str(&body)
                     .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
+    /// Whether `principal` has an instance of `type_id` in `namespace` with
+    /// `status`, decided at or after `since_ms`; one index probe.
+    pub fn action_instance_decided_since(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        principal: &str,
+        status: &str,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        self.migrate_action_instances()?;
+        self.conn()
+            .query_row(
+                SQLITE_ACTION_INSTANCE_DECIDED_SINCE,
+                params![namespace, type_id, principal, status, since_ms],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    /// Instances of `namespace` in `status` (of `type_id` when given) older
+    /// than `before`, newest first, read as an index range.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<ActionInstance>, String> {
+        self.migrate_action_instances()?;
+        let type_filter = type_id.filter(|t| !t.trim().is_empty());
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(SQLITE_ACTION_INSTANCES_OLDER_THAN)
+            .map_err(|e| e.to_string())?;
+        let bodies = stmt
+            .query_map(
+                params![
+                    namespace,
+                    status,
+                    type_filter,
+                    before.at_ms,
+                    before.id,
+                    limit.clamp(1, 500) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        bodies
+            .iter()
+            .map(|body| {
+                serde_json::from_str(body).map_err(|e| format!("corrupt action instance body: {e}"))
             })
             .collect()
     }
@@ -1588,6 +1649,21 @@ fn list_forgotten_site_agent_memory(db: &SekaiDb) -> Result<Vec<crate::domain::O
 
 /// Writer-type literals must match [`crate::sekai::site_agent_memory`]
 /// create/update/forget so the partial indexes in `migrate_*` apply (#2048).
+/// Whether `principal` has an instance of a type in a namespace with a status
+/// decided at or after a time.
+pub(crate) const SQLITE_ACTION_INSTANCE_DECIDED_SINCE: &str = "SELECT EXISTS (
+     SELECT 1 FROM sekai_action_instances
+     WHERE namespace = ?1 AND type_id = ?2 AND principal = ?3 AND status = ?4
+       AND decided_at_ms >= ?5)";
+
+/// Instances of a namespace in a status, of a type when `?3` is not NULL,
+/// past a keyset position, newest first.
+pub(crate) const SQLITE_ACTION_INSTANCES_OLDER_THAN: &str =
+    "SELECT body_json FROM sekai_action_instances
+     WHERE namespace = ?1 AND status = ?2 AND (?3 IS NULL OR type_id = ?3)
+       AND (created_at_ms, instance_id) < (?4, ?5)
+     ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?6";
+
 pub(crate) const SQLITE_REDACT_WRITER_ACTIONS: &str =
     "SELECT instance_id, parameters_json, body_json
      FROM sekai_action_instances

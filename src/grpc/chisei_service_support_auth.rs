@@ -96,6 +96,25 @@ pub(super) fn required_authenticated_actor<T>(request: &Request<T>) -> Result<St
         .map(str::to_string)
         .ok_or_else(|| Status::unauthenticated("authenticated principal required"))
 }
+/// True for the built-in service principals, or for a configured gateway
+/// principal authenticated by token. A trusted signed assertion that merely
+/// carries a gateway principal's name does not qualify.
+pub(super) fn is_gateway_service_principal<T>(request: &Request<T>, config: &Config) -> bool {
+    let actor = authenticated_actor(request);
+    if matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
+        return true;
+    }
+    let token_authenticated = request
+        .metadata()
+        .get(AUTH_SOURCE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        == Some("token");
+    token_authenticated
+        && config
+            .gateway_receipt_principals
+            .iter()
+            .any(|principal| principal == &actor)
+}
 pub(super) fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> {
     if matches!(authenticated_actor(request).as_str(), "root" | "local") {
         Ok(())

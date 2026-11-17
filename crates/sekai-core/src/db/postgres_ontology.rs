@@ -11,7 +11,7 @@ const RELATION_COLUMNS: &str =
 impl PostgresDb {
     pub fn upsert_ontology_class(&self, class: &OntologyClass) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
-        upsert_class_row(&mut *self.connection()?, class, now)
+        upsert_class_row(&mut *self.connection()?, class, now).map(|_| ())
     }
 
     /// Writes the class and its chained audit decision in one transaction,
@@ -26,18 +26,11 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let existed: bool = transaction
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM sekai_ontology_classes WHERE name = $1)",
-                &[&class.name],
-            )
-            .map_err(|error| error.to_string())?
-            .get(0);
-        upsert_class_row(&mut transaction, class, now)?;
+        let inserted = upsert_class_row(&mut transaction, class, now)?;
         insert_ontology_audit(
             &mut transaction,
             actor,
-            if existed {
+            if !inserted {
                 "ontology.class.update"
             } else {
                 "ontology.class.create"
@@ -100,18 +93,11 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
-        let existed: bool = transaction
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM sekai_ontology_relations WHERE name = $1)",
-                &[&relation.name],
-            )
-            .map_err(|error| error.to_string())?
-            .get(0);
-        upsert_relation_row(&mut transaction, relation, now)?;
+        let inserted = upsert_relation_row(&mut transaction, relation, now)?;
         insert_ontology_audit(
             &mut transaction,
             actor,
-            if existed {
+            if !inserted {
                 "ontology.relation.update"
             } else {
                 "ontology.relation.create"
@@ -286,11 +272,14 @@ fn decode<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&value).map_err(|error| format!("corrupt {field}: {error}"))
 }
 
+/// Writes the class row; true when it inserted, false when it updated.
+/// `xmax = 0` is true only for a freshly inserted row, so concurrent first
+/// writes cannot both report a create.
 fn upsert_class_row(
     client: &mut impl postgres::GenericClient,
     class: &OntologyClass,
     now: i64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let superclasses =
         serde_json::to_string(&class.superclasses).map_err(|error| error.to_string())?;
     let equivalent =
@@ -299,7 +288,7 @@ fn upsert_class_row(
         serde_json::to_string(&class.disjoint_classes).map_err(|error| error.to_string())?;
     let properties = serde_json::to_string(&class.properties).map_err(|error| error.to_string())?;
     client
-        .execute(
+        .query_one(
             "INSERT INTO sekai_ontology_classes
                 (name,description,superclasses_json,equivalent_json,disjoint_json,
                  properties_json,mapped_kind,created,updated)
@@ -311,7 +300,8 @@ fn upsert_class_row(
                 disjoint_json=EXCLUDED.disjoint_json,
                 properties_json=EXCLUDED.properties_json,
                 mapped_kind=EXCLUDED.mapped_kind,
-                updated=EXCLUDED.updated",
+                updated=EXCLUDED.updated
+             RETURNING (xmax = 0)",
             &[
                 &class.name,
                 &class.description,
@@ -323,7 +313,7 @@ fn upsert_class_row(
                 &now,
             ],
         )
-        .map(|_| ())
+        .map(|row| row.get(0))
         .map_err(|error| error.to_string())
 }
 
@@ -333,7 +323,7 @@ fn upsert_relation_row(
     transaction: &mut postgres::Transaction<'_>,
     relation: &OntologyRelation,
     now: i64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let cardinality =
         serde_json::to_string(&relation.cardinality).map_err(|error| error.to_string())?;
     let transitive = i64::from(relation.transitive);
@@ -359,7 +349,7 @@ fn upsert_relation_row(
         }
     }
     transaction
-        .execute(
+        .query_one(
             "INSERT INTO sekai_ontology_relations
                 (name,description,domain,range,cardinality_json,inverse,transitive,
                  mapped_relation,created,updated)
@@ -372,7 +362,8 @@ fn upsert_relation_row(
                 inverse=EXCLUDED.inverse,
                 transitive=EXCLUDED.transitive,
                 mapped_relation=EXCLUDED.mapped_relation,
-                updated=EXCLUDED.updated",
+                updated=EXCLUDED.updated
+             RETURNING (xmax = 0)",
             &[
                 &relation.name,
                 &relation.description,
@@ -385,7 +376,7 @@ fn upsert_relation_row(
                 &now,
             ],
         )
-        .map(|_| ())
+        .map(|row| row.get(0))
         .map_err(|error| error.to_string())
 }
 
@@ -413,4 +404,98 @@ fn insert_ontology_audit(
             outcome: "applied".into(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::postgres::ScratchDatabase;
+    use sekai_types::decision_ledger::DecisionFilter;
+
+    /// Two first writes of one class race; the upsert, not a prior read,
+    /// decides which one is the create (#2478).
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn concurrent_first_class_writes_audit_one_create_and_one_update() {
+        let scratch = ScratchDatabase::create();
+        let db = std::sync::Arc::new(scratch.connect());
+        let class = OntologyClass {
+            name: "Pump".into(),
+            description: String::new(),
+            superclasses: Vec::new(),
+            equivalent_classes: Vec::new(),
+            disjoint_classes: Vec::new(),
+            properties: Vec::new(),
+            is_builtin: false,
+            mapped_kind: String::new(),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers: Vec<_> = (0..2)
+            .map(|index| {
+                let (db, class, barrier) = (db.clone(), class.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.upsert_ontology_class_with_audit(&class, &format!("writer-{index}"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let actions = |action: &str| {
+            db.list_decisions(&DecisionFilter {
+                action: Some(action.into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .len()
+        };
+        assert_eq!(actions("ontology.class.create"), 1);
+        assert_eq!(actions("ontology.class.update"), 1);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn concurrent_first_relation_writes_audit_one_create_and_one_update() {
+        let scratch = ScratchDatabase::create();
+        let db = std::sync::Arc::new(scratch.connect());
+        let relation = OntologyRelation {
+            name: "feeds".into(),
+            description: String::new(),
+            domain: "Pump".into(),
+            range: "Pipe".into(),
+            cardinality: Default::default(),
+            inverse: String::new(),
+            transitive: false,
+            is_builtin: false,
+            mapped_relation: String::new(),
+        };
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers: Vec<_> = (0..2)
+            .map(|index| {
+                let (db, relation, barrier) = (db.clone(), relation.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.upsert_ontology_relation_with_audit(&relation, &format!("writer-{index}"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let actions = |action: &str| {
+            db.list_decisions(&DecisionFilter {
+                action: Some(action.into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .len()
+        };
+        assert_eq!(actions("ontology.relation.create"), 1);
+        assert_eq!(actions("ontology.relation.update"), 1);
+    }
 }

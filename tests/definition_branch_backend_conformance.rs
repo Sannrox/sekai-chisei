@@ -3,7 +3,7 @@ use std::sync::{Arc, Barrier};
 
 use sekai_chisei::db::dataset::DatasetBackend;
 use sekai_chisei::db::definition_branch::DefinitionBranchBackend;
-use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::db::{OlderThan, postgres::PostgresDb, sekai::SekaiDb};
 use sekai_chisei::domain::Object;
 use sekai_chisei::sekai::agent_promotion::{
     AgentDefinitionCertification, REFUSAL_FAILED, REFUSAL_MISSING, REFUSAL_REGRESSION,
@@ -2121,6 +2121,16 @@ fn proposed_dataset_branch(
     tenant: &str,
     name: &str,
 ) -> DatasetBranchProposal {
+    proposed_bound_dataset_branch(db, tenant, name, "")
+}
+
+/// A proposal on a fresh dataset bound to `object_id` (unbound when empty).
+fn proposed_bound_dataset_branch(
+    db: &dyn DatasetBackend,
+    tenant: &str,
+    name: &str,
+    object_id: &str,
+) -> DatasetBranchProposal {
     let id = format!("ds-{}", uuid::Uuid::new_v4().simple());
     db.create_dataset(&Dataset {
         id: id.clone(),
@@ -2132,7 +2142,7 @@ fn proposed_dataset_branch(
                 classification: "internal".into(),
             })
             .to_vec(),
-        object_id: String::new(),
+        object_id: object_id.into(),
         created: 0,
         partition_keys: Vec::new(),
     })
@@ -2309,30 +2319,52 @@ fn live_values(db: &dyn DatasetBackend, dataset_id: &str) -> Vec<String> {
 /// store has them inherently; the backend traits do not.
 trait OpenProposalListings: DefinitionBranchBackend + DatasetBackend {
     fn open_definition_proposals(&self, namespace: &str) -> Vec<String>;
-    /// Sorted `(proposal id, attached)` pairs of `tenant`.
-    fn open_dataset_proposals(&self, tenant: &str) -> Vec<(String, bool)>;
+    /// Open proposal ids of `tenant` in `namespace` older than `before`,
+    /// newest first.
+    fn dataset_proposal_page(
+        &self,
+        tenant: &str,
+        namespace: &str,
+        limit: usize,
+        before: OlderThan<'_>,
+    ) -> Vec<(DatasetBranchProposal, bool)>;
+    /// Sorted `(proposal id, attached)` pairs of `tenant` in `namespace`.
+    fn open_dataset_proposals(&self, tenant: &str, namespace: &str) -> Vec<(String, bool)> {
+        let mut open: Vec<_> = self
+            .dataset_proposal_page(tenant, namespace, 100, OlderThan::START)
+            .into_iter()
+            .map(|(proposal, attached)| (proposal.id, attached))
+            .collect();
+        open.sort();
+        open
+    }
+    fn put_object(&self, object: &Object);
 }
 
 macro_rules! open_proposal_listings {
     ($target:ty) => {
         impl OpenProposalListings for $target {
             fn open_definition_proposals(&self, namespace: &str) -> Vec<String> {
-                self.list_open_definition_proposals(namespace, 100, 0)
+                self.list_open_definition_proposals(namespace, 100, OlderThan::START)
                     .unwrap()
                     .into_iter()
                     .map(|proposal| proposal.proposal_id)
                     .collect()
             }
 
-            fn open_dataset_proposals(&self, tenant: &str) -> Vec<(String, bool)> {
-                let mut open: Vec<_> = self
-                    .list_open_dataset_branch_proposals(tenant, 100, 0)
+            fn dataset_proposal_page(
+                &self,
+                tenant: &str,
+                namespace: &str,
+                limit: usize,
+                before: OlderThan<'_>,
+            ) -> Vec<(DatasetBranchProposal, bool)> {
+                self.list_open_dataset_branch_proposals(tenant, namespace, limit, before)
                     .unwrap()
-                    .into_iter()
-                    .map(|(proposal, attached)| (proposal.id, attached))
-                    .collect();
-                open.sort();
-                open
+            }
+
+            fn put_object(&self, object: &Object) {
+                self.create_object(object).unwrap();
             }
         }
     };
@@ -2344,9 +2376,16 @@ open_proposal_listings!(PostgresDb);
 /// dataset proposal an open definition proposal attaches says so.
 fn exercise_open_proposal_listings(db: &impl OpenProposalListings, prefix: &str) {
     let namespace = format!("{prefix}-open");
+    let elsewhere = format!("{namespace}-other");
     let tenant = format!("{prefix}-tenant");
-    let standalone = proposed_dataset_branch(db, &tenant, "fix");
-    let attached = proposed_dataset_branch(db, &tenant, "fix");
+    let binding = ticket_object(&namespace, "binding", None);
+    let foreign_binding = ticket_object(&elsewhere, "binding", None);
+    db.put_object(&binding);
+    db.put_object(&foreign_binding);
+    let standalone = proposed_bound_dataset_branch(db, &tenant, "fix", &binding.id);
+    let attached = proposed_bound_dataset_branch(db, &tenant, "fix", &binding.id);
+    // Same tenant, but its dataset is bound in another namespace.
+    let foreign = proposed_bound_dataset_branch(db, &tenant, "fix", &foreign_binding.id);
     let both = |attached_flag: bool| {
         let mut expected = vec![
             (standalone.id.clone(), false),
@@ -2355,17 +2394,43 @@ fn exercise_open_proposal_listings(db: &impl OpenProposalListings, prefix: &str)
         expected.sort();
         expected
     };
-    assert_eq!(db.open_dataset_proposals(&tenant), both(false));
+    assert_eq!(db.open_dataset_proposals(&tenant, &namespace), both(false));
+    assert_eq!(
+        db.open_dataset_proposals(&tenant, &elsewhere),
+        [(foreign.id.clone(), false)]
+    );
+    // A page resumes strictly after the last proposal it showed.
+    let first = db.dataset_proposal_page(&tenant, &namespace, 1, OlderThan::START);
+    let [(newest, _)] = first.as_slice() else {
+        panic!("one proposal per page: {first:?}");
+    };
+    let next = db.dataset_proposal_page(
+        &tenant,
+        &namespace,
+        10,
+        OlderThan {
+            at_ms: newest.created_at_ms,
+            id: &newest.id,
+        },
+    );
+    let mut seen: Vec<_> = std::iter::once(newest.id.clone())
+        .chain(next.into_iter().map(|(proposal, _)| proposal.id))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        both(false)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    );
     assert!(db.open_definition_proposals(&namespace).is_empty());
     let base = open_attached_proposal(db, &namespace, attach(&[&attached]), &tenant).unwrap();
     assert_eq!(db.open_definition_proposals(&namespace), ["cs"]);
+    assert!(db.open_definition_proposals(&elsewhere).is_empty());
+    assert_eq!(db.open_dataset_proposals(&tenant, &namespace), both(true));
     assert!(
-        db.open_definition_proposals(&format!("{namespace}-other"))
-            .is_empty()
-    );
-    assert_eq!(db.open_dataset_proposals(&tenant), both(true));
-    assert!(
-        db.open_dataset_proposals(&format!("{tenant}-other"))
+        db.open_dataset_proposals(&format!("{tenant}-other"), &namespace)
             .is_empty()
     );
     db.merge_dataset_branch(&MergeDatasetBranch {
@@ -2377,12 +2442,12 @@ fn exercise_open_proposal_listings(db: &impl OpenProposalListings, prefix: &str)
     })
     .unwrap();
     assert_eq!(
-        db.open_dataset_proposals(&tenant),
+        db.open_dataset_proposals(&tenant, &namespace),
         [(attached.id.clone(), true)]
     );
     merge_attached(db, &namespace, &base, "merge").unwrap();
     assert!(db.open_definition_proposals(&namespace).is_empty());
-    assert!(db.open_dataset_proposals(&tenant).is_empty());
+    assert!(db.open_dataset_proposals(&tenant, &namespace).is_empty());
 }
 
 fn exercise_dataset_attachments(

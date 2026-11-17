@@ -123,6 +123,24 @@ impl RuntimeDb {
         }
     }
 
+    pub fn load_dataset_version_page(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+        after_row_id: Option<i64>,
+        limit: usize,
+    ) -> Result<crate::sekai::dataset::DatasetVersionPage, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.load_dataset_version_page(dataset_id, version_id, as_of_ms, after_row_id, limit)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.load_dataset_version_page(dataset_id, version_id, as_of_ms, after_row_id, limit)
+            }),
+        }
+    }
+
     pub fn create_dataset_branch(
         &self,
         request: &crate::sekai::dataset_branch::CreateDatasetBranch,
@@ -249,18 +267,22 @@ impl RuntimeDb {
         }
     }
 
-    /// Open dataset branch proposals of `tenant`, newest first, each with
-    /// whether an open definition proposal attaches it (#2203).
+    /// Open dataset branch proposals of `tenant` on datasets bound in
+    /// `namespace`, older than `before`, newest first, each with whether an
+    /// open definition proposal attaches it (#2203).
     pub fn list_open_dataset_branch_proposals(
         &self,
         tenant: &str,
+        namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<(crate::sekai::dataset_branch::DatasetBranchProposal, bool)>, String> {
         match self {
-            Self::Sqlite(db) => db.list_open_dataset_branch_proposals(tenant, limit, offset),
+            Self::Sqlite(db) => {
+                db.list_open_dataset_branch_proposals(tenant, namespace, limit, before)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_open_dataset_branch_proposals(tenant, limit, offset)
+                db.list_open_dataset_branch_proposals(tenant, namespace, limit, before)
             }),
         }
     }

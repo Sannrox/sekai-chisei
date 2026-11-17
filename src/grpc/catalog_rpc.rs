@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::sekai::catalog::{self, CatalogError, CatalogRegistration, EntryKind};
+use crate::sekai::catalog_criticality;
 
 pub(super) async fn register_catalog_entry(
     service: &SekaiServiceImpl,
@@ -346,6 +347,43 @@ pub(super) async fn get_catalog_entry_lineage(
     }))
 }
 
+/// Most outbox rows one `ListCatalogCriticalityOutbox` request reads, however
+/// few of them the caller may see.
+const MAX_OUTBOX_SCAN_ROWS: usize = 1_000;
+
+/// Collect up to `page_size` visible events, reading at most
+/// [`MAX_OUTBOX_SCAN_ROWS`] rows. `accept` maps a row to the event to return,
+/// or `None` for a row the caller may not see. A page that ends early on the
+/// scan bound still carries a token at the last row read, so the caller resumes
+/// after it instead of mistaking the page for the end of the outbox.
+fn scan_outbox_page(
+    page_size: usize,
+    mut page_token: String,
+    mut fetch: impl FnMut(&str) -> Result<(Vec<catalog_criticality::CriticalityEvent>, String), Status>,
+    mut accept: impl FnMut(
+        &catalog_criticality::CriticalityEvent,
+    ) -> Result<Option<CatalogCriticalityEvent>, Status>,
+) -> Result<(Vec<CatalogCriticalityEvent>, String), Status> {
+    let mut visible = Vec::new();
+    let mut scanned = 0usize;
+    loop {
+        let (events, next) = fetch(&page_token)?;
+        for event in events {
+            scanned += 1;
+            visible.extend(accept(&event)?);
+            if visible.len() >= page_size || scanned >= MAX_OUTBOX_SCAN_ROWS {
+                let token =
+                    catalog_criticality::encode_page_token(event.created_at_ms, &event.event_id);
+                return Ok((visible, token));
+            }
+        }
+        if next.is_empty() {
+            return Ok((visible, String::new()));
+        }
+        page_token = next;
+    }
+}
+
 pub(super) async fn list_catalog_criticality_outbox(
     service: &SekaiServiceImpl,
     req: Request<ListCatalogCriticalityOutboxRequest>,
@@ -372,21 +410,22 @@ pub(super) async fn list_catalog_criticality_outbox(
                 other => Status::internal(format!("{other:?}")),
             }
         })?;
-    let mut page_token = input.page_token;
-    let mut visible = Vec::new();
-    loop {
-        let (events, next) = db
-            .list_catalog_criticality_outbox(&input.namespace, page_size, &page_token)
-            .map_err(Status::internal)?;
-        for event in events {
+    let (events, next_page_token) = scan_outbox_page(
+        page_size as usize,
+        input.page_token,
+        |token| {
+            db.list_catalog_criticality_outbox(&input.namespace, page_size, token)
+                .map_err(Status::internal)
+        },
+        |event| {
             let Some(entry) = db
                 .get_object(&event.entry_id)
                 .map_err(|_| Status::internal("catalog entry unavailable"))?
             else {
-                continue;
+                return Ok(None);
             };
             if entry.kind != catalog::CATALOG_ENTRY_KIND || entry.namespace != input.namespace {
-                continue;
+                return Ok(None);
             }
             if !object_is_visible_for_purpose(
                 db,
@@ -397,7 +436,7 @@ pub(super) async fn list_catalog_criticality_outbox(
                 crate::sekai::object_security::ObjectSecurityOperation::Read,
                 purpose.as_ref(),
             ) {
-                continue;
+                return Ok(None);
             }
             let projected = match service.resolve_computed_for_response_with_policy(
                 entry,
@@ -407,57 +446,34 @@ pub(super) async fn list_catalog_criticality_outbox(
                 purpose.as_ref(),
             ) {
                 Ok(object) => object,
-                Err(status) if status.code() == tonic::Code::PermissionDenied => continue,
+                Err(status) if status.code() == tonic::Code::PermissionDenied => return Ok(None),
                 Err(status) => return Err(status),
             };
-            if projected
+            let matches_source = projected
                 .properties
                 .get("source_system")
                 .map(String::as_str)
-                != Some(event.source_system.as_str())
-                || projected.properties.get("source_id").map(String::as_str)
-                    != Some(event.source_id.as_str())
-            {
-                continue;
-            }
-            visible.push(CatalogCriticalityEvent {
-                event_id: event.event_id,
-                namespace: event.namespace,
-                entry_id: event.entry_id,
-                entry_kind: event.entry_kind,
-                source_system: event.source_system,
-                source_id: event.source_id,
-                declared: event.declared,
-                derived: event.derived,
-                effective: event.effective,
-                evidence_digest: event.evidence_digest,
+                == Some(event.source_system.as_str())
+                && projected.properties.get("source_id").map(String::as_str)
+                    == Some(event.source_id.as_str());
+            Ok(matches_source.then(|| CatalogCriticalityEvent {
+                event_id: event.event_id.clone(),
+                namespace: event.namespace.clone(),
+                entry_id: event.entry_id.clone(),
+                entry_kind: event.entry_kind.clone(),
+                source_system: event.source_system.clone(),
+                source_id: event.source_id.clone(),
+                declared: event.declared.clone(),
+                derived: event.derived.clone(),
+                effective: event.effective.clone(),
+                evidence_digest: event.evidence_digest.clone(),
                 created_at_ms: event.created_at_ms,
                 seq: event.seq,
-            });
-            if visible.len() >= page_size as usize {
-                break;
-            }
-        }
-        if visible.len() >= page_size as usize || next.is_empty() {
-            break;
-        }
-        page_token = next;
-    }
-    let next_page_token = if visible.len() < page_size as usize {
-        String::new()
-    } else {
-        visible
-            .last()
-            .map(|event| {
-                crate::sekai::catalog_criticality::encode_page_token(
-                    event.created_at_ms,
-                    &event.event_id,
-                )
-            })
-            .unwrap_or_default()
-    };
+            }))
+        },
+    )?;
     Ok(Response::new(ListCatalogCriticalityOutboxResponse {
-        events: visible,
+        events,
         next_page_token,
     }))
 }
@@ -592,5 +608,98 @@ impl SekaiServiceImpl {
             catalog_version,
         )?;
         Ok(Some((operation_id, invocation)))
+    }
+}
+
+#[cfg(test)]
+mod outbox_scan_tests {
+    use super::*;
+    use crate::sekai::catalog_criticality::{CriticalityEvent, decode_page_token};
+
+    fn event(n: i64) -> CriticalityEvent {
+        CriticalityEvent {
+            event_id: format!("e{n:06}"),
+            namespace: "acme".into(),
+            entry_id: format!("entry-{n}"),
+            entry_kind: "service".into(),
+            source_system: "sys".into(),
+            source_id: format!("id-{n}"),
+            seq: n,
+            declared: String::new(),
+            derived: String::new(),
+            effective: String::new(),
+            evidence_digest: String::new(),
+            created_at_ms: 1_000_000 - n,
+        }
+    }
+
+    /// Outbox of `total` rows newest first, served `size` at a time like the store.
+    fn fetch_from(
+        total: i64,
+        size: usize,
+        fetched: &std::cell::Cell<usize>,
+    ) -> impl FnMut(&str) -> Result<(Vec<CriticalityEvent>, String), Status> + '_ {
+        move |token| {
+            let start = if token.is_empty() {
+                0
+            } else {
+                let (created, _) = decode_page_token(token).unwrap().unwrap();
+                (1_000_000 - created + 1) as usize
+            };
+            let rows: Vec<_> = (start as i64..total).take(size).map(event).collect();
+            fetched.set(fetched.get() + rows.len());
+            let next = match rows.last() {
+                Some(last) if (start + rows.len()) < total as usize => {
+                    catalog_criticality::encode_page_token(last.created_at_ms, &last.event_id)
+                }
+                _ => String::new(),
+            };
+            Ok((rows, next))
+        }
+    }
+
+    fn projected(event: &CriticalityEvent) -> CatalogCriticalityEvent {
+        CatalogCriticalityEvent {
+            event_id: event.event_id.clone(),
+            created_at_ms: event.created_at_ms,
+            seq: event.seq,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_mostly_invisible_outbox_stops_at_the_scan_bound_with_a_resume_token() {
+        let fetched = std::cell::Cell::new(0);
+        let total = 5_000;
+        let (page, token) =
+            scan_outbox_page(1, String::new(), fetch_from(total, 10, &fetched), |_| {
+                Ok(None)
+            })
+            .unwrap();
+        assert!(page.is_empty());
+        assert_eq!(fetched.get(), 1_000);
+        let (_, last_event_id) = decode_page_token(&token).unwrap().unwrap();
+        assert_eq!(last_event_id, "e000999");
+
+        // The token resumes after the last scanned row and can reach a visible event.
+        let visible_at = 1_003;
+        let (resumed, _) = scan_outbox_page(1, token, fetch_from(total, 10, &fetched), |event| {
+            Ok((event.seq == visible_at).then(|| projected(event)))
+        })
+        .unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].seq, visible_at);
+    }
+
+    #[test]
+    fn a_short_outbox_ends_with_an_empty_token() {
+        let fetched = std::cell::Cell::new(0);
+        let (page, token) =
+            scan_outbox_page(5, String::new(), fetch_from(3, 10, &fetched), |event| {
+                Ok(Some(projected(event)))
+            })
+            .unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(token.is_empty());
     }
 }

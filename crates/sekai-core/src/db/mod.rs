@@ -131,3 +131,82 @@ pub mod store_plane;
 pub mod team_namespace;
 pub mod warehouse_projection_store;
 pub mod workflow_action_store;
+
+/// Where a newest-first listing resumes: rows strictly older than
+/// `(at_ms, id)` in `(at_ms DESC, id DESC)` order. Stores apply it as a
+/// row-value range on an index, so a page reads only its own rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OlderThan<'a> {
+    pub at_ms: i64,
+    pub id: &'a str,
+}
+
+impl OlderThan<'_> {
+    /// The first page. A row stamped `i64::MAX` is never listed.
+    pub const START: OlderThan<'static> = OlderThan {
+        at_ms: i64::MAX,
+        id: "",
+    };
+}
+
+#[cfg(test)]
+mod older_than_tests {
+    use super::OlderThan;
+    use super::sekai::SekaiDb;
+
+    /// Each pending-decision listing seeks its index from the keyset
+    /// position, so a page reads only its own rows, however deep it is.
+    #[test]
+    fn pending_decision_listings_seek_their_index_from_the_position() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        // Each listing creates its tables on first use.
+        db.list_action_instances_older_than("ns", None, "parked", 1, OlderThan::START)
+            .unwrap();
+        db.list_pending_plan_reviews("ns", 1, OlderThan::START)
+            .unwrap();
+        db.list_open_definition_proposals("ns", 1, OlderThan::START)
+            .unwrap();
+        db.list_open_dataset_branch_proposals("t", "ns", 1, OlderThan::START)
+            .unwrap();
+        let conn = db.conn();
+        for (sql, index) in [
+            (
+                crate::sekai::action_instance::SQLITE_ACTION_INSTANCES_OLDER_THAN,
+                "idx_action_instances_ns_status",
+            ),
+            (
+                crate::sekai::action_plan_store::SQLITE_PENDING_PLAN_REVIEWS,
+                "idx_sekai_plan_reviews_pending",
+            ),
+            (
+                super::definition_branch::SQLITE_OPEN_DEFINITION_PROPOSALS,
+                "idx_definition_proposal_open",
+            ),
+            (
+                super::dataset_branch::SQLITE_OPEN_DATASET_BRANCH_PROPOSALS,
+                "idx_sekai_dataset_branch_proposals_open",
+            ),
+        ] {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let count = stmt.parameter_count();
+            let plan: Vec<String> = stmt
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n("x", count)),
+                    |row| row.get(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains(&format!("USING INDEX {index}"))
+                        && step.contains(")<(?,?)")),
+                "{index}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+                "{index}: {plan:?}"
+            );
+        }
+    }
+}

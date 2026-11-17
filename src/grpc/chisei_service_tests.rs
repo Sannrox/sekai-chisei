@@ -4705,6 +4705,66 @@ async fn evaluation_resolution_binds_requirement_provenance_evidence() {
 }
 
 #[tokio::test]
+async fn a_hidden_dependency_is_not_cached_as_visible_for_later_references() {
+    let svc = memory_service();
+    let invariant_id = install_invariant(&svc, "acme");
+    // The invariant is visible to root only.
+    svc.db
+        .runtime()
+        .create_grant(&Grant {
+            id: "root-only-invariant".into(),
+            object_id: invariant_id.clone(),
+            principal: "root".into(),
+            role: Role::Viewer,
+            created: 3,
+            ..Default::default()
+        })
+        .unwrap();
+    let waiver = governed_fact_domain::put_waiver(
+        svc.db.runtime(),
+        governed_fact_domain::GovernedWaiverInput {
+            contract_version: governed_fact_domain::PROFILE_CONTRACT_VERSION.into(),
+            namespace: "acme".into(),
+            waiver_id: "depends-on-hidden".into(),
+            version: "1.0.0".into(),
+            invariant_version_ids: vec![invariant_id],
+            applicability: governed_fact_domain::FactApplicability {
+                subject_profiles: vec!["document/v1".into()],
+                subject_refs: vec![],
+            },
+            reason: "References a hidden invariant.".into(),
+            evidence_refs: vec![],
+            source_ref: "decision:hidden-dependency".into(),
+            valid_from_ms: 3,
+            expires_at_ms: 20,
+            supersedes_object_id: String::new(),
+            access_marking: String::new(),
+        },
+        "root",
+        3,
+    )
+    .unwrap();
+
+    // One cache across references, as resolution shares it across facts and
+    // waivers: the second reference must not see the first's partial walk.
+    let mut cache = HashMap::new();
+    let mut work = 0;
+    for _ in 0..2 {
+        assert!(
+            !evaluation_manifest_resolution::invariant_reference_visible(
+                svc.db.runtime(),
+                "acme",
+                &waiver.object_id,
+                "alice",
+                &mut cache,
+                &mut work,
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
 async fn evaluation_resolution_detects_hidden_applicable_waivers() {
     let svc = memory_service();
     let invariant_id = install_invariant(&svc, "acme");
@@ -6207,6 +6267,39 @@ async fn team_principals_cannot_mutate_usage_accounting() {
         svc.record_usage(sample).await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
+}
+
+#[tokio::test]
+async fn usage_recording_requires_token_auth_for_a_configured_gateway_principal() {
+    let mut svc = memory_service();
+    svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
+    let usage = || RecordUsageRequest {
+        user_id: "agent:codex-app".into(),
+        tokens_used: 3,
+        project: "sekai-chisei".into(),
+        idempotency_key: "gateway-usage".into(),
+        ..Default::default()
+    };
+    let mut assertion = Request::new(usage());
+    assertion
+        .metadata_mut()
+        .insert("x-principal", "Gateway-Prod".parse().unwrap());
+    assertion
+        .metadata_mut()
+        .insert(AUTH_SOURCE_HEADER, "assertion".parse().unwrap());
+    assert_eq!(
+        svc.record_usage(assertion).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let mut token = Request::new(usage());
+    token
+        .metadata_mut()
+        .insert("x-principal", "Gateway-Prod".parse().unwrap());
+    token
+        .metadata_mut()
+        .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+    svc.record_usage(token).await.unwrap();
 }
 
 #[tokio::test]

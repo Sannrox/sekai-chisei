@@ -538,6 +538,52 @@ impl PostgresDb {
         Ok((version, rows))
     }
 
+    /// One page of a version's rows in `row_id` order; see the SQLite
+    /// `load_dataset_version_page`.
+    pub fn load_dataset_version_page(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+        as_of_ms: i64,
+        after_row_id: Option<i64>,
+        limit: usize,
+    ) -> Result<crate::sekai::dataset::DatasetVersionPage, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        crate::db::postgres::lock_dataset_rows(&mut tx, dataset_id)?;
+        let version = get_dataset_version_pg(&mut tx, dataset_id, version_id, as_of_ms)?;
+        if version.purged {
+            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        let rows = tx
+            .query(
+                "SELECT row_id, data FROM sekai_dataset_version_rows
+                 WHERE dataset_id = $1 AND version_id = $2 AND row_id > $3
+                 ORDER BY row_id LIMIT $4",
+                &[
+                    &dataset_id,
+                    &version.version_id,
+                    &after_row_id.unwrap_or(i64::MIN),
+                    &i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let row_id: i64 = row.get(0);
+                let data: String = row.get(1);
+                serde_json::from_str(&data)
+                    .map(|values| (row_id, values))
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((version, rows))
+    }
+
     pub fn rollback_dataset(&self, request: &DatasetRollback) -> Result<DatasetVersion, String> {
         if request.restore_from_version_id.trim().is_empty() {
             return Err(dataset_version::DATASET_ROLLBACK_REQUIRES_RESTORE.into());
@@ -555,6 +601,21 @@ impl PostgresDb {
         )?;
         if restored.purged {
             return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        // Checked inside the rollback transaction, as on SQLite.
+        if let Some(row) = tx
+            .query_opt(
+                "SELECT namespace, kind FROM sekai_object_type_datasource
+                 WHERE dataset_id = $1 AND NOT edits_only
+                 ORDER BY namespace, kind LIMIT 1",
+                &[&request.dataset_id],
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err(dataset_version::rollback_backs_index_error(
+                &row.get::<_, String>(0),
+                &row.get::<_, String>(1),
+            ));
         }
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",

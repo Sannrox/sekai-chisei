@@ -544,6 +544,46 @@ impl RuntimeDb {
         }
     }
 
+    /// Whether `principal` has an instance of `type_id` in `namespace` with
+    /// `status`, decided at or after `since_ms`.
+    pub fn action_instance_decided_since(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        principal: &str,
+        status: &str,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.action_instance_decided_since(namespace, type_id, principal, status, since_ms)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.action_instance_decided_since(namespace, type_id, principal, status, since_ms)
+            }),
+        }
+    }
+
+    /// Instances of `namespace` in `status` (of `type_id` when given) older
+    /// than `before`, newest first.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.list_action_instances_older_than(namespace, type_id, status, limit, before)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_action_instances_older_than(namespace, type_id, status, limit, before)
+            }),
+        }
+    }
+
     pub fn put_action_effects(
         &self,
         effects: &[crate::sekai::action_effect::ActionEffect],

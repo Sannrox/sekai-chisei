@@ -127,6 +127,63 @@ impl PostgresDb {
         Ok(out)
     }
 
+    /// See `SekaiDb::action_instance_decided_since`.
+    pub fn action_instance_decided_since(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        principal: &str,
+        status: &str,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .connection()?
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM sekai_action_instances
+                     WHERE namespace = $1 AND type_id = $2 AND principal = $3
+                       AND status = $4 AND decided_at_ms >= $5)",
+                &[&namespace, &type_id, &principal, &status, &since_ms],
+            )
+            .map_err(|e| e.to_string())?
+            .get(0))
+    }
+
+    /// See `SekaiDb::list_action_instances_older_than`.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<ActionInstance>, String> {
+        let type_filter = type_id.filter(|t| !t.trim().is_empty());
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_instances
+                 WHERE namespace = $1 AND status = $2
+                   AND ($3::TEXT IS NULL OR type_id = $3)
+                   AND (created_at_ms, instance_id) < ($4, $5)
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $6",
+                &[
+                    &namespace,
+                    &status,
+                    &type_filter,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit.clamp(1, 500) as i64),
+                ],
+            )
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| {
+                serde_json::from_str(row.get(0))
+                    .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     pub fn put_action_instance(&self, instance: &ActionInstance) -> Result<ActionInstance, String> {
         instance.validate_fields()?;
         if let Some(existing) =

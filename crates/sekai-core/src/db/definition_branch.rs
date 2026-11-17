@@ -26,6 +26,13 @@ use crate::sekai::definition_proposal::{
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
 
+/// Open proposals of a namespace past a keyset position, newest first.
+pub const SQLITE_OPEN_DEFINITION_PROPOSALS: &str =
+    "SELECT body_json FROM sekai_definition_proposals
+     WHERE namespace = ?1 AND status = ?2
+       AND (created_at_ms, proposal_id) < (?3, ?4)
+     ORDER BY created_at_ms DESC, proposal_id DESC LIMIT ?5";
+
 pub trait DefinitionBranchBackend: Send + Sync {
     fn seed_published_definition_revision(
         &self,
@@ -793,24 +800,27 @@ impl SekaiDb {
         load_proposal_sqlite(&self.conn(), namespace, proposal_id)
     }
 
-    /// Open proposals of `namespace`, newest first (#2203).
+    /// Open proposals of `namespace` older than `before`, newest first
+    /// (#2203).
     pub fn list_open_definition_proposals(
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<DefinitionProposal>, String> {
         let connection = self.conn();
         let mut statement = connection
-            .prepare(
-                "SELECT body_json FROM sekai_definition_proposals
-                 WHERE namespace = ?1 AND status = ?2
-                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT ?3 OFFSET ?4",
-            )
+            .prepare(SQLITE_OPEN_DEFINITION_PROPOSALS)
             .map_err(|error| error.to_string())?;
         let bodies = statement
             .query_map(
-                params![namespace, STATUS_OPEN, limit as i64, offset as i64],
+                params![
+                    namespace,
+                    STATUS_OPEN,
+                    before.at_ms,
+                    before.id,
+                    limit as i64
+                ],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|error| error.to_string())?

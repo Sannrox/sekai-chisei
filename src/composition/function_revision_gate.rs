@@ -34,7 +34,7 @@ use crate::sekai::function::{
     function_digest, invoke_with_llm, validate_function,
 };
 use crate::sekai::markings::{
-    MarkingDecision, PrincipalAuthority, evaluate_marking_access, object_classification,
+    MarkingDecision, PrincipalAuthority, evaluate_marking_access, required_object_classification,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -48,11 +48,14 @@ pub const FUNCTION_OUTPUT_SCHEMA: &str = "chisei.function-revision-output/v1";
 pub const FUNCTION_OUTPUT_SCHEMA_VERSION: &str = "1";
 
 /// Most restrictive marking among the fixture inputs (union of the lattice).
-pub fn inherited_marking(inputs: &[Object]) -> Option<EvidenceClassification> {
-    inputs
-        .iter()
-        .filter_map(|object| object_classification(object).ok().flatten())
-        .max()
+/// An unparseable marking token is an error, so the gate never treats it as
+/// unmarked and sends outputs to the evaluator.
+pub fn inherited_marking(inputs: &[Object]) -> Result<Option<EvidenceClassification>, String> {
+    let mut strictest = None;
+    for object in inputs {
+        strictest = strictest.max(required_object_classification(object)?);
+    }
+    Ok(strictest)
 }
 
 /// Evaluator route may read retained evidence only when its ceiling covers the
@@ -213,7 +216,7 @@ pub fn gate_function_revision(
         })?;
         stored_fixtures.push(stored);
     }
-    let suite_marking = inherited_marking(&stored_fixtures);
+    let suite_marking = inherited_marking(&stored_fixtures)?;
     let mut retained = Vec::with_capacity(stored_fixtures.len());
     for fixture in &stored_fixtures {
         let fixture_id = fixture.id.clone();
@@ -768,6 +771,30 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("is not in the store"));
+    }
+
+    #[test]
+    fn unparseable_fixture_marking_is_refused_before_evaluation() {
+        let db = db();
+        let stored = fixture("odd", Some("secret-sauce"));
+        seed_fixture(&db, &stored);
+        let function = classify_function("classify-unknown-marking", "classify/v1");
+        let error = gate_function_revision(FunctionRevisionGateRequest {
+            db: &db,
+            function: &function,
+            fixtures: std::slice::from_ref(&stored),
+            llm_host: &ScriptedHost {
+                output: serde_json::json!({"label": "systems"}),
+            },
+            evaluator_authority: &authority(Some(EvidenceClassification::Public)),
+            registry: &rubric_registry(),
+            minimum_mean_score_micros: 800_000,
+            expected_label: "systems",
+            host: host(),
+            budget: FunctionBudget::for_tests(),
+        })
+        .unwrap_err();
+        assert!(error.contains("secret-sauce"), "{error}");
     }
 
     #[test]

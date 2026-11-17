@@ -227,6 +227,8 @@ const SOURCE_BATCH_DATASET_SCHEMA: &str = include_str!("postgres/0157_source_bat
 const TRANSFORM_CHAINS_SCHEMA: &str = include_str!("postgres/0158_transform_chains.sql");
 const OBJECT_LOG_INGEST_INTENTS_SCHEMA: &str =
     include_str!("postgres/0159_object_log_ingest_intents.sql");
+const ACTION_INSTANCE_DENIAL_INDEX_SCHEMA: &str =
+    include_str!("postgres/0160_action_instance_denial_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1145,6 +1147,12 @@ const MIGRATIONS: &[Migration] = &[
         158,
         "object_log_ingest_intents",
         OBJECT_LOG_INGEST_INTENTS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        159,
+        "action_instance_denial_index",
+        ACTION_INSTANCE_DENIAL_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

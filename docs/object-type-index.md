@@ -30,6 +30,10 @@ Operator RPCs (stable; served on the default build):
    visible `member_count`.
 4. `PutObjectTypeIndexEdit` — Action delta that survives a full rebuild.
 
+`RollbackDataset` refuses a dataset that a registered datasource reads
+(`edits_only` false) with `FAILED_PRECONDITION` naming the index, because a
+rollback would leave derived objects on rows the dataset no longer holds.
+
 Admitted object create/update still persists clerk objects and receipts
 here. Combined and Sekai processes always open an object log (default
 `<SEKAI_DATA_DIR>/objects.mikura`, or `SEKAI_OBJECT_LOG_HOST`). The same

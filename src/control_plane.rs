@@ -12,6 +12,7 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
     let mut telemetry = crate::obs::logging::init("sekai-chisei");
     // Refuse retired single-store variables before anything touches the data dir.
     crate::combined_stores::refuse_legacy_store_env().map_err(std::io::Error::other)?;
+    crate::config::require_valid_site_env().map_err(std::io::Error::other)?;
     let config = Config::from_env();
     plane
         .require_sekai_endpoint(config.sekai_endpoint.as_deref())

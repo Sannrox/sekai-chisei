@@ -31,6 +31,16 @@ impl tonic::service::Interceptor for GatewayAuthInterceptor {
     }
 }
 
+/// The bearer from `SEKAI_CREDENTIAL`, trimmed. A trailing newline from a
+/// secret file would otherwise make every call fail as invalid metadata.
+fn environment_credential() -> Option<String> {
+    normalize_credential(&std::env::var("SEKAI_CREDENTIAL").ok()?)
+}
+
+fn normalize_credential(raw: &str) -> Option<String> {
+    Some(raw.trim().to_string()).filter(|token| !token.is_empty())
+}
+
 pub async fn connect_sekai(
     target: &str,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
@@ -42,9 +52,7 @@ pub async fn connect_sekai_with_timeout(
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
     let auth_token = if target.starts_with("http://") || target.starts_with("https://") {
-        std::env::var("SEKAI_CREDENTIAL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
+        environment_credential()
     } else {
         None
     };
@@ -61,21 +69,15 @@ pub async fn connect_sekai_as_gateway_with_timeout(
     target: &str,
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
-    let environment_token = || {
-        std::env::var("SEKAI_CREDENTIAL")
-            .ok()
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-    };
     let auth_token = if target.starts_with("http://") || target.starts_with("https://") {
-        environment_token()
+        environment_credential()
     } else {
         let socket_target = target.strip_prefix("unix://").unwrap_or(target);
         std::fs::read_to_string(format!("{socket_target}.gateway-token"))
             .ok()
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty())
-            .or_else(environment_token)
+            .or_else(environment_credential)
     };
     connect_sekai_with_token(target, auth_token, timeout).await
 }
@@ -85,6 +87,19 @@ pub async fn connect_sekai_with_token(
     auth_token: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
+    // A bearer leaves the host in plaintext only under the same explicit
+    // opt-in that lets the server accept it (`SEKAI_ALLOW_PLAINTEXT=1`).
+    if auth_token.is_some()
+        && target.starts_with("http://")
+        && !is_loopback_target(target)?
+        && std::env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() != "1"
+    {
+        return Err(
+            "a credential is only sent over https or to a loopback target \
+             unless SEKAI_ALLOW_PLAINTEXT=1"
+                .into(),
+        );
+    }
     let interceptor = GatewayAuthInterceptor { auth_token };
 
     if target.starts_with("http://") || target.starts_with("https://") {
@@ -127,4 +142,49 @@ pub async fn connect_sekai_with_token(
             .await?;
 
     Ok(InterceptedService::new(channel, interceptor))
+}
+
+/// Whether a URI target names `localhost` or a loopback IP address.
+fn is_loopback_target(target: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = Uri::from_str(target)?;
+    let host = uri.host().unwrap_or_default();
+    Ok(host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #2466: a credential with surrounding whitespace authenticates trimmed;
+    // a blank one is no credential.
+    #[test]
+    fn credential_is_trimmed_and_blank_is_dropped() {
+        assert_eq!(normalize_credential("secret\n").as_deref(), Some("secret"));
+        assert_eq!(normalize_credential(" \n"), None);
+    }
+
+    // #2475: a bearer credential never leaves the host in plaintext.
+    #[tokio::test]
+    async fn credential_over_plaintext_to_remote_host_is_refused_before_connecting() {
+        let Err(error) = connect_sekai_with_token(
+            "http://203.0.113.1:50051",
+            Some("secret".into()),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        else {
+            panic!("plaintext remote target with a credential must fail");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("only sent over https or to a loopback"),
+            "{error}"
+        );
+    }
 }

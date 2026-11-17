@@ -476,6 +476,51 @@ async fn get_lineage_filters_nodes_outside_tenant_namespace() {
 }
 
 #[tokio::test]
+async fn get_lineage_spends_its_budget_only_on_visible_nodes() {
+    // A hidden neighbour takes no slot of `max_nodes`, so `truncated` cannot
+    // reveal it, and the walk does not reach visible nodes through it.
+    let svc = enterprise_service();
+    seed_lineage_object(&svc, "budget-root", "allowed");
+    seed_lineage_object(&svc, "budget-hidden", "denied");
+    seed_lineage_object(&svc, "budget-behind-hidden", "allowed");
+    seed_lineage_object(&svc, "budget-visible", "allowed");
+    for (id, from, to) in [
+        ("budget-a", "budget-root", "budget-hidden"),
+        ("budget-b", "budget-hidden", "budget-behind-hidden"),
+        ("budget-c", "budget-root", "budget-visible"),
+    ] {
+        svc.db
+            .runtime()
+            .create_link(&domain::Link {
+                id: id.into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                relation: "derived_from".into(),
+                created: 0,
+            })
+            .unwrap();
+    }
+    let result = svc
+        .get_lineage(with_tenant_context(GetLineageRequest {
+            object_id: "budget-root".into(),
+            max_nodes: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .unwrap();
+    let ids = result
+        .nodes
+        .iter()
+        .filter_map(|node| node.object.as_ref().map(|object| object.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["budget-root", "budget-visible"]);
+    assert!(!result.truncated);
+    assert_eq!(result.edges.len(), 1);
+}
+
+#[tokio::test]
 async fn semantic_reads_apply_the_enterprise_tenant_gate() {
     // #1147: expand, explain, and retrieve apply the same tenant gate as
     // object reads before capability or ACL work.
@@ -6185,7 +6230,10 @@ async fn list_datasets_omits_bindings_above_marking_ceiling() {
         })
         .unwrap();
     let denied = svc
-        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_named_principal(
+            ListDatasetsRequest::default(),
+            "alice",
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -6226,7 +6274,10 @@ async fn list_datasets_omits_bindings_above_marking_ceiling() {
         security::Role::Admin,
     );
     let allowed = svc
-        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_named_principal(
+            ListDatasetsRequest::default(),
+            "alice",
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -6237,6 +6288,77 @@ async fn list_datasets_omits_bindings_above_marking_ceiling() {
         .collect();
     assert!(allowed_ids.contains(&"open-ds"));
     assert!(allowed_ids.contains(&"marked-ds"));
+}
+
+/// #2532: ListDatasets pages in id order after the access filter, so a hidden
+/// dataset never takes a slot or shows up through a page token.
+#[tokio::test]
+async fn list_datasets_pages_visible_datasets_only() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "marked-page-object".into(),
+            kind: "artifact".into(),
+            name: "secret".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:marked-page".into(),
+            properties: HashMap::from([(
+                markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    for (id, object_id) in [
+        ("ds-c", ""),
+        ("ds-b-hidden", "marked-page-object"),
+        ("ds-a", ""),
+        ("ds-d", ""),
+    ] {
+        svc.db
+            .runtime()
+            .create_dataset(&dataset::Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![],
+                object_id: object_id.into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    let list = |page_size: i32, page_token: String| {
+        svc.list_datasets(with_named_principal(
+            ListDatasetsRequest {
+                page_size,
+                page_token,
+            },
+            "alice",
+        ))
+    };
+
+    let mut pages = Vec::new();
+    let mut token = String::new();
+    loop {
+        let page = list(2, token).await.unwrap().into_inner();
+        pages.push(
+            page.datasets
+                .into_iter()
+                .map(|dataset| dataset.id)
+                .collect::<Vec<_>>(),
+        );
+        if page.next_page_token.is_empty() {
+            break;
+        }
+        token = page.next_page_token;
+    }
+    assert_eq!(pages, [vec!["ds-a", "ds-c"], vec!["ds-d"]]);
+    assert_eq!(
+        list(-1, String::new()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
 }
 
 #[tokio::test]
@@ -6386,7 +6508,10 @@ async fn catalog_listings_omit_bindings_when_object_policy_cannot_be_evaluated()
         .unwrap();
 
     let datasets = svc
-        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_named_principal(
+            ListDatasetsRequest::default(),
+            "alice",
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -6499,7 +6624,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
     );
 
     let datasets = svc
-        .list_datasets(with_discoverer(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_discoverer(ListDatasetsRequest::default(), "alice"))
         .await
         .unwrap()
         .into_inner();
@@ -6525,7 +6650,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
         "{read:?}"
     );
 
-    let mut community = with_named_principal(ListDatasetsRequest {}, "alice");
+    let mut community = with_named_principal(ListDatasetsRequest::default(), "alice");
     community
         .extensions_mut()
         .insert(crate::enterprise::AuthenticatedContext::machine(
@@ -6626,7 +6751,7 @@ async fn discoverer_lists_catalog_and_is_denied_object_reads() {
         security::Role::Admin,
     );
     let delegated = svc
-        .list_datasets(with_discoverer(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_discoverer(ListDatasetsRequest::default(), "alice"))
         .await
         .unwrap()
         .into_inner();
@@ -7690,6 +7815,7 @@ async fn dataset_row_reads_honour_property_grants() {
                 dataset_id: "graded".into(),
                 version_id: version_id.clone(),
                 as_of_ms: 0,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -7707,9 +7833,10 @@ async fn dataset_row_reads_honour_property_grants() {
                 }))
                 .await
                 .unwrap()
-                .into_inner()
-                .rows;
-            assert_eq!(rolled[0].values, readable);
+                .into_inner();
+            // Rollback returns no rows; the restored rows are read through
+            // GetDatasetVersion (#2532).
+            assert!(rolled.version.is_some());
         }
     }
 }
@@ -7938,6 +8065,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
         dataset_id: dataset_id.into(),
         version_id: version(dataset_id),
         as_of_ms: 0,
+        ..Default::default()
     };
 
     let own = svc
@@ -7957,6 +8085,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             ListDatasetVersionsRequest {
                 dataset_id: "a-rows".into(),
                 as_of_ms: 0,
+                ..Default::default()
             },
         ))
         .await
@@ -7994,6 +8123,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             ListDatasetVersionsRequest {
                 dataset_id: dataset_id(),
                 as_of_ms: 0,
+                ..Default::default()
             }
         ))
     );
@@ -8033,6 +8163,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             "ListDatasetHealthChecks",
             ListDatasetHealthChecksRequest {
                 dataset_id: dataset_id(),
+                ..Default::default()
             }
         ))
     );
@@ -8044,6 +8175,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             ListDatasetHealthResultsRequest {
                 dataset_id: dataset_id(),
                 version_id: String::new(),
+                ..Default::default()
             }
         ))
     );
@@ -8054,7 +8186,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             "RunDatasetHealthChecks",
             RunDatasetHealthChecksRequest {
                 dataset_id: dataset_id(),
-                now_ms: 0,
+                ..Default::default()
             }
         ))
     );
@@ -8065,6 +8197,7 @@ async fn enterprise_dataset_reads_refuse_another_tenants_dataset() {
             "ListDatasetAlerts",
             ListDatasetAlertsRequest {
                 dataset_id: dataset_id(),
+                ..Default::default()
             }
         ))
     );
@@ -8109,6 +8242,7 @@ async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
         .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
             dataset_id: "versioned".into(),
             as_of_ms: 0,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8127,6 +8261,16 @@ async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
         .into_inner();
     let version = rolled.version.unwrap();
     assert_eq!(version.seq, 4);
+    let restored = svc
+        .get_dataset_version(with_principal(GetDatasetVersionRequest {
+            dataset_id: "versioned".into(),
+            version_id: version.version_id.clone(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .rows;
     assert_eq!(version.restored_from_version_id, first.version_id);
     assert_eq!(version.actor, "tester");
     let live = svc
@@ -8138,7 +8282,7 @@ async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
         .unwrap()
         .into_inner()
         .rows;
-    assert_eq!(live, rolled.rows);
+    assert_eq!(live, restored);
     svc.db
         .runtime()
         .set_dataset_version_retention("versioned", 2)
@@ -8156,11 +8300,176 @@ async fn rollback_dataset_restores_prior_snapshot_as_new_version() {
             dataset_id: "versioned".into(),
             version_id: first.version_id,
             as_of_ms: 0,
+            ..Default::default()
         }))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert!(error.message().contains("past retention"));
+}
+
+/// #2532: version history and a version's rows page, a row token stays on the
+/// version it started on, and a token that does not parse is refused.
+#[tokio::test]
+async fn dataset_versions_and_version_rows_page() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "paged".into(),
+            name: "paged".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    for kind in ["v1", "v2", "v3"] {
+        svc.append_rows(with_principal(AppendRowsRequest {
+            dataset_id: "paged".into(),
+            rows: vec![Row {
+                values: [("kind".into(), kind.into())].into(),
+            }],
+        }))
+        .await
+        .unwrap();
+    }
+    let versions = |page_token: &str| {
+        svc.list_dataset_versions(with_principal(ListDatasetVersionsRequest {
+            dataset_id: "paged".into(),
+            page_size: 2,
+            page_token: page_token.into(),
+            ..Default::default()
+        }))
+    };
+    let first = versions("").await.unwrap().into_inner();
+    assert_eq!(
+        first.versions.iter().map(|v| v.seq).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    let rest = versions(&first.next_page_token).await.unwrap().into_inner();
+    assert_eq!(rest.versions.iter().map(|v| v.seq).collect::<Vec<_>>(), [3]);
+    assert!(rest.next_page_token.is_empty());
+
+    let rows = |page_token: &str| {
+        svc.get_dataset_version(with_principal(GetDatasetVersionRequest {
+            dataset_id: "paged".into(),
+            // Empty: the first page resolves the latest version.
+            version_id: String::new(),
+            page_size: 2,
+            page_token: page_token.into(),
+            ..Default::default()
+        }))
+    };
+    let kinds = |rows: &[Row]| {
+        rows.iter()
+            .map(|row| row.values["kind"].clone())
+            .collect::<Vec<_>>()
+    };
+    let head = rows("").await.unwrap().into_inner();
+    // A write between pages makes a newer version; the token stays on the
+    // version the first page read.
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "paged".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v4".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    let tail = rows(&head.next_page_token).await.unwrap().into_inner();
+    assert_eq!(tail.version, head.version);
+    assert_eq!(head.version.unwrap().seq, 3);
+    assert!(tail.next_page_token.is_empty());
+    let mut all = kinds(&head.rows);
+    assert_eq!(all.len(), 2);
+    all.extend(kinds(&tail.rows));
+    all.sort();
+    assert_eq!(all, ["v1", "v2", "v3"]);
+    assert_eq!(
+        rows("not-a-position").await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+}
+
+/// #2533: RunDatasetHealthChecks refuses a caller-supplied time and records
+/// nothing; without one it judges freshness against the server clock.
+#[tokio::test]
+async fn run_dataset_health_checks_uses_the_server_clock() {
+    let svc = service();
+    svc.create_dataset(with_principal(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: "clocked".into(),
+            name: "clocked".into(),
+            columns: vec![ColumnDef {
+                name: "kind".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.append_rows(with_principal(AppendRowsRequest {
+        dataset_id: "clocked".into(),
+        rows: vec![Row {
+            values: [("kind".into(), "v1".into())].into(),
+        }],
+    }))
+    .await
+    .unwrap();
+    svc.put_dataset_health_check(with_principal(PutDatasetHealthCheckRequest {
+        check: Some(DatasetHealthCheck {
+            dataset_id: "clocked".into(),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: 3_600_000,
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    let results = || {
+        svc.list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
+            dataset_id: "clocked".into(),
+            ..Default::default()
+        }))
+    };
+
+    // A time far past the version would fail freshness if it were honored.
+    #[allow(deprecated)]
+    let supplied = RunDatasetHealthChecksRequest {
+        dataset_id: "clocked".into(),
+        now_ms: i64::MAX / 2,
+    };
+    let refused = svc
+        .run_dataset_health_checks(with_principal(supplied))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(refused.message().contains("now_ms"));
+    assert!(results().await.unwrap().into_inner().results.is_empty());
+
+    let judged = svc
+        .run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
+            dataset_id: "clocked".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .results;
+    assert_eq!(judged.len(), 1);
+    assert!(judged[0].passed, "{}", judged[0].detail);
+    assert_eq!(results().await.unwrap().into_inner().results.len(), 1);
 }
 
 #[tokio::test]
@@ -8205,6 +8514,7 @@ async fn rollback_dataset_requires_write_access() {
         .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
             dataset_id: "protected-versions".into(),
             as_of_ms: 0,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8360,6 +8670,7 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
             dataset_id: "health".into(),
             version_id: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8384,21 +8695,20 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
     }))
     .await
     .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 5_000,
-    }))
-    .await
-    .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 7_000,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 5_000)
+        .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 7_000)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8410,15 +8720,15 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .collect();
     assert_eq!(late.len(), 1);
     assert_eq!(late[0].state, "firing");
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 7_500,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 7_500)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8428,15 +8738,15 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         alerts.iter().filter(|alert| alert.reason == "late").count(),
         1
     );
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "health".into(),
-        now_ms: 8_000,
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("health", 8_000)
+        .unwrap();
     let alerts = svc
         .list_dataset_alerts(with_principal(ListDatasetAlertsRequest {
             dataset_id: "health".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8460,6 +8770,7 @@ async fn dataset_health_checks_quarantine_and_schedule_alerts() {
         .list_dataset_health_results(with_principal(ListDatasetHealthResultsRequest {
             dataset_id: "health".into(),
             version_id: String::new(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -8629,12 +8940,11 @@ async fn freshness_violations_notify_bound_consumers_and_hide_unread_evidence() 
         .map(|version| version.created_at_ms)
         .max()
         .unwrap();
-    svc.run_dataset_health_checks(with_principal(RunDatasetHealthChecksRequest {
-        dataset_id: "notify-orders".into(),
-        now_ms: created.saturating_add(10_000),
-    }))
-    .await
-    .unwrap();
+    // A fixed time drives the store-level run; the RPC uses the server clock.
+    svc.db
+        .runtime()
+        .run_dataset_health_checks("notify-orders", created.saturating_add(10_000))
+        .unwrap();
 
     let alice = svc
         .list_consumer_violation_notifications(with_named_principal(
@@ -28780,6 +29090,7 @@ async fn dataset_branch_rpcs_isolate_then_merge_once_by_another_principal() {
         .list_dataset_versions(with_principal(ListDatasetVersionsRequest {
             dataset_id: "branched".into(),
             as_of_ms: 0,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -37581,7 +37892,10 @@ async fn adhoc_runs_read_as_the_caller_and_replay_by_key() {
 
     // Scratch outputs stay out of the catalog listing and leave at expiry.
     let listed = svc
-        .list_datasets(with_named_principal(ListDatasetsRequest {}, "alice"))
+        .list_datasets(with_named_principal(
+            ListDatasetsRequest::default(),
+            "alice",
+        ))
         .await
         .unwrap()
         .into_inner()
@@ -37983,3 +38297,6 @@ mod governed_document_rpc_tests;
 
 #[path = "object_type_index_rpc_tests.rs"]
 mod object_type_index_rpc_tests;
+
+#[path = "dataset_rpc_tests.rs"]
+mod dataset_rpc_tests;

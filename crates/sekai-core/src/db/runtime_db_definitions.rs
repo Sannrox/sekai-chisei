@@ -274,17 +274,18 @@ impl RuntimeDb {
         }
     }
 
-    /// Open definition proposals of `namespace`, newest first (#2203).
+    /// Open definition proposals of `namespace` older than `before`, newest
+    /// first (#2203).
     pub fn list_open_definition_proposals(
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<DefinitionProposal>, String> {
         match self {
-            Self::Sqlite(db) => db.list_open_definition_proposals(namespace, limit, offset),
+            Self::Sqlite(db) => db.list_open_definition_proposals(namespace, limit, before),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_open_definition_proposals(namespace, limit, offset)
+                db.list_open_definition_proposals(namespace, limit, before)
             }),
         }
     }

@@ -2611,8 +2611,17 @@ message CreateDatasetRequest { Dataset dataset = 1; }
 message CreateDatasetResponse { Dataset dataset = 1; }
 message UpdateDatasetRequest { Dataset dataset = 1; }
 message UpdateDatasetResponse { Dataset dataset = 1; }
-message ListDatasetsRequest {}
-message ListDatasetsResponse { repeated Dataset datasets = 1; }
+message ListDatasetsRequest {
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 1;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 2;
+}
+message ListDatasetsResponse {
+  repeated Dataset datasets = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message AppendRowsRequest { string dataset_id = 1; repeated Row rows = 2; }
 message Row { map<string, string> values = 1; }
 message AppendRowsResponse { int32 count = 1; }
@@ -2622,6 +2631,10 @@ message QueryRowsResponse { repeated Row rows = 1; }
 message ListDatasetVersionsRequest {
   string dataset_id = 1;
   int64 as_of_ms = 2;
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 3;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 4;
 }
 message DatasetVersion {
   string dataset_id = 1;
@@ -2638,16 +2651,25 @@ message DatasetVersion {
 message ListDatasetVersionsResponse {
   repeated DatasetVersion versions = 1;
   int32 version_retention_count = 2;
+  // Empty on the last page.
+  string next_page_token = 3;
 }
 message GetDatasetVersionRequest {
   string dataset_id = 1;
   string version_id = 2;
   int64 as_of_ms = 3;
+  // Pages the version's rows.
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 4;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 5;
 }
 message GetDatasetVersionResponse {
   DatasetVersion version = 1;
   repeated Row rows = 2;
   int32 version_retention_count = 3;
+  // Empty on the last page.
+  string next_page_token = 4;
 }
 message RollbackDatasetRequest {
   string dataset_id = 1;
@@ -2657,7 +2679,8 @@ message RollbackDatasetRequest {
 }
 message RollbackDatasetResponse {
   DatasetVersion version = 1;
-  repeated Row rows = 2;
+  // Always empty: read the restored rows page by page with GetDatasetVersion.
+  repeated Row rows = 2 [deprecated = true];
 }
 
 // Dataset branches (ADR 0119). The tenant always comes from the caller's
@@ -2898,8 +2921,18 @@ message DatasetHealthCheck {
 }
 message PutDatasetHealthCheckRequest { DatasetHealthCheck check = 1; }
 message PutDatasetHealthCheckResponse { DatasetHealthCheck check = 1; }
-message ListDatasetHealthChecksRequest { string dataset_id = 1; }
-message ListDatasetHealthChecksResponse { repeated DatasetHealthCheck checks = 1; }
+message ListDatasetHealthChecksRequest {
+  string dataset_id = 1;
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 2;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 3;
+}
+message ListDatasetHealthChecksResponse {
+  repeated DatasetHealthCheck checks = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message DatasetHealthResult {
   string dataset_id = 1;
   string version_id = 2;
@@ -2912,15 +2945,23 @@ message DatasetHealthResult {
 message ListDatasetHealthResultsRequest {
   string dataset_id = 1;
   string version_id = 2;
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 3;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 4;
 }
 message ListDatasetHealthResultsResponse {
   repeated DatasetHealthResult results = 1;
   string last_healthy_version_id = 2;
   bool quarantined = 3;
+  // Empty on the last page.
+  string next_page_token = 4;
 }
 message RunDatasetHealthChecksRequest {
   string dataset_id = 1;
-  int64 now_ms = 2;
+  // Must be 0. A non-zero value is refused with INVALID_ARGUMENT: health runs
+  // judge freshness against the server clock, not a time the caller picks.
+  int64 now_ms = 2 [deprecated = true];
 }
 message RunDatasetHealthChecksResponse { repeated DatasetHealthResult results = 1; }
 message DatasetAlert {
@@ -2933,8 +2974,18 @@ message DatasetAlert {
   string state = 7;
   int64 emitted_at_ms = 8;
 }
-message ListDatasetAlertsRequest { string dataset_id = 1; }
-message ListDatasetAlertsResponse { repeated DatasetAlert alerts = 1; }
+message ListDatasetAlertsRequest {
+  string dataset_id = 1;
+  // At most 100; 0 means 100; negative is refused.
+  int32 page_size = 2;
+  // Empty for the first page, else the previous response's next_page_token.
+  string page_token = 3;
+}
+message ListDatasetAlertsResponse {
+  repeated DatasetAlert alerts = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 // Caller-scoped deliveries for freshness (#1411) and quality (#681) violations
 // written at commit for bound consumers (#1636). Evidence is stored in full
 // and stripped at read when the caller cannot read the dataset.

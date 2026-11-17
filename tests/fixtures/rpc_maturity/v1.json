@@ -1665,8 +1665,8 @@
       "rpc": "ListDatasets",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -1692,8 +1692,8 @@
       "rpc": "ListDatasetVersions",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1701,8 +1701,8 @@
       "rpc": "GetDatasetVersion",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1710,8 +1710,8 @@
       "rpc": "RollbackDataset",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1809,8 +1809,8 @@
       "rpc": "PutDatasetHealthCheck",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1818,8 +1818,8 @@
       "rpc": "ListDatasetHealthChecks",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1827,8 +1827,8 @@
       "rpc": "ListDatasetHealthResults",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1836,8 +1836,8 @@
       "rpc": "RunDatasetHealthChecks",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1845,8 +1845,8 @@
       "rpc": "ListDatasetAlerts",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -2322,8 +2322,8 @@
       "rpc": "GetLineage",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "core"
     },
     {
