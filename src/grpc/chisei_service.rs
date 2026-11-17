@@ -77,6 +77,8 @@ mod support_policy;
 use support_policy::*;
 #[path = "chisei_service_rpc_control.rs"]
 mod rpc_control;
+#[path = "chisei_service_rpc_eval_datasets.rs"]
+mod rpc_eval_datasets;
 #[path = "chisei_service_rpc_execution.rs"]
 mod rpc_execution;
 #[path = "chisei_service_rpc_model_release_evidence.rs"]
@@ -935,6 +937,34 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ListEvalDatasetRunTrendRequest>,
     ) -> Result<Response<ListEvalDatasetRunTrendResponse>, Status> {
         rpc_execution::list_eval_dataset_run_trend(self, req).await
+    }
+
+    async fn put_eval_dataset_definition(
+        &self,
+        req: Request<PutEvalDatasetDefinitionRequest>,
+    ) -> Result<Response<PutEvalDatasetDefinitionResponse>, Status> {
+        rpc_eval_datasets::put_eval_dataset_definition(self, req).await
+    }
+
+    async fn get_eval_dataset_definition(
+        &self,
+        req: Request<GetEvalDatasetDefinitionRequest>,
+    ) -> Result<Response<GetEvalDatasetDefinitionResponse>, Status> {
+        rpc_eval_datasets::get_eval_dataset_definition(self, req).await
+    }
+
+    async fn list_eval_dataset_definitions(
+        &self,
+        req: Request<ListEvalDatasetDefinitionsRequest>,
+    ) -> Result<Response<ListEvalDatasetDefinitionsResponse>, Status> {
+        rpc_eval_datasets::list_eval_dataset_definitions(self, req).await
+    }
+
+    async fn list_eval_dataset_cases(
+        &self,
+        req: Request<ListEvalDatasetCasesRequest>,
+    ) -> Result<Response<ListEvalDatasetCasesResponse>, Status> {
+        rpc_eval_datasets::list_eval_dataset_cases(self, req).await
     }
 
     async fn cancel_evaluation_execution(

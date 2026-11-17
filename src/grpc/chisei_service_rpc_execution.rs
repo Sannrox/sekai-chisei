@@ -844,7 +844,7 @@ pub(super) async fn execute_evaluation_manifest(
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
     }))
 }
-/// Directory of checked-in eval dataset definitions runs resolve from.
+/// Directory of checked-in eval dataset definitions, beside the stored ones.
 pub(crate) const EVAL_DATASETS_DIR_ENV: &str = "CHISEI_EVAL_DATASETS_DIR";
 
 pub(super) async fn run_eval_dataset(
@@ -899,16 +899,19 @@ pub(super) async fn run_eval_dataset(
             "artifact_digest must be sha256:<64 hex>",
         ));
     }
-    let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-        .ok_or_else(|| Status::failed_precondition("eval datasets are not configured"))?;
-    let dataset = crate::chisei::eval_dataset::resolve(
-        std::path::Path::new(&definitions),
-        &spec.dataset,
-        &spec.dataset_version,
-    )
-    .map_err(Status::not_found)?;
+    let dataset = {
+        let (store, spec) = (service.db.runtime_arc(), spec.clone());
+        tokio::task::spawn_blocking(move || {
+            super::rpc_eval_datasets::resolve_dataset(
+                store.as_ref(),
+                &spec.namespace,
+                &spec.dataset,
+                &spec.dataset_version,
+            )
+        })
+        .await
+        .map_err(|_| Status::internal("eval dataset task failed"))??
+    };
     let pricing = crate::cost_estimate::pricing_from_env()
         .map_err(|_| Status::failed_precondition("model pricing is misconfigured"))?
         .remove(&spec.model);
@@ -1065,10 +1068,6 @@ async fn compare_dataset_runs_detailed(
 ) -> Result<DetailedComparison, Status> {
     use crate::chisei::eval_compare::{ComparedRun, case_differences, compare_runs};
     use crate::chisei::eval_run::EvalRunStore;
-    let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-        .ok_or_else(|| Status::failed_precondition("eval datasets are not configured"))?;
     let store = service.db.runtime_arc();
     let (namespace, baseline_run_id, candidate_run_id) = (
         namespace.to_string(),
@@ -1086,12 +1085,12 @@ async fn compare_dataset_runs_detailed(
                 .ok_or_else(|| Status::not_found("eval run not found"))
         };
         let (baseline, candidate) = (spec_of(&baseline_run_id)?, spec_of(&candidate_run_id)?);
-        let dataset = crate::chisei::eval_dataset::resolve(
-            std::path::Path::new(&definitions),
+        let dataset = super::rpc_eval_datasets::resolve_dataset(
+            store.as_ref(),
+            &candidate.namespace,
             &candidate.dataset,
             &candidate.dataset_version,
-        )
-        .map_err(Status::not_found)?;
+        )?;
         let results = |spec: &crate::chisei::eval_run::EvalRunSpec| {
             store
                 .list_dataset_run_cases(&spec.namespace, &spec.run_id)

@@ -9,6 +9,10 @@
 //! name and version regenerates the dataset and refuses a version the
 //! definition no longer produces, so a version is immutable by construction.
 //!
+//! Definitions come from a directory configured on the server, or are put
+//! through the plane under a name in a namespace (#2306,
+//! [`StoredEvalDatasetDefinition`]). Both resolve the same way.
+//!
 //! Cases feed the existing evaluation executor as evidence
 //! ([`EvalDataset::evidence`]), so their runs leave the executor's usual
 //! step receipts; there is no eval store of their own. Cases name only the
@@ -268,15 +272,19 @@ impl EvalDataset {
     }
 }
 
-/// The dataset `name` at `version`, regenerated from the definition
-/// `<definitions>/<name>.json`. A version the definition does not produce
-/// (an older seed or template) is not found: versions are never rewritten.
-pub fn resolve(definitions: &Path, name: &str, version: &str) -> Result<EvalDataset, String> {
+/// The definition `<definitions>/<name>.json`, or `None` when there is no
+/// such file.
+pub fn directory_definition(
+    definitions: &Path,
+    name: &str,
+) -> Result<Option<EvalDatasetDefinition>, String> {
     if !identifier(name) {
-        return Err(DATASET_NOT_FOUND.into());
+        return Ok(None);
     }
     let path = definitions.join(format!("{name}.json"));
-    let json = std::fs::read_to_string(&path).map_err(|_| DATASET_NOT_FOUND.to_string())?;
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return Ok(None);
+    };
     let definition: EvalDatasetDefinition = serde_json::from_str(&json)
         .map_err(|error| format!("eval dataset definition {name}: {error}"))?;
     if definition.name != name {
@@ -285,11 +293,165 @@ pub fn resolve(definitions: &Path, name: &str, version: &str) -> Result<EvalData
             definition.name
         ));
     }
+    Ok(Some(definition))
+}
+
+/// Every well-formed definition in the directory, by name. A file that does
+/// not parse or names another dataset is skipped: it resolves to an error
+/// on its own, and must not hide the others.
+pub fn directory_definitions(definitions: &Path) -> Vec<EvalDatasetDefinition> {
+    let Ok(entries) = std::fs::read_dir(definitions) else {
+        return Vec::new();
+    };
+    let mut found: Vec<EvalDatasetDefinition> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".json")?
+                .to_string();
+            directory_definition(definitions, &name).ok().flatten()
+        })
+        .collect();
+    found.sort_by(|left, right| left.name.cmp(&right.name));
+    found
+}
+
+/// The dataset `name` at `version`, regenerated from the definition
+/// `<definitions>/<name>.json`. A version the definition does not produce
+/// (an older seed or template) is not found: versions are never rewritten.
+pub fn resolve(definitions: &Path, name: &str, version: &str) -> Result<EvalDataset, String> {
+    let definition =
+        directory_definition(definitions, name)?.ok_or_else(|| DATASET_NOT_FOUND.to_string())?;
     let dataset = definition.generate()?;
     if dataset.version != version {
         return Err(DATASET_NOT_FOUND.into());
     }
     Ok(dataset)
+}
+
+/// The most a stored definition's JSON may take.
+pub const MAX_STORED_DEFINITION_BYTES: usize = 64 * 1024;
+
+/// One version of a definition put through the plane (#2306), kept under a
+/// name in the namespace that put it. The namespace is the caller's, not
+/// the fixture tenant the definition generates into. Rows are never
+/// rewritten: putting changed content adds a version, and the current
+/// version of a name is the one first put most recently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvalDatasetDefinition {
+    pub namespace: String,
+    pub definition: EvalDatasetDefinition,
+    pub version: String,
+    pub digest: String,
+    pub case_count: u64,
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
+impl StoredEvalDatasetDefinition {
+    /// Parses and generates `json`, so only a definition that produces a
+    /// dataset is stored, at the version it produces.
+    pub fn new(
+        namespace: &str,
+        json: &str,
+        created_by: &str,
+        created_at_ms: i64,
+    ) -> Result<Self, String> {
+        if json.len() > MAX_STORED_DEFINITION_BYTES {
+            return Err(format!(
+                "eval dataset definition exceeds {MAX_STORED_DEFINITION_BYTES} bytes"
+            ));
+        }
+        let definition: EvalDatasetDefinition = serde_json::from_str(json)
+            .map_err(|error| format!("eval dataset definition: {error}"))?;
+        let dataset = definition.generate()?;
+        Ok(Self {
+            namespace: namespace.into(),
+            definition,
+            version: dataset.version,
+            digest: dataset.digest,
+            case_count: dataset.cases.len() as u64,
+            created_by: created_by.into(),
+            created_at_ms,
+        })
+    }
+}
+
+/// Stored definition versions, per namespace and name.
+pub trait EvalDatasetDefinitionStore {
+    /// Records the version, or returns the one already recorded at that
+    /// (namespace, name, version), unchanged.
+    fn put_eval_dataset_definition(
+        &self,
+        record: &StoredEvalDatasetDefinition,
+    ) -> Result<StoredEvalDatasetDefinition, String>;
+    /// One version, or the current one when `version` is `None`.
+    fn get_eval_dataset_definition(
+        &self,
+        namespace: &str,
+        name: &str,
+        version: Option<&str>,
+    ) -> Result<Option<StoredEvalDatasetDefinition>, String>;
+    /// The current version of each name after `after_name`, by name, at most
+    /// `limit`.
+    fn list_eval_dataset_definitions(
+        &self,
+        namespace: &str,
+        after_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredEvalDatasetDefinition>, String>;
+}
+
+/// Where a dataset name resolves from for one namespace: the server's
+/// directory, when configured, and the namespace's stored definitions.
+pub struct DatasetSources<'a, S: ?Sized> {
+    pub directory: Option<&'a Path>,
+    pub store: &'a S,
+    pub namespace: &'a str,
+}
+
+impl<S: EvalDatasetDefinitionStore + ?Sized> DatasetSources<'_, S> {
+    /// The directory's definition of `name`, if it has one. A name the
+    /// directory defines is read-only: it cannot be put.
+    pub fn directory_definition(
+        &self,
+        name: &str,
+    ) -> Result<Option<EvalDatasetDefinition>, String> {
+        match self.directory {
+            Some(directory) => directory_definition(directory, name),
+            None => Ok(None),
+        }
+    }
+
+    /// `name@version` from the directory or the namespace's stored history.
+    /// Either way the version is regenerated and must match, so a version
+    /// is the same dataset whichever source holds it.
+    pub fn resolve(&self, name: &str, version: &str) -> Result<EvalDataset, String> {
+        if let Some(definition) = self.directory_definition(name)? {
+            let dataset = definition.generate()?;
+            if dataset.version == version {
+                return Ok(dataset);
+            }
+        }
+        // A name the directory took up after it was put keeps its stored
+        // versions.
+        let stored = self
+            .store
+            .get_eval_dataset_definition(self.namespace, name, Some(version))?
+            .ok_or_else(|| DATASET_NOT_FOUND.to_string())?;
+        let dataset = stored.definition.generate()?;
+        if dataset.version != version {
+            return Err(DATASET_NOT_FOUND.into());
+        }
+        Ok(dataset)
+    }
+}
+
+/// Whether `error` is the not-found answer of a resolve.
+pub fn is_not_found(error: &str) -> bool {
+    error == DATASET_NOT_FOUND
 }
 
 #[cfg(test)]

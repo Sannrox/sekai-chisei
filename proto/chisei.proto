@@ -820,6 +820,79 @@ message EvalRunTrendPoint {
 message ListEvalDatasetRunTrendResponse {
   repeated EvalRunTrendPoint runs = 1;
 }
+// Eval dataset definitions put through the plane (#2306), beside those in
+// the server's definitions directory. A definition is the unchanged
+// chisei.eval-dataset-definition/v1 JSON; its version is derived from the
+// dataset it generates, so the same content always has the same version.
+message EvalDatasetDefinitionRecord {
+  // The namespace the definition is kept in; empty for directory entries,
+  // which every namespace sees.
+  string namespace = 1;
+  string name = 2;
+  string version = 3;
+  string definition_json = 4;
+  // stored or directory. Directory entries are read-only.
+  string source = 5;
+  string digest = 6;
+  uint64 case_count = 7;
+  // Who first put this version and when; empty and 0 for directory entries.
+  string created_by = 8;
+  int64 created_at_ms = 9;
+}
+// Stores a version of the definition under its name. Putting content that
+// produces a version already stored returns that version unchanged; a name
+// the directory defines is refused.
+message PutEvalDatasetDefinitionRequest {
+  string namespace = 1;
+  string definition_json = 2;
+}
+message PutEvalDatasetDefinitionResponse {
+  EvalDatasetDefinitionRecord record = 1;
+}
+// One version of a definition; an empty version reads the current one, the
+// directory's or the one first put most recently.
+message GetEvalDatasetDefinitionRequest {
+  string namespace = 1;
+  string name = 2;
+  string version = 3;
+}
+message GetEvalDatasetDefinitionResponse {
+  EvalDatasetDefinitionRecord record = 1;
+}
+// The current version of every definition the namespace sees, by name.
+message ListEvalDatasetDefinitionsRequest {
+  string namespace = 1;
+  // 0 uses the plane default, and the plane caps it.
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+message ListEvalDatasetDefinitionsResponse {
+  repeated EvalDatasetDefinitionRecord definitions = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
+// The cases of one dataset version, in dataset order.
+message ListEvalDatasetCasesRequest {
+  string namespace = 1;
+  string dataset = 2;
+  string dataset_version = 3;
+  // 0 uses the plane default, and the plane caps it.
+  uint32 page_size = 4;
+  string page_token = 5;
+}
+message EvalDatasetCase {
+  string case_id = 1;
+  map<string, string> input = 2;
+  string expected = 3;
+  repeated string tags = 4;
+}
+message ListEvalDatasetCasesResponse {
+  repeated EvalDatasetCase cases = 1;
+  uint64 cases_total = 2;
+  string dataset_digest = 3;
+  // Empty on the last page.
+  string next_page_token = 4;
+}
 message EvalPolicyCount {
   string kind = 1;
   uint64 count = 2;
@@ -1891,6 +1964,10 @@ service ChiseiService {
   rpc RunEvalDataset(RunEvalDatasetRequest) returns (RunEvalDatasetResponse);
   rpc CompareEvalDatasetRuns(CompareEvalDatasetRunsRequest) returns (CompareEvalDatasetRunsResponse);
   rpc ListEvalDatasetRunTrend(ListEvalDatasetRunTrendRequest) returns (ListEvalDatasetRunTrendResponse);
+  rpc PutEvalDatasetDefinition(PutEvalDatasetDefinitionRequest) returns (PutEvalDatasetDefinitionResponse);
+  rpc GetEvalDatasetDefinition(GetEvalDatasetDefinitionRequest) returns (GetEvalDatasetDefinitionResponse);
+  rpc ListEvalDatasetDefinitions(ListEvalDatasetDefinitionsRequest) returns (ListEvalDatasetDefinitionsResponse);
+  rpc ListEvalDatasetCases(ListEvalDatasetCasesRequest) returns (ListEvalDatasetCasesResponse);
   rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc TransitionExternalAction(TransitionExternalActionRequest) returns (TransitionExternalActionResponse);

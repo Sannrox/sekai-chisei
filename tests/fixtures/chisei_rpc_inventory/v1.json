@@ -148,6 +148,58 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutEvalDatasetDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_dataset.rs",
+        "crates/chisei-core/src/chisei/eval_dataset.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetEvalDatasetDefinition",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_dataset.rs",
+        "crates/chisei-core/src/chisei/eval_dataset.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEvalDatasetDefinitions",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_dataset.rs",
+        "crates/chisei-core/src/chisei/eval_dataset.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListEvalDatasetCases",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/eval_dataset.rs",
+        "crates/chisei-core/src/chisei/eval_dataset.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ExecutePlanStream",
       "kind": "persistent",
       "surfaces": [
