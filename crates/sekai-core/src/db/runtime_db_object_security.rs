@@ -629,9 +629,21 @@ impl RuntimeDb {
         if cells.is_empty() {
             return Ok(objects);
         }
+        // One policy read per distinct (namespace, kind), so every object of
+        // a kind in this call is checked against the same policy.
+        let mut policies = HashMap::<(String, String), Option<ObjectSecurityPolicy>>::new();
         let mut kept = Vec::with_capacity(objects.len());
         for object in objects {
-            let Some(policy) = self.active_object_policy(&object.namespace, &object.kind)? else {
+            let key = (object.namespace.clone(), object.kind.clone());
+            let policy = match policies.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let (namespace, kind) = entry.key();
+                    let policy = self.active_object_policy(namespace, kind)?;
+                    entry.insert(policy)
+                }
+            };
+            let Some(policy) = policy.as_ref() else {
                 kept.push(object);
                 continue;
             };
@@ -719,5 +731,100 @@ impl RuntimeDb {
                 crate::db::postgres::off_runtime(|| db.list_activated_object_security_namespaces())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sekai::object_security::{
+        OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPredicate,
+        ObjectSecurityRule, PropertyGrant, PropertyGrantAccess, ValueInstanceGrant,
+        value_instance_digest,
+    };
+
+    fn note(id: &str, kind: &str, body: &str) -> Object {
+        Object {
+            id: id.into(),
+            kind: kind.into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: id.into(),
+            properties: HashMap::from([("body".into(), body.into())]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    /// Matches are filtered against one policy read per distinct kind, not
+    /// one per matched object.
+    #[test]
+    fn value_instance_matches_read_each_kinds_policy_once() {
+        let db = RuntimeDb::memory();
+        // Activation covers instantiated kinds; only `note` is stored.
+        db.create_object_with_audit(&note("note-0", "note", "shared"), "editor")
+            .unwrap();
+        let grants = (0..5)
+            .map(|index| ValueInstanceGrant {
+                object_id: format!("note-{index}"),
+                property: "body".into(),
+                value_digest: value_instance_digest("shared").unwrap(),
+                access: PropertyGrantAccess::Read,
+            })
+            .collect();
+        let policy = ObjectSecurityPolicy {
+            contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+            namespace: "acme".into(),
+            kind: "note".into(),
+            rules: vec![ObjectSecurityRule {
+                operation: ObjectSecurityOperation::Read,
+                predicates: vec![ObjectSecurityPredicate::AllowAll],
+            }],
+            property_grants: Some(vec![PropertyGrant {
+                property: "body".into(),
+                access: PropertyGrantAccess::Read,
+            }]),
+            value_instance_grants: Some(grants),
+            required_purpose: None,
+        };
+        let revision = db
+            .put_object_security_policy(&policy, "root", "put", 1)
+            .unwrap();
+        db.activate_object_security_policies(
+            "acme",
+            &std::collections::BTreeMap::from([("note".into(), revision.revision_digest)]),
+            "root",
+            "activate",
+            2,
+        )
+        .unwrap();
+        // Six notes, five granted, plus two objects in a namespace with no
+        // activated policies.
+        let mut objects: Vec<_> = (0..6)
+            .map(|index| note(&format!("note-{index}"), "note", "shared"))
+            .collect();
+        objects.push(Object {
+            namespace: "plain".into(),
+            ..note("memo-a", "memo", "shared")
+        });
+        objects.push(Object {
+            namespace: "plain".into(),
+            ..note("memo-b", "memo", "shared")
+        });
+        source_batch_auth_counters::POLICY_LOOKUPS.with(|count| count.set(0));
+        let kept = db
+            .retain_granted_value_instance_matches(objects, &[("body".into(), "shared".into())])
+            .unwrap();
+        assert_eq!(
+            source_batch_auth_counters::POLICY_LOOKUPS.with(std::cell::Cell::get),
+            2
+        );
+        let ids: Vec<_> = kept.iter().map(|object| object.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "note-0", "note-1", "note-2", "note-3", "note-4", "memo-a", "memo-b"
+            ]
+        );
     }
 }
