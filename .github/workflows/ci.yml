@@ -107,7 +107,7 @@ jobs:
   # the pull request is marked breaking (`type!:` subject or a Breaking/Upgrade
   # heading, as scripts/changelog-draft.sh reads it) and labelled
   # `risk:breaking`. A break vs the tag that is already on the base is a
-  # notice, as in scripts/check-semver.py. A tool failure stays red.
+  # notice. A tool failure stays red.
   proto-breaking:
     name: Proto breaking
     if: github.event_name == 'pull_request'
