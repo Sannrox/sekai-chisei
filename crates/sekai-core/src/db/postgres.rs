@@ -1155,6 +1155,12 @@ const MIGRATIONS: &[Migration] = &[
         ACTION_INSTANCE_DENIAL_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        160,
+        "chisei_eval_dataset_definitions",
+        "",
+        MigrationOwner::Chisei,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

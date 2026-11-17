@@ -158,6 +158,12 @@ pub const CHISEI_PLANE_SQL: &[PlaneSql] = &[
         include_str!("postgres/0144_external_action_reclaim_index.sql"),
         None,
     ),
+    plane(
+        160,
+        "chisei_eval_dataset_definitions",
+        include_str!("postgres/0161_chisei_eval_dataset_definitions.sql"),
+        None,
+    ),
 ];
 
 pub fn apply_chisei_postgres_schema(db: &PostgresDb) -> Result<(), String> {

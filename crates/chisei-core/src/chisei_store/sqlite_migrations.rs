@@ -37,6 +37,17 @@ CREATE TABLE IF NOT EXISTS chisei_dataset_run_cases (
     recorded_at_ms INTEGER NOT NULL,
     PRIMARY KEY (namespace, run_id, case_id)
 );
+CREATE TABLE IF NOT EXISTS chisei_eval_dataset_definitions (
+    namespace TEXT NOT NULL,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    case_count INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, name, version)
+);
 ";
 
 const MODEL_REVIEW_SQLITE: &str = "

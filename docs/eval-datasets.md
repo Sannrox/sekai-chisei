@@ -3,9 +3,10 @@
 Versioned eval datasets (#1673) give evaluations a case set large enough to
 compare agent, model and tool versions, built the same way every time.
 
-A dataset is generated, not stored. A checked-in definition
-(`chisei.eval-dataset-definition/v1`, under
-`tests/fixtures/evaluation/datasets/`) names a synthetic tenant (generator,
+A dataset is generated, not stored. A definition
+(`chisei.eval-dataset-definition/v1`, checked in under
+`tests/fixtures/evaluation/datasets/` or put through the plane, see
+[Definitions](#definitions)) names a synthetic tenant (generator,
 fixture namespace, seed and size preset, see synthetic tenants in
 `crates/sekai-core/src/sekai/synthetic.rs`) and case templates over its objects:
 
@@ -48,6 +49,43 @@ template may not use its expected property as input.
 Datasets built from recorded traces and model-graded rubrics are out of
 scope.
 
+## Definitions
+
+A namespace sees two sources of definitions:
+
+- **The directory.** The files in `CHISEI_EVAL_DATASETS_DIR`, one
+  `<name>.json` per dataset. Every namespace sees them, and they are
+  read-only through the plane.
+- **Stored definitions (#2306).** `ChiseiService.PutEvalDatasetDefinition`
+  stores a definition's JSON under its name in the request's namespace
+  (`chisei_eval_dataset_definitions`). It needs namespace write access and
+  leaves one audit decision per stored version
+  (`eval_dataset_definition/put`). A name the directory defines is refused.
+
+Both resolve the same way: the same content has the same version whichever
+source holds it. Stored versions are never rewritten. Putting changed
+content under a name adds a version, and every earlier version that the
+stored history still produces keeps resolving. Putting content that
+produces a version already stored returns that version unchanged. The
+current version of a name is the one first put most recently, so putting
+an earlier version's content again does not make it current. Instances over
+one database share stored definitions without shared files.
+
+The read calls need namespace read access and only read the caller's
+namespace and the directory:
+
+- `GetEvalDatasetDefinition` reads one version, or the current one. Where
+  the directory and the store both hold a name, the directory's is current.
+- `ListEvalDatasetDefinitions` lists the current version of every name, by
+  name, in pages (50 by default, at most 200). Entries say whether they are
+  `stored` or from the `directory`. A directory file that does not parse or
+  generate is left out.
+- `ListEvalDatasetCases` pages through the cases of one `name@version` in
+  dataset order (100 by default, at most 1,000). A version never changes, so
+  pages stay stable.
+
+All four calls are experimental.
+
 ## Runs
 
 `ChiseiService.RunEvalDataset` (experimental, #1674) runs every case of one
@@ -55,8 +93,8 @@ dataset version through a registered evaluator definition that accepts
 `chisei.eval-case/v1`, against a named agent, model and tool version, and is
 started by CI or the delivery plane per release. It is rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
-enabled. Datasets resolve from the
-definitions in `CHISEI_EVAL_DATASETS_DIR`.
+enabled. Datasets resolve from the definitions in
+`CHISEI_EVAL_DATASETS_DIR` and from those stored in the run's namespace.
 
 - At most `concurrency` cases (1 to 64) run at once, and one start of a run
   at a time: a start holds the run's lease (two minutes, renewed before every

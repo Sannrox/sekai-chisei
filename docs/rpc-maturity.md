@@ -403,6 +403,10 @@ Edit the fixture, then regenerate with
 | `ChiseiService.RunEvalDataset` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.CompareEvalDatasetRuns` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.ListEvalDatasetRunTrend` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.PutEvalDatasetDefinition` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.GetEvalDatasetDefinition` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.ListEvalDatasetDefinitions` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.ListEvalDatasetCases` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |

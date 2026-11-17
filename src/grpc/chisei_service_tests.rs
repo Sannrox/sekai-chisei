@@ -14217,6 +14217,255 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
     );
 }
 
+/// Definitions put through the plane (#2306) list beside the directory's,
+/// page their cases, run like directory ones, and are audited once per
+/// version; a name the directory defines is read-only.
+#[test]
+fn eval_dataset_definitions_are_put_listed_paged_and_run() {
+    use crate::chisei_store::ChiseiDecisionStore;
+    let definition_json = |name: &str| {
+        format!(
+            r#"{{
+            "contract_version": "chisei.eval-dataset-definition/v1",
+            "name": "{name}",
+            "generator": "supply_chain",
+            "namespace": "eval-demo",
+            "seed": 7,
+            "preset": "demo",
+            "templates": [{{
+                "id": "shipment-status",
+                "kind": "synthetic_shipment",
+                "input_properties": ["tracking"],
+                "expected_property": "status"
+            }}]
+        }}"#
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("demo-shipments.json"),
+        definition_json("demo-shipments"),
+    )
+    .unwrap();
+    let stored: crate::chisei::eval_dataset::EvalDatasetDefinition =
+        serde_json::from_str(&definition_json("demo-stored")).unwrap();
+    let dataset = stored.generate().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir_path = dir.path().to_string_lossy().into_owned();
+    crate::provider_credentials::with_test_env(
+        crate::grpc::chisei_service::rpc_execution::EVAL_DATASETS_DIR_ENV,
+        &dir_path,
+        || {
+            runtime.block_on(async {
+                let svc = evaluation_execution_service(0);
+                let put = |namespace: &str, name: &str| {
+                    Request::new(PutEvalDatasetDefinitionRequest {
+                        namespace: namespace.into(),
+                        definition_json: definition_json(name),
+                    })
+                };
+                let read_only = svc
+                    .put_eval_dataset_definition(put("acme", "demo-shipments"))
+                    .await
+                    .unwrap_err();
+                assert_eq!(read_only.code(), tonic::Code::FailedPrecondition);
+                let record = svc
+                    .put_eval_dataset_definition(put("acme", "demo-stored"))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .record
+                    .unwrap();
+                assert_eq!(record.version, dataset.version);
+                assert_eq!(record.source, "stored");
+                assert_eq!(record.case_count as usize, dataset.cases.len());
+                // A repeat is the same version and the same single decision.
+                svc.put_eval_dataset_definition(put("acme", "demo-stored"))
+                    .await
+                    .unwrap();
+                let decisions = svc
+                    .db
+                    .list_decisions_for_action_namespace("eval_dataset_definition/put", "acme")
+                    .unwrap();
+                assert_eq!(decisions.len(), 1, "{decisions:?}");
+                assert_eq!(decisions[0].evidence["dataset_version"], dataset.version);
+
+                // Without access to the namespace, nothing is written or read.
+                fn as_mallory<T>(mut request: Request<T>) -> Request<T> {
+                    request
+                        .metadata_mut()
+                        .insert("x-principal", "mallory".parse().unwrap());
+                    request
+                }
+                let denied = [
+                    svc.put_eval_dataset_definition(as_mallory(put("acme", "demo-other")))
+                        .await
+                        .unwrap_err(),
+                    svc.list_eval_dataset_definitions(as_mallory(Request::new(
+                        ListEvalDatasetDefinitionsRequest {
+                            namespace: "acme".into(),
+                            ..Default::default()
+                        },
+                    )))
+                    .await
+                    .unwrap_err(),
+                    svc.list_eval_dataset_cases(as_mallory(Request::new(
+                        ListEvalDatasetCasesRequest {
+                            namespace: "acme".into(),
+                            dataset: "demo-stored".into(),
+                            dataset_version: dataset.version.clone(),
+                            ..Default::default()
+                        },
+                    )))
+                    .await
+                    .unwrap_err(),
+                ];
+                for error in denied {
+                    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+                }
+
+                // The directory's definition and the stored one, by name, in
+                // pages; another namespace sees only the directory's.
+                let list = |namespace: &str, page_token: String| {
+                    Request::new(ListEvalDatasetDefinitionsRequest {
+                        namespace: namespace.into(),
+                        page_size: 1,
+                        page_token,
+                    })
+                };
+                let first = svc
+                    .list_eval_dataset_definitions(list("acme", String::new()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(first.definitions[0].name, "demo-shipments");
+                assert_eq!(first.definitions[0].source, "directory");
+                let second = svc
+                    .list_eval_dataset_definitions(list("acme", first.next_page_token))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(second.definitions, std::slice::from_ref(&record));
+                assert!(second.next_page_token.is_empty());
+                let other = svc
+                    .list_eval_dataset_definitions(list("globex", String::new()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(other.definitions.len(), 1);
+                assert!(other.next_page_token.is_empty());
+                let got = svc
+                    .get_eval_dataset_definition(Request::new(GetEvalDatasetDefinitionRequest {
+                        namespace: "acme".into(),
+                        name: "demo-stored".into(),
+                        version: String::new(),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .record
+                    .unwrap();
+                assert_eq!(got, record);
+
+                // Case pages cover the version once, in dataset order.
+                let mut case_ids = Vec::new();
+                let mut page_token = String::new();
+                loop {
+                    let page = svc
+                        .list_eval_dataset_cases(Request::new(ListEvalDatasetCasesRequest {
+                            namespace: "acme".into(),
+                            dataset: "demo-stored".into(),
+                            dataset_version: dataset.version.clone(),
+                            page_size: 3,
+                            page_token,
+                        }))
+                        .await
+                        .unwrap()
+                        .into_inner();
+                    assert!(page.cases.len() <= 3);
+                    assert_eq!(page.cases_total as usize, dataset.cases.len());
+                    case_ids.extend(page.cases.into_iter().map(|case| case.case_id));
+                    if page.next_page_token.is_empty() {
+                        break;
+                    }
+                    page_token = page.next_page_token;
+                }
+                let expected: Vec<_> = dataset
+                    .cases
+                    .iter()
+                    .map(|case| case.case_id.clone())
+                    .collect();
+                assert_eq!(case_ids, expected);
+                let foreign = svc
+                    .list_eval_dataset_cases(Request::new(ListEvalDatasetCasesRequest {
+                        namespace: "acme".into(),
+                        dataset: "demo-stored".into(),
+                        dataset_version: dataset.version.clone(),
+                        page_size: 3,
+                        page_token: "v0000000000000000/3".into(),
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(foreign.code(), tonic::Code::InvalidArgument);
+
+                // A stored definition runs like a directory one, and only in
+                // the namespace that stored it.
+                let mut evaluator = evaluator_definition_request("acme");
+                evaluator
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .supported_input_schemas
+                    .push(crate::chisei::eval_dataset::EVAL_CASE_SCHEMA.into());
+                let evaluator_definition_id = svc
+                    .put_evaluator_definition(Request::new(evaluator))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .record
+                    .unwrap()
+                    .definition
+                    .unwrap()
+                    .definition_id;
+                let run = RunEvalDatasetRequest {
+                    namespace: "acme".into(),
+                    run_id: "stored-1".into(),
+                    dataset: "demo-stored".into(),
+                    dataset_version: dataset.version.clone(),
+                    agent: "triage@1".into(),
+                    model: "deterministic".into(),
+                    tool_version: "tools@1".into(),
+                    evaluator_definition_id,
+                    concurrency: 4,
+                    budget_micros: 1_000,
+                    max_case_cost_micros: 10,
+                    artifact_digest: String::new(),
+                };
+                let report = svc
+                    .run_eval_dataset(Request::new(run.clone()))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(report.status, "completed", "{report:?}");
+                assert_eq!(report.cases_total as usize, dataset.cases.len());
+                let unseen = svc
+                    .list_eval_dataset_cases(Request::new(ListEvalDatasetCasesRequest {
+                        namespace: "globex".into(),
+                        dataset: "demo-stored".into(),
+                        dataset_version: dataset.version.clone(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(unseen.code(), tonic::Code::NotFound);
+            })
+        },
+    );
+}
+
 /// Grants a tenant the namespaces named after it: `tenant-a` reads `ns-a`
 /// and `ns-a2`, not `ns-b`.
 struct TenantNamespaceExtension;

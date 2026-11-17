@@ -2625,6 +2625,42 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "PutEvalDatasetDefinition",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetEvalDatasetDefinition",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListEvalDatasetDefinitions",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "ListEvalDatasetCases",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "CancelEvaluationExecution",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",
