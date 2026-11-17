@@ -11486,6 +11486,87 @@ async fn decide_gateway_execution_records_the_cited_claim_impact() {
     assert_eq!(record.evidence["action_claim_resolution"], "foreign");
 }
 
+/// #2608: no gateway decision leaves without its audit row, and a replay of an
+/// attempt whose row already exists still answers.
+#[tokio::test]
+async fn decide_gateway_execution_refuses_when_its_audit_write_fails() {
+    let svc = openai_team_a_service();
+    svc.policy
+        .set_context_admission_policy(
+            "team-a",
+            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
+        )
+        .unwrap();
+    let admitted = svc
+        .decide_gateway_execution(decide_request("op-audit-1", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(admitted.admitted, "{admitted:?}");
+
+    svc.db
+        .runtime()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER audit_down BEFORE INSERT ON sekai_decisions
+             BEGIN SELECT RAISE(ABORT, 'audit store down'); END;",
+        )
+        .unwrap();
+
+    let replay = svc
+        .decide_gateway_execution(decide_request("op-audit-1", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(replay.admitted, admitted.admitted);
+
+    // Another principal reusing the attempt is not covered by the first row.
+    let mut foreign = decide_request("op-audit-1", "");
+    foreign
+        .metadata_mut()
+        .insert("x-principal", "root".parse().unwrap());
+    let foreign = svc.decide_gateway_execution(foreign).await.unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
+
+    let refused = svc
+        .decide_gateway_execution(decide_request("op-audit-2", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::Unavailable);
+    assert!(
+        svc.db
+            .get_decision("gateway-decide:team-a:op-audit-2:1")
+            .unwrap()
+            .is_none()
+    );
+
+    // The same attempt replayed after the policy changed would answer
+    // differently than its recorded row. Retrying it cannot succeed, so the
+    // refusal is a precondition failure rather than an outage.
+    svc.policy.set_namespace_policy(
+        "team-a",
+        crate::chisei::policy::Policy {
+            allowed_runtimes: vec!["openai".into()],
+            allowed_models: vec!["gpt-5.5-mini".into()],
+            default_runtime: "openai".into(),
+            default_model: "gpt-5.5-mini".into(),
+            data_class: "internal".into(),
+        },
+    );
+    let changed = svc
+        .decide_gateway_execution(decide_request("op-audit-1", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), tonic::Code::FailedPrecondition);
+
+    // Evidence the ledger refuses is a bad request, not an outage.
+    let unauditable = svc
+        .decide_gateway_execution(decide_request("sk-looks-like-a-key", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(unauditable.code(), tonic::Code::InvalidArgument);
+}
+
 #[tokio::test]
 async fn decide_gateway_execution_denies_missing_context_admission_policy() {
     let svc = openai_team_a_service();
