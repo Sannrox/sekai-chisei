@@ -267,18 +267,22 @@ impl RuntimeDb {
         }
     }
 
-    /// Open dataset branch proposals of `tenant`, newest first, each with
-    /// whether an open definition proposal attaches it (#2203).
+    /// Open dataset branch proposals of `tenant` on datasets bound in
+    /// `namespace`, older than `before`, newest first, each with whether an
+    /// open definition proposal attaches it (#2203).
     pub fn list_open_dataset_branch_proposals(
         &self,
         tenant: &str,
+        namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<(crate::sekai::dataset_branch::DatasetBranchProposal, bool)>, String> {
         match self {
-            Self::Sqlite(db) => db.list_open_dataset_branch_proposals(tenant, limit, offset),
+            Self::Sqlite(db) => {
+                db.list_open_dataset_branch_proposals(tenant, namespace, limit, before)
+            }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.list_open_dataset_branch_proposals(tenant, limit, offset)
+                db.list_open_dataset_branch_proposals(tenant, namespace, limit, before)
             }),
         }
     }

@@ -367,12 +367,21 @@ mod tests {
         assert_eq!(db.put_plan_review(&other).unwrap(), review);
         // Open reviews are pending (#2203), scoped to their namespace.
         assert_eq!(
-            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            db.list_pending_plan_reviews(ns, 10, crate::db::OlderThan::START)
+                .unwrap(),
             std::slice::from_ref(&review)
         );
-        assert!(db.list_pending_plan_reviews(ns, 10, 1).unwrap().is_empty());
+        let past_review = crate::db::OlderThan {
+            at_ms: review.submitted_at_ms,
+            id: &review.plan_id,
+        };
         assert!(
-            db.list_pending_plan_reviews(&format!("{ns}-other"), 10, 0)
+            db.list_pending_plan_reviews(ns, 10, past_review)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_pending_plan_reviews(&format!("{ns}-other"), 10, crate::db::OlderThan::START)
                 .unwrap()
                 .is_empty()
         );
@@ -402,7 +411,8 @@ mod tests {
         db.put_plan_review(&second).unwrap();
         // Decided reviews leave the pending list.
         assert_eq!(
-            db.list_pending_plan_reviews(ns, 10, 0).unwrap(),
+            db.list_pending_plan_reviews(ns, 10, crate::db::OlderThan::START)
+                .unwrap(),
             std::slice::from_ref(&second)
         );
         assert!(

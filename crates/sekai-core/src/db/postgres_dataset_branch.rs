@@ -414,21 +414,27 @@ impl PostgresDb {
     pub fn list_open_dataset_branch_proposals(
         &self,
         tenant: &str,
+        namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<(DatasetBranchProposal, bool)>, String> {
         let mut connection = self.connection()?;
         let mut tx = read_snapshot(&mut connection)?;
         let keys = tx
             .query(
-                "SELECT dataset_id, id FROM sekai_dataset_branch_proposals
-                 WHERE tenant = $1 AND status = $2
-                 ORDER BY created_at_ms DESC, id DESC LIMIT $3 OFFSET $4",
+                "SELECT p.dataset_id, p.id FROM sekai_dataset_branch_proposals p
+                 JOIN sekai_datasets d ON d.id = p.dataset_id
+                 JOIN sekai_objects o ON o.id = d.object_id
+                 WHERE p.tenant = $1 AND p.status = $2 AND o.namespace = $3
+                   AND (p.created_at_ms, p.id) < ($4, $5)
+                 ORDER BY p.created_at_ms DESC, p.id DESC LIMIT $6",
                 &[
                     &tenant,
                     &dataset_branch::STATUS_OPEN,
+                    &namespace,
+                    &before.at_ms,
+                    &before.id,
                     &(limit as i64),
-                    &(offset as i64),
                 ],
             )
             .map_err(|error| error.to_string())?

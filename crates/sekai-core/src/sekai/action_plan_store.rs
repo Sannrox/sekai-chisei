@@ -3,12 +3,19 @@
 //! write of an existing id keeps the stored record and returns it, so the
 //! caller can tell a retry from a conflict.
 
+use crate::db::OlderThan;
 use crate::db::postgres::PostgresDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::action_instance::ActionInstance;
 use crate::sekai::action_plan::{PlanIntent, PlanSimulation, ProposedPlan};
 use crate::sekai::plan_execution::PlanExecution;
 use crate::sekai::plan_review::PlanReview;
+
+/// Undecided reviews of a namespace past a keyset position, newest first.
+pub const SQLITE_PENDING_PLAN_REVIEWS: &str = "SELECT body_json FROM sekai_plan_reviews
+     WHERE namespace = ?1 AND decision = ''
+       AND (submitted_at_ms, plan_id) < (?2, ?3)
+     ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT ?4";
 
 const CREATE_SQLITE: &str = "
 CREATE TABLE IF NOT EXISTS sekai_plan_intents (
@@ -234,24 +241,20 @@ impl SekaiDb {
         .transpose()
     }
 
-    /// Undecided reviews of `namespace`, newest first.
+    /// Undecided reviews of `namespace` older than `before`, newest first.
     pub fn list_pending_plan_reviews(
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: OlderThan<'_>,
     ) -> Result<Vec<PlanReview>, String> {
         let conn = self.conn();
         let mut statement = conn
-            .prepare(
-                "SELECT body_json FROM sekai_plan_reviews
-                 WHERE namespace = ?1 AND decision = ''
-                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT ?2 OFFSET ?3",
-            )
+            .prepare(SQLITE_PENDING_PLAN_REVIEWS)
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(
-                rusqlite::params![namespace, limit as i64, offset as i64],
+                rusqlite::params![namespace, before.at_ms, before.id, limit as i64],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|error| error.to_string())?;
@@ -572,14 +575,15 @@ impl PostgresDb {
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: OlderThan<'_>,
     ) -> Result<Vec<PlanReview>, String> {
         self.connection()?
             .query(
                 "SELECT body_json FROM sekai_plan_reviews
                  WHERE namespace = $1 AND decision = ''
-                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT $2 OFFSET $3",
-                &[&namespace, &(limit as i64), &(offset as i64)],
+                   AND (submitted_at_ms, plan_id) < ($2, $3)
+                 ORDER BY submitted_at_ms DESC, plan_id DESC LIMIT $4",
+                &[&namespace, &before.at_ms, &before.id, &(limit as i64)],
             )
             .map_err(|error| error.to_string())?
             .iter()
@@ -809,14 +813,15 @@ impl crate::db::runtime_db::RuntimeDb {
         dispatch!(self, db => db.get_plan_review(namespace, plan_id))
     }
 
-    /// Undecided reviews of `namespace`, newest first (#2203).
+    /// Undecided reviews of `namespace` older than `before`, newest first
+    /// (#2203).
     pub fn list_pending_plan_reviews(
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: OlderThan<'_>,
     ) -> Result<Vec<PlanReview>, String> {
-        dispatch!(self, db => db.list_pending_plan_reviews(namespace, limit, offset))
+        dispatch!(self, db => db.list_pending_plan_reviews(namespace, limit, before))
     }
 
     pub fn decide_plan_review(&self, review: &PlanReview) -> Result<bool, String> {

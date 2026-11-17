@@ -26,9 +26,12 @@ use super::rpc_actions::{
 use super::rpc_data::{context_tenant, may_merge_dataset_proposal};
 use super::rpc_definitions::authorize_definition_proposal_approval;
 use super::*;
+use crate::db::OlderThan;
 use crate::sekai::plan_review;
 
-/// Store rows read per page while filtering.
+/// Store rows read per store query while filtering. Every read resumes
+/// after the last row read, so a page costs the rows it filters, not the
+/// rows before the cursor.
 const SCAN_PAGE: usize = 100;
 
 /// Position after the last decision of a page: its kind, then its place in
@@ -68,6 +71,26 @@ impl Cursor {
     }
 }
 
+/// The last store row read in one kind; the next read starts after it.
+struct Position {
+    at_ms: i64,
+    id: String,
+}
+
+impl Position {
+    fn older_than(&self) -> OlderThan<'_> {
+        OlderThan {
+            at_ms: self.at_ms,
+            id: &self.id,
+        }
+    }
+
+    fn advance(&mut self, at_ms: i64, id: &str) {
+        self.at_ms = at_ms;
+        self.id = id.to_string();
+    }
+}
+
 /// The page being filled: decisions past the cursor, up to the limit.
 struct Page {
     cursor: Option<Cursor>,
@@ -87,14 +110,19 @@ impl Page {
             .is_none_or(|cursor| kind as i32 >= cursor.kind)
     }
 
-    /// Whether `decision` comes after the cursor in response order.
-    fn after_cursor(&self, decision: &PendingDecision) -> bool {
-        self.cursor.as_ref().is_none_or(|cursor| {
-            decision.kind > cursor.kind
-                || (decision.kind == cursor.kind
-                    && (decision.requested_at_ms, decision.subject_id.as_str())
-                        < (cursor.requested_at_ms, cursor.subject_id.as_str()))
-        })
+    /// Where `kind`'s newest-first store read resumes: after the cursor in
+    /// the cursor's own kind, from the newest row in a later kind.
+    fn start(&self, kind: PendingDecisionKind) -> Position {
+        match &self.cursor {
+            Some(cursor) if cursor.kind == kind as i32 => Position {
+                at_ms: cursor.requested_at_ms,
+                id: cursor.subject_id.clone(),
+            },
+            _ => Position {
+                at_ms: OlderThan::START.at_ms,
+                id: OlderThan::START.id.to_string(),
+            },
+        }
     }
 
     /// Adds `decision`; false once the page is full.
@@ -236,20 +264,28 @@ fn list_action_instances(
     namespace: &str,
     page: &mut Page,
 ) -> Result<(), Status> {
-    visit_decidable_action_instances(service, decider, namespace, None, |instance| {
-        let decision = PendingDecision {
-            kind: PendingDecisionKind::ActionInstance.into(),
-            namespace: instance.namespace.clone(),
-            subject_id: instance.instance_id.clone(),
-            subject_digest: instance.request_digest.clone(),
-            requested_by: instance.principal.clone(),
-            requested_at_ms: instance.created_at_ms,
-            deadline_ms: instance.review.sla_deadline_ms,
-            queue_id: instance.review.queue_id.clone(),
-            dataset_id: String::new(),
-        };
-        !page.after_cursor(&decision) || page.push(decision)
-    })
+    let start = page.start(PendingDecisionKind::ActionInstance);
+    visit_decidable_action_instances(
+        service,
+        decider,
+        namespace,
+        None,
+        start.older_than(),
+        |instance| {
+            let decision = PendingDecision {
+                kind: PendingDecisionKind::ActionInstance.into(),
+                namespace: instance.namespace.clone(),
+                subject_id: instance.instance_id.clone(),
+                subject_digest: instance.request_digest.clone(),
+                requested_by: instance.principal.clone(),
+                requested_at_ms: instance.created_at_ms,
+                deadline_ms: instance.review.sla_deadline_ms,
+                queue_id: instance.review.queue_id.clone(),
+                dataset_id: String::new(),
+            };
+            page.push(decision)
+        },
+    )
 }
 
 fn list_plan_reviews(
@@ -263,12 +299,14 @@ fn list_plan_reviews(
     page: &mut Page,
 ) -> Result<(), Status> {
     let db = service.db.runtime();
-    let mut offset = 0;
+    let mut position = page.start(PendingDecisionKind::PlanReview);
     loop {
         let reviews = db
-            .list_pending_plan_reviews(namespace, SCAN_PAGE, offset)
+            .list_pending_plan_reviews(namespace, SCAN_PAGE, position.older_than())
             .map_err(Status::internal)?;
-        offset += reviews.len();
+        if let Some(last) = reviews.last() {
+            position.advance(last.submitted_at_ms, &last.plan_id);
+        }
         for review in &reviews {
             let decision = PendingDecision {
                 kind: PendingDecisionKind::PlanReview.into(),
@@ -286,9 +324,6 @@ fn list_plan_reviews(
                     .unwrap_or_default(),
                 dataset_id: String::new(),
             };
-            if !page.after_cursor(&decision) {
-                continue;
-            }
             let Some(plan) = db
                 .get_plan(namespace, &review.plan_id)
                 .map_err(Status::internal)?
@@ -314,12 +349,14 @@ fn list_definition_proposals(
     page: &mut Page,
 ) -> Result<(), Status> {
     let db = service.db.runtime();
-    let mut offset = 0;
+    let mut position = page.start(PendingDecisionKind::DefinitionProposal);
     loop {
         let proposals = db
-            .list_open_definition_proposals(namespace, SCAN_PAGE, offset)
+            .list_open_definition_proposals(namespace, SCAN_PAGE, position.older_than())
             .map_err(Status::internal)?;
-        offset += proposals.len();
+        if let Some(last) = proposals.last() {
+            position.advance(last.created_at_ms, &last.proposal_id);
+        }
         for proposal in &proposals {
             let decision = PendingDecision {
                 kind: PendingDecisionKind::DefinitionProposal.into(),
@@ -332,9 +369,6 @@ fn list_definition_proposals(
                 queue_id: String::new(),
                 dataset_id: String::new(),
             };
-            if !page.after_cursor(&decision) {
-                continue;
-            }
             // An approval the caller already gave is not pending on them.
             let pending =
                 match authorize_definition_proposal_approval(service, principals, proposal) {
@@ -363,12 +397,19 @@ fn list_dataset_proposals(
 ) -> Result<(), Status> {
     let db = service.db.runtime();
     let tenant = context_tenant(context);
-    let mut offset = 0;
+    let mut position = page.start(PendingDecisionKind::DatasetBranchProposal);
     loop {
         let proposals = db
-            .list_open_dataset_branch_proposals(&tenant, SCAN_PAGE, offset)
+            .list_open_dataset_branch_proposals(
+                &tenant,
+                namespace,
+                SCAN_PAGE,
+                position.older_than(),
+            )
             .map_err(Status::internal)?;
-        offset += proposals.len();
+        if let Some(last) = proposals.last() {
+            position.advance(last.0.created_at_ms, &last.0.id);
+        }
         for (proposal, attached) in &proposals {
             let decision = PendingDecision {
                 kind: PendingDecisionKind::DatasetBranchProposal.into(),
@@ -381,11 +422,9 @@ fn list_dataset_proposals(
                 queue_id: String::new(),
                 dataset_id: proposal.dataset_id.clone(),
             };
-            if page.after_cursor(&decision)
-                && may_merge_dataset_proposal(
-                    service, principals, context, namespace, proposal, *attached,
-                )?
-                && !page.push(decision)
+            if may_merge_dataset_proposal(
+                service, principals, context, namespace, proposal, *attached,
+            )? && !page.push(decision)
             {
                 return Ok(());
             }
@@ -409,8 +448,8 @@ mod tests {
         }
     }
 
-    /// A token resumes strictly after the decision it names, in kind order
-    /// then newest first.
+    /// A token resumes its own kind's store read after the decision it
+    /// names, skips earlier kinds, and starts later kinds from the newest.
     #[test]
     fn a_page_token_resumes_after_its_decision() {
         let last = decision(PendingDecisionKind::PlanReview, 20, "plan:b");
@@ -421,12 +460,16 @@ mod tests {
         };
         assert!(!page.reaches(PendingDecisionKind::ActionInstance));
         assert!(page.reaches(PendingDecisionKind::PlanReview));
-        assert!(!page.after_cursor(&last));
-        assert!(!page.after_cursor(&decision(PendingDecisionKind::PlanReview, 30, "a")));
-        assert!(!page.after_cursor(&decision(PendingDecisionKind::PlanReview, 20, "plan:c")));
-        assert!(page.after_cursor(&decision(PendingDecisionKind::PlanReview, 20, "plan:a")));
-        assert!(page.after_cursor(&decision(PendingDecisionKind::PlanReview, 10, "z")));
-        assert!(page.after_cursor(&decision(PendingDecisionKind::DefinitionProposal, 99, "z")));
+        let resumed = page.start(PendingDecisionKind::PlanReview);
+        assert_eq!(
+            resumed.older_than(),
+            OlderThan {
+                at_ms: 20,
+                id: "plan:b"
+            }
+        );
+        let later = page.start(PendingDecisionKind::DefinitionProposal);
+        assert_eq!(later.older_than(), OlderThan::START);
         for token in ["x", "1:2", "a:2:id", "1:b:id"] {
             assert!(Cursor::parse(token).is_err(), "{token}");
         }

@@ -127,6 +127,41 @@ impl PostgresDb {
         Ok(out)
     }
 
+    /// See `SekaiDb::list_action_instances_older_than`.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<ActionInstance>, String> {
+        let type_filter = type_id.filter(|t| !t.trim().is_empty());
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_instances
+                 WHERE namespace = $1 AND status = $2
+                   AND ($3::TEXT IS NULL OR type_id = $3)
+                   AND (created_at_ms, instance_id) < ($4, $5)
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $6",
+                &[
+                    &namespace,
+                    &status,
+                    &type_filter,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit.clamp(1, 500) as i64),
+                ],
+            )
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| {
+                serde_json::from_str(row.get(0))
+                    .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     pub fn put_action_instance(&self, instance: &ActionInstance) -> Result<ActionInstance, String> {
         instance.validate_fields()?;
         if let Some(existing) =
