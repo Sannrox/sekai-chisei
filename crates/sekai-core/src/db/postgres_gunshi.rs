@@ -16,15 +16,16 @@ impl PostgresDb {
 
     /// Insert or CAS-update Gunshi allocation state.
     ///
-    /// When `expected_revision` is `None`, the row must not exist yet (install).
-    /// When `Some(rev)`, the existing `revision_id` must match for the update to apply.
+    /// When `expected_state_json` is `None`, the row must not exist yet (install).
+    /// When `Some(json)`, the stored `state_json` must still equal it, so a stale
+    /// read-modify-write fails even when it keeps the revision id (#2372).
     pub fn put_gunshi_allocation_state_cas(
         &self,
         namespace: &str,
         revision_id: &str,
         changed_at_ms: i64,
         state_json: &str,
-        expected_revision: Option<&str>,
+        expected_state_json: Option<&str>,
     ) -> Result<bool, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
@@ -32,12 +33,12 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         let current = tx
             .query_opt(
-                "SELECT revision_id FROM chisei_gunshi_allocation_state WHERE namespace = $1 FOR UPDATE",
+                "SELECT state_json FROM chisei_gunshi_allocation_state WHERE namespace = $1 FOR UPDATE",
                 &[&namespace],
             )
             .map_err(|error| error.to_string())?
             .map(|row| row.get::<_, String>(0));
-        match (current.as_deref(), expected_revision) {
+        match (current.as_deref(), expected_state_json) {
             (None, None) => {
                 // PostgreSQL cannot FOR UPDATE an absent key, so two first
                 // installs can both pass SELECT and race the INSERT. Map that
@@ -60,7 +61,7 @@ impl PostgresDb {
                     .execute(
                         "UPDATE chisei_gunshi_allocation_state
                          SET revision_id = $2, changed_at_ms = $3, state_json = $4
-                         WHERE namespace = $1 AND revision_id = $5",
+                         WHERE namespace = $1 AND state_json = $5",
                         &[
                             &namespace,
                             &revision_id,

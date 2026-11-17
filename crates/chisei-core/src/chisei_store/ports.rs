@@ -711,7 +711,7 @@ chisei_store_trait! {
     /// Gunshi allocation state.
     pub trait ChiseiGunshiStore {
         fn get_gunshi_allocation_state(&self, namespace: &str) -> Result<Option<String>, String>;
-        fn put_gunshi_allocation_state_cas(&self, namespace: &str, revision_id: &str, changed_at_ms: i64, state_json: &str, expected_revision: Option<&str>) -> Result<bool, String>;
+        fn put_gunshi_allocation_state_cas(&self, namespace: &str, revision_id: &str, changed_at_ms: i64, state_json: &str, expected_state_json: Option<&str>) -> Result<bool, String>;
     }
 }
 

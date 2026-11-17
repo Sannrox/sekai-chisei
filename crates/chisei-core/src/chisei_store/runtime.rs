@@ -697,7 +697,7 @@ pub trait ChiseiRuntimeDb {
         revision_id: &str,
         changed_at_ms: i64,
         state_json: &str,
-        expected_revision: Option<&str>,
+        expected_state_json: Option<&str>,
     ) -> Result<bool, String>;
 
     fn put_operation_receipt_with_kioku_holdouts(
@@ -2857,7 +2857,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
         revision_id: &str,
         changed_at_ms: i64,
         state_json: &str,
-        expected_revision: Option<&str>,
+        expected_state_json: Option<&str>,
     ) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.put_gunshi_allocation_state_cas(
@@ -2865,7 +2865,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 revision_id,
                 changed_at_ms,
                 state_json,
-                expected_revision,
+                expected_state_json,
             ),
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.put_gunshi_allocation_state_cas(
@@ -2873,7 +2873,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
                     revision_id,
                     changed_at_ms,
                     state_json,
-                    expected_revision,
+                    expected_state_json,
                 )
             }),
         }

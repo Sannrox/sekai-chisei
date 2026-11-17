@@ -180,15 +180,16 @@ pub trait ChiseiSekaiDbExt2 {
 
     /// Insert or CAS-update Gunshi allocation state.
     ///
-    /// When `expected_revision` is `None`, the row must not exist yet (install).
-    /// When `Some(rev)`, the existing `revision_id` must match for the update to apply.
+    /// When `expected_state_json` is `None`, the row must not exist yet (install).
+    /// When `Some(json)`, the stored `state_json` must still equal it, so a stale
+    /// read-modify-write fails even when it keeps the revision id (#2372).
     fn put_gunshi_allocation_state_cas(
         &self,
         namespace: &str,
         revision_id: &str,
         changed_at_ms: i64,
         state_json: &str,
-        expected_revision: Option<&str>,
+        expected_state_json: Option<&str>,
     ) -> Result<bool, String>;
 
     fn get_evolve_task_record(&self, id: &str) -> Result<Option<evolve::TaskRecord>, String>;
@@ -795,27 +796,28 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
 
     /// Insert or CAS-update Gunshi allocation state.
     ///
-    /// When `expected_revision` is `None`, the row must not exist yet (install).
-    /// When `Some(rev)`, the existing `revision_id` must match for the update to apply.
+    /// When `expected_state_json` is `None`, the row must not exist yet (install).
+    /// When `Some(json)`, the stored `state_json` must still equal it, so a stale
+    /// read-modify-write fails even when it keeps the revision id (#2372).
     fn put_gunshi_allocation_state_cas(
         &self,
         namespace: &str,
         revision_id: &str,
         changed_at_ms: i64,
         state_json: &str,
-        expected_revision: Option<&str>,
+        expected_state_json: Option<&str>,
     ) -> Result<bool, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         let current = tx
             .query_row(
-                "SELECT revision_id FROM chisei_gunshi_allocation_state WHERE namespace = ?1",
+                "SELECT state_json FROM chisei_gunshi_allocation_state WHERE namespace = ?1",
                 params![namespace],
                 |row| row.get::<_, String>(0),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        match (current.as_deref(), expected_revision) {
+        match (current.as_deref(), expected_state_json) {
             (None, None) => {
                 tx.execute(
                     "INSERT INTO chisei_gunshi_allocation_state
@@ -830,7 +832,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
                     .execute(
                         "UPDATE chisei_gunshi_allocation_state
                          SET revision_id = ?2, changed_at_ms = ?3, state_json = ?4
-                         WHERE namespace = ?1 AND revision_id = ?5",
+                         WHERE namespace = ?1 AND state_json = ?5",
                         params![namespace, revision_id, changed_at_ms, state_json, expected],
                     )
                     .map_err(|e| e.to_string())?;
