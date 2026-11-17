@@ -18,6 +18,68 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
 pub(super) const MAX_PROVIDER_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Accumulates raw stream bytes and yields complete SSE events as text.
+/// Bytes are decoded only once an event is complete, so a multi-byte UTF-8
+/// character split across network chunks arrives intact. Events end at
+/// `\n\n` or `\r\n\r\n`, whichever comes first.
+#[derive(Default)]
+pub(super) struct SseFrames(Vec<u8>);
+
+impl SseFrames {
+    pub(super) fn push(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    /// Removes and returns the next complete event, if one is buffered.
+    pub(super) fn next_event(&mut self) -> Option<String> {
+        let (index, delimiter) = self.0.windows(2).enumerate().find_map(|(i, pair)| {
+            if pair == b"\n\n" {
+                Some((i, 2))
+            } else if pair == b"\r\n" && self.0[i + 2..].starts_with(b"\r\n") {
+                Some((i, 4))
+            } else {
+                None
+            }
+        })?;
+        let event = String::from_utf8_lossy(&self.0[..index]).into_owned();
+        self.0.drain(..index + delimiter);
+        Some(event)
+    }
+
+    /// The unterminated tail left when the stream ends.
+    pub(super) fn tail(&self) -> String {
+        String::from_utf8_lossy(&self.0).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod sse_frames_tests {
+    use super::SseFrames;
+
+    #[test]
+    fn multibyte_character_split_across_chunks_arrives_intact() {
+        let body = "data: 日本\n\n".as_bytes();
+        // Split inside the 3-byte "日".
+        let split = "data: ".len() + 1;
+        let mut frames = SseFrames::default();
+        frames.push(&body[..split]);
+        assert_eq!(frames.next_event(), None);
+        frames.push(&body[split..]);
+        assert_eq!(frames.next_event().as_deref(), Some("data: 日本"));
+        assert!(frames.tail().is_empty());
+    }
+
+    #[test]
+    fn crlf_events_are_split_incrementally() {
+        let mut frames = SseFrames::default();
+        frames.push(b"data: a\r\n\r\ndata: b\r\n\r\ndata: c");
+        assert_eq!(frames.next_event().as_deref(), Some("data: a"));
+        assert_eq!(frames.next_event().as_deref(), Some("data: b"));
+        assert_eq!(frames.next_event(), None);
+        assert_eq!(frames.tail(), "data: c");
+    }
+}
+
 pub(super) fn event_data_values(event: &str) -> Vec<String> {
     let mut values = Vec::new();
     for line in event.lines() {
