@@ -692,7 +692,8 @@ fn mutation_kind(mutation: &CommittedObjectMutation) -> String {
     }
 }
 
-fn object_matches_filters(scope: &ObjectChangeScope, object: &Object) -> bool {
+/// Whether `object` satisfies every property filter of `scope`.
+pub fn object_matches_filters(scope: &ObjectChangeScope, object: &Object) -> bool {
     if scope.property_filters.is_empty() {
         return true;
     }

@@ -1267,6 +1267,41 @@ pub(super) fn retain_reachable_visible_objects(
         object_ids.contains(link.from_id.as_str()) && object_ids.contains(link.to_id.as_str())
     });
 }
+/// Whether `principals` may read `object`, a row the store already returned
+/// through ACL and row policy: marking, collaboration, object security and
+/// purpose, exactly as listings apply them. `recorded_purposes` carries purpose
+/// decisions already recorded in this read, so each kind is recorded once.
+pub(super) fn object_passes_read_checks(
+    db: &RuntimeDb,
+    object: &domain::Object,
+    principals: &[String],
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+    recorded_purposes: &mut HashSet<(String, String)>,
+) -> Result<bool, Status> {
+    Ok(object_passes_marking(db, object, principals)?
+        && collaboration_object_permitted(
+            db,
+            tenant_context,
+            object,
+            crate::enterprise::NamespaceAction::Read,
+        )?
+        && object_passes_security_policy(
+            db,
+            object,
+            principals,
+            tenant_context,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            purpose,
+        )?
+        && purpose_allows_kind(
+            db,
+            &object.namespace,
+            &object.kind,
+            purpose,
+            recorded_purposes,
+        )?)
+}
 /// Visits, in one scan and in filter order, every object of `filter` the
 /// caller may read: ACL and row policy, marking, collaboration, object
 /// security and purpose, exactly as reads apply them (ignores the filter's
@@ -1304,31 +1339,12 @@ pub(super) fn for_each_visible_object(
         }
         let page_len = page.len() as i32;
         for object in page {
-            if !object_passes_marking(db, &object, principals)?
-                || !collaboration_object_permitted(
-                    db,
-                    tenant_context,
-                    &object,
-                    crate::enterprise::NamespaceAction::Read,
-                )?
-            {
-                continue;
-            }
-            if !object_passes_security_policy(
+            if !object_passes_read_checks(
                 db,
                 &object,
                 principals,
+                purpose,
                 tenant_context,
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                purpose,
-            )? {
-                continue;
-            }
-            if !purpose_allows_kind(
-                db,
-                &object.namespace,
-                &object.kind,
-                purpose,
                 &mut recorded_purposes,
             )? {
                 continue;

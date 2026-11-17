@@ -3,7 +3,8 @@
 use super::*;
 use crate::sekai::event_subscription::SUBSCRIBE_UNAVAILABLE;
 use crate::sekai::object_change_subscription::{
-    ObjectChangeReadRequest, ObjectChangeScope, authorization_pin, read_object_change_subscription,
+    ObjectChangeReadRequest, ObjectChangeScope, authorization_pin, object_matches_filters,
+    read_object_change_subscription_with_resolved_objects,
 };
 
 impl SekaiServiceImpl {
@@ -64,36 +65,7 @@ impl SekaiServiceImpl {
                 })
                 .collect(),
         };
-        let filter = domain::ListFilter {
-            kind: Some(domain_scope.kind.clone()),
-            name: None,
-            namespace: Some(domain_scope.namespace.clone()),
-            property_filters: domain_scope.property_filters.clone(),
-            interface_filter: Vec::new(),
-            limit: domain::MAX_LIST_LIMIT,
-            offset: 0,
-            order_by: "name".into(),
-            descending: false,
-        };
-        let (visible, _) = list_objects_with_marking(
-            self.db.runtime(),
-            &filter,
-            &principals,
-            &policy_context,
-            purpose.as_ref(),
-            tenant_context.as_ref(),
-            |objects, _, _| Ok(objects),
-        )?;
-        let visible = if domain_scope.object_ids.is_empty() {
-            visible
-        } else {
-            let pinned: std::collections::BTreeSet<_> =
-                domain_scope.object_ids.iter().cloned().collect();
-            visible
-                .into_iter()
-                .filter(|object| pinned.contains(&object.id))
-                .collect()
-        };
+        let scope_filter = domain_scope.clone();
         let activation_id = self
             .db
             .runtime()
@@ -104,7 +76,14 @@ impl SekaiServiceImpl {
         let pin = authorization_pin(&activation_id, &principals)
             .map_err(|_| Status::internal("object-change authorization pin unavailable"))?;
         let now_ms = now_millis();
-        let page = read_object_change_subscription(
+        let mut recorded_purposes = HashSet::new();
+        let mut resolver_error = None;
+        let mut visible = Vec::new();
+        // Objects are resolved by the ids the change feed names, so a pinned or
+        // changed object is checked on its own, never cut off by a listing page.
+        // One that is unreadable or outside the scope's filters stays out and
+        // its change reads as an invalidation.
+        let page = read_object_change_subscription_with_resolved_objects(
             self.db.runtime(),
             &actor,
             &ObjectChangeReadRequest {
@@ -117,10 +96,28 @@ impl SekaiServiceImpl {
                 revoke: input.revoke,
             },
             now_ms,
-            &visible,
+            &mut visible,
+            |object_ids| {
+                self.resolve_visible_changed_objects(
+                    object_ids,
+                    &scope_filter,
+                    &principals,
+                    &policy_context,
+                    purpose.as_ref(),
+                    tenant_context.as_ref(),
+                    &mut recorded_purposes,
+                )
+                .map_err(|status| {
+                    resolver_error = Some(status);
+                    "object change objects unavailable".to_string()
+                })
+            },
             &pin,
-        )
-        .map_err(map_object_change_error)?;
+        );
+        if let Some(status) = resolver_error {
+            return Err(status);
+        }
+        let page = page.map_err(map_object_change_error)?;
         Ok(Response::new(ReadObjectChangeSubscriptionResponse {
             contract_version: page.contract_version,
             subscription_id: page.subscription_id,
@@ -148,6 +145,50 @@ impl SekaiServiceImpl {
             authority: false,
             disconnect_reason: page.disconnect_reason,
         }))
+    }
+}
+
+impl SekaiServiceImpl {
+    /// The objects among `object_ids` in `scope` that `principals` may read
+    /// and that match its property filters, checked one by one as listings
+    /// check them. Objects stay raw, as change projection reads them.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_visible_changed_objects(
+        &self,
+        object_ids: &[String],
+        scope: &ObjectChangeScope,
+        principals: &[String],
+        policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+        purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+        tenant_context: Option<&RequestEnterpriseContext>,
+        recorded_purposes: &mut HashSet<(String, String)>,
+    ) -> Result<Vec<domain::Object>, Status> {
+        let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
+        let objects = self
+            .db
+            .runtime()
+            .list_objects_by_ids_with_policy_context(object_ids, &principal_refs, policy_context)
+            .map_err(Status::internal)?;
+        let mut visible = Vec::with_capacity(objects.len());
+        for object in objects {
+            if object.namespace != scope.namespace
+                || object.kind != scope.kind
+                || !object_matches_filters(scope, &object)
+            {
+                continue;
+            }
+            if object_passes_read_checks(
+                self.db.runtime(),
+                &object,
+                principals,
+                purpose,
+                tenant_context,
+                recorded_purposes,
+            )? {
+                visible.push(object);
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -346,5 +387,81 @@ mod tests {
 
         let revoked = read(&svc, &first.snapshot_revision, true, "").await;
         assert_eq!(revoked.outcome, OUTCOME_REVOKED);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_object_past_the_first_listing_page_gets_filtered_updates() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        // One more readable customer than a listing page holds; the pinned one
+        // sorts last by name.
+        for index in 0..=domain::MAX_LIST_LIMIT {
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(proto_customer(
+                        &format!("c-{index:04}"),
+                        &format!("customer {index:04}"),
+                        "eu",
+                    )),
+                    lease_precondition: None,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap();
+        }
+        let last_index = domain::MAX_LIST_LIMIT;
+        let last = format!("c-{last_index:04}");
+        let pinned_read = |snapshot: String| {
+            svc.read_object_change_subscription(with_named_principal(
+                ReadObjectChangeSubscriptionRequest {
+                    subscription_id: "last-eu-customer".into(),
+                    scope: Some(ObjectChangeSubscriptionScope {
+                        object_ids: vec![last.clone()],
+                        property_filters: vec![PropertyFilter {
+                            key: "region".into(),
+                            op: "eq".into(),
+                            value: "eu".into(),
+                        }],
+                        ..scope()
+                    }),
+                    snapshot_revision: snapshot,
+                    limit: 32,
+                    ..Default::default()
+                },
+                "alice",
+            ))
+        };
+        let snapshot = pinned_read(String::new())
+            .await
+            .unwrap()
+            .into_inner()
+            .snapshot_revision;
+
+        let mut updated = proto_customer(&last, &format!("customer {last_index:04}"), "eu");
+        updated.properties.insert("tier".into(), "gold".into());
+        svc.update_object(with_named_principal(
+            UpdateObjectRequest {
+                object: Some(updated),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+
+        let page = pinned_read(snapshot).await.unwrap().into_inner();
+        let events: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event.object_id.as_str(),
+                    event.op.as_str(),
+                    event.field.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(events, [(last.as_str(), OP_UPDATE, "properties.tier")]);
     }
 }
