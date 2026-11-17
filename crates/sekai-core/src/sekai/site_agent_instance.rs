@@ -54,7 +54,7 @@ const PROPERTIES: &[(&str, bool, &str)] = &[
     (
         "principal_id",
         true,
-        "The org-owned principal the instance acts as.",
+        "The org-owned principal the instance acts as: a registered service principal.",
     ),
     (
         "responsibility",
@@ -276,11 +276,29 @@ pub fn validate_object_write(db: &RuntimeDb, object: &Object, now_ms: i64) -> Re
     }
     let digest = property(object, "definition_revision_digest").unwrap_or_default();
     let member = property(object, "agent_member").unwrap_or_default();
+    let principal = property(object, "principal_id").unwrap_or_default();
+    let existing = db
+        .get_object(&object.id)?
+        .filter(|existing| existing.kind == KIND);
+    // An update re-checks the principal only when it changes. The principal
+    // must be registered for this namespace: freezing an instance blocks its
+    // principal everywhere, so it must not name another tenant's worker.
+    if existing
+        .as_ref()
+        .is_none_or(|existing| property(existing, "principal_id") != Some(principal))
+        && !db
+            .get_service_principal(principal)?
+            .is_some_and(|registration| registration.namespaces.contains(&object.namespace))
+    {
+        return Err(format!(
+            "{principal} is not a registered org-owned service principal for namespace {}",
+            object.namespace
+        ));
+    }
     // An update re-checks the binding only when it changes.
-    if let Some(existing) = db.get_object(&object.id)?
-        && existing.kind == KIND
-        && property(&existing, "definition_revision_digest") == Some(digest)
-        && property(&existing, "agent_member") == Some(member)
+    if let Some(existing) = &existing
+        && property(existing, "definition_revision_digest") == Some(digest)
+        && property(existing, "agent_member") == Some(member)
     {
         return Ok(());
     }
@@ -443,9 +461,26 @@ mod tests {
             "object_id": "line-7",
             "definition_revision_digest": digest,
             "agent_member": member,
-            "principal_id": "org:line-7-agent",
+            "principal_id": "svc-line-7",
             "responsibility": "line:7"
         })
+    }
+
+    fn register_principal(runtime: &RuntimeDb, principal: &str) {
+        runtime
+            .put_service_principal(
+                &crate::sekai::service_principal::ServicePrincipalRegistration {
+                    capabilities: Vec::new(),
+                    principal: principal.into(),
+                    tenant_id: "org".into(),
+                    namespaces: vec![NAMESPACE.into()],
+                    action_types: vec![ACTION_CREATE.into(), ACTION_UPDATE.into()],
+                    registered_by: ACTOR.into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            )
+            .unwrap();
     }
 
     fn refusal(outcome: Result<String, ActionInstanceAdmissionError>) -> String {
@@ -462,9 +497,10 @@ mod tests {
     fn a_principal_answers_for_one_revision_or_is_ambiguous() {
         let runtime = RuntimeDb::memory();
         install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        register_principal(&runtime, "svc-line-7");
         let first = published_revision(&runtime, "", true);
         let second = published_revision(&runtime, &first, true);
-        let principal = "org:line-7-agent";
+        let principal = "svc-line-7";
         assert_eq!(
             definition_revision_for(&runtime, NAMESPACE, principal).unwrap(),
             None
@@ -495,6 +531,7 @@ mod tests {
     fn instances_bind_only_to_a_certified_published_agent_revision() {
         let runtime = RuntimeDb::memory();
         install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        register_principal(&runtime, "svc-line-7");
         let certified = published_revision(&runtime, "", true);
         let uncertified = published_revision(&runtime, &certified, false);
 
@@ -569,9 +606,58 @@ mod tests {
     /// recorded denial; other principals are not; unfreeze restores
     /// admission (#1934).
     #[test]
+    fn instances_refuse_a_principal_the_org_does_not_own() {
+        let runtime = RuntimeDb::memory();
+        install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        register_principal(&runtime, "svc-line-7");
+        let certified = published_revision(&runtime, "", true);
+
+        let mut human = instance(&certified, "triage");
+        human["principal_id"] = json!("alice");
+        let message = refusal(admit(&runtime, ACTION_CREATE, human, "human"));
+        assert!(message.contains("not a registered"), "{message}");
+
+        // Registered, but for another namespace.
+        runtime
+            .put_service_principal(
+                &crate::sekai::service_principal::ServicePrincipalRegistration {
+                    capabilities: Vec::new(),
+                    principal: "worker-elsewhere".into(),
+                    tenant_id: "other".into(),
+                    namespaces: vec!["other-site".into()],
+                    action_types: vec![ACTION_CREATE.into()],
+                    registered_by: ACTOR.into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            )
+            .unwrap();
+        let mut foreign = instance(&certified, "triage");
+        foreign["principal_id"] = json!("worker-elsewhere");
+        let message = refusal(admit(&runtime, ACTION_CREATE, foreign, "foreign"));
+        assert!(message.contains("not a registered"), "{message}");
+
+        admit(
+            &runtime,
+            ACTION_CREATE,
+            instance(&certified, "triage"),
+            "owned",
+        )
+        .unwrap();
+        let message = refusal(admit(
+            &runtime,
+            ACTION_UPDATE,
+            json!({"object_id": "line-7", "principal_id": "alice"}),
+            "retarget",
+        ));
+        assert!(message.contains("not a registered"), "{message}");
+    }
+
+    #[test]
     fn freezing_refuses_the_instance_principal_until_unfrozen() {
         let runtime = RuntimeDb::memory();
         install(&runtime, NAMESPACE, ACTOR, 1_000).unwrap();
+        register_principal(&runtime, "svc-line-7");
         let certified = published_revision(&runtime, "", true);
         admit(
             &runtime,
@@ -580,7 +666,7 @@ mod tests {
             "create",
         )
         .unwrap();
-        let principal = "org:line-7-agent";
+        let principal = "svc-line-7";
         let touch = |key: &str, actor: &str| {
             admit_as(
                 &runtime,
@@ -591,7 +677,9 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(touch("before", principal).status, "admitted");
+        // A registered service principal is an agent: its Actions park for
+        // approval, so "not denied" is what the freeze changes.
+        assert_eq!(touch("before", principal).status, "parked");
 
         admit(
             &runtime,
@@ -629,6 +717,6 @@ mod tests {
             "thaw",
         )
         .unwrap();
-        assert_eq!(touch("after", principal).status, "admitted");
+        assert_eq!(touch("after", principal).status, "parked");
     }
 }
