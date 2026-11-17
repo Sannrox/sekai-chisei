@@ -16,12 +16,59 @@ pub fn usage() -> &'static str {
     "sekaictl admin model-release-evidence trust-set --file <roots.json>\n  sekaictl admin model-release-evidence trust-get\n  sekaictl admin model-release-evidence ingest --file <runtime.json>\n  sekaictl admin model-release-evidence get --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri>\n  sekaictl admin model-release-evidence export --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --suite <id> --baseline <run> --candidate <run> --eval-run <id> [--signing-key <file>] [--actor <principal>]\n  sekaictl admin model-release-evidence feedback --namespace <ns> --provider <id> --model <id> --profile-version <v> --digest <digest> --endpoint <uri> --note <text> [--actor <principal>]"
 }
 
+const IDENTITY_FLAGS: [&str; 5] = [
+    "--provider",
+    "--model",
+    "--profile-version",
+    "--digest",
+    "--endpoint",
+];
+const EXPORT_FLAGS: [&str; 11] = [
+    "--provider",
+    "--model",
+    "--profile-version",
+    "--digest",
+    "--endpoint",
+    "--suite",
+    "--baseline",
+    "--candidate",
+    "--eval-run",
+    "--signing-key",
+    "--actor",
+];
+const FEEDBACK_FLAGS: [&str; 8] = [
+    "--provider",
+    "--model",
+    "--profile-version",
+    "--digest",
+    "--endpoint",
+    "--namespace",
+    "--note",
+    "--actor",
+];
+
+/// Rejects unknown, repeated, or value-less flags before any field defaults.
+fn check_flags(args: &[String], known: &[&str]) -> Result<(), BoxErr> {
+    crate::value_flags::check_value_flags(args, known)
+        .map_err(|error| std::io::Error::other(error).into())
+}
+
 pub async fn run_model_release_evidence_command(args: Vec<String>) -> Result<(), BoxErr> {
+    let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
-        Some("trust-set") => trust_set(flag(&args[1..], "--file")?).await,
+        Some("trust-set") => {
+            check_flags(rest, &["--file"])?;
+            trust_set(flag(rest, "--file")?).await
+        }
         Some("trust-get") => trust_get().await,
-        Some("ingest") => ingest(flag(&args[1..], "--file")?).await,
-        Some("get") => get(parse_identity(&args[1..])?).await,
+        Some("ingest") => {
+            check_flags(rest, &["--file"])?;
+            ingest(flag(rest, "--file")?).await
+        }
+        Some("get") => {
+            check_flags(rest, &IDENTITY_FLAGS)?;
+            get(parse_identity(rest)?).await
+        }
         Some("export") => export(parse_export(&args[1..])?).await,
         Some("feedback") => feedback(parse_feedback(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
@@ -78,6 +125,7 @@ fn parse_export(args: &[String]) -> Result<ExportArgs, BoxErr> {
         )
         .into());
     }
+    check_flags(args, &EXPORT_FLAGS)?;
     Ok(ExportArgs {
         identity: parse_identity(args)?,
         suite: flag(args, "--suite")?,
@@ -97,6 +145,7 @@ struct FeedbackArgs {
 }
 
 fn parse_feedback(args: &[String]) -> Result<FeedbackArgs, BoxErr> {
+    check_flags(args, &FEEDBACK_FLAGS)?;
     Ok(FeedbackArgs {
         namespace: flag(args, "--namespace")?,
         identity: parse_identity(args)?,

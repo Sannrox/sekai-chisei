@@ -20,14 +20,67 @@ pub fn usage() -> &'static str {
     "sekaictl admin model-review set --namespace <ns> --provider <id> --model <id> [--digest <digest>] --status <disallowed|reviewed|enabled|revoked> --reason <text> [--actor <principal>]\n  sekaictl admin model-review revoke --namespace <ns> --provider <id> --model <id> [--digest <digest>] --reason <text> [--actor <principal>]\n  sekaictl admin model-review list --namespace <ns>\n  sekaictl admin model-review family-set --namespace <ns> [--region <label>] --family <id> --status <disallowed|reviewed|enabled|revoked> --reason <text> [--actor <principal>]\n  sekaictl admin model-review family-revoke --namespace <ns> [--region <label>] --family <id> --reason <text> [--actor <principal>]\n  sekaictl admin model-review family-list --namespace <ns>\n  sekaictl admin model-review backfill"
 }
 
+const NAMESPACE_FLAGS: [&str; 1] = ["--namespace"];
+const MODEL_FLAGS: [&str; 6] = [
+    "--namespace",
+    "--provider",
+    "--model",
+    "--digest",
+    "--reason",
+    "--actor",
+];
+const MODEL_SET_FLAGS: [&str; 7] = [
+    "--namespace",
+    "--provider",
+    "--model",
+    "--digest",
+    "--reason",
+    "--actor",
+    "--status",
+];
+const FAMILY_FLAGS: [&str; 5] = ["--namespace", "--region", "--family", "--reason", "--actor"];
+const FAMILY_SET_FLAGS: [&str; 6] = [
+    "--namespace",
+    "--region",
+    "--family",
+    "--reason",
+    "--actor",
+    "--status",
+];
+
+/// Rejects unknown, repeated, or value-less flags before any field defaults.
+fn check_flags(args: &[String], known: &[&str]) -> Result<(), BoxErr> {
+    crate::value_flags::check_value_flags(args, known)
+        .map_err(|error| std::io::Error::other(error).into())
+}
+
 pub async fn run_model_review_command(args: Vec<String>) -> Result<(), BoxErr> {
+    let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
-        Some("set") => set(parse_set(&args[1..])?).await,
-        Some("revoke") => revoke(parse_model(&args[1..])?).await,
-        Some("list") => list(parse_namespace(&args[1..])?).await,
-        Some("family-set") => family_set(parse_family_set(&args[1..])?).await,
-        Some("family-revoke") => family_revoke(parse_family(&args[1..])?).await,
-        Some("family-list") => family_list(parse_namespace(&args[1..])?).await,
+        Some("set") => {
+            check_flags(rest, &MODEL_SET_FLAGS)?;
+            set(parse_set(rest)?).await
+        }
+        Some("revoke") => {
+            check_flags(rest, &MODEL_FLAGS)?;
+            revoke(parse_model(rest)?).await
+        }
+        Some("list") => {
+            check_flags(rest, &NAMESPACE_FLAGS)?;
+            list(parse_namespace(rest)?).await
+        }
+        Some("family-set") => {
+            check_flags(rest, &FAMILY_SET_FLAGS)?;
+            family_set(parse_family_set(rest)?).await
+        }
+        Some("family-revoke") => {
+            check_flags(rest, &FAMILY_FLAGS)?;
+            family_revoke(parse_family(rest)?).await
+        }
+        Some("family-list") => {
+            check_flags(rest, &NAMESPACE_FLAGS)?;
+            family_list(parse_namespace(rest)?).await
+        }
         Some("backfill") => backfill().await,
         _ => Err(std::io::Error::other(usage()).into()),
     }
@@ -362,6 +415,16 @@ mod tests {
         let parsed = parse_family(&args).unwrap();
         assert_eq!(parsed.region, "");
         assert_eq!(parsed.family, "hosted.acme");
+    }
+
+    #[test]
+    fn a_misspelled_digest_flag_is_refused_not_defaulted() {
+        let args = ["--namespace", "ns", "--digets", "sha256:abc"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let error = check_flags(&args, &MODEL_SET_FLAGS).unwrap_err();
+        assert!(error.to_string().contains("--digets"));
     }
 
     #[test]
