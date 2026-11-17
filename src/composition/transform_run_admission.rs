@@ -71,19 +71,24 @@ pub fn quota_gate(db: std::sync::Arc<RuntimeDb>) -> TenantQuotaGate {
     TenantQuotaGate::new(ChiseiStore::from_shared_runtime(db))
 }
 
+type BudgetLimitRows = Vec<(String, String, i64, String)>;
+
+/// A plane without budget tables has no tenant quota (`Ok(None)`). Every other
+/// store error propagates so admission refuses instead of running unmetered.
+fn budget_rows(result: Result<BudgetLimitRows, String>) -> Result<Option<BudgetLimitRows>, String> {
+    match result {
+        Ok(rows) => Ok(Some(rows)),
+        Err(error) if relation_missing(&error, "chisei_budget_limits") => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn configured_limits(
     db: &RuntimeDb,
     tenant_id: &str,
 ) -> Result<Option<TenantQuotaLimits>, String> {
-    let rows = match db.budget_limits_for_scope(&tenant_scope_id(tenant_id)) {
-        Ok(rows) => rows,
-        Err(error)
-            if error.contains("unavailable")
-                || relation_missing(&error, "chisei_budget_limits") =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let Some(rows) = budget_rows(db.budget_limits_for_scope(&tenant_scope_id(tenant_id)))? else {
+        return Ok(None);
     };
     let mut limits = TenantQuotaLimits::unlimited(1);
     let mut any = false;
@@ -316,6 +321,16 @@ mod tests {
         let db = RuntimeDb::Sqlite(std::sync::Arc::new(sqlite));
         let events = record_transform_usage(&db, "tenant-a", &run("run-1"), "local", 20).unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_budget_store_outage_refuses_instead_of_dropping_the_quota() {
+        // #2607: an error that merely mentions "unavailable" used to read as
+        // "no quota configured", so a database fault ran transforms unmetered.
+        let error = "connection pool unavailable: timed out".to_string();
+        assert_eq!(budget_rows(Err(error.clone())), Err(error));
+        let missing = "no such table: chisei_budget_limits".to_string();
+        assert_eq!(budget_rows(Err(missing)), Ok(None));
     }
 
     #[test]
