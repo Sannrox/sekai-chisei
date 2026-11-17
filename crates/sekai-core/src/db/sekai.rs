@@ -266,8 +266,41 @@ impl SekaiDb {
             source_index_derive,
             source_index_derive_lock_path,
         };
-        db.migrate_for_plane(schema_plane)?;
+        if persistent {
+            db.migrate_for_plane(schema_plane)?;
+        } else {
+            db.migrate_memory_from_image(schema_plane)?;
+        }
         Ok(db)
+    }
+
+    /// Brings a fresh in-memory database to the migrated schema. The first
+    /// open per plane migrates from scratch and keeps a copy; later opens
+    /// copy that image with SQLite's backup API instead of re-running every
+    /// migration (the suite opens thousands of these). Each database stays
+    /// its own connection, so none share rows.
+    fn migrate_memory_from_image(
+        &self,
+        plane: crate::db::schema_plane::SchemaPlane,
+    ) -> Result<(), String> {
+        static IMAGES: OnceLock<Mutex<HashMap<&'static str, Connection>>> = OnceLock::new();
+        let mut images = IMAGES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let copy = |from: &Connection, to: &mut Connection| -> Result<(), String> {
+            rusqlite::backup::Backup::new(from, to)
+                .and_then(|backup| backup.run_to_completion(256, Duration::ZERO, None))
+                .map_err(|error| format!("copy migrated in-memory schema: {error}"))
+        };
+        if let Some(image) = images.get(plane.as_str()) {
+            return copy(image, &mut self.conn());
+        }
+        self.migrate_for_plane(plane)?;
+        let mut image = Connection::open_in_memory().map_err(|error| error.to_string())?;
+        copy(&self.conn(), &mut image)?;
+        images.insert(plane.as_str(), image);
+        Ok(())
     }
 
     pub fn schema_plane(&self) -> crate::db::schema_plane::SchemaPlane {
@@ -2639,6 +2672,72 @@ fn row_to_link(row: &rusqlite::Row) -> rusqlite::Result<Link> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Schema objects and every table's row count, as one comparable value.
+    fn schema_and_rows(db: &SekaiDb) -> Vec<String> {
+        let conn = db.conn();
+        let objects: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut lines = Vec::new();
+        for (kind, name, sql) in objects {
+            lines.push(format!("{kind} {name} {sql:?}"));
+            if kind == "table" && !name.contains("_fts") {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                lines.push(format!("rows {name}={count}"));
+            }
+        }
+        lines
+    }
+
+    /// A copied in-memory image equals a database migrated from scratch, for
+    /// every plane, and two copies never share rows.
+    #[test]
+    fn in_memory_image_matches_a_scratch_migration_and_stays_isolated() {
+        use crate::db::schema_plane::SchemaPlane;
+        let dir = std::env::temp_dir().join(format!("sekai-image-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for plane in [SchemaPlane::Shared, SchemaPlane::Sekai, SchemaPlane::Chisei] {
+            let scratch = SekaiDb::open(
+                dir.join(format!("{}.db", plane.as_str())).to_str().unwrap(),
+                1,
+                None,
+                plane,
+            )
+            .unwrap();
+            let first = SekaiDb::open(":memory:", 1, None, plane).unwrap();
+            let copy = SekaiDb::open(":memory:", 1, None, plane).unwrap();
+            assert_eq!(
+                schema_and_rows(&copy),
+                schema_and_rows(&scratch),
+                "{plane:?}"
+            );
+            assert_eq!(
+                schema_and_rows(&first),
+                schema_and_rows(&scratch),
+                "{plane:?}"
+            );
+            let marked = |db: &SekaiDb| {
+                db.conn()
+                    .execute_batch("CREATE TABLE isolation_probe (id INTEGER)")
+                    .is_ok()
+            };
+            assert!(marked(&first));
+            assert!(marked(&copy), "{plane:?}: copies do not share a database");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use crate::sekai::security;
     use std::path::PathBuf;
 
