@@ -1,7 +1,7 @@
 //! Receipt persistence moved with `RuntimeDb` so Sekai admission can record events.
 
 use crate::db::chisei_receipt::{
-    open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+    WindowOrder, open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
 };
 use crate::db::sekai::SekaiDb;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -158,12 +158,47 @@ impl SekaiDb {
             .transpose()
     }
 
+    /// Receipts in the window, oldest start first.
     pub fn list_operation_receipts_in_window(
         &self,
         namespace: &str,
         start_timestamp_ms: i64,
         end_timestamp_ms: i64,
         limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        self.operation_receipts_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            limit,
+            WindowOrder::OldestFirst,
+        )
+    }
+
+    /// Receipts in the window, newest start first, so `limit` drops the oldest.
+    pub fn list_newest_operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        self.operation_receipts_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            limit,
+            WindowOrder::NewestFirst,
+        )
+    }
+
+    fn operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+        order: WindowOrder,
     ) -> Result<Vec<OperationReceipt>, String> {
         // Callers may pass max+1 to detect overflow; allow that sentinel.
         let limit = limit.min(5_001) as i64;
@@ -172,8 +207,9 @@ impl SekaiDb {
         // narrowing a window actually shrinks the result set.
         let open_min_started_at_ms = open_receipt_min_started_at_ms(start_timestamp_ms);
         let conn = self.conn();
+        let direction = order.sql();
         let mut statement = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT receipt_json FROM chisei_operation_receipts
                  WHERE namespace=?1
                    AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) < ?3
@@ -187,9 +223,9 @@ impl SekaiDb {
                        AND CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) >= ?5
                      )
                    )
-                 ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER), operation_id
+                 ORDER BY CAST(json_extract(receipt_json, '$.started_at_ms') AS INTEGER) {direction}, operation_id {direction}
                  LIMIT ?4",
-            )
+            ))
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(

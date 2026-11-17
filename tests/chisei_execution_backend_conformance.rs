@@ -9,9 +9,21 @@ use sekai_chisei::db::chisei_receipt::ChiseiReceiptBackend;
 use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
 use std::collections::BTreeMap;
 
-trait ReceiptHarness: ChiseiReceiptBackend {}
-impl ReceiptHarness for SekaiDb {}
-impl ReceiptHarness for PostgresDb {}
+trait ReceiptHarness: ChiseiReceiptBackend {
+    fn newest_in_window(&self, namespace: &str, limit: usize) -> Vec<OperationReceipt>;
+}
+impl ReceiptHarness for SekaiDb {
+    fn newest_in_window(&self, namespace: &str, limit: usize) -> Vec<OperationReceipt> {
+        self.list_newest_operation_receipts_in_window(namespace, 0, i64::MAX, limit)
+            .unwrap()
+    }
+}
+impl ReceiptHarness for PostgresDb {
+    fn newest_in_window(&self, namespace: &str, limit: usize) -> Vec<OperationReceipt> {
+        self.list_newest_operation_receipts_in_window(namespace, 0, i64::MAX, limit)
+            .unwrap()
+    }
+}
 
 fn intent_receipt(
     operation_id: &str,
@@ -184,6 +196,24 @@ fn exercise(db: &dyn ReceiptHarness, prefix: &str) {
         !db.reserve_gateway_request_alias(&format!("{prefix}-scope"), &lookup, "any", "any-op",)
             .unwrap()
     );
+    // #2541: a newest-first window read keeps the newest under its limit.
+    let window_ns = format!("{prefix}-window-ns");
+    for started in [1_000, 3_000, 2_000] {
+        let mut receipt = intent_receipt(
+            &format!("{prefix}-window-{started}"),
+            &window_ns,
+            BTreeMap::new(),
+        );
+        receipt.started_at_ms = started;
+        receipt.completed_at_ms = Some(started + 1);
+        db.put_operation_receipt(&receipt).unwrap();
+    }
+    let newest: Vec<i64> = db
+        .newest_in_window(&window_ns, 2)
+        .iter()
+        .map(|receipt| receipt.started_at_ms)
+        .collect();
+    assert_eq!(newest, [3_000, 2_000]);
 }
 
 #[test]

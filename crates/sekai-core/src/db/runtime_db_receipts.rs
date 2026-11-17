@@ -72,6 +72,33 @@ impl RuntimeDb {
         }
     }
 
+    /// Same window as [`Self::list_operation_receipts_in_window`], newest
+    /// start first, so `limit` drops the oldest receipts instead of the newest.
+    pub fn list_newest_operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_newest_operation_receipts_in_window(
+                namespace,
+                start_timestamp_ms,
+                end_timestamp_ms,
+                limit,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_newest_operation_receipts_in_window(
+                    namespace,
+                    start_timestamp_ms,
+                    end_timestamp_ms,
+                    limit,
+                )
+            }),
+        }
+    }
+
     pub fn update_operation_receipt<F>(
         &self,
         operation_id: &str,

@@ -16,6 +16,22 @@ pub fn open_receipt_min_started_at_ms(window_start_ms: i64) -> i64 {
     window_start_ms.saturating_sub(OPEN_OPERATION_RECEIPT_WINDOW_TTL_MS)
 }
 
+/// Start-time order of a windowed receipt read; the row limit keeps the head.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WindowOrder {
+    OldestFirst,
+    NewestFirst,
+}
+
+impl WindowOrder {
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::OldestFirst => "ASC",
+            Self::NewestFirst => "DESC",
+        }
+    }
+}
+
 /// Overlap for `[window_start_ms, window_end_ms)` used by both receipt stores.
 /// Completed receipts overlap when they close on or after the start.
 /// Open receipts overlap only while `started_at_ms` is still within the TTL
