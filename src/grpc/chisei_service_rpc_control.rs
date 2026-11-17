@@ -184,14 +184,7 @@ pub(super) async fn record_usage(
     req: Request<RecordUsageRequest>,
 ) -> Result<Response<RecordUsageResponse>, Status> {
     let actor = authenticated_actor(&req);
-    let trusted_accounting_principal =
-        matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
-            || service
-                .config
-                .gateway_receipt_principals
-                .iter()
-                .any(|principal| principal == &actor);
-    if !trusted_accounting_principal {
+    if !is_gateway_service_principal(&req, &service.config) {
         return Err(Status::permission_denied(
             "usage recording requires an authorized accounting principal",
         ));
