@@ -489,22 +489,7 @@ fn has_denial_since(
     type_id: &str,
     since_ms: i64,
 ) -> Result<bool, String> {
-    let mut offset = 0usize;
-    loop {
-        let page = db.list_action_instances_page(namespace, Some(type_id), None, 500, offset)?;
-        if page.is_empty() {
-            return Ok(false);
-        }
-        offset = offset.saturating_add(page.len());
-        for instance in page {
-            if instance.principal == principal
-                && instance.status == STATUS_DENIED
-                && instance.decided_at_ms >= since_ms
-            {
-                return Ok(true);
-            }
-        }
-    }
+    db.action_instance_decided_since(namespace, type_id, principal, STATUS_DENIED, since_ms)
 }
 
 fn ensure_revoke_receipt(
@@ -1098,6 +1083,55 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(revoked.revoke_reason, REASON_REJECTED);
+    }
+
+    #[test]
+    fn only_this_agents_denials_since_the_grant_count() {
+        let db = setup();
+        parked(&db, "agent:fixture", "dispatch", "old", DECISION_DENY, 10);
+        parked(&db, "agent:other", "dispatch", "other", DECISION_DENY, 50);
+        parked(
+            &db,
+            "agent:fixture",
+            "dispatch",
+            "granted",
+            DECISION_GRANT,
+            60,
+        );
+        assert!(!has_denial_since(&db, "acme", "agent:fixture", "dispatch", 30).unwrap());
+        assert!(has_denial_since(&db, "acme", "agent:fixture", "dispatch", 10).unwrap());
+        assert!(!has_denial_since(&db, "acme", "agent:fixture", "other-type", 0).unwrap());
+    }
+
+    /// The admission check is one probe of its index, so its cost does not
+    /// grow with the type's other Action instances.
+    #[test]
+    fn the_denial_check_probes_its_index() {
+        let RuntimeDb::Sqlite(db) = setup() else {
+            unreachable!("memory store is SQLite")
+        };
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::sekai::action_instance::SQLITE_ACTION_INSTANCE_DECIDED_SINCE
+            ))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(
+                rusqlite::params!["acme", "dispatch", "agent:x", "denied", 0],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|step| step.contains(
+                "USING COVERING INDEX idx_action_instances_principal_status_decided \
+                 (namespace=? AND type_id=? AND principal=? AND status=? AND decided_at_ms>?)"
+            )),
+            "{plan:?}"
+        );
     }
 
     #[test]

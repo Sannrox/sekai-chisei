@@ -127,6 +127,28 @@ impl PostgresDb {
         Ok(out)
     }
 
+    /// See `SekaiDb::action_instance_decided_since`.
+    pub fn action_instance_decided_since(
+        &self,
+        namespace: &str,
+        type_id: &str,
+        principal: &str,
+        status: &str,
+        since_ms: i64,
+    ) -> Result<bool, String> {
+        Ok(self
+            .connection()?
+            .query_one(
+                "SELECT EXISTS (
+                     SELECT 1 FROM sekai_action_instances
+                     WHERE namespace = $1 AND type_id = $2 AND principal = $3
+                       AND status = $4 AND decided_at_ms >= $5)",
+                &[&namespace, &type_id, &principal, &status, &since_ms],
+            )
+            .map_err(|e| e.to_string())?
+            .get(0))
+    }
+
     /// See `SekaiDb::list_action_instances_older_than`.
     pub fn list_action_instances_older_than(
         &self,
