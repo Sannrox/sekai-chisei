@@ -278,3 +278,225 @@ async fn rollback_refuses_an_index_backed_dataset() {
 fn postgres_rollback_refuses_an_index_backed_dataset() {
     on_postgres(exercise_rollback_refuses_index_backed_dataset);
 }
+
+/// Registers `kind` in `sales` as an object type indexed from `dataset_id`,
+/// and creates one object of it.
+async fn seed_dataset_backed_object(svc: &SekaiServiceImpl, kind: &str, dataset_id: &str) {
+    svc.create_schema_type(local(CreateSchemaTypeRequest {
+        r#type: Some(ObjectType {
+            kind: kind.into(),
+            properties: vec![PropertyDef {
+                name: "region".into(),
+                r#type: "string".into(),
+                classification: "public".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    svc.register_object_type_datasource(local(RegisterObjectTypeDatasourceRequest {
+        datasource: Some(ObjectTypeDatasource {
+            contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: kind.into(),
+            definition_digest: format!("sha256:{kind}-v1"),
+            dataset_id: dataset_id.into(),
+            key_column: "order_id".into(),
+            property_mapping: HashMap::from([("region".into(), "region".into())]),
+            ..Default::default()
+        }),
+        idempotency_key: format!("reg-{kind}"),
+    }))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: format!("{kind}-1"),
+            kind: kind.into(),
+            name: kind.into(),
+            namespace: "sales".into(),
+            external_id: format!("{kind}:1"),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+}
+
+fn seed_dataset(svc: &SekaiServiceImpl, id: &str, object_id: &str) {
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: id.into(),
+            name: id.into(),
+            columns: Vec::new(),
+            object_id: object_id.into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+}
+
+fn seed_transform(svc: &SekaiServiceImpl, id: &str, input: &str, output: &str) {
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform, TransformStep};
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "sales".into(),
+        transform_id: id.into(),
+        input_dataset_id: input.into(),
+        output_dataset_id: output.into(),
+        steps: vec![TransformStep {
+            kind: "project".into(),
+            column: String::new(),
+            op: String::new(),
+            value: String::new(),
+            columns: vec!["order_id".into()],
+        }],
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: None,
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    svc.db
+        .runtime()
+        .put_governed_transform(&transform, 10)
+        .unwrap();
+}
+
+async fn lineage_of(svc: &SekaiServiceImpl, object_id: &str) -> LineageResult {
+    svc.get_lineage(local(GetLineageRequest {
+        object_id: object_id.into(),
+        max_nodes: 0,
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .result
+    .unwrap()
+}
+
+/// `(kind, id, ephemeral)` per node, and `from>to` per edge.
+fn lineage_shape(result: &LineageResult) -> (Vec<(String, String, bool)>, Vec<String>) {
+    (
+        result
+            .nodes
+            .iter()
+            .map(|node| {
+                let object = node.object.as_ref().unwrap();
+                (object.kind.clone(), object.id.clone(), node.ephemeral)
+            })
+            .collect(),
+        result
+            .edges
+            .iter()
+            .map(|edge| format!("{}>{}", edge.from, edge.to))
+            .collect(),
+    )
+}
+
+/// GetLineage on a dataset-backed object reaches its dataset, the transform
+/// that writes it and that transform's input, or the source that lands a
+/// source-owned dataset. A dataset the caller may not read is left out
+/// without truncating the answer.
+async fn exercise_lineage_reaches_datasets(db: RuntimeDb) {
+    let svc = service_on(db);
+    seed_dataset(&svc, "ds-raw", "");
+    seed_dataset(&svc, "ds-orders", "");
+    seed_transform(&svc, "tf-orders", "ds-raw", "ds-orders");
+    seed_dataset_backed_object(&svc, "Order", "ds-orders").await;
+    let result = lineage_of(&svc, "Order-1").await;
+    let node = |kind: &str, id: &str, ephemeral| (kind.to_string(), id.to_string(), ephemeral);
+    assert_eq!(
+        lineage_shape(&result),
+        (
+            vec![
+                node("Order", "Order-1", false),
+                node("dataset", "dataset:sales/ds-orders", true),
+                node("transform", "transform:sales/tf-orders", true),
+                node("dataset", "dataset:sales/ds-raw", true),
+            ],
+            [
+                "Order-1>dataset:sales/ds-orders",
+                "dataset:sales/ds-orders>transform:sales/tf-orders",
+                "transform:sales/tf-orders>dataset:sales/ds-raw",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+    );
+    assert!(!result.truncated);
+
+    // The input dataset is bound to an object that does not exist, so the
+    // dataset read check refuses it.
+    seed_dataset(&svc, "ds-hidden", "missing-binding-object");
+    seed_dataset(&svc, "ds-returns", "");
+    seed_transform(&svc, "tf-returns", "ds-hidden", "ds-returns");
+    seed_dataset_backed_object(&svc, "Return", "ds-returns").await;
+    let result = lineage_of(&svc, "Return-1").await;
+    let (nodes, edges) = lineage_shape(&result);
+    assert_eq!(
+        nodes.last(),
+        Some(&node("transform", "transform:sales/tf-returns", true)),
+        "{nodes:?}"
+    );
+    assert!(edges.iter().all(|edge| !edge.contains("ds-hidden")));
+    assert!(!result.truncated);
+
+    let source_dataset = crate::db::source_batch_dataset::binding_dataset_id("bind-1", "Refund");
+    seed_dataset(&svc, &source_dataset, "");
+    seed_dataset_backed_object(&svc, "Refund", &source_dataset).await;
+    let (nodes, _) = lineage_shape(&lineage_of(&svc, "Refund-1").await);
+    assert_eq!(
+        nodes.last(),
+        Some(&node("source", "source:sales/bind-1", true)),
+        "{nodes:?}"
+    );
+
+    // A second object backed by the same dataset keeps its own edge to it.
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "Order-2".into(),
+            kind: "Order".into(),
+            name: "Order".into(),
+            namespace: "sales".into(),
+            external_id: "Order:2".into(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_link(&domain::Link {
+            id: "order-1-from-2".into(),
+            from_id: "Order-1".into(),
+            to_id: "Order-2".into(),
+            relation: "derived_from".into(),
+            created: 0,
+        })
+        .unwrap();
+    let (_, edges) = lineage_shape(&lineage_of(&svc, "Order-1").await);
+    assert!(
+        edges.contains(&"Order-2>dataset:sales/ds-orders".to_string()),
+        "{edges:?}"
+    );
+}
+
+#[tokio::test]
+async fn lineage_reaches_datasets() {
+    exercise_lineage_reaches_datasets(RuntimeDb::memory()).await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_lineage_reaches_datasets() {
+    on_postgres(exercise_lineage_reaches_datasets);
+}

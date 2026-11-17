@@ -39,7 +39,8 @@ fn walk_store(
             None => db.get_links(id, "", direction),
         },
         object,
-        |_| Ok(true),
+        |_, _| Ok(Vec::new()),
+        |_, _| Ok(true),
     )
 }
 
