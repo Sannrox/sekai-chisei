@@ -51,6 +51,32 @@ impl SekaiServiceImpl {
         if is_reserved_governance_kind(&scope.kind) {
             return Err(Status::not_found("object change subscription unavailable"));
         }
+        // Filters decide which objects a page names, so they are checked as
+        // the same filters on a listing would be.
+        if !scope.property_filters.is_empty() {
+            let schema = self
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
+            let queried = scope
+                .property_filters
+                .iter()
+                .map(|filter| filter.key.clone())
+                .collect::<Vec<_>>();
+            ensure_property_query_allowed(
+                &schema,
+                &principals,
+                tenant_context.as_ref(),
+                &scope.kind,
+                queried.clone(),
+            )?;
+            ensure_property_grant_query_allowed(
+                self.db.runtime(),
+                Some(&scope.namespace),
+                Some(&scope.kind),
+                queried,
+            )?;
+        }
         let domain_scope = ObjectChangeScope {
             namespace: scope.namespace.clone(),
             kind: scope.kind.clone(),

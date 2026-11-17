@@ -38370,3 +38370,50 @@ mod object_type_index_rpc_tests;
 
 #[path = "dataset_rpc_tests.rs"]
 mod dataset_rpc_tests;
+
+#[tokio::test]
+async fn object_change_subscription_refuses_restricted_property_filters() {
+    let svc = service();
+    let mut schema_type = widget_schema_type();
+    schema_type.properties.push(PropertyDef {
+        name: "secret_note".into(),
+        r#type: "string".into(),
+        required: false,
+        description: String::new(),
+        enum_values: Vec::new(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+        classification: "sensitive".into(),
+        struct_fields: Vec::new(),
+    });
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(schema_type),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let subscribe = |key: &str| {
+        svc.read_object_change_subscription(with_named_principal(
+            ReadObjectChangeSubscriptionRequest {
+                subscription_id: "widgets".into(),
+                scope: Some(ObjectChangeSubscriptionScope {
+                    namespace: "plant".into(),
+                    kind: "widget".into(),
+                    property_filters: vec![PropertyFilter {
+                        key: key.into(),
+                        op: "eq".into(),
+                        value: "launch code".into(),
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            "alice",
+        ))
+    };
+    let refused = subscribe("secret_note").await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    subscribe("name").await.unwrap();
+}

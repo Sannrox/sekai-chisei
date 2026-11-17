@@ -22,7 +22,9 @@ and does not move the cursor.
 `ReadObjectChangeSubscriptionResponse.authority` is always false. Events
 name object identity, op, and changed field. They do not carry source
 credentials or newly hidden values. Visibility loss emits `invalidate`
-without field names. Revoke with `revoke=true` to end delivery.
+without field names. A `create` is delivered only for an object the caller can
+read. Property filters pass the same restricted-property and property-grant
+query checks as a listing filter. Revoke with `revoke=true` to end delivery.
 
 ## Backpressure
 
