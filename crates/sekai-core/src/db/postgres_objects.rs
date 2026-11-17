@@ -6,7 +6,7 @@ use crate::domain::{
     Direction, Link, ListFilter, MAX_LIST_LIMIT, Object, PropertyFilter, excluded_kinds_sql,
     is_valid_property_key, storage_properties_json,
 };
-use crate::sekai::lineage::{LineageEdge, LineageNode, LineageResult};
+use crate::sekai::lineage::LineageResult;
 use crate::sekai::object_security::PrincipalPolicyContext;
 use postgres::IsolationLevel;
 
@@ -928,59 +928,14 @@ impl PostgresDb {
     }
 
     pub fn get_lineage(&self, object_id: &str, max_nodes: usize) -> Result<LineageResult, String> {
-        use std::collections::{HashSet, VecDeque};
-        let max = if max_nodes == 0 {
-            200
-        } else {
-            max_nodes.min(500)
-        };
         let start = self.get_object(object_id)?.ok_or("object not found")?;
-        let mut result = LineageResult::default();
-        let mut visited = HashSet::from([start.id.clone()]);
-        let mut queue = VecDeque::from([start.clone()]);
-        result.nodes.push(LineageNode {
-            role: lineage_role(&start.kind),
-            ephemeral: false,
-            object: start,
-        });
-        while let Some(object) = queue.pop_front() {
-            if result.nodes.len() >= max {
-                result.truncated = true;
-                break;
-            }
-            for direction in [Direction::Outgoing, Direction::Incoming] {
-                for link in self.get_links(&object.id, "", &direction)? {
-                    if !is_lineage_relation(&link.relation) {
-                        continue;
-                    }
-                    let target = match direction {
-                        Direction::Outgoing => &link.to_id,
-                        Direction::Incoming => &link.from_id,
-                    };
-                    if !visited.insert(target.clone()) {
-                        continue;
-                    }
-                    if let Some(object) = self.get_object(target)? {
-                        result.edges.push(LineageEdge {
-                            from: link.from_id,
-                            to: link.to_id,
-                            relation: link.relation,
-                        });
-                        result.nodes.push(LineageNode {
-                            role: lineage_role(&object.kind),
-                            ephemeral: false,
-                            object: object.clone(),
-                        });
-                        queue.push_back(object);
-                    }
-                    if result.nodes.len() >= max {
-                        result.truncated = true;
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(result)
+        sekai_types::lineage::walk_lineage(
+            start,
+            max_nodes,
+            |id, direction| self.get_links(id, "", direction),
+            |id| self.get_object(id),
+            |_| Ok(true),
+        )
     }
 
     pub fn get_lineage_with_policy_context(
@@ -989,63 +944,16 @@ impl PostgresDb {
         max_nodes: usize,
         context: &PrincipalPolicyContext,
     ) -> Result<LineageResult, String> {
-        use std::collections::{HashSet, VecDeque};
-        let max = if max_nodes == 0 {
-            200
-        } else {
-            max_nodes.min(500)
-        };
         let start = self
             .get_object_with_policy_context(object_id, context)?
             .ok_or("object not found")?;
-        let mut result = LineageResult::default();
-        let mut visited = HashSet::from([start.id.clone()]);
-        let mut queue = VecDeque::from([start.clone()]);
-        result.nodes.push(LineageNode {
-            role: lineage_role(&start.kind),
-            ephemeral: false,
-            object: start,
-        });
-        while let Some(object) = queue.pop_front() {
-            if result.nodes.len() >= max {
-                result.truncated = true;
-                break;
-            }
-            for direction in [Direction::Outgoing, Direction::Incoming] {
-                for link in
-                    self.get_links_with_policy_context(&object.id, "", &direction, context)?
-                {
-                    if !is_lineage_relation(&link.relation) {
-                        continue;
-                    }
-                    let target = match direction {
-                        Direction::Outgoing => &link.to_id,
-                        Direction::Incoming => &link.from_id,
-                    };
-                    if !visited.insert(target.clone()) {
-                        continue;
-                    }
-                    if let Some(object) = self.get_object_with_policy_context(target, context)? {
-                        result.edges.push(LineageEdge {
-                            from: link.from_id,
-                            to: link.to_id,
-                            relation: link.relation,
-                        });
-                        result.nodes.push(LineageNode {
-                            role: lineage_role(&object.kind),
-                            ephemeral: false,
-                            object: object.clone(),
-                        });
-                        queue.push_back(object);
-                    }
-                    if result.nodes.len() >= max {
-                        result.truncated = true;
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(result)
+        sekai_types::lineage::walk_lineage(
+            start,
+            max_nodes,
+            |id, direction| self.get_links_with_policy_context(id, "", direction, context),
+            |id| self.get_object_with_policy_context(id, context),
+            |_| Ok(true),
+        )
     }
 
     fn get_links_query(
@@ -1192,29 +1100,6 @@ fn escape_like_pattern(value: &str) -> String {
 
 fn postgres_numeric_predicate(expression: &str) -> String {
     format!("sekai_is_numeric_text({expression})")
-}
-
-fn lineage_role(kind: &str) -> String {
-    match kind {
-        "namespace" => "namespace",
-        "commit" => "commit",
-        "pull_request" => "pr",
-        _ => "other",
-    }
-    .into()
-}
-
-fn is_lineage_relation(relation: &str) -> bool {
-    matches!(
-        relation,
-        "contains"
-            | "produces"
-            | "targets"
-            | "executed"
-            | "depends_on"
-            | "evidence_for"
-            | "derived_from"
-    )
 }
 
 /// The one PostgreSQL insert path for `sekai_links`: inserts `link` unless its
