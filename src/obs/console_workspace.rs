@@ -11,8 +11,8 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::obs::console::{
     ConsoleSession, is_safe_namespace, list_accessible_namespaces, principal_can_access_namespace,
 };
+use crate::operation_report::causal_operation_view;
 use crate::operation_report::{ClaimState, OperationReport};
-use crate::report_cli::causal_operation_view;
 use crate::sekai::security::Role;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

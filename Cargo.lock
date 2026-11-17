@@ -1599,7 +1599,7 @@ dependencies = [
  "aes-gcm",
  "crc32fast",
  "rand 0.8.8",
- "sekai-keys 1.0.0 (git+https://github.com/Sannrox/sekai-chisei.git?rev=1b2e12789a2b360759a087252367cf4bc633caf0)",
+ "sekai-keys",
  "serde",
  "serde_json",
 ]
@@ -2998,18 +2998,6 @@ dependencies = [
  "rand 0.8.8",
  "serde",
  "serde_json",
- "zeroize",
-]
-
-[[package]]
-name = "sekai-keys"
-version = "1.0.0"
-source = "git+https://github.com/Sannrox/sekai-chisei.git?rev=1b2e12789a2b360759a087252367cf4bc633caf0#1b2e12789a2b360759a087252367cf4bc633caf0"
-dependencies = [
- "aes-gcm",
- "libc",
- "rand 0.8.8",
- "serde",
  "zeroize",
 ]
 

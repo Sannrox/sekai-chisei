@@ -2,6 +2,8 @@ use crate::chisei::receipt::OperationReceipt;
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
+// Re-exported at its pre-#2428 public path; operation_report owns it now.
+pub use crate::operation_report::causal_operation_view;
 use crate::operation_report::{ClaimState, OperationReport, OperationSummary};
 use std::path::PathBuf;
 
@@ -412,72 +414,6 @@ pub fn render_report(report: &OperationReport) -> String {
         }
     }
     out
-}
-
-/// Project the agent-facing causal path without claiming that an absent event
-/// occurred. Values come only from the authorized receipt projection.
-pub fn causal_operation_view(report: &OperationReport) -> Vec<(&'static str, String)> {
-    let attribute = |surface: &str, key: &str| {
-        report
-            .sections
-            .get(surface)
-            .and_then(|events| events.iter().find_map(|event| event.attributes.get(key)))
-            .cloned()
-    };
-    let has_surface = |surface: &str| report.sections.get(surface).is_some_and(|v| !v.is_empty());
-    let outcome = attribute("outcome", "outcome").unwrap_or_else(|| "not_reported".into());
-    let approval = attribute("approval", "decision")
-        .or_else(|| {
-            (outcome == "approval_required").then(|| {
-                let id = attribute("outcome", "approval_id").unwrap_or_else(|| "unknown".into());
-                format!("required:{id}")
-            })
-        })
-        .unwrap_or_else(|| "not_required_or_not_reported".into());
-    vec![
-        (
-            "discovered_catalog",
-            attribute("intent", "reported_catalog_version")
-                .unwrap_or_else(|| "not_reported".into()),
-        ),
-        (
-            "selected_capability",
-            attribute("intent", "capability").unwrap_or_else(|| "not_reported".into()),
-        ),
-        ("requested_operation", report.operation_id.clone()),
-        (
-            "policy_decision",
-            attribute("policy", "decision").unwrap_or_else(|| "not_reached".into()),
-        ),
-        ("approval_or_permit", approval),
-        (
-            "invocation",
-            if has_surface("attempt") || has_surface("action") {
-                "executed".into()
-            } else if outcome == "succeeded" {
-                "completed_by_native_rpc".into()
-            } else {
-                "not_executed".into()
-            },
-        ),
-        (
-            "action_or_evidence",
-            if has_surface("action") || has_surface("artifact") {
-                "recorded".into()
-            } else {
-                "not_reported".into()
-            },
-        ),
-        (
-            "verification",
-            if has_surface("verification") {
-                "recorded".into()
-            } else {
-                "not_reported".into()
-            },
-        ),
-        ("outcome", outcome),
-    ]
 }
 
 fn claim(state: &ClaimState) -> &'static str {

@@ -2059,6 +2059,24 @@ fn spawn_admission_reconciler(
     });
 }
 
+/// Archive only when the restore fence admits the mutation. `dry_run` skips
+/// the fence because it writes nothing. The retention tick below and
+/// `sekaictl admin retention run` share it.
+pub(crate) fn archive_admitted(
+    db: &RuntimeDb,
+    stores: &CombinedStoreLayout,
+    now: i64,
+    dry_run: bool,
+    skip_if_busy: bool,
+) -> Result<crate::sekai::retention::ArchiveRun, String> {
+    crate::db::postgres::off_runtime(|| {
+        if !dry_run {
+            crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
+        }
+        db.archive_retained_records_locked(now, dry_run, skip_if_busy)
+    })
+}
+
 /// Run retention on a schedule (#1987, ADR 0129). PostgreSQL elects one
 /// replica per tick (`pg_try_advisory_lock`); others skip. Operator
 /// `sekaictl admin retention run` waits on the same lock. SQLite's writer
@@ -2074,7 +2092,7 @@ fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
             let db = db.clone();
             let stores = stores.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::retention_cli::archive_admitted(
+                archive_admitted(
                     &db,
                     &stores,
                     chrono::Utc::now().timestamp_millis(),
