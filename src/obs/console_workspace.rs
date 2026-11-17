@@ -26,8 +26,8 @@ pub const WORKSPACE_INITIAL_LOAD_BUDGET_MS: u128 = 2_000;
 /// Max operations returned on the namespace operations home.
 pub const OPERATIONS_LIST_LIMIT: usize = 50;
 
-/// Most receipts one list request reads before filtering to what the caller
-/// may view: the store's per-query maximum. Reading only `OPERATIONS_LIST_LIMIT`
+/// Most receipts one list request reads, newest start first, before filtering
+/// to what the caller may view: the store's per-query maximum. Reading only `OPERATIONS_LIST_LIMIT`
 /// would let other principals' receipts crowd out the caller's own. A window
 /// holding more than this many receipts can still hide the caller's oldest
 /// ones; the list is a recent-activity view, not an audit export.
@@ -168,7 +168,7 @@ pub fn list_visible_operations(
     let start = now_ms.saturating_sub(OPERATIONS_LIST_WINDOW_MS);
     let end = now_ms.saturating_add(1);
     let receipts = db
-        .list_operation_receipts_in_window(namespace, start, end, OPERATIONS_LIST_SCAN_LIMIT)
+        .list_newest_operation_receipts_in_window(namespace, start, end, OPERATIONS_LIST_SCAN_LIMIT)
         .map_err(|_| WorkspaceError::Internal)?;
     Ok(receipts
         .into_iter()
@@ -575,18 +575,21 @@ mod tests {
             receipt.started_at_ms = base + index;
             db.put_operation_receipt(&receipt).unwrap();
         }
-        // Newer than every one of alice's receipts, so a limit applied
+        // Older than every one of alice's receipts, so a limit applied
         // before the visibility filter would never reach it.
         let mut bobs = sample_receipt("alpha", "op-bob", "bob");
-        bobs.started_at_ms = base + 1_000;
+        bobs.started_at_ms = base - 1_000;
         db.put_operation_receipt(&bobs).unwrap();
 
         let bob_list = list_visible_operations(&db, "bob", "alpha").unwrap();
         assert_eq!(bob_list.len(), 1);
         assert_eq!(bob_list[0].operation_id, "op-bob");
 
+        // #2541: past the limit, the caller sees their newest receipts.
         let alice_list = list_visible_operations(&db, "alice", "alpha").unwrap();
         assert_eq!(alice_list.len(), OPERATIONS_LIST_LIMIT);
+        let newest = format!("op-alice-{:03}", OPERATIONS_LIST_LIMIT + 10);
+        assert_eq!(alice_list[0].operation_id, newest);
     }
 
     #[test]

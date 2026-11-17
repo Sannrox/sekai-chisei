@@ -1,7 +1,7 @@
 //! PostgreSQL receipt persistence used by `RuntimeDb`.
 
 use crate::db::chisei_receipt::{
-    open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+    WindowOrder, open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
 };
 use crate::db::postgres::PostgresDb;
 use postgres::GenericClient;
@@ -219,12 +219,47 @@ impl PostgresDb {
             .transpose()
     }
 
+    /// Receipts in the window, oldest start first.
     pub fn list_operation_receipts_in_window(
         &self,
         namespace: &str,
         start_timestamp_ms: i64,
         end_timestamp_ms: i64,
         limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        self.operation_receipts_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            limit,
+            WindowOrder::OldestFirst,
+        )
+    }
+
+    /// Receipts in the window, newest start first, so `limit` drops the oldest.
+    pub fn list_newest_operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<OperationReceipt>, String> {
+        self.operation_receipts_in_window(
+            namespace,
+            start_timestamp_ms,
+            end_timestamp_ms,
+            limit,
+            WindowOrder::NewestFirst,
+        )
+    }
+
+    fn operation_receipts_in_window(
+        &self,
+        namespace: &str,
+        start_timestamp_ms: i64,
+        end_timestamp_ms: i64,
+        limit: usize,
+        order: WindowOrder,
     ) -> Result<Vec<OperationReceipt>, String> {
         // Callers may pass max+1 to detect overflow; allow that sentinel.
         let limit = i64::try_from(limit.min(5_001)).unwrap_or(5_001);
@@ -234,7 +269,8 @@ impl PostgresDb {
         let rows = self
             .connection()?
             .query(
-                "SELECT receipt_json FROM chisei_operation_receipts
+                &format!(
+                    "SELECT receipt_json FROM chisei_operation_receipts
                  WHERE namespace=$1
                    AND ((receipt_json::jsonb->>'started_at_ms')::bigint) < $3
                    AND (
@@ -247,8 +283,10 @@ impl PostgresDb {
                        AND ((receipt_json::jsonb->>'started_at_ms')::bigint) >= $5
                      )
                    )
-                 ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint), operation_id
+                 ORDER BY ((receipt_json::jsonb->>'started_at_ms')::bigint) {direction}, operation_id {direction}
                  LIMIT $4",
+                    direction = order.sql()
+                ),
                 &[
                     &namespace,
                     &start_timestamp_ms,
