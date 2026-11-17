@@ -3,9 +3,10 @@
 use super::*;
 use crate::sekai::event_subscription::SUBSCRIBE_UNAVAILABLE;
 use crate::sekai::object_change_subscription::{
-    ObjectChangeReadRequest, ObjectChangeScope, authorization_pin, object_matches_filters,
-    read_object_change_subscription_with_resolved_objects,
+    ObjectChangeReadRequest, ObjectChangeScope, ReaderVisibility, authorization_pin,
+    object_matches_filters, read_object_change_subscription_for_reader,
 };
+use std::collections::BTreeSet;
 
 impl SekaiServiceImpl {
     pub(super) async fn read_visible_object_change_subscription(
@@ -92,11 +93,16 @@ impl SekaiServiceImpl {
                 .collect(),
         };
         let scope_filter = domain_scope.clone();
-        let activation_id = self
+        let activation = self
             .db
             .runtime()
             .get_object_security_activation(&domain_scope.namespace)
-            .map_err(|_| Status::unavailable("object authorization unavailable"))?
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
+        // Deleted objects cannot be re-evaluated, so their deletes follow the
+        // deleted-history rule of ListObjectChanges: activated namespaces and
+        // tenant callers fail closed, otherwise the object ACL decides.
+        let deletes_readable = activation.is_none() && tenant_context.is_none();
+        let activation_id = activation
             .map(|activation| activation.activation_id)
             .unwrap_or_else(|| "legacy".into());
         let pin = authorization_pin(&activation_id, &principals)
@@ -107,9 +113,9 @@ impl SekaiServiceImpl {
         let mut visible = Vec::new();
         // Objects are resolved by the ids the change feed names, so a pinned or
         // changed object is checked on its own, never cut off by a listing page.
-        // One that is unreadable or outside the scope's filters stays out and
-        // its change reads as an invalidation.
-        let page = read_object_change_subscription_with_resolved_objects(
+        // One outside the scope's filters reads as an invalidation; a change to
+        // one the caller may not read restarts the subscription unnamed.
+        let page = read_object_change_subscription_for_reader(
             self.db.runtime(),
             &actor,
             &ObjectChangeReadRequest {
@@ -123,7 +129,7 @@ impl SekaiServiceImpl {
             },
             now_ms,
             &mut visible,
-            |object_ids| {
+            |object_ids, deleted_ids| {
                 self.resolve_visible_changed_objects(
                     object_ids,
                     &scope_filter,
@@ -133,6 +139,22 @@ impl SekaiServiceImpl {
                     tenant_context.as_ref(),
                     &mut recorded_purposes,
                 )
+                .map(|(visible, readable_ids)| {
+                    let readable_deletes = deleted_ids
+                        .iter()
+                        .filter(|id| {
+                            deletes_readable && check_read(&self.security, id, &principals).is_ok()
+                        })
+                        .cloned()
+                        .collect();
+                    (
+                        visible,
+                        ReaderVisibility {
+                            readable_ids,
+                            readable_deletes,
+                        },
+                    )
+                })
                 .map_err(|status| {
                     resolver_error = Some(status);
                     "object change objects unavailable".to_string()
@@ -177,7 +199,8 @@ impl SekaiServiceImpl {
 impl SekaiServiceImpl {
     /// The objects among `object_ids` in `scope` that `principals` may read
     /// and that match its property filters, checked one by one as listings
-    /// check them. Objects stay raw, as change projection reads them.
+    /// check them, and the ids of every readable one, in the filters or not.
+    /// Objects stay raw, as change projection reads them.
     #[allow(clippy::too_many_arguments)]
     fn resolve_visible_changed_objects(
         &self,
@@ -188,7 +211,7 @@ impl SekaiServiceImpl {
         purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
         tenant_context: Option<&RequestEnterpriseContext>,
         recorded_purposes: &mut HashSet<(String, String)>,
-    ) -> Result<Vec<domain::Object>, Status> {
+    ) -> Result<(Vec<domain::Object>, BTreeSet<String>), Status> {
         let principal_refs = principals.iter().map(String::as_str).collect::<Vec<_>>();
         let objects = self
             .db
@@ -196,14 +219,12 @@ impl SekaiServiceImpl {
             .list_objects_by_ids_with_policy_context(object_ids, &principal_refs, policy_context)
             .map_err(Status::internal)?;
         let mut visible = Vec::with_capacity(objects.len());
+        let mut readable = BTreeSet::new();
         for object in objects {
-            if object.namespace != scope.namespace
-                || object.kind != scope.kind
-                || !object_matches_filters(scope, &object)
-            {
+            if object.namespace != scope.namespace || object.kind != scope.kind {
                 continue;
             }
-            if object_passes_read_checks(
+            if !object_passes_read_checks(
                 self.db.runtime(),
                 &object,
                 principals,
@@ -211,10 +232,14 @@ impl SekaiServiceImpl {
                 tenant_context,
                 recorded_purposes,
             )? {
+                continue;
+            }
+            readable.insert(object.id.clone());
+            if object_matches_filters(scope, &object) {
                 visible.push(object);
             }
         }
-        Ok(visible)
+        Ok((visible, readable))
     }
 }
 
@@ -413,6 +438,75 @@ mod tests {
 
         let revoked = read(&svc, &first.snapshot_revision, true, "").await;
         assert_eq!(revoked.outcome, OUTCOME_REVOKED);
+    }
+
+    #[tokio::test]
+    async fn changes_to_objects_the_reader_may_not_read_name_nothing() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        for id in ["c-eu", "c-secret"] {
+            svc.create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(proto_customer(id, id, "eu")),
+                    lease_precondition: None,
+                },
+                "root",
+            ))
+            .await
+            .unwrap();
+        }
+        let grant = security::Grant {
+            id: "c-secret-bob".into(),
+            object_id: "c-secret".into(),
+            principal: "bob".into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+        let snapshot = read(&svc, "", false, "").await.snapshot_revision;
+        read(&svc, &snapshot, false, "").await;
+
+        // The ACL keeps the namespace's members out; the owner writes directly.
+        let mut hidden = svc.db.runtime().get_object("c-secret").unwrap().unwrap();
+        hidden.properties.insert("tier".into(), "gold".into());
+        svc.db
+            .runtime()
+            .update_object_with_audit(&hidden, "bob")
+            .unwrap();
+        let restarted = read(&svc, &snapshot, false, "").await;
+        assert_eq!(restarted.outcome, OUTCOME_RESNAPSHOT);
+        assert!(restarted.events.is_empty());
+
+        // The deleted object keeps its ACL, so its delete names nothing either;
+        // a readable object's delete is still delivered.
+        let snapshot = restarted.snapshot_revision;
+        assert_eq!(read(&svc, &snapshot, false, "").await.outcome, OUTCOME_PAGE);
+        svc.delete_object(with_named_principal(
+            DeleteObjectRequest {
+                id: "c-eu".into(),
+                lease_precondition: None,
+            },
+            "alice",
+        ))
+        .await
+        .unwrap();
+        svc.db
+            .runtime()
+            .delete_object_with_audit("c-secret", "bob")
+            .unwrap();
+        let refused = read(&svc, &snapshot, false, "").await;
+        assert_eq!(refused.outcome, OUTCOME_RESNAPSHOT);
+        assert!(refused.events.is_empty());
+        svc.security.remove_grant("c-secret", "bob");
+        let page = read(&svc, &snapshot, false, "").await;
+        let ops: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| (event.object_id.as_str(), event.op.as_str()))
+            .collect();
+        assert_eq!(ops, [("c-eu", OP_DELETE), ("c-secret", OP_DELETE)]);
     }
 
     #[tokio::test]
