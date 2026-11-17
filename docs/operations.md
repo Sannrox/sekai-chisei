@@ -201,6 +201,10 @@ reports the full chain on either backend. See
   `sekaictl admin gateway key create`. Control-plane
   `sekaictl admin access credential create`
   tokens are for gRPC principals, not gateway HTTP keys.
+- `gateway setup` does not enable models for route admission, which denies
+  any model that model review has not enabled. Run
+  `sekaictl admin model-review backfill` once after setup to enable the models
+  its policies allow, or enable a family with `model-review family-set`.
 - Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
   `GATEWAY_KEYS` entry and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
   Startup fails closed if those gates are missing.
