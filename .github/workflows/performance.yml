@@ -1,10 +1,13 @@
 name: Performance
 
-# Adoption workloads stay on the weekly schedule. Object-path workloads also
-# run a wide-budget smoke subset on pull requests (#1437) that change a
-# non-docs path (#2571).
+# Adoption and object-path matrices stay on the weekly schedule and manual
+# dispatch. The wide-budget object-path smoke (#1437) also runs on each push
+# to main that changes a non-docs path (#2571). It moved off pull requests
+# (#2575): it never failed there, and a gross regression still shows on the
+# merge that caused it.
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths-ignore:
       - "docs/**"
       - "*.md"
@@ -53,7 +56,7 @@ jobs:
 
   benchmark:
     name: Benchmark matrix
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -101,7 +104,7 @@ jobs:
 
   object-path:
     name: Object-path matrix
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

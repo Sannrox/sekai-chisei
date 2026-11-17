@@ -1,11 +1,11 @@
 {
   "contract_version": "sekai.performance-manifest/v1",
   "fixture_version": "sekai.object-path-smoke/v1",
-  "description": "PR smoke subset of object-path workloads with wide budgets.",
+  "description": "Smoke subset of object-path workloads with wide budgets.",
   "workloads": [
     {
       "id": "get_object_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -25,7 +25,7 @@
     },
     {
       "id": "list_page_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -45,7 +45,7 @@
     },
     {
       "id": "evaluate_object_set_filter_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -65,7 +65,7 @@
     },
     {
       "id": "evaluate_object_set_sort_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -85,7 +85,7 @@
     },
     {
       "id": "evaluate_object_set_one_hop_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -105,7 +105,7 @@
     },
     {
       "id": "evaluate_object_set_two_hop_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -125,7 +125,7 @@
     },
     {
       "id": "action_apply_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -145,7 +145,7 @@
     },
     {
       "id": "policy_checked_read_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 32,
       "concurrency": 1,
@@ -165,7 +165,7 @@
     },
     {
       "id": "apply_source_batch_grpc_sqlite_smoke",
-      "description": "PR smoke subset of object-path gRPC workloads.",
+      "description": "Smoke subset of object-path gRPC workloads.",
       "category": "object_smoke",
       "dataset_size": 100,
       "concurrency": 1,

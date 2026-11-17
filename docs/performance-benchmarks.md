@@ -64,8 +64,8 @@ CreateObject, UpdateObject, EvaluateObjectSet (filter, sort, one-hop, two-hop),
 Action apply, policy-checked reads, and ApplySourceBatch through the gRPC
 handlers on SQLite and PostgreSQL at 10⁴ and 10⁵ objects (batch sizes 100 and
 1000 for ApplySourceBatch). PostgreSQL rows run when
-`SEKAI_BENCH_POSTGRES_URL` is set. Local and pull-request smoke skip those
-rows when the URL is unset. The scheduled object-path job starts an ephemeral
+`SEKAI_BENCH_POSTGRES_URL` is set. Local runs and the smoke skip those rows
+when the URL is unset. The scheduled object-path job starts an ephemeral
 TLS PostgreSQL through `scripts/object-path-with-postgres.sh` and fails if
 every postgres workload was dropped.
 
@@ -77,8 +77,9 @@ Published SQLite runner-class budgets:
 - policy-checked read overhead ≤ 20% over unrestricted GetObject
 - ApplySourceBatch ≥ 2 000 records/s
 
-`.github/workflows/performance.yml` runs a wide-budget smoke subset on pull
-requests (`benchmarks/manifest-object-path-smoke-v1.json`). The scheduled
+`.github/workflows/performance.yml` runs a wide-budget smoke subset
+(`benchmarks/manifest-object-path-smoke-v1.json`) on each push to `main` that
+changes a non-docs path, weekly, and on manual dispatch. The scheduled
 object-path job repeats the full matrix three times and fails on a >20% p95
 regression against `benchmarks/baseline-github-ubuntu-latest-object-path.json`.
 That file starts with empty `results`; `MissingFromBaseline` is not a
