@@ -361,8 +361,13 @@ pub(super) fn base_url_for_provider(
     }
 }
 /// Maps a client request path to (client provider by wire shape, upstream path).
+/// Returns `None` for an unknown route and for a suffix that could make the
+/// provider resolve a different endpoint than the route the gateway admitted.
 pub(super) fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
     let path = uri.path();
+    if !forwardable_path(path) {
+        return None;
+    }
     let openai = ProviderKind::OpenAi(OpenAiRuntime::OpenAi);
     let mapped = if matches!(path, "/v1/responses" | "/v1/responses/") {
         (openai, path.trim_start_matches("/v1").to_string())
@@ -372,9 +377,14 @@ pub(super) fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
         (openai, format!("/chat/completions{rest}"))
     } else if let Some(rest) = path.strip_prefix("/chat/completions") {
         (openai, format!("/chat/completions{rest}"))
-    } else if let Some(rest) = path.strip_prefix("/v1/models") {
-        (openai, format!("/models{rest}"))
-    } else if let Some(rest) = path.strip_prefix("/models") {
+    } else if let Some(rest) = path
+        .strip_prefix("/v1/models")
+        .or_else(|| path.strip_prefix("/models"))
+    {
+        // Model listing or one model id; nothing deeper reaches the provider.
+        if !(rest.is_empty() || rest.strip_prefix('/').is_some_and(|id| !id.contains('/'))) {
+            return None;
+        }
         (openai, format!("/models{rest}"))
     } else if let Some(rest) = path.strip_prefix("/v1/messages/count_tokens") {
         (
@@ -393,6 +403,16 @@ pub(super) fn upstream_path(uri: &Uri) -> Option<(ProviderKind, String)> {
         (ProviderKind::Anthropic, format!("/messages{rest}"))
     };
     Some(mapped)
+}
+/// A client path the gateway may forward: no `.` or `..` segment, no backslash,
+/// and no percent-encoded `.`, `/` or `\` that the provider could decode into one.
+fn forwardable_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    !path.contains('\\')
+        && !["%2e", "%2f", "%5c"]
+            .iter()
+            .any(|encoded| lower.contains(encoded))
+        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
 }
 pub(super) fn build_upstream_url(base_url: &str, upstream_path: &str, uri: &Uri) -> String {
     let mut url = format!("{}{}", base_url.trim_end_matches('/'), upstream_path);

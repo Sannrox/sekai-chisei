@@ -221,6 +221,28 @@ fn profile_rejects_unenforced_idempotency_keys() {
 }
 
 #[test]
+fn upstream_path_refuses_suffixes_that_leave_the_route() {
+    for path in [
+        "/v1/models/../files",
+        "/v1/models/%2E%2E/files",
+        "/v1/models/a%2Fb",
+        "/v1/chat/completions/../../files",
+        "/v1/messages/.%2e/batches",
+        "/v1/messages\\..\\files",
+    ] {
+        let uri: Uri = path.parse().unwrap();
+        assert!(upstream_path(&uri).is_none(), "{path}");
+    }
+    for (path, upstream) in [
+        ("/v1/models", "/models"),
+        ("/v1/models/llama3:8b", "/models/llama3:8b"),
+    ] {
+        let uri: Uri = path.parse().unwrap();
+        assert_eq!(upstream_path(&uri).unwrap().1, upstream);
+    }
+}
+
+#[test]
 fn capability_preflight_rejects_unsupported_paths() {
     assert!(is_responses_create(&Method::POST, "/responses"));
     assert!(is_responses_create(&Method::POST, "/responses/"));
@@ -3799,7 +3821,7 @@ async fn models_proxy_forwards_to_openai_upstream() {
         .send()
         .await
         .unwrap();
-    assert_eq!(prefixed_body.status(), StatusCode::FORBIDDEN);
+    assert_eq!(prefixed_body.status(), StatusCode::NOT_FOUND);
 
     let metadata_body = reqwest::Client::new()
         .get(format!("{gateway_base}/models/gpt-5.5"))
@@ -3811,6 +3833,20 @@ async fn models_proxy_forwards_to_openai_upstream() {
         .await
         .unwrap();
     assert_eq!(metadata_body.status(), StatusCode::FORBIDDEN);
+
+    // A models suffix that the provider could resolve to another endpoint never
+    // leaves the gateway with its credential.
+    for path in ["/v1/models/%2e%2e%2ffiles", "/v1/models/gpt-5.5/files"] {
+        let escaped = reqwest::Client::new()
+            .get(format!("{gateway_base}{path}"))
+            .bearer_auth("sk-chisei-codex-app")
+            .header("x-chisei-data-class", "unclassified")
+            .header("x-chisei-action-risk", "low")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(escaped.status(), StatusCode::NOT_FOUND, "{path}");
+    }
 
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 2);
