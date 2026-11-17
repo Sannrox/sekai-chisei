@@ -15294,6 +15294,26 @@ async fn action_policy_set_rejects_invalid_decision() {
 }
 
 #[tokio::test]
+async fn action_policy_set_rejects_override_names_the_encoding_cannot_keep() {
+    let svc = service();
+    grant_action_admin(&svc);
+    for name in ["a:allow,b", " padded", ""] {
+        let err = svc
+            .set_action_policy(with_principal(SetActionPolicyRequest {
+                policy: Some(ActionPolicy {
+                    scope: "agent:codex-app".into(),
+                    default_decision: "deny".into(),
+                    action_overrides: [(name.to_string(), "deny".to_string())].into(),
+                    ..Default::default()
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "name {name:?}");
+    }
+}
+
+#[tokio::test]
 async fn scoring_writer_records_private_typed_learning_and_retries_idempotently() {
     let svc = service();
     let namespace_id = seed_scoring_namespace(&svc, "acme");

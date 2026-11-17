@@ -183,7 +183,9 @@ impl ActionPolicy {
         let mut action_overrides = HashMap::new();
         if let Some(raw) = properties.get("action_overrides") {
             for pair in raw.split(',').filter(|token| !token.trim().is_empty()) {
-                let Some((name, decision)) = pair.split_once(':') else {
+                // Decision tokens never contain ':', so split at the last one;
+                // an action name may itself contain ':'.
+                let Some((name, decision)) = pair.rsplit_once(':') else {
                     return Err(format!(
                         "action policy {scope:?} has unparsable action override"
                     ));
@@ -292,4 +294,23 @@ pub fn action_policy_id(scope: &str) -> String {
 
 pub fn action_policy_external_id(scope: &str) -> String {
     format!("{ACTION_POLICY_KIND}:{scope}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_override_name_with_colon_round_trips() {
+        let policy = ActionPolicy {
+            scope: "s".into(),
+            default_decision: ActionDecision::Deny,
+            action_overrides: HashMap::from([("object:delete".to_string(), ActionDecision::Deny)]),
+            risk_overrides: HashMap::new(),
+            max_mutations_per_work_unit: None,
+            max_deletes_per_work_unit: None,
+        };
+        let read = ActionPolicy::from_properties("s", &policy.to_properties()).unwrap();
+        assert_eq!(read.action_overrides, policy.action_overrides);
+    }
 }
