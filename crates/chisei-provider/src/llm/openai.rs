@@ -129,7 +129,7 @@ impl Provider for OpenAI {
 
         let stream = resp.bytes_stream();
         Ok(Box::pin(async_stream::stream! {
-            let mut buffer = String::new();
+            let mut frames = super::SseFrames::default();
             let mut content = String::new();
             let mut input_tokens = 0;
             let mut output_tokens = 0;
@@ -155,12 +155,8 @@ impl Provider for OpenAI {
                     ));
                     return;
                 }
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(index) = buffer.find("\n\n") {
-                    let event = buffer[..index].to_string();
-                    // Drain in place so many small SSE frames do not copy the
-                    // unread tail into a fresh String on every event boundary.
-                    buffer.drain(..index + 2);
+                frames.push(&bytes);
+                while let Some(event) = frames.next_event() {
                     let parsed = parse_openai_sse_event(
                         &event,
                         &mut content,
@@ -182,6 +178,7 @@ impl Provider for OpenAI {
                     }
                 }
             }
+            let buffer = frames.tail();
             if !buffer.trim().is_empty() {
                 // A non-empty unread tail after the byte stream ends is only
                 // acceptable when it is itself a complete terminal frame
