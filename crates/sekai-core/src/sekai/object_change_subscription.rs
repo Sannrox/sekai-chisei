@@ -591,6 +591,11 @@ pub fn project_events(
     let mut offset = prior_offset;
     let pinned: BTreeSet<&str> = scope.object_ids.iter().map(String::as_str).collect();
     let visible_ids: BTreeSet<&str> = visible.iter().map(|object| object.id.as_str()).collect();
+    let deleted_ids: BTreeSet<&str> = mutations
+        .iter()
+        .filter(|mutation| mutation.change.field == "_deleted")
+        .map(|mutation| mutation.change.object_id.as_str())
+        .collect();
     for mutation in mutations {
         if !pinned.is_empty() && !pinned.contains(mutation.change.object_id.as_str()) {
             continue;
@@ -612,6 +617,13 @@ pub fn project_events(
         if let Some(object) = live
             && !object_matches_filters(scope, object)
             && mutation.change.field != "_deleted"
+        {
+            continue;
+        }
+        // A live object the caller cannot see was never theirs to learn of.
+        if mutation.change.field == "_created"
+            && !visible_ids.contains(mutation.change.object_id.as_str())
+            && !deleted_ids.contains(mutation.change.object_id.as_str())
         {
             continue;
         }
@@ -1184,6 +1196,30 @@ mod tests {
             .unwrap();
         assert_eq!(hidden_event.op, OP_INVALIDATE);
         assert!(hidden_event.field.is_empty());
+    }
+
+    #[test]
+    fn creates_of_live_hidden_objects_are_not_delivered() {
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read(&runtime, &revision, &["c-eu"], 20, false, "");
+        runtime
+            .create_object_with_audit(&customer("c-hidden", "Hidden", "eu", 21), "alice")
+            .unwrap();
+        runtime
+            .create_object_with_audit(&customer("c-seen", "Seen", "eu", 22), "alice")
+            .unwrap();
+        let page = read(&runtime, &revision, &["c-eu", "c-seen"], 23, false, "");
+        let ids: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| (event.object_id.as_str(), event.op.as_str()))
+            .collect();
+        assert_eq!(ids, [("c-seen", OP_CREATE)]);
     }
 
     #[test]
