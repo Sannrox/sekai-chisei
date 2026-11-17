@@ -387,6 +387,7 @@ fn finish_authenticated_audited(
     req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
     enterprise_scoped: bool,
+    source: IdentitySource,
     actor_rate_gate: &crate::chisei::actor_limit::ActorRateGate,
 ) -> Result<Request<()>, Status> {
     let guest = authenticated_context
@@ -399,7 +400,7 @@ fn finish_authenticated_audited(
     if let Some(chain) = authenticated_context.actor_chain() {
         actor_rate_gate.admit(&chain).map_err(actor_rate_status)?;
     }
-    let result = finish_authenticated(req, authenticated_context, enterprise_scoped);
+    let result = finish_authenticated(req, authenticated_context, enterprise_scoped, source);
     if let (Some(context), Err(_)) = (&guest, &result) {
         let _ = record_guest_access(db, context, &rpc, "rpc", false);
     }
@@ -547,6 +548,7 @@ fn finish_authenticated(
     mut req: Request<()>,
     authenticated_context: crate::enterprise::AuthenticatedContext,
     enterprise_scoped: bool,
+    source: IdentitySource,
 ) -> Result<Request<()>, Status> {
     if enterprise_scoped && authenticated_context.tenant.is_none() {
         reject_unauthorized();
@@ -574,7 +576,9 @@ fn finish_authenticated(
     }
     let principal = authenticated_context.principal.subject.clone();
     let credential_id = authenticated_context.principal.credential_id.clone();
-    if !valid_single_principal(&principal) {
+    if !valid_single_principal(&principal)
+        || (source == IdentitySource::External && RESERVED_PRINCIPALS.contains(&principal.as_str()))
+    {
         reject_unauthorized();
         return Err(Status::unauthenticated("invalid principal identity"));
     }
@@ -662,6 +666,7 @@ impl TokenAuthInterceptor {
             req,
             claims.authenticated_context(),
             true,
+            IdentitySource::External,
             &self.actor_rate_gate,
         )?;
         req.extensions_mut().insert(claims);
@@ -706,7 +711,14 @@ impl TokenAuthInterceptor {
         if context.credential_kind != crate::enterprise::CredentialKind::Machine {
             return Err(refuse(Status::unauthenticated("invalid token")));
         }
-        finish_authenticated_audited(self.db.runtime(), req, context, true, &self.actor_rate_gate)
+        finish_authenticated_audited(
+            self.db.runtime(),
+            req,
+            context,
+            true,
+            IdentitySource::External,
+            &self.actor_rate_gate,
+        )
     }
 }
 
@@ -773,6 +785,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                         req,
                         authenticated_context,
                         enterprise_scoped,
+                        IdentitySource::External,
                         &self.actor_rate_gate,
                     );
                 }
@@ -789,7 +802,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             .runtime()
             .enterprise_extension()
             .map(|extension| extension.authenticate_context(&token));
-        let (authenticated_context, enterprise_scoped) = match enterprise_result {
+        let (authenticated_context, enterprise_scoped, source) = match enterprise_result {
             Some(Ok(context)) => {
                 let extension_version = self
                     .db
@@ -811,7 +824,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                         "enterprise authenticated context expired",
                     ));
                 }
-                (context, true)
+                (context, true, IdentitySource::External)
             }
             None => {
                 let credential = self.resolve_credential(&token).ok_or_else(|| {
@@ -825,6 +838,7 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
                 (
                     crate::enterprise::AuthenticatedContext::machine(principal),
                     false,
+                    IdentitySource::OperatorCredential,
                 )
             }
             Some(Err(crate::enterprise::ExtensionError::Unavailable(message))) => {
@@ -840,10 +854,23 @@ impl tonic::service::Interceptor for TokenAuthInterceptor {
             req,
             authenticated_context,
             enterprise_scoped,
+            source,
             &self.actor_rate_gate,
         )
     }
 }
+
+/// Where an authenticated principal name came from. Only operator-issued local
+/// credentials may carry a reserved name; every other path takes the name from
+/// an identity provider, an extension or a signed token subject.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    OperatorCredential,
+    External,
+}
+
+/// Principal names that authorization checks treat as built-in identities.
+const RESERVED_PRINCIPALS: [&str; 4] = ["root", "local", "anonymous", "chisei-gateway"];
 
 fn valid_single_principal(principal: &str) -> bool {
     !principal.is_empty() && principal.trim() == principal && !principal.contains(',')

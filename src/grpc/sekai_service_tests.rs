@@ -776,6 +776,76 @@ fn seed_definition_parent(
     revision
 }
 
+/// An identity-provider subject that equals a built-in principal name must not
+/// inherit that principal's privileges; an operator credential still may.
+#[test]
+fn external_identities_may_not_claim_reserved_principals() {
+    use crate::identity_assertion::{
+        AssertionAuthority, IDENTITY_ASSERTION_VERSION, IdentityAssertion,
+    };
+    use sekai_domain::gateway_keys::hash_gateway_key;
+    use tonic::service::Interceptor;
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let operator_token = "operator-root-token";
+    db.create_principal_credential("root", &hash_gateway_key(operator_token), 1)
+        .unwrap();
+    let store = crate::db::store::SekaiStore::from_shared_runtime(db);
+    let credentials = Arc::new(crate::sekai::credentials::PrincipalCredentialStore::new());
+    let authority =
+        AssertionAuthority::new("https://issuer.test", "https://sekai.test", b"test-key");
+    let mut interceptor = crate::grpc::TokenAuthInterceptor::from_runtime(
+        credentials,
+        store,
+        Some(Arc::new(authority.clone())),
+    );
+    let request = |token: &str| {
+        let mut req = Request::new(());
+        req.metadata_mut().insert(
+            "authorization",
+            MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+        );
+        req.extensions_mut()
+            .insert(tonic::GrpcMethod::new("sekai.SekaiService", "GetObject"));
+        req
+    };
+    let assertion = |subject: &str| {
+        authority
+            .sign(&IdentityAssertion {
+                contract_version: IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: subject.into(),
+                credential_id: format!("credential-{subject}"),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: None,
+                scopes: vec!["sekai.read".into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: format!("nonce-{subject}"),
+                device: None,
+            })
+            .unwrap()
+    };
+
+    for subject in ["root", "local", "anonymous", "chisei-gateway"] {
+        assert_eq!(
+            interceptor
+                .call(request(&assertion(subject)))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated,
+            "{subject}"
+        );
+    }
+    interceptor.call(request(&assertion("subject-a"))).unwrap();
+    interceptor.call(request(operator_token)).unwrap();
+}
+
 /// Exercise definition reads through the actual assertion interceptor, then
 /// the handler, so transport admission cannot bypass resource authorization.
 #[tokio::test]
