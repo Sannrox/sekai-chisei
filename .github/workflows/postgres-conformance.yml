@@ -2,11 +2,16 @@ name: PostgreSQL conformance
 
 # Runs the ignored PostgreSQL conformance suites against an ephemeral TLS-only
 # PostgreSQL (#1153). Community PostgreSQL defects do not show up in the
-# default SQLite test run, so every pull request runs these too (#1316).
+# default SQLite test run, so every pull request that changes a non-docs path
+# runs these too (#1316). A docs-only change cannot add a SQLite-only surface,
+# and the parity docs are checked by Build & Test (#2571).
 on:
   push:
     branches: [main, "release-*"]
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   schedule:
     - cron: "41 3 * * 1"
   workflow_dispatch:

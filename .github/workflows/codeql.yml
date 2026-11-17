@@ -3,8 +3,12 @@ name: CodeQL
 on:
   push:
     branches: [main, "release-*"]
+  # A docs-only pull request skips the scan (#2571); main and the schedule scan everything.
   pull_request:
     branches: [main, "release-*"]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
   schedule:
     - cron: "27 4 * * 1"
 
