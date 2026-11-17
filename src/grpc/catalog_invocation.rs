@@ -34,16 +34,15 @@ impl<'a> CatalogInvocation<'a> {
         capability_name: String,
         catalog_version: Option<String>,
     ) -> Result<Self, Status> {
-        record(
+        let operation_id = reserve(
             db,
-            &operation_id,
+            operation_id,
             namespace,
             &actor,
             &capability_name,
             catalog_version.as_deref(),
             "pending",
             "invocation_started",
-            true,
         )?;
         Ok(Self {
             db,
@@ -67,17 +66,23 @@ impl<'a> CatalogInvocation<'a> {
         catalog_version: Option<&str>,
         outcome: &str,
     ) -> Result<(), Status> {
-        record(
+        reserve(
             db,
-            operation_id,
+            operation_id.to_string(),
             namespace,
             actor,
             capability_name,
             catalog_version,
             "refuse",
             outcome,
-            true,
         )
+        .map(drop)
+    }
+
+    /// The id this invocation's receipt is recorded under.
+    #[cfg(test)]
+    pub(super) fn operation_id(&self) -> &str {
+        &self.operation_id
     }
 
     #[cfg(test)]
@@ -135,6 +140,61 @@ impl Drop for CatalogInvocation<'_> {
             outcome,
             false,
         );
+    }
+}
+
+/// Records the first receipt of an invocation and returns the id it holds.
+/// A caller-supplied id that another principal already holds is replaced by a
+/// fresh server id for the receipt only; the call still reports the caller's
+/// id, so a collision answers exactly like a fresh id and never reveals
+/// another operation. The caller's own id stays reserved: reusing it
+/// to start an invocation answers `already_exists`, while a refusal reserves
+/// nothing and moves to a fresh id so it still answers its refusal.
+#[allow(clippy::too_many_arguments)]
+fn reserve(
+    db: &RuntimeDb,
+    operation_id: String,
+    namespace: &str,
+    actor: &str,
+    capability_name: &str,
+    catalog_version: Option<&str>,
+    decision: &str,
+    outcome: &str,
+) -> Result<String, Status> {
+    let insert = |operation_id: &str| {
+        record(
+            db,
+            operation_id,
+            namespace,
+            actor,
+            capability_name,
+            catalog_version,
+            decision,
+            outcome,
+            true,
+        )
+    };
+    match insert(&operation_id) {
+        Err(status) if status.code() == tonic::Code::AlreadyExists => {
+            let held_by_caller = db
+                .get_operation_receipt(&operation_id)
+                .map_err(Status::internal)?
+                .is_some_and(|receipt| receipt.initiating_actor == actor);
+            if held_by_caller && decision != "refuse" {
+                return Err(status);
+            }
+            let fresh = format!("catalog-invocation-{}", uuid::Uuid::new_v4().simple());
+            insert(&fresh)?;
+            // The inbound span carries the caller's id; this joins it to the
+            // receipt for operators without telling the caller.
+            tracing::info!(
+                caller_operation_id = %operation_id,
+                operation_id = %fresh,
+                "catalog invocation recorded under a generated operation id"
+            );
+            Ok(fresh)
+        }
+        result => result.map(|()| operation_id),
     }
 }
 
@@ -432,5 +492,53 @@ mod tests {
             receipt.uncovered_surfaces[0].surface,
             ReceiptSurface::Budget
         );
+    }
+
+    fn start(db: &RuntimeDb, operation_id: &str, actor: &str) -> Result<String, Status> {
+        CatalogInvocation::begin(
+            db,
+            operation_id.into(),
+            "project-a",
+            actor.into(),
+            "sekai.object.query".into(),
+            None,
+        )
+        .map(|mut invocation| {
+            invocation.finalize("allow", "completed").unwrap();
+            invocation.operation_id().to_string()
+        })
+    }
+
+    #[test]
+    fn another_principals_operation_id_answers_like_a_fresh_one() {
+        let db = database();
+        start(&db, "shared-op", "bob").unwrap();
+        let bobs = db.get_operation_receipt("shared-op").unwrap().unwrap();
+
+        let alices = start(&db, "shared-op", "alice").unwrap();
+        assert_ne!(alices, "shared-op");
+        CatalogInvocation::record_refusal(
+            &db,
+            "shared-op",
+            "project-a",
+            "alice",
+            "sekai.object.query",
+            None,
+            "capability_unavailable",
+        )
+        .unwrap();
+
+        assert_eq!(db.get_operation_receipt("shared-op").unwrap(), Some(bobs));
+        let receipt = db.get_operation_receipt(&alices).unwrap().unwrap();
+        assert_eq!(receipt.initiating_actor, "alice");
+    }
+
+    #[test]
+    fn reusing_ones_own_operation_id_stays_refused() {
+        let db = database();
+        start(&db, "own-op", "alice").unwrap();
+
+        let reused = start(&db, "own-op", "alice").unwrap_err();
+        assert_eq!(reused.code(), tonic::Code::AlreadyExists);
     }
 }
