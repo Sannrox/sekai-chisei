@@ -3549,7 +3549,18 @@ mod tests {
         assert!(canonical_unrelated.exists());
         assert!(binary_unrelated.exists());
         drop(active_file);
-        cleanup_stale_registry_publications(&lock_path).unwrap();
+        // The lock lives on the open file description, so a process another
+        // test forks just before the drop can hold it until that child execs.
+        // Cleanup skips a still-locked file, so allow it a bounded time to
+        // observe the release.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cleanup_stale_registry_publications(&lock_path).unwrap();
+            if !active.exists() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!active.exists());
         assert!(unrelated.exists());
         assert!(noncanonical.exists());
