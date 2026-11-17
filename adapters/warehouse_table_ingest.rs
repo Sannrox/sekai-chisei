@@ -425,6 +425,7 @@ impl SourceInspector for TableStore {
                 columns,
                 key_candidates: vec![vec![snapshot.key_column.clone()]],
                 references: Vec::new(),
+                value_findings: Vec::new(),
             }],
         })
     }

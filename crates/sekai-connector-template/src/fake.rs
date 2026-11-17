@@ -76,6 +76,7 @@ impl SourceInspector for FakeSource {
                 columns: vec![column("id"), column("name")],
                 key_candidates: vec![vec!["id".into()]],
                 references: Vec::new(),
+                value_findings: Vec::new(),
             }],
         })
     }

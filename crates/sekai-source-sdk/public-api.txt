@@ -142,6 +142,9 @@ SourceTypeRevisionDescriptor
 SyncDecision
 SyncedObject
 TransportFailure
+ValueShapeCode
+ValueShapeFinding
+ValueShapeSupport
 assert_change_capture
 assert_cross_page_identity
 assert_deterministic_batch
@@ -150,6 +153,7 @@ assert_files_omit
 assert_lifecycle_report
 assert_snapshot_chain
 attach_references
+attach_value_findings
 bind_sync_lineage
 bind_writeback
 build_registered_source_batch
@@ -577,6 +581,7 @@ discover::DiscoveredRecordKind.key_candidates: Vec<Vec<String>>
 discover::DiscoveredRecordKind.record_kind: String
 discover::DiscoveredRecordKind.references: Vec<ReferenceCandidate>
 discover::DiscoveredRecordKind.schema_revision: String
+discover::DiscoveredRecordKind.value_findings: Vec<ValueShapeFinding>
 discover::DiscoverySample
 discover::DiscoverySample::Rows{cells:Vec<BTreeMap<String,String>>}
 discover::DiscoverySample::Unsupported
@@ -614,7 +619,25 @@ discover::SourceInspector::check(&mut self) -> Result<(),ConnectionFailure>
 discover::SourceInspector::declared_references(&mut self) -> Result<DeclaredReferences,ConnectionFailure>
 discover::SourceInspector::discover(&mut self) -> Result<SourceDiscovery,ConnectionFailure>
 discover::SourceInspector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectionFailure>
+discover::ValueShapeCode
+discover::ValueShapeCode::MixedTemporalFormat
+discover::ValueShapeCode::NullableReference
+discover::ValueShapeCode::NumericAsText
+discover::ValueShapeCode::SoftDeleteCandidate
+discover::ValueShapeCode::TemporalAsText
+discover::ValueShapeCode::ValueVariants
+discover::ValueShapeCode::as_str(self) -> &str
+discover::ValueShapeFinding
+discover::ValueShapeFinding.code: ValueShapeCode
+discover::ValueShapeFinding.column: String
+discover::ValueShapeFinding.formats: Vec<&str>
+discover::ValueShapeFinding.matched: u32
+discover::ValueShapeFinding.sampled: u32
+discover::ValueShapeSupport
+discover::ValueShapeSupport::Attached
+discover::ValueShapeSupport::SamplesUnavailable
 discover::attach_references<S:SourceInspector>(&mut S,&mut SourceDiscovery) -> Result<ReferenceSupport,ConnectionFailure>
+discover::attach_value_findings<S:SourceInspector>(&mut S,&mut SourceDiscovery) -> Result<ValueShapeSupport,ConnectionFailure>
 discover::cap_discovery_sample(DiscoverySample) -> DiscoverySample
 discover::column_name_suggests_sensitive(&str) -> bool
 feed::ChangeFeedPage
