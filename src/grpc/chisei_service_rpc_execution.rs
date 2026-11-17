@@ -1024,28 +1024,8 @@ fn bind_artifact(
 }
 
 /// Loads two recorded eval dataset runs of `namespace` and compares them
-/// (#1677). Returns the comparison and the candidate's spec.
-pub(super) async fn compare_dataset_runs(
-    service: &ChiseiServiceImpl,
-    namespace: &str,
-    baseline_run_id: &str,
-    candidate_run_id: &str,
-    gate: crate::chisei::eval_compare::ComparisonGate,
-) -> Result<
-    (
-        crate::chisei::eval_compare::RunComparison,
-        crate::chisei::eval_run::EvalRunSpec,
-    ),
-    Status,
-> {
-    let (comparison, candidate, _) =
-        compare_dataset_runs_bound(service, namespace, baseline_run_id, candidate_run_id, gate)
-            .await?;
-    Ok((comparison, candidate))
-}
-
-/// Like [`compare_dataset_runs`], also returning the artifact the candidate
-/// is bound to.
+/// (#1677). Returns the comparison, the candidate's spec, and the artifact the
+/// candidate is bound to.
 pub(super) async fn compare_dataset_runs_bound(
     service: &ChiseiServiceImpl,
     namespace: &str,
@@ -1060,7 +1040,30 @@ pub(super) async fn compare_dataset_runs_bound(
     ),
     Status,
 > {
-    use crate::chisei::eval_compare::{ComparedRun, compare_runs};
+    let detailed =
+        compare_dataset_runs_detailed(service, namespace, baseline_run_id, candidate_run_id, gate)
+            .await?;
+    Ok((detailed.comparison, detailed.candidate, detailed.artifact))
+}
+
+/// A comparison with the cases behind its counts, read once so the counts and
+/// the case list cannot disagree.
+pub(super) struct DetailedComparison {
+    pub comparison: crate::chisei::eval_compare::RunComparison,
+    pub candidate: crate::chisei::eval_run::EvalRunSpec,
+    pub artifact: Option<String>,
+    /// Every case that did not pass in both runs, in dataset order.
+    pub differences: Vec<crate::chisei::eval_compare::CaseDifference>,
+}
+
+async fn compare_dataset_runs_detailed(
+    service: &ChiseiServiceImpl,
+    namespace: &str,
+    baseline_run_id: &str,
+    candidate_run_id: &str,
+    gate: crate::chisei::eval_compare::ComparisonGate,
+) -> Result<DetailedComparison, Status> {
+    use crate::chisei::eval_compare::{ComparedRun, case_differences, compare_runs};
     use crate::chisei::eval_run::EvalRunStore;
     let definitions = std::env::var(EVAL_DATASETS_DIR_ENV)
         .ok()
@@ -1095,23 +1098,34 @@ pub(super) async fn compare_dataset_runs_bound(
                 .map_err(Status::internal)
         };
         let (before, after) = (results(&baseline)?, results(&candidate)?);
-        let comparison = compare_runs(
-            &dataset,
-            ComparedRun {
-                spec: &baseline,
-                results: &before,
-            },
-            ComparedRun {
-                spec: &candidate,
-                results: &after,
-            },
-            gate,
-        )
-        .map_err(Status::failed_precondition)?;
+        let baseline_run = ComparedRun {
+            spec: &baseline,
+            results: &before,
+        };
+        let candidate_run = ComparedRun {
+            spec: &candidate,
+            results: &after,
+        };
+        let comparison = compare_runs(&dataset, baseline_run, candidate_run, gate)
+            .map_err(Status::failed_precondition)?;
+        let baseline_run = ComparedRun {
+            spec: &baseline,
+            results: &before,
+        };
+        let candidate_run = ComparedRun {
+            spec: &candidate,
+            results: &after,
+        };
+        let differences = case_differences(&dataset, &baseline_run, &candidate_run);
         let artifact = store
             .dataset_run_artifact(&candidate.namespace, &candidate.run_id)
             .map_err(Status::internal)?;
-        Ok((comparison, candidate, artifact))
+        Ok(DetailedComparison {
+            comparison,
+            candidate,
+            artifact,
+            differences,
+        })
     })
     .await
     .map_err(|_| Status::internal("eval comparison task failed"))?
@@ -1132,6 +1146,56 @@ pub(super) fn comparison_gate(
     }
 }
 
+/// Default and maximum page of `differing_cases`; the plane owns the cap.
+const DEFAULT_COMPARISON_CASE_PAGE: usize = 50;
+const MAX_COMPARISON_CASE_PAGE: usize = 200;
+
+/// One page of the cases behind a comparison's counts. The page token is the
+/// offset into the dataset-ordered list, which the same two runs always
+/// produce in the same order.
+fn comparison_case_page(
+    differences: Vec<crate::chisei::eval_compare::CaseDifference>,
+    request: &CompareEvalDatasetRunsRequest,
+) -> Result<(Vec<EvalCaseDifference>, String), Status> {
+    let offset = if request.page_token.is_empty() {
+        0
+    } else {
+        request
+            .page_token
+            .parse::<usize>()
+            .map_err(|_| Status::invalid_argument("invalid page token"))?
+    };
+    let limit = match request.case_limit as usize {
+        0 => DEFAULT_COMPARISON_CASE_PAGE,
+        requested => requested.min(MAX_COMPARISON_CASE_PAGE),
+    };
+    let mut listed = differences
+        .into_iter()
+        .filter(|case| request.include_both_failed || case.baseline_passed != case.candidate_passed)
+        .skip(offset);
+    let page: Vec<_> = listed.by_ref().take(limit).collect();
+    let next_page_token = if listed.next().is_some() {
+        (offset + page.len()).to_string()
+    } else {
+        String::new()
+    };
+    let page = page
+        .into_iter()
+        .map(|case| EvalCaseDifference {
+            case_id: case.case_id,
+            tags: case.tags,
+            baseline_passed: case.baseline_passed,
+            candidate_passed: case.candidate_passed,
+            candidate_violations: case
+                .candidate_violations
+                .into_iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+        })
+        .collect();
+    Ok((page, next_page_token))
+}
+
 pub(super) async fn compare_eval_dataset_runs(
     service: &ChiseiServiceImpl,
     req: Request<CompareEvalDatasetRunsRequest>,
@@ -1139,7 +1203,7 @@ pub(super) async fn compare_eval_dataset_runs(
     let actor = authenticated_actor(&req);
     let request = req.into_inner();
     require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
-    let (comparison, _) = compare_dataset_runs(
+    let detailed = compare_dataset_runs_detailed(
         service,
         &request.namespace,
         &request.baseline_run_id,
@@ -1147,6 +1211,12 @@ pub(super) async fn compare_eval_dataset_runs(
         comparison_gate(request.alpha, request.allow_policy_increase),
     )
     .await?;
+    let comparison = detailed.comparison;
+    let (differing_cases, next_page_token) = if request.include_cases {
+        comparison_case_page(detailed.differences, &request)?
+    } else {
+        (Vec::new(), String::new())
+    };
     Ok(Response::new(CompareEvalDatasetRunsResponse {
         dataset: comparison.dataset,
         dataset_version: comparison.dataset_version,
@@ -1170,6 +1240,9 @@ pub(super) async fn compare_eval_dataset_runs(
         policy_increased: comparison.policy_increased,
         verdict: comparison.verdict,
         reasons: comparison.reasons,
+        cases_truncated: !next_page_token.is_empty(),
+        differing_cases,
+        next_page_token,
     }))
 }
 
@@ -1552,4 +1625,64 @@ fn require_hosted_route_policy(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod comparison_case_page_tests {
+    use super::*;
+    use crate::chisei::eval_compare::CaseDifference;
+    use crate::chisei::eval_policy::ViolationKind;
+
+    fn difference(index: usize, baseline: bool, candidate: bool) -> CaseDifference {
+        CaseDifference {
+            case_id: format!("case-{index}"),
+            tags: vec!["smoke".into()],
+            baseline_passed: baseline,
+            candidate_passed: candidate,
+            candidate_violations: vec![ViolationKind::MarkingLeak],
+        }
+    }
+
+    fn request(limit: u32, token: &str, both_failed: bool) -> CompareEvalDatasetRunsRequest {
+        CompareEvalDatasetRunsRequest {
+            include_cases: true,
+            include_both_failed: both_failed,
+            case_limit: limit,
+            page_token: token.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Pages follow dataset order, a truncated page names the next one, the
+    /// plane caps the limit, and failed-in-both cases appear only on request.
+    #[test]
+    fn case_pages_are_ordered_bounded_and_filtered() {
+        let all: Vec<_> = (0..5)
+            .map(|index| difference(index, true, false))
+            .chain([difference(5, false, false)])
+            .collect();
+        let (first, token) = comparison_case_page(all.clone(), &request(2, "", false)).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|case| case.case_id.as_str())
+                .collect::<Vec<_>>(),
+            ["case-0", "case-1"]
+        );
+        assert_eq!(token, "2");
+        let (last, token) = comparison_case_page(all.clone(), &request(2, "4", false)).unwrap();
+        assert_eq!(last.len(), 1, "failed-in-both is not listed by default");
+        assert!(token.is_empty());
+        let (with_both, _) = comparison_case_page(all.clone(), &request(100, "", true)).unwrap();
+        assert_eq!(with_both.len(), 6);
+        assert_eq!(with_both[0].candidate_violations, ["marking_leak"]);
+        let many: Vec<_> = (0..300)
+            .map(|index| difference(index, true, false))
+            .collect();
+        let (capped, token) = comparison_case_page(many, &request(u32::MAX, "", false)).unwrap();
+        assert_eq!(capped.len(), MAX_COMPARISON_CASE_PAGE);
+        assert_eq!(token, MAX_COMPARISON_CASE_PAGE.to_string());
+        let bad = comparison_case_page(all, &request(2, "nope", false)).unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::InvalidArgument);
+    }
 }
