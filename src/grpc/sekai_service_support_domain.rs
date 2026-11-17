@@ -1053,6 +1053,7 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         || error.starts_with("fact_migration_no_change")
         || error.starts_with("fact_migration_unsupported_mode")
         || error.starts_with("fact_migration_not_committed")
+        || error.starts_with("fact_migration_id_in_use")
         || error.starts_with("fact_migration_revision_mismatch")
         || error.starts_with("fact_migration_rollback_denied")
         || error.starts_with("object_security_denied")

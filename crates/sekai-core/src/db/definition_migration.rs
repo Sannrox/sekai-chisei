@@ -68,6 +68,16 @@ impl SekaiDb {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
+        require_migration_id_not_committed(
+            tx.query_row(
+                "SELECT result_json FROM sekai_fact_migrations
+                 WHERE namespace=?1 AND migration_id=?2",
+                params![request.namespace, request.migration_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?,
+        )?;
         let from =
             load_revision_required_sqlite(&tx, &request.namespace, &request.from_revision_digest)?;
         let to =
@@ -108,6 +118,12 @@ impl SekaiDb {
         let blocked = planned.iter().any(|item| item.outcome == "blocked");
         let executed = request.mode == MODE_EXECUTE && !blocked;
         if executed {
+            tx.execute(
+                "DELETE FROM sekai_fact_migration_snapshots
+                 WHERE namespace=?1 AND migration_id=?2",
+                params![request.namespace, request.migration_id],
+            )
+            .map_err(|error| error.to_string())?;
             for item in &planned {
                 if item.outcome != "migrate" {
                     continue;
@@ -236,6 +252,22 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())
     }
+}
+
+/// A committed migration keeps its record and snapshots: a later plan, dry run
+/// or execute under the same id would overwrite the record that rollback
+/// relies on. A plan, a blocked run, or a rolled back migration may be followed
+/// by an execute under its id; that execute replaces the old snapshots.
+fn require_migration_id_not_committed(stored_json: Option<String>) -> Result<(), String> {
+    let Some(json) = stored_json else {
+        return Ok(());
+    };
+    let stored: FactMigrationResult =
+        serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    if stored.status == STATUS_COMMITTED {
+        return Err("fact_migration_id_in_use: a committed migration id cannot be reused".into());
+    }
+    Ok(())
 }
 
 fn replay_migration_sqlite(
@@ -775,6 +807,15 @@ impl PostgresDb {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(result);
         }
+        require_migration_id_not_committed(
+            tx.query_opt(
+                "SELECT result_json FROM sekai_fact_migrations
+                 WHERE namespace=$1 AND migration_id=$2",
+                &[&request.namespace, &request.migration_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, String>(0)),
+        )?;
         let from = load_revision_required_postgres(
             &mut tx,
             &request.namespace,
@@ -824,6 +865,12 @@ impl PostgresDb {
         let blocked = planned.iter().any(|item| item.outcome == "blocked");
         let executed = request.mode == MODE_EXECUTE && !blocked;
         if executed {
+            tx.execute(
+                "DELETE FROM sekai_fact_migration_snapshots
+                 WHERE namespace=$1 AND migration_id=$2",
+                &[&request.namespace, &request.migration_id],
+            )
+            .map_err(|error| error.to_string())?;
             for item in &planned {
                 if item.outcome != "migrate" {
                     continue;
