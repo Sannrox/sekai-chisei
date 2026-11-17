@@ -512,6 +512,60 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "ListDatasets") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_datasets(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListDatasetVersions") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_dataset_versions(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetDatasetVersion") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_dataset_version(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RollbackDataset") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::rollback_dataset(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "PutDatasetHealthCheck") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::put_dataset_health_check(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListDatasetHealthChecks") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_dataset_health_checks(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListDatasetHealthResults") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_dataset_health_results(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RunDatasetHealthChecks") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::run_dataset_health_checks(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListDatasetAlerts") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_dataset_alerts(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "CreateGrant") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_grant(&*svc, req).await
@@ -1304,6 +1358,36 @@ mod tests {
         let (sekai, chisei, interceptor, token) = token_world();
         let app = router_for(sekai, chisei, interceptor);
         for rpc in ["Search", "GetSearchIndexStatus"] {
+            let path = format!("/sekai.SekaiService/{rpc}");
+            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
+            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+
+            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
+            let message = payload["message"].as_str().unwrap_or_default();
+            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            assert!(
+                !message.contains("experimental"),
+                "{rpc} is stable and must not hit the experimental gate: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn promoted_dataset_version_and_health_rpcs_are_hosted_and_stay_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        for rpc in [
+            "ListDatasets",
+            "ListDatasetVersions",
+            "GetDatasetVersion",
+            "RollbackDataset",
+            "PutDatasetHealthCheck",
+            "ListDatasetHealthChecks",
+            "ListDatasetHealthResults",
+            "RunDatasetHealthChecks",
+            "ListDatasetAlerts",
+        ] {
             let path = format!("/sekai.SekaiService/{rpc}");
             let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");

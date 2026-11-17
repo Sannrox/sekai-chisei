@@ -38,6 +38,11 @@ impl PostgresDb {
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        // The dataset lock first (the order a definition-branch publish
+        // uses), so a registration cannot commit between RollbackDataset's
+        // index check and its commit, then index the rows the rollback
+        // removes (#2415).
+        crate::db::postgres::lock_dataset_rows(&mut transaction, &binding.dataset_id)?;
         crate::db::postgres::lock_object_type_datasource(
             &mut transaction,
             &binding.namespace,

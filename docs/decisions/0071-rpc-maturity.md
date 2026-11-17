@@ -138,3 +138,20 @@ the shrink-only SQLite-only list.
   required siblings of `EvaluateObjectSet` once objects derive from datasets.
   The HTTP/JSON projection and generated stable SDKs pick them up as unary
   stables.
+- 2026-11-17, Issue [#2415](https://github.com/Sannrox/sekai-chisei/issues/2415):
+  `ListDatasets`, `ListDatasetVersions`, `GetDatasetVersion`,
+  `RollbackDataset`, `PutDatasetHealthCheck`, `ListDatasetHealthChecks`,
+  `ListDatasetHealthResults`, `RunDatasetHealthChecks`, and
+  `ListDatasetAlerts` become `stable` after meeting the #2089 promotion
+  criteria: list calls and version rows page (#2532), health runs judge on
+  the server clock (#2533), tenant and column authorization run before the
+  limit (#2099), and RPC-level tests run on SQLite and PostgreSQL. Messages
+  were reviewed once before the freeze and stay as they are:
+  `RollbackDatasetResponse.rows` and `RunDatasetHealthChecksRequest.now_ms`
+  stay on the wire as deprecated fields, and health check `kind` stays a
+  string (`freshness`, `row_count`). A rollback of a dataset that a
+  registered, non-edits-only object type datasource reads is refused with
+  `FAILED_PRECONDITION` naming the index, so derived objects never sit on
+  rows the dataset no longer holds. `native_server_smoke` consumes all nine
+  on the spawned binary. The HTTP/JSON projection and generated stable SDKs
+  pick them up as unary stables.

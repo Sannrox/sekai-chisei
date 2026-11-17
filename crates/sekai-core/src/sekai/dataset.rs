@@ -653,7 +653,12 @@ impl SekaiDb {
             return Err(dataset_version::DATASET_ROLLBACK_REQUIRES_RESTORE.into());
         }
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // Immediate: the write lock is held before the object type index
+        // check, so a registration on another connection cannot commit
+        // between the check and the rollback (#2415).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let restored = get_dataset_version_tx(
             &tx,
             &request.dataset_id,
@@ -662,6 +667,22 @@ impl SekaiDb {
         )?;
         if restored.purged {
             return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+        }
+        // Checked inside the rollback transaction, so it holds for the write.
+        let backing_index: Option<(String, String)> = tx
+            .query_row(
+                "SELECT namespace, kind FROM sekai_object_type_datasource
+                 WHERE dataset_id = ?1 AND edits_only = 0
+                 ORDER BY namespace, kind LIMIT 1",
+                params![request.dataset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((namespace, kind)) = backing_index {
+            return Err(dataset_version::rollback_backs_index_error(
+                &namespace, &kind,
+            ));
         }
         tx.execute(
             "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",

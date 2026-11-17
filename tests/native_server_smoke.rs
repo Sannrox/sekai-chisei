@@ -2321,3 +2321,132 @@ async fn spawned_binary_serves_datasource_index_rpcs() {
         .await
         .unwrap_or_else(|error| panic!("put edit: {error}\n{}", server.logs()));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_serves_dataset_version_and_health_rpcs() {
+    use sekai_chisei::grpc::pb::sekai as pb;
+
+    let server = NativeServer::spawn();
+    let mut sekai = server.sekai().await;
+    let dataset_id = format!("ds-orders-{}", uuid::Uuid::new_v4().simple());
+
+    sekai
+        .create_dataset(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: dataset_id.clone(),
+                name: "orders".into(),
+                columns: vec![ColumnDef {
+                    name: "order_id".into(),
+                    r#type: "string".into(),
+                    classification: "public".into(),
+                }],
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create dataset: {error}\n{}", server.logs()));
+    for order in ["o1", "o2"] {
+        sekai
+            .append_rows(AppendRowsRequest {
+                dataset_id: dataset_id.clone(),
+                rows: vec![Row {
+                    values: HashMap::from([("order_id".into(), order.into())]),
+                }],
+            })
+            .await
+            .unwrap_or_else(|error| panic!("append rows: {error}\n{}", server.logs()));
+    }
+
+    let listed = sekai
+        .list_datasets(pb::ListDatasetsRequest::default())
+        .await
+        .unwrap_or_else(|error| panic!("list datasets: {error}\n{}", server.logs()))
+        .into_inner();
+    assert!(
+        listed
+            .datasets
+            .iter()
+            .any(|dataset| dataset.id == dataset_id)
+    );
+    let versions = sekai
+        .list_dataset_versions(pb::ListDatasetVersionsRequest {
+            dataset_id: dataset_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list versions: {error}\n{}", server.logs()))
+        .into_inner()
+        .versions;
+    assert_eq!(versions.len(), 2);
+    let first = sekai
+        .get_dataset_version(pb::GetDatasetVersionRequest {
+            dataset_id: dataset_id.clone(),
+            version_id: versions[0].version_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("get version: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(first.rows.len(), 1);
+    let rolled = sekai
+        .rollback_dataset(pb::RollbackDatasetRequest {
+            dataset_id: dataset_id.clone(),
+            restore_from_version_id: versions[0].version_id.clone(),
+            reason: "smoke".into(),
+            tenant: String::new(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("rollback: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(rolled.version.expect("restore version").seq, 3);
+
+    sekai
+        .put_dataset_health_check(pb::PutDatasetHealthCheckRequest {
+            check: Some(pb::DatasetHealthCheck {
+                dataset_id: dataset_id.clone(),
+                check_id: "has-rows".into(),
+                kind: "row_count".into(),
+                min_rows: 1,
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put check: {error}\n{}", server.logs()));
+    let checks = sekai
+        .list_dataset_health_checks(pb::ListDatasetHealthChecksRequest {
+            dataset_id: dataset_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list checks: {error}\n{}", server.logs()))
+        .into_inner()
+        .checks;
+    assert_eq!(checks.len(), 1);
+    let judged = sekai
+        .run_dataset_health_checks(pb::RunDatasetHealthChecksRequest {
+            dataset_id: dataset_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("run checks: {error}\n{}", server.logs()))
+        .into_inner()
+        .results;
+    assert!(judged.iter().all(|result| result.passed), "{judged:?}");
+    let results = sekai
+        .list_dataset_health_results(pb::ListDatasetHealthResultsRequest {
+            dataset_id: dataset_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list results: {error}\n{}", server.logs()))
+        .into_inner()
+        .results;
+    assert_eq!(results.len(), 1);
+    sekai
+        .list_dataset_alerts(pb::ListDatasetAlertsRequest {
+            dataset_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("list alerts: {error}\n{}", server.logs()));
+}

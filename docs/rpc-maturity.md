@@ -82,8 +82,9 @@ An `experimental` RPC moves to `stable` only when it meets the
 5. **Bounded cost.** List and query RPCs page, and the upper limits on input,
    results, and index size are enforced and documented.
 
-Search (#2243), the governed-document RPCs (#2266), and the datasource
-index RPCs (#2282) met these criteria and are `stable`. Status of the
+Search (#2243), the governed-document RPCs (#2266), the datasource
+index RPCs (#2282), and the dataset version and health RPCs (#2415) met
+these criteria and are `stable`. Status of the
 remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
@@ -295,12 +296,12 @@ Edit the fixture, then regenerate with
 | `SekaiService.InvokeFunction` | `sekai.function-definitions` | yes | none | `experimental` |
 | `SekaiService.CreateDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.UpdateDataset` | `sekai.datasets` | yes | host | `stable` |
-| `SekaiService.ListDatasets` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasets` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.AppendRows` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.QueryRows` | `sekai.datasets` | yes | host | `stable` |
-| `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.RollbackDataset` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetVersions` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.GetDatasetVersion` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.RollbackDataset` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.CreateDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListDatasetBranches` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.DeleteDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
@@ -311,11 +312,11 @@ Edit the fixture, then regenerate with
 | `SekaiService.ReplayGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformReplay` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ShadowGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.RunDatasetHealthChecks` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.ListDatasetAlerts` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PutDatasetHealthCheck` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.ListDatasetHealthChecks` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.ListDatasetHealthResults` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.RunDatasetHealthChecks` | `sekai.datasets` | yes | host | `stable` |
+| `SekaiService.ListDatasetAlerts` | `sekai.datasets` | yes | host | `stable` |
 | `SekaiService.ListConsumerViolationNotifications` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.AcknowledgeConsumerViolationNotification` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.CreateVirtualTable` | `sekai.datasets` | yes | none | `experimental` |
