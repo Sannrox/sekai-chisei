@@ -333,14 +333,28 @@ pub fn refuse_revoke_undo(
     }
 }
 
+/// Principals who changed agent members along a lineage, newest first, as
+/// returned by [`certification_lineage`]. Each revision is compared with its
+/// parent. The oldest revision is the baseline only when it was a published
+/// head; otherwise it is compared with an empty member set, so the author of a
+/// new definition counts.
 pub fn agent_change_authors(lineage_newest_first: &[DefinitionRevision]) -> Vec<String> {
     let mut authors = Vec::new();
-    for pair in lineage_newest_first.windows(2) {
-        if agent_members_changed(&pair[1].members, &pair[0].members)
-            && !authors.contains(&pair[0].created_by)
-        {
-            authors.push(pair[0].created_by.clone());
+    let mut record = |author: &String| {
+        if !authors.contains(author) {
+            authors.push(author.clone());
         }
+    };
+    for pair in lineage_newest_first.windows(2) {
+        if agent_members_changed(&pair[1].members, &pair[0].members) {
+            record(&pair[0].created_by);
+        }
+    }
+    if let Some(oldest) = lineage_newest_first.last()
+        && !oldest.published
+        && agent_members_changed(&[], &oldest.members)
+    {
+        record(&oldest.created_by);
     }
     authors
 }
@@ -621,6 +635,32 @@ mod tests {
             ["bob", "alice", "pub"]
         );
         assert_eq!(agent_change_authors(&loaded), vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn agent_change_authors_count_the_author_of_a_parentless_definition() {
+        let alice = revision("alice", "alice", "", vec![member("agent", "triage", "a")]);
+        let bob = revision(
+            "bob",
+            "bob",
+            "alice",
+            vec![
+                member("agent", "triage", "a"),
+                member("function", "fn", "b"),
+            ],
+        );
+        let lineage = certification_lineage(&bob, None, |digest| {
+            Ok((digest == "alice").then(|| alice.clone()))
+        })
+        .unwrap();
+        assert_eq!(agent_change_authors(&lineage), vec!["alice".to_string()]);
+        assert_eq!(
+            agent_change_authors(std::slice::from_ref(&alice)),
+            vec!["alice".to_string()]
+        );
+        let mut published = alice;
+        published.published = true;
+        assert!(agent_change_authors(&[bob, published]).is_empty());
     }
 
     #[test]
