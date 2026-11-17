@@ -906,7 +906,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let provider = OpenAI::with_timeouts("", Some(&base_url), test_timeouts());
+        // Default timeouts: this asserts parsing, and `test_timeouts()`' 50 ms
+        // request budget is too tight for a loaded CI runner (#2619).
+        let provider = OpenAI::with_timeouts("", Some(&base_url), HttpTimeouts::default());
         let response = provider.chat(&test_chat_request("acme-1")).await.unwrap();
         assert_eq!(response.stop_reason, "length");
     }
