@@ -185,17 +185,17 @@ pub(super) async fn issue_service_principal_token(
             "principal and client_secret required",
         ));
     }
+    // The request body is the only authentication here, so an unknown
+    // principal, an untenanted registration, and a wrong secret all get the
+    // same answer: none of them may reveal which principals exist.
+    let refused = || Status::unauthenticated("service principal authentication failed");
     let registration = service
         .db
         .runtime()
         .get_service_principal(&input.principal)
         .map_err(Status::internal)?
-        .ok_or_else(|| Status::not_found("service principal not found"))?;
-    if registration.tenant_id.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "service token issuance requires a tenant-bound registration",
-        ));
-    }
+        .filter(|registration| !registration.tenant_id.trim().is_empty())
+        .ok_or_else(refused)?;
     let grant = extension
         .issue_service_principal_token(crate::enterprise::ServicePrincipalTokenRequest {
             principal: registration.principal.clone(),
@@ -204,7 +204,11 @@ pub(super) async fn issue_service_principal_token(
             namespaces: registration.namespaces.clone(),
             action_types: registration.action_types.clone(),
         })
-        .map_err(extension_status)?;
+        .map_err(|error| match error {
+            crate::enterprise::ExtensionError::CredentialNotFound
+            | crate::enterprise::ExtensionError::Unauthenticated => refused(),
+            other => extension_status(other),
+        })?;
     let now_ms = now_millis();
     let claims = crate::service_token::ServiceTokenClaims::for_grant(
         authority,
