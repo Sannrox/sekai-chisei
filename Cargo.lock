@@ -355,6 +355,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -376,6 +377,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

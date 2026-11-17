@@ -999,6 +999,7 @@ fn gateway_success_receipt_uses_canonical_complete_shape() {
         tier: DEFAULT_GATEWAY_TIER.into(),
     };
     let context = UsageContext {
+        genai_span: tracing::Span::none(),
         request_id: "gateway-op-1".into(),
         lookup_request_id: Some("client-request-1".into()),
         caller_scope: "scope-a".into(),
@@ -1346,6 +1347,7 @@ fn recovery_llm_row_carries_the_live_rows_data_class_and_pipeline_fields() {
         tier: DEFAULT_GATEWAY_TIER.into(),
     };
     let context = UsageContext {
+        genai_span: tracing::Span::none(),
         request_id: "gateway-op-denied".into(),
         lookup_request_id: None,
         caller_scope: "scope-a".into(),
@@ -1429,6 +1431,7 @@ fn gateway_refusal_receipt_is_terminal_and_complete() {
         tier: DEFAULT_GATEWAY_TIER.into(),
     };
     let context = UsageContext {
+        genai_span: tracing::Span::none(),
         request_id: "gateway-op-denied".into(),
         lookup_request_id: None,
         caller_scope: "scope-a".into(),
@@ -4308,6 +4311,182 @@ async fn anthropic_messages_streaming_records_usage() {
     assert_eq!(rows[0].get("input_tokens").map(String::as_str), Some("11"));
     assert_eq!(rows[0].get("output_tokens").map(String::as_str), Some("7"));
     assert_eq!(rows[0].get("total_tokens").map(String::as_str), Some("18"));
+}
+
+/// Fields of every `gen_ai.client` span whose operation id contains
+/// [`GENAI_TEST_OPERATION`], plus the parent span's name.
+///
+/// Installed once as the process-global subscriber: a thread-scoped one races
+/// the global callsite-interest cache against concurrently running tests.
+#[derive(Default)]
+struct GenAiSpanCapture {
+    active: std::collections::HashMap<u64, usize>,
+    spans: Vec<Vec<(String, String)>>,
+}
+
+const GENAI_TEST_OPERATION: &str = "op-genai-gateway";
+
+struct GenAiSpanLayer(&'static std::sync::Mutex<GenAiSpanCapture>);
+
+#[derive(Default)]
+struct FieldList(Vec<(String, String)>);
+
+impl tracing::field::Visit for FieldList {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push((field.name().into(), format!("{value:?}")));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.push((field.name().into(), value.into()));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for GenAiSpanLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attrs.metadata().name() != "gen_ai.client" {
+            return;
+        }
+        let mut fields = FieldList::default();
+        attrs.record(&mut fields);
+        let ours = fields.0.iter().any(|(key, value)| {
+            key == "sekai.operation_id" && value.contains(GENAI_TEST_OPERATION)
+        });
+        if !ours {
+            return;
+        }
+        let parent = ctx
+            .span(id)
+            .and_then(|span| span.parent())
+            .map(|parent| parent.name().to_string())
+            .unwrap_or_default();
+        fields.0.push(("parent".into(), parent));
+        let mut capture = self.0.lock().unwrap();
+        let index = capture.spans.len();
+        capture.spans.push(fields.0);
+        capture.active.insert(id.into_u64(), index);
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut capture = self.0.lock().unwrap();
+        if let Some(&index) = capture.active.get(&id.into_u64()) {
+            let mut fields = FieldList::default();
+            values.record(&mut fields);
+            capture.spans[index].extend(fields.0);
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+        // Span ids are reused after close.
+        self.0.lock().unwrap().active.remove(&id.into_u64());
+    }
+}
+
+fn genai_span_capture() -> &'static std::sync::Mutex<GenAiSpanCapture> {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    static CAPTURE: std::sync::OnceLock<&'static std::sync::Mutex<GenAiSpanCapture>> =
+        std::sync::OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture: &'static _ = Box::leak(Box::default());
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(GenAiSpanLayer(capture)),
+        )
+        .expect("no other global subscriber in the gateway test binary");
+        capture
+    })
+}
+
+#[tokio::test]
+async fn proxied_model_call_exports_a_content_free_genai_span() {
+    let capture = genai_span_capture();
+    tracing::callsite::rebuild_interest_cache();
+
+    let sse = "event: message_start\n\
+               data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n\
+               event: content_block_delta\n\
+               data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"SECRET-COMPLETION\"}}\n\n\
+               event: message_delta\n\
+               data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n\
+               event: message_stop\n\
+               data: {\"type\":\"message_stop\"}\n\n";
+    let (upstream_base, _requests) = spawn_fake_upstream(sse, "text/event-stream").await;
+    let (chisei_target, db) = spawn_control_plane().await;
+    let gateway_base = spawn_gateway_with_config(GatewayConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        openai_base_url: "http://127.0.0.1:9/v1".to_string(),
+        openai_api_key: None,
+        anthropic_base_url: upstream_base,
+        ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+        native_base_url: None,
+        anthropic_api_key: Some("real-anthropic-key".to_string()),
+        chisei_grpc_target: Some(chisei_target.clone()),
+        default_project: "default".to_string(),
+        gateway_keys: HashMap::new(),
+        allow_auth_passthrough: false,
+        rewrite_openai_passthrough_auth: false,
+        pricing: HashMap::new(),
+        allow_cross_provider: false,
+    })
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{gateway_base}/v1/messages"))
+        .bearer_auth("sk-chisei-claude-code")
+        .header("anthropic-version", "2023-06-01")
+        .header(X_CHISEI_OPERATION_ID.as_str(), GENAI_TEST_OPERATION)
+        .json(&serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [{"role": "user", "content": "SECRET-PROMPT"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.text().await.unwrap();
+    wait_for_llm_calls(&db, 1).await;
+
+    let spans = capture.lock().unwrap().spans.clone();
+    assert_eq!(spans.len(), 1, "one span per provider call: {spans:?}");
+    let fields = &spans[0];
+    let field = |name: &str| -> Vec<&str> {
+        fields
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect()
+    };
+    assert_eq!(field("parent"), ["gateway.http"], "{fields:?}");
+    assert_eq!(field("otel.kind"), ["client"]);
+    assert_eq!(field("gen_ai.operation.name"), ["chat"]);
+    assert_eq!(field("gen_ai.provider.name"), ["anthropic"]);
+    assert_eq!(field("gen_ai.request.model"), ["claude-sonnet-4-6"]);
+    assert_eq!(field("gen_ai.usage.input_tokens"), ["11"]);
+    assert_eq!(field("gen_ai.usage.output_tokens"), ["7"]);
+    assert_eq!(field("gen_ai.response.finish_reasons"), ["end_turn"]);
+    assert!(field("error.type").is_empty());
+    let operation = field("sekai.operation_id");
+    assert!(
+        operation.len() == 1 && operation[0].contains(GENAI_TEST_OPERATION),
+        "{operation:?}"
+    );
+    assert!(
+        fields.iter().all(|(_, value)| !value.contains("SECRET")),
+        "content reached span fields: {fields:?}"
+    );
 }
 
 #[tokio::test]

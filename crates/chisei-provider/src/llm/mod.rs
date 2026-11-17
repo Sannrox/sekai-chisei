@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::env;
 use std::pin::Pin;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 use crate::content::{ContentChatRequest, ContentKind, validate_resolved_part};
 use futures_util::{Stream, StreamExt, stream};
@@ -417,6 +417,8 @@ pub trait Provider: Send + Sync {
 
 struct ResolvedModelProvider {
     inner: Box<dyn Provider>,
+    /// Route provider id, reported as the GenAI provider name.
+    provider: String,
     upstream_model: String,
     canonical_model: String,
     registry_state_path: Option<std::path::PathBuf>,
@@ -442,7 +444,14 @@ impl Provider for ResolvedModelProvider {
             .map_err(encode_provider_error)?;
         let mut request = req.clone();
         request.model.clone_from(&self.upstream_model);
-        self.inner.chat_with_sampling(&request, sampling).await
+        let span = self.genai_span();
+        traced_response(
+            &span,
+            self.inner
+                .chat_with_sampling(&request, sampling)
+                .instrument(span.clone())
+                .await,
+        )
     }
 
     async fn content_chat(&self, req: &ContentChatRequest) -> Result<ChatResponse, String> {
@@ -451,7 +460,14 @@ impl Provider for ResolvedModelProvider {
             .map_err(encode_provider_error)?;
         let mut request = req.clone();
         request.model.clone_from(&self.upstream_model);
-        self.inner.content_chat(&request).await
+        let span = self.genai_span();
+        traced_response(
+            &span,
+            self.inner
+                .content_chat(&request)
+                .instrument(span.clone())
+                .await,
+        )
     }
 
     async fn content_chat_stream(&self, req: &ContentChatRequest) -> Result<ChatStream, String> {
@@ -460,7 +476,14 @@ impl Provider for ResolvedModelProvider {
             .map_err(encode_provider_error)?;
         let mut request = req.clone();
         request.model.clone_from(&self.upstream_model);
-        self.inner.content_chat_stream(&request).await
+        let span = self.genai_span();
+        traced_stream(
+            span.clone(),
+            self.inner
+                .content_chat_stream(&request)
+                .instrument(span)
+                .await,
+        )
     }
 
     async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatStream, String> {
@@ -469,11 +492,65 @@ impl Provider for ResolvedModelProvider {
             .map_err(encode_provider_error)?;
         let mut request = req.clone();
         request.model.clone_from(&self.upstream_model);
-        self.inner.chat_stream(&request).await
+        let span = self.genai_span();
+        traced_stream(
+            span.clone(),
+            self.inner.chat_stream(&request).instrument(span).await,
+        )
     }
 }
 
+/// Record a finished call's usage, finish reason, or error class on its span.
+fn traced_response(
+    span: &tracing::Span,
+    result: Result<ChatResponse, String>,
+) -> Result<ChatResponse, String> {
+    match &result {
+        Ok(response) => {
+            crate::genai::record_usage(
+                span,
+                response.input_tokens.into(),
+                response.output_tokens.into(),
+            );
+            crate::genai::record_finish_reason(span, &response.stop_reason);
+        }
+        Err(error) => crate::genai::record_error(span, crate::genai::provider_error_type(error)),
+    }
+    result
+}
+
+/// Keep the span open for the life of the stream and record the terminal
+/// chunk or the first error on it.
+fn traced_stream(
+    span: tracing::Span,
+    result: Result<ChatStream, String>,
+) -> Result<ChatStream, String> {
+    let stream = match result {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::genai::record_error(&span, crate::genai::provider_error_type(&error));
+            return Err(error);
+        }
+    };
+    Ok(Box::pin(stream.inspect(move |item| match item {
+        Ok(chunk) if chunk.done => {
+            crate::genai::record_usage(
+                &span,
+                chunk.input_tokens.into(),
+                chunk.output_tokens.into(),
+            );
+            crate::genai::record_finish_reason(&span, &chunk.stop_reason);
+        }
+        Ok(_) => {}
+        Err(error) => crate::genai::record_error(&span, crate::genai::provider_error_type(error)),
+    })))
+}
+
 impl ResolvedModelProvider {
+    fn genai_span(&self) -> tracing::Span {
+        crate::genai::client_span(&self.provider, &self.upstream_model, None)
+    }
+
     async fn enforce_current_capabilities(
         &self,
         request: &ChatRequest,
@@ -717,6 +794,7 @@ pub fn resolve_with_registry_and_provider_credential(
         .flatten();
     Ok(Box::new(ResolvedModelProvider {
         inner,
+        provider: resolved.provider,
         upstream_model: resolved.upstream_model,
         canonical_model: resolved.canonical_model,
         registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
@@ -897,11 +975,174 @@ mod tests {
         }
     }
 
+    /// Upstream model only the GenAI span test uses; the capture keeps only
+    /// spans for it, so concurrently running tests do not interfere.
+    const GENAI_TEST_MODEL: &str = "genai-span-test-model";
+
+    /// Fields of `gen_ai.client` spans for [`GENAI_TEST_MODEL`], in creation
+    /// order. Installed once as the process-global subscriber: a thread-scoped
+    /// one races the global callsite-interest cache against other tests.
+    #[derive(Default)]
+    struct GenAiSpans {
+        active: std::collections::HashMap<u64, usize>,
+        spans: Vec<std::collections::BTreeMap<String, String>>,
+    }
+
+    struct GenAiSpanLayer(&'static Mutex<GenAiSpans>);
+
+    #[derive(Default)]
+    struct FieldMap(std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for FieldMap {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for GenAiSpanLayer {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "gen_ai.client" {
+                return;
+            }
+            let mut fields = FieldMap::default();
+            attrs.record(&mut fields);
+            if fields.0.get("gen_ai.request.model").map(String::as_str) != Some(GENAI_TEST_MODEL) {
+                return;
+            }
+            let mut capture = self.0.lock().unwrap();
+            let index = capture.spans.len();
+            capture.spans.push(fields.0);
+            capture.active.insert(id.into_u64(), index);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut capture = self.0.lock().unwrap();
+            if let Some(&index) = capture.active.get(&id.into_u64()) {
+                let mut fields = FieldMap::default();
+                values.record(&mut fields);
+                capture.spans[index].extend(fields.0);
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+            // Span ids are reused after close.
+            self.0.lock().unwrap().active.remove(&id.into_u64());
+        }
+    }
+
+    fn genai_span_capture() -> &'static Mutex<GenAiSpans> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        static CAPTURE: std::sync::OnceLock<&'static Mutex<GenAiSpans>> =
+            std::sync::OnceLock::new();
+        CAPTURE.get_or_init(|| {
+            let capture: &'static _ = Box::leak(Box::default());
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(GenAiSpanLayer(capture)),
+            )
+            .expect("no other global subscriber in the provider test binary");
+            capture
+        })
+    }
+
+    struct ScriptedProvider {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        async fn chat(&self, _: &ChatRequest) -> Result<ChatResponse, String> {
+            if self.fail {
+                return Err("HTTP 500: upstream echoed SECRET-PROMPT".into());
+            }
+            Ok(ChatResponse {
+                content: "SECRET-COMPLETION".into(),
+                tool_calls: Vec::new(),
+                input_tokens: 7,
+                output_tokens: 3,
+                stop_reason: "end_turn".into(),
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn every_resolved_call_exports_a_content_free_genai_span() {
+        let capture = genai_span_capture();
+        tracing::callsite::rebuild_interest_cache();
+        let provider = |fail| ResolvedModelProvider {
+            inner: Box::new(ScriptedProvider { fail }),
+            provider: "anthropic".into(),
+            upstream_model: GENAI_TEST_MODEL.into(),
+            canonical_model: "anthropic/claude-sonnet-4-5".into(),
+            registry_state_path: None,
+            hosted_profile: None,
+        };
+        let request = ChatRequest {
+            model: "anthropic/claude-sonnet-4-5".into(),
+            system: "SECRET-PROMPT".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 1,
+            prompt_cache: Default::default(),
+        };
+
+        crate::genai::with_operation_id("op-genai-1".into(), provider(false).chat(&request))
+            .await
+            .unwrap();
+        let chunks: Vec<_> = provider(false)
+            .chat_stream(&request)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(chunks.len(), 1);
+        provider(true).chat(&request).await.unwrap_err();
+
+        let spans = capture.lock().unwrap().spans.clone();
+        assert_eq!(spans.len(), 3, "one span per provider call: {spans:?}");
+        for span in &spans[..2] {
+            assert_eq!(span["otel.kind"], "client");
+            assert_eq!(span["otel.name"], format!("chat {GENAI_TEST_MODEL}"));
+            assert_eq!(span["gen_ai.operation.name"], "chat");
+            assert_eq!(span["gen_ai.provider.name"], "anthropic");
+            assert_eq!(span["gen_ai.request.model"], GENAI_TEST_MODEL);
+            assert_eq!(span["gen_ai.usage.input_tokens"], "7");
+            assert_eq!(span["gen_ai.usage.output_tokens"], "3");
+            assert_eq!(span["gen_ai.response.finish_reasons"], "end_turn");
+            assert!(!span.contains_key("error.type"));
+        }
+        assert_eq!(spans[0]["sekai.operation_id"], "op-genai-1");
+        assert_eq!(spans[2]["error.type"], "upstream_error");
+        assert_eq!(spans[2]["otel.status_code"], "ERROR");
+        let leaked: Vec<_> = spans
+            .iter()
+            .flat_map(|span| span.values())
+            .filter(|value| value.contains("SECRET"))
+            .collect();
+        assert!(leaked.is_empty(), "content reached span fields: {leaked:?}");
+    }
+
     #[tokio::test]
     async fn resolved_provider_strips_anthropic_route_prefix_before_upstream() {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
+            provider: "anthropic".into(),
             upstream_model: "claude-sonnet-4-5".into(),
             canonical_model: "anthropic/claude-sonnet-4-5".into(),
             registry_state_path: None,
@@ -926,6 +1167,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
+            provider: "anthropic".into(),
             upstream_model: "mistral".into(),
             canonical_model: "native/mistral".into(),
             registry_state_path: None,
@@ -956,6 +1198,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
+            provider: "anthropic".into(),
             upstream_model: "mistral".into(),
             canonical_model: "native/mistral".into(),
             registry_state_path: None,
@@ -1005,6 +1248,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
+            provider: "anthropic".into(),
             upstream_model: "gpt-5.5".into(),
             canonical_model: "openai/gpt-5.5".into(),
             registry_state_path: None,
@@ -1071,6 +1315,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(String::new()));
         let provider = ResolvedModelProvider {
             inner: Box::new(CapturingProvider(captured.clone())),
+            provider: "anthropic".into(),
             upstream_model: "gpt-5.5".into(),
             canonical_model: "openai/gpt-5.5".into(),
             registry_state_path: Some(registry_path),

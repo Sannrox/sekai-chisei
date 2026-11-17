@@ -107,6 +107,25 @@ values must not be placed in spans or logs. The durable operation receipt and
 its digest remain the authoritative operation record; exported traces are
 diagnostic only.
 
+Each model call, native or through the gateway, exports one `client` span
+named `chat {model}` under the inbound trace. It carries the GenAI
+attributes below and `sekai.operation_id` when the caller supplied one. It
+never carries prompts, completions, tool arguments, evidence, or provider
+error messages; outcome values that are not short tokens are reported as
+`other`.
+
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.operation.name` | `chat` |
+| `gen_ai.provider.name` | route provider id (`x_ai` for `xai`) |
+| `gen_ai.request.model` | upstream model id sent to the provider |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | provider-reported counts |
+| `gen_ai.response.finish_reasons` | provider stop reason |
+| `error.type` | failure class: `precondition`, `unavailable`, `upstream_error`, or the gateway refusal type |
+
+The response model is not reported: providers' response model fields are not
+parsed today.
+
 The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
 

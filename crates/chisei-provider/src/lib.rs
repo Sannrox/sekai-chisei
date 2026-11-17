@@ -3,6 +3,7 @@ pub mod cost_estimate;
 pub mod embedding;
 pub mod gateway_contract;
 pub mod gateway_keys;
+pub mod genai;
 pub mod llm;
 pub mod model_availability;
 pub mod pricing;

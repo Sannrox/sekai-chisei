@@ -73,6 +73,7 @@ pub(super) fn early_refusal_context(
     capability_snapshot_version: String,
 ) -> UsageContext {
     UsageContext {
+        genai_span: tracing::Span::none(),
         request_id: correlation.request_id.clone(),
         lookup_request_id: correlation.lookup_request_id.clone(),
         caller_scope: correlation.caller_scope.clone(),
