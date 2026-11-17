@@ -58,6 +58,10 @@ producers:
   or change a member or property a valid blocking binding depends on, and
   names each such binding. A blocking binding with a stale digest does not
   block.
+- `GetOntologyHealth` follows the same disclosure for its contract part: it
+  scores and names blocking bindings whatever the caller can see. Like the
+  impact RPC, it applies only after the caller is authorized to read the
+  published definition revision; otherwise the part is unavailable.
 - A proposal created with `major_revision: true` is approved and merged as
   a new major revision and passes the gate. The flag is part of the approved
   proposal digest, so it cannot be added after approval. A replayed merge
