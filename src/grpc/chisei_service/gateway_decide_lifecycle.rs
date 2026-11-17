@@ -455,13 +455,12 @@ impl ChiseiServiceImpl {
                 impact_decision,
             ));
         }
-        let _ = self.db.record_decision(&crate::sekai::audit::Decision {
-            id: format!(
-                "gateway-decide:{}:{}:{}",
-                namespace,
-                domain_request.correlation_operation_id,
-                domain_request.correlation_attempt
-            ),
+        let decision_id = format!(
+            "gateway-decide:{}:{}:{}",
+            namespace, domain_request.correlation_operation_id, domain_request.correlation_attempt
+        );
+        let decision = crate::sekai::audit::Decision {
+            id: decision_id.clone(),
             timestamp: chrono::Utc::now().timestamp_millis(),
             actor,
             action: "gateway.decide".into(),
@@ -477,7 +476,42 @@ impl ChiseiServiceImpl {
             } else {
                 "denied".into()
             },
-        });
+        };
+        // No decision leaves without its audit row. The id is deterministic per
+        // correlation attempt, so a replay whose insert collides with a row that
+        // records the same answer counts as recorded. A replay that now answers
+        // differently has no row of its own and is refused as a precondition
+        // failure: retrying that attempt cannot succeed, a new attempt can.
+        // Evidence the audit ledger refuses (for example caller input shaped
+        // like a secret) is a bad request, not an outage.
+        crate::sekai::audit::validate_decision(&decision).map_err(|error| {
+            Status::invalid_argument(format!("gateway decision cannot be audited: {error}"))
+        })?;
+        if let Err(error) = self.db.record_decision(&decision) {
+            // Everything but the timestamp and free-text reason must match, so a
+            // different principal reusing the correlation id is not covered by
+            // someone else's row.
+            let same_answer = |existing: &crate::sekai::audit::Decision| {
+                existing.actor == decision.actor
+                    && existing.action == decision.action
+                    && existing.target_id == decision.target_id
+                    && existing.outcome == decision.outcome
+                    && existing.evidence == decision.evidence
+            };
+            match self.db.get_decision(&decision_id) {
+                Ok(Some(existing)) if same_answer(&existing) => {}
+                Ok(Some(_)) => {
+                    return Err(Status::failed_precondition(format!(
+                        "gateway decision {decision_id} is already recorded with a different answer; retry with a new correlation attempt"
+                    )));
+                }
+                _ => {
+                    return Err(Status::unavailable(format!(
+                        "gateway decision audit unavailable: {error}"
+                    )));
+                }
+            }
+        }
 
         Ok(response)
     }
