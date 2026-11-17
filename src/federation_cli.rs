@@ -576,7 +576,75 @@ struct ExportSnapshotConfig {
     not_after_ms: Option<i64>,
 }
 
+/// An output path claimed before an export runs. The bundle is written to a
+/// temporary file beside the final path and linked into place without
+/// overwriting, so a failed write never leaves a partial file at the final
+/// path and an existing file is refused before anything is signed or audited.
+struct ReservedOutput {
+    temp: PathBuf,
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+impl ReservedOutput {
+    fn reserve(path: &Path) -> std::io::Result<Self> {
+        let exists_error = || {
+            std::io::Error::other(format!(
+                "output already exists: {} (refusing to overwrite a signed snapshot)",
+                path.display()
+            ))
+        };
+        if std::fs::symlink_metadata(path).is_ok() {
+            return Err(exists_error());
+        }
+        let name = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("output must name a file"))?;
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(name);
+        temp_name.push(format!(".{}.tmp", std::process::id()));
+        let temp = path.with_file_name(temp_name);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        Ok(Self {
+            temp,
+            file,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Writes and syncs the bytes, then links them to the final path. Fails if
+    /// the final path appeared in the meantime. The temporary file is removed
+    /// on every outcome.
+    fn publish(mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let written = std::io::Write::write_all(&mut self.file, bytes)
+            .and_then(|()| self.file.sync_all())
+            .and_then(|()| std::fs::hard_link(&self.temp, &self.path));
+        let _ = std::fs::remove_file(&self.temp);
+        written.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::other(format!(
+                    "output already exists: {} (refusing to overwrite a signed snapshot)",
+                    self.path.display()
+                ))
+            } else {
+                error
+            }
+        })
+    }
+}
+
+impl Drop for ReservedOutput {
+    fn drop(&mut self) {
+        // After `publish` this is a no-op; on an early error it cleans up.
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
 async fn export_snapshot(config: ExportSnapshotConfig) -> Result<(), BoxErr> {
+    let output = ReservedOutput::reserve(&config.output)?;
     let db = open_db().await?;
     let signing_key = load_signing_key(&config.signing_key).map_err(std::io::Error::other)?;
     let bundle = namespace_snapshot::export_namespace_snapshot(
@@ -593,21 +661,7 @@ async fn export_snapshot(config: ExportSnapshotConfig) -> Result<(), BoxErr> {
         Utc::now().timestamp_millis(),
     )
     .map_err(std::io::Error::other)?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config.output)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                std::io::Error::other(format!(
-                    "output already exists: {} (refusing to overwrite a signed snapshot)",
-                    config.output.display()
-                ))
-            } else {
-                error
-            }
-        })?;
-    std::io::Write::write_all(&mut output, &serde_json::to_vec_pretty(&bundle)?)?;
+    output.publish(&serde_json::to_vec_pretty(&bundle)?)?;
     println!("{}", serde_json::to_string_pretty(&bundle.manifest)?);
     Ok(())
 }
@@ -1288,4 +1342,49 @@ fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, St
     args.get(index + 1)
         .cloned()
         .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+#[cfg(test)]
+mod reserved_output_tests {
+    use super::ReservedOutput;
+
+    #[test]
+    fn an_existing_output_is_refused_before_anything_is_reserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, b"signed").unwrap();
+        let error = ReservedOutput::reserve(&path).err().unwrap();
+        assert!(error.to_string().contains("output already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"signed");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn publish_leaves_only_the_final_file_and_never_a_partial_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        ReservedOutput::reserve(&path)
+            .unwrap()
+            .publish(b"bundle")
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"bundle");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // A file that appears after the reservation is not overwritten, and
+        // the temporary file is cleaned up.
+        let racing = dir.path().join("racing.json");
+        let reserved = ReservedOutput::reserve(&racing).unwrap();
+        std::fs::write(&racing, b"other").unwrap();
+        assert!(reserved.publish(b"bundle").is_err());
+        assert_eq!(std::fs::read(&racing).unwrap(), b"other");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn dropping_a_reservation_removes_the_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.json");
+        drop(ReservedOutput::reserve(&path).unwrap());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 }
