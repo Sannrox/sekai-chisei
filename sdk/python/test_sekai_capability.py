@@ -26,7 +26,7 @@ class CapabilityConformanceTest(unittest.TestCase):
         )
         self.assertEqual(native_metadata(call), FIXTURE["expected_metadata"])
         self.assertEqual(
-            normalize_error(call, "permission_denied", "write denied"),
+            normalize_error(call, "permission_denied", FIXTURE["expected_error"]["message"]),
             FIXTURE["expected_error"],
         )
 
