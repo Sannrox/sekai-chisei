@@ -55,8 +55,9 @@ pub use discover::{
     DiscoveredColumn, DiscoveredRecordKind, DiscoverySample, MAX_DISCOVERED_COLUMNS,
     MAX_DISCOVERED_RECORD_KINDS, MAX_DISCOVERY_SAMPLE_ROWS, MIN_INFERRED_REFERENCE_MATCH_BP,
     PROFILE_RATIO_SCALE, ReferenceBasis, ReferenceCandidate, ReferenceEvidence, ReferenceSupport,
-    SOURCE_DISCOVERY_VERSION, SourceDiscovery, SourceInspector, attach_references,
-    cap_discovery_sample, column_name_suggests_sensitive,
+    SOURCE_DISCOVERY_VERSION, SourceDiscovery, SourceInspector, ValueShapeCode, ValueShapeFinding,
+    ValueShapeSupport, attach_references, attach_value_findings, cap_discovery_sample,
+    column_name_suggests_sensitive,
 };
 pub use feed::{
     ChangeFeedPage, ChangeFeedRunError, ChangeFeedSource, ChangeFeedSourceFailure, run_change_feed,

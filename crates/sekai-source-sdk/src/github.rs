@@ -284,6 +284,7 @@ impl SourceInspector for GitHubSource {
             ],
             key_candidates: vec![vec!["number".into()]],
             references: Vec::new(),
+            value_findings: Vec::new(),
         };
         Ok(SourceDiscovery {
             contract_version: SOURCE_DISCOVERY_VERSION.into(),

@@ -50,6 +50,7 @@ impl SourceInspector for FakeSource {
             columns: vec![column("id", false), column("name", true)],
             key_candidates: vec![vec!["id".into()]],
             references: Vec::new(),
+            value_findings: Vec::new(),
         };
         if self.drift && self.discoveries > 1 {
             account.columns.push(column("tier", true));

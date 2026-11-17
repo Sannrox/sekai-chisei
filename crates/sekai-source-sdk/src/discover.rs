@@ -18,6 +18,12 @@
 //! [`SourceInspector::sample_rows`] call per record kind, so the cost does not
 //! grow with the number of column pairs. Sample values are compared in memory;
 //! only counts leave this module.
+//!
+//! [`attach_value_findings`] adds value-shape findings (#2295): hints computed
+//! from the same bounded samples, one `sample_rows` call per record kind. A
+//! finding names a column, a stable code, the rows it saw and the rows that
+//! matched, and the formats involved. It never carries a value, and the
+//! absence of a finding says nothing about the rest of the column.
 
 use crate::contract::{MAX_SOURCE_IDENTIFIER_BYTES, contains_secret_like_text};
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,6 +151,50 @@ pub struct DiscoveredRecordKind {
     /// Reference candidates, ordered by columns then target. Empty until
     /// [`attach_references`] runs; older consumers ignore it.
     pub references: Vec<ReferenceCandidate>,
+    /// Value-shape findings, ordered by column then code. Empty until
+    /// [`attach_value_findings`] runs; older consumers ignore it.
+    pub value_findings: Vec<ValueShapeFinding>,
+}
+
+/// What a sampled column looks like. The strings from [`Self::as_str`] are
+/// stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum ValueShapeCode {
+    MixedTemporalFormat,
+    TemporalAsText,
+    ValueVariants,
+    NullableReference,
+    SoftDeleteCandidate,
+    NumericAsText,
+}
+
+impl ValueShapeCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MixedTemporalFormat => "mixed_temporal_format",
+            Self::TemporalAsText => "temporal_as_text",
+            Self::ValueVariants => "value_variants",
+            Self::NullableReference => "nullable_reference",
+            Self::SoftDeleteCandidate => "soft_delete_candidate",
+            Self::NumericAsText => "numeric_as_text",
+        }
+    }
+}
+
+/// One hint about a column, from the bounded sample. Counts and format names
+/// only; `sampled` says how many rows it saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueShapeFinding {
+    pub column: String,
+    pub code: ValueShapeCode,
+    /// Sampled rows of the record kind.
+    pub sampled: u32,
+    /// Sampled rows the finding rests on: parsed values, distinct spellings
+    /// that collapse, or rows with a missing value.
+    pub matched: u32,
+    /// Temporal format names, in ascending order; empty for other codes.
+    pub formats: Vec<&'static str>,
 }
 
 /// Why a reference candidate is reported.
@@ -398,6 +448,171 @@ pub fn attach_references<S: SourceInspector>(
     Ok(ReferenceSupport::Attached)
 }
 
+/// Whether the source sampled at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValueShapeSupport {
+    /// No record kind could be sampled, so no finding was computed.
+    SamplesUnavailable,
+    Attached,
+}
+
+/// Fill `value_findings` on every record kind of `discovery` from the bounded
+/// samples. Run [`attach_references`] first to get `nullable_reference`
+/// findings. Deterministic for unchanged data.
+pub fn attach_value_findings<S: SourceInspector>(
+    inspector: &mut S,
+    discovery: &mut SourceDiscovery,
+) -> Result<ValueShapeSupport, ConnectionFailure> {
+    let mut sampled_any = false;
+    for kind in &mut discovery.record_kinds {
+        kind.value_findings.clear();
+        let DiscoverySample::Rows { cells } =
+            cap_discovery_sample(inspector.sample_rows(&kind.record_kind)?)
+        else {
+            continue;
+        };
+        sampled_any = true;
+        let mut findings = Vec::new();
+        for column in &kind.columns {
+            column_findings(column, &cells, &mut findings);
+        }
+        for reference in &kind.references {
+            let [column] = reference.columns.as_slice() else {
+                continue;
+            };
+            let missing = nulls(&cells, &reference.columns);
+            if missing > 0 && (missing as usize) < cells.len() {
+                findings.push(ValueShapeFinding {
+                    column: column.clone(),
+                    code: ValueShapeCode::NullableReference,
+                    sampled: cells.len() as u32,
+                    matched: missing,
+                    formats: Vec::new(),
+                });
+            }
+        }
+        findings.sort_by(|a, b| (&a.column, a.code).cmp(&(&b.column, b.code)));
+        kind.value_findings = findings;
+    }
+    Ok(if sampled_any {
+        ValueShapeSupport::Attached
+    } else {
+        ValueShapeSupport::SamplesUnavailable
+    })
+}
+
+fn column_findings(
+    column: &DiscoveredColumn,
+    rows: &[BTreeMap<String, String>],
+    findings: &mut Vec<ValueShapeFinding>,
+) {
+    let sampled = rows.len() as u32;
+    let values: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| cell(row, &column.name))
+        .collect();
+    let missing = sampled - values.len() as u32;
+    let finding = |code, matched, formats| ValueShapeFinding {
+        column: column.name.clone(),
+        code,
+        sampled,
+        matched,
+        formats,
+    };
+    let data_type = column.data_type.to_ascii_lowercase();
+    let is_text = ["char", "text", "string"]
+        .iter()
+        .any(|word| data_type.contains(word));
+    let is_temporal = ["date", "time"].iter().any(|word| data_type.contains(word));
+    let is_boolean = data_type.contains("bool");
+
+    if is_text && !values.is_empty() {
+        let formats: Vec<Option<&'static str>> =
+            values.iter().map(|value| temporal_format(value)).collect();
+        let parsed: BTreeSet<&'static str> = formats.iter().flatten().copied().collect();
+        let temporal_rows = formats.iter().flatten().count() as u32;
+        if parsed.len() > 1 {
+            findings.push(finding(
+                ValueShapeCode::MixedTemporalFormat,
+                temporal_rows,
+                parsed.into_iter().collect(),
+            ));
+        } else if parsed.len() == 1 && temporal_rows as usize == values.len() {
+            findings.push(finding(
+                ValueShapeCode::TemporalAsText,
+                temporal_rows,
+                parsed.into_iter().collect(),
+            ));
+        } else if values
+            .iter()
+            .all(|value| value.parse::<f64>().is_ok_and(f64::is_finite))
+        {
+            findings.push(finding(
+                ValueShapeCode::NumericAsText,
+                values.len() as u32,
+                Vec::new(),
+            ));
+        } else if parsed.is_empty() {
+            let raw: BTreeSet<&str> = values.iter().copied().collect();
+            let folded: BTreeSet<String> = raw
+                .iter()
+                .map(|value| value.trim().to_lowercase())
+                .collect();
+            if folded.len() < raw.len() {
+                findings.push(finding(
+                    ValueShapeCode::ValueVariants,
+                    raw.len() as u32,
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+    let marker = ["delete", "removed", "archived"]
+        .iter()
+        .any(|word| column.name.to_ascii_lowercase().contains(word));
+    let mostly_missing = u64::from(missing) * 2 >= u64::from(sampled) && sampled > 0;
+    if column.nullable && marker && ((is_temporal && mostly_missing) || is_boolean) {
+        findings.push(finding(
+            ValueShapeCode::SoftDeleteCandidate,
+            missing,
+            Vec::new(),
+        ));
+    }
+}
+
+/// The temporal format of a value, or `None`. Shapes are checked by digit
+/// layout and plausible month and day ranges, not by a calendar.
+fn temporal_format(value: &str) -> Option<&'static str> {
+    let digits_at = |range: std::ops::Range<usize>| -> Option<u32> {
+        value
+            .get(range)?
+            .parse()
+            .ok()
+            .filter(|_| value.is_char_boundary(0))
+    };
+    let shape: String = value
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '9' } else { c })
+        .collect();
+    let plausible = |month: Option<u32>, day: Option<u32>| {
+        matches!(month, Some(1..=12)) && matches!(day, Some(1..=31))
+    };
+    match shape.as_str() {
+        "9999-99-99" if plausible(digits_at(5..7), digits_at(8..10)) => Some("iso_date"),
+        "99.99.9999" if plausible(digits_at(3..5), digits_at(0..2)) => Some("dotted_date"),
+        "99/99/9999" if plausible(digits_at(0..2), digits_at(3..5)) => Some("slash_date"),
+        "99:99" | "99:99:99" => Some("time"),
+        _ if (shape.starts_with("9999-99-99T") || shape.starts_with("9999-99-99 "))
+            && shape[11..].starts_with("99:99")
+            && plausible(digits_at(5..7), digits_at(8..10)) =>
+        {
+            Some("iso_datetime")
+        }
+        _ => None,
+    }
+}
+
 fn nullable(kind: &DiscoveredRecordKind, columns: &[String]) -> bool {
     kind.columns
         .iter()
@@ -500,6 +715,13 @@ fn validate_record_kind(kind: &DiscoveredRecordKind) -> Result<(), String> {
             return Err("profile ratios must be within 0..=10000 basis points".into());
         }
     }
+    if kind
+        .value_findings
+        .iter()
+        .any(|finding| !names.contains(finding.column.as_str()))
+    {
+        return Err("value findings must name declared columns".into());
+    }
     let mut candidates = BTreeSet::new();
     for candidate in &kind.key_candidates {
         let mut seen = BTreeSet::new();
@@ -563,6 +785,7 @@ mod tests {
                     columns: vec![column("id"), column("region")],
                     key_candidates: vec![vec!["id".into()], vec!["region".into(), "id".into()]],
                     references: Vec::new(),
+                    value_findings: Vec::new(),
                 })
                 .collect(),
         }
@@ -689,6 +912,7 @@ mod tests {
                     .collect(),
                 key_candidates: vec![vec!["id".into()]],
                 references: Vec::new(),
+                value_findings: Vec::new(),
             };
             Ok(SourceDiscovery {
                 contract_version: SOURCE_DISCOVERY_VERSION.into(),
@@ -852,5 +1076,195 @@ mod tests {
                 evidence: None,
             });
         assert!(discovery.validate().is_err());
+    }
+
+    /// One seeded instance of every shape, plus clean columns.
+    struct Shapes {
+        samples: bool,
+    }
+
+    impl SourceInspector for Shapes {
+        fn check(&mut self) -> Result<(), ConnectionFailure> {
+            Ok(())
+        }
+
+        fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+            let typed = |name: &str, data_type: &str, nullable| DiscoveredColumn {
+                data_type: data_type.into(),
+                nullable,
+                ..column(name)
+            };
+            let kind = |name: &str, columns: Vec<DiscoveredColumn>| DiscoveredRecordKind {
+                record_kind: name.into(),
+                schema_revision: "v1".into(),
+                columns,
+                key_candidates: vec![vec!["id".into()]],
+                references: Vec::new(),
+                value_findings: Vec::new(),
+            };
+            Ok(SourceDiscovery {
+                contract_version: SOURCE_DISCOVERY_VERSION.into(),
+                source: "fake.crm".into(),
+                record_kinds: vec![
+                    kind(
+                        "Customer",
+                        vec![
+                            typed("id", "bigint", false),
+                            typed("name", "text", false),
+                            typed("signup", "text", false),
+                            typed("created", "text", false),
+                            typed("status", "text", false),
+                            typed("amount", "text", false),
+                            typed("quantity", "integer", false),
+                            typed("region_id", "text", true),
+                            typed("deleted_at", "timestamp", true),
+                        ],
+                    ),
+                    kind("Region", vec![typed("id", "text", false)]),
+                ],
+            })
+        }
+
+        fn sample_rows(&mut self, record_kind: &str) -> Result<DiscoverySample, ConnectionFailure> {
+            if !self.samples {
+                return Ok(DiscoverySample::Unsupported);
+            }
+            let cells = match record_kind {
+                "Customer" => rows(
+                    &[
+                        "id",
+                        "name",
+                        "signup",
+                        "created",
+                        "status",
+                        "amount",
+                        "quantity",
+                        "region_id",
+                        "deleted_at",
+                    ],
+                    &[
+                        &[
+                            "1",
+                            "Ann",
+                            "2024-03-01",
+                            "2024-03-01",
+                            "Active",
+                            "12.5",
+                            "3",
+                            "r1",
+                            "",
+                        ],
+                        &[
+                            "2",
+                            "Bob",
+                            "01.03.2024",
+                            "2024-03-02",
+                            "active ",
+                            "7",
+                            "4",
+                            "",
+                            "",
+                        ],
+                        &[
+                            "3",
+                            "Cyd",
+                            "2024-04-02",
+                            "2024-03-03",
+                            "ACTIVE",
+                            "3",
+                            "5",
+                            "r2",
+                            "2024-05-01",
+                        ],
+                        &[
+                            "4",
+                            "Dee",
+                            "03.04.2024",
+                            "2024-03-04",
+                            "Closed",
+                            "40",
+                            "6",
+                            "",
+                            "",
+                        ],
+                    ],
+                ),
+                "Region" => rows(&["id"], &[&["r1"], &["r2"], &["r3"]]),
+                _ => return Ok(DiscoverySample::Unsupported),
+            };
+            Ok(DiscoverySample::Rows { cells })
+        }
+    }
+
+    #[test]
+    fn value_findings_flag_each_shape_with_counts_and_no_values() {
+        let mut source = Shapes { samples: true };
+        let mut discovery = source.discover().unwrap();
+        attach_references(&mut source, &mut discovery).unwrap();
+        assert_eq!(
+            attach_value_findings(&mut source, &mut discovery).unwrap(),
+            ValueShapeSupport::Attached
+        );
+        discovery.validate().unwrap();
+        let found: Vec<_> = discovery
+            .record_kinds
+            .iter()
+            .flat_map(|kind| &kind.value_findings)
+            .map(|finding| {
+                (
+                    finding.column.as_str(),
+                    finding.code.as_str(),
+                    finding.sampled,
+                    finding.matched,
+                    finding.formats.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("amount", "numeric_as_text", 4, 4, vec![]),
+                ("created", "temporal_as_text", 4, 4, vec!["iso_date"]),
+                ("deleted_at", "soft_delete_candidate", 4, 3, vec![]),
+                ("region_id", "nullable_reference", 4, 2, vec![]),
+                (
+                    "signup",
+                    "mixed_temporal_format",
+                    4,
+                    4,
+                    vec!["dotted_date", "iso_date"]
+                ),
+                ("status", "value_variants", 4, 4, vec![]),
+            ],
+            "name, quantity and the Region columns are clean"
+        );
+        let output = format!("{discovery:?}");
+        for value in [
+            "2024-03-01",
+            "01.03.2024",
+            "ACTIVE",
+            "Closed",
+            "12.5",
+            "Ann",
+            "r2",
+        ] {
+            assert!(!output.contains(value), "{value} leaked into the discovery");
+        }
+    }
+
+    #[test]
+    fn value_findings_say_when_samples_are_unavailable() {
+        let mut source = Shapes { samples: false };
+        let mut discovery = source.discover().unwrap();
+        assert_eq!(
+            attach_value_findings(&mut source, &mut discovery).unwrap(),
+            ValueShapeSupport::SamplesUnavailable
+        );
+        assert!(
+            discovery
+                .record_kinds
+                .iter()
+                .all(|kind| kind.value_findings.is_empty())
+        );
     }
 }
