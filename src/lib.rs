@@ -104,6 +104,7 @@ pub mod source_webhook_cli;
 pub mod store_relocate;
 pub mod substitution_report;
 pub mod team_cli;
+pub mod value_flags;
 pub mod warehouse_projection_cli;
 pub mod weekly_report;
 pub mod weekly_report_cli;
