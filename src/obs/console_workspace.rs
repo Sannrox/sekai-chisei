@@ -26,6 +26,13 @@ pub const WORKSPACE_INITIAL_LOAD_BUDGET_MS: u128 = 2_000;
 /// Max operations returned on the namespace operations home.
 pub const OPERATIONS_LIST_LIMIT: usize = 50;
 
+/// Most receipts one list request reads before filtering to what the caller
+/// may view: the store's per-query maximum. Reading only `OPERATIONS_LIST_LIMIT`
+/// would let other principals' receipts crowd out the caller's own. A window
+/// holding more than this many receipts can still hide the caller's oldest
+/// ones; the list is a recent-activity view, not an audit export.
+const OPERATIONS_LIST_SCAN_LIMIT: usize = 5_000;
+
 /// Look-back window for the operations list (7 days).
 pub const OPERATIONS_LIST_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -161,11 +168,12 @@ pub fn list_visible_operations(
     let start = now_ms.saturating_sub(OPERATIONS_LIST_WINDOW_MS);
     let end = now_ms.saturating_add(1);
     let receipts = db
-        .list_operation_receipts_in_window(namespace, start, end, OPERATIONS_LIST_LIMIT)
+        .list_operation_receipts_in_window(namespace, start, end, OPERATIONS_LIST_SCAN_LIMIT)
         .map_err(|_| WorkspaceError::Internal)?;
     Ok(receipts
         .into_iter()
         .filter(|receipt| principal_can_view_receipt(principal, receipt))
+        .take(OPERATIONS_LIST_LIMIT)
         .map(|receipt| OperationListItem {
             operation_id: receipt.operation_id,
             operation_class: receipt.operation_class,
@@ -553,6 +561,32 @@ mod tests {
                 || html.contains("demo.cap")
                 || html.contains("Causal path")
         );
+    }
+
+    // #2447
+    #[test]
+    fn other_principals_operations_do_not_crowd_out_the_callers_own() {
+        let db = test_db();
+        seed_ns(&db, "alpha", "alice");
+        seed_ns(&db, "alpha", "bob");
+        let base = chrono::Utc::now().timestamp_millis() - 10_000;
+        for index in 0..=OPERATIONS_LIST_LIMIT as i64 + 10 {
+            let mut receipt = sample_receipt("alpha", &format!("op-alice-{index:03}"), "alice");
+            receipt.started_at_ms = base + index;
+            db.put_operation_receipt(&receipt).unwrap();
+        }
+        // Newer than every one of alice's receipts, so a limit applied
+        // before the visibility filter would never reach it.
+        let mut bobs = sample_receipt("alpha", "op-bob", "bob");
+        bobs.started_at_ms = base + 1_000;
+        db.put_operation_receipt(&bobs).unwrap();
+
+        let bob_list = list_visible_operations(&db, "bob", "alpha").unwrap();
+        assert_eq!(bob_list.len(), 1);
+        assert_eq!(bob_list[0].operation_id, "op-bob");
+
+        let alice_list = list_visible_operations(&db, "alice", "alpha").unwrap();
+        assert_eq!(alice_list.len(), OPERATIONS_LIST_LIMIT);
     }
 
     #[test]
