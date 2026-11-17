@@ -5,6 +5,53 @@ use sekai_chisei::ext::ChiseiSekaiDbExt;
 const DEFAULT_CONTEXT_ADMISSION_POLICY_JSON: &str = r#"{"contract_version":"chisei.context-admission/v1","default_action":"include","unknown_action":"hold_out","rules":[]}"#;
 
 #[test]
+fn key_cache_stays_bounded_and_keeps_known_keys() {
+    let ttl = Duration::from_secs(30);
+    let negative = || KeyCacheEntry {
+        identity: None,
+        cached_at: Instant::now(),
+    };
+    let known = || KeyCacheEntry {
+        identity: Some(GatewayIdentity {
+            agent: "alice".into(),
+            project: "acme".into(),
+            user_id: "agent:alice".into(),
+            key_id: "alice-key".into(),
+            tier: DEFAULT_GATEWAY_TIER.into(),
+        }),
+        cached_at: Instant::now(),
+    };
+    let mut cache = HashMap::new();
+    insert_bounded_key_cache_entry(&mut cache, ttl, 3, "known".into(), known());
+    for n in 0..100 {
+        insert_bounded_key_cache_entry(&mut cache, ttl, 3, format!("unknown-{n}"), negative());
+        assert!(cache.len() <= 3);
+    }
+    assert!(
+        cache
+            .get("known")
+            .is_some_and(|entry| entry.identity.is_some())
+    );
+
+    // Expired entries make room before live ones are dropped.
+    let mut cache = HashMap::new();
+    let expired = KeyCacheEntry {
+        identity: None,
+        cached_at: Instant::now() - Duration::from_secs(60),
+    };
+    cache.insert("expired".to_string(), expired);
+    insert_bounded_key_cache_entry(&mut cache, ttl, 2, "a".into(), known());
+    insert_bounded_key_cache_entry(&mut cache, ttl, 2, "b".into(), known());
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("expired"));
+
+    // A cache full of known keys refuses new entries instead of growing.
+    insert_bounded_key_cache_entry(&mut cache, ttl, 2, "c".into(), known());
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains_key("c"));
+}
+
+#[test]
 fn only_registered_gateway_identities_can_delegate_principals() {
     let registered = GatewayIdentity {
         agent: "alice".into(),
