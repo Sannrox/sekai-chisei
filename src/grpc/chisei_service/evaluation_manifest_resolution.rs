@@ -76,7 +76,7 @@ fn object_visible_to_actor(db: &RuntimeDb, object: &Object, actor: &str) -> Resu
     )
 }
 
-fn invariant_reference_visible(
+pub(super) fn invariant_reference_visible(
     db: &RuntimeDb,
     namespace: &str,
     invariant_id: &str,
@@ -86,11 +86,18 @@ fn invariant_reference_visible(
 ) -> Result<bool, String> {
     const MAX_VISIBILITY_OBJECTS: usize = 4_096;
     let mut pending = vec![invariant_id.to_string()];
+    // Objects walked by this call. They are cached visible only once the whole
+    // closure is, so an early return never leaves a partly checked object
+    // cached as visible for a later fact or waiver.
+    let mut walked = HashSet::new();
     while let Some(object_id) = pending.pop() {
         if let Some(visible) = visibility_cache.get(&object_id) {
             if !visible {
                 return Ok(false);
             }
+            continue;
+        }
+        if !walked.insert(object_id.clone()) {
             continue;
         }
         *visibility_work += 1;
@@ -105,7 +112,6 @@ fn invariant_reference_visible(
             visibility_cache.insert(object_id, false);
             return Ok(false);
         }
-        visibility_cache.insert(object_id, true);
         if object.kind == governed_fact_domain::FACT_KIND {
             let fact = governed_fact_domain::fact_from_object(&object)?;
             pending.extend(fact.input.requirement_version_ids);
@@ -122,6 +128,7 @@ fn invariant_reference_visible(
             }
         }
     }
+    visibility_cache.extend(walked.into_iter().map(|object_id| (object_id, true)));
     Ok(true)
 }
 
