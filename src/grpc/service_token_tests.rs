@@ -189,18 +189,15 @@ async fn valid_credentials_issue_a_token_that_authenticates_as_the_service_princ
 }
 
 #[tokio::test]
-async fn invalid_credentials_are_refused() {
+async fn unknown_principals_and_wrong_secrets_are_refused_alike() {
     let plane = plane(true);
+    let unknown = issue(&plane, "worker-a", "secret-ok").await.unwrap_err();
     register(&plane).await;
-    let status = issue(&plane, "worker-a", "wrong").await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
-}
-
-#[tokio::test]
-async fn unregistered_principal_is_refused() {
-    let plane = plane(true);
-    let status = issue(&plane, "worker-a", "secret-ok").await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::NotFound);
+    let wrong_secret = issue(&plane, "worker-a", "wrong").await.unwrap_err();
+    for status in [&unknown, &wrong_secret] {
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+    assert_eq!(unknown.message(), wrong_secret.message());
 }
 
 #[tokio::test]
