@@ -1433,6 +1433,33 @@ fn setup_user_scope_creates_the_user_database_without_indexing() {
 }
 
 #[test]
+fn setup_that_cannot_resolve_the_skill_directory_changes_nothing() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+    command
+        .args(["setup"])
+        .current_dir(&project)
+        .env_remove("HOME")
+        .env_remove("SEKAI_DB")
+        .env_remove("SEKAI_SKILL_PATH");
+    #[cfg(not(target_os = "macos"))]
+    command.env_remove("XDG_DATA_HOME");
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot resolve a user skill directory")
+    );
+    assert!(
+        !project.join(".sekai").exists(),
+        "a refused setup must not create the database"
+    );
+}
+
+#[test]
 fn setup_rejects_index_flags_without_indexing_and_keeps_json_stdout_clean() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("home");
