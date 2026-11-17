@@ -12,20 +12,18 @@ fails when the crate version did not major. No waiver at release time.
 
     python3 scripts/check-semver.py pr
     python3 scripts/check-semver.py release
-    python3 scripts/check-semver.py --self-test
+
+Unit tests: scripts/tests/release/test_check_semver.py.
 """
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import pathlib
 import re
 import subprocess
 import sys
-import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BANG_TITLE = re.compile(r"^[a-z]+(\([^)]*\))?!:")
@@ -383,7 +381,7 @@ def run_pr() -> int:
 
 def run_release() -> int:
     # HEAD may already carry this release's tag; start from the parent so the
-    # previous final v* tag is the baseline (same trick as release-package.sh).
+    # previous final v* tag is the baseline (same trick as scripts/release/package.sh).
     describe_rev = os.environ.get("CHECK_SEMVER_TAG_REV") or "HEAD^"
     tag = last_final_tag(describe_rev)
     if tag is None:
@@ -412,193 +410,12 @@ def run_release() -> int:
     return evaluate_release(vs_tag, versions, tag)
 
 
-def self_test() -> None:
-    assert breaking_waiver("fix!: break", "", ["risk:breaking"])
-    assert breaking_waiver("fix(api)!: break", "", ["risk:breaking"])
-    assert breaking_waiver(
-        "fix: break", "### Breaking\n\nok\n", ["risk:breaking"]
-    )
-    assert breaking_waiver(
-        "fix: break", "### Upgrade\n\nok\n", ["risk:breaking"]
-    )
-    assert breaking_waiver(
-        "fix: break", "BREAKING CHANGE: gone\n", ["risk:breaking"]
-    )
-    assert not breaking_waiver("fix!: break", "", [])
-    assert not breaking_waiver("fix: break", "### Breaking\n", [])
-    assert not breaking_waiver("fix: break", "", ["risk:breaking"])
-    assert not breaking_waiver("fix: break", "mentions Breaking inside prose", ["risk:breaking"])
-
-    assert classify_semver_output("ok", 0) == "ok"
-    assert (
-        classify_semver_output("semver requires new major version\n", 1) == "major"
-    )
-    assert (
-        classify_semver_output("semver requires new minor version\n", 1) == "minor"
-    )
-    assert classify_semver_output("rustc exploded", 2) == "error"
-
-    assert crate_major("1.5.0") == 1
-    assert crate_major("v2.0.0") == 2
-    assert major_bumped("2.0.0", "1.5.0")
-    assert not major_bumped("1.6.0", "1.5.0")
-    assert not major_bumped("1.5.0", "1.5.0")
-    assert toml_package_version('[package]\nname = "x"\nversion = "1.4.0"\n') == "1.4.0"
-
-    sample = (
-        "/// docs\n"
-        "#[derive(Debug)]\n"
-        "#[non_exhaustive]\n"
-        "pub enum Marked {}\n"
-        "\n"
-        "#[derive(Clone)]\n"
-        "pub enum Bare {}\n"
-        "pub(crate) enum Hidden {}\n"
-        "    pub enum Nested {}\n"
-        "// pub enum Commented {}\n"
-    )
-    enums = public_enums(sample)
-    assert ("Marked", True) in enums, enums
-    assert ("Bare", False) in enums, enums
-    assert ("Nested", False) in enums, enums
-    assert ("SameLine", True) in public_enums("#[non_exhaustive] pub enum SameLine {}\n")
-    assert all(name != "Hidden" for name, _ in enums), enums
-    assert all(name != "Commented" for name, _ in enums), enums
-
-    base = {("src/lib.rs", "Old"): False}
-    head = {
-        ("src/lib.rs", "Old"): False,
-        ("src/lib.rs", "New"): False,
-        ("src/other.rs", "Ok"): True,
-    }
-    assert new_enums_missing_non_exhaustive(base, head) == ["src/lib.rs::New"]
-    head["src/lib.rs", "New"] = True
-    assert new_enums_missing_non_exhaustive(base, head) == []
-
-    def quiet(fn, *args, **kwargs):
-        with contextlib.redirect_stdout(io.StringIO()):
-            return fn(*args, **kwargs)
-
-    rc = quiet(evaluate_pr, {"demo": "major"}, waived=False, missing_enums=[])
-    assert rc == 1
-    rc = quiet(evaluate_pr, {"demo": "major"}, waived=True, missing_enums=[])
-    assert rc == 0
-    rc = quiet(
-        evaluate_pr, {"demo": "ok"}, waived=False, missing_enums=["src/lib.rs::New"]
-    )
-    assert rc == 1
-    rc = quiet(evaluate_pr, {"demo": "error"}, waived=False, missing_enums=[])
-    assert rc == 1
-    rc = quiet(evaluate_pr, {"demo": "minor"}, waived=False, missing_enums=[])
-    assert rc == 0
-
-    rc = quiet(
-        evaluate_release,
-        {"demo": "major"},
-        {"demo": ("1.5.0", "1.5.0")},
-        "v1.5.0",
-    )
-    assert rc == 1
-    rc = quiet(
-        evaluate_release,
-        {"demo": "major"},
-        {"demo": ("2.0.0", "1.5.0")},
-        "v1.5.0",
-    )
-    assert rc == 0
-    rc = quiet(
-        evaluate_release, {"demo": "ok"}, {"demo": ("1.5.0", "1.5.0")}, "v1.5.0"
-    )
-    assert rc == 0
-    rc = quiet(
-        evaluate_release, {"demo": "error"}, {"demo": ("2.0.0", "1.5.0")}, "v1.5.0"
-    )
-    assert rc == 1
-
-    with tempfile.TemporaryDirectory() as tmp:
-        work = pathlib.Path(tmp) / "work"
-        work.mkdir()
-        subprocess.run(["git", "init", "-q"], cwd=work, check=True)
-        subprocess.run(["git", "config", "user.email", "check-semver@example.invalid"], cwd=work, check=True)
-        subprocess.run(["git", "config", "user.name", "check-semver"], cwd=work, check=True)
-        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=work, check=True)
-        subprocess.run(["git", "config", "tag.gpgSign", "false"], cwd=work, check=True)
-        (work / "README").write_text("a\n")
-        subprocess.run(["git", "add", "README"], cwd=work, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "first"], cwd=work, check=True)
-        first = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=work, text=True).strip()
-        subprocess.run(["git", "tag", "-a", "v1.5.0", "-m", "v1.5.0", first], cwd=work, check=True)
-        subprocess.run(["git", "tag", "-a", "v1.6.0-rc.1", "-m", "rc", first], cwd=work, check=True)
-        (work / "README").write_text("b\n")
-        subprocess.run(["git", "commit", "-q", "-am", "second"], cwd=work, check=True)
-        proc = subprocess.run(
-            [
-                "git",
-                "describe",
-                "--tags",
-                "--abbrev=0",
-                "--match",
-                "v*",
-                "--exclude",
-                "*-*",
-                "HEAD^",
-            ],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert proc.stdout.strip() == "v1.5.0", proc.stdout
-        subprocess.run(["git", "tag", "-a", "v1.6.0", "-m", "v1.6.0"], cwd=work, check=True)
-        proc = subprocess.run(
-            [
-                "git",
-                "describe",
-                "--tags",
-                "--abbrev=0",
-                "--match",
-                "v*",
-                "--exclude",
-                "*-*",
-                "HEAD",
-            ],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert proc.stdout.strip() == "v1.6.0", proc.stdout
-        proc = subprocess.run(
-            [
-                "git",
-                "describe",
-                "--tags",
-                "--abbrev=0",
-                "--match",
-                "v*",
-                "--exclude",
-                "*-*",
-                "HEAD^",
-            ],
-            cwd=work,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert proc.stdout.strip() == "v1.5.0", proc.stdout
-
-    print("check-semver self-test passed")
-
-
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-        return
     if argv == ["pr"]:
         raise SystemExit(run_pr())
     if argv == ["release"]:
         raise SystemExit(run_release())
-    raise SystemExit("usage: check-semver.py {pr|release|--self-test}")
+    raise SystemExit("usage: check-semver.py {pr|release}")
 
 
 if __name__ == "__main__":

@@ -150,10 +150,10 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 `release.yml` refuses a tagged run that does not start from `main`. It then:
 
 - checks out the tag and fetches the annotated tag object
-- verifies the signed tag with main's `scripts/verify-release-tag.sh` and
+- verifies the signed tag with main's `scripts/release/verify-tag.sh` and
   main's allowed keys against the tagged commit's `Cargo.toml`
 - requires the tagged commit to be on `main` or on the tag's maintenance line
-  (`verify-release-tag.sh ancestry`), and marks a line-only release so it is
+  (`verify-tag.sh ancestry`), and marks a line-only release so it is
   never published as latest
 - builds, packages, tags images, and writes the manifest `git_sha` from that
   commit, and creates the release with `gh release create <tag> --verify-tag`
@@ -173,16 +173,39 @@ gh workflow run release.yml --ref main -f tag=vX.Y.Z
 A retry picks up fixes to `release.yml` and to the tag verifier and keys.
 Everything else (the release and image scripts, `CHANGELOG.md`, and the
 sources) comes from the tagged commit, so a bug there needs a new rc or patch
-version.
+version. A maintenance line cut before `scripts/release/` existed needs that
+directory backported before its next tag.
 
-A re-run resumes the draft release and replaces its assets. Every job that
-uploads, pushes an image, or publishes refuses a release that is already
-published, so neither a new run nor "Re-run failed jobs" on an old one can
-change it; cut a new version instead. One run per tag executes at a time.
+A re-run resumes the draft release and replaces its assets. Every change to
+a GitHub Release goes through `scripts/release/github-release.sh`, and every
+job that uploads, pushes an image, attests, or publishes first runs its
+`guard`, which refuses a release that is already published or cannot be
+read. Neither a new run nor "Re-run failed jobs" on an old one can change a
+published release; cut a new version instead. One run per tag executes at a
+time.
 
 Pull requests and `workflow_dispatch` without a tag dry-run the family
 scripts on that ref. Dry runs never mint attestations, push images, or touch a
 GitHub Release.
+
+## Checking the release path
+
+The same commands run in CI and locally:
+
+```sh
+bash scripts/check-workflows.sh
+python3 -m pip install --require-hashes -r scripts/tests/requirements.txt
+python3 -m unittest discover -s scripts/tests -t scripts -v
+```
+
+`check-workflows.sh` runs the pinned workflow linter and workflow security
+auditor over `.github/workflows/`. A finding is fixed, or suppressed inline
+with the reason on the line above. The unit tests in `scripts/tests/release/`
+cover each release script and assert the release invariants on the parsed
+workflow YAML: the dispatcher only starts `release.yml` from `main`, the
+release never runs on push, every job after `verify-tag` builds the verified
+commit, every mutating job runs the guard first, publish waits for every other
+job, and write permissions stay job scoped.
 
 ## Provenance
 

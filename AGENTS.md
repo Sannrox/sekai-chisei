@@ -164,6 +164,7 @@ Rows beyond `## Testing Guidelines`:
 | persistence | fresh and upgrade behavior; SQLite/PostgreSQL alignment where implemented, PostgreSQL through `scripts/postgres-conformance.sh` |
 | configuration | parsing/default tests, `.env.example`, configuration docs |
 | ADRs | `sh scripts/adr-index.sh --check` |
+| workflows / release scripts | `bash scripts/check-workflows.sh`; `python3 -m unittest discover -s scripts/tests -t scripts` (pyyaml from `scripts/tests/requirements.txt`) |
 | Skills / `AGENTS.md` | `bash scripts/validate-workflow-skills.sh` (it also checks that `CLAUDE.md` links to `AGENTS.md`) |
 
 Unit or mocked tests do not establish live provider, gateway transport,

@@ -81,53 +81,10 @@ def bom_from_metadata(meta: dict) -> dict:
     return bom
 
 
-def self_test() -> None:
-    meta = {
-        "workspace_members": [f"{ROOT_NAME} 1.4.0 (path+file:///workspace)"],
-        "packages": [
-            {
-                "id": f"{ROOT_NAME} 1.4.0 (path+file:///workspace)",
-                "name": ROOT_NAME,
-                "version": "1.4.0",
-                "license": "Apache-2.0",
-            },
-            {
-                "id": "libc 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
-                "name": "libc",
-                "version": "0.2.0",
-                "license": "MIT OR Apache-2.0",
-            },
-            {
-                "id": "foo 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
-                "name": "foo",
-                "version": "1.0.0",
-                "license": "MIT",
-            },
-        ],
-    }
-    bom = bom_from_metadata(meta)
-    assert bom["bomFormat"] == "CycloneDX"
-    assert bom["metadata"]["component"]["version"] == "1.4.0"
-    assert bom["metadata"]["component"]["type"] == "application"
-    serial = bom["serialNumber"]
-    assert uuid.UUID(serial.removeprefix("urn:uuid:")).version == 5
-    assert serial.startswith("urn:uuid:")
-    assert bom_from_metadata(meta)["serialNumber"] == serial
-    meta["packages"][1]["version"] = "0.2.1"
-    assert bom_from_metadata(meta)["serialNumber"] != serial
-    by_name = {item["name"]: item for item in bom["components"]}
-    assert by_name["libc"]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
-    assert by_name["foo"]["licenses"] == [{"license": {"id": "MIT"}}]
-    print("release-sbom self-test passed")
-
-
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-        return
     if len(argv) != 1:
-        raise SystemExit("usage: release-sbom.py OUT")
-    root = Path(__file__).resolve().parent.parent
+        raise SystemExit("usage: sbom.py OUT")
+    root = Path(__file__).resolve().parents[2]
     bom = bom_from_metadata(cargo_metadata(root))
     out = Path(argv[0])
     out.write_text(json.dumps(bom, indent=2) + "\n")
