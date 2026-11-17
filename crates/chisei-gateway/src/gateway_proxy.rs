@@ -96,7 +96,9 @@ pub(super) async fn proxy_gateway_inner(
             "canary admission requires an operator-managed low-risk identity and an explicit bounded task class",
         );
     }
-    let scoped = proxy_gateway_inner_scoped(
+    // Boxed so the scope wrappers below move a pointer, not the whole
+    // operation future, through their stack frames.
+    let scoped = Box::pin(proxy_gateway_inner_scoped(
         state,
         uri,
         method,
@@ -104,7 +106,7 @@ pub(super) async fn proxy_gateway_inner(
         request,
         correlation,
         identity_context,
-    );
+    ));
     crate::provider_profile::with_provider_registry_snapshot(registry, async move {
         if canary_requested {
             crate::provider_profile::with_canary_admission(scoped).await
@@ -869,13 +871,17 @@ pub(super) async fn proxy_gateway_inner_scoped(
             &request_model,
             Some(&usage_context.operation_id),
         );
-        let send_result = send_upstream_with_resilience(
-            &state.runtime,
-            prepared.provider,
-            upstream,
-            &contact_guard,
+        // Boxed: the proxy future already sits close to the default test
+        // thread stack, and the instrumented send would add to every poll frame.
+        let send_result = Box::pin(
+            send_upstream_with_resilience(
+                &state.runtime,
+                prepared.provider,
+                upstream,
+                &contact_guard,
+            )
+            .instrument(usage_context.genai_span.clone()),
         )
-        .instrument(usage_context.genai_span.clone())
         .await;
 
         // Mid-request failover only when the first provider never received work:
