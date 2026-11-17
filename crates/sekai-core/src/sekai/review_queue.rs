@@ -127,7 +127,10 @@ impl ReviewQueueSpec {
     }
 }
 
-/// Whether a parked instance of this type belongs on the named queue.
+/// Whether a parked instance of this type belongs on the named queue. With a
+/// threshold parameter, only a number below the threshold stays off the queue:
+/// parameters that are missing, malformed or non-numeric cannot be judged, so
+/// they route to review rather than around it.
 pub fn routes_to_queue(spec: &ReviewQueueSpec, parameters_json: &str) -> bool {
     if !spec.active() {
         return false;
@@ -135,13 +138,10 @@ pub fn routes_to_queue(spec: &ReviewQueueSpec, parameters_json: &str) -> bool {
     if spec.threshold_param.trim().is_empty() {
         return true;
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(parameters_json) else {
-        return false;
-    };
-    let Some(raw) = value.get(spec.threshold_param.trim()) else {
-        return false;
-    };
-    json_amount(raw).is_some_and(|amount| amount >= spec.threshold as f64)
+    let amount = serde_json::from_str::<serde_json::Value>(parameters_json)
+        .ok()
+        .and_then(|value| value.get(spec.threshold_param.trim()).and_then(json_amount));
+    amount.is_none_or(|amount| amount >= spec.threshold as f64)
 }
 
 fn json_amount(raw: &serde_json::Value) -> Option<f64> {
@@ -279,6 +279,21 @@ mod tests {
             place(&spec, r#"{"amount":50}"#, 10, "alice", &[]),
             ReviewPlacement::default()
         );
+    }
+
+    #[test]
+    fn an_unreadable_amount_routes_to_the_queue() {
+        let spec = spend_queue();
+        for parameters in [
+            "{}",
+            "not json",
+            r#"{"amount":"big"}"#,
+            r#"{"amount":null}"#,
+            r#"{"other":1}"#,
+        ] {
+            assert!(routes_to_queue(&spec, parameters), "{parameters}");
+        }
+        assert!(!routes_to_queue(&spec, r#"{"amount":99}"#));
     }
 
     #[test]
