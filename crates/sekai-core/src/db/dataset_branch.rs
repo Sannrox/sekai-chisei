@@ -18,6 +18,16 @@ use crate::sekai::dataset_version::{self, encode_row_map};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::HashMap;
 
+/// Open proposal keys of a tenant on datasets bound in a namespace, past a
+/// keyset position, newest first.
+pub const SQLITE_OPEN_DATASET_BRANCH_PROPOSALS: &str =
+    "SELECT p.dataset_id, p.id FROM sekai_dataset_branch_proposals p
+     JOIN sekai_datasets d ON d.id = p.dataset_id
+     JOIN sekai_objects o ON o.id = d.object_id
+     WHERE p.tenant = ?1 AND p.status = ?2 AND o.namespace = ?3
+       AND (p.created_at_ms, p.id) < (?4, ?5)
+     ORDER BY p.created_at_ms DESC, p.id DESC LIMIT ?6";
+
 pub fn migrate_dataset_branches(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sekai_dataset_branches (
@@ -493,31 +503,31 @@ impl SekaiDb {
         load_proposal(&tx, dataset_id, id)
     }
 
-    /// Open proposals of `tenant`, newest first, each with whether an open
-    /// definition proposal attaches it, so it merges only through that
-    /// proposal (#2203).
+    /// Open proposals of `tenant` on datasets bound in `namespace`, older
+    /// than `before`, newest first, each with whether an open definition
+    /// proposal attaches it, so it merges only through that proposal
+    /// (#2203). A dataset is bound in the namespace of its binding object.
     pub fn list_open_dataset_branch_proposals(
         &self,
         tenant: &str,
+        namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<(DatasetBranchProposal, bool)>, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let keys = {
             let mut stmt = tx
-                .prepare(
-                    "SELECT dataset_id, id FROM sekai_dataset_branch_proposals
-                     WHERE tenant = ?1 AND status = ?2
-                     ORDER BY created_at_ms DESC, id DESC LIMIT ?3 OFFSET ?4",
-                )
+                .prepare(SQLITE_OPEN_DATASET_BRANCH_PROPOSALS)
                 .map_err(|error| error.to_string())?;
             stmt.query_map(
                 params![
                     tenant,
                     dataset_branch::STATUS_OPEN,
-                    limit as i64,
-                    offset as i64
+                    namespace,
+                    before.at_ms,
+                    before.id,
+                    limit as i64
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )

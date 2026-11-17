@@ -315,19 +315,27 @@ impl PostgresDb {
         load_proposal_postgres(&mut *self.connection()?, namespace, proposal_id)
     }
 
-    /// Open proposals of `namespace`, newest first (#2203).
+    /// Open proposals of `namespace` older than `before`, newest first
+    /// (#2203).
     pub fn list_open_definition_proposals(
         &self,
         namespace: &str,
         limit: usize,
-        offset: usize,
+        before: crate::db::OlderThan<'_>,
     ) -> Result<Vec<DefinitionProposal>, String> {
         self.connection()?
             .query(
                 "SELECT body_json FROM sekai_definition_proposals
                  WHERE namespace = $1 AND status = $2
-                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT $3 OFFSET $4",
-                &[&namespace, &STATUS_OPEN, &(limit as i64), &(offset as i64)],
+                   AND (created_at_ms, proposal_id) < ($3, $4)
+                 ORDER BY created_at_ms DESC, proposal_id DESC LIMIT $5",
+                &[
+                    &namespace,
+                    &STATUS_OPEN,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit as i64),
+                ],
             )
             .map_err(|error| error.to_string())?
             .iter()

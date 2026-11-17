@@ -857,10 +857,17 @@ fn list_decidable_action_instances(
     })
     .clamp(1, 500);
     let mut instances = Vec::new();
-    visit_decidable_action_instances(service, &decider, &inner.namespace, type_id, |instance| {
-        instances.push(to_proto_action_instance(instance));
-        instances.len() < limit
-    })?;
+    visit_decidable_action_instances(
+        service,
+        &decider,
+        &inner.namespace,
+        type_id,
+        crate::db::OlderThan::START,
+        |instance| {
+            instances.push(to_proto_action_instance(instance));
+            instances.len() < limit
+        },
+    )?;
     Ok(Response::new(ListActionInstancesResponse { instances }))
 }
 
@@ -885,15 +892,16 @@ pub(super) fn namespace_decider<T>(
     Some(decider)
 }
 
-/// Visits, newest first, the parked instances of `namespace` (of `type_id`
-/// when given) that `decider`, past [`namespace_decider`], may decide: the
-/// per-instance checks of `DecideActionInstance`, marking clearance and
-/// `may_decide`. Stops when `visit` returns false.
+/// Visits, newest first from `before`, the parked instances of `namespace`
+/// (of `type_id` when given) that `decider`, past [`namespace_decider`], may
+/// decide: the per-instance checks of `DecideActionInstance`, marking
+/// clearance and `may_decide`. Stops when `visit` returns false.
 pub(super) fn visit_decidable_action_instances(
     service: &SekaiServiceImpl,
     decider: &str,
     namespace: &str,
     type_id: Option<&str>,
+    before: crate::db::OlderThan<'_>,
     mut visit: impl FnMut(&crate::sekai::action_instance::ActionInstance) -> bool,
 ) -> Result<(), Status> {
     let runtime = service.db.runtime();
@@ -903,19 +911,24 @@ pub(super) fn visit_decidable_action_instances(
     let decider_is_namespace_admin =
         authorize_source_type_namespace_admin(service, &deciders, namespace).is_ok();
     let mut types = HashMap::new();
-    let mut offset = 0;
+    let mut position = (before.at_ms, before.id.to_string());
     loop {
         let stored = runtime
-            .list_action_instances_page(
+            .list_action_instances_older_than(
                 namespace,
                 type_id,
-                Some(crate::sekai::action_instance::STATUS_PARKED),
+                crate::sekai::action_instance::STATUS_PARKED,
                 100,
-                offset,
+                crate::db::OlderThan {
+                    at_ms: position.0,
+                    id: &position.1,
+                },
             )
             .map_err(Status::internal)?;
         let exhausted = stored.len() < 100;
-        offset += stored.len();
+        if let Some(last) = stored.last() {
+            position = (last.created_at_ms, last.instance_id.clone());
+        }
         for instance in &stored {
             let key = (instance.type_id.clone(), instance.version.clone());
             if !types.contains_key(&key) {

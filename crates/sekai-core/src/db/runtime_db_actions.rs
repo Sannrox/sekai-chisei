@@ -544,6 +544,26 @@ impl RuntimeDb {
         }
     }
 
+    /// Instances of `namespace` in `status` (of `type_id` when given) older
+    /// than `before`, newest first.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.list_action_instances_older_than(namespace, type_id, status, limit, before)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_action_instances_older_than(namespace, type_id, status, limit, before)
+            }),
+        }
+    }
+
     pub fn put_action_effects(
         &self,
         effects: &[crate::sekai::action_effect::ActionEffect],

@@ -769,6 +769,45 @@ impl SekaiDb {
             .collect()
     }
 
+    /// Instances of `namespace` in `status` (of `type_id` when given) older
+    /// than `before`, newest first, read as an index range.
+    pub fn list_action_instances_older_than(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: &str,
+        limit: usize,
+        before: crate::db::OlderThan<'_>,
+    ) -> Result<Vec<ActionInstance>, String> {
+        self.migrate_action_instances()?;
+        let type_filter = type_id.filter(|t| !t.trim().is_empty());
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(SQLITE_ACTION_INSTANCES_OLDER_THAN)
+            .map_err(|e| e.to_string())?;
+        let bodies = stmt
+            .query_map(
+                params![
+                    namespace,
+                    status,
+                    type_filter,
+                    before.at_ms,
+                    before.id,
+                    limit.clamp(1, 500) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        bodies
+            .iter()
+            .map(|body| {
+                serde_json::from_str(body).map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     /// Insert a newly decided instance. Caller must already have checked
     /// idempotency. Returns conflict if the unique key races.
     pub fn put_action_instance(&self, instance: &ActionInstance) -> Result<ActionInstance, String> {
@@ -1588,6 +1627,14 @@ fn list_forgotten_site_agent_memory(db: &SekaiDb) -> Result<Vec<crate::domain::O
 
 /// Writer-type literals must match [`crate::sekai::site_agent_memory`]
 /// create/update/forget so the partial indexes in `migrate_*` apply (#2048).
+/// Instances of a namespace in a status, of a type when `?3` is not NULL,
+/// past a keyset position, newest first.
+pub(crate) const SQLITE_ACTION_INSTANCES_OLDER_THAN: &str =
+    "SELECT body_json FROM sekai_action_instances
+     WHERE namespace = ?1 AND status = ?2 AND (?3 IS NULL OR type_id = ?3)
+       AND (created_at_ms, instance_id) < (?4, ?5)
+     ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?6";
+
 pub(crate) const SQLITE_REDACT_WRITER_ACTIONS: &str =
     "SELECT instance_id, parameters_json, body_json
      FROM sekai_action_instances
