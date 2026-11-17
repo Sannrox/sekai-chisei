@@ -26,7 +26,7 @@ Accept `sekai.site-agent-instance/v1`. Identity is
   the instance runs.
 - `agent_member`: the agent member of that revision the instance runs. A
   revision can hold several agents, so the digest alone does not say which.
-- `principal_id`: the org-owned principal the instance acts as.
+- `principal_id`: the org-owned principal the instance acts as, a service principal registered for the instance namespace. Admission refuses any other principal on create, and on an update that changes it.
 - `responsibility`: the object ids or the ObjectSet it owns.
 - `wake_policies`: references to wake policies, by id. Wake admission is a
   separate contract.
