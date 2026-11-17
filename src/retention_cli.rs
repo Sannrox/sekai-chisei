@@ -7,6 +7,7 @@
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
+use crate::grpc::archive_admitted;
 use crate::sekai::retention::{ArchiveRun, ArchiveStatus, RetentionPolicy};
 use chrono::Utc;
 
@@ -100,23 +101,6 @@ fn open_retention_layout(default_sqlite_path: &str) -> Result<CombinedStoreLayou
     } else {
         crate::plane::ProcessPlane::Sekai.open_layout(default_sqlite_path)
     }
-}
-
-/// Archive only when the restore fence admits the mutation. `dry_run` skips
-/// the fence because it writes nothing.
-pub(crate) fn archive_admitted(
-    db: &RuntimeDb,
-    stores: &CombinedStoreLayout,
-    now: i64,
-    dry_run: bool,
-    skip_if_busy: bool,
-) -> Result<ArchiveRun, String> {
-    crate::db::postgres::off_runtime(|| {
-        if !dry_run {
-            crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
-        }
-        db.archive_retained_records_locked(now, dry_run, skip_if_busy)
-    })
 }
 
 /// Policy writes go through the same restore fence as `run`.

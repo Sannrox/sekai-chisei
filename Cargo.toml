@@ -242,3 +242,8 @@ path = "tests/deploy_kubernetes_manifest.rs"
 [profile.dev.package."*"]
 debug = false
 
+
+# mikura pins sekai-keys from this repository's git history. Build the
+# workspace crate instead, so sekai-keys compiles once (#2428).
+[patch."https://github.com/Sannrox/sekai-chisei.git"]
+sekai-keys = { path = "crates/sekai-keys" }
