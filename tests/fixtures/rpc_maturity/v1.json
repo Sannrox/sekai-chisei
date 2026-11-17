@@ -2322,8 +2322,8 @@
       "rpc": "GetLineage",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "core"
     },
     {

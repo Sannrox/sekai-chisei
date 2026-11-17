@@ -83,8 +83,8 @@ An `experimental` RPC moves to `stable` only when it meets the
    results, and index size are enforced and documented.
 
 Search (#2243), the governed-document RPCs (#2266), the datasource
-index RPCs (#2282), and the dataset version and health RPCs (#2415) met
-these criteria and are `stable`. Status of the
+index RPCs (#2282), the dataset version and health RPCs (#2415), and
+`GetLineage` (#2416) met these criteria and are `stable`. Status of the
 remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
@@ -369,7 +369,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListActionPolicies` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
-| `SekaiService.GetLineage` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetLineage` | `sekai.graph, sekai.audit` | yes | host | `stable` |
 | `SekaiService.CreateContentionScope` | `sekai.coordination` | yes | none | `experimental` |
 | `SekaiService.UpdateContentionScope` | `sekai.coordination` | yes | none | `experimental` |
 | `SekaiService.GetContentionScope` | `sekai.coordination` | yes | none | `experimental` |

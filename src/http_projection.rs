@@ -644,6 +644,12 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "GetLineage") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_lineage(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "CreateCredential") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_credential(&*svc, req).await
@@ -1371,6 +1377,25 @@ mod tests {
                 "{rpc} is stable and must not hit the experimental gate: {message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn promoted_get_lineage_is_hosted_and_stays_authorized() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router_for(sekai, chisei, interceptor);
+        let path = "/sekai.SekaiService/GetLineage";
+        let (status, payload) = http_json(app.clone(), path, None, json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(payload["code"], "unauthenticated");
+
+        let (_, payload) = http_json(
+            app,
+            path,
+            Some(&token),
+            json!({"objectId": "missing", "maxNodes": 5}),
+        )
+        .await;
+        assert_eq!(payload["code"], "not_found", "{payload}");
     }
 
     #[tokio::test]

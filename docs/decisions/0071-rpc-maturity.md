@@ -155,3 +155,17 @@ the shrink-only SQLite-only list.
   rows the dataset no longer holds. `native_server_smoke` consumes all nine
   on the spawned binary. The HTTP/JSON projection and generated stable SDKs
   pick them up as unary stables.
+- 2026-11-17, Issue [#2416](https://github.com/Sannrox/sekai-chisei/issues/2416):
+  `GetLineage` becomes `stable` after meeting the #2089 promotion criteria.
+  The caller's visibility and purpose checks run inside the walk, so a node
+  the caller may not read takes no slot of `max_nodes`, is not walked past,
+  and cannot set `truncated` (#2542). A dataset-backed object reaches its
+  dataset, the transforms that write it and their inputs, and the source
+  that lands it, as ephemeral nodes under the same checks (#2543). The walk
+  is capped at 500 nodes (default 200) and is shared by SQLite and
+  PostgreSQL; RPC-level tests run on both. Messages were reviewed once
+  before the freeze and stay as they are: `max_nodes` stays `int32`, with 0
+  or a negative value meaning the default, and ephemeral nodes reuse
+  `LineageNode.object` with `id`, `kind`, `namespace` and `external_id`.
+  `native_server_smoke` consumes it on the spawned binary. The HTTP/JSON
+  projection and generated stable SDKs pick it up as a unary stable.

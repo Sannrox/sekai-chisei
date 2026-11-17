@@ -74,6 +74,7 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "ListActionInstances" },
   { service: "sekai.SekaiService", rpc: "GetActionEffect" },
   { service: "sekai.SekaiService", rpc: "ListActionEffects" },
+  { service: "sekai.SekaiService", rpc: "GetLineage" },
   { service: "sekai.SekaiService", rpc: "CreateCredential" },
   { service: "sekai.SekaiService", rpc: "RotateCredential" },
   { service: "sekai.SekaiService", rpc: "RevokeCredential" },
