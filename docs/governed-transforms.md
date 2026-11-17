@@ -94,7 +94,8 @@ judgment and the alerts. So two planes ticking at once run a due check once,
 and a crash before the commit leaves the bucket for the next tick. A run that
 starts after a whole bucket passed with no run fires the `late` schedule
 alert; the next on-time run resolves it. `RunDatasetHealthChecks` stays the
-on-demand call for one dataset. It runs every unscheduled check, and runs a
+on-demand call for one dataset and judges against the server clock; it
+refuses a non-zero `now_ms` (#2533). It runs every unscheduled check, and runs a
 scheduled check only through the same claim, so a cadence caller and the tick
 together still run each bucket once. Planes from before #2187 run a scheduled
 check when `last_run_ms + every_ms <= now` and write the same field. In a
