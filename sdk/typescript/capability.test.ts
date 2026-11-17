@@ -15,7 +15,7 @@ test("TypeScript preserves authority, correlation, and errors", () => {
     fixture.invocation.input,
   );
   assert.deepEqual(nativeMetadata(call), fixture.expected_metadata);
-  assert.deepEqual(normalizeError(call, "permission_denied", "write denied"), fixture.expected_error);
+  assert.deepEqual(normalizeError(call, "permission_denied", fixture.expected_error.message), fixture.expected_error);
 });
 
 test("TypeScript fails closed on contract drift", () => {
