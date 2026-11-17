@@ -85,9 +85,14 @@ correlation and is atomically reserved before an effectful action. The same
 identity is stamped on the inbound span, the receipt, and the object-change
 event; see [operation-correlation.md](operation-correlation.md). The server
 generates one when omitted and returns the effective identifier on successful
-response metadata. Callers that need to correlate a refused or failed RPC must
-supply the header, because generic gRPC error propagation does not guarantee
-generated response metadata. Traverse and Kioku candidate entries continue to
+response metadata. When another principal already holds the supplied
+identifier, the call still answers and reports it exactly as a fresh one, but
+its receipt is recorded under a generated identifier that a server log event
+links to the supplied one; reusing your own identifier to start a second
+invocation answers `ALREADY_EXISTS`. Generate identifiers with enough entropy
+that they stay unique to you. Callers that need to correlate a refused or
+failed RPC must supply the header, because generic gRPC error propagation does
+not guarantee generated response metadata. Traverse and Kioku candidate entries continue to
 use their canonical governed RPCs but do not yet participate in this
 receipt-attribution metadata contract.
 
