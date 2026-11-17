@@ -381,6 +381,7 @@ impl BudgetTracker {
         estimated: i32,
         metric: &str,
     ) -> Result<(), String> {
+        refuse_negative_reservation(estimated)?;
         self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             metric,
@@ -411,6 +412,7 @@ impl BudgetTracker {
         idempotency_key: &str,
         now_ms: i64,
     ) -> Result<(), String> {
+        refuse_negative_reservation(estimated)?;
         self.db.budget_check_and_reserve_chain_for_site(
             scope_id,
             METRIC_TOKENS,
@@ -694,6 +696,15 @@ impl BudgetTracker {
             _ => PressureLevel::None,
         }
     }
+}
+
+/// A reservation only adds usage; a negative amount would lower recorded usage
+/// past every limit check.
+fn refuse_negative_reservation(estimated: i32) -> Result<(), String> {
+    if estimated < 0 {
+        return Err("budget reservation amount must not be negative".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1098,6 +1109,20 @@ mod tests {
             t.route_bias("project:p", 100, "requests", "bulk"),
             BudgetRouteBias::Capable
         );
+    }
+
+    #[test]
+    fn negative_reservation_is_refused_and_leaves_usage_unchanged() {
+        let t = tracker();
+        t.set_limit("project:p", 100, PeriodType::Daily).unwrap();
+        t.record("project:p", 90);
+        assert!(t.check_and_reserve("project:p", -1_000).is_err());
+        assert!(
+            t.check_and_reserve_idempotent("project:p", -1_000, "negative")
+                .is_err()
+        );
+        assert_eq!(t.get_usage("project:p").tokens_used, 90);
+        assert!(t.check_and_reserve("project:p", 20).is_err());
     }
 
     #[test]
