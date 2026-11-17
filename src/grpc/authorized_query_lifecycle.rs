@@ -1036,32 +1036,38 @@ impl SekaiServiceImpl {
             revision_pin.as_deref(),
             &root.namespace,
         )?;
-        let mut res = self
-            .db
-            .runtime()
-            .get_lineage_with_policy_context(&root.id, r.max_nodes as usize, &policy_context)
-            .map_err(Status::internal)?;
+        // The visibility and purpose checks run inside the walk, so a node the
+        // caller may not read never takes a slot of `max_nodes` and never leads
+        // the walk further.
+        let db = self.db.runtime();
         let mut recorded_purposes = HashSet::new();
-        let mut visible_nodes = Vec::new();
-        for node in res.nodes {
-            if object_is_visible(
-                self.db.runtime(),
-                &self.security,
-                &node.object,
-                &principals,
-                tenant_context.as_ref(),
-            ) && purpose_allows_kind(
-                self.db.runtime(),
-                &node.object.namespace,
-                &node.object.kind,
-                purpose.as_ref(),
-                &mut recorded_purposes,
-            )? {
-                visible_nodes.push(node);
-            }
-        }
-        res.nodes = visible_nodes;
-        retain_reachable_visible_lineage(&root.id, &mut res.nodes, &mut res.edges);
+        let res = crate::sekai::lineage::walk_lineage(
+            root.clone(),
+            usize::try_from(r.max_nodes).unwrap_or(0),
+            |id, direction| {
+                db.get_links_with_policy_context(id, "", direction, &policy_context)
+                    .map_err(Status::internal)
+            },
+            |id| {
+                db.get_object_with_policy_context(id, &policy_context)
+                    .map_err(Status::internal)
+            },
+            |object| {
+                Ok(object_is_visible(
+                    db,
+                    &self.security,
+                    object,
+                    &principals,
+                    tenant_context.as_ref(),
+                ) && purpose_allows_kind(
+                    db,
+                    &object.namespace,
+                    &object.kind,
+                    purpose.as_ref(),
+                    &mut recorded_purposes,
+                )?)
+            },
+        )?;
         let objects = self.resolve_computed_for_responses_with_policy(
             res.nodes.iter().map(|node| node.object.clone()).collect(),
             &principals,

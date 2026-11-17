@@ -1,7 +1,5 @@
 use crate::db::sekai::SekaiDb;
-use crate::domain::Direction;
 use crate::sekai::object_security::PrincipalPolicyContext;
-use std::collections::{HashSet, VecDeque};
 
 pub use sekai_types::lineage::*;
 
@@ -10,7 +8,7 @@ pub fn get_lineage(
     object_id: &str,
     max_nodes: usize,
 ) -> Result<LineageResult, String> {
-    walk_lineage(db, object_id, max_nodes, None)
+    walk_store(db, object_id, max_nodes, None)
 }
 
 pub fn get_lineage_with_policy_context(
@@ -19,86 +17,30 @@ pub fn get_lineage_with_policy_context(
     max_nodes: usize,
     context: &PrincipalPolicyContext,
 ) -> Result<LineageResult, String> {
-    walk_lineage(db, object_id, max_nodes, Some(context))
+    walk_store(db, object_id, max_nodes, Some(context))
 }
 
-fn walk_lineage(
+fn walk_store(
     db: &SekaiDb,
     object_id: &str,
     max_nodes: usize,
     context: Option<&PrincipalPolicyContext>,
 ) -> Result<LineageResult, String> {
-    let max = if max_nodes == 0 {
-        DEFAULT_MAX_LINEAGE_NODES
-    } else {
-        max_nodes.min(500)
+    let object = |id: &str| match context {
+        Some(context) => db.get_object_with_policy_context(id, context),
+        None => db.get_object(id),
     };
-    let mut result = LineageResult::default();
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-
-    let start = match context {
-        Some(context) => db.get_object_with_policy_context(object_id, context)?,
-        None => db.get_object(object_id)?,
-    }
-    .ok_or("object not found")?;
-    visited.insert(start.id.clone());
-    queue.push_back(start.clone());
-    result.nodes.push(LineageNode {
-        role: role_for(&start.kind),
-        ephemeral: false,
-        object: start,
-    });
-
-    while let Some(node) = queue.pop_front() {
-        if result.nodes.len() >= max {
-            result.truncated = true;
-            break;
-        }
-        // Traverse both directions for lineage relations
-        for dir in [Direction::Outgoing, Direction::Incoming] {
-            let links = match context {
-                Some(context) => db.get_links_with_policy_context(&node.id, "", &dir, context)?,
-                None => db.get_links(&node.id, "", &dir)?,
-            };
-            for link in &links {
-                if !is_lineage_relation(&link.relation) {
-                    continue;
-                }
-                let target_id = match dir {
-                    Direction::Outgoing => &link.to_id,
-                    Direction::Incoming => &link.from_id,
-                };
-                if visited.contains(target_id) {
-                    continue;
-                }
-                visited.insert(target_id.clone());
-
-                let obj = match context {
-                    Some(context) => db.get_object_with_policy_context(target_id, context)?,
-                    None => db.get_object(target_id)?,
-                };
-                if let Some(obj) = obj {
-                    result.edges.push(LineageEdge {
-                        from: link.from_id.clone(),
-                        to: link.to_id.clone(),
-                        relation: link.relation.clone(),
-                    });
-                    result.nodes.push(LineageNode {
-                        role: role_for(&obj.kind),
-                        ephemeral: false,
-                        object: obj.clone(),
-                    });
-                    queue.push_back(obj);
-                }
-                if result.nodes.len() >= max {
-                    result.truncated = true;
-                    break;
-                }
-            }
-        }
-    }
-    Ok(result)
+    let start = object(object_id)?.ok_or("object not found")?;
+    walk_lineage(
+        start,
+        max_nodes,
+        |id, direction| match context {
+            Some(context) => db.get_links_with_policy_context(id, "", direction, context),
+            None => db.get_links(id, "", direction),
+        },
+        object,
+        |_| Ok(true),
+    )
 }
 
 #[cfg(test)]

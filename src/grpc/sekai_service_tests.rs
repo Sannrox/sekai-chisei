@@ -476,6 +476,51 @@ async fn get_lineage_filters_nodes_outside_tenant_namespace() {
 }
 
 #[tokio::test]
+async fn get_lineage_spends_its_budget_only_on_visible_nodes() {
+    // A hidden neighbour takes no slot of `max_nodes`, so `truncated` cannot
+    // reveal it, and the walk does not reach visible nodes through it.
+    let svc = enterprise_service();
+    seed_lineage_object(&svc, "budget-root", "allowed");
+    seed_lineage_object(&svc, "budget-hidden", "denied");
+    seed_lineage_object(&svc, "budget-behind-hidden", "allowed");
+    seed_lineage_object(&svc, "budget-visible", "allowed");
+    for (id, from, to) in [
+        ("budget-a", "budget-root", "budget-hidden"),
+        ("budget-b", "budget-hidden", "budget-behind-hidden"),
+        ("budget-c", "budget-root", "budget-visible"),
+    ] {
+        svc.db
+            .runtime()
+            .create_link(&domain::Link {
+                id: id.into(),
+                from_id: from.into(),
+                to_id: to.into(),
+                relation: "derived_from".into(),
+                created: 0,
+            })
+            .unwrap();
+    }
+    let result = svc
+        .get_lineage(with_tenant_context(GetLineageRequest {
+            object_id: "budget-root".into(),
+            max_nodes: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .result
+        .unwrap();
+    let ids = result
+        .nodes
+        .iter()
+        .filter_map(|node| node.object.as_ref().map(|object| object.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["budget-root", "budget-visible"]);
+    assert!(!result.truncated);
+    assert_eq!(result.edges.len(), 1);
+}
+
+#[tokio::test]
 async fn semantic_reads_apply_the_enterprise_tenant_gate() {
     // #1147: expand, explain, and retrieve apply the same tenant gate as
     // object reads before capability or ACL work.

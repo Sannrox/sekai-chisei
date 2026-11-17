@@ -1267,45 +1267,6 @@ pub(super) fn retain_reachable_visible_objects(
         object_ids.contains(link.from_id.as_str()) && object_ids.contains(link.to_id.as_str())
     });
 }
-pub(super) fn retain_reachable_visible_lineage(
-    start_id: &str,
-    nodes: &mut Vec<crate::sekai::lineage::LineageNode>,
-    edges: &mut Vec<crate::sekai::lineage::LineageEdge>,
-) {
-    let mut visible = nodes
-        .iter()
-        .map(|node| node.object.id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    visible.insert(start_id.to_string());
-    let mut adjacency = HashMap::<String, Vec<String>>::new();
-    for edge in edges.iter() {
-        if !visible.contains(&edge.from) || !visible.contains(&edge.to) {
-            continue;
-        }
-        adjacency
-            .entry(edge.from.clone())
-            .or_default()
-            .push(edge.to.clone());
-        adjacency
-            .entry(edge.to.clone())
-            .or_default()
-            .push(edge.from.clone());
-    }
-    let mut reachable = std::collections::HashSet::from([start_id.to_string()]);
-    let mut stack = vec![start_id.to_string()];
-    while let Some(id) = stack.pop() {
-        let Some(next) = adjacency.get(&id) else {
-            continue;
-        };
-        for neighbor in next {
-            if reachable.insert(neighbor.clone()) {
-                stack.push(neighbor.clone());
-            }
-        }
-    }
-    nodes.retain(|node| reachable.contains(&node.object.id));
-    edges.retain(|edge| reachable.contains(&edge.from) && reachable.contains(&edge.to));
-}
 /// Visits, in one scan and in filter order, every object of `filter` the
 /// caller may read: ACL and row policy, marking, collaboration, object
 /// security and purpose, exactly as reads apply them (ignores the filter's
