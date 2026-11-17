@@ -1,13 +1,12 @@
 name: Security Audit
 
+# Pull requests do not run the audit: a new advisory arrives through the feed,
+# not the diff, so a pull-request run failed unrelated changes for advisories
+# already on main (#2576). The push run below and Dependabot alerts report an
+# advisory that a merge adds.
 on:
   push:
     branches: [main, "release-*"]
-    paths:
-      - "**/Cargo.toml"
-      - "**/Cargo.lock"
-      - ".github/workflows/security-audit.yml"
-  pull_request:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
