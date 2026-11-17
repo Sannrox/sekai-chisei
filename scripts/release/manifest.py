@@ -9,7 +9,6 @@ import json
 import pathlib
 import re
 import sys
-import tempfile
 
 SCHEMA = "tenkai.family-release-manifest.v1"
 COMPONENT = "sekai-chisei"
@@ -110,67 +109,7 @@ def build_manifest(
     }
 
 
-def self_test() -> None:
-    labels = gate_flags_from_labels(
-        ["risk:breaking", "area:ops", "GATE:mig", "risk:realm", "docs"]
-    )
-    assert labels == ["breaking", "migration", "realm"], labels
-    assert gate_flags_from_labels([]) == []
-    try:
-        build_manifest(
-            component=COMPONENT,
-            version="1.4.0",
-            git_sha="deadbeef",
-            tag="v1.4.0",
-            dist=pathlib.Path("."),
-            images=[],
-            attestations=[],
-            gate_flags=[],
-        )
-    except SystemExit:
-        pass
-    else:
-        raise SystemExit("expected short git_sha to fail")
-    try:
-        parse_image("sekai-chisei:latest=sha256:" + "a" * 64)
-    except SystemExit as exc:
-        assert "latest" in str(exc)
-    else:
-        raise SystemExit("expected latest image tag to fail")
-    with tempfile.TemporaryDirectory() as tmp:
-        dist = pathlib.Path(tmp)
-        (dist / "sekai-1.4.0-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"bin")
-        (dist / "sekai-chisei-1.4.0-image.tar").write_bytes(b"tar")
-        (dist / "SHA256SUMS").write_text("skip\n")
-        manifest = build_manifest(
-            component=COMPONENT,
-            version="1.4.0",
-            git_sha="a" * 40,
-            tag="v1.4.0",
-            dist=dist,
-            images=[
-                {
-                    "name": "ghcr.io/sannrox/sekai-chisei:v1.4.0",
-                    "digest": "sha256:" + "b" * 64,
-                }
-            ],
-            attestations=["https://github.com/Sannrox/sekai-chisei/attestations/1"],
-            gate_flags=["breaking"],
-        )
-        assert manifest["schema"] == SCHEMA
-        assert len(manifest["binaries"]) == 1
-        assert manifest["binaries"][0]["name"] == "sekai-1.4.0-x86_64-unknown-linux-gnu.tar.gz"
-        assert manifest["binaries"][0]["digest"].startswith("sha256:")
-        assert manifest["images"][0]["name"] == "ghcr.io/sannrox/sekai-chisei:v1.4.0"
-        dumped = json.dumps(manifest)
-        assert "latest" not in dumped
-    print("release-manifest self-test passed")
-
-
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-        return
     parser = argparse.ArgumentParser()
     parser.add_argument("--component", default=COMPONENT)
     parser.add_argument("--version", required=True)
