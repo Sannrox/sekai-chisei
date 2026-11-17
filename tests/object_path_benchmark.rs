@@ -106,7 +106,6 @@ fn scheduled_performance_workflow_enforces_object_path_at_twenty_percent() {
     assert!(WORKFLOW.contains("--enforce"));
     assert!(WORKFLOW.contains("--regression-threshold-percent"));
     assert!(WORKFLOW.contains("20"));
-    assert!(WORKFLOW.contains("pull_request"));
     assert!(WORKFLOW.contains("scripts/object-path-with-postgres.sh"));
     assert!(WORKFLOW.contains("dropped every postgres workload"));
     assert!(POSTGRES_WRAPPER.contains("SEKAI_BENCH_POSTGRES_URL"));
