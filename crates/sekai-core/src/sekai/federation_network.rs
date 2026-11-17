@@ -3,11 +3,12 @@
 //! Two planes exchange governed requests, evidence, and outcomes through an
 //! explicit contract. Each plane keeps local write and governance authority.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::sekai::audit::Decision;
 use crate::shomei;
 
 pub const NETWORK_CONTRACT: &str = "sekai.federation-network-contract/v1";
@@ -94,7 +95,10 @@ pub fn accept_contract(
         return replay_contract(&existing, &validated);
     }
     match db.put_network_contract(&validated) {
-        Ok(()) => Ok(validated),
+        Ok(()) => {
+            audit_transition(db, actor, "accept", &validated, now_ms)?;
+            Ok(validated)
+        }
         Err(error) if error == NETWORK_UNAVAILABLE => {
             let existing = db
                 .get_network_contract(&validated.namespace, &validated.contract_id)?
@@ -164,6 +168,7 @@ pub fn mark_peer_lost(
     let mut next = current.clone();
     next.status = STATUS_DISCONNECTED.into();
     db.cas_network_contract(&current, &next)?;
+    audit_transition(db, actor, "peer-loss", &next, now_ms)?;
     Ok(next)
 }
 
@@ -186,6 +191,7 @@ pub fn reconnect(
     let mut next = current.clone();
     next.status = STATUS_ACCEPTED.into();
     db.cas_network_contract(&current, &next)?;
+    audit_transition(db, actor, "reconnect", &next, now_ms)?;
     Ok(next)
 }
 
@@ -205,6 +211,7 @@ pub fn revoke_contract(
     let mut next = current.clone();
     next.status = STATUS_REVOKED.into();
     db.cas_network_contract(&current, &next)?;
+    audit_transition(db, actor, "revoke", &next, now_ms)?;
     Ok(next)
 }
 
@@ -216,6 +223,38 @@ pub fn get_contract(
 ) -> Result<NetworkContract, String> {
     required("actor", actor)?;
     owned_contract(db, namespace, contract_id, actor)
+}
+
+/// Records the ledger decision for one contract state transition, stamped
+/// with the caller-supplied time. Called only after a real transition; a
+/// replay that finds the contract already in the target state records nothing.
+fn audit_transition(
+    db: &RuntimeDb,
+    actor: &str,
+    action: &str,
+    contract: &NetworkContract,
+    now_ms: i64,
+) -> Result<(), String> {
+    db.record_decisions_idempotently(&[Decision {
+        id: format!(
+            "network-{action}:{}:{}:{now_ms}",
+            contract.namespace, contract.contract_id
+        ),
+        timestamp: now_ms,
+        actor: actor.into(),
+        action: format!("federation_network_{}", action.replace('-', "_")),
+        reason: format!("{action} of {NETWORK_CONTRACT} contract"),
+        evidence: HashMap::from([
+            ("contract_version".into(), NETWORK_CONTRACT.into()),
+            ("namespace".into(), contract.namespace.clone()),
+            ("contract_id".into(), contract.contract_id.clone()),
+            ("peer_site_id".into(), contract.peer_site_id.clone()),
+            ("status".into(), contract.status.clone()),
+            ("data_class".into(), "internal".into()),
+        ]),
+        target_id: format!("{}/{}", contract.namespace, contract.contract_id),
+        outcome: contract.status.clone(),
+    }])
 }
 
 fn validate_contract(
@@ -506,6 +545,39 @@ mod tests {
         assert_eq!(
             get_contract(&runtime, "intruder", "shared", "net:alpha-beta").unwrap_err(),
             NETWORK_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn each_transition_records_one_decision_stamped_with_the_supplied_time() {
+        use crate::sekai::audit::DecisionFilter;
+        let runtime = db();
+        accept(&runtime);
+        mark_peer_lost(&runtime, "operator", "shared", "net:alpha-beta", 2_000).unwrap();
+        reconnect(&runtime, "operator", "shared", "net:alpha-beta", 2_200).unwrap();
+        revoke_contract(&runtime, "operator", "shared", "net:alpha-beta", 3_000).unwrap();
+        // A replay is not a transition and records nothing.
+        revoke_contract(&runtime, "operator", "shared", "net:alpha-beta", 3_500).unwrap();
+        let mut decisions = runtime
+            .list_decisions(&DecisionFilter {
+                target_id: Some("shared/net:alpha-beta".into()),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
+        decisions.sort_by_key(|decision| decision.timestamp);
+        let seen: Vec<_> = decisions
+            .iter()
+            .map(|decision| (decision.action.as_str(), decision.timestamp))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("federation_network_accept", 1_000),
+                ("federation_network_peer_loss", 2_000),
+                ("federation_network_reconnect", 2_200),
+                ("federation_network_revoke", 3_000),
+            ]
         );
     }
 
