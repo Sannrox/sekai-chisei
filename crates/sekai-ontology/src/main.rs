@@ -445,6 +445,9 @@ fn run_setup(arguments: &Arguments) -> Result<ExitCode, Error> {
     } else {
         None
     };
+    // Resolve every input that can fail before the first change to disk, so a
+    // refused setup leaves no database or index behind.
+    let skill_directory = resolve_setup_skill_directory(arguments)?;
     if let Some(parent) = database.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             Error::Input(format!("cannot create '{}': {error}", parent.display()))
@@ -464,7 +467,7 @@ fn run_setup(arguments: &Arguments) -> Result<ExitCode, Error> {
     } else {
         None
     };
-    let (skill, skill_code) = setup_skill(arguments)?;
+    let (skill, skill_code) = setup_skill(arguments, skill_directory)?;
     let result = SetupResult {
         database: database.display().to_string(),
         created_database,
@@ -553,8 +556,30 @@ fn resolve_setup_kind(
     Ok(scope.default_kind().into())
 }
 
-fn setup_skill(arguments: &Arguments) -> Result<(SetupSkillResult, ExitCode), Error> {
+/// The skill directory `setup` installs into, or `None` under `--no-skill`.
+fn resolve_setup_skill_directory(arguments: &Arguments) -> Result<Option<PathBuf>, Error> {
     if arguments.no_skill {
+        return Ok(None);
+    }
+    arguments
+        .skill_path
+        .clone()
+        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
+        .or_else(default_skill_path)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::Input(
+                "cannot resolve a user skill directory; pass --path, set SEKAI_SKILL_PATH, or use --no-skill"
+                    .into(),
+            )
+        })
+}
+
+fn setup_skill(
+    arguments: &Arguments,
+    directory: Option<PathBuf>,
+) -> Result<(SetupSkillResult, ExitCode), Error> {
+    let Some(directory) = directory else {
         return Ok((
             SetupSkillResult {
                 path: None,
@@ -562,18 +587,7 @@ fn setup_skill(arguments: &Arguments) -> Result<(SetupSkillResult, ExitCode), Er
             },
             ExitCode::SUCCESS,
         ));
-    }
-    let directory = arguments
-        .skill_path
-        .clone()
-        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
-        .or_else(default_skill_path)
-        .ok_or_else(|| {
-            Error::Input(
-                "cannot resolve a user skill directory; pass --path, set SEKAI_SKILL_PATH, or use --no-skill"
-                    .into(),
-            )
-        })?;
+    };
     let target = directory.join("SKILL.md");
     let code = install_skill(&target, arguments.force, false)?;
     let status = match code {
