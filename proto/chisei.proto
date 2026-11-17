@@ -749,6 +749,27 @@ message CompareEvalDatasetRunsRequest {
   double alpha = 4;
   // Report an increase in policy violations without failing the gate.
   bool allow_policy_increase = 5;
+  // Also list the cases behind the counts (differing_cases). Off by default.
+  bool include_cases = 6;
+  // With include_cases, also list the cases that failed in both runs. Cases
+  // that passed in both are only counted.
+  bool include_both_failed = 7;
+  // Page size for differing_cases; 0 uses the plane default, and the plane
+  // caps it.
+  uint32 case_limit = 8;
+  // next_page_token of the previous page; empty starts at the first case.
+  string page_token = 9;
+}
+// A case whose outcome differs between the baseline and candidate runs, or
+// that failed in both. Ids, tags and verdicts only; content is read through
+// the dataset.
+message EvalCaseDifference {
+  string case_id = 1;
+  repeated string tags = 2;
+  bool baseline_passed = 3;
+  bool candidate_passed = 4;
+  // Policy violation kinds recorded for the candidate's run of this case.
+  repeated string candidate_violations = 5;
 }
 message EvalPolicyDelta {
   string kind = 1;
@@ -773,6 +794,12 @@ message CompareEvalDatasetRunsResponse {
   // pass or fail.
   string verdict = 13;
   repeated string reasons = 14;
+  // One page of the cases behind the counts, in dataset order, when
+  // include_cases is set. The counts above are exact whatever the page.
+  repeated EvalCaseDifference differing_cases = 15;
+  // More cases follow this page; pass next_page_token to read them.
+  bool cases_truncated = 16;
+  string next_page_token = 17;
 }
 // Every run of a dataset in a namespace, oldest first, for trend views.
 message ListEvalDatasetRunTrendRequest {

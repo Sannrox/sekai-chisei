@@ -18,7 +18,7 @@
 //! stochastic evaluator pins the model it runs on, so comparing two models
 //! needs an evaluator that does not run on the model under test.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -211,6 +211,67 @@ pub fn compare_runs(
         .into(),
         reasons,
     })
+}
+
+/// A case that did not pass in both runs, as `compare_runs` counted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseDifference {
+    pub case_id: String,
+    pub tags: Vec<String>,
+    pub baseline_passed: bool,
+    pub candidate_passed: bool,
+    /// Violation kinds recorded for the candidate's run of this case.
+    pub candidate_violations: Vec<ViolationKind>,
+}
+
+/// Every case that did not pass in both runs, in dataset order: regressions,
+/// improvements and failed-in-both. Call it with runs `compare_runs` accepted,
+/// so every dataset case has a result in both; a case missing a result is
+/// skipped rather than guessed.
+pub fn case_differences(
+    dataset: &EvalDataset,
+    baseline: &ComparedRun<'_>,
+    candidate: &ComparedRun<'_>,
+) -> Vec<CaseDifference> {
+    fn by_case<'a>(run: &ComparedRun<'a>) -> HashMap<&'a str, &'a EvalCaseResult> {
+        run.results
+            .iter()
+            .map(|result| (result.case_id.as_str(), result))
+            .collect()
+    }
+    let (before, after) = (by_case(baseline), by_case(candidate));
+    dataset
+        .cases
+        .iter()
+        .filter_map(|case| {
+            let (before, after) = (
+                before.get(case.case_id.as_str())?,
+                after.get(case.case_id.as_str())?,
+            );
+            let (baseline_passed, candidate_passed) = (before.outcome.passed, after.outcome.passed);
+            (!(baseline_passed && candidate_passed)).then(|| CaseDifference {
+                case_id: case.case_id.clone(),
+                tags: case.tags.clone(),
+                baseline_passed,
+                candidate_passed,
+                candidate_violations: after
+                    .outcome
+                    .policy
+                    .as_ref()
+                    .map(|policy| {
+                        policy
+                            .violations
+                            .iter()
+                            .filter(|violation| violation.case_id == case.case_id)
+                            .map(|violation| violation.kind)
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// `P(X >= regressions)` for `X ~ Binomial(regressions + improvements, 1/2)`,
@@ -408,6 +469,71 @@ mod tests {
         });
         assert_eq!(reported.policy_increased, ["marking_leak"]);
         assert_eq!(reported.verdict, VERDICT_PASS);
+    }
+
+    #[test]
+    fn case_differences_list_the_cases_behind_the_counts() {
+        let dataset = dataset(40);
+        let (baseline_spec, candidate_spec) = (run_spec("baseline"), run_spec("candidate"));
+        // Cases 0..4 regress, 4..6 improve, 6..8 fail in both; the rest pass.
+        let baseline = results(|index| !(4..8).contains(&index), 0);
+        let candidate = results(|index| index >= 8 || (4..6).contains(&index), 3);
+        let comparison = compare_runs(
+            &dataset,
+            ComparedRun {
+                spec: &baseline_spec,
+                results: &baseline,
+            },
+            ComparedRun {
+                spec: &candidate_spec,
+                results: &candidate,
+            },
+            ComparisonGate::default(),
+        )
+        .unwrap();
+        let listed = case_differences(
+            &dataset,
+            &ComparedRun {
+                spec: &baseline_spec,
+                results: &baseline,
+            },
+            &ComparedRun {
+                spec: &candidate_spec,
+                results: &candidate,
+            },
+        );
+        let count = |keep: fn(&CaseDifference) -> bool| listed.iter().filter(|c| keep(c)).count();
+        assert_eq!(
+            count(|c| c.baseline_passed && !c.candidate_passed) as u64,
+            comparison.regressions
+        );
+        assert_eq!(
+            count(|c| !c.baseline_passed && c.candidate_passed) as u64,
+            comparison.improvements
+        );
+        assert_eq!(
+            count(|c| !c.baseline_passed && !c.candidate_passed) as u64,
+            comparison.both_failed
+        );
+        assert_eq!(
+            listed.len() as u64,
+            comparison.cases - comparison.both_passed
+        );
+        // Dataset order, and the candidate's violations ride along.
+        let ids: Vec<_> = listed.iter().map(|c| c.case_id.as_str()).collect();
+        let expected: Vec<_> = dataset
+            .cases
+            .iter()
+            .map(|case| case.case_id.as_str())
+            .filter(|id| ids.contains(id))
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(listed[0].candidate_violations, [ViolationKind::MarkingLeak]);
+        assert!(
+            listed
+                .iter()
+                .all(|c| c.case_id != dataset.cases[39].case_id)
+        );
     }
 
     #[test]

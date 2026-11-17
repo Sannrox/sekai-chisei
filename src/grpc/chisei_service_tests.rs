@@ -14069,6 +14069,7 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                         candidate_run_id: "release-3".into(),
                         alpha: 0.0,
                         allow_policy_increase: false,
+                        ..Default::default()
                     }))
                     .await
                     .unwrap()
@@ -14077,6 +14078,24 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                 assert_eq!(compared.cases as usize, version.cases.len());
                 assert_eq!(compared.regressions, 0);
                 assert_eq!(compared.alpha, 0.05);
+                // Without include_cases the response is today's; with it, a
+                // pair of identical runs lists no differing case.
+                assert!(compared.differing_cases.is_empty());
+                let listed = svc
+                    .compare_eval_dataset_runs(Request::new(CompareEvalDatasetRunsRequest {
+                        namespace: "acme".into(),
+                        baseline_run_id: "release-1".into(),
+                        candidate_run_id: "release-3".into(),
+                        include_cases: true,
+                        include_both_failed: true,
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(listed.differing_cases.len() as u64, listed.both_failed);
+                assert!(!listed.cases_truncated);
+                assert_eq!(listed.regressions, compared.regressions);
                 let unknown = svc
                     .compare_eval_dataset_runs(Request::new(CompareEvalDatasetRunsRequest {
                         namespace: "acme".into(),
@@ -14084,6 +14103,7 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                         candidate_run_id: "release-9".into(),
                         alpha: 0.0,
                         allow_policy_increase: false,
+                        ..Default::default()
                     }))
                     .await
                     .unwrap_err();

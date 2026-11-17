@@ -134,6 +134,12 @@ never compared.
 - **Gate.** The verdict is `fail` on a significant regression, or on a
   policy increase unless `allow_policy_increase` is set. `reasons` names
   why.
+- **Cases.** The counts hide which cases moved. With `include_cases` set,
+  `differing_cases` lists, in dataset order, every case that did not pass in
+  both runs: its id, tags, both outcomes, and the candidate's violation
+  kinds. Cases that failed in both runs are left out unless
+  `include_both_failed` is set. `case_limit` (default 50, at most 200) bounds
+  a page; `cases_truncated` and `next_page_token` continue it.
 
 `ExportModelEvaluationEvidence` with `dataset_namespace` set signs the release
 evaluation evidence from this comparison. The outcome is the gate's verdict.
