@@ -80,6 +80,7 @@ HTTP_UNARY_METHODS = (
     ("sekai.SekaiService", "ListActionInstances"),
     ("sekai.SekaiService", "GetActionEffect"),
     ("sekai.SekaiService", "ListActionEffects"),
+    ("sekai.SekaiService", "GetLineage"),
     ("sekai.SekaiService", "CreateCredential"),
     ("sekai.SekaiService", "RotateCredential"),
     ("sekai.SekaiService", "RevokeCredential"),

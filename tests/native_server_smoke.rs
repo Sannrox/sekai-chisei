@@ -2323,6 +2323,64 @@ async fn spawned_binary_serves_datasource_index_rpcs() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_serves_get_lineage() {
+    use sekai_chisei::grpc::pb::sekai as pb;
+
+    let server = NativeServer::spawn();
+    let mut sekai = server.sekai().await;
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let source = format!("lineage-source-{suffix}");
+    let derived = format!("lineage-derived-{suffix}");
+    for id in [&source, &derived] {
+        sekai
+            .create_object(CreateObjectRequest {
+                object: Some(Object {
+                    id: id.clone(),
+                    kind: "component".into(),
+                    name: id.clone(),
+                    namespace: "demo".into(),
+                    ..Default::default()
+                }),
+                lease_precondition: None,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("create object: {error}\n{}", server.logs()));
+    }
+    sekai
+        .create_link(pb::CreateLinkRequest {
+            link: Some(pb::Link {
+                id: format!("lineage-link-{suffix}"),
+                from_id: derived.clone(),
+                to_id: source.clone(),
+                relation: "derived_from".into(),
+                created: 0,
+            }),
+            fail_if_exists: false,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create link: {error}\n{}", server.logs()));
+
+    let result = sekai
+        .get_lineage(pb::GetLineageRequest {
+            object_id: derived.clone(),
+            max_nodes: 10,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("get lineage: {error}\n{}", server.logs()))
+        .into_inner()
+        .result
+        .expect("lineage result");
+    let ids = result
+        .nodes
+        .iter()
+        .filter_map(|node| node.object.as_ref().map(|object| object.id.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [derived.clone(), source.clone()]);
+    assert_eq!(result.edges.len(), 1);
+    assert!(!result.truncated);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn spawned_binary_serves_dataset_version_and_health_rpcs() {
     use sekai_chisei::grpc::pb::sekai as pb;
 

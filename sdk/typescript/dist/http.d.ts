@@ -214,6 +214,8 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "ListActionEffects";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "GetLineage";}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "CreateCredential";
 }, {
     readonly service: "sekai.SekaiService";
