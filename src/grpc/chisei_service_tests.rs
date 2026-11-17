@@ -6210,6 +6210,39 @@ async fn team_principals_cannot_mutate_usage_accounting() {
 }
 
 #[tokio::test]
+async fn usage_recording_requires_token_auth_for_a_configured_gateway_principal() {
+    let mut svc = memory_service();
+    svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
+    let usage = || RecordUsageRequest {
+        user_id: "agent:codex-app".into(),
+        tokens_used: 3,
+        project: "sekai-chisei".into(),
+        idempotency_key: "gateway-usage".into(),
+        ..Default::default()
+    };
+    let mut assertion = Request::new(usage());
+    assertion
+        .metadata_mut()
+        .insert("x-principal", "Gateway-Prod".parse().unwrap());
+    assertion
+        .metadata_mut()
+        .insert(AUTH_SOURCE_HEADER, "assertion".parse().unwrap());
+    assert_eq!(
+        svc.record_usage(assertion).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+
+    let mut token = Request::new(usage());
+    token
+        .metadata_mut()
+        .insert("x-principal", "Gateway-Prod".parse().unwrap());
+    token
+        .metadata_mut()
+        .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
+    svc.record_usage(token).await.unwrap();
+}
+
+#[tokio::test]
 async fn cached_plan_execution_rechecks_namespace_membership() {
     let svc = memory_service();
     svc.db

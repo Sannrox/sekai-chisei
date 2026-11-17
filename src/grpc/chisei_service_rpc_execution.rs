@@ -293,18 +293,7 @@ pub(super) async fn claim_gateway_dispatch(
     service: &ChiseiServiceImpl,
     req: Request<ClaimGatewayDispatchRequest>,
 ) -> Result<Response<ClaimGatewayDispatchResponse>, Status> {
-    let actor = authenticated_actor(&req);
-    let auth_source = req
-        .metadata()
-        .get(AUTH_SOURCE_HEADER)
-        .and_then(|value| value.to_str().ok());
-    let configured_gateway = service
-        .config
-        .gateway_receipt_principals
-        .iter()
-        .any(|principal| principal == &actor)
-        && auth_source == Some("token");
-    if !configured_gateway && !matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
+    if !is_gateway_service_principal(&req, &service.config) {
         return Err(Status::permission_denied(
             "gateway dispatch claim requires a gateway service principal",
         ));
