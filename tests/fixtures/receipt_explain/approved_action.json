@@ -1,0 +1,137 @@
+{
+  "version": "operation.receipt/v1",
+  "operation_id": "op-action-1",
+  "namespace": "logistics",
+  "operation_class": "action_instance",
+  "initiating_actor": "agent:dispatch",
+  "schema_version": "v1",
+  "policy_version": "12",
+  "started_at_ms": 1794319320000,
+  "events": [
+    {
+      "event_id": "a1",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319320000,
+      "kind": "intent_recorded",
+      "surface": "intent",
+      "actor": "agent:dispatch",
+      "references": [],
+      "attributes": {
+        "request_id": "req-11"
+      }
+    },
+    {
+      "event_id": "a2",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "policy_decided",
+      "surface": "policy",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "policy_version": "12",
+        "status": "approval_required"
+      },
+      "parent_event_id": "a1"
+    },
+    {
+      "event_id": "a3",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "route_selected",
+      "surface": "routing",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "runtime": "sekai"
+      },
+      "parent_event_id": "a2"
+    },
+    {
+      "event_id": "a4",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "budget_decided",
+      "surface": "budget",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "allowed": "true"
+      },
+      "parent_event_id": "a2"
+    },
+    {
+      "event_id": "a5",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319500000,
+      "kind": "approval_decided",
+      "surface": "approval",
+      "actor": "m.keller",
+      "references": [],
+      "attributes": {
+        "decision": "approved"
+      },
+      "parent_event_id": "a2"
+    },
+    {
+      "event_id": "a6",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319501000,
+      "kind": "human_intervened",
+      "surface": "intervention",
+      "actor": "m.keller",
+      "references": [],
+      "attributes": {
+        "status": "edited_parameters"
+      },
+      "parent_event_id": "a5"
+    },
+    {
+      "event_id": "a7",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319502000,
+      "kind": "action_performed",
+      "surface": "action",
+      "actor": "agent:dispatch",
+      "references": [],
+      "attributes": {
+        "action": "reassign_carrier"
+      },
+      "parent_event_id": "a5"
+    },
+    {
+      "event_id": "a8",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319503000,
+      "kind": "outcome_recorded",
+      "surface": "outcome",
+      "actor": "agent:dispatch",
+      "references": [],
+      "attributes": {
+        "status": "succeeded"
+      },
+      "parent_event_id": "a7"
+    },
+    {
+      "event_id": "a9",
+      "operation_id": "op-action-1",
+      "timestamp_ms": 1794319504000,
+      "kind": "memory_outcome_recorded",
+      "surface": "memory",
+      "actor": "agent:dispatch",
+      "references": [],
+      "attributes": {
+        "status": "recorded"
+      },
+      "parent_event_id": "a8"
+    }
+  ],
+  "uncovered_surfaces": [
+    {
+      "surface": "egress",
+      "reason": "the source system write-back reports separately"
+    }
+  ],
+  "reporter_grants": [],
+  "completed_at_ms": 1794319504000
+}

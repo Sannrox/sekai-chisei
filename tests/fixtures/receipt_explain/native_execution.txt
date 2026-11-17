@@ -1,0 +1,12 @@
+On 2026-11-10 at 14:02 UTC, "agent:planner" started operation "op-native-1" ("native_execution") in namespace "team-b".
+
+1. "agent:planner" recorded the intent for request "req-9". (14:02:00 UTC)
+2. Policy version "12" decided the request with status "allow". (14:02:01 UTC)
+3. The request was routed to "ollama" with model "llama3.2". (14:02:01 UTC)
+4. Attempt "1" started. (14:02:02 UTC)
+5. A model was called: "llama3.2" at "ollama". (14:02:04 UTC)
+6. An artifact was produced of type "structured_lookup". (14:02:04 UTC)
+   It cites "evidence" "ev-42", whose content was omitted.
+7. The operation ended with status "succeeded", reason "stop". (14:02:06 UTC)
+
+This record is incomplete. Nothing was recorded for: budget.

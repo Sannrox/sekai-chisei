@@ -1,0 +1,158 @@
+{
+  "version": "operation.receipt/v1",
+  "operation_id": "op-chat-1",
+  "namespace": "team-a",
+  "operation_class": "chat",
+  "initiating_actor": "gateway:codex-app",
+  "schema_version": "v1",
+  "policy_version": "12",
+  "started_at_ms": 1794319320000,
+  "events": [
+    {
+      "event_id": "e1",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319320000,
+      "kind": "intent_recorded",
+      "surface": "intent",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "request_id": "req-7"
+      }
+    },
+    {
+      "event_id": "e2",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319320000,
+      "kind": "context_governed",
+      "surface": "context",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {},
+      "parent_event_id": "e1"
+    },
+    {
+      "event_id": "e3",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "policy_decided",
+      "surface": "policy",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "policy_version": "12",
+        "status": "allowed"
+      },
+      "parent_event_id": "e1"
+    },
+    {
+      "event_id": "e4",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "route_selected",
+      "surface": "routing",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "provider": "openai",
+        "resolved_model": "gpt-5.5"
+      },
+      "parent_event_id": "e3"
+    },
+    {
+      "event_id": "e5",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "budget_decided",
+      "surface": "budget",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "status": "allowed"
+      },
+      "parent_event_id": "e3"
+    },
+    {
+      "event_id": "e6",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319321000,
+      "kind": "egress_decided",
+      "surface": "egress",
+      "actor": "chisei",
+      "references": [],
+      "attributes": {
+        "status": "allowed"
+      },
+      "parent_event_id": "e3"
+    },
+    {
+      "event_id": "e7",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319322000,
+      "kind": "attempt_started",
+      "surface": "attempt",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "attempt": "1"
+      },
+      "parent_event_id": "e4"
+    },
+    {
+      "event_id": "e8",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319325000,
+      "kind": "model_called",
+      "surface": "model_call",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "provider": "openai",
+        "model": "gpt-5.5"
+      },
+      "parent_event_id": "e7"
+    },
+    {
+      "event_id": "e9",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319325000,
+      "kind": "artifact_produced",
+      "surface": "artifact",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "artifact_type": "model_response"
+      },
+      "parent_event_id": "e8"
+    },
+    {
+      "event_id": "e10",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319325000,
+      "kind": "verification_recorded",
+      "surface": "verification",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "status": "not_requested"
+      },
+      "parent_event_id": "e9"
+    },
+    {
+      "event_id": "e11",
+      "operation_id": "op-chat-1",
+      "timestamp_ms": 1794319329000,
+      "kind": "outcome_recorded",
+      "surface": "outcome",
+      "actor": "gateway:codex-app",
+      "references": [],
+      "attributes": {
+        "status": "succeeded"
+      },
+      "parent_event_id": "e8"
+    }
+  ],
+  "uncovered_surfaces": [],
+  "reporter_grants": [],
+  "completed_at_ms": 1794319329000
+}

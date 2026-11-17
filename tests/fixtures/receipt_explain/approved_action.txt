@@ -1,0 +1,13 @@
+On 2026-11-10 at 14:02 UTC, "agent:dispatch" started operation "op-action-1" ("action_instance") in namespace "logistics".
+
+1. "agent:dispatch" recorded the intent for request "req-11". (14:02:00 UTC)
+2. Policy version "12" decided the request with status "approval_required". (14:02:01 UTC)
+3. The request was routed to "sekai". (14:02:01 UTC)
+4. The budget was checked and allowed it. (14:02:01 UTC)
+5. "m.keller" decided the approval with status "approved". (14:05:00 UTC)
+6. "m.keller" intervened with status "edited_parameters". (14:05:01 UTC)
+7. "agent:dispatch" performed an action: "reassign_carrier". (14:05:02 UTC)
+8. The operation ended with status "succeeded". (14:05:03 UTC)
+9. A memory outcome was recorded with status "recorded". (14:05:04 UTC)
+
+This record is incomplete. The egress surface was not covered: "the source system write-back reports separately".
