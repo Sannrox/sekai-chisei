@@ -763,6 +763,14 @@ pub(super) fn from_proto_action_policy(
         .ok_or_else(|| Status::invalid_argument("invalid or missing default_decision"))?;
     let mut action_overrides = HashMap::new();
     for (name, decision) in &policy.action_overrides {
+        // Overrides are stored as a comma-joined `name:decision` string, so a
+        // name with a comma, or one that trimming would change, cannot be read
+        // back faithfully.
+        if name.trim().is_empty() || name.trim() != name || name.contains(',') {
+            return Err(Status::invalid_argument(format!(
+                "invalid action override name {name:?}: must be non-empty, without surrounding whitespace or ','"
+            )));
+        }
         let decision = ActionDecision::parse(decision).ok_or_else(|| {
             Status::invalid_argument(format!("invalid decision for action {name}"))
         })?;
