@@ -84,6 +84,10 @@ if [[ -z "$GIT_SHA" ]]; then
   GIT_SHA="$(git rev-parse HEAD)"
 fi
 [[ "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "git sha must be a full lowercase SHA"
+# The manifest names GIT_SHA but the tests, build, and SBOM come from the
+# checked-out tree, so the two must be the same commit.
+HEAD_SHA="$(git rev-parse HEAD)"
+[[ "$GIT_SHA" == "$HEAD_SHA" ]] || fail "git sha ${GIT_SHA} is not the checked-out commit ${HEAD_SHA}"
 
 if [[ "$SKIP_TEST" -eq 0 ]]; then
   cargo test --locked --workspace

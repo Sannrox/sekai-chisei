@@ -76,6 +76,12 @@ class Package(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("sekai-chisei-release.json", self.checksummed())
 
+    def test_refuses_a_git_sha_that_is_not_the_checked_out_commit(self):
+        result = self.package("--skip-build", "--skip-test", "--git-sha", "0" * 40, "--skip-github")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is not the checked-out commit", result.stderr)
+        self.assertFalse((self.out / "sekai-chisei-release.json").exists())
+
     def test_refuses_a_tag_that_does_not_match_the_workspace_version(self):
         result = self.package(*DRY_RUN, "--skip-github", "--tag", "v9.9.9")
         self.assertNotEqual(result.returncode, 0)
