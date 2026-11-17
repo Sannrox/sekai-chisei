@@ -9,7 +9,7 @@ cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
     echo "gateway smoke failed (exit $status); dumping logs from $TMPDIR" >&2
-    for f in setup-codex.log setup-claude.log sekai.log gateway.log; do
+    for f in setup-codex.log setup-claude.log model-review-backfill.log sekai.log gateway.log; do
       if [ -f "$TMPDIR/$f" ]; then
         echo "=== $f ===" >&2
         sed -n '1,160p' "$TMPDIR/$f" >&2 || true
@@ -307,6 +307,11 @@ PROVIDER_PORT="$(cat "$PROVIDER_PORT_FILE")"
 SOCKET="$TMPDIR/sekai.sock"
 SEKAI_DB_PATH="$TMPDIR/sekai.db"
 CHISEI_DB_PATH="$TMPDIR/chisei.db"
+# Every process keeps its state under the smoke's temp dir, never the checkout.
+export SEKAI_DATA_DIR="$TMPDIR/data"
+export CHISEI_GATEWAY_USAGE_RECOVERY_PATH="$SEKAI_DATA_DIR/chisei-gateway-usage-recovery.json"
+export CHISEI_GATEWAY_RECOVERY_SPOOL_PATH="$SEKAI_DATA_DIR/chisei-gateway-recovery-spool.jsonl"
+mkdir -p "$SEKAI_DATA_DIR"
 SEKAI_INSECURE=1 \
 GRPC_PORT=0 \
 OPS_PORT="" \
@@ -350,6 +355,14 @@ SEKAI_SOCKET="$SOCKET" "$SEKAICTL_BIN" admin gateway setup \
   --allowed-model haiku \
   --allowed-model opus \
   --allowed-model fable >"$TMPDIR/setup-claude.log" 2>&1
+
+# Route admission denies any model that is not enabled by model review. The
+# backfill enables the models the setup policies above allow, as an operator
+# does once after setup.
+SEKAI_DB_PATH="$SEKAI_DB_PATH" \
+CHISEI_DB_PATH="$CHISEI_DB_PATH" \
+env -u DB_PATH -u SEKAI_SHARED_STORE \
+"$SEKAICTL_BIN" admin model-review backfill >"$TMPDIR/model-review-backfill.log" 2>&1
 
 GATEWAY_PORT=""
 for attempt in $(seq 1 10); do

@@ -24,6 +24,7 @@ data/*.db
 data/*.db-*
 data/*.sqlite
 data/*.sqlite-*
+data/objects.mikura*
 data/chisei-gateway-audit.jsonl*
 data/provider-registry-state.json*
 /provider-registry-state.json*
