@@ -33,18 +33,18 @@ async fn run_software_release(args: Vec<String>) -> Result<(), BoxErr> {
         .filter(|value| !value.starts_with('-'))
         .map(PathBuf::from)
         .ok_or_else(|| std::io::Error::other(usage()))?;
-    let flag = |name: &str| {
-        args.windows(2)
-            .find(|pair| pair[0] == name)
-            .map(|pair| pair[1].clone())
-    };
-    let namespace = flag("--namespace").ok_or_else(|| std::io::Error::other(usage()))?;
-    let request_id = flag("--request-id").ok_or_else(|| std::io::Error::other(usage()))?;
-    let evaluation_profile = flag("--evaluation-profile").unwrap_or_else(|| ALLOW_PROFILE.into());
-    let target = flag("--target")
-        .or_else(|| std::env::var("CHISEI_GRPC_URL").ok())
-        .or_else(|| std::env::var("SEKAI_SOCKET").ok())
-        .unwrap_or_else(|| "./data/sekai.sock".into());
+    let flags =
+        Flags::parse(&args[2..], &VALUE_FLAGS_SOFTWARE_RELEASE).map_err(std::io::Error::other)?;
+    let namespace = flags
+        .get("--namespace")
+        .ok_or_else(|| std::io::Error::other(usage()))?;
+    let request_id = flags
+        .get("--request-id")
+        .ok_or_else(|| std::io::Error::other(usage()))?;
+    let evaluation_profile = flags
+        .get("--evaluation-profile")
+        .unwrap_or_else(|| ALLOW_PROFILE.into());
+    let target = flags.target();
     let bytes = std::fs::read(&path)?;
     let candidate: SoftwareReleaseCandidate = serde_json::from_slice(&bytes)?;
     let subject_identity = candidate
@@ -133,14 +133,19 @@ async fn run_provenance_export(args: Vec<String>) -> Result<(), BoxErr> {
         .filter(|value| !value.starts_with('-'))
         .map(PathBuf::from)
         .ok_or_else(|| std::io::Error::other(usage()))?;
-    let operation_id =
-        flag(&args, "--operation-id").ok_or_else(|| std::io::Error::other(usage()))?;
-    let receipt_digest =
-        flag(&args, "--receipt-digest").ok_or_else(|| std::io::Error::other(usage()))?;
-    let export_id = flag(&args, "--export-id").ok_or_else(|| std::io::Error::other(usage()))?;
-    let output = flag(&args, "--output").map(PathBuf::from);
-    let trust_root_output = flag(&args, "--trust-root-output").map(PathBuf::from);
-    let target = target(&args);
+    let flags =
+        Flags::parse(&args[2..], &VALUE_FLAGS_PROVENANCE_EXPORT).map_err(std::io::Error::other)?;
+    let required = |name: &str| {
+        flags
+            .get(name)
+            .ok_or_else(|| std::io::Error::other(usage()))
+    };
+    let operation_id = required("--operation-id")?;
+    let receipt_digest = required("--receipt-digest")?;
+    let export_id = required("--export-id")?;
+    let output = flags.get("--output").map(PathBuf::from);
+    let trust_root_output = flags.get("--trust-root-output").map(PathBuf::from);
+    let target = flags.target();
     let candidate: SoftwareReleaseCandidate = serde_json::from_slice(&std::fs::read(path)?)?;
     let subject_identity = candidate
         .canonical_identity()
@@ -206,17 +211,61 @@ fn trust_root_toml(version: u32, key_id: &str, identity: &str, public_key: &str)
     )
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair[0] == name)
-        .map(|pair| pair[1].clone())
-}
+const VALUE_FLAGS_SOFTWARE_RELEASE: [&str; 4] = [
+    "--namespace",
+    "--request-id",
+    "--evaluation-profile",
+    "--target",
+];
+const VALUE_FLAGS_PROVENANCE_EXPORT: [&str; 6] = [
+    "--operation-id",
+    "--receipt-digest",
+    "--export-id",
+    "--output",
+    "--trust-root-output",
+    "--target",
+];
 
-fn target(args: &[String]) -> String {
-    flag(args, "--target")
-        .or_else(|| std::env::var("CHISEI_GRPC_URL").ok())
-        .or_else(|| std::env::var("SEKAI_SOCKET").ok())
-        .unwrap_or_else(|| "./data/sekai.sock".into())
+/// Arguments after the candidate path: `--flag value` pairs of known flags.
+/// An unknown flag, a missing value, a value that looks like a flag, or a
+/// repeated flag is an error naming the flag.
+#[derive(Debug)]
+struct Flags(Vec<(String, String)>);
+
+impl Flags {
+    fn parse(args: &[String], known: &[&str]) -> Result<Self, String> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut remaining = args.iter();
+        while let Some(name) = remaining.next() {
+            if !known.contains(&name.as_str()) {
+                return Err(format!("unknown argument {name}\n{}", usage()));
+            }
+            if pairs.iter().any(|(seen, _)| seen == name) {
+                return Err(format!("{name} given twice"));
+            }
+            match remaining.next() {
+                Some(value) if !value.starts_with("--") => {
+                    pairs.push((name.clone(), value.clone()))
+                }
+                _ => return Err(format!("{name} needs a value")),
+            }
+        }
+        Ok(Self(pairs))
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(flag, _)| flag == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn target(&self) -> String {
+        self.get("--target")
+            .or_else(|| std::env::var("CHISEI_GRPC_URL").ok())
+            .or_else(|| std::env::var("SEKAI_SOCKET").ok())
+            .unwrap_or_else(|| "./data/sekai.sock".into())
+    }
 }
 
 fn write_or_print(output: Option<PathBuf>, bytes: &[u8]) -> Result<(), BoxErr> {
@@ -301,6 +350,41 @@ mod tests {
         ] {
             assert!(!serialized.contains(forbidden));
         }
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn flags_parse_known_pairs_and_name_the_offending_argument() {
+        let flags = Flags::parse(
+            &words("--namespace prod --request-id r1"),
+            &VALUE_FLAGS_SOFTWARE_RELEASE,
+        )
+        .unwrap();
+        assert_eq!(flags.get("--namespace").as_deref(), Some("prod"));
+        assert_eq!(flags.get("--evaluation-profile"), None);
+
+        for (line, offender) in [
+            (
+                "--namespace prod --evaluation-profil strict",
+                "--evaluation-profil",
+            ),
+            ("--namespace prod --target", "--target"),
+            ("--namespace --request-id r1", "--namespace"),
+            ("--namespace prod --namespace dev", "--namespace"),
+        ] {
+            let error = Flags::parse(&words(line), &VALUE_FLAGS_SOFTWARE_RELEASE).unwrap_err();
+            assert!(error.contains(offender), "{line}: {error}");
+        }
+        assert!(
+            Flags::parse(
+                &words("--operation-id o --output"),
+                &VALUE_FLAGS_PROVENANCE_EXPORT
+            )
+            .is_err()
+        );
     }
 
     #[test]
