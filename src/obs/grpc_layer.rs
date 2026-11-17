@@ -74,8 +74,10 @@ where
 
         crate::obs::otel::set_parent_from_headers(&span, req.headers());
         let future = self.inner.call(req);
+        // Model calls the handler makes on this task report the same caller
+        // operation on their GenAI spans.
         Box::pin(
-            async move {
+            chisei_provider::genai::with_operation_id(caller_operation.clone(), async move {
                 let response = future.await?;
                 if let Some(code) = grpc_code(response.headers()) {
                     record_rpc(&grpc_service, &grpc_method, &code, started.elapsed());
@@ -84,7 +86,7 @@ where
                     Ok(response
                         .map(|body| MetricsBody::new(body, grpc_service, grpc_method, started)))
                 }
-            }
+            })
             .instrument(span),
         )
     }

@@ -381,6 +381,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let mut preflight_context = UsageContext {
+        genai_span: tracing::Span::none(),
         request_id: request_id.clone(),
         // The client alias is not owned until durable reservation succeeds.
         // Pre-dispatch refusal receipts remain addressable by canonical request
@@ -788,6 +789,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
             .and_then(|resolved| registry_snapshot.profile(&resolved.provider));
         let automatic_cache_requested = automatic_cache_attempted(resolved_profile, &prepared.body);
         UsageContext {
+            genai_span: tracing::Span::none(),
             request_id,
             lookup_request_id: correlation.lookup_request_id,
             caller_scope: correlation.caller_scope,
@@ -853,12 +855,27 @@ pub(super) async fn proxy_gateway_inner_scoped(
     };
 
     loop {
+        // One GenAI client span per provider attempt; the usage or refusal
+        // recorder finishes it.
+        let request_model = resolved
+            .resolved_model
+            .as_deref()
+            .and_then(|model| registry_snapshot.resolve_model(model).ok())
+            .map(|model| model.upstream_model)
+            .or_else(|| usage_context.requested_model.clone())
+            .unwrap_or_default();
+        usage_context.genai_span = chisei_provider::genai::client_span(
+            capability_provider_id(usage_context.provider),
+            &request_model,
+            Some(&usage_context.operation_id),
+        );
         let send_result = send_upstream_with_resilience(
             &state.runtime,
             prepared.provider,
             upstream,
             &contact_guard,
         )
+        .instrument(usage_context.genai_span.clone())
         .await;
 
         // Mid-request failover only when the first provider never received work:

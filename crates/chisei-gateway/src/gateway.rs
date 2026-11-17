@@ -863,6 +863,9 @@ impl GatewayCorrelation {
 
 #[derive(Debug, Clone)]
 struct UsageContext {
+    /// GenAI client span of the current provider attempt; finished by the
+    /// usage or refusal recorder. `Span::none()` before any provider contact.
+    genai_span: tracing::Span,
     request_id: String,
     lookup_request_id: Option<String>,
     caller_scope: String,

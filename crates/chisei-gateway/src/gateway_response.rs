@@ -379,12 +379,21 @@ pub(super) fn extract_sse_event_observation(event: &[u8]) -> Option<ResponseObse
     }
     collect_response_text(&value, &mut text);
     let text = truncate_gateway_spec(text.trim());
-    if text.is_empty() {
+    // Anthropic reports the stop reason on a text-less `message_delta`.
+    let mut stop_reason = extract_stop_reason(&value);
+    if stop_reason.is_empty() {
+        stop_reason = value
+            .pointer("/delta/stop_reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+    }
+    if text.is_empty() && stop_reason.is_empty() {
         return None;
     }
     Some(ResponseObservation {
         output_content: text,
-        stop_reason: extract_stop_reason(&value),
+        stop_reason,
     })
 }
 pub(super) fn extract_sse_data(event: &[u8]) -> Option<String> {

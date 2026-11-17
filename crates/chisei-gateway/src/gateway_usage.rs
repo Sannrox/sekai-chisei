@@ -1,5 +1,39 @@
 use super::*;
 
+/// Finish the attempt's GenAI span from the observed usage and outcome. Only
+/// counts and bounded outcome tokens are recorded, never response content.
+fn record_genai_outcome(
+    context: &UsageContext,
+    usage: Option<&ResponseUsage>,
+    observation: Option<&ResponseObservation>,
+    outcome: &GatewayUsageOutcome,
+) {
+    let span = &context.genai_span;
+    if let Some(usage) = usage {
+        record_genai_usage(span, usage);
+    }
+    if let Some(observation) = observation {
+        chisei_provider::genai::record_finish_reason(span, &observation.stop_reason);
+    }
+    match outcome {
+        GatewayUsageOutcome::TerminalFailure(_, reason)
+        | GatewayUsageOutcome::Interrupted(_, reason) => {
+            chisei_provider::genai::record_error(span, reason);
+        }
+        GatewayUsageOutcome::Success(_)
+        | GatewayUsageOutcome::Incomplete(_, _)
+        | GatewayUsageOutcome::AccountingOnly(_) => {}
+    }
+}
+
+fn record_genai_usage(span: &tracing::Span, usage: &ResponseUsage) {
+    chisei_provider::genai::record_usage(
+        span,
+        usage.input_tokens.into(),
+        usage.output_tokens.into(),
+    );
+}
+
 pub(super) async fn record_usage_and_append(
     config: &GatewayConfig,
     runtime: &GatewayRuntime,
@@ -9,6 +43,12 @@ pub(super) async fn record_usage_and_append(
     context: &UsageContext,
     outcome: GatewayUsageOutcome,
 ) {
+    record_genai_outcome(
+        context,
+        usage.as_ref(),
+        response_observation.as_ref(),
+        &outcome,
+    );
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
@@ -458,6 +498,10 @@ pub(super) async fn record_refusal_with_usage_and_append(
     usage: Option<ResponseUsage>,
     model_attempted: bool,
 ) {
+    if let Some(usage) = &usage {
+        record_genai_usage(&context.genai_span, usage);
+    }
+    chisei_provider::genai::record_error(&context.genai_span, &rejection.error_type);
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
