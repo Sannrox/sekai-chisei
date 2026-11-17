@@ -28,6 +28,13 @@ pub(super) fn in_process_facts_runtime_arc(
         .map_err(map_in_process_facts_error)
 }
 
+/// Evidence admission stores canonical SHA-256 as lowercase hex. A manifest
+/// binding qualifies the algorithm; resolution and execution both go through
+/// this helper so the two sides compare the same form.
+pub(super) fn qualified_evidence_digest(hex: &str) -> String {
+    format!("sha256:{hex}")
+}
+
 fn map_in_process_facts_error(error: crate::chisei::sekai_facts::SekaiFactError) -> Status {
     match error {
         crate::chisei::sekai_facts::SekaiFactError::Read(message) => Status::internal(message),
@@ -577,9 +584,7 @@ fn resolve_manifest_evidence(
     Ok(Ok(evaluation_manifest_domain::ResolvedEvidenceBinding {
         evidence_object_id: evidence_object_id.into(),
         submission_id: submission.id,
-        // Evidence admission stores canonical SHA-256 as lowercase hex. The
-        // manifest qualifies the algorithm for unambiguous later binding.
-        content_digest: format!("sha256:{}", submission.content_digest),
+        content_digest: qualified_evidence_digest(&submission.content_digest),
         evidence_type: submission.evidence_type,
         schema_id: submission.schema_id,
         schema_version: submission.schema_version,

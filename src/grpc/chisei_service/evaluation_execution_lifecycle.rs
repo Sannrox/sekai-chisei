@@ -6,6 +6,7 @@
 //! serialization, cancellation, worker dispatch, durable step and gate
 //! ordering, and terminal process-state cleanup.
 
+use super::evaluation_manifest_resolution::qualified_evidence_digest;
 use super::*;
 use crate::chisei_store::{ChiseiEvaluationStore, ChiseiReceiptStore};
 use crate::ext::*;
@@ -488,13 +489,14 @@ fn load_evaluation_node_evidence(
             &envelope.content,
         )
         .map_err(|_| evaluation_execution_domain::REASON_EVIDENCE_UNAVAILABLE.to_string())?;
+        let bound = |hex: &str| qualified_evidence_digest(hex) == binding.content_digest;
         if submission.id != binding.submission_id
             || submission.namespace != manifest.namespace
-            || submission.content_digest != binding.content_digest
+            || !bound(&submission.content_digest)
             || submission.schema_id != binding.schema_id
             || submission.schema_version != binding.schema_version
-            || envelope.content_digest != binding.content_digest
-            || retained_content_digest != binding.content_digest
+            || !bound(&envelope.content_digest)
+            || !bound(&retained_content_digest)
             || envelope.schema_id != binding.schema_id
             || envelope.schema_version != binding.schema_version
         {
@@ -911,7 +913,8 @@ mod tests {
         let binding = evaluation_manifest_domain::ResolvedEvidenceBinding {
             evidence_object_id: object_id.clone(),
             submission_id: outcome.submission.id.clone(),
-            content_digest: digest,
+            // #2371: the binding carries the qualified form resolution stores.
+            content_digest: qualified_evidence_digest(&digest),
             evidence_type: "schema-check.record".into(),
             schema_id: "schema://evidence/schema-check/v1".into(),
             schema_version: "1.0.0".into(),
