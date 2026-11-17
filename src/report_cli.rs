@@ -2,9 +2,9 @@ use crate::chisei::receipt::OperationReceipt;
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
-use crate::operation_report::{
-    ClaimState, OperationReport, OperationSummary, causal_operation_view,
-};
+// Re-exported at its pre-#2428 public path; operation_report owns it now.
+pub use crate::operation_report::causal_operation_view;
+use crate::operation_report::{ClaimState, OperationReport, OperationSummary};
 use std::path::PathBuf;
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
