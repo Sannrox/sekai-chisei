@@ -135,6 +135,16 @@ pub fn load_state(
     db: &ChiseiStore,
     namespace: &str,
 ) -> Result<Option<NamespaceAllocationState>, String> {
+    Ok(load_row(db, namespace)?.map(|(state, _)| state))
+}
+
+/// Load the state together with the stored row it decoded from. A mutator
+/// passes that row back to `persist`, so a write lands only when nothing else
+/// changed the state in between, including toggles that keep the revision id.
+fn load_row(
+    db: &ChiseiStore,
+    namespace: &str,
+) -> Result<Option<(NamespaceAllocationState, String)>, String> {
     required("namespace", namespace)?;
     let Some(json) = db.get_gunshi_allocation_state(namespace)? else {
         return Ok(None);
@@ -145,7 +155,7 @@ pub fn load_state(
     if state.namespace != namespace {
         return Err("stored allocation state namespace does not match key".into());
     }
-    Ok(Some(state))
+    Ok(Some((state, json)))
 }
 
 pub fn get_status(
@@ -228,7 +238,7 @@ pub fn promote(
     request: PromoteRequest,
 ) -> Result<NamespaceAllocationStatus, String> {
     required("actor", &request.actor)?;
-    let mut state = load_state(db, &request.namespace)?
+    let (mut state, loaded) = load_row(db, &request.namespace)?
         .ok_or_else(|| "namespace has no installed allocation policy baseline".to_string())?;
     if state.policy.active.revision_id != request.expected_revision {
         return Err(format!(
@@ -259,7 +269,6 @@ pub fn promote(
         &state.gate,
         request.now_ms,
     )?;
-    let previous = state.policy.active.revision_id.clone();
     state.policy = promoted;
     state.last_gate_result = state.policy.last_transition.clone();
     state.last_promoted_evaluation = Some(request.candidate_evaluation);
@@ -274,7 +283,7 @@ pub fn promote(
         "promoted",
         request.now_ms,
     )?;
-    if !persist(db, &state, Some(&previous))? {
+    if !persist(db, &state, Some(&loaded))? {
         return Err("allocation policy revision race during promote".into());
     }
     Ok(state.status())
@@ -290,7 +299,7 @@ pub fn rollback(
 ) -> Result<NamespaceAllocationStatus, String> {
     required("actor", actor)?;
     required("reason", reason)?;
-    let mut state = load_state(db, namespace)?
+    let (mut state, loaded) = load_row(db, namespace)?
         .ok_or_else(|| "namespace has no installed allocation policy".to_string())?;
     if state.policy.active.revision_id != expected_revision {
         return Err(format!(
@@ -350,7 +359,7 @@ pub fn rollback(
         "rolled_back",
         now_ms,
     )?;
-    if !persist(db, &state, Some(&from))? {
+    if !persist(db, &state, Some(&loaded))? {
         return Err("allocation policy revision race during rollback".into());
     }
     Ok(state.status())
@@ -366,7 +375,7 @@ pub fn monitor(
     now_ms: i64,
 ) -> Result<NamespaceAllocationStatus, String> {
     required("actor", actor)?;
-    let mut state = load_state(db, namespace)?
+    let (mut state, loaded) = load_row(db, namespace)?
         .ok_or_else(|| "namespace has no installed allocation policy".to_string())?;
     if state.policy.active.revision_id != expected_revision {
         return Err(format!(
@@ -397,7 +406,7 @@ pub fn monitor(
                 now_ms,
             )?;
         }
-        if !persist(db, &state, Some(&previous))? {
+        if !persist(db, &state, Some(&loaded))? {
             return Err("allocation policy revision race during monitor".into());
         }
     }
@@ -413,7 +422,7 @@ pub fn set_auto_opt_in(
     now_ms: i64,
 ) -> Result<NamespaceAllocationStatus, String> {
     required("actor", actor)?;
-    let mut state = load_state(db, namespace)?
+    let (mut state, loaded) = load_row(db, namespace)?
         .ok_or_else(|| "namespace has no installed allocation policy".to_string())?;
     if state.policy.active.revision_id != expected_revision {
         return Err(format!(
@@ -437,7 +446,6 @@ pub fn set_auto_opt_in(
             );
         }
     }
-    let previous = state.policy.active.revision_id.clone();
     state.auto_opt_in = opt_in;
     // Bump changed_at for operator visibility without changing revision id.
     if now_ms > state.policy.changed_at_ms {
@@ -457,7 +465,7 @@ pub fn set_auto_opt_in(
         if opt_in { "opted_in" } else { "opted_out" },
         now_ms,
     )?;
-    if !persist(db, &state, Some(&previous))? {
+    if !persist(db, &state, Some(&loaded))? {
         return Err("allocation policy revision race during auto opt-in".into());
     }
     Ok(state.status())
@@ -475,9 +483,8 @@ pub fn set_kill_switch(
     if enabled {
         required("reason", reason)?;
     }
-    let mut state = load_state(db, namespace)?
+    let (mut state, loaded) = load_row(db, namespace)?
         .ok_or_else(|| "namespace has no installed allocation policy".to_string())?;
-    let previous = state.policy.active.revision_id.clone();
     state.kill_switch = enabled;
     state.kill_switch_reason = if enabled {
         reason.into()
@@ -508,7 +515,7 @@ pub fn set_kill_switch(
         },
         now_ms,
     )?;
-    if !persist(db, &state, Some(&previous))? {
+    if !persist(db, &state, Some(&loaded))? {
         return Err("allocation policy revision race during kill switch".into());
     }
     Ok(state.status())
@@ -621,10 +628,12 @@ pub fn receipt_attributes(
     attrs
 }
 
+/// Write `state` only if the stored row still equals `expected_row`, the JSON
+/// `load_row` returned (`None` installs a namespace that has no row yet).
 fn persist(
     db: &ChiseiStore,
     state: &NamespaceAllocationState,
-    expected_revision: Option<&str>,
+    expected_row: Option<&str>,
 ) -> Result<bool, String> {
     let json = serde_json::to_string(state)
         .map_err(|error| format!("encode allocation state: {error}"))?;
@@ -633,7 +642,7 @@ fn persist(
         &state.policy.active.revision_id,
         state.policy.changed_at_ms,
         &json,
-        expected_revision,
+        expected_row,
     )
 }
 
@@ -976,6 +985,22 @@ mod tests {
             .unwrap_err()
             .contains("revision race")
         );
+    }
+
+    #[test]
+    fn a_stale_opt_in_cannot_clear_an_activated_kill_switch() {
+        // #2372: opt-in loads, the kill switch persists, then the opt-in
+        // persists its stale copy. The revision id never changed.
+        let db = db();
+        install_baseline(&db, "admin", "support", snapshot("v1", false), gate(), 1).unwrap();
+        let (mut stale, loaded) = load_row(&db, "support").unwrap().unwrap();
+        set_kill_switch(&db, "admin", "support", true, "incident", 2).unwrap();
+
+        stale.auto_opt_in = true;
+        assert!(!persist(&db, &stale, Some(&loaded)).unwrap());
+        let state = load_state(&db, "support").unwrap().unwrap();
+        assert!(state.kill_switch);
+        assert!(!state.auto_opt_in);
     }
 
     #[test]

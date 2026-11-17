@@ -44,15 +44,15 @@ fn exercise(store: &ChiseiStore, prefix: &str) {
         Some(first)
     );
 
-    // CAS against a missing row, or the wrong revision, leaves state unchanged.
+    // CAS against a missing row, or a stale row, leaves state unchanged.
     assert!(
         !store
-            .put_gunshi_allocation_state_cas(&missing, "r1", 1, "{}", Some("r1"))
+            .put_gunshi_allocation_state_cas(&missing, "r1", 1, "{}", Some(first))
             .unwrap()
     );
     assert!(
         !store
-            .put_gunshi_allocation_state_cas(&namespace, "r2", 12, "{}", Some("stale"))
+            .put_gunshi_allocation_state_cas(&namespace, "r2", 12, "{}", Some(r#"{"stale":true}"#))
             .unwrap()
     );
     assert_eq!(
@@ -65,7 +65,7 @@ fn exercise(store: &ChiseiStore, prefix: &str) {
 
     assert!(
         store
-            .put_gunshi_allocation_state_cas(&namespace, "r2", 13, second, Some("r1"))
+            .put_gunshi_allocation_state_cas(&namespace, "r2", 13, second, Some(first))
             .unwrap()
     );
     assert_eq!(
@@ -78,7 +78,7 @@ fn exercise(store: &ChiseiStore, prefix: &str) {
 
     assert!(
         !store
-            .put_gunshi_allocation_state_cas(&namespace, "r3", 14, "{}", Some("r1"))
+            .put_gunshi_allocation_state_cas(&namespace, "r3", 14, "{}", Some(first))
             .unwrap()
     );
     assert_eq!(
