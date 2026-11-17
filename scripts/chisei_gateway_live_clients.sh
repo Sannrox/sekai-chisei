@@ -70,20 +70,22 @@ require_command() {
   fi
 }
 
+# Returns non-zero (never exits) so `doctor` can call it as a condition and keep
+# reporting; the check-* commands still fail the script under `set -e`.
 check_codex_config() {
   local config_path="${1:-$CODEX_CONFIG}"
   if [ ! -f "$config_path" ]; then
     echo "missing Codex config: $config_path" >&2
-    exit 2
+    return 2
   fi
   if ! grep -q '^\[model_providers\.chisei\]' "$config_path"; then
     echo "missing [model_providers.chisei] in $config_path" >&2
     echo "Run: scripts/chisei_gateway_live_clients.sh print-codex-config" >&2
-    exit 2
+    return 2
   fi
   if ! grep -q 'wire_api *= *"responses"' "$config_path"; then
     echo "chisei provider exists, but wire_api is not responses" >&2
-    exit 2
+    return 2
   fi
   echo "Codex chisei provider appears configured in $config_path"
 }
