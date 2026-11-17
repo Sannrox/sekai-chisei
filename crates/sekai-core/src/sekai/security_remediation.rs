@@ -67,7 +67,8 @@ pub fn is_remediation_action(type_id: &str) -> bool {
 
 /// Park apply and lift, and park a proposal that is two-person, a production
 /// change, high criticality, or that touches marked data. Low-tier proposals
-/// auto-admit. Lift proposals from a fixed disposition auto-admit.
+/// auto-admit. A lift proposal auto-admits only while a `fixed` disposition
+/// heads its exposure's chain; otherwise it parks.
 pub fn should_park(
     db: &RuntimeDb,
     namespace: &str,
@@ -76,10 +77,43 @@ pub fn should_park(
 ) -> Result<bool, String> {
     match type_id {
         ACTION_MITIGATION_APPLY | ACTION_MITIGATION_LIFT => Ok(true),
-        ACTION_MITIGATION_PROPOSE_LIFT => Ok(false),
+        ACTION_MITIGATION_PROPOSE_LIFT => lift_needs_human(db, namespace, parameters_json),
         ACTION_REMEDIATION_PROPOSE => proposal_needs_human(db, namespace, parameters_json),
         _ => Ok(false),
     }
+}
+
+/// A lift proposal is routine only when the head of its exposure's disposition
+/// chain is `fixed` and covers the mitigation's marking. A missing mitigation,
+/// exposure, or chain parks.
+fn lift_needs_human(
+    db: &RuntimeDb,
+    namespace: &str,
+    parameters_json: &str,
+) -> Result<bool, String> {
+    let parameters: serde_json::Value = serde_json::from_str(parameters_json)
+        .map_err(|error| format!("lift proposal parameters: {error}"))?;
+    let Some(object_id) = string_param(&parameters, "object_id") else {
+        return Ok(true);
+    };
+    let Some(mitigation) = db
+        .get_object(object_id)?
+        .filter(|object| object.kind == KIND_MITIGATION && object.namespace == namespace)
+    else {
+        return Ok(true);
+    };
+    let Some(exposure_id) = mitigation.properties.get("exposure_id") else {
+        return Ok(true);
+    };
+    let Some(head) =
+        crate::sekai::security_package::disposition_chain_head(db, namespace, exposure_id)?
+    else {
+        return Ok(true);
+    };
+    if head.properties.get("disposition").map(String::as_str) != Some(DISPOSITION_FIXED) {
+        return Ok(true);
+    }
+    Ok(!disposition_covers_mitigation(db, &head, &mitigation)?)
 }
 
 fn proposal_needs_human(
@@ -2295,6 +2329,35 @@ mod tests {
             intent.attributes.get("marking_audit").map(String::as_str),
             Some(MARKING_AUDIT_PENDING)
         );
+    }
+
+    /// A lift proposal parks unless a fixed disposition heads the exposure chain.
+    #[test]
+    fn lift_proposal_without_a_fixed_disposition_parks() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_REMEDIATION_PROPOSE,
+            propose_freeze(),
+            "r-1",
+        )
+        .unwrap();
+        let parked = admit(
+            &runtime,
+            ACTION_MITIGATION_APPLY,
+            apply_freeze_params(),
+            "m-1",
+        )
+        .unwrap();
+        grant(&runtime, &parked.instance.instance_id).unwrap();
+        let proposal = admit(
+            &runtime,
+            ACTION_MITIGATION_PROPOSE_LIFT,
+            json!({"object_id": "m-1", "state": STATE_LIFT_PROPOSED}),
+            "lift-manual",
+        )
+        .unwrap();
+        assert_eq!(proposal.instance.status, STATUS_PARKED);
     }
 
     /// A fixed disposition produces a lift proposal for every active mitigation.
