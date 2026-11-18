@@ -134,6 +134,17 @@ fn deliver(
     flush(&path, transport).unwrap()
 }
 
+/// Deliver `item` from its own outbox and assert the plane refuses it.
+fn refused(dir: &Path, name: &str, transport: &mut PlaneTransport, item: WorkflowCommand) {
+    let path = enqueue(&dir.join(name), &item).unwrap();
+    transport.now_ms += 1;
+    assert_eq!(
+        flush(&path, transport).unwrap_err(),
+        WORKFLOW_UNAVAILABLE,
+        "{name}"
+    );
+}
+
 fn adapter_lifecycle(mut envelope: WorkflowStepEnvelope, profile: &str) {
     let db = setup();
     let mut transport = PlaneTransport {
@@ -160,15 +171,15 @@ fn adapter_lifecycle(mut envelope: WorkflowStepEnvelope, profile: &str) {
     envelope.cursor = 0;
     let parked = deliver(&dir, &mut transport, command("park", envelope.clone(), ""));
     assert_eq!(parked.status, STATUS_PARKED);
-    let mut stale = envelope.clone();
-    stale.cursor = 8;
-    let stale_dir = dir.join("stale");
-    let stale_path = enqueue(&stale_dir, &command("park", stale, "")).unwrap();
-    transport.now_ms += 1;
-    assert_eq!(
-        flush(&stale_path, &mut transport).unwrap_err(),
-        WORKFLOW_UNAVAILABLE
+    let mut out_of_order = envelope.clone();
+    out_of_order.cursor = 8;
+    refused(
+        &dir,
+        "out-of-order",
+        &mut transport,
+        command("park", out_of_order, ""),
     );
+    let park_envelope = envelope.clone();
 
     envelope.cursor = 1;
     let resumed = deliver(
@@ -191,6 +202,47 @@ fn adapter_lifecycle(mut envelope: WorkflowStepEnvelope, profile: &str) {
         command("cancel", envelope.clone(), ""),
     );
     assert_eq!(cancelled.status, STATUS_CANCELLED);
+
+    // Older cursors after the cancel: a changed payload is refused, a
+    // byte-identical replay returns its recorded result, and the binding
+    // stays cancelled.
+    let mut changed_park = park_envelope.clone();
+    changed_park.usage_units += 1;
+    refused(
+        &dir,
+        "stale-park",
+        &mut transport,
+        command("park", changed_park, ""),
+    );
+    let mut changed_resume = park_envelope.clone();
+    changed_resume.cursor = 1;
+    changed_resume.usage_units += 1;
+    refused(
+        &dir,
+        "stale-resume",
+        &mut transport,
+        command("resume", changed_resume, ""),
+    );
+    let mut callback_envelope = park_envelope.clone();
+    callback_envelope.cursor = 2;
+    refused(
+        &dir,
+        "stale-callback",
+        &mut transport,
+        command("callback", callback_envelope, &digest(8)),
+    );
+    let replayed = deliver(
+        &dir.join("replay"),
+        &mut transport,
+        command("park", park_envelope, ""),
+    );
+    assert_eq!(replayed, parked);
+    let still = deliver(
+        &dir.join("replay"),
+        &mut transport,
+        command("cancel", envelope.clone(), ""),
+    );
+    assert_eq!(still, cancelled);
 
     let report = transport
         .reconcile(&submitted.namespace, &submitted.binding_id)
