@@ -1682,7 +1682,9 @@ pub(crate) const SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS: &str = "SELECT mem
          'site_agent.memory.update',
          'site_agent.memory.forget'
        )
-       AND json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id') = ?2";
+       AND CASE WHEN json_valid(json_extract(body_json, '$.parameters_json'))
+         THEN json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id')
+       END = ?2";
 pub(crate) const SQLITE_REDACT_DECISION_MEMORY_BY_FACTS: &str = "SELECT memory_id, body_json
      FROM sekai_action_decision_memory
      WHERE namespace = ?1
@@ -1691,7 +1693,9 @@ pub(crate) const SQLITE_REDACT_DECISION_MEMORY_BY_FACTS: &str = "SELECT memory_i
          'site_agent.memory.update',
          'site_agent.memory.forget'
        )
-       AND json_extract(json_extract(body_json, '$.facts_json'), '$.object_id') = ?2";
+       AND CASE WHEN json_valid(json_extract(body_json, '$.facts_json'))
+         THEN json_extract(json_extract(body_json, '$.facts_json'), '$.object_id')
+       END = ?2";
 
 /// Empty forgotten memory `content` in writer Action parameters, in this
 /// transaction (#1969). Leaves each stored request digest as it was.
