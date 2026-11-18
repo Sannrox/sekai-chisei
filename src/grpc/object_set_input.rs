@@ -208,14 +208,15 @@ impl SekaiServiceImpl {
         let descriptor = parse_descriptor(alias, json)?;
         let bound =
             self.authorize_domain_object_set_read(principals, tenant_context, descriptor)?;
-        // Plain sets in this layer; aggregates, hops and traversals read
-        // differently and wait for their own slice.
+        // Plain sets in this layer; aggregates, hops, traversals and spatial
+        // predicates read differently and wait for their own slice.
         if bound.descriptor.aggregation.is_some()
             || bound.descriptor.traversal.is_some()
             || !bound.descriptor.hops.is_empty()
+            || bound.spatial.is_some()
         {
             return Err(Status::invalid_argument(format!(
-                "input {alias}: object-set inputs read plain sets, without aggregation or traversal"
+                "input {alias}: object-set inputs read plain sets, without aggregation, traversal or a spatial predicate"
             )));
         }
         if self

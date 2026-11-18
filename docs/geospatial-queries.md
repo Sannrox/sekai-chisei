@@ -32,3 +32,6 @@ examined. Invalid or foreign stored geometry is a non-match. Audit records
 operator, property, namespace, and total — not coordinates. SQLite and the
 reusable PostgreSQL graph surface share the same in-process evaluator after
 the existing object-security list.
+
+An object set can carry the same comparison as a spatial predicate under
+`sekai.object-set/v3`; see [object-set.md](object-set.md).
