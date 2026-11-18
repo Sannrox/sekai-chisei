@@ -61,6 +61,12 @@ schema property redaction classes and free-form domain fields.)
 - **Marked objects**: principal must present a ceiling that dominates the
   marking, or be a trusted service principal. Otherwise read and action
   targeting fail closed with generic `access denied`.
+- **One subject per request**: marking checks, marked and unmarked, evaluate
+  one subject. It is the authenticated subject, or the first `x-principal`
+  entry on the unauthenticated local path. Single reads, lists and search
+  use that same subject. Other listed principals never widen clearance,
+  trust, declassify rights or the explicit grant that admits an unmarked
+  object.
 
 ## Principal profiles
 
