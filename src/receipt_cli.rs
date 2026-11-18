@@ -1,4 +1,5 @@
 use crate::chisei::receipt::{OperationReceipt, OperationReceiptEvent};
+use crate::cli_args::require_value;
 use crate::grpc::client::connect_sekai;
 use crate::grpc::pb::chisei::GetOperationReceiptRequest;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
@@ -16,45 +17,79 @@ fn target() -> String {
         .unwrap_or_else(|_| "./data/sekai.sock".to_string())
 }
 
-pub async fn run_receipt_command(args: Vec<String>) -> Result<(), BoxErr> {
+/// Parsed `sekaictl receipt` arguments. Parsing finishes before any connection,
+/// so a malformed invocation never reaches the server.
+#[derive(Debug, Default, PartialEq)]
+struct ReceiptArgs {
+    id: String,
+    by_request_id: bool,
+    caller_scope: String,
+    attempt: u32,
+    json: bool,
+    explain: bool,
+    trace: bool,
+}
+
+fn parse_receipt_args(args: &[String]) -> Result<ReceiptArgs, String> {
+    let usage_error = |message: String| format!("{message}\n{}", usage());
     let id = args
         .first()
         .filter(|value| !value.starts_with('-'))
-        .ok_or_else(|| std::io::Error::other(usage()))?;
-    let flag = |name: &str| args.iter().any(|arg| arg == name);
-    let (json, explain, trace) = (flag("--json"), flag("--explain"), flag("--trace"));
-    if (json && explain) || (trace && !explain) {
-        return Err(std::io::Error::other(format!(
-            "--json and --explain are exclusive, and --trace needs --explain\n{}",
-            usage()
-        ))
-        .into());
+        .ok_or_else(|| usage().to_string())?;
+    let mut parsed = ReceiptArgs {
+        id: id.clone(),
+        ..ReceiptArgs::default()
+    };
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--request-id" => parsed.by_request_id = true,
+            "--json" => parsed.json = true,
+            "--explain" => parsed.explain = true,
+            "--trace" => parsed.trace = true,
+            "--scope" => {
+                parsed.caller_scope = require_value(args, index, "--scope").map_err(usage_error)?;
+                index += 1;
+            }
+            "--attempt" => {
+                let value = require_value(args, index, "--attempt").map_err(usage_error)?;
+                parsed.attempt = value.parse().map_err(|_| {
+                    usage_error(format!("--attempt must be a number, got {value:?}"))
+                })?;
+                index += 1;
+            }
+            other => return Err(usage_error(format!("unknown argument {other:?}"))),
+        }
+        index += 1;
     }
+    if (parsed.json && parsed.explain) || (parsed.trace && !parsed.explain) {
+        return Err(usage_error(
+            "--json and --explain are exclusive, and --trace needs --explain".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+pub async fn run_receipt_command(args: Vec<String>) -> Result<(), BoxErr> {
+    let ReceiptArgs {
+        id,
+        by_request_id,
+        caller_scope,
+        attempt,
+        json,
+        explain,
+        trace,
+    } = parse_receipt_args(&args).map_err(std::io::Error::other)?;
     let mut client = ChiseiServiceClient::new(connect_sekai(&target()).await?);
-    let by_request_id = args.iter().any(|arg| arg == "--request-id");
-    let caller_scope = args
-        .windows(2)
-        .find(|pair| pair[0] == "--scope")
-        .map(|pair| pair[1].clone())
-        .unwrap_or_default();
-    let attempt = args
-        .windows(2)
-        .find(|pair| pair[0] == "--attempt")
-        .map(|pair| pair[1].parse::<u32>())
-        .transpose()?
-        .unwrap_or_default();
+    let (operation_id, request_id) = if by_request_id {
+        (String::new(), id)
+    } else {
+        (id, String::new())
+    };
     let response = client
         .get_operation_receipt(GetOperationReceiptRequest {
-            operation_id: if by_request_id {
-                String::new()
-            } else {
-                id.clone()
-            },
-            request_id: if by_request_id {
-                id.clone()
-            } else {
-                String::new()
-            },
+            operation_id,
+            request_id,
             caller_scope,
             attempt,
         })
@@ -356,6 +391,61 @@ mod tests {
     use super::*;
     use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, ReceiptEventKind, ReceiptSurface};
     use std::collections::BTreeMap;
+
+    fn parse(raw: &[&str]) -> Result<ReceiptArgs, String> {
+        parse_receipt_args(&raw.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn receipt_args_keep_today_s_invocations() {
+        assert_eq!(
+            parse(&[
+                "op-1",
+                "--request-id",
+                "--scope",
+                "team",
+                "--attempt",
+                "2",
+                "--explain",
+                "--trace"
+            ]),
+            Ok(ReceiptArgs {
+                id: "op-1".to_string(),
+                by_request_id: true,
+                caller_scope: "team".to_string(),
+                attempt: 2,
+                explain: true,
+                trace: true,
+                ..ReceiptArgs::default()
+            })
+        );
+        assert_eq!(
+            parse(&["op-1", "--json"]).map(|args| (args.json, args.attempt)),
+            Ok((true, 0))
+        );
+    }
+
+    #[test]
+    fn receipt_args_refuse_unknown_flags_and_missing_values() {
+        for (raw, wanted) in [
+            (&["op-1", "--verbose"][..], "unknown argument \"--verbose\""),
+            (&["op-1", "extra"], "unknown argument \"extra\""),
+            (&["op-1", "--scope"], "--scope requires a value"),
+            (&["op-1", "--scope", "--json"], "--scope requires a value"),
+            (&["op-1", "--attempt"], "--attempt requires a value"),
+            (&["op-1", "--attempt", "two"], "--attempt must be a number"),
+            (
+                &["op-1", "--json", "--explain"],
+                "--json and --explain are exclusive",
+            ),
+            (&["op-1", "--trace"], "--trace needs --explain"),
+            (&["--json"], "sekaictl receipt <id>"),
+        ] {
+            let error = parse(raw).expect_err(&format!("{raw:?} must be refused"));
+            assert!(error.contains(wanted), "{raw:?}: {error}");
+            assert!(error.contains(usage()), "{raw:?} carries usage: {error}");
+        }
+    }
 
     #[test]
     fn renderer_orders_events_by_causality() {
