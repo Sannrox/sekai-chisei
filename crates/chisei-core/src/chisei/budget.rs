@@ -443,7 +443,6 @@ impl BudgetTracker {
             ));
         }
         if self.topology.partition_simulated {
-            let had = self.db.budget_get_transfer(transfer_id)?.is_some();
             let refused = self.db.budget_record_transfer_refused(
                 transfer_id,
                 metric,
@@ -454,15 +453,14 @@ impl BudgetTracker {
                 "partition_simulated: transfer refused fail-closed",
                 now_ms(),
             )?;
-            if !had {
-                self.audit_transfer(&refused, actor)?;
-            }
+            // Recorded on every call: a retry after a failed audit write
+            // restores the missing decision, and a repeat is a no-op.
+            self.audit_transfer(&refused, actor)?;
             return Err(format!(
                 "budget transfer refused under partition: {}",
                 refused.reason
             ));
         }
-        let had = self.db.budget_get_transfer(transfer_id)?.is_some();
         let record = self.db.budget_transfer_capacity(
             transfer_id,
             metric,
@@ -472,9 +470,7 @@ impl BudgetTracker {
             actor,
             now_ms(),
         )?;
-        if !had {
-            self.audit_transfer(&record, actor)?;
-        }
+        self.audit_transfer(&record, actor)?;
         Ok(record)
     }
 
@@ -510,7 +506,8 @@ impl BudgetTracker {
             target_id: record.from_scope_id.clone(),
             outcome: record.status.clone(),
         };
-        self.db.record_decision(&decision)
+        // The id is deterministic per transfer, so a repeat finds its row.
+        self.db.record_decisions_idempotently(&[decision])
     }
 
     /// Adjust reservation to actual usage after the call completes.
@@ -896,6 +893,57 @@ mod tests {
         assert!(err.contains("partition"), "{err}");
         let refused = us.get_transfer("xfer-part-1").unwrap().unwrap();
         assert_eq!(refused.status, "refused");
+    }
+
+    #[test]
+    fn a_transfer_whose_audit_was_lost_is_audited_on_retry() {
+        let db = ChiseiStore::memory();
+        let t = BudgetTracker::with_topology(
+            db.clone(),
+            BudgetTopologyConfig {
+                mode: BudgetTopologyMode::RegionalWithTransfer,
+                site_id: "us-east".into(),
+                partition_simulated: false,
+            },
+        );
+        t.set_pool_ceiling("org", METRIC_TOKENS, 100, PeriodType::Daily)
+            .unwrap();
+        for (scope, max, site) in [("region:us", 100, "us-east"), ("region:eu", 0, "eu-west")] {
+            t.set_limit_scoped(scope, METRIC_TOKENS, max, PeriodType::Daily, site, "org")
+                .unwrap();
+        }
+        // The transfer commits, then the process dies before its audit write.
+        db.budget_transfer_capacity(
+            "xfer-lost",
+            METRIC_TOKENS,
+            "region:us",
+            "region:eu",
+            40,
+            "operator",
+            now_ms(),
+        )
+        .unwrap();
+        let decisions = || {
+            db.list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                action: Some("budget.transfer".into()),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        assert!(decisions().is_empty());
+
+        for _ in 0..2 {
+            t.transfer_capacity(
+                "xfer-lost",
+                "region:us",
+                "region:eu",
+                40,
+                METRIC_TOKENS,
+                "operator",
+            )
+            .unwrap();
+        }
+        assert_eq!(decisions().len(), 1);
     }
 
     #[test]
