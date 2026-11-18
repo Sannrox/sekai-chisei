@@ -328,7 +328,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetWriteFreeze` | `sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.ListWriteFreezes` | `sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.EnsureTeamNamespace` | `sekai.team-namespaces, sekai.authorization, sekai.graph, sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RecordDecision` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.RecordDecision` | `sekai.audit` | yes | host | `stable` |
 | `SekaiService.ListDecisions` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListObjectChanges` | `sekai.audit, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ExplainValue` | `sekai.audit, sekai.graph` | yes | none | `experimental` |

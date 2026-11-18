@@ -69,6 +69,7 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "DeleteGrant" },
   { service: "sekai.SekaiService", rpc: "ListGrants" },
   { service: "sekai.SekaiService", rpc: "CheckAccess" },
+  { service: "sekai.SekaiService", rpc: "RecordDecision" },
   { service: "sekai.SekaiService", rpc: "PutGovernedActionType" },
   { service: "sekai.SekaiService", rpc: "SubmitActionInstance" },
   { service: "sekai.SekaiService", rpc: "DecideActionInstance" },

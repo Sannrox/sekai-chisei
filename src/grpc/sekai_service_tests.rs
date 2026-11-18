@@ -6046,6 +6046,134 @@ async fn record_decision_clamps_future_timestamp() {
 }
 
 #[tokio::test]
+async fn record_decision_replay_is_idempotent_and_conflicts_are_refused() {
+    exercise_record_decision_replay(&service()).await;
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; run through scripts/postgres-conformance.sh"]
+fn postgres_record_decision_replay_is_idempotent_and_conflicts_are_refused() {
+    let scratch = crate::db::ScratchDatabase::create();
+    let db = Arc::new(RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect())));
+    // The PostgreSQL client must drop outside the runtime, so the test
+    // keeps a handle and the service only borrows into the future.
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db));
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_record_decision_replay(&svc));
+}
+
+async fn exercise_record_decision_replay(svc: &SekaiServiceImpl) {
+    let decision = |outcome: &str| Decision {
+        id: "decision-replay".into(),
+        timestamp: 0,
+        actor: String::new(),
+        action: "act".into(),
+        reason: "why".into(),
+        evidence: HashMap::from([("k".into(), "v".into())]),
+        target_id: String::new(),
+        outcome: outcome.into(),
+    };
+    let record = |decision: Decision| {
+        svc.record_decision(with_principal(RecordDecisionRequest {
+            decision: Some(decision),
+        }))
+    };
+    let first = record(decision("done"))
+        .await
+        .unwrap()
+        .into_inner()
+        .decision
+        .unwrap();
+    // Timestamp 0 is clamped to server time on each call; the replay still
+    // matches and returns the stored timestamp.
+    let replay = record(decision("done"))
+        .await
+        .unwrap()
+        .into_inner()
+        .decision
+        .unwrap();
+    assert_eq!(replay.timestamp, first.timestamp);
+    let conflict = record(decision("other")).await.unwrap_err();
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+    assert!(!conflict.message().contains("done"));
+}
+
+#[tokio::test]
+async fn record_decision_requires_write_on_its_target() {
+    let svc = service();
+    svc.db
+        .runtime()
+        .create_object(&domain::Object {
+            id: "restricted".into(),
+            kind: "artifact".into(),
+            name: "restricted".into(),
+            namespace: "ns".into(),
+            external_id: "artifact:restricted".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    grant_object_role(&svc, "restricted", "bob", security::Role::Editor);
+    let record = |principal: &str| {
+        svc.record_decision(with_named_principal(
+            RecordDecisionRequest {
+                decision: Some(Decision {
+                    action: "act".into(),
+                    target_id: "restricted".into(),
+                    ..Default::default()
+                }),
+            },
+            principal,
+        ))
+    };
+    assert_eq!(
+        record("alice").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    record("bob").await.unwrap();
+}
+
+#[tokio::test]
+async fn record_decision_rejects_oversized_input() {
+    let svc = service();
+    let oversized = [
+        Decision {
+            reason: "r".repeat(4097),
+            ..Default::default()
+        },
+        Decision {
+            evidence: (0..65).map(|i| (format!("k{i}"), "v".into())).collect(),
+            ..Default::default()
+        },
+        Decision {
+            evidence: HashMap::from([("k".into(), "v".repeat(32 * 1024))]),
+            ..Default::default()
+        },
+    ];
+    for decision in oversized {
+        let err = svc
+            .record_decision(with_principal(RecordDecisionRequest {
+                decision: Some(Decision {
+                    action: "act".into(),
+                    ..decision
+                }),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "{}",
+            err.message()
+        );
+    }
+}
+
+#[tokio::test]
 async fn record_decision_strips_reserved_attestation_evidence_keys() {
     let svc = service();
     let recorded = svc

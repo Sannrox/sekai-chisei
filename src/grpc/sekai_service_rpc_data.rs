@@ -1569,6 +1569,7 @@ pub(super) async fn record_decision(
         )?;
         check_write(&service.security, &decision.target_id, &principals)?;
     }
+    validate_record_decision_bounds(&decision)?;
     if decision.id.is_empty() {
         decision.id = uuid::Uuid::new_v4().to_string();
     }
@@ -1588,23 +1589,94 @@ pub(super) async fn record_decision(
     decision
         .evidence
         .remove(attestation::EVIDENCE_ATTESTATION_HASH);
-    service
-        .db
-        .runtime()
-        .record_decision(&audit::Decision {
-            id: decision.id.clone(),
-            timestamp: decision.timestamp,
-            actor: decision.actor.clone(),
-            action: decision.action.clone(),
-            reason: decision.reason.clone(),
-            evidence: decision.evidence.clone(),
-            target_id: decision.target_id.clone(),
-            outcome: decision.outcome.clone(),
-        })
-        .map_err(Status::internal)?;
+    let mut record = audit::Decision {
+        id: decision.id.clone(),
+        timestamp: decision.timestamp,
+        actor: decision.actor.clone(),
+        action: decision.action.clone(),
+        reason: decision.reason.clone(),
+        evidence: decision.evidence.clone(),
+        target_id: decision.target_id.clone(),
+        outcome: decision.outcome.clone(),
+    };
+    audit::validate_decision(&record).map_err(Status::invalid_argument)?;
+    let db = service.db.runtime();
+    // A retry of the same decision id is idempotent: the stored decision is
+    // returned when everything but the server-clamped timestamp matches.
+    // Any other reuse of the id is refused without revealing the stored row.
+    if let Some(stored) = db.get_decision(&record.id).map_err(Status::internal)? {
+        if same_decision_ignoring_timestamp(&stored, &record) {
+            record.timestamp = stored.timestamp;
+        } else {
+            return Err(decision_id_taken());
+        }
+    }
+    db.record_decisions_idempotently(std::slice::from_ref(&record))
+        .map_err(|error| {
+            if error.starts_with("conflicting audit decision already exists") {
+                decision_id_taken()
+            } else {
+                Status::internal(error)
+            }
+        })?;
+    decision.timestamp = record.timestamp;
     Ok(Response::new(RecordDecisionResponse {
         decision: Some(decision),
     }))
+}
+
+/// Input bounds for `RecordDecision`. The decision log is append-only, so
+/// every row a caller writes is kept until retention purges it.
+const MAX_DECISION_ID_BYTES: usize = 128;
+const MAX_DECISION_FIELD_BYTES: usize = 256;
+const MAX_DECISION_REASON_BYTES: usize = 4096;
+const MAX_DECISION_EVIDENCE_ENTRIES: usize = 64;
+const MAX_DECISION_EVIDENCE_BYTES: usize = 32 * 1024;
+
+fn validate_record_decision_bounds(decision: &Decision) -> Result<(), Status> {
+    let too_long = |field: &str, limit: usize| {
+        Status::invalid_argument(format!("decision {field} exceeds {limit} bytes"))
+    };
+    if decision.id.len() > MAX_DECISION_ID_BYTES {
+        return Err(too_long("id", MAX_DECISION_ID_BYTES));
+    }
+    for (field, value) in [
+        ("action", &decision.action),
+        ("outcome", &decision.outcome),
+        ("target_id", &decision.target_id),
+    ] {
+        if value.len() > MAX_DECISION_FIELD_BYTES {
+            return Err(too_long(field, MAX_DECISION_FIELD_BYTES));
+        }
+    }
+    if decision.reason.len() > MAX_DECISION_REASON_BYTES {
+        return Err(too_long("reason", MAX_DECISION_REASON_BYTES));
+    }
+    if decision.evidence.len() > MAX_DECISION_EVIDENCE_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "decision evidence exceeds {MAX_DECISION_EVIDENCE_ENTRIES} entries"
+        )));
+    }
+    let evidence_bytes: usize = decision
+        .evidence
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    if evidence_bytes > MAX_DECISION_EVIDENCE_BYTES {
+        return Err(too_long("evidence", MAX_DECISION_EVIDENCE_BYTES));
+    }
+    Ok(())
+}
+
+fn same_decision_ignoring_timestamp(stored: &audit::Decision, requested: &audit::Decision) -> bool {
+    audit::Decision {
+        timestamp: requested.timestamp,
+        ..stored.clone()
+    } == *requested
+}
+
+fn decision_id_taken() -> Status {
+    Status::already_exists("decision id already recorded with different content")
 }
 pub(super) async fn list_decisions(
     service: &SekaiServiceImpl,

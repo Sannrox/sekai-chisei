@@ -320,7 +320,7 @@ SEKAI_DB_PATH="$SEKAI_DB_PATH" \
 CHISEI_DB_PATH="$CHISEI_DB_PATH" \
 OPENAI_API_KEY="control-plane-openai-smoke-key" \
 ANTHROPIC_API_KEY="control-plane-anthropic-smoke-key" \
-env -u DB_PATH -u SEKAI_SHARED_STORE \
+env -u DB_PATH -u SEKAI_SHARED_STORE -u SEKAI_EXPERIMENTAL_RPCS \
 "$SEKAI_CHISEI_BIN" >"$TMPDIR/sekai.log" 2>&1 &
 PIDS+=("$!")
 wait_for_file "$SOCKET"
@@ -466,6 +466,23 @@ SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
 
 SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
   report --since 24h --html "$TMPDIR/dashboard.html" >"$TMPDIR/dashboard-command.txt"
+
+# RecordDecision is stable, so a control plane without experimental RPCs
+# keeps the gateway's audit decisions (#2568).
+if grep -h "audit decision record failed" "$TMPDIR"/gateway*.log; then
+  echo "gateway dropped audit decisions" >&2
+  exit 1
+fi
+python3 - "$SEKAI_DB_PATH" <<'PY'
+import sqlite3
+import sys
+
+conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+(count,) = conn.execute(
+    "SELECT count(*) FROM sekai_decisions WHERE target_id = 'llm_calls'"
+).fetchone()
+assert count > 0, "no gateway audit decisions recorded"
+PY
 
 python3 - "$PROVIDER_REQUESTS" "$TMPDIR/report.txt" "$TMPDIR/dashboard.html" "$TMPDIR/openai-stream.sse" "$TMPDIR/anthropic-stream.sse" <<'PY'
 import json
