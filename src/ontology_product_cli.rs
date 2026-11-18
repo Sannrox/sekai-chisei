@@ -418,7 +418,82 @@ pub fn should_ensure_kind(class: &DomainClass) -> bool {
 
 // --- gRPC apply / seed / run --------------------------------------------------
 
+/// Orders the document's classes so each comes after the superclasses it names
+/// that the same document defines. Superclasses defined elsewhere impose no
+/// order, and independent classes keep document order. A superclass cycle
+/// inside the document is refused, naming the classes in it.
+fn classes_parent_first(classes: &[DomainClass]) -> Result<Vec<&DomainClass>, String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Unvisited,
+        Visiting,
+        Done,
+    }
+    let index: HashMap<&str, usize> = classes
+        .iter()
+        .enumerate()
+        .map(|(position, class)| (class.name.as_str(), position))
+        .collect();
+    let mut marks = vec![Mark::Unvisited; classes.len()];
+    let mut ordered = Vec::with_capacity(classes.len());
+    // Depth-first from each class in document order; `path` holds the chain
+    // being visited so a cycle can be reported by name.
+    fn visit<'a>(
+        position: usize,
+        classes: &'a [DomainClass],
+        index: &HashMap<&str, usize>,
+        marks: &mut [Mark],
+        path: &mut Vec<usize>,
+        ordered: &mut Vec<&'a DomainClass>,
+    ) -> Result<(), String> {
+        match marks[position] {
+            Mark::Done => return Ok(()),
+            Mark::Visiting => {
+                let start = path
+                    .iter()
+                    .position(|&entry| entry == position)
+                    .unwrap_or(0);
+                let mut cycle: Vec<&str> = path[start..]
+                    .iter()
+                    .map(|&entry| classes[entry].name.as_str())
+                    .collect();
+                cycle.push(classes[position].name.as_str());
+                return Err(format!(
+                    "superclass cycle in the document: {}",
+                    cycle.join(" -> ")
+                ));
+            }
+            Mark::Unvisited => {}
+        }
+        marks[position] = Mark::Visiting;
+        path.push(position);
+        for superclass in &classes[position].superclasses {
+            if let Some(&parent) = index.get(superclass.as_str()) {
+                visit(parent, classes, index, marks, path, ordered)?;
+            }
+        }
+        path.pop();
+        marks[position] = Mark::Done;
+        ordered.push(&classes[position]);
+        Ok(())
+    }
+    let mut path = Vec::new();
+    for position in 0..classes.len() {
+        visit(
+            position,
+            classes,
+            &index,
+            &mut marks,
+            &mut path,
+            &mut ordered,
+        )?;
+    }
+    Ok(ordered)
+}
+
 pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyReport, BoxErr> {
+    // Ordered before connecting so a superclass cycle fails without any RPC.
+    let classes = classes_parent_first(&doc.classes)?;
     let channel = connect_sekai(target).await?;
     let mut client = SekaiServiceClient::new(channel);
     let mut report = ApplyReport {
@@ -427,11 +502,7 @@ pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyRep
         relations_created: Vec::new(),
     };
 
-    // Superclasses first: sort so dependents follow dependents when possible.
-    let mut classes = doc.classes.clone();
-    classes.sort_by_key(|a| a.superclasses.len());
-
-    for class in &classes {
+    for class in classes {
         if should_ensure_kind(class) {
             let kind = class.mapped_kind.trim();
             let description = if class.kind_description.trim().is_empty() {
@@ -515,6 +586,12 @@ pub async fn apply_domain(target: &str, doc: &DomainDocument) -> Result<ApplyRep
                     // Lock contention, not a mapped_kind problem: no schema hint.
                     return Err(format!(
                         "create ontology class {:?}: store busy, retry: {msg}",
+                        class.name
+                    )
+                    .into());
+                } else if msg.contains("superclass") {
+                    return Err(format!(
+                        "create ontology class {:?}: {msg}. Hint: each superclass must be defined in this document or already applied.",
                         class.name
                     )
                     .into());
@@ -1315,6 +1392,61 @@ mod tests {
         }
       ]
     }"#;
+
+    fn class(name: &str, superclasses: &[&str]) -> DomainClass {
+        DomainClass {
+            name: name.into(),
+            description: String::new(),
+            mapped_kind: String::new(),
+            ensure_kind: false,
+            kind_description: String::new(),
+            superclasses: superclasses.iter().map(|name| name.to_string()).collect(),
+            equivalent_classes: Vec::new(),
+            disjoint_classes: Vec::new(),
+            properties: Vec::new(),
+        }
+    }
+
+    fn order(classes: &[DomainClass]) -> Result<Vec<&str>, String> {
+        classes_parent_first(classes).map(|ordered| {
+            ordered
+                .into_iter()
+                .map(|class| class.name.as_str())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn classes_apply_parent_first_and_keep_document_order_otherwise() {
+        let chain = [class("C", &["B"]), class("B", &["A"]), class("A", &[])];
+        assert_eq!(order(&chain), Ok(vec!["A", "B", "C"]));
+        // Superclasses outside the document impose no order.
+        let independent = [
+            class("Zeta", &["Thing"]),
+            class("Alpha", &[]),
+            class("Mid", &["Builtin", "Other"]),
+        ];
+        assert_eq!(order(&independent), Ok(vec!["Zeta", "Alpha", "Mid"]));
+        let mixed = [
+            class("Leaf", &["Root"]),
+            class("Solo", &[]),
+            class("Root", &[]),
+        ];
+        assert_eq!(order(&mixed), Ok(vec!["Root", "Leaf", "Solo"]));
+    }
+
+    #[test]
+    fn a_superclass_cycle_is_refused_by_name() {
+        let cycle = [class("A", &["B"]), class("B", &["C"]), class("C", &["A"])];
+        assert_eq!(
+            order(&cycle),
+            Err("superclass cycle in the document: A -> B -> C -> A".to_string())
+        );
+        assert_eq!(
+            order(&[class("Self", &["Self"])]),
+            Err("superclass cycle in the document: Self -> Self".to_string())
+        );
+    }
 
     #[test]
     fn parses_and_validates_domain_document() {
