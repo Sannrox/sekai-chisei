@@ -30177,6 +30177,70 @@ async fn ontology_changelog_lists_the_week_with_authors_approvers_and_consumers(
 }
 
 #[tokio::test]
+async fn ontology_changelog_default_caps_readable_namespaces_not_held_roles() {
+    use crate::sekai::ontology_changelog::MAX_CHANGELOG_NAMESPACES;
+    let svc = service();
+    let request = |namespaces: Vec<String>| {
+        with_named_principal(
+            GetOntologyChangelogRequest {
+                namespaces,
+                since_ms: now_millis() - 24 * 60 * 60 * 1000,
+                until_ms: now_millis() + 1_000,
+                reader: "busy-team".into(),
+            },
+            "root",
+        )
+    };
+    // The store lists every held role. Only a namespace whose cached ACL
+    // names the reader is readable; the others carry another team's grant.
+    let hold = |namespace: String, readable: bool| {
+        let (_, grants) = svc
+            .db
+            .runtime()
+            .ensure_team_namespace(&namespace, "busy-team", security::Role::Viewer, "local")
+            .unwrap();
+        for mut grant in grants {
+            if !readable {
+                grant.principal = "other-team".into();
+            }
+            svc.security.add_grant(&grant);
+        }
+    };
+    for index in 0..MAX_CHANGELOG_NAMESPACES + 5 {
+        hold(format!("held-{index:02}"), false);
+    }
+    hold("read-00".into(), true);
+    svc.get_ontology_changelog(request(Vec::new()))
+        .await
+        .expect("held roles the reader cannot read do not count against the cap");
+
+    for index in 1..=MAX_CHANGELOG_NAMESPACES {
+        hold(format!("read-{index:02}"), true);
+    }
+    let too_many_readable = svc
+        .get_ontology_changelog(request(Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(too_many_readable.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        too_many_readable
+            .message()
+            .contains("pass the namespaces explicitly"),
+        "{}",
+        too_many_readable.message()
+    );
+
+    let explicit = (0..=MAX_CHANGELOG_NAMESPACES)
+        .map(|index| format!("read-{index:02}"))
+        .collect();
+    let too_many_named = svc
+        .get_ontology_changelog(request(explicit))
+        .await
+        .unwrap_err();
+    assert_eq!(too_many_named.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
 async fn transform_replay_rpc_reproduces_and_needs_read_on_every_input() {
     let svc = service();
     seed_lineage_object(&svc, "replay-secret", "replays");

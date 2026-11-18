@@ -263,7 +263,8 @@ pub(super) async fn get_ontology_changelog(
             purpose: None,
         }
     };
-    let mut namespaces: Vec<String> = if input.namespaces.is_empty() {
+    let defaulted = input.namespaces.is_empty();
+    let mut namespaces: Vec<String> = if defaulted {
         let mut held = Vec::new();
         for principal in &reader.principals {
             held.extend(
@@ -282,7 +283,18 @@ pub(super) async fn get_ontology_changelog(
     };
     namespaces.sort();
     namespaces.dedup();
-    if namespaces.len() > MAX_CHANGELOG_NAMESPACES {
+    if defaulted {
+        // The default covers what the reader can read, so roles in namespaces
+        // the reader cannot read do not count against the cap.
+        namespaces.retain(|namespace| reader.can_read_namespace(namespace));
+        if namespaces.len() > MAX_CHANGELOG_NAMESPACES {
+            return Err(Status::failed_precondition(format!(
+                "the reader can read {} namespaces and a changelog covers at most \
+                 {MAX_CHANGELOG_NAMESPACES}; pass the namespaces explicitly",
+                namespaces.len()
+            )));
+        }
+    } else if namespaces.len() > MAX_CHANGELOG_NAMESPACES {
         return Err(Status::invalid_argument(format!(
             "a changelog covers at most {MAX_CHANGELOG_NAMESPACES} namespaces"
         )));
