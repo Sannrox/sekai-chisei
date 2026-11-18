@@ -435,8 +435,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
             "SELECT id, name, description, cases_json FROM chisei_eval_suites WHERE id = ?1",
             params![id],
             |row| {
-                let cases_json: String = row.get(3)?;
-                let cases = serde_json::from_str(&cases_json).unwrap_or_default();
+                let cases = json_column(row, 3)?;
                 Ok(eval::Suite {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -483,8 +482,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                let cases_json: String = row.get(3)?;
-                let cases = serde_json::from_str(&cases_json).unwrap_or_default();
+                let cases = json_column(row, 3)?;
                 Ok(eval::Suite {
                     id: row.get(0)?,
                     name: row.get(1)?,
@@ -493,7 +491,8 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
                 })
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     fn put_eval_run(&self, run: &eval::Run) -> Result<(), String> {
@@ -534,8 +533,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
             "SELECT id, suite_id, config_ref, results_json, timestamp FROM chisei_eval_runs WHERE id = ?1",
             params![id],
             |row| {
-                let results_json: String = row.get(3)?;
-                let results = serde_json::from_str(&results_json).unwrap_or_default();
+                let results = json_column(row, 3)?;
                 Ok(eval::Run {
                     id: row.get(0)?,
                     suite_id: row.get(1)?,
@@ -598,8 +596,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![suite_id], |row| {
-                let results_json: String = row.get(3)?;
-                let results = serde_json::from_str(&results_json).unwrap_or_default();
+                let results = json_column(row, 3)?;
                 Ok(eval::Run {
                     id: row.get(0)?,
                     suite_id: row.get(1)?,
@@ -609,7 +606,8 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
                 })
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     fn list_all_eval_run_records(&self) -> Result<Vec<eval::Run>, String> {
@@ -621,8 +619,7 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
-                let results_json: String = row.get(3)?;
-                let results = serde_json::from_str(&results_json).unwrap_or_default();
+                let results = json_column(row, 3)?;
                 Ok(eval::Run {
                     id: row.get(0)?,
                     suite_id: row.get(1)?,
@@ -632,7 +629,8 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
                 })
             })
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// Keep only the newest `keep` runs for a suite (newest by timestamp), deleting the rest. Used
@@ -1050,9 +1048,57 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
     }
 }
 
+/// Decodes a JSON text column. A corrupt value is a read error: an empty
+/// default would turn a damaged eval run into one with no failures.
+fn json_column<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let text: String = row.get(index)?;
+    serde_json::from_str(&text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_eval_json_fails_reads_instead_of_reading_back_empty() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        db.put_eval_suite(&eval::Suite {
+            id: "suite".into(),
+            name: "suite".into(),
+            description: String::new(),
+            cases: Vec::new(),
+        })
+        .unwrap();
+        db.put_eval_run(&eval::Run {
+            id: "run".into(),
+            suite_id: "suite".into(),
+            config_ref: "cfg".into(),
+            results: Vec::new(),
+            timestamp: 1,
+        })
+        .unwrap();
+        db.conn()
+            .execute("UPDATE chisei_eval_suites SET cases_json = 'not json'", [])
+            .unwrap();
+        db.conn()
+            .execute("UPDATE chisei_eval_runs SET results_json = 'not json'", [])
+            .unwrap();
+
+        assert!(db.get_eval_suite_record("suite").is_err());
+        assert!(db.list_eval_suite_records().is_err());
+        assert!(db.get_eval_run_record("run").is_err());
+        assert!(db.list_eval_run_records("suite").is_err());
+        assert!(db.list_all_eval_run_records().is_err());
+    }
 
     #[test]
     fn gateway_request_aliases_are_reserved_once_per_scope() {
