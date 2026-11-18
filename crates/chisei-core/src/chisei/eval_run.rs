@@ -417,6 +417,19 @@ fn run_leased(
                     }
                     match executor.run_case(spec, dataset, case) {
                         Ok(mut outcome) => {
+                            // The reservation covered only `0..=cap`; a cost
+                            // outside it would overspend or replenish the
+                            // budget. Keep the cap counted and stop.
+                            if !(0..=cap).contains(&outcome.cost_micros) {
+                                release(cap);
+                                *store_error
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner()) = Some(format!(
+                                    "case {} reported cost {} micros, outside 0..={cap}",
+                                    case.case_id, outcome.cost_micros
+                                ));
+                                return;
+                            }
                             let policy = executor.case_policy(spec, dataset, case);
                             outcome.policy = Some(score_case(
                                 &case.case_id,
@@ -1440,6 +1453,21 @@ pub(crate) mod tests {
         assert_eq!(report.policy.counts.len(), 4);
         assert!(report.policy.counts.values().all(|count| *count == 0));
         assert!(report.policy.violations.is_empty());
+    }
+
+    #[test]
+    fn a_case_cost_outside_its_reserved_cap_fails_the_run_and_records_nothing() {
+        for cost in [-1_000, 101] {
+            let store = MemoryStore::default();
+            let fake = Fake::new(cost, usize::MAX);
+            let error = run(&store, &fake, &spec(1, 1_000), &dataset(5), || 1).unwrap_err();
+            assert!(error.contains("outside 0..=100"), "{error}");
+            let fine = Fake::new(1, usize::MAX);
+            let report = run(&store, &fine, &spec(1, 1_000), &dataset(5), || 2).unwrap();
+            // The refused case was never recorded, and its cap stays counted.
+            assert_eq!(report.uncertain_micros, 100);
+            assert!(report.spent_micros <= 1_000);
+        }
     }
 
     #[test]
