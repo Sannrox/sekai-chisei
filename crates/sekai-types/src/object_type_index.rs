@@ -11,6 +11,50 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::object_schema::{ObjectType, PropertyValue, coerce_properties};
 
+/// SQLite scalar function, registered on every store connection, that applies
+/// [`is_numeric_text`]. Range filters use it so SQLite admits the same text
+/// values as the PostgreSQL pattern below.
+pub const SQLITE_NUMERIC_TEXT_FN: &str = "is_index_numeric_text";
+
+/// Whether `value` matches `^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$`, the
+/// text a range filter compares as a number on both backends.
+pub fn is_numeric_text(value: &str) -> bool {
+    fn digits(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    }
+    let mut rest = value.as_bytes();
+    if let [b'+' | b'-', tail @ ..] = rest {
+        rest = tail;
+    }
+    let whole = digits(rest);
+    if whole == 0 {
+        return false;
+    }
+    rest = &rest[whole..];
+    if let [b'.', tail @ ..] = rest {
+        let fraction = digits(tail);
+        if fraction == 0 {
+            return false;
+        }
+        rest = &tail[fraction..];
+    }
+    if let [b'e' | b'E', tail @ ..] = rest {
+        let tail = match tail {
+            [b'+' | b'-', signed @ ..] => signed,
+            _ => tail,
+        };
+        let exponent = digits(tail);
+        if exponent == 0 {
+            return false;
+        }
+        rest = &tail[exponent..];
+    }
+    rest.is_empty()
+}
+
 pub fn join_value_digest(value: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -139,18 +183,18 @@ pub fn member_filter_sql(
                             let typed = format!("json_extract(properties, '$.{}')", filter.column);
                             if integer_range {
                                 format!(
-                                    "({typed} IS NOT NULL AND ((typeof({typed}) = 'integer' AND {typed} {cmp} CAST({placeholder} AS INTEGER)) OR (typeof({typed}) = 'real' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {typed} GLOB '*[0-9]*' AND {typed} NOT GLOB '*[A-Za-z]*' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
+                                    "({typed} IS NOT NULL AND ((typeof({typed}) = 'integer' AND {typed} {cmp} CAST({placeholder} AS INTEGER)) OR (typeof({typed}) = 'real' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {SQLITE_NUMERIC_TEXT_FN}({typed}) AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
                                 )
                             } else {
                                 format!(
-                                    "({typed} IS NOT NULL AND ((typeof({typed}) IN ('integer', 'real') AND {typed} {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {typed} GLOB '*[0-9]*' AND {typed} NOT GLOB '*[A-Za-z]*' AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
+                                    "({typed} IS NOT NULL AND ((typeof({typed}) IN ('integer', 'real') AND {typed} {cmp} CAST({placeholder} AS REAL)) OR (typeof({typed}) = 'text' AND {SQLITE_NUMERIC_TEXT_FN}({typed}) AND CAST({typed} AS REAL) {cmp} CAST({placeholder} AS REAL))))"
                                 )
                             }
                         }
                         IndexSqlDialect::Postgres => {
                             let json_num = format!("(properties::json -> '{}')", filter.column);
                             format!(
-                                "({json_num} IS NOT NULL AND ((jsonb_typeof({json_num}::jsonb) = 'number' AND ({json_num} #>> '{{}}')::numeric {cmp} ({placeholder})::numeric) OR (jsonb_typeof({json_num}::jsonb) = 'string' AND ({extract}) ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::numeric {cmp} ({placeholder})::numeric)))"
+                                "({json_num} IS NOT NULL AND ((jsonb_typeof({json_num}::jsonb) = 'number' AND ({json_num} #>> '{{}}')::numeric {cmp} ({placeholder})::text::numeric) OR (jsonb_typeof({json_num}::jsonb) = 'string' AND ({extract}) ~ '^[+-]?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$' AND ({extract})::numeric {cmp} ({placeholder})::text::numeric)))"
                             )
                         }
                     }
@@ -903,6 +947,41 @@ fn require_token(field: &str, value: &str) -> Result<(), ObjectTypeIndexError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numeric_text_matches_the_postgres_pattern() {
+        for value in [
+            "0",
+            "42",
+            "-7",
+            "+3",
+            "1.5",
+            "-0.25",
+            "1e5",
+            "2E-3",
+            "+6.02e+23",
+        ] {
+            assert!(is_numeric_text(value), "{value}");
+        }
+        for value in [
+            "",
+            "2024-01-05",
+            "1.",
+            ".5",
+            "1e",
+            "1e+",
+            "e5",
+            "--1",
+            " 1",
+            "1 ",
+            "0x10",
+            "inf",
+            "NaN",
+            "1,000",
+        ] {
+            assert!(!is_numeric_text(value), "{value}");
+        }
+    }
+
     use super::*;
     use crate::dataset::ColumnDef;
 
