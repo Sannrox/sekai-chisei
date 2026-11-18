@@ -256,7 +256,8 @@ impl ChiseiServiceImpl {
         }))
     }
 
-    #[cfg(feature = "gateway-test-support")]
+    /// Test harness hook: admit all context in `namespaces` on this
+    /// instance's in-memory resolver. Used by root gateway tests.
     pub fn seed_allow_by_default_context_admission(&self, namespaces: &[&str]) {
         for namespace in namespaces {
             self.policy

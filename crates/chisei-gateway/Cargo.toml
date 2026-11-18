@@ -8,6 +8,8 @@ description = "Governed OpenAI- and Anthropic-compatible egress gateway."
 [features]
 default = []
 secret-command = ["sekai-domain/secret-command"]
+# Hooks for the root crate's control-plane gateway tests; not a supported API.
+test-support = []
 
 [dependencies]
 async-stream = "0.3"
@@ -48,7 +50,8 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-sekai-chisei = { version = "3.1.0", path = "../..", features = ["gateway-test-support"] }
+chisei-core = { version = "3.0.0", path = "../chisei-core", features = ["gateway-test-support"] }
+sekai-core = { version = "4.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "registry",

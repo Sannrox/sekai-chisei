@@ -130,7 +130,7 @@ sekai-client = { path = "crates/sekai-client" }
 sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
 rusqlite = { version = "0.41", features = ["trace"] }
-chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
+chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway", features = ["test-support"] }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 sekai-parquet-export = { version = "1.0.0", path = "crates/sekai-parquet-export" }

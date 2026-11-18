@@ -22,8 +22,3 @@ tokio = { version = "1", default-features = false, features = [
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
-
-[dev-dependencies]
-sekai-chisei = { version = "3.1.0", path = "../..", features = ["gateway-test-support"] }
-tempfile = "3"
-tokio-stream = { version = "0.1", features = ["net"] }
