@@ -49,6 +49,22 @@ pub(super) async fn record_usage_and_append(
         response_observation.as_ref(),
         &outcome,
     );
+    let (log_status, log_outcome, log_reason) = match &outcome {
+        GatewayUsageOutcome::Success(status) => (*status, "success", None),
+        GatewayUsageOutcome::Incomplete(status, reason) => (*status, "incomplete", Some(reason)),
+        GatewayUsageOutcome::TerminalFailure(status, reason) => (*status, "failed", Some(reason)),
+        GatewayUsageOutcome::Interrupted(status, reason) => (*status, "interrupted", Some(reason)),
+        GatewayUsageOutcome::AccountingOnly(status) => (*status, "accounting_only", None),
+    };
+    log_attempt_usage(
+        runtime,
+        context,
+        log_status,
+        log_outcome,
+        log_reason.map(String::as_str),
+        usage.as_ref(),
+    )
+    .await;
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
@@ -502,6 +518,15 @@ pub(super) async fn record_refusal_with_usage_and_append(
         record_genai_usage(&context.genai_span, usage);
     }
     chisei_provider::genai::record_error(&context.genai_span, &rejection.error_type);
+    log_attempt_usage(
+        runtime,
+        context,
+        rejection.status,
+        "refused",
+        Some(&rejection.error_type),
+        usage.as_ref(),
+    )
+    .await;
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };

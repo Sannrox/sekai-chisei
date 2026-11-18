@@ -1054,6 +1054,7 @@ fn gateway_success_receipt_uses_canonical_complete_shape() {
         budget_status: "allowed".into(),
         egress_applied: true,
         cache_requested: true,
+        logged_admission: false,
     };
     let observation = ResponseObservation {
         output_content: "private model output".into(),
@@ -1407,6 +1408,7 @@ fn recovery_llm_row_carries_the_live_rows_data_class_and_pipeline_fields() {
         budget_status: "not_evaluated".into(),
         egress_applied: false,
         cache_requested: false,
+        logged_admission: false,
     };
     let config = routing_config();
     let row = |outcome: &GatewayUsageOutcome| {
@@ -1486,6 +1488,7 @@ fn gateway_refusal_receipt_is_terminal_and_complete() {
         budget_status: "not_evaluated".into(),
         egress_applied: false,
         cache_requested: false,
+        logged_admission: false,
     };
     let rejection =
         GatewayRejection::json(StatusCode::FORBIDDEN, "policy_denied", "request denied");
@@ -4285,4 +4288,182 @@ fn policy_model_limit_survives_a_reload() {
         store.admit(request()),
         Err(PolicyDenial::LimitExceeded(_))
     ));
+}
+
+fn admission(request_id: &str) -> LogEntry {
+    LogEntry::Admission {
+        request_id: request_id.into(),
+        operation_id: format!("op-{request_id}"),
+        principal: "coder".into(),
+        provider: "openai".into(),
+        model: Some("openai/gpt-5.5".into()),
+        data_class: "unknown".into(),
+        policy_version: format!("{POLICY_FORMAT}:1"),
+        at_ms: 1,
+    }
+}
+
+fn request_ids(page: &LogPage) -> Vec<(u64, String)> {
+    page.records
+        .iter()
+        .map(|record| match &record.entry {
+            LogEntry::Admission { request_id, .. } | LogEntry::Usage { request_id, .. } => {
+                (record.seq, request_id.clone())
+            }
+        })
+        .collect()
+}
+
+/// A crash after an admission leaves that admission and nothing else; the
+/// restarted log continues the sequence, drops a torn final line, and only
+/// one process may own the directory (#3095).
+#[tokio::test]
+async fn egress_log_survives_a_crash_with_gapless_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = EgressLog::open(dir.path()).unwrap();
+    assert_eq!(log.append(admission("r1")).await, Ok(1));
+    assert!(EgressLog::open(dir.path()).is_err(), "a second owner");
+    drop(log);
+
+    // A crash mid-append leaves part of a line behind.
+    let segment = dir.path().join(format!("{:020}.jsonl", 1));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"0123456789abcdef {\"seq\":2,").unwrap();
+    drop(file);
+
+    let log = EgressLog::open(dir.path()).unwrap();
+    assert_eq!(log.append(admission("r2")).await, Ok(2));
+    let page = log.read(0, 10).await.unwrap();
+    assert_eq!(
+        request_ids(&page),
+        vec![(1, "r1".to_string()), (2, "r2".to_string())]
+    );
+}
+
+/// Acknowledged records are no longer served, an acknowledgement past the
+/// last record is refused, and the acknowledgement survives a restart.
+#[tokio::test]
+async fn egress_log_drops_only_acknowledged_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = EgressLog::open(dir.path()).unwrap();
+    for id in ["r1", "r2", "r3"] {
+        log.append(admission(id)).await.unwrap();
+    }
+    assert_eq!(log.acknowledge(4).await, Err(AckError::NotWritten(3)));
+    assert_eq!(log.acknowledge(2).await, Ok(2));
+    assert_eq!(log.acknowledge(1).await, Ok(2));
+    // Records 1 and 2 filled the first segment, which is gone.
+    assert!(!dir.path().join(format!("{:020}.jsonl", 1)).exists());
+    assert_eq!(
+        request_ids(&log.read(0, 10).await.unwrap()),
+        vec![(3, "r3".to_string())]
+    );
+    drop(log);
+
+    let log = EgressLog::open(dir.path()).unwrap();
+    assert_eq!(
+        request_ids(&log.read(0, 10).await.unwrap()),
+        vec![(3, "r3".to_string())]
+    );
+    assert_eq!(log.append(admission("r4")).await, Ok(4));
+    assert_eq!(
+        request_ids(&log.read(3, 1).await.unwrap()),
+        vec![(4, "r4".to_string())]
+    );
+}
+
+const LOG_READER_KEY: &str = "sk-policy-chisei";
+
+/// Policy mode records an admission and a usage record per call, serves them
+/// only to a log reader, and denies with zero provider contact when it cannot
+/// record the admission (#3095).
+#[tokio::test]
+async fn policy_mode_logs_each_call_before_and_after_provider_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    let policy = serde_json::json!({
+        "format": POLICY_FORMAT,
+        "generation": 1,
+        "principals": [
+            {
+                "name": "coder",
+                "key_sha256": [hash_gateway_key(POLICY_KEY)],
+                "routes": [{"provider": "openai", "models": ["gpt-5.5"]}],
+            },
+            {
+                "name": "chisei",
+                "key_sha256": [hash_gateway_key(LOG_READER_KEY)],
+                "routes": [{"provider": "openai", "models": ["gpt-5.5"]}],
+                "log_reader": true,
+            }
+        ],
+        "egress": [{"provider": "openai", "data_classes": ["unknown"]}],
+    });
+    std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let log_dir = dir.path().join("log");
+    let (upstream_base, upstream) = spawn_fake_upstream(
+        r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+        "application/json",
+    )
+    .await;
+    let mut config = routing_config();
+    config.openai_base_url = upstream_base;
+    config.openai_api_key = Some("sk-upstream".into());
+    config.allow_auth_passthrough = false;
+    let mut runtime = test_gateway_runtime();
+    runtime.policy = Some(PolicyStore::open(path));
+    runtime.egress_log = Some(EgressLog::open(&log_dir).unwrap());
+    let gateway = spawn_gateway_with_runtime(config, runtime).await;
+
+    let (status, body) = policy_chat(&gateway, "gpt-5.5", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let read = |key: &'static str| {
+        reqwest::Client::new()
+            .get(format!("{gateway}/_chisei/log?after=0"))
+            .bearer_auth(key)
+            .send()
+    };
+    assert_eq!(
+        read(POLICY_KEY).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let page: serde_json::Value = read(LOG_READER_KEY).await.unwrap().json().await.unwrap();
+    let records = page["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2, "{page}");
+    assert_eq!(records[0]["kind"], "admission");
+    assert_eq!(records[0]["principal"], "coder");
+    assert_eq!(records[1]["kind"], "usage");
+    assert_eq!(records[1]["outcome"], "success");
+    assert_eq!(records[1]["total_tokens"], 7);
+    assert_eq!(records[0]["request_id"], records[1]["request_id"]);
+
+    let acked: serde_json::Value = reqwest::Client::new()
+        .post(format!("{gateway}/_chisei/log/ack"))
+        .bearer_auth(LOG_READER_KEY)
+        .json(&serde_json::json!({"seq": 2}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(acked["acked"], 2);
+
+    // The log directory can no longer be written.
+    std::fs::remove_dir_all(&log_dir).unwrap();
+    std::fs::write(&log_dir, b"").unwrap();
+    let (status, body) = policy_chat(&gateway, "gpt-5.5", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["type"], "log_unavailable", "{body}");
+    assert_eq!(upstream.lock().unwrap().len(), 1);
+    let ready: serde_json::Value = reqwest::get(format!("{gateway}/readyz"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready["reason"], "log_unavailable", "{ready}");
 }

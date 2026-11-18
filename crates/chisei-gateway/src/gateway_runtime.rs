@@ -209,7 +209,12 @@ pub(super) fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -
             COMMUNITY_GATEWAY_ROUTES[4],
             axum::routing::get(published_policy),
         ),
-        (COMMUNITY_GATEWAY_ROUTES[5], any(proxy_gateway)),
+        (
+            COMMUNITY_GATEWAY_ROUTES[5],
+            axum::routing::get(read_egress_log),
+        ),
+        (COMMUNITY_GATEWAY_ROUTES[6], post(acknowledge_egress_log)),
+        (COMMUNITY_GATEWAY_ROUTES[7], any(proxy_gateway)),
     ];
     routes
         .into_iter()
@@ -277,6 +282,22 @@ pub(super) async fn gateway_readiness(State(state): State<GatewayState>) -> Resp
     }
     if let Some(policy) = &state.runtime.policy {
         let (status, body) = policy.readiness();
+        // A failing log denies every request, so the gateway cannot do work.
+        if let Some(error) = state
+            .runtime
+            .egress_log
+            .as_ref()
+            .and_then(EgressLog::last_error)
+        {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "status": "not_ready",
+                    "reason": "log_unavailable",
+                    "detail": error,
+                }),
+            );
+        }
         return json_response(status, body);
     }
     let Some(target) = state.config.chisei_grpc_target.as_deref() else {
@@ -341,7 +362,13 @@ pub(super) async fn gateway_readiness(State(state): State<GatewayState>) -> Resp
     }
 }
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = GatewayRuntime::from_env();
+    let mut runtime = GatewayRuntime::from_env();
+    // Policy mode records every admission before provider contact, so it does
+    // not start without its log.
+    if let Some(policy_path) = policy_path_from_env() {
+        runtime.egress_log =
+            Some(EgressLog::open(&log_dir_from_env(&policy_path)).map_err(std::io::Error::other)?);
+    }
     if let Some(state_path) = runtime.provider_registry_state_path.as_deref() {
         validate_provider_registry_storage(state_path).map_err(std::io::Error::other)?;
         refresh_provider_registry(state_path).map_err(std::io::Error::other)?;

@@ -66,6 +66,9 @@ struct PrincipalPolicy {
     routes: Vec<RoutePolicy>,
     #[serde(default)]
     limits: Vec<RequestLimit>,
+    /// May read and acknowledge the gateway's egress log (Chisei).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    log_reader: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -549,6 +552,15 @@ impl PolicyStore {
             }
         }
         Ok(policy.generation())
+    }
+
+    /// Whether the active policy names `principal` as a log reader.
+    pub(super) fn is_log_reader(&self, principal: &str) -> bool {
+        self.read()
+            .active
+            .as_ref()
+            .and_then(|policy| policy.principal(principal))
+            .is_some_and(|principal| principal.log_reader)
     }
 
     /// `/readyz` body for policy mode: ready while a valid generation is active.

@@ -113,6 +113,7 @@ pub(super) fn early_refusal_context(
         budget_status: "not_evaluated".into(),
         egress_applied: false,
         cache_requested: false,
+        logged_admission: false,
     }
 }
 pub(super) fn is_transient_governance_status(status: &tonic::Status) -> bool {

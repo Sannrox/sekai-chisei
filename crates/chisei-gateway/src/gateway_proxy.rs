@@ -436,6 +436,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
         budget_status: "not_evaluated".into(),
         egress_applied: false,
         cache_requested: false,
+        logged_admission: false,
     };
     if !client_provider.same_family(requested_provider) && !state.config.allow_cross_provider {
         let rejection = GatewayRejection::json(
@@ -781,8 +782,38 @@ pub(super) async fn proxy_gateway_inner_scoped(
     // Atomically bind the opaque alias and claim its one provider dispatch only
     // after every fallible pre-dispatch step has completed.
     // Policy mode has no control plane to claim the alias with; a request id
-    // is not deduplicated there until the gateway keeps its own log.
+    // is not deduplicated there. It records the admission in its own log
+    // instead, and a request it cannot record never reaches the provider.
     let dispatch_token = uuid::Uuid::new_v4().to_string();
+    let logged_admission = state.runtime.egress_log.is_some();
+    if let Some(log) = &state.runtime.egress_log {
+        let admission = LogEntry::Admission {
+            request_id: request_id.clone(),
+            operation_id: correlation.operation_id.clone(),
+            principal: identity.agent.clone(),
+            provider: capability_provider_id(resolved.resolved_provider).into(),
+            model: resolved.resolved_model.clone(),
+            data_class: caller_data_class.clone(),
+            policy_version: resolved.policy_version.clone().unwrap_or_default(),
+            at_ms: Utc::now().timestamp_millis(),
+        };
+        if log.append(admission).await.is_err() {
+            let rejection = GatewayRejection::json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "log_unavailable",
+                "the gateway cannot record this request",
+            );
+            record_refusal_and_append(
+                &state.config,
+                &state.runtime,
+                &identity,
+                &preflight_context,
+                &rejection,
+            )
+            .await;
+            return rejection.response();
+        }
+    }
     if state.runtime.policy.is_none()
         && let Err(error) =
             claim_gateway_dispatch(&state.config, &alias_context, &dispatch_token).await
@@ -865,6 +896,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
                 .into(),
             egress_applied: true,
             cache_requested: cache_requested || automatic_cache_requested,
+            logged_admission,
         }
     };
 
