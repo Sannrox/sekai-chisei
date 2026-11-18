@@ -806,8 +806,15 @@ impl RuntimeDb {
         excluded_kinds: &[&str],
         context: &PrincipalPolicyContext,
     ) -> Result<(Vec<Object>, i32), String> {
-        let mut queried = filter
+        // The object-id filter selects rows by id, not by a property value,
+        // so property and value-instance grants do not govern it.
+        let property_filters = filter
             .property_filters
+            .iter()
+            .filter(|property_filter| property_filter.key != crate::domain::OBJECT_ID_FILTER_KEY)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut queried = property_filters
             .iter()
             .map(|property_filter| property_filter.key.clone())
             .collect::<Vec<_>>();
@@ -832,10 +839,9 @@ impl RuntimeDb {
         self.reject_value_instance_filter_ops(
             filter.namespace.as_deref(),
             filter.kind.as_deref(),
-            &filter.property_filters,
+            &property_filters,
         )?;
-        let cells = filter
-            .property_filters
+        let cells = property_filters
             .iter()
             .map(|property_filter| (property_filter.key.clone(), property_filter.value.clone()))
             .collect::<Vec<_>>();

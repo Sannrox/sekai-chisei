@@ -13,6 +13,27 @@ digest it is bound to. v1 may include at most four equality or comparison
 property filters, one `order_by`, a documented limit, and optional one-hop
 traversal over one declared `link_type` with a far-side kind filter.
 
+## Id filter
+
+Every contract version accepts one more filter, `{ key: "id", op: "in",
+value: <JSON array of ids> }`. It answers "which of these objects may this
+caller read" in one call. The result is exactly the listed objects the caller
+may read, through the same namespace, grant, and marking checks as any other
+read. An id the caller may not read is absent, like an id that does not
+exist, so a page or a count never reveals which absent ids exist.
+
+- A list holds at most 1,000 ids. A longer list is refused with invalid
+  argument and is never truncated. Capability discovery advertises the bound
+  as `max_id_filter_values` on `sekai.objects.evaluate_set`.
+- `in` applies only to `id`. On a property it is the unsupported-operator
+  error. A server that predates the id filter returns the same error, so a
+  client can tell whether the server supports it.
+- The list counts as one of the four filters. Order and duplicates do not
+  matter: the list is part of the query digest and the page cursor.
+- On a kind with an object type index, the filter selects index members by
+  object id, so the answer matches a plain evaluate of the same set.
+  Aggregation and extra hops refuse it; one-hop traversal accepts it.
+
 `sekai.object-set/v2` is the multi-hop contract: extra hops, `aggregation`,
 and cost limits (`max_rows_scanned`, `max_depth`, `max_time_ms`). Hop-projection
 is the shipping default. See [object-type-index.md](object-type-index.md) for

@@ -2490,6 +2490,18 @@ fn build_property_filter_condition(
     filter: &PropertyFilter,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
 ) -> Result<String, String> {
+    if let Some(ids) = crate::domain::object_id_filter_ids(&filter.key, &filter.op, &filter.value) {
+        let ids = ids?;
+        if ids.is_empty() {
+            return Ok("0 = 1".into());
+        }
+        let mut placeholders = Vec::with_capacity(ids.len());
+        for id in ids {
+            placeholders.push(format!("?{}", params.len() + 1));
+            params.push(Box::new(id));
+        }
+        return Ok(format!("sekai_objects.id IN ({})", placeholders.join(", ")));
+    }
     if !is_valid_property_key(&filter.key) {
         return Err("invalid property key".into());
     }
