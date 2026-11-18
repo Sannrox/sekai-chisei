@@ -71,15 +71,20 @@ fn exercise_functions(db: &dyn DefinitionHarness, prefix: &str) {
         "duplicates fail closed"
     );
 
-    let mut corrupt = alpha.clone();
+    // A fresh name, so only the invalid field can refuse the create.
+    let mut corrupt = function(&format!("{prefix}-corrupt"));
     corrupt.pipeline.clear();
-    assert!(
-        db.create_function(&corrupt).is_err(),
+    assert_eq!(
+        db.create_function(&corrupt).unwrap_err(),
+        "pipeline must have at least one step",
         "corrupt definitions fail closed"
     );
-    corrupt.pipeline = alpha.pipeline.clone();
-    corrupt.name.clear();
-    assert!(db.create_function(&corrupt).is_err());
+    assert!(db.get_function(&corrupt.name).unwrap().is_none());
+    let nameless = function("");
+    assert_eq!(
+        db.create_function(&nameless).unwrap_err(),
+        "function name required"
+    );
 
     let listed = db.list_functions().unwrap();
     let names = listed
