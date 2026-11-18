@@ -5,7 +5,7 @@ pub mod gateway_setup;
 #[allow(dead_code)]
 mod client;
 #[cfg(test)]
-pub use sekai_chisei::config;
+pub use chisei_core::config;
 pub use sekai_domain::domain;
 mod egress;
 pub use sekai_domain::enterprise;
@@ -19,13 +19,6 @@ pub use chisei_provider::{
     cost_estimate, gateway_keys, llm, model_availability, pricing, provider_profile,
     provider_resolution,
 };
-
-#[cfg(test)]
-mod test_support {
-    pub use sekai_chisei::db::{runtime_db, sekai as sekai_db};
-    pub use sekai_chisei::grpc::{chisei_service, sekai_service};
-    pub use sekai_chisei::sekai::{audit, dataset, security};
-}
 
 #[cfg(test)]
 mod shared_crate_cut {

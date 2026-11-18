@@ -25,8 +25,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request as GrpcRequest;
 use tracing::{Instrument, error, info, warn};
 
-#[cfg(test)]
-use crate::client::connect_sekai;
 use crate::client::{
     GatewayClient, connect_sekai_as_gateway_with_timeout, connect_sekai_with_timeout,
 };
@@ -45,8 +43,6 @@ use sekai_domain::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, UncoveredSurface,
 };
-#[cfg(test)]
-use sekai_proto::chisei::GetEffectivePolicySummaryRequest;
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_proto::chisei::{
     ClaimGatewayDispatchRequest, DecideGatewayExecutionRequest, RecordUsageRequest,
@@ -1940,3 +1936,8 @@ enum BoundedResponseError {
 #[cfg(test)]
 #[path = "gateway_tests.rs"]
 mod tests;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+#[path = "gateway_test_support.rs"]
+pub mod test_support;

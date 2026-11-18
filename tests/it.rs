@@ -69,6 +69,8 @@ mod game_demo_report;
 mod game_governance_pack;
 mod game_reference_actions;
 mod game_soak;
+mod gateway_admin_setup;
+mod gateway_control_plane;
 mod gateway_http_smoke;
 mod governed_fact_backend_conformance;
 mod governed_image_backend_conformance;
