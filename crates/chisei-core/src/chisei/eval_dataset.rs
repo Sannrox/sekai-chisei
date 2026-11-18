@@ -36,6 +36,17 @@ pub const EVAL_CASE_SCHEMA: &str = "chisei.eval-case/v1";
 /// such a change is a new version, never a rewritten one.
 pub const GENERATOR_VERSION: &str = "eval-dataset-generator/v1";
 const DATASET_NOT_FOUND: &str = "eval dataset version not found";
+/// Names the server's read-only directory of checked-in definitions, read
+/// beside the definitions put under a namespace.
+pub const EVAL_DATASETS_DIR_ENV: &str = "CHISEI_EVAL_DATASETS_DIR";
+
+/// The configured definitions directory, if any.
+pub fn datasets_directory() -> Option<std::path::PathBuf> {
+    std::env::var(EVAL_DATASETS_DIR_ENV)
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(std::path::PathBuf::from)
+}
 
 /// What a dataset is generated from. Checked in; never edited in place for
 /// a version anyone relies on, since an edit is a new version.

@@ -42,7 +42,7 @@ The read-only shell is an operator convenience surface. Console mutations
 5. Select a namespace from the header switcher (or open
    `/console/n/{namespace}/ops` when authorized). Primary nav is keyboard
    reachable (skip link → namespace control → Operations / Transforms /
-   Pressure / Policy).
+   Pressure / Policy / Evals).
 
 Unauthenticated visits to `/console/` or any namespaced route redirect to
 `/console/login`. Unauthorized namespace paths return **403** without loading
@@ -97,6 +97,8 @@ server {
 | `POST /console/n/{ns}/policy/dry-run` | session + ns | Experimental historical dry-run (audited) |
 | `POST /console/n/{ns}/policy/promote` | session + ns write | Experimental eval-gated promote with confirm |
 | `POST /console/n/{ns}/policy/rollback` | session + ns write | Experimental rollback with confirm + reason |
+| `GET /console/n/{ns}/evals` | session + ns | Eval dataset runs: pass-rate trend per dataset, recent runs |
+| `GET /console/n/{ns}/evals/{run_id}` | session + ns | One eval run against its baseline (`?baseline={run_id}` picks it), then every recorded case |
 | `GET /console/api/session` | session | JSON session summary |
 | `GET /console/api/namespaces` | session | JSON memberships for the principal |
 
@@ -142,6 +144,37 @@ Deep link: `/console/n/{namespace}/policy`.
   Promote requires candidate + evaluation JSON.
 - Kill switch remains on the Pressure surface; status is visible here when
   auto-dispatch policy is installed.
+
+### Evals
+
+Deep links: `/console/n/{namespace}/evals` and
+`/console/n/{namespace}/evals/{run_id}`.
+
+- Read-only. Reads the same recorded runs and case results as
+  `ListEvalDatasetRunTrend` and `CompareEvalDatasetRuns`
+  ([quality trends](evaluation-quality-trends.md),
+  [operator CLI](evaluation-operator-cli.md)); starting or gating a run stays
+  in `sekaictl`.
+- The list groups the **50** most recent runs by dataset, newest first, with a
+  pass-rate line over up to 20 of each dataset's listed runs that are
+  complete. Pass rate is over recorded cases. Status is
+  `Complete` when every case of the dataset version has a result,
+  `Incomplete` while some are missing, `Unknown` when the dataset version no
+  longer resolves.
+- The run page compares with the latest earlier complete run of the same
+  dataset version under the same evaluator, or with `?baseline=`, through the default
+  gate (alpha 0.05, policy increases fail). It shows the verdict and reasons,
+  regressions, improvements, p-value, pass and spend against the baseline,
+  and policy violation changes, then regressions grouped by the candidate's
+  recorded reason code. No cause is inferred beyond the code.
+- The full case table (verdict, reason code, policy violations, tokens, cost)
+  is folded below the comparison.
+- Case results record no operation id, so cases do not link to the causal
+  operation workspace yet.
+- The underlying eval dataset RPCs are experimental, so these pages share
+  their gate: without `SEKAI_EXPERIMENTAL_RPCS=1` (or the `experimental-rpcs`
+  build feature), and on a process that does not serve Chisei, they answer
+  **503**.
 
 Namespace URL segments must be short ASCII tokens (`[A-Za-z0-9._-]+`). Bootstrap
 principals `root` and `local` (administrative principal / local socket principal) may

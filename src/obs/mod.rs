@@ -17,6 +17,7 @@ pub mod metrics {
 }
 
 pub mod console;
+pub mod console_evals;
 pub mod console_policy;
 pub mod console_pressure;
 pub mod console_transforms;

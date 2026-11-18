@@ -81,7 +81,18 @@ impl SessionStore {
     }
 }
 
+/// The console without eval pages' store: `/evals` answers unavailable.
 pub fn router(state: ConsoleState) -> Router {
+    router_with_evals(state, None)
+}
+
+/// Chisei's store, where eval dataset runs live; `None` on a process that
+/// does not serve Chisei.
+#[derive(Clone)]
+struct EvalStore(Option<Arc<RuntimeDb>>);
+
+/// The console with eval pages reading runs from `chisei_db`.
+pub fn router_with_evals(state: ConsoleState, chisei_db: Option<Arc<RuntimeDb>>) -> Router {
     Router::new()
         .route("/console", get(console_root))
         .route("/console/", get(console_home))
@@ -110,6 +121,11 @@ pub fn router(state: ConsoleState) -> Router {
             "/console/n/{namespace}/transforms/{run_id}",
             get(screen_transform_run),
         )
+        .route("/console/n/{namespace}/evals", get(screen_evals))
+        .route(
+            "/console/n/{namespace}/evals/{run_id}",
+            get(screen_eval_run),
+        )
         .route("/console/n/{namespace}/policy", get(screen_policy))
         .route(
             "/console/n/{namespace}/policy/dry-run",
@@ -131,6 +147,7 @@ pub fn router(state: ConsoleState) -> Router {
             "/console/n/{namespace}/policy/auto-opt-in",
             post(policy_auto_opt_in),
         )
+        .layer(axum::Extension(EvalStore(chisei_db)))
         .with_state(state)
 }
 
@@ -141,6 +158,7 @@ enum Screen {
     Transforms,
     Pressure,
     Policy,
+    Evals,
 }
 
 impl Screen {
@@ -151,6 +169,7 @@ impl Screen {
             Self::Transforms => "Transforms",
             Self::Pressure => "Pressure",
             Self::Policy => "Policy",
+            Self::Evals => "Evals",
         }
     }
 
@@ -161,6 +180,7 @@ impl Screen {
             Self::Transforms => "/transforms",
             Self::Pressure => "/pressure",
             Self::Policy => "/policy",
+            Self::Evals => "/evals",
         }
     }
 }
@@ -349,7 +369,7 @@ pub fn list_accessible_namespaces(
     db.list_namespace_roles_for_principal(principal)
 }
 
-fn escape_html(input: &str) -> String {
+pub(crate) fn escape_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
         match c {
@@ -479,6 +499,20 @@ button.secondary {
   color: var(--fg);
 }
 .error { color: var(--danger); margin: 0.5rem 0; }
+.ok { color: #3fb27f; }
+.bad { color: var(--danger); }
+.warn { color: var(--focus); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; }
+.table-wrap .ops-table td, .table-wrap .ops-table th { white-space: nowrap; }
+.verdict { font-weight: 700; font-size: 1.05rem; }
+.kv { display: flex; flex-wrap: wrap; gap: 0.25rem 1.5rem; margin: 0.5rem 0; }
+.kv dt { display: inline; color: var(--muted); margin-right: 0.4rem; }
+.kv dd { display: inline; margin: 0; }
+.eval-trend { display: block; width: 100%; max-width: 26rem; height: auto; fill: var(--muted); }
+.eval-bar { display: inline-block; height: 0.5rem; background: var(--danger); }
+.case-ids { overflow-wrap: anywhere; font-size: 0.9rem; }
+details summary { cursor: pointer; color: var(--accent); margin: 0.75rem 0; }
 .stub { color: var(--muted); }
 .inline-form { display: inline; margin: 0; }
 .ops-table { width: 100%; border-collapse: collapse; margin-top: 0.75rem; }
@@ -630,15 +664,16 @@ fn shell_chrome(
         };
         format!(
             r#"<nav class="nav" aria-label="Primary">
-  {ops}{transforms}{pressure}{policy}
+  {ops}{transforms}{pressure}{policy}{evals}
 </nav>"#,
             ops = link(Screen::Operations),
             transforms = link(Screen::Transforms),
             pressure = link(Screen::Pressure),
             policy = link(Screen::Policy),
+            evals = link(Screen::Evals),
         )
     } else {
-        r#"<nav class="nav" aria-label="Primary"><span class="meta">Select a namespace to open Operations, Transforms, Pressure, or Policy.</span></nav>"#
+        r#"<nav class="nav" aria-label="Primary"><span class="meta">Select a namespace to open Operations, Transforms, Pressure, Policy, or Evals.</span></nav>"#
             .to_string()
     };
 
@@ -1163,6 +1198,112 @@ async fn pressure_kill_switch(
             )
                 .into_response()
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct EvalRunQuery {
+    baseline: Option<String>,
+}
+
+/// Eval page error, with the console shell and no namespace context.
+fn eval_error(
+    session: &ConsoleSession,
+    namespaces: &[(String, Role)],
+    heading: &str,
+    err: crate::obs::console_evals::EvalViewError,
+) -> Response {
+    (
+        err.status(),
+        shell_chrome(
+            &session.principal,
+            None,
+            namespaces,
+            Screen::Home,
+            &format!(
+                r#"<section><h1>{heading}</h1><p class="error" role="alert">{}</p></section>"#,
+                escape_html(err.message())
+            ),
+        ),
+    )
+        .into_response()
+}
+
+/// Runs an eval page load on the blocking pool; a failed task is internal.
+async fn run_eval_load(
+    load: impl FnOnce() -> Result<String, crate::obs::console_evals::EvalViewError> + Send + 'static,
+) -> Result<String, crate::obs::console_evals::EvalViewError> {
+    tokio::task::spawn_blocking(load)
+        .await
+        .unwrap_or(Err(crate::obs::console_evals::EvalViewError::Internal))
+}
+
+async fn screen_evals(
+    State(state): State<ConsoleState>,
+    axum::Extension(EvalStore(chisei_db)): axum::Extension<EvalStore>,
+    HtmlSession(session): HtmlSession,
+    Path(namespace): Path<String>,
+) -> Response {
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    let (db, principal, ns) = (
+        state.db.clone(),
+        session.principal.clone(),
+        namespace.clone(),
+    );
+    // Reads every listed run's cases and resolves datasets: off the runtime.
+    let page = run_eval_load(move || {
+        crate::obs::console_evals::load_home(&db, chisei_db.as_deref(), &principal, &ns)
+            .map(|home| crate::obs::console_evals::render_home(&home))
+    })
+    .await;
+    match page {
+        Ok(main) => shell_chrome(
+            &session.principal,
+            Some(&namespace),
+            &namespaces,
+            Screen::Evals,
+            &main,
+        )
+        .into_response(),
+        Err(err) => eval_error(&session, &namespaces, "Evals", err),
+    }
+}
+
+async fn screen_eval_run(
+    State(state): State<ConsoleState>,
+    axum::Extension(EvalStore(chisei_db)): axum::Extension<EvalStore>,
+    HtmlSession(session): HtmlSession,
+    Path((namespace, run_id)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<EvalRunQuery>,
+) -> Response {
+    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
+    let (db, principal, ns) = (
+        state.db.clone(),
+        session.principal.clone(),
+        namespace.clone(),
+    );
+    let page = run_eval_load(move || {
+        crate::obs::console_evals::load_run(
+            &db,
+            chisei_db.as_deref(),
+            &principal,
+            &ns,
+            &run_id,
+            query.baseline.as_deref(),
+        )
+        .map(|view| crate::obs::console_evals::render_run(&view))
+    })
+    .await;
+    match page {
+        Ok(main) => shell_chrome(
+            &session.principal,
+            Some(&namespace),
+            &namespaces,
+            Screen::Evals,
+            &main,
+        )
+        .into_response(),
+        Err(err) => eval_error(&session, &namespaces, "Eval run", err),
     }
 }
 
@@ -1707,6 +1848,47 @@ mod tests {
         let login_text = String::from_utf8(login_body.to_vec()).unwrap();
         assert!(login_text.contains("Sign in"));
         assert!(!login_text.contains("Signed in as"));
+    }
+
+    #[tokio::test]
+    async fn eval_pages_are_namespace_scoped_and_unavailable_without_chisei() {
+        let db = test_db();
+        let token = "alice-console-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .expect("credential");
+        seed_namespace_grant(&db, "alpha", "alice", Role::Viewer);
+        let chisei = crate::chisei_store::ChiseiStore::memory().runtime_arc();
+        let get = |app: Router, uri: &'static str, cookie: String| async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::COOKIE, cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        };
+
+        let app = router_with_evals(test_state(db.clone()), Some(chisei));
+        let cookie = format!("{SESSION_COOKIE}={}", login(&app, token).await.1.unwrap());
+        let (status, body) = get(app.clone(), "/console/n/alpha/evals", cookie.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains(r#"<a href="/console/n/alpha/evals" aria-current="page">Evals</a>"#));
+        assert!(body.contains("No eval runs in this namespace"));
+        let (status, body) = get(app, "/console/n/beta/evals/r1", cookie).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("Namespace access denied"));
+
+        let app = router(test_state(db));
+        let cookie = format!("{SESSION_COOKIE}={}", login(&app, token).await.1.unwrap());
+        let (status, body) = get(app, "/console/n/alpha/evals", cookie).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("Eval results are not available on this console."));
     }
 
     #[tokio::test]
