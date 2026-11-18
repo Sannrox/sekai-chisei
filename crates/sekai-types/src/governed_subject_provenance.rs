@@ -250,7 +250,9 @@ impl ProvenanceEnvelope {
             return Err("provenance operation reference is invalid".into());
         }
         if self.observed_at_unix_ms <= 0
-            || self.expires_at_unix_ms < self.observed_at_unix_ms
+            // Zero TTL would issue an envelope that `validate` refuses at
+            // its own observation time.
+            || self.expires_at_unix_ms <= self.observed_at_unix_ms
             || self.expires_at_unix_ms - self.observed_at_unix_ms > MAX_ENVELOPE_TTL_MS
         {
             return Err("provenance freshness interval is invalid".into());
@@ -411,6 +413,27 @@ mod tests {
                 .verify(&key.verifying_key().to_bytes(), 2_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn envelope_must_expire_after_it_is_observed() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9_u8; 32]);
+        let issue = |expires_at| {
+            ProvenanceEnvelope::issue(
+                &key,
+                "subject-1".into(),
+                digest('1'),
+                digest('2'),
+                "operation-1".into(),
+                1_000,
+                expires_at,
+            )
+        };
+        assert!(issue(1_000).is_err());
+        issue(1_001)
+            .unwrap()
+            .verify(&key.verifying_key().to_bytes(), 1_000)
+            .unwrap();
     }
 
     #[test]
