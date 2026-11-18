@@ -9,6 +9,7 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::chisei::budget::PeriodType;
 use crate::chisei::tenant_quota::TenantQuotaLimits;
 use sekai_core::enterprise::AuthenticatedContext;
 
@@ -184,21 +185,44 @@ impl EntitlementRegistry {
         let Some(ceiling) = &assignment.set.quota_ceiling else {
             return Ok(requested.clone());
         };
+        // The ceiling's per-period counts are converted to the requested period first, so a
+        // daily request under a monthly ceiling cannot add up to many times that ceiling.
+        let ceiling_requests = scale_to_period(
+            ceiling.max_requests_per_period,
+            ceiling.period,
+            requested.period,
+        );
+        let ceiling_tokens = scale_to_period(
+            ceiling.max_tokens_per_period,
+            ceiling.period,
+            requested.period,
+        );
         Ok(TenantQuotaLimits {
             version: requested.version.max(ceiling.version),
-            max_requests_per_period: min_opt(
-                requested.max_requests_per_period,
-                ceiling.max_requests_per_period,
-            ),
-            max_tokens_per_period: min_opt(
-                requested.max_tokens_per_period,
-                ceiling.max_tokens_per_period,
-            ),
+            max_requests_per_period: min_opt(requested.max_requests_per_period, ceiling_requests),
+            max_tokens_per_period: min_opt(requested.max_tokens_per_period, ceiling_tokens),
             max_concurrency: min_opt(requested.max_concurrency, ceiling.max_concurrency),
             max_storage_bytes: min_opt_i64(requested.max_storage_bytes, ceiling.max_storage_bytes),
             period: requested.period,
         })
     }
+}
+
+/// Days a period counts for when converting a per-period count between periods.
+fn period_days(period: PeriodType) -> i64 {
+    match period {
+        PeriodType::Daily => 1,
+        PeriodType::Weekly => 7,
+        PeriodType::Monthly => 31,
+    }
+}
+
+/// Convert a per-period count to another period by day count, rounding down.
+fn scale_to_period(value: Option<i32>, from: PeriodType, to: PeriodType) -> Option<i32> {
+    value.map(|count| {
+        let scaled = i64::from(count) * period_days(to) / period_days(from);
+        i32::try_from(scaled).unwrap_or(i32::MAX)
+    })
 }
 
 fn min_opt(a: Option<i32>, b: Option<i32>) -> Option<i32> {
@@ -333,6 +357,46 @@ mod tests {
         assert_eq!(narrowed.max_tokens_per_period, Some(50)); // requested tighter
         assert_eq!(narrowed.max_concurrency, Some(2));
         assert_eq!(narrowed.max_storage_bytes, Some(500));
+    }
+
+    #[test]
+    fn shorter_request_period_gets_a_proportional_share_of_the_ceiling() {
+        let reg = EntitlementRegistry::new();
+        let mut set = set_with_feature("core.chat", 1);
+        let ceiling = set.quota_ceiling.as_mut().unwrap();
+        ceiling.period = PeriodType::Monthly;
+        ceiling.max_requests_per_period = Some(310);
+        ceiling.max_tokens_per_period = Some(1_000);
+        reg.assign(TenantEntitlementAssignment {
+            tenant_id: "tenant-a".into(),
+            set,
+            assigned_at_ms: 1,
+            removed: false,
+        });
+        let ctx = tenant_context("tenant-a", "alice");
+        let request = |period| TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(310),
+            max_tokens_per_period: Some(500),
+            max_concurrency: None,
+            max_storage_bytes: None,
+            period,
+        };
+        let daily = reg
+            .narrow_quota_limits(&ctx, &request(PeriodType::Daily), 10)
+            .unwrap();
+        assert_eq!(daily.max_requests_per_period, Some(10));
+        assert_eq!(daily.max_tokens_per_period, Some(32));
+        let weekly = reg
+            .narrow_quota_limits(&ctx, &request(PeriodType::Weekly), 10)
+            .unwrap();
+        assert_eq!(weekly.max_requests_per_period, Some(70));
+        assert_eq!(weekly.max_tokens_per_period, Some(225));
+        let monthly = reg
+            .narrow_quota_limits(&ctx, &request(PeriodType::Monthly), 10)
+            .unwrap();
+        assert_eq!(monthly.max_requests_per_period, Some(310));
+        assert_eq!(monthly.max_tokens_per_period, Some(500));
     }
 
     #[test]
