@@ -113,7 +113,16 @@ fn run() -> Result<ExitCode, String> {
     let mut budgets = BTreeMap::new();
     let mut signal_budgets = BTreeMap::new();
     for workload in manifest.workloads {
-        budgets.insert(workload.id.clone(), workload.budgets);
+        // A later duplicate would silently replace the budget a reader sees first.
+        if budgets
+            .insert(workload.id.clone(), workload.budgets)
+            .is_some()
+        {
+            return Err(format!(
+                "{manifest_path}: duplicate workload id {:?}",
+                workload.id
+            ));
+        }
         signal_budgets.insert(workload.id, workload.signal_budgets);
     }
 
