@@ -427,6 +427,32 @@ fn postgres_concurrent_retention_ticks_archive_once() {
             .find(|(dataset, _)| dataset == CONTENT_EVENTS_DATASET)
             .map_or(0, |(_, n)| *n)
     };
+    // Content events carry no namespace, so this run's events are the ones
+    // on its reference; other runs may share the database.
+    let reference_id = request.reference_id.clone();
+    let ours = |sql: &str| -> i64 {
+        postgres(&pair.a)
+            .connection()
+            .unwrap()
+            .query_one(sql, &[&reference_id, &CONTENT_EVENTS_DATASET])
+            .unwrap()
+            .get(0)
+    };
+    // Batch records per event of ours: one per archive that took it.
+    const OUR_BATCH_RECORDS: &str = "SELECT count(*) FROM sekai_archive_batch_records b
+         JOIN sekai_archive_records r ON r.dataset = b.dataset AND r.source_key = b.source_key
+         WHERE r.payload::jsonb ->> 'reference_id' = $1 AND b.dataset = $2";
+    let eligible: i64 = postgres(&pair.a)
+        .connection()
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM sekai_content_events
+             WHERE reference_id = $1 AND created_at_ms < $2",
+            &[&reference_id, &DAY_MS],
+        )
+        .unwrap()
+        .get(0);
+    assert!(eligible > 0);
     let before = count(&pair.a);
     let results = pair.race_results(2, |_index, db| {
         db.archive_retained_records(2 * DAY_MS, false)
@@ -435,8 +461,25 @@ fn postgres_concurrent_retention_ticks_archive_once() {
         .iter()
         .map(|run| run.as_ref().unwrap().content_events_archived)
         .sum();
-    assert!(archived > 0, "results={results:?}");
+    assert!(i64::from(archived) >= eligible, "results={results:?}");
     assert_eq!(count(&pair.b), before + i64::from(archived));
+    // Each eligible event of this run was archived by exactly one replica.
+    assert_eq!(ours(OUR_BATCH_RECORDS), eligible);
+    assert_eq!(
+        postgres(&pair.a)
+            .connection()
+            .unwrap()
+            .query_one(
+                "SELECT count(*) FROM sekai_content_events WHERE reference_id = $1",
+                &[&reference_id],
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    // A later tick archives none of this run's events again.
+    pair.b.archive_retained_records(2 * DAY_MS, false).unwrap();
+    assert_eq!(ours(OUR_BATCH_RECORDS), eligible);
     assert!(pair.b.verify_retention_archive().unwrap().ok);
 }
 
