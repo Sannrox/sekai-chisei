@@ -305,7 +305,7 @@ pub fn dry_run_policy_over_receipts(
     })
 }
 
-fn receipt_in_window(
+pub(crate) fn receipt_in_window(
     receipt: &OperationReceipt,
     start_timestamp_ms: i64,
     end_timestamp_ms: i64,

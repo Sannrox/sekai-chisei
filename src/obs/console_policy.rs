@@ -4,6 +4,7 @@
 //! promote/rollback. UI is not a privilege escalation path: same membership
 //! and write checks as gRPC.
 
+use crate::chisei::action_policy_dry_run::{self, ActionPolicyDryRunReport};
 use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus, PromoteRequest};
 use crate::chisei::gunshi_policy::{
     AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
@@ -15,6 +16,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, Object};
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::obs::console_pressure::principal_can_write_namespace;
+use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::audit::Decision;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -225,6 +227,93 @@ pub fn run_console_dry_run(
     Ok(report)
 }
 
+/// Dry-run a candidate Action policy over the namespace's past action
+/// submits (#2121). Same guarantees as the route dry-run: namespace grant
+/// required, nothing but the `action_policy.dry_run` decision is written,
+/// and the run fails when that audit write fails.
+pub fn run_console_action_dry_run(
+    db: &RuntimeDb,
+    principal: &str,
+    namespace: &str,
+    start_timestamp_ms: i64,
+    end_timestamp_ms: i64,
+    candidate: &ActionPolicy,
+) -> Result<ActionPolicyDryRunReport, String> {
+    if !principal_can_access_namespace(db, principal, namespace).unwrap_or(false) {
+        return Err("namespace access denied".into());
+    }
+    if end_timestamp_ms <= start_timestamp_ms {
+        return Err("end_timestamp_ms must be greater than start_timestamp_ms".into());
+    }
+    let receipts = db.list_operation_receipts_in_window(
+        namespace,
+        start_timestamp_ms,
+        end_timestamp_ms,
+        policy_dry_run::MAX_DRY_RUN_RECEIPTS.saturating_add(1),
+    )?;
+    let report = action_policy_dry_run::dry_run_action_policy_over_receipts(
+        namespace,
+        start_timestamp_ms,
+        end_timestamp_ms,
+        candidate,
+        &receipts,
+    )?;
+    let request_id = format!(
+        "console-action-policy-dry-run-{}",
+        chrono::Utc::now().timestamp_millis()
+    );
+    let decision_id = format!(
+        "action-policy-dry-run:{:x}",
+        Sha256::digest(format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            report.namespace,
+            principal,
+            request_id,
+            report.candidate_scope,
+            report.candidate_policy_version,
+            report.start_timestamp_ms,
+            report.end_timestamp_ms
+        ))
+    );
+    let counts = &report.counts;
+    db.record_decision(&Decision {
+        id: decision_id,
+        timestamp: chrono::Utc::now().timestamp_millis(),
+        actor: principal.into(),
+        action: "action_policy.dry_run".into(),
+        reason: "console historical action policy dry-run".into(),
+        evidence: HashMap::from([
+            ("namespace".into(), report.namespace.clone()),
+            ("candidate_scope".into(), report.candidate_scope.clone()),
+            (
+                "candidate_policy_version".into(),
+                report.candidate_policy_version.clone(),
+            ),
+            ("evaluated".into(), counts.evaluated.to_string()),
+            ("unchanged".into(), counts.unchanged.to_string()),
+            ("would_deny".into(), counts.would_deny.to_string()),
+            ("would_allow".into(), counts.would_allow.to_string()),
+            (
+                "would_require_approval".into(),
+                counts.would_require_approval.to_string(),
+            ),
+            (
+                "would_skip_approval".into(),
+                counts.would_skip_approval.to_string(),
+            ),
+            (
+                "insufficient_history".into(),
+                counts.insufficient_history.to_string(),
+            ),
+            ("request_id".into(), request_id),
+            ("surface".into(), "console".into()),
+        ]),
+        target_id: report.namespace.clone(),
+        outcome: "completed".into(),
+    })?;
+    Ok(report)
+}
+
 pub fn console_install_baseline(
     db: &RuntimeDb,
     principal: &str,
@@ -336,9 +425,17 @@ fn escape_html(input: &str) -> String {
     out
 }
 
+/// The dry-run result a policy page shows, if one just ran.
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub enum DryRunResult<'a> {
+    Route(&'a PolicyDryRunReport),
+    Action(&'a ActionPolicyDryRunReport),
+}
+
 pub fn render_policy_page(
     view: &EffectivePolicyView,
-    dry_run: Option<&PolicyDryRunReport>,
+    dry_run: Option<DryRunResult<'_>>,
     flash: Option<&str>,
 ) -> String {
     let flash_html = flash
@@ -372,34 +469,10 @@ pub fn render_policy_page(
         None => r#"<p class="stub">No Gunshi allocation policy installed.</p>"#.into(),
     };
 
-    let dry_run_html = if let Some(report) = dry_run {
-        let mut samples = String::new();
-        for (class, ids) in &report.samples {
-            samples.push_str(&format!(
-                "<li><strong>{}</strong>: {}</li>",
-                escape_html(class),
-                escape_html(&ids.join(", "))
-            ));
-        }
-        format!(
-            r#"
-<section class="panel" aria-labelledby="dryrun-result">
-  <h2 id="dryrun-result">Dry-run result</h2>
-  <p>Candidate version <code>{}</code> · evaluated {} · unchanged {} · re_routed {} · would_deny {} · would_allow {} · insufficient_history {}</p>
-  <ul>{samples}</ul>
-  <p class="stub">Dry-run never activates policy. A <code>policy.dry_run</code> audit decision was recorded.</p>
-</section>"#,
-            escape_html(&report.candidate_policy_version),
-            report.counts.evaluated,
-            report.counts.unchanged,
-            report.counts.re_routed,
-            report.counts.would_deny,
-            report.counts.would_allow,
-            report.counts.insufficient_history,
-            samples = samples,
-        )
-    } else {
-        String::new()
+    let dry_run_html = match dry_run {
+        Some(DryRunResult::Route(report)) => render_route_dry_run(report),
+        Some(DryRunResult::Action(report)) => render_action_dry_run(report),
+        None => String::new(),
     };
 
     let now = chrono::Utc::now().timestamp_millis();
@@ -541,6 +614,25 @@ pub fn render_policy_page(
     <button type="submit">Run dry-run</button>
   </form>
 </section>
+<section class="panel" aria-labelledby="action-dryrun-heading">
+  <h2 id="action-dryrun-heading">Action policy dry-run</h2>
+  <p class="meta">Replays past action submits against a candidate policy for one scope. No side effects. Creates an audit decision.</p>
+  <form method="post" action="/console/n/{ns}/policy/action-dry-run">
+    <label for="action_start_ms">Start timestamp (ms)</label>
+    <input id="action_start_ms" name="start_timestamp_ms" type="text" value="{start}" required>
+    <label for="action_end_ms">End timestamp (ms)</label>
+    <input id="action_end_ms" name="end_timestamp_ms" type="text" value="{end}" required>
+    <label for="action_scope">Scope</label>
+    <input id="action_scope" name="scope" type="text" value="{ns}" required>
+    <label for="action_default">Default decision (allow, deny, require_approval)</label>
+    <input id="action_default" name="default_decision" type="text" value="allow" required>
+    <label for="action_overrides">Action overrides (action:decision, comma-separated)</label>
+    <input id="action_overrides" name="action_overrides" type="text">
+    <label for="risk_overrides">Risk overrides (risk:decision, comma-separated)</label>
+    <input id="risk_overrides" name="risk_overrides" type="text">
+    <button type="submit">Run action dry-run</button>
+  </form>
+</section>
 {dry_run_html}
 {write_forms}
 <section class="panel">
@@ -567,6 +659,74 @@ pub fn render_policy_page(
         end = now,
         dry_run_html = dry_run_html,
         write_forms = write_forms,
+    )
+}
+
+fn render_route_dry_run(report: &PolicyDryRunReport) -> String {
+    let mut samples = String::new();
+    for (class, ids) in &report.samples {
+        samples.push_str(&format!(
+            "<li><strong>{}</strong>: {}</li>",
+            escape_html(class),
+            escape_html(&ids.join(", "))
+        ));
+    }
+    format!(
+        r#"
+<section class="panel" aria-labelledby="dryrun-result">
+  <h2 id="dryrun-result">Dry-run result</h2>
+  <p>Candidate version <code>{}</code> · evaluated {} · unchanged {} · re_routed {} · would_deny {} · would_allow {} · insufficient_history {}</p>
+  <ul>{samples}</ul>
+  <p class="stub">Dry-run never activates policy. A <code>policy.dry_run</code> audit decision was recorded.</p>
+</section>"#,
+        escape_html(&report.candidate_policy_version),
+        report.counts.evaluated,
+        report.counts.unchanged,
+        report.counts.re_routed,
+        report.counts.would_deny,
+        report.counts.would_allow,
+        report.counts.insufficient_history,
+        samples = samples,
+    )
+}
+
+fn render_action_dry_run(report: &ActionPolicyDryRunReport) -> String {
+    let mut samples = String::new();
+    for (class, class_samples) in &report.samples {
+        for sample in class_samples {
+            samples.push_str(&format!(
+                "<tr><td>{}</td><td><code>{}</code></td><td>{} <code>{}</code></td><td>{} <code>{}</code></td><td>{}</td></tr>",
+                class.as_str(),
+                escape_html(&sample.instance_id),
+                escape_html(&sample.historical_decision),
+                escape_html(&sample.historical_policy_version),
+                escape_html(&sample.candidate_decision),
+                escape_html(&sample.candidate_rule),
+                escape_html(&sample.detail),
+            ));
+        }
+    }
+    let counts = &report.counts;
+    format!(
+        r#"
+<section class="panel" aria-labelledby="action-dryrun-result">
+  <h2 id="action-dryrun-result">Action policy dry-run result</h2>
+  <p>Candidate <code>{scope}</code> version <code>{version}</code> · evaluated {evaluated} · unchanged {unchanged} · would_deny {would_deny} · would_allow {would_allow} · would_require_approval {would_require_approval} · would_skip_approval {would_skip_approval} · insufficient_history {insufficient_history}</p>
+  <table>
+    <thead><tr><th>Class</th><th>Instance</th><th>Decided</th><th>Candidate</th><th>Detail</th></tr></thead>
+    <tbody>{samples}</tbody>
+  </table>
+  <p class="stub">Dry-run never activates policy. A <code>action_policy.dry_run</code> audit decision was recorded.</p>
+</section>"#,
+        scope = escape_html(&report.candidate_scope),
+        version = escape_html(&report.candidate_policy_version),
+        evaluated = counts.evaluated,
+        unchanged = counts.unchanged,
+        would_deny = counts.would_deny,
+        would_allow = counts.would_allow,
+        would_require_approval = counts.would_require_approval,
+        would_skip_approval = counts.would_skip_approval,
+        insufficient_history = counts.insufficient_history,
     )
 }
 
@@ -666,7 +826,7 @@ mod tests {
             samples: Default::default(),
             results: vec![],
         };
-        let html = render_policy_page(&view, Some(&empty_report), None);
+        let html = render_policy_page(&view, Some(DryRunResult::Route(&empty_report)), None);
         assert!(html.contains("Dry-run result"));
         assert!(html.contains("Install allocation baseline"));
         assert!(!html.contains("Promote allocation policy"));
