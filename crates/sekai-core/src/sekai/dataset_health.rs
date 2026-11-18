@@ -524,9 +524,23 @@ fn list_results_conn(
         .map_err(|error| error.to_string())
 }
 
+/// Decodes a JSON text column. A corrupt value is a read error: an empty
+/// default would turn a damaged blocking check into one that cannot fail.
+fn json_column<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let text: String = row.get(index)?;
+    serde_json::from_str(&text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn row_to_check(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetHealthCheck> {
-    let columns: String = row.get(6)?;
-    let predicate: String = row.get(7)?;
     let blocking: i64 = row.get(8)?;
     Ok(DatasetHealthCheck {
         dataset_id: row.get(0)?,
@@ -535,8 +549,8 @@ fn row_to_check(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetHealthCheck>
         max_age_ms: row.get(3)?,
         min_rows: row.get(4)?,
         max_rows: row.get(5)?,
-        columns: serde_json::from_str(&columns).unwrap_or_default(),
-        predicate: serde_json::from_str(&predicate).unwrap_or_default(),
+        columns: json_column(row, 6)?,
+        predicate: json_column(row, 7)?,
         blocking: blocking != 0,
         every_ms: row.get(9)?,
         tenant: row.get(10)?,
@@ -1045,6 +1059,22 @@ mod tests {
             space: "ops".into(),
             last_run_ms: 0,
         }
+    }
+
+    #[test]
+    fn a_check_with_corrupt_predicate_json_fails_the_read() {
+        let db = db();
+        db.create_dataset(&dataset("orders", &["kind"])).unwrap();
+        let mut fresh = check("fresh", "orders", "freshness");
+        fresh.max_age_ms = 1_000;
+        db.put_dataset_health_check(&fresh).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_dataset_health_checks SET predicate = 'not json'",
+                [],
+            )
+            .unwrap();
+        assert!(db.list_dataset_health_checks("orders").is_err());
     }
 
     #[test]
