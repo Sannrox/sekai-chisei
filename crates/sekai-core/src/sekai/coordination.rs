@@ -330,7 +330,8 @@ impl SekaiDb {
         let rows = stmt
             .query_map([], row_to_contention_scope)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn contention_scope_chain(&self, scope_id: &str) -> Result<Vec<ContentionScope>, String> {
@@ -526,7 +527,8 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_work_unit)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn create_reservation(&self, reservation: &Reservation) -> Result<(), String> {
@@ -577,7 +579,8 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_reservation)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn append_run_event(&self, event: &RunEvent) -> Result<(), String> {
@@ -697,7 +700,8 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_run_event)
             .map_err(|e| e.to_string())?;
-        Ok(rows.filter_map(Result::ok).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     }
 
     pub fn create_reconciliation_record(
@@ -758,7 +762,8 @@ impl SekaiDb {
             let rows = stmt
                 .query_map(params![WORK_UNIT_STATUS_PENDING], row_to_work_unit)
                 .map_err(|e| e.to_string())?;
-            rows.filter_map(Result::ok).collect::<Vec<_>>()
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
         };
         let mut conflicting_older = 0;
         for other in &all_pending {
@@ -1022,7 +1027,9 @@ impl SekaiDb {
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_work_unit)
             .map_err(|e| e.to_string())?;
-        let live_units: Vec<WorkUnit> = rows.filter_map(Result::ok).collect();
+        let live_units: Vec<WorkUnit> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
 
         for mut work_unit in live_units {
             let active_reservations: Vec<Reservation> = {
@@ -1039,7 +1046,8 @@ impl SekaiDb {
                         row_to_reservation,
                     )
                     .map_err(|e| e.to_string())?;
-                rows.filter_map(Result::ok).collect()
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
             };
             let timed_out = work_unit.started_at > 0
                 && work_unit.timeout_seconds > 0
@@ -1388,7 +1396,10 @@ fn row_to_reservation(row: &rusqlite::Row) -> rusqlite::Result<Reservation> {
 
 fn row_to_run_event(row: &rusqlite::Row) -> rusqlite::Result<RunEvent> {
     let evidence_json: String = row.get(4)?;
-    let evidence = serde_json::from_str(&evidence_json).unwrap_or_default();
+    // A corrupt value is a read error, not empty evidence.
+    let evidence = serde_json::from_str(&evidence_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(RunEvent {
         id: row.get(0)?,
         work_unit_id: row.get(1)?,
@@ -1461,6 +1472,24 @@ mod tests {
             idempotency_key: String::new(),
             updated_at: created_at,
         }
+    }
+
+    #[test]
+    fn a_work_unit_row_that_fails_to_decode_fails_the_read() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.create_contention_scope(&root_scope()).unwrap();
+        db.create_work_unit(&work_unit("w1", "scope-root", 10))
+            .unwrap();
+        assert_eq!(
+            db.list_work_units(&WorkUnitFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        db.conn()
+            .execute("UPDATE sekai_work_units SET created_at = 'garbage'", [])
+            .unwrap();
+        assert!(db.list_work_units(&WorkUnitFilter::default()).is_err());
     }
 
     #[test]
