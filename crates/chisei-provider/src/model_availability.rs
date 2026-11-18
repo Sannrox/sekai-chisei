@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_TTL_SECS: u64 = 300;
 const DISCOVERY_TIMEOUT_SECS: u64 = 3;
+/// `discovery_source` of models kept from the last good live discovery after a later
+/// discovery of that provider failed. They stay routable but are known to be stale.
+pub const STALE_CATALOG_SOURCE: &str = "stale_provider_catalog";
 pub const AVAILABLE_MODELS_VERSION: &str = "chisei.available-models/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +222,7 @@ pub async fn refresh_model_availability(
     let anthropic = anthropic.unwrap_or_else(|_| Err("Anthropic model discovery timed out".into()));
     let ollama = ollama.unwrap_or_else(|_| Err("Ollama model discovery timed out".into()));
 
+    let (openai_ok, anthropic_ok) = (openai.is_ok(), anthropic.is_ok());
     let registry = provider_registry_snapshot();
     let mut discovered: HashMap<String, (Vec<String>, bool)> = HashMap::new();
     let mut ollama_ranks = HashMap::new();
@@ -246,14 +250,18 @@ pub async fn refresh_model_availability(
         }
         Err(_) => {}
     }
-    if let Ok(models) = ollama {
-        for model in &models {
-            ollama_ranks.insert(model.name.clone(), ollama_model_ranks(model));
+    let mut ollama_failed = false;
+    match ollama {
+        Ok(models) => {
+            for model in &models {
+                ollama_ranks.insert(model.name.clone(), ollama_model_ranks(model));
+            }
+            discovered.insert(
+                "ollama".to_string(),
+                (models.into_iter().map(|model| model.name).collect(), true),
+            );
         }
-        discovered.insert(
-            "ollama".to_string(),
-            (models.into_iter().map(|model| model.name).collect(), true),
-        );
+        Err(_) => ollama_failed = true,
     }
     if config.native_configured {
         discovered.insert("native".to_string(), (vec!["native-default".into()], false));
@@ -329,7 +337,34 @@ pub async fn refresh_model_availability(
                 .collect(),
         );
     }
-    entry.snapshot.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
+    // A live provider whose discovery failed keeps its last good models, marked stale,
+    // and the snapshot does not look freshly refreshed. The TTL clock still advances so
+    // a dead server is not re-probed on every call.
+    let mut any_stale = false;
+    let failed_live = [
+        (!openai_ok, "openai"),
+        (!anthropic_ok, "anthropic"),
+        (ollama_failed, "ollama"),
+    ];
+    for (failed, provider) in failed_live {
+        if failed
+            && entry
+                .snapshot
+                .authoritative_providers
+                .contains(&provider.to_string())
+            && let Some(models) = entry.snapshot.models_by_provider.get_mut(provider)
+        {
+            any_stale = true;
+            for model in models {
+                if model.discovery_source == "provider_catalog" {
+                    model.discovery_source = STALE_CATALOG_SOURCE.into();
+                }
+            }
+        }
+    }
+    if !any_stale {
+        entry.snapshot.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
+    }
     entry.refreshed_at = Some(Instant::now());
     let snapshot = entry.snapshot.clone();
     cache.latest = snapshot.clone();
@@ -601,6 +636,39 @@ mod tests {
         let serialized = serde_json::to_string(&matrix).unwrap();
         assert!(!serialized.contains("openai-secret"));
         assert!(!serialized.contains("anthropic-secret"));
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_keeps_models_but_marks_them_stale() {
+        let app = Router::new()
+            .route("/{*path}", get(catalog))
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = ModelDiscoveryConfig {
+            openai_base_url: format!("http://{address}/v1"),
+            openai_api_key: None,
+            anthropic_base_url: format!("http://{address}/v1"),
+            anthropic_api_key: None,
+            ollama_url: format!("http://{address}"),
+            native_configured: false,
+        };
+        let fresh = refresh_model_availability(&config, true).await;
+        assert_eq!(
+            fresh.models_by_provider["ollama"][0].discovery_source,
+            "provider_catalog"
+        );
+        assert!(fresh.refreshed_at.is_some());
+
+        server.abort();
+        let _ = server.await;
+        let stale = refresh_model_availability(&config, true).await;
+        assert_eq!(stale.refreshed_at, fresh.refreshed_at);
+        let kept = &stale.models_by_provider["ollama"][0];
+        assert_eq!(kept.upstream_model, "llama-test");
+        assert!(kept.routable);
+        assert_eq!(kept.discovery_source, super::STALE_CATALOG_SOURCE);
     }
 
     #[tokio::test]
