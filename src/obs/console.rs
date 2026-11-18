@@ -132,6 +132,10 @@ pub fn router_with_evals(state: ConsoleState, chisei_db: Option<Arc<RuntimeDb>>)
             post(policy_dry_run),
         )
         .route(
+            "/console/n/{namespace}/policy/action-dry-run",
+            post(policy_action_dry_run),
+        )
+        .route(
             "/console/n/{namespace}/policy/install",
             post(policy_install),
         )
@@ -1375,7 +1379,6 @@ async fn policy_dry_run(
     Path(namespace): Path<String>,
     Form(form): Form<DryRunForm>,
 ) -> Response {
-    let namespaces = list_accessible_namespaces(&state.db, &session.principal).unwrap_or_default();
     let start = form.start_timestamp_ms.parse::<i64>().unwrap_or(0);
     let end = form.end_timestamp_ms.parse::<i64>().unwrap_or(0);
     let candidate = crate::chisei::policy::Policy {
@@ -1385,27 +1388,96 @@ async fn policy_dry_run(
         default_model: form.default_model.unwrap_or_default(),
         data_class: form.data_class.unwrap_or_default(),
     };
-    let view = crate::obs::console_policy::load_effective_policy_view(
+    let report = crate::obs::console_policy::run_console_dry_run(
         &state.db,
         &session.principal,
         &namespace,
+        start,
+        end,
+        &candidate,
     );
-    match (
-        view,
-        crate::obs::console_policy::run_console_dry_run(
-            &state.db,
-            &session.principal,
-            &namespace,
-            start,
-            end,
-            &candidate,
+    dry_run_response(
+        &state,
+        &session.principal,
+        &namespace,
+        report
+            .as_ref()
+            .map(crate::obs::console_policy::DryRunResult::Route)
+            .map_err(String::clone),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ActionDryRunForm {
+    start_timestamp_ms: String,
+    end_timestamp_ms: String,
+    scope: String,
+    default_decision: String,
+    action_overrides: Option<String>,
+    risk_overrides: Option<String>,
+}
+
+/// Dry-run a candidate Action policy (#2121). The candidate is parsed by the
+/// same reader as a stored policy, so a malformed one fails the same way.
+async fn policy_action_dry_run(
+    State(state): State<ConsoleState>,
+    HtmlSession(session): HtmlSession,
+    Path(namespace): Path<String>,
+    Form(form): Form<ActionDryRunForm>,
+) -> Response {
+    let start = form.start_timestamp_ms.parse::<i64>().unwrap_or(0);
+    let end = form.end_timestamp_ms.parse::<i64>().unwrap_or(0);
+    let scope = form.scope.trim().to_string();
+    let properties = std::collections::HashMap::from([
+        ("default_decision".to_string(), form.default_decision),
+        (
+            "action_overrides".to_string(),
+            form.action_overrides.unwrap_or_default(),
         ),
-    ) {
-        (Ok(view), Ok(report)) => {
-            let main = crate::obs::console_policy::render_policy_page(&view, Some(&report), None);
-            shell_chrome(
+        (
+            "risk_overrides".to_string(),
+            form.risk_overrides.unwrap_or_default(),
+        ),
+    ]);
+    let report = crate::sekai::action_policy::ActionPolicy::from_properties(&scope, &properties)
+        .and_then(|candidate| {
+            crate::obs::console_policy::run_console_action_dry_run(
+                &state.db,
                 &session.principal,
-                Some(&namespace),
+                &namespace,
+                start,
+                end,
+                &candidate,
+            )
+        });
+    dry_run_response(
+        &state,
+        &session.principal,
+        &namespace,
+        report
+            .as_ref()
+            .map(crate::obs::console_policy::DryRunResult::Action)
+            .map_err(String::clone),
+    )
+}
+
+/// The policy page after a dry-run: the result, the run's error, or a
+/// refusal when the principal cannot see the namespace.
+fn dry_run_response(
+    state: &ConsoleState,
+    principal: &str,
+    namespace: &str,
+    result: Result<crate::obs::console_policy::DryRunResult<'_>, String>,
+) -> Response {
+    let namespaces = list_accessible_namespaces(&state.db, principal).unwrap_or_default();
+    let view =
+        crate::obs::console_policy::load_effective_policy_view(&state.db, principal, namespace);
+    match (view, result) {
+        (Ok(view), Ok(result)) => {
+            let main = crate::obs::console_policy::render_policy_page(&view, Some(result), None);
+            shell_chrome(
+                principal,
+                Some(namespace),
                 &namespaces,
                 Screen::Policy,
                 &main,
@@ -1415,8 +1487,8 @@ async fn policy_dry_run(
         (Ok(view), Err(error)) => (
             StatusCode::BAD_REQUEST,
             shell_chrome(
-                &session.principal,
-                Some(&namespace),
+                principal,
+                Some(namespace),
                 &namespaces,
                 Screen::Policy,
                 &crate::obs::console_policy::render_policy_page(&view, None, Some(&error)),
@@ -1426,7 +1498,7 @@ async fn policy_dry_run(
         (Err(error), _) => (
             StatusCode::FORBIDDEN,
             shell_chrome(
-                &session.principal,
+                principal,
                 None,
                 &namespaces,
                 Screen::Home,

@@ -17,6 +17,7 @@ fn isolate_object_log(command: &mut std::process::Command, dir: &std::path::Path
 mod action_binding_backend_conformance;
 mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
+mod action_policy_dry_run_backend_conformance;
 mod agent_instruction_sync;
 mod capability_authoring;
 mod capability_package_backend_conformance;

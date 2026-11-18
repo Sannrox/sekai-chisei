@@ -60,6 +60,46 @@ The rendered workspace includes aggregate counts, bounded samples per delta
 class, and a capped per-receipt result list. The 1.0 public Chisei RPC surface
 does not expose a separate dry-run endpoint.
 
+## Action policy dry-run
+
+Issue: [#2121](https://github.com/Sannrox/sekai-chisei/issues/2121).
+
+Before changing a governed-action policy, an operator replays a candidate
+`ActionPolicy` for one scope over the namespace's past action submits. The
+console policy workspace posts the scope, default decision, action and risk
+overrides, and a time window to `/console/n/<namespace>/policy/action-dry-run`.
+
+- **History**: governed action instance admission receipts record what the
+  resolved Action policy alone decided, its clause, scope, version digest and
+  risk class (#3016). Receipts written before that count as
+  `insufficient_history`, as does any receipt missing the action name or risk
+  class.
+- **Scope**: the candidate replaces only its own scope's policy. A submit
+  decided by a more specific scope is `unchanged`. A new `agent:<actor>`
+  candidate takes over that actor's submits. A namespace candidate decides
+  submits that no policy resolved for. A `project:<p>` candidate's reach
+  depends on the Action type's policy scope, which receipts do not record, so
+  submits it might reach count as `insufficient_history`.
+- **Samples**: at most 16 per class, each with the original instance, the
+  historical decision and policy version, and the candidate's decision and
+  clause (`action_override:<a>`, `risk_override:<r>`, `default_decision`).
+- **Guarantees**: same as the route dry-run. It requires a namespace grant,
+  reads at most 5,000 receipts, writes no object, instance or policy, and
+  records one `action_policy.dry_run` decision with the counts and the
+  candidate's digest. It fails if that audit write fails.
+
+| Class | Meaning |
+| --- | --- |
+| `unchanged` | Candidate decides as the recorded policy did, or does not reach the submit |
+| `would_deny` | Candidate denies a submit the policy allowed or parked |
+| `would_allow` | Candidate allows a submit the policy denied |
+| `would_require_approval` | Candidate parks a submit the policy allowed or denied |
+| `would_skip_approval` | Candidate allows a submit the policy parked |
+| `insufficient_history` | Receipt lacks the policy record, or the candidate's reach is unknown |
+
+The comparison is the policy's own decision. Agent autonomy, remediation,
+criteria, budget, freezes and blast-radius caps are not replayed.
+
 ## Live shadow
 
 Issue: [#1630](https://github.com/Sannrox/sekai-chisei/issues/1630).
@@ -131,5 +171,4 @@ admission, privacy, budget, and evaluation gates are not shadowed.
 - Full agent trajectory re-execution
 - Graph world-state counterfactuals (#148)
 - Automatic policy apply from dry-run results
-- Budget/egress/approval micro-simulation beyond route policy (v1 focuses on
-  the namespace model/runtime policy surface)
+- Budget/egress micro-simulation beyond route and Action policy

@@ -1,5 +1,6 @@
 pub mod action_impact;
 pub mod action_policy;
+pub mod action_policy_dry_run;
 pub mod affinity;
 pub mod billing_adapter;
 pub mod budget;
