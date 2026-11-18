@@ -139,6 +139,7 @@ pub struct TypeSafeClient {
     api_key: String,
     endpoint: String,
     client: reqwest::Client,
+    timeouts: HttpTimeouts,
 }
 
 impl TypeSafeClient {
@@ -157,10 +158,19 @@ impl TypeSafeClient {
     }
 
     pub fn new(api_key: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self::with_timeouts(api_key, endpoint, HttpTimeouts::from_env())
+    }
+
+    fn with_timeouts(
+        api_key: impl Into<String>,
+        endpoint: impl Into<String>,
+        timeouts: HttpTimeouts,
+    ) -> Self {
         Self {
             api_key: api_key.into(),
             endpoint: endpoint.into(),
-            client: HttpTimeouts::from_env().client(),
+            client: timeouts.client(),
+            timeouts,
         }
     }
 
@@ -175,6 +185,9 @@ impl TypeSafeClient {
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(request)
+            // The read timeout only bounds the gap between bytes, so a server
+            // that trickles its body needs this overall deadline as well.
+            .timeout(self.timeouts.request_timeout)
             .send()
             .await
             .map_err(|error| classify_reqwest_error("system one", error))?;
@@ -361,5 +374,41 @@ mod tests {
         assert_eq!(posted["model"], "jev-1.13.0");
         assert_eq!(posted["questions"]["department"]["type"], "choice");
         assert_eq!(posted["state"]["title"], "payouts failing for 3 days");
+    }
+
+    #[tokio::test]
+    async fn evaluate_stops_at_the_request_timeout_when_the_body_trickles() {
+        // Headers arrive at once; the body sends one byte every 50 ms forever,
+        // so only the overall request deadline can end the call.
+        let app = Router::new().route(
+            "/v1/systemone",
+            post(|| async {
+                let trickle = futures_util::stream::unfold((), |()| async {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Some((Ok::<_, std::convert::Infallible>(" "), ()))
+                });
+                Body::from_stream(trickle)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let timeouts = HttpTimeouts {
+            request_timeout: std::time::Duration::from_millis(400),
+            ..HttpTimeouts::from_env()
+        };
+        let client = TypeSafeClient::with_timeouts(
+            "test-key",
+            format!("http://{addr}/v1/systemone"),
+            timeouts,
+        );
+        let request = request_from_bind(&triage_bind(), json!({"title": "slow"})).unwrap();
+        let started = std::time::Instant::now();
+        let error = client.evaluate(&request).await.unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }
