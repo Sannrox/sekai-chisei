@@ -46,8 +46,10 @@ template may not use its expected property as input.
   and digest, for the evaluation executor (docs/evaluation-execution.md).
   Its step receipts pin each case; there is no separate eval store.
 
-Datasets built from recorded traces and model-graded rubrics are out of
-scope.
+Model-graded rubrics are out of scope. Datasets recorded from decided Action
+instances are proposed in
+[ADR 0153](decisions/0153-eval-cases-recorded-from-reviewed-actions.md)
+and not implemented.
 
 ## Definitions
 
