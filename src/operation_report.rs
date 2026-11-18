@@ -281,7 +281,7 @@ impl OperationSummary {
             let mut operation_cost = 0i64;
             for event in report.sections.values().flatten() {
                 operation_cost = operation_cost
-                    .saturating_add(attribute_i64(event, "cost_usd_micros").unwrap_or(0));
+                    .saturating_add(attribute_cost(event, "cost_usd_micros").unwrap_or(0));
                 budget_pressure += attribute_true(event, "budget_pressure") as usize;
                 policy_blocks += (event.kind == "policy_decided"
                     && ["decision", "status"].iter().any(|key| {
@@ -296,7 +296,7 @@ impl OperationSummary {
                 ) as usize;
                 degraded += attribute_true(event, "degraded_mode") as usize;
                 if event.kind == "outcome_recorded"
-                    && let Some(value) = attribute_f64(event, "quality_score")
+                    && let Some(value) = attribute_score(event, "quality_score")
                 {
                     quality.push(value);
                 }
@@ -338,11 +338,24 @@ impl OperationSummary {
     }
 }
 
-fn attribute_i64(event: &ReportEvent, key: &str) -> Option<i64> {
-    event.attributes.get(key)?.parse().ok()
+/// A cost attribute counts only when it parses and is non-negative, matching
+/// `operation_statistics`; a negative value must not lower reported spend.
+fn attribute_cost(event: &ReportEvent, key: &str) -> Option<i64> {
+    event
+        .attributes
+        .get(key)?
+        .parse()
+        .ok()
+        .filter(|value| *value >= 0)
 }
-fn attribute_f64(event: &ReportEvent, key: &str) -> Option<f64> {
-    event.attributes.get(key)?.parse().ok()
+/// A score counts only when finite, so `NaN` or infinity cannot poison the mean.
+fn attribute_score(event: &ReportEvent, key: &str) -> Option<f64> {
+    event
+        .attributes
+        .get(key)?
+        .parse()
+        .ok()
+        .filter(|value: &f64| value.is_finite())
 }
 fn attribute_true(event: &ReportEvent, key: &str) -> bool {
     event
@@ -572,6 +585,35 @@ mod tests {
         assert_eq!(summary.mean_outcome_quality, Some(0.8));
         assert_eq!(summary.policy_blocks, 1);
         assert_eq!(summary.evidence_coverage_ratio, 0.0);
+    }
+
+    #[test]
+    fn summary_ignores_negative_costs_and_non_finite_quality() {
+        let outcome_with = |id: &str, cost: &str, quality: &str| ReportEvent {
+            event_id: id.into(),
+            parent_event_id: None,
+            timestamp_ms: 1,
+            kind: "outcome_recorded".into(),
+            actor: "agent".into(),
+            attributes: BTreeMap::from([
+                ("cost_usd_micros".into(), cost.into()),
+                ("quality_score".into(), quality.into()),
+            ]),
+            references: vec![],
+        };
+        let mut report = OperationReport::from_receipt(&receipt());
+        report.sections.clear();
+        report.sections.insert(
+            "outcome".into(),
+            vec![
+                outcome_with("good", "1000", "0.5"),
+                outcome_with("negative", "-5000", "NaN"),
+                outcome_with("infinite", "7", "inf"),
+            ],
+        );
+        let summary = OperationSummary::from_reports(&[report], None, 0, 100);
+        assert_eq!(summary.spend_usd_micros, 1007);
+        assert_eq!(summary.mean_outcome_quality, Some(0.5));
     }
 
     #[test]
