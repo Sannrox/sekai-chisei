@@ -394,7 +394,7 @@ fn validate_page(
         }
         for (key, value) in &row.values {
             reject_secret(key)?;
-            reject_secret(value)?;
+            reject_secret_value(value)?;
             let Some(column) = authorized.get(key.as_str()) else {
                 return Err(WAREHOUSE_UNAVAILABLE.into());
             };
@@ -514,6 +514,31 @@ fn reject_secret(value: &str) -> Result<(), String> {
         || lower.contains("github_pat_")
         || lower.contains("-----begin")
         || crate::sekai::object_sync::contains_secret_like_text(value)
+    {
+        return Err(WAREHOUSE_UNAVAILABLE.into());
+    }
+    Ok(())
+}
+
+/// Row values are ordinary data, so only real credential shapes are refused:
+/// the shared detector, an `sk-` key, a bearer credential, or any PEM private
+/// key. Words like `desk-lamp` or "reset your password" pass; identifiers
+/// keep the stricter `reject_secret` word list.
+fn reject_secret_value(value: &str) -> Result<(), String> {
+    let lower = value.to_ascii_lowercase();
+    let words: Vec<&str> = lower
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let long_credential = |word: &&str| word.len() >= 16;
+    if crate::sekai::object_sync::contains_secret_like_text(value)
+        || words
+            .iter()
+            .any(|word| word.starts_with("sk-") && long_credential(word))
+        || words
+            .windows(2)
+            .any(|pair| pair[0] == "bearer" && long_credential(&pair[1]))
+        || (lower.contains("-----begin") && lower.contains("private key-----"))
     {
         return Err(WAREHOUSE_UNAVAILABLE.into());
     }
@@ -785,5 +810,22 @@ mod tests {
                 .outcome,
             OUTCOME_EXPORTED
         );
+    }
+
+    #[test]
+    fn row_values_refuse_credential_shapes_not_ordinary_words() {
+        for value in ["desk-lamp", "task-42", "reset your password", "token_count"] {
+            assert!(reject_secret_value(value).is_ok(), "{value}");
+        }
+        for value in [
+            "sk-proj-abcdefghijklmnop0123",
+            "Bearer abcdefghijklmnopqrstuvwxyz012345",
+            "-----BEGIN EC PRIVATE KEY-----\nabc",
+            "authorization: bearer abc",
+        ] {
+            assert!(reject_secret_value(value).is_err(), "{value}");
+        }
+        assert!(reject_secret("token_count").is_err());
+        assert!(reject_secret("client_secret").is_err());
     }
 }
