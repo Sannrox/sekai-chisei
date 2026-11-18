@@ -178,4 +178,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0150: Keep operator console sessions process-local across failover](0150-process-local-console-sessions.md)
 - [ADR 0151: Chisei admits every model call](0151-chisei-admits-every-model-call.md) (superseded by ADR 0152)
 - [ADR 0152: The gateway is the model egress layer, not an entry point to Chisei](0152-gateway-is-the-model-egress-layer.md)
+- [ADR 0153: Eval cases recorded from reviewed Actions are references, replayed through the agent dry run](0153-eval-cases-recorded-from-reviewed-actions.md) (proposed)
 <!-- adr-index:end -->
