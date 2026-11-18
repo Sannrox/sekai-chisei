@@ -118,90 +118,46 @@ impl SekaiDb {
                 ",
             )
             .map_err(|error| error.to_string())?;
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_checkpoint
+        {
+            let conn = self.conn();
+            for statement in [
+                "ALTER TABLE sekai_governed_transform_checkpoint
              ADD COLUMN definition_digest TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN markings_in TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN markings_out TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN profile TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN engine TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN runtime_image TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN dispatch_status TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_transform_work
+                "ALTER TABLE sekai_transform_work
              ADD COLUMN definition_json TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_transform_work
+                "ALTER TABLE sekai_transform_work
              ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN trigger_cause TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN trigger_ref TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_transform_run_input
+                "ALTER TABLE sekai_transform_run_input
              ADD COLUMN partition_key TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN input_partitions TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN output_partitions TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_checkpoint
+                "ALTER TABLE sekai_governed_transform_checkpoint
              ADD COLUMN input_partition_digests TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_governed_transform_run
+                "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN input_versions TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_transform_run_finish ADD COLUMN output_version_id TEXT",
-            [],
-        );
+                "ALTER TABLE sekai_transform_run_finish ADD COLUMN output_version_id TEXT",
+            ] {
+                crate::db::add_sqlite_column(&conn, statement)?;
+            }
+        }
         self.conn()
             .execute_batch(
                 "
