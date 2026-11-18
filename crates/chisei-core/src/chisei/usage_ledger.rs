@@ -367,28 +367,31 @@ pub(crate) fn validate_event(event: &UsageEvent) -> Result<(), String> {
 }
 
 fn measured_tokens_from_receipt(receipt: &OperationReceipt) -> i64 {
-    let mut total = 0i64;
-    for event in &receipt.events {
-        for key in [
-            "total_tokens",
-            "tokens",
-            "input_tokens",
-            "output_tokens",
-            "prompt_tokens",
-            "completion_tokens",
-        ] {
-            if let Some(value) = event.attributes.get(key)
-                && let Ok(n) = value.parse::<i64>()
-            {
-                // Prefer explicit total when present once.
-                if key == "total_tokens" || key == "tokens" {
-                    return n;
-                }
-                total = total.saturating_add(n);
-            }
-        }
-    }
-    total
+    // Per event: an explicit total wins over its parts. Across events: totals add up,
+    // so a receipt with several model calls is not under-counted.
+    receipt.events.iter().fold(0i64, |total, event| {
+        let attr = |key: &str| {
+            event
+                .attributes
+                .get(key)
+                .and_then(|value| value.parse::<i64>().ok())
+        };
+        let measured = ["total_tokens", "tokens"]
+            .into_iter()
+            .find_map(attr)
+            .unwrap_or_else(|| {
+                [
+                    "input_tokens",
+                    "output_tokens",
+                    "prompt_tokens",
+                    "completion_tokens",
+                ]
+                .into_iter()
+                .filter_map(attr)
+                .fold(0i64, i64::saturating_add)
+            });
+        total.saturating_add(measured)
+    })
 }
 
 fn stable_event_id(tenant_id: &str, operation_id: &str, unit: &str, source: &str) -> String {
@@ -494,6 +497,24 @@ mod tests {
             .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, 10_000)
             .unwrap();
         assert_eq!(req.measured, 1);
+    }
+
+    #[test]
+    fn measured_tokens_sum_across_events_and_prefer_event_total() {
+        let mut receipt = sample_receipt("op-multi", 100);
+        let mut second = receipt.events[0].clone();
+        second.event_id = "op-multi-ev2".into();
+        second.attributes.clear();
+        second.attributes.insert("input_tokens".into(), "30".into());
+        second
+            .attributes
+            .insert("output_tokens".into(), "20".into());
+        let mut third = receipt.events[0].clone();
+        third.event_id = "op-multi-ev3".into();
+        third.attributes.insert("input_tokens".into(), "7".into());
+        receipt.events.extend([second, third]);
+        // 100 (total wins over parts) + 50 (30 + 20) + 100 (total wins over input).
+        assert_eq!(measured_tokens_from_receipt(&receipt), 250);
     }
 
     #[test]
