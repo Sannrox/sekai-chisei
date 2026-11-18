@@ -1,5 +1,6 @@
 //! sekaictl admin federation profile commands (#291).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::federation_conflict;
@@ -1336,12 +1337,6 @@ fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
         .try_into()
         .map_err(|_| "signing key must be 32 bytes".to_string())?;
     Ok(SigningKey::from_bytes(&array))
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]

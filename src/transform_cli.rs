@@ -1,5 +1,6 @@
 //! sekaictl admin transform commands (#1287).
 
+use crate::cli_args::require_value;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
@@ -221,12 +222,6 @@ async fn list_ns(config: ListConfig) -> Result<(), BoxErr> {
         }))?
     );
     Ok(())
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_put(args: &[String]) -> Result<PutConfig, String> {

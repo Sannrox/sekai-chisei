@@ -1,5 +1,6 @@
 //! sekaictl admin geospatial query commands (#680).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::geospatial::{self, query_geospatial};
@@ -58,12 +59,6 @@ async fn query(config: QueryConfig) -> Result<(), BoxErr> {
     .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&page)?);
     Ok(())
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_query(args: &[String]) -> Result<QueryConfig, String> {

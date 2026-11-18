@@ -3,6 +3,7 @@
 use crate::chisei::data_quality::{self, PublishDataQualityRule};
 use crate::chisei::sekai_facts::SekaiFacts;
 use crate::chisei_store::ChiseiStore;
+use crate::cli_args::require_value;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use chrono::Utc;
@@ -143,12 +144,6 @@ async fn mutate_result(config: ResultConfig, op: MutateOp) -> Result<(), BoxErr>
     .map_err(std::io::Error::other)?;
     println!("{}", serde_json::to_string_pretty(&record)?);
     Ok(())
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_publish(args: &[String]) -> Result<PublishConfig, String> {

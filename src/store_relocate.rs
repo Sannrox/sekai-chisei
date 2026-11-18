@@ -17,6 +17,7 @@
 //! `SEKAI_STORE_PEER` (read-only) or refuses mutations until an operator
 //! restamp. Independent backups are not a paired restore set.
 
+use crate::cli_args::require_value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -208,12 +209,6 @@ pub fn migrate_object_log(src: &str, dst: &str) -> Result<usize, String> {
 pub fn migrate_object_log_with_db(src: &Path, dst: &Path, db: &RuntimeDb) -> Result<usize, String> {
     let rows = db.object_log_migration_identities()?;
     crate::sekai::object_log::migrate_unnamespaced_object_log_from_projection(src, dst, &rows)
-}
-
-fn require_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
-    args.get(i + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 /// Copy Chisei families from `source` into `chisei`, stamp both destinations,

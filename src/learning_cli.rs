@@ -3,6 +3,7 @@
 use crate::chisei::learning_change::{self, ProposeLearningChange};
 use crate::chisei::sekai_facts::SekaiFacts;
 use crate::chisei_store::ChiseiStore;
+use crate::cli_args::require_value;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use chrono::Utc;
@@ -161,12 +162,6 @@ pub fn proposed_changes(namespace: &str) -> Result<Vec<learning_change::Learning
         .map_err(std::io::Error::other)?;
     records.retain(|record| record.status == "proposed");
     Ok(records)
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_propose(args: &[String]) -> Result<ProposeConfig, String> {

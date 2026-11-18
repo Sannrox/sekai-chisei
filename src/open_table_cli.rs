@@ -1,5 +1,6 @@
 //! sekaictl admin tables commands (#682).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::dataset::RowFilter;
@@ -200,10 +201,4 @@ fn parse_filter(value: &str) -> Result<RowFilter, String> {
         op: op.into(),
         value: expected.into(),
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }

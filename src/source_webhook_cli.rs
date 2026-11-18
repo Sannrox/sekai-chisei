@@ -1,6 +1,7 @@
 //! sekaictl admin sync webhook, source-health, quarantine, and descriptor
 //! commands (#673, #685, #818, #820).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::object_sync::SourceBatch;
@@ -536,12 +537,6 @@ fn parse_namespace_digest(
         digest: digest.ok_or("--digest is required")?,
         actor,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]

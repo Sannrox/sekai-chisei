@@ -1,5 +1,6 @@
 //! sekaictl admin providers commands (#713).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::model_platform::{self, ModelPlatformCertification};
@@ -189,13 +190,6 @@ fn parse_verify(args: &[String]) -> Result<Verify, String> {
         },
         path: path.ok_or("--certification is required")?,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]
