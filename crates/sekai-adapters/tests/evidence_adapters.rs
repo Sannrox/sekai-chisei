@@ -149,12 +149,20 @@ fn outbox_rejects_symlink_entries_without_changing_the_target() {
     let target = outbox.with_extension("target");
     std::fs::write(&target, b"not an envelope").unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-    symlink(&target, outbox.join(entry_name)).unwrap();
+    let link = outbox.join(entry_name);
+    symlink(&target, &link).unwrap();
 
     assert!(sdk::prepare_delivery_in(&outbox, &config(), draft, 2_000).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"not an envelope");
     assert_eq!(
         std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
         0o644
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
     std::fs::remove_file(
         std::fs::read_dir(&outbox)
