@@ -290,6 +290,8 @@ every principal and key.
   Every provider a route names needs an egress rule.
 - `sekai_principal` maps the principal to a Sekai principal; it defaults to
   the name.
+- `log_reader: true` lets the principal read and acknowledge the egress log
+  (below). Chisei reads with such a principal.
 
 Every denial (unknown key, route, data class, limit, no valid policy) returns
 before any provider contact: `401`, `403 policy_denied`,
@@ -306,9 +308,39 @@ Without any valid generation, every request is denied and `/readyz` returns
 `GET /_chisei/policy` returns the active generation without keys to any
 principal of the policy. Chisei reads it there.
 
-Not yet in policy mode: usage, receipts, and audit records (they move to the
-gateway's own log in #2698), `x-chisei-request-id` dispatch deduplication,
-`chisei_context` (refused), and cost or token quotas.
+### Egress log
+
+In policy mode the gateway appends an admission record to its own log before
+provider contact, and a usage record when each provider attempt ends (#3095).
+Each append is synced to disk first. If the admission cannot be recorded, the
+request is denied with `503 log_unavailable` and the provider is never
+contacted. While the latest append is failing, `/readyz` returns
+`503 log_unavailable`. A usage record that cannot be written does not change a
+response already sent.
+
+The log lives in `CHISEI_GATEWAY_LOG_DIR`, by default `chisei-gateway-log`
+beside the policy file. The gateway does not start if it cannot open the log,
+or if another process already owns it. Each record carries a sequence that
+continues without gaps across restarts. If a crash leaves a partial final
+record, it is dropped on start. A crash after the admission and before the
+provider call leaves that admission without a usage record.
+
+A `log_reader` principal reads records in order:
+
+- `GET /_chisei/log?after=<seq>&limit=<n>` returns `chisei.gateway-log/v1`
+  records with a sequence after `after`, at most `n` (default 100, maximum
+  1000). Each record names its `kind` (`admission` or `usage`) and its
+  `request_id`.
+- `POST /_chisei/log/ack` with `{"seq": N}` tells the gateway that records up
+  to `N` are committed elsewhere. They are no longer served and may be
+  deleted. Nothing unacknowledged is ever deleted. Acknowledging a sequence
+  past the last record is refused with `409 invalid_ack`.
+
+Back up the log directory with the policy file.
+
+Not yet in policy mode: Chisei reading the log into receipts (#3096),
+`x-chisei-request-id` dispatch deduplication, `chisei_context` (refused), and
+cost or token quotas.
 
 ## Context selection and egress
 

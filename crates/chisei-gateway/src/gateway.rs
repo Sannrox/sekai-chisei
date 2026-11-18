@@ -141,6 +141,9 @@ use recovery::*;
 #[path = "gateway_policy.rs"]
 mod policy;
 use policy::*;
+#[path = "gateway_egress_log.rs"]
+mod egress_log;
+use egress_log::*;
 #[path = "gateway_response.rs"]
 mod response;
 use response::*;
@@ -367,6 +370,8 @@ struct GatewayRuntime {
     /// Set in policy mode: the gateway-owned egress policy replaces every
     /// control-plane call on the request path.
     policy: Option<PolicyStore>,
+    /// Set in policy mode by `serve`: admission and usage records Chisei reads.
+    egress_log: Option<EgressLog>,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +661,7 @@ impl GatewayRuntime {
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
             resilience: ResilienceConfig::default(),
             policy: None,
+            egress_log: None,
         }
     }
 
@@ -781,6 +787,8 @@ pub const COMMUNITY_GATEWAY_ROUTES: &[&str] = &[
     "/statusz",
     "/_chisei/admin/refresh",
     "/_chisei/policy",
+    "/_chisei/log",
+    "/_chisei/log/ack",
     "/{*path}",
 ];
 
@@ -921,6 +929,9 @@ struct UsageContext {
     budget_status: String,
     egress_applied: bool,
     cache_requested: bool,
+    /// The egress log holds this request's admission, so each provider
+    /// attempt appends its usage there.
+    logged_admission: bool,
 }
 
 #[derive(Debug)]
