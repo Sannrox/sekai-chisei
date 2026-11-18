@@ -4,6 +4,9 @@
 //! or the property a comment is anchored to, gets `NOT_FOUND` for the thread
 //! and never sees the comment in a listing or a count. A body that quoted a
 //! property hidden from the caller is redacted (see `object_comment`).
+//!
+//! Each handler runs its store work through `spawn_db`, so a burst of comment
+//! traffic cannot block executor threads other RPCs need.
 
 use super::*;
 use crate::sekai::object_comment::{self, CommentError, ObjectComment as StoredComment};
@@ -180,6 +183,16 @@ pub(super) async fn create_object_comment(
     service: &SekaiServiceImpl,
     req: Request<CreateObjectCommentRequest>,
 ) -> Result<Response<CreateObjectCommentResponse>, Status> {
+    let owned = service.clone();
+    service
+        .spawn_db(move || create_object_comment_blocking(&owned, req))
+        .await
+}
+
+fn create_object_comment_blocking(
+    service: &SekaiServiceImpl,
+    req: Request<CreateObjectCommentRequest>,
+) -> Result<Response<CreateObjectCommentResponse>, Status> {
     let caller = Caller::new(service, &req)?;
     let input = req.into_inner();
     object_comment::validate_target_property(&input.property).map_err(comment_status)?;
@@ -222,6 +235,16 @@ pub(super) async fn create_object_comment(
 }
 
 pub(super) async fn update_object_comment(
+    service: &SekaiServiceImpl,
+    req: Request<UpdateObjectCommentRequest>,
+) -> Result<Response<UpdateObjectCommentResponse>, Status> {
+    let owned = service.clone();
+    service
+        .spawn_db(move || update_object_comment_blocking(&owned, req))
+        .await
+}
+
+fn update_object_comment_blocking(
     service: &SekaiServiceImpl,
     req: Request<UpdateObjectCommentRequest>,
 ) -> Result<Response<UpdateObjectCommentResponse>, Status> {
@@ -286,6 +309,16 @@ pub(super) async fn list_object_comments(
     service: &SekaiServiceImpl,
     req: Request<ListObjectCommentsRequest>,
 ) -> Result<Response<ListObjectCommentsResponse>, Status> {
+    let owned = service.clone();
+    service
+        .spawn_db(move || list_object_comments_blocking(&owned, req))
+        .await
+}
+
+fn list_object_comments_blocking(
+    service: &SekaiServiceImpl,
+    req: Request<ListObjectCommentsRequest>,
+) -> Result<Response<ListObjectCommentsResponse>, Status> {
     let caller = Caller::new(service, &req)?;
     let input = req.into_inner();
     let target = caller.target(&input.object_id)?;
@@ -311,6 +344,16 @@ pub(super) async fn list_object_comments(
 }
 
 pub(super) async fn list_comment_mentions(
+    service: &SekaiServiceImpl,
+    req: Request<ListCommentMentionsRequest>,
+) -> Result<Response<ListCommentMentionsResponse>, Status> {
+    let owned = service.clone();
+    service
+        .spawn_db(move || list_comment_mentions_blocking(&owned, req))
+        .await
+}
+
+fn list_comment_mentions_blocking(
     service: &SekaiServiceImpl,
     req: Request<ListCommentMentionsRequest>,
 ) -> Result<Response<ListCommentMentionsResponse>, Status> {
