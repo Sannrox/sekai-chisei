@@ -6334,6 +6334,51 @@ async fn configuration_mutations_require_control_plane_administration() {
     );
 }
 
+#[tokio::test]
+async fn external_permit_changes_do_not_apply_when_their_audit_is_refused() {
+    use chisei_core::chisei_store::ChiseiPermitStore;
+    let svc = memory_service();
+    // The audit ledger refuses secret-shaped evidence, so the decision fails.
+    let secret = "sk-not-a-scope";
+    let kill = svc
+        .set_external_action_policy(Request::new(SetExternalActionPolicyRequest {
+            operation: "kill_switch".into(),
+            scope_kind: "action_type".into(),
+            scope_value: secret.into(),
+            enabled: true,
+            reason: "incident".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(kill.is_err());
+    // Nothing was switched, so enabling it now still reports a change.
+    assert!(
+        svc.db
+            .set_permit_kill_switch("action_type", secret, true, "incident", 1)
+            .unwrap()
+    );
+
+    let policy = svc
+        .set_external_action_policy(Request::new(SetExternalActionPolicyRequest {
+            operation: "set_policy".into(),
+            policy: Some(crate::grpc::pb::chisei::ExternalPermitPolicy {
+                scope: secret.into(),
+                offline_action_types: vec!["orders.row.write/v1".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await;
+    assert!(policy.is_err());
+    assert!(
+        svc.db
+            .get_external_permit_policy(secret)
+            .unwrap()
+            .offline_action_types
+            .is_empty()
+    );
+}
+
 #[test]
 fn team_execution_uses_authenticated_namespace_and_budget_scope() {
     let svc = memory_service();
