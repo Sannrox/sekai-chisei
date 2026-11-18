@@ -79,10 +79,12 @@ impl ResidencyPolicy {
         self.validate()?;
         let provider_region = self.provider_regions.get(provider).cloned();
         let model_region = self.model_regions.get(model).cloned().or_else(|| {
-            // Prefix match: ollama/llama → provider region if model unset
+            // Prefix match: the most specific (longest) key the model id
+            // starts with wins, so `ollama/llama-eu` beats `ollama/`.
             self.model_regions
                 .iter()
-                .find(|(key, _)| model.starts_with(key.as_str()))
+                .filter(|(key, _)| model.starts_with(key.as_str()))
+                .max_by_key(|(key, _)| key.len())
                 .map(|(_, region)| region.clone())
         });
 
@@ -326,5 +328,28 @@ mod tests {
         let mut policy = eu_policy();
         policy.allowed_regions.insert("*".into());
         assert!(policy.validate().unwrap_err().contains("explicit"));
+    }
+
+    #[test]
+    fn model_region_uses_the_longest_matching_prefix() {
+        let policy = ResidencyPolicy {
+            allowed_regions: BTreeSet::from(["eu".into(), "us".into()]),
+            model_regions: BTreeMap::from([
+                ("ollama/".into(), "us".into()),
+                ("ollama/llama-eu".into(), "eu".into()),
+                ("ollama/llama-eu-8b-exact".into(), "us".into()),
+            ]),
+            ..eu_policy()
+        };
+        let region = |model: &str| {
+            policy
+                .evaluate("azure-eu", model, "internal")
+                .unwrap()
+                .model_region
+        };
+        assert_eq!(region("ollama/llama-eu-8b"), Some("eu".into()));
+        assert_eq!(region("ollama/mistral"), Some("us".into()));
+        assert_eq!(region("ollama/llama-eu-8b-exact"), Some("us".into()));
+        assert_eq!(region("anthropic/claude"), None);
     }
 }
