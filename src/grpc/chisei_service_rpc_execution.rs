@@ -844,8 +844,6 @@ pub(super) async fn execute_evaluation_manifest(
         execution: Some(to_proto_evaluation_execution_projection(&projection)),
     }))
 }
-/// Directory of checked-in eval dataset definitions, beside the stored ones.
-pub(crate) const EVAL_DATASETS_DIR_ENV: &str = "CHISEI_EVAL_DATASETS_DIR";
 
 pub(super) async fn run_eval_dataset(
     service: &ChiseiServiceImpl,

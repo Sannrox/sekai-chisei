@@ -14353,7 +14353,7 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
         .unwrap();
     let dir_path = dir.path().to_string_lossy().into_owned();
     crate::provider_credentials::with_test_env(
-        crate::grpc::chisei_service::rpc_execution::EVAL_DATASETS_DIR_ENV,
+        crate::chisei::eval_dataset::EVAL_DATASETS_DIR_ENV,
         &dir_path,
         || {
             runtime.block_on(async {
@@ -14544,7 +14544,7 @@ fn eval_dataset_definitions_are_put_listed_paged_and_run() {
         .unwrap();
     let dir_path = dir.path().to_string_lossy().into_owned();
     crate::provider_credentials::with_test_env(
-        crate::grpc::chisei_service::rpc_execution::EVAL_DATASETS_DIR_ENV,
+        crate::chisei::eval_dataset::EVAL_DATASETS_DIR_ENV,
         &dir_path,
         || {
             runtime.block_on(async {

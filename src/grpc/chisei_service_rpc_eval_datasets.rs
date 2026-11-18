@@ -8,7 +8,7 @@
 use super::*;
 use crate::chisei::eval_dataset::{
     DatasetSources, EvalDataset, EvalDatasetDefinition, EvalDatasetDefinitionStore,
-    StoredEvalDatasetDefinition, directory_definitions, is_not_found,
+    StoredEvalDatasetDefinition, datasets_directory, directory_definitions, is_not_found,
 };
 use crate::chisei_store::ChiseiDecisionStore;
 
@@ -16,14 +16,6 @@ const SOURCE_STORED: &str = "stored";
 const SOURCE_DIRECTORY: &str = "directory";
 const DEFINITION_PAGE: (usize, usize) = (50, 200);
 const CASE_PAGE: (usize, usize) = (100, 1_000);
-
-/// The configured definitions directory, if any.
-pub(super) fn datasets_directory() -> Option<std::path::PathBuf> {
-    std::env::var(super::rpc_execution::EVAL_DATASETS_DIR_ENV)
-        .ok()
-        .filter(|dir| !dir.trim().is_empty())
-        .map(std::path::PathBuf::from)
-}
 
 /// `name@version` for `namespace`, from the directory or the namespace's
 /// stored definitions. Blocking: run off the async runtime.

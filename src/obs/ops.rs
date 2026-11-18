@@ -39,21 +39,26 @@ pub fn router(
         .route("/readyz", get(readyz))
         .with_state(OpsState {
             db: db.clone(),
-            chisei_db,
+            chisei_db: chisei_db.clone(),
             provider_registry_state_path,
             transform_queue,
         });
 
-    let console = console::router(ConsoleState {
-        db: db.clone(),
-        auth: crate::grpc::TokenAuthInterceptor::from_runtime(
-            credential_store,
-            crate::db::store::SekaiStore::from_shared_runtime(db),
-            assertion_authority,
-        ),
-        sessions: Arc::new(SessionStore::new()),
-        session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
-    });
+    let console = console::router_with_evals(
+        ConsoleState {
+            db: db.clone(),
+            auth: crate::grpc::TokenAuthInterceptor::from_runtime(
+                credential_store,
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+                assertion_authority,
+            ),
+            sessions: Arc::new(SessionStore::new()),
+            session_ttl: Duration::from_secs(DEFAULT_SESSION_TTL_SECS),
+        },
+        // Eval pages read the same runs as the experimental eval dataset RPCs,
+        // so they share that gate: without it the pages answer unavailable.
+        chisei_db.filter(|_| crate::rpc_maturity::experimental_rpcs_enabled()),
+    );
 
     ops.merge(console)
 }
