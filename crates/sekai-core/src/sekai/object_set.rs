@@ -41,6 +41,10 @@ pub const MAX_HOPS: usize = 3;
 pub const DEFAULT_MAX_ROWS_SCANNED: i32 = 10_000;
 pub const DEFAULT_MAX_DEPTH: i32 = 3;
 
+/// Most ids one `id in` filter may list. A longer list is refused, never
+/// truncated, so a caller cannot mistake a cut-off answer for a full one.
+pub const MAX_ID_FILTER_VALUES: usize = 1_000;
+
 const ALLOWED_OPERATORS: &[&str] = &["eq", "gt", "gte", "lt", "lte"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -347,6 +351,16 @@ impl ObjectSetDescriptor {
         for filter in &self.property_filters {
             filters.push(prepare_property_filter(object_type, filter)?);
         }
+        let selects_ids = filters
+            .iter()
+            .any(|filter| filter.key == domain::OBJECT_ID_FILTER_KEY);
+        // The aggregation engines and object-log reads do not evaluate the
+        // id filter, so the combination fails closed.
+        if selects_ids && (self.aggregation.is_some() || !self.hops.is_empty()) {
+            return Err(ObjectSetError::Unsupported(
+                "object-set id filter does not combine with aggregation or extra hops",
+            ));
+        }
         let order_by = prepare_order_by(object_type, &self.order_by)?;
         let hops = resolved_hops(&self);
         if hops.len() > MAX_HOPS {
@@ -607,6 +621,9 @@ fn prepare_property_filter(
         ));
     }
     let op = filter.op.trim().to_ascii_lowercase();
+    if op == "in" && filter.key == "id" {
+        return prepare_id_filter(&filter.value);
+    }
     if !ALLOWED_OPERATORS.contains(&op.as_str()) {
         return Err(ObjectSetError::Unsupported(
             "unsupported object-set property operator",
@@ -630,6 +647,30 @@ fn prepare_property_filter(
     Ok(PropertyFilter {
         key: filter.key.clone(),
         op,
+        value,
+    })
+}
+
+/// `id in [..]`: a JSON array of at most [`MAX_ID_FILTER_VALUES`] ids,
+/// stored sorted and deduplicated so equal sets share one query digest.
+fn prepare_id_filter(value: &str) -> Result<PropertyFilter, ObjectSetError> {
+    let mut ids = serde_json::from_str::<Vec<String>>(value).map_err(|_| {
+        ObjectSetError::InvalidArgument(
+            "object-set id filter value must be a JSON array of ids".into(),
+        )
+    })?;
+    if ids.len() > MAX_ID_FILTER_VALUES {
+        return Err(ObjectSetError::InvalidArgument(format!(
+            "object-set id filter lists more than {MAX_ID_FILTER_VALUES} ids"
+        )));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let value = serde_json::to_string(&ids)
+        .map_err(|_| ObjectSetError::InvalidArgument("object-set id filter is invalid".into()))?;
+    Ok(PropertyFilter {
+        key: domain::OBJECT_ID_FILTER_KEY.into(),
+        op: "in".into(),
         value,
     })
 }

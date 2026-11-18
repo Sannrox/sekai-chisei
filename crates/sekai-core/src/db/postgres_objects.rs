@@ -1016,6 +1016,14 @@ fn postgres_property_filter(
     filter: &PropertyFilter,
     params: &mut Vec<Box<dyn postgres::types::ToSql + Sync>>,
 ) -> Result<String, String> {
+    if let Some(ids) = crate::domain::object_id_filter_ids(&filter.key, &filter.op, &filter.value) {
+        let ids = ids?;
+        if ids.is_empty() {
+            return Ok("FALSE".into());
+        }
+        params.push(Box::new(ids));
+        return Ok(format!("o.id = ANY(${})", params.len()));
+    }
     if !is_valid_property_key(&filter.key) {
         return Err("invalid property key".into());
     }

@@ -152,6 +152,30 @@ pub struct PropertyFilter {
     pub value: String,
 }
 
+/// List-filter key that matches the object id column instead of a property.
+/// The only operator is `in`, whose value is a JSON array of ids. The `$`
+/// keeps it outside [`is_valid_property_key`], so no property can collide.
+pub const OBJECT_ID_FILTER_KEY: &str = "$id";
+
+/// The ids an object-id filter selects, or `None` for a property filter.
+/// Storage builders call this before treating the key as a property.
+pub fn object_id_filter_ids(
+    key: &str,
+    op: &str,
+    value: &str,
+) -> Option<Result<Vec<String>, String>> {
+    if key != OBJECT_ID_FILTER_KEY {
+        return None;
+    }
+    if !op.eq_ignore_ascii_case("in") {
+        return Some(Err("object id filter supports only op in".into()));
+    }
+    Some(
+        serde_json::from_str::<Vec<String>>(value)
+            .map_err(|_| "object id filter value must be a JSON array of ids".into()),
+    )
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ListFilter {

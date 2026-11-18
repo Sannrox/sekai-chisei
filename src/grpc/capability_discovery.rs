@@ -543,10 +543,16 @@ fn evaluate_object_set_capability() -> CapabilityEntry {
         "object_acl".into(),
         "definition_revision".into(),
     ];
-    entry.limits = vec![CapabilityLimit {
-        name: "max_filters".into(),
-        value: crate::sekai::object_set::MAX_PROPERTY_FILTERS as u64,
-    }];
+    entry.limits = vec![
+        CapabilityLimit {
+            name: "max_filters".into(),
+            value: crate::sekai::object_set::MAX_PROPERTY_FILTERS as u64,
+        },
+        CapabilityLimit {
+            name: "max_id_filter_values".into(),
+            value: crate::sekai::object_set::MAX_ID_FILTER_VALUES as u64,
+        },
+    ];
     entry
 }
 

@@ -58,7 +58,8 @@ pub enum IndexSqlDialect {
 }
 
 /// Push eq/gt/gte/lt/lte onto stored member JSON so evaluate does not
-/// decode every kind row. Unknown ops fail closed (no rows).
+/// decode every kind row, and the object-id filter onto `object_id`.
+/// Unknown ops fail closed (no rows).
 pub fn member_filter_sql(
     dialect: IndexSqlDialect,
     filters: &[crate::dataset::RowFilter],
@@ -67,6 +68,26 @@ pub fn member_filter_sql(
     let mut values = Vec::new();
     let mut param = 3usize;
     for filter in filters {
+        if let Some(ids) =
+            sekai_domain::domain::object_id_filter_ids(&filter.column, &filter.op, &filter.value)
+        {
+            let ids = ids?;
+            let placeholders = (param..param + ids.len())
+                .map(|index| match dialect {
+                    IndexSqlDialect::Sqlite => format!("?{index}"),
+                    IndexSqlDialect::Postgres => format!("${index}"),
+                })
+                .collect::<Vec<_>>();
+            param += ids.len();
+            values.extend(ids);
+            clause.push_str(" AND ");
+            if placeholders.is_empty() {
+                clause.push_str("1=0");
+            } else {
+                clause.push_str(&format!("object_id IN ({})", placeholders.join(", ")));
+            }
+            continue;
+        }
         if filter.column.is_empty() || filter.column.contains('\'') || filter.column.contains('"') {
             return Err(format!("invalid index filter key {}", filter.column));
         }

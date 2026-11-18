@@ -540,6 +540,8 @@ message ObjectSetDescriptor {
   string namespace = 2;
   string kind = 3;
   string definition_digest = 4;
+  // At most 4; eq, gt, gte, lt or lte on a declared property, or
+  // `in` on key `id` with a JSON array of at most 1,000 ids (#2706).
   repeated PropertyFilter property_filters = 5;
   string order_by = 6;
   bool descending = 7;

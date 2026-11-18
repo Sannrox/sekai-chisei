@@ -522,6 +522,7 @@ impl SekaiServiceImpl {
                 .filter
                 .property_filters
                 .iter()
+                .filter(|property_filter| property_filter.key != domain::OBJECT_ID_FILTER_KEY)
                 .map(|property_filter| property_filter.key.clone())
                 .collect::<Vec<_>>();
             if let Some(order_property) = queried_order_property(&bound.filter.order_by) {
@@ -595,14 +596,24 @@ impl SekaiServiceImpl {
             return Err(Status::failed_precondition("object type index is stale"));
         }
         let query = crate::sekai::dataset::RowQuery {
+            // Caller filters as written, except the id filter, which only
+            // its prepared form (`OBJECT_ID_FILTER_KEY`) pushes onto members.
             filters: bound
                 .descriptor
                 .property_filters
                 .iter()
-                .map(|filter| crate::sekai::dataset::RowFilter {
-                    column: filter.key.clone(),
-                    op: filter.op.clone(),
-                    value: filter.value.clone(),
+                .zip(&bound.filter.property_filters)
+                .map(|(filter, prepared)| {
+                    let filter = if prepared.key == domain::OBJECT_ID_FILTER_KEY {
+                        prepared
+                    } else {
+                        filter
+                    };
+                    crate::sekai::dataset::RowFilter {
+                        column: filter.key.clone(),
+                        op: filter.op.clone(),
+                        value: filter.value.clone(),
+                    }
                 })
                 .collect(),
             columns: Vec::new(),
@@ -1931,6 +1942,9 @@ fn object_matches_bound_filters(object: &domain::Object, bound: &BoundObjectSet)
         return false;
     }
     bound.filter.property_filters.iter().all(|filter| {
+        if let Some(ids) = domain::object_id_filter_ids(&filter.key, &filter.op, &filter.value) {
+            return ids.is_ok_and(|ids| ids.contains(&object.id));
+        }
         let Some(actual) = object.properties.get(&filter.key) else {
             return false;
         };
@@ -2561,6 +2575,159 @@ mod tests {
         assert_eq!(second.members[0].id, "o-north");
         assert!(second.next_page_token.is_empty());
         assert!(!second.members.iter().any(|object| object.id == "o-west"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_object_set_id_filter_returns_only_readable_ids() {
+        exercise_id_filter_returns_only_readable_ids(service()).await;
+    }
+
+    /// #2706: the id filter answers the same on PostgreSQL as on SQLite.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_evaluate_object_set_id_filter_matches_sqlite() {
+        let scratch = crate::db::ScratchDatabase::create();
+        let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_id_filter_returns_only_readable_ids(
+                SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+                    db.clone(),
+                )),
+            ));
+        drop(db);
+    }
+
+    /// #2706: `id in [..]` returns exactly the listed objects the caller may
+    /// read. A marked, privately granted, other-namespace, wrong-kind or
+    /// missing id is absent, and the answer does not tell them apart.
+    async fn exercise_id_filter_returns_only_readable_ids(svc: SekaiServiceImpl) {
+        grant_namespace(&svc, "sales", "alice");
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        let mut marked = object("c-marked", "Customer", "Marked", &[], 14);
+        marked.properties.insert(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "restricted".into(),
+        );
+        let mut elsewhere = object("c-hr", "Customer", "Elsewhere", &[], 15);
+        elsewhere.namespace = "hr".into();
+        elsewhere.external_id = "hr:c-hr".into();
+        for item in [
+            marked,
+            object("c-private", "Customer", "Private", &[], 16),
+            elsewhere,
+            domain::Object {
+                id: "profile-alice".into(),
+                kind: crate::sekai::markings::PRINCIPAL_PROFILE_KIND.into(),
+                name: "alice".into(),
+                namespace: String::new(),
+                external_id: crate::sekai::markings::principal_profile_external_id("alice"),
+                properties: std::collections::HashMap::from([
+                    (
+                        crate::sekai::markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                        "public".into(),
+                    ),
+                    (
+                        crate::sekai::markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                        "true".into(),
+                    ),
+                ]),
+                created: 1,
+                updated: 1,
+            },
+        ] {
+            svc.db.runtime().create_object(&item).unwrap();
+        }
+        for (object_id, principal) in [("c-private", "bob"), ("profile-alice", "root")] {
+            let grant = security::Grant {
+                id: format!("grant-{object_id}"),
+                object_id: object_id.into(),
+                principal: principal.into(),
+                role: security::Role::Admin,
+                created: 1,
+                ..Default::default()
+            };
+            svc.db.runtime().create_grant(&grant).unwrap();
+            svc.security.add_grant(&grant);
+        }
+        let by_ids = |ids: &[&str]| ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            definition_digest: digest.clone(),
+            property_filters: vec![PropertyFilter {
+                key: "id".into(),
+                op: "in".into(),
+                value: serde_json::to_string(ids).unwrap(),
+            }],
+            ..Default::default()
+        };
+        let evaluate = |descriptor: ObjectSetDescriptor| {
+            svc.evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor),
+                    ..Default::default()
+                },
+                "alice",
+            ))
+        };
+
+        let mixed = evaluate(by_ids(&[
+            "missing",
+            "c-marked",
+            "c-eu-2",
+            "c-private",
+            "c-hr",
+            "o-south",
+            "c-eu-3",
+            "c-eu-2",
+        ]))
+        .await
+        .unwrap()
+        .into_inner();
+        let mut visible = member_ids(&mixed);
+        visible.sort_unstable();
+        assert_eq!(visible, ["c-eu-2", "c-eu-3"]);
+        assert_eq!(mixed.total, 2);
+
+        // Existing-but-unreadable ids answer exactly as missing ids do.
+        let hidden = evaluate(by_ids(&["c-marked", "c-private", "c-hr"]))
+            .await
+            .unwrap()
+            .into_inner();
+        let missing = evaluate(by_ids(&["nope-1", "nope-2", "nope-3"]))
+            .await
+            .unwrap()
+            .into_inner();
+        for response in [&hidden, &missing] {
+            assert!(response.members.is_empty());
+            assert_eq!(response.total, 0);
+            assert!(response.next_page_token.is_empty());
+        }
+
+        let over_bound = (0..=crate::sekai::object_set::MAX_ID_FILTER_VALUES)
+            .map(|index| format!("id-{index}"))
+            .collect::<Vec<_>>();
+        let over_bound = over_bound.iter().map(String::as_str).collect::<Vec<_>>();
+        let refused = evaluate(by_ids(&over_bound)).await.unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+        // `in` stays unknown on properties, as on a server without it.
+        let mut on_property = by_ids(&["eu"]);
+        on_property.property_filters[0].key = "region".into();
+        let unsupported = evaluate(on_property).await.unwrap_err();
+        let mut unknown_op = by_ids(&["eu"]);
+        unknown_op.property_filters[0] = PropertyFilter {
+            key: "region".into(),
+            op: "contains".into(),
+            value: "eu".into(),
+        };
+        let existing = evaluate(unknown_op).await.unwrap_err();
+        assert_eq!(unsupported.code(), existing.code());
+        assert_eq!(unsupported.message(), existing.message());
     }
 
     #[tokio::test]
@@ -3356,6 +3523,48 @@ mod tests {
             .into_inner();
         assert_eq!(page.members.len(), 1);
         assert_eq!(page.members[0].id, "Customer:c-high");
+
+        // #2706: the id filter selects index members by object id and
+        // combines with the other filters on the index path.
+        for (extra, expected) in [
+            (None, vec!["Customer:c-high", "Customer:c-low"]),
+            (
+                Some(PropertyFilter {
+                    key: "tier".into(),
+                    op: "gte".into(),
+                    value: "2".into(),
+                }),
+                vec!["Customer:c-high"],
+            ),
+        ] {
+            let mut request = descriptor(&digest, 10);
+            request.order_by.clear();
+            request.traversal = None;
+            request.property_filters = vec![PropertyFilter {
+                key: "id".into(),
+                op: "in".into(),
+                value: r#"["Customer:c-low","Customer:c-high","Customer:missing"]"#.into(),
+            }];
+            request.property_filters.extend(extra);
+            let page = svc
+                .evaluate_object_set(with_named_principal(
+                    EvaluateObjectSetRequest {
+                        descriptor: Some(request),
+                        ..Default::default()
+                    },
+                    "alice",
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            let mut ids = member_ids(&page);
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
+            assert_eq!(
+                page.source,
+                crate::sekai::object_set::EVALUATE_SOURCE_SQL_PROJECTION
+            );
+        }
     }
 
     #[tokio::test]
