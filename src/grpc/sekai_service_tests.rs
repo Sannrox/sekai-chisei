@@ -32551,6 +32551,20 @@ async fn approved_bundle_applies_the_backfill_then_publishes_last() {
         .list_dataset_versions("tickets")
         .unwrap()
         .len();
+    // The completed apply answers only for the bundle it applied.
+    let mut other = request.clone();
+    other.bundle_digest = format!("sha256:{}", "0".repeat(64));
+    let refused = svc
+        .apply_definition_change_bundle(with_named_principal(other, "root"))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with("definition_bundle_apply_unapproved_bundle"),
+        "{refused:?}"
+    );
     let again = svc
         .apply_definition_change_bundle(with_named_principal(request, "root"))
         .await
