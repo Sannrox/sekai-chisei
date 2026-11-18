@@ -1,7 +1,7 @@
 //! Evaluate repeated benchmark reports against the checked-in budgets.
 //!
 //! `perf_regression` gates on the median of repeated runs, so this driver takes
-//! several `sekai.performance-report/v1` files rather than one:
+//! several `sekai.performance-report` files (v1 or v2) rather than one:
 //!
 //! ```text
 //! perf-gate --manifest benchmarks/manifest-v1.json run1.json run2.json run3.json [--enforce]
@@ -12,10 +12,17 @@
 //! That split exists because absolute latency budgets are hardware-specific:
 //! the checked-in budgets were calibrated on Apple M2 Pro, and enforcing them
 //! unchanged on other hardware fails for reasons unrelated to a code change.
+//!
+//! v2 reports also carry plane signals per workload. Those are gated against
+//! the manifest's `signal_budgets` and the baseline the same way; a baseline
+//! without signals skips the signal comparison.
 
 use sekai_chisei::perf_regression::{
     BaselineVerdict, GateOutcome, Ineligibility, MIN_DETECTABLE_REGRESSION_PERCENT,
     MIN_REPETITIONS, WorkloadBudget, WorkloadSample, compare_to_baseline_with_threshold, evaluate,
+};
+use sekai_chisei::perf_signals::{
+    SignalOutcome, SignalVerdict, WorkloadSignals, compare_signals_to_baseline, evaluate_signals,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -24,6 +31,12 @@ use std::process::ExitCode;
 #[derive(Debug, Deserialize)]
 struct Report {
     results: Vec<WorkloadSample>,
+}
+
+/// The same report read for its plane signals only.
+#[derive(Debug, Deserialize)]
+struct SignalReport {
+    results: Vec<WorkloadSignals>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +48,8 @@ struct Manifest {
 struct ManifestWorkload {
     id: String,
     budgets: WorkloadBudget,
+    #[serde(default)]
+    signal_budgets: BTreeMap<String, f64>,
 }
 
 fn main() -> ExitCode {
@@ -95,18 +110,19 @@ fn run() -> Result<ExitCode, String> {
         std::fs::read(&manifest_path).map_err(|e| format!("read {manifest_path}: {e}"))?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("parse {manifest_path}: {e}"))?;
-    let budgets: BTreeMap<String, WorkloadBudget> = manifest
-        .workloads
-        .into_iter()
-        .map(|workload| (workload.id, workload.budgets))
-        .collect();
+    let mut budgets = BTreeMap::new();
+    let mut signal_budgets = BTreeMap::new();
+    for workload in manifest.workloads {
+        budgets.insert(workload.id.clone(), workload.budgets);
+        signal_budgets.insert(workload.id, workload.signal_budgets);
+    }
 
     let mut runs = Vec::new();
+    let mut signal_runs = Vec::new();
     for path in &report_paths {
-        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        let report: Report =
-            serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+        let (report, signals) = read_report(path)?;
         runs.push(report.results);
+        signal_runs.push(signals.results);
     }
 
     let gate = evaluate(&runs, &budgets);
@@ -144,11 +160,44 @@ fn run() -> Result<ExitCode, String> {
     }
     println!("{}", "-".repeat(78));
 
+    let signal_gate = evaluate_signals(&signal_runs, &signal_budgets);
+    let signal_failures = signal_gate
+        .iter()
+        .filter(|decision| decision.outcome.fails_gate())
+        .count();
+    if !signal_gate.is_empty() {
+        println!();
+        println!(
+            "{:<36}{:<20}{:>12}{:>10}  outcome",
+            "workload", "signal", "median", "spread"
+        );
+        println!("{}", "-".repeat(98));
+        for decision in &signal_gate {
+            let outcome = match &decision.outcome {
+                SignalOutcome::WithinBudget => "within budget".to_string(),
+                SignalOutcome::Regression { worse_by_percent } => format!(
+                    "REGRESSION +{worse_by_percent:.1}% over {:.3}",
+                    decision.budget
+                ),
+                SignalOutcome::InconclusiveBreach {
+                    dispersion_percent, ..
+                } => format!("over budget, within noise ({dispersion_percent:.1}%)"),
+                SignalOutcome::NotGateable(reason) => {
+                    format!("not gateable: {}", ineligibility(reason))
+                }
+                _ => "unknown outcome".to_string(),
+            };
+            println!(
+                "{:<36}{:<20}{:>12.3}{:>9.0}%  {outcome}",
+                decision.id, decision.signal, decision.median, decision.spread_percent
+            );
+        }
+        println!("{}", "-".repeat(98));
+    }
+
     let mut baseline_regressions = 0usize;
     if let Some(path) = &baseline_path {
-        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        let baseline: Report =
-            serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+        let (baseline, baseline_signals) = read_report(path)?;
         let comparison = compare_to_baseline_with_threshold(
             &runs,
             &baseline.results,
@@ -197,6 +246,59 @@ fn run() -> Result<ExitCode, String> {
             baseline_regressions,
             comparison.improvements().len()
         );
+
+        let signal_comparison = compare_signals_to_baseline(
+            &signal_runs,
+            &baseline_signals.results,
+            regression_threshold_percent,
+        );
+        if !signal_comparison.is_empty() {
+            println!();
+            println!(
+                "{:<36}{:<20}{:>12}{:>12}  verdict",
+                "workload", "signal", "baseline", "current"
+            );
+            println!("{}", "-".repeat(98));
+            for row in &signal_comparison {
+                let verdict = match &row.verdict {
+                    SignalVerdict::Unchanged => "unchanged".to_string(),
+                    SignalVerdict::Improved { worse_by_percent } => {
+                        format!("improved {:.1}%", -worse_by_percent)
+                    }
+                    SignalVerdict::Regressed {
+                        worse_by_percent,
+                        threshold_percent,
+                    } => format!(
+                        "REGRESSED +{worse_by_percent:.1}% over {threshold_percent:.1}% threshold"
+                    ),
+                    SignalVerdict::SkippedAbsentFromBaseline => {
+                        "skipped: absent from baseline".to_string()
+                    }
+                    SignalVerdict::SkippedZeroBaseline => "skipped: zero baseline".to_string(),
+                    SignalVerdict::NotComparable(reason) => {
+                        format!("not comparable: {}", ineligibility(reason))
+                    }
+                    _ => "unknown verdict".to_string(),
+                };
+                let baseline = row
+                    .baseline
+                    .map_or_else(|| "-".to_string(), |value| format!("{value:.3}"));
+                println!(
+                    "{:<36}{:<20}{:>12}{:>12.3}  {verdict}",
+                    row.id, row.signal, baseline, row.current_median
+                );
+            }
+            println!("{}", "-".repeat(98));
+            let signal_regressions = signal_comparison
+                .iter()
+                .filter(|row| row.verdict.is_regression())
+                .count();
+            baseline_regressions += signal_regressions;
+            println!(
+                "{} signals compared, {signal_regressions} regressions",
+                signal_comparison.len()
+            );
+        }
     }
 
     let failures = gate.failures();
@@ -209,18 +311,34 @@ fn run() -> Result<ExitCode, String> {
         report_paths.len()
     );
 
-    let total = failures.len() + baseline_regressions;
+    let total = failures.len() + signal_failures + baseline_regressions;
     if total == 0 {
         return Ok(ExitCode::SUCCESS);
     }
     if enforce {
         eprintln!(
             "perf-gate: {} budget regressions, {baseline_regressions} baseline regressions",
-            failures.len()
+            failures.len() + signal_failures
         );
         Ok(ExitCode::FAILURE)
     } else {
         println!("perf-gate: reporting only, rerun with --enforce to fail on regressions");
         Ok(ExitCode::SUCCESS)
+    }
+}
+
+/// Reads one report for its latency samples and its plane signals.
+fn read_report(path: &str) -> Result<(Report, SignalReport), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let report = serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+    let signals = serde_json::from_slice(&bytes).map_err(|e| format!("parse {path}: {e}"))?;
+    Ok((report, signals))
+}
+
+fn ineligibility(reason: &Ineligibility) -> &'static str {
+    match reason {
+        Ineligibility::NoiseDominated => "noise dominated",
+        Ineligibility::BelowTimerResolution => "below timer resolution",
+        Ineligibility::InsufficientSamples => "insufficient samples",
     }
 }
