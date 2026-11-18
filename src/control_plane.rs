@@ -161,12 +161,8 @@ pub fn run_gateway_report(config: &Config) -> Result<(), Box<dyn std::error::Err
     }
 
     let format = arg_value(&args, "--format").unwrap_or("csv");
-    let after = arg_value(&args, "--after")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(0);
-    let limit = arg_value(&args, "--limit")
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(500);
+    let after: i64 = parsed_arg(&args, "--after", 0)?;
+    let limit: i32 = parsed_arg(&args, "--limit", 500)?;
 
     let stores = open_gateway_report_layout(&config.db_path).map_err(std::io::Error::other)?;
     let db = stores.sekai_runtime();
@@ -186,6 +182,19 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|pair| pair[1].as_str())
 }
 
+/// Parses `flag`'s value, or returns `default` when the flag is absent. A
+/// supplied value that does not parse, or a trailing flag with no value, is an
+/// error naming the flag, so a typo never silently becomes the default.
+fn parsed_arg<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Result<T, String> {
+    match arg_value(args, flag) {
+        None if args.iter().any(|arg| arg == flag) => Err(format!("{flag} requires a value")),
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .map_err(|_| format!("{flag} must be a number, got {value:?}")),
+    }
+}
+
 fn open_gateway_report_layout(db_path: &str) -> Result<CombinedStoreLayout, String> {
     crate::store_relocate::open_layout_or_fence(db_path)
 }
@@ -193,6 +202,29 @@ fn open_gateway_report_layout(db_path: &str) -> Result<CombinedStoreLayout, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_report_numeric_flags_refuse_unparsable_values() {
+        let args = |raw: &[&str]| raw.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let err =
+            parsed_arg::<i32>(&args(&["--egress", "--limit", "5k"]), "--limit", 500).unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
+        let err = parsed_arg::<i64>(&args(&["--after", "x"]), "--after", 0).unwrap_err();
+        assert!(err.contains("--after"), "{err}");
+        let err = parsed_arg::<i32>(&args(&["--egress", "--limit"]), "--limit", 500).unwrap_err();
+        assert!(err.contains("--limit"), "{err}");
+
+        assert_eq!(
+            parsed_arg::<i32>(&args(&["--egress"]), "--limit", 500),
+            Ok(500)
+        );
+        assert_eq!(parsed_arg::<i64>(&args(&["--egress"]), "--after", 0), Ok(0));
+        assert_eq!(
+            parsed_arg::<i32>(&args(&["--limit", "25"]), "--limit", 500),
+            Ok(25)
+        );
+    }
 
     #[test]
     fn gateway_report_refuses_a_legacy_single_store() {
