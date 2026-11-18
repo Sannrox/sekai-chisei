@@ -26,6 +26,7 @@ const TREND_POINTS: usize = 20;
 const BASELINE_CANDIDATES: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvalViewError {
     InvalidNamespace,
     NamespaceDenied,
@@ -86,6 +87,7 @@ pub struct Compared {
 }
 
 /// The run against its baseline, or why there is no comparison.
+#[non_exhaustive]
 pub enum Baseline {
     Compared(Box<Compared>),
     Missing(&'static str),
