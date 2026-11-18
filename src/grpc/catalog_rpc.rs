@@ -522,10 +522,7 @@ fn binding_discoverable_for_caller(
 
 /// Catalog-attributed invocation helpers shared by the semantic RPCs.
 impl SekaiServiceImpl {
-    pub(super) fn catalog_metadata_value(
-        req: &Request<impl prost::Message>,
-        key: &str,
-    ) -> Option<String> {
+    pub(super) fn catalog_metadata_value<T>(req: &Request<T>, key: &str) -> Option<String> {
         req.metadata()
             .get(key)
             .and_then(|value| value.to_str().ok())
@@ -534,14 +531,18 @@ impl SekaiServiceImpl {
             .map(str::to_string)
     }
 
-    /// MCP link tools send `x-sekai-capability` as `sekai.links.get` /
-    /// `sekai.links.create`. Direct gRPC and the HTTP gateway also carry
-    /// `x-sekai-namespace`; only the MCP tools bind object ids to it.
-    pub(super) fn mcp_link_session_namespace(req: &Request<impl prost::Message>) -> Option<String> {
+    /// The namespace an MCP session binds object ids to. The MCP link, lineage,
+    /// and neighborhood tools send their name as `x-sekai-capability`; direct
+    /// gRPC and the HTTP gateway also carry `x-sekai-namespace`, but only these
+    /// tools are confined to it.
+    pub(super) fn mcp_session_namespace<T>(req: &Request<T>) -> Option<String> {
         match Self::catalog_metadata_value(req, "x-sekai-capability").as_deref() {
-            Some("sekai.links.get") | Some("sekai.links.create") => {
-                Self::catalog_metadata_value(req, "x-sekai-namespace")
-            }
+            Some(
+                "sekai.links.get"
+                | "sekai.links.create"
+                | "sekai.lineage.get"
+                | super::graph_explore_rpc::NEIGHBORHOOD_CAPABILITY,
+            ) => Self::catalog_metadata_value(req, "x-sekai-namespace"),
             _ => None,
         }
     }

@@ -492,6 +492,28 @@ fused score, and the highlighted fields of the caller's live projection) in
 the RPC's order and paging, under the same read policy and the
 `late_fusion.rrf/v1` profile, and never vectors. See [search.md](search.md).
 
+### Discovery tools
+
+Read-only tools let an agent find what exists without type names supplied out
+of band (#2430). Each is a projection of the gRPC call under the same
+principal, so a class or object the principal cannot read over gRPC is absent
+or refused the same way.
+
+- `sekai.lineage.get` → `GetLineage` (`stable`, always listed). It requires
+  `object_id` and accepts `max_nodes` from 0 to 500; a larger value is refused
+  rather than truncated.
+- `sekai.ontology.classes.list` → `ListOntologyClasses` takes no input.
+- `sekai.ontology.classes.get` → `GetOntologyClass` requires `name`.
+- `sekai.relations.neighborhood` → `ExpandNeighborhood` requires `seed_ids`
+  and accepts `relations`, `object_kinds`, `depth`, `fan_out_cap`, and
+  `limit`. Values past the RPC bounds are refused.
+
+The last three RPCs are `experimental`, so those tools are listed and run only
+when experimental RPCs are enabled. The server confines the lineage and
+neighborhood walks to the session namespace: a start object outside it is not
+found, and objects outside it are left out as if unreadable, even when the
+principal may read them over direct gRPC.
+
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and
 call `GetQualityTrend`; they do not reimplement the reducer. Every binding fails

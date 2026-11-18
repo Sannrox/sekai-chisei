@@ -369,6 +369,9 @@ struct Walker<'a> {
     authority: markings::PrincipalAuthority,
     relations: Vec<String>,
     kinds: HashSet<String>,
+    /// The MCP session namespace the walk is confined to, when the neighborhood
+    /// tool called; objects outside it are hidden like unreadable ones.
+    session_namespace: Option<String>,
     /// Classifications each read root starts under.
     paths: HashMap<String, BTreeSet<PathClassification>>,
     /// Hop-independent verdict per object id.
@@ -394,6 +397,7 @@ impl<'a> Walker<'a> {
             authority,
             relations: Vec::new(),
             kinds: HashSet::new(),
+            session_namespace: SekaiServiceImpl::mcp_session_namespace(req),
             paths: HashMap::new(),
             readable: HashMap::new(),
             expanded: HashMap::new(),
@@ -418,6 +422,7 @@ impl<'a> Walker<'a> {
             .db()
             .get_object_with_policy_context(id, &self.policy_context)
             .map_err(Status::internal)?
+            .filter(|object| self.in_session(object))
             .ok_or_else(|| Status::not_found("not found"))?;
         let operation = format!("{operation}:{}", object.id);
         require_purpose_for_kind(
@@ -617,7 +622,16 @@ impl<'a> Walker<'a> {
         Ok(readable)
     }
 
+    fn in_session(&self, object: &domain::Object) -> bool {
+        self.session_namespace
+            .as_deref()
+            .is_none_or(|namespace| namespace == object.namespace)
+    }
+
     fn readable_object(&mut self, object: &domain::Object) -> Result<bool, Status> {
+        if !self.in_session(object) {
+            return Ok(false);
+        }
         if !self.kinds.is_empty() && !self.kinds.contains(&object.kind) {
             return Ok(false);
         }
