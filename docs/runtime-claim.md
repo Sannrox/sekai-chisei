@@ -16,8 +16,12 @@ Authorized **runtime hosts** pull and claim admitted `runtime_dispatch` effects.
 The plane remains the system of record for claim state; hosts execute work and
 ack terminal outcomes. The plane never spawns processes or holds model tools.
 
-These claim RPCs are classified `experimental` and are rejected unless
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
+The one claim family (`ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim`,
+`AckWork`) is `stable` (#2286). The per-kind claim RPCs below are
+`experimental` and deprecated; they are rejected unless
+`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
+enabled, and are removed in 5.0.0 (see [Deprecated per-kind
+families](#deprecated-per-kind-families)).
 
 ## Versioned client
 
@@ -55,7 +59,8 @@ and `InvalidArgument` is a malformed batch; empty-queue `ClaimTransformWork`
 `run_id` that is gone or held is contention; `ClaimActionWork` `NotFound` is
 a missing effect, not an empty queue. Streamed transform-input item errors
 use the same owned-fence mapping. Fence loss is never
-success or idle. Enable experimental RPCs on the plane before polling.
+success or idle. The per-kind fallback, and transform input reads and
+result writes, still need experimental RPCs enabled on the plane.
 
 The client does not change claim, lease, or fencing semantics on the server
 and does not embed credentials or provider routing.
@@ -70,7 +75,7 @@ and does not embed credentials or provider routing.
 | `AckActionWork` | `completed` / `failed`, or a durably idempotent intentional park under the matching fence |
 | `ReportActionClaimEvent` | Append a fenced, idempotent resume/fallback event without checkpoint content |
 
-### One claim family (experimental, ADR 0149)
+### One claim family (stable, ADR 0149)
 
 `ListClaimableWork`, `ClaimWork`, `HeartbeatWorkClaim` and `AckWork` take a
 `kind` (`WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION`, `WORK_KIND_AGENT_TURN`,
@@ -102,6 +107,28 @@ returns `ExternalEffectWork`: the effect with its fence, the Source, and the
 Action's parameters. A live claim is never replayed, even to its holder.
 `AckWork` takes `completed`, `failed` or `outcome_unknown`, each final.
 `ClaimActionWork` keeps refusing the effect.
+
+The family is `stable`, but transform work still needs the experimental
+gate to finish: its input reads and result writes
+(`ReadTransformRunInputs`, `WriteTransformRunResult`) stay `experimental`.
+
+List calls return at most 500 items per kind, and 50 when `limit` is 0.
+
+### Deprecated per-kind families
+
+Each per-kind claim RPC is deprecated in the 4.0.0 cycle and removed in
+5.0.0. `sekai-client` already calls the one family and falls back to these
+RPCs only on an older plane.
+
+| Deprecated RPC | Replacement |
+| --- | --- |
+| `ListClaimableTransformWork`, `ListClaimableActionWork`, `ListClaimableAgentTurns` | `ListClaimableWork` with `WORK_KIND_TRANSFORM`, `WORK_KIND_ACTION` or `WORK_KIND_AGENT_TURN` |
+| `ClaimTransformWork`, `ClaimActionWork`, `ClaimAgentTurn` | `ClaimWork` with the same kind |
+| `HeartbeatTransformClaim`, `HeartbeatActionClaim`, `HeartbeatAgentTurnClaim` | `HeartbeatWorkClaim` with the same kind |
+| `AckActionWork`, `AckAgentTurn` | `AckWork` with the same kind |
+
+`ReportActionClaimEvent` has no replacement in the family and is not
+deprecated.
 
 ## Lease rules (v1)
 

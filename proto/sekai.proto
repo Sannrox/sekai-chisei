@@ -5768,16 +5768,34 @@ service SekaiService {
   rpc ListGovernedTransforms(ListGovernedTransformsRequest) returns (ListGovernedTransformsResponse);
   rpc ListGovernedTransformRuns(ListGovernedTransformRunsRequest) returns (ListGovernedTransformRunsResponse);
   rpc RegisterTransformRuntime(RegisterTransformRuntimeRequest) returns (RegisterTransformRuntimeResponse);
-  rpc ListClaimableTransformWork(ListClaimableTransformWorkRequest) returns (ListClaimableTransformWorkResponse);
-  rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse);
-  rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse);
+  // Deprecated (#2286): use ListClaimableWork, ClaimWork and HeartbeatWorkClaim
+  // with WORK_KIND_TRANSFORM. Served until 5.0.0.
+  rpc ListClaimableTransformWork(ListClaimableTransformWorkRequest) returns (ListClaimableTransformWorkResponse) {
+    option deprecated = true;
+  }
+  rpc ClaimTransformWork(ClaimTransformWorkRequest) returns (ClaimTransformWorkResponse) {
+    option deprecated = true;
+  }
+  rpc HeartbeatTransformClaim(HeartbeatTransformClaimRequest) returns (HeartbeatTransformClaimResponse) {
+    option deprecated = true;
+  }
   rpc WakeSiteAgentInstance(WakeSiteAgentInstanceRequest) returns (WakeSiteAgentInstanceResponse);
   rpc ListSiteAgentInstanceTurns(ListSiteAgentInstanceTurnsRequest) returns (ListSiteAgentInstanceTurnsResponse);
-  rpc ListClaimableAgentTurns(ListClaimableAgentTurnsRequest) returns (ListClaimableAgentTurnsResponse);
-  rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse);
-  rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse);
-  rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse);
-  // Experimental (ADR 0149). One claim family over every work kind; each
+  // Deprecated (#2286): use ListClaimableWork, ClaimWork, HeartbeatWorkClaim and
+  // AckWork with WORK_KIND_AGENT_TURN. Served until 5.0.0.
+  rpc ListClaimableAgentTurns(ListClaimableAgentTurnsRequest) returns (ListClaimableAgentTurnsResponse) {
+    option deprecated = true;
+  }
+  rpc ClaimAgentTurn(ClaimAgentTurnRequest) returns (ClaimAgentTurnResponse) {
+    option deprecated = true;
+  }
+  rpc HeartbeatAgentTurnClaim(HeartbeatAgentTurnClaimRequest) returns (HeartbeatAgentTurnClaimResponse) {
+    option deprecated = true;
+  }
+  rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse) {
+    option deprecated = true;
+  }
+  // Stable (ADR 0149, #2286). One claim family over every work kind; each
   // call runs the kind's own claim path, so both families see one claim.
   // Export delivery has no claim RPCs of its own; its old delivery RPCs
   // above honor these claims.
@@ -5953,10 +5971,20 @@ service SekaiService {
   rpc GetActionEffect(GetActionEffectRequest) returns (GetActionEffectResponse);
   rpc ListActionEffects(ListActionEffectsRequest) returns (ListActionEffectsResponse);
 
-  rpc ListClaimableActionWork(ListClaimableActionWorkRequest) returns (ListClaimableActionWorkResponse);
-  rpc ClaimActionWork(ClaimActionWorkRequest) returns (ClaimActionWorkResponse);
-  rpc HeartbeatActionClaim(HeartbeatActionClaimRequest) returns (HeartbeatActionClaimResponse);
-  rpc AckActionWork(AckActionWorkRequest) returns (AckActionWorkResponse);
+  // Deprecated (#2286): use ListClaimableWork, ClaimWork, HeartbeatWorkClaim and
+  // AckWork with WORK_KIND_ACTION. Served until 5.0.0.
+  rpc ListClaimableActionWork(ListClaimableActionWorkRequest) returns (ListClaimableActionWorkResponse) {
+    option deprecated = true;
+  }
+  rpc ClaimActionWork(ClaimActionWorkRequest) returns (ClaimActionWorkResponse) {
+    option deprecated = true;
+  }
+  rpc HeartbeatActionClaim(HeartbeatActionClaimRequest) returns (HeartbeatActionClaimResponse) {
+    option deprecated = true;
+  }
+  rpc AckActionWork(AckActionWorkRequest) returns (AckActionWorkResponse) {
+    option deprecated = true;
+  }
   rpc ReportActionClaimEvent(ReportActionClaimEventRequest) returns (ReportActionClaimEventResponse);
   rpc PutServicePrincipal(PutServicePrincipalRequest) returns (PutServicePrincipalResponse);
   rpc GetServicePrincipal(GetServicePrincipalRequest) returns (GetServicePrincipalResponse);

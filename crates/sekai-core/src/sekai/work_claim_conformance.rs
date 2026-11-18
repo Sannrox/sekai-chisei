@@ -6,6 +6,8 @@
 //! external effect needs none, since a reclaim cannot redeem its permit
 //! again.
 //! Source sync fails the due bucket at the limit.
+//! Every kind also survives a killed worker and plane: the claim lives only
+//! in the store, and a second worker takes it over at a higher generation.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -631,4 +633,79 @@ fn postgres_external_effect_claim_conformance() {
         WorkKind::ExternalEffect,
         &format!("pg{}", std::process::id()),
     );
+}
+
+/// A worker claims `kind` work and is killed: nothing heartbeats or writes
+/// back, and the plane that served it goes too. `open` is called once per
+/// plane process, so the claim the next plane sees is only what the store
+/// kept. A second worker takes the work over once the lease lapses, at a
+/// higher generation, and the dead worker's fence no longer writes.
+fn kill_the_worker(open: impl Fn() -> RuntimeDb, kind: WorkKind, prefix: &str) {
+    let (namespace, id, dead) = {
+        let plane = open();
+        let work = admit(&plane, kind, prefix);
+        let dead = work
+            .claim("worker-a", 1_000)
+            .expect("open work is claimable");
+        (work.namespace, work.id, dead)
+    };
+
+    let plane = open();
+    let work = Subject {
+        db: &plane,
+        kind,
+        namespace,
+        id,
+    };
+    assert!(
+        work.claim("worker-b", 1_500).is_none(),
+        "{kind}: the dead worker's claim outlives its plane"
+    );
+    let takeover = work
+        .claim("worker-b", 2_100)
+        .expect("a dead worker's lapsed claim is reclaimable");
+    assert!(
+        takeover.generation > dead.generation,
+        "{kind}: takeover raises the generation"
+    );
+    assert!(
+        !work.heartbeat(&dead, 2_200),
+        "{kind}: the dead worker cannot heartbeat back"
+    );
+    assert!(
+        work.write_back_refused_as_stale(&dead, 2_200),
+        "{kind}: the dead worker cannot write back"
+    );
+    assert!(
+        work.heartbeat(&takeover, 2_200),
+        "{kind}: the takeover holds"
+    );
+}
+
+#[test]
+fn sqlite_kill_the_worker_per_kind() {
+    let path = std::env::temp_dir().join(format!(
+        "sekai-kill-worker-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let open = || {
+        RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ))
+    };
+    for kind in WorkKind::ALL {
+        kill_the_worker(open, kind, "sqlite-kill");
+    }
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_kill_the_worker_per_kind() {
+    for kind in WorkKind::ALL {
+        kill_the_worker(postgres, kind, &format!("pgkill{}", std::process::id()));
+    }
 }
