@@ -2251,6 +2251,26 @@ async fn stalled_control_plane_rpc_is_bounded_and_opens_circuit() {
 }
 
 #[tokio::test]
+async fn only_transient_statuses_open_the_control_plane_circuit() {
+    let runtime =
+        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
+            circuit_failure_threshold: 2,
+            ..ResilienceConfig::default()
+        });
+    let client_fault =
+        tonic::Status::failed_precondition("capability_unsupported: tool use is not supported");
+    for _ in 0..5 {
+        record_control_plane_status(&runtime, &client_fault).await;
+    }
+    assert!(!runtime.control_plane_circuit.read().await.is_open());
+
+    let outage = tonic::Status::unavailable("control plane down");
+    record_control_plane_status(&runtime, &outage).await;
+    record_control_plane_status(&runtime, &outage).await;
+    assert!(runtime.control_plane_circuit.read().await.is_open());
+}
+
+#[tokio::test]
 async fn successful_key_store_lookup_resets_control_plane_failures() {
     let (target, db) = spawn_control_plane().await;
     let key = "sk-chisei-resilient-worker";
