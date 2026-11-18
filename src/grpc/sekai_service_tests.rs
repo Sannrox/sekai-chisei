@@ -12586,7 +12586,7 @@ async fn preview_records_typesafe_egress_after_admission() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid() {
+async fn preview_records_typesafe_egress_even_when_filled_preview_is_invalid() {
     let _env = TYPE_SAFE_TEST_ENV
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -12684,7 +12684,8 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
         .into_inner();
     assert_eq!(preview.outcome, "invalid");
     assert!(preview.proposed_parameters_json.is_empty());
-    assert!(
+    // The provider was called, so the egress is audited whatever the outcome.
+    assert_eq!(
         svc.db
             .runtime()
             .list_decisions(&crate::sekai::audit::DecisionFilter {
@@ -12692,7 +12693,8 @@ async fn preview_does_not_record_typesafe_egress_when_filled_preview_is_invalid(
                 ..Default::default()
             })
             .unwrap()
-            .is_empty()
+            .len(),
+        1
     );
     unsafe {
         std::env::remove_var(chisei_provider::system_one::API_KEY_ENV);
