@@ -1,12 +1,12 @@
 # ADR 0151: Chisei admits every model call
 
-- Status: accepted
+- Status: superseded by ADR 0152
 - Date: 2026-11-14
 - Owners: @Sannrox
 - Discussion: none, resolved in Issue #2279
 - Issue: #2279
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0152](0152-gateway-is-the-model-egress-layer.md)
 - Related: [ADR 0008](0008-gateway-is-a-fail-closed-translator.md)
 
 ## Context

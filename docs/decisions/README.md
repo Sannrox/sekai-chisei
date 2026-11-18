@@ -34,7 +34,7 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0004: Add selective bitemporal history to the current graph](0004-selective-bitemporal-history.md) (retired for 1.0)
 - [ADR 0005: Object-bound coordination leases](0005-object-bound-coordination-leases.md)
 - [ADR 0007: Provisional classification markings and purpose gates](0007-provisional-classification-markings.md)
-- [ADR 0008: Keep the gateway a fail-closed protocol translator](0008-gateway-is-a-fail-closed-translator.md)
+- [ADR 0008: Keep the gateway a fail-closed protocol translator](0008-gateway-is-a-fail-closed-translator.md) (superseded by ADR 0152)
 - [ADR 0009: Group expert `sekaictl` operations under `admin`](0009-sekaictl-administration-hierarchy.md)
 - [ADR 0010: Retire deprecated `sekaictl` aliases at `0.2.0`](0010-retire-sekaictl-aliases-at-0.2.0.md)
 - [ADR 0011: Separate invariant facts from configurable evaluation plans](0011-separate-invariant-facts-and-evaluation-plans.md)
@@ -176,5 +176,6 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0148: Sources are first-class; one connector runtime runs source integrations](0148-sources-and-one-connector-runtime.md)
 - [ADR 0149: One claimable work queue, with typed kinds](0149-one-claimable-work-queue.md)
 - [ADR 0150: Keep operator console sessions process-local across failover](0150-process-local-console-sessions.md)
-- [ADR 0151: Chisei admits every model call](0151-chisei-admits-every-model-call.md)
+- [ADR 0151: Chisei admits every model call](0151-chisei-admits-every-model-call.md) (superseded by ADR 0152)
+- [ADR 0152: The gateway is the model egress layer, not an entry point to Chisei](0152-gateway-is-the-model-egress-layer.md)
 <!-- adr-index:end -->

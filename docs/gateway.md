@@ -5,6 +5,11 @@ lets existing model clients use Chisei governance without
 moving their sessions, tool loops, workspace state, or approval UI into the
 control plane.
 
+Direction: [ADR 0152](decisions/0152-gateway-is-the-model-egress-layer.md)
+makes the gateway the model egress layer with its own egress policy, no calls
+into Sekai or Chisei, and no `chisei_context`. This page describes the current
+`gateway.decide/v2` path, which stays supported until it is drained.
+
 It exposes:
 
 - OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models`;

@@ -31,9 +31,10 @@ runtime.
   routing, evaluation, and approvals apply around plan and execution.
 - **Inspectable outcomes.** Decisions, normalized usage, lineage, verification,
   action outcomes, and provenance are retained under a durable operation.
-- **Compatible entry paths.** Existing OpenAI- and Anthropic-compatible
-  clients enter through the gateway; native integrations use governed gRPC.
-  Both paths run under the same control plane.
+- **One model egress.** Native integrations use governed gRPC. Existing
+  OpenAI- and Anthropic-compatible clients send model calls through the
+  gateway, which is moving to its own egress policy
+  ([ADR 0152](docs/decisions/0152-gateway-is-the-model-egress-layer.md)).
 - **Local-first authority.** The stable 3.x graph and governance state live in
   SQLite by default. PostgreSQL is a first-class community backend for the
   dual-backend inventory; remaining experimental and admin SQLite-only

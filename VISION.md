@@ -17,9 +17,11 @@ The product has two layers:
   evaluation, and learning rules
 
 Provider adapters remain internal execution machinery, not a public policy
-boundary. Existing OpenAI- and Anthropic-compatible clients enter through the
-gateway; native integrations use `PlanExecution` and `ExecutePlanStream`. Both paths
-are governed by the same control plane.
+boundary. Native integrations use `PlanExecution` and `ExecutePlanStream`.
+Every governed model call, native or from an existing OpenAI- or
+Anthropic-compatible client, leaves through the gateway, which enforces its own
+egress policy and is not an entry point into the control plane
+([ADR 0152](docs/decisions/0152-gateway-is-the-model-egress-layer.md)).
 
 ## Problem
 
@@ -103,12 +105,18 @@ contract, which continue to live in schemas and adapters.
 The decision layer makes policy choices inspectable instead of burying them in
 an agent runtime or provider adapter.
 
-### Governed Entry Paths
+### Governed Entry and Egress
 
-The gateway accepts existing OpenAI- and Anthropic-compatible clients. The
-native execution API plans and executes an operation through `PlanExecution`
-and `ExecutePlanStream`. These are two entry paths into the same control plane, not
-separate products.
+The native execution API plans and executes an operation through
+`PlanExecution` and `ExecutePlanStream`. That is the entry into the control
+plane.
+
+The gateway is the model egress layer. Existing OpenAI- and
+Anthropic-compatible clients and Chisei's native execution both send model
+calls through it. It owns its egress policy (who may reach which provider and
+model, how fast, and how much), records every call, and never calls Sekai or
+Chisei. Chisei reads its records. Unmodified clients reach governed data and
+actions through MCP, where disclosure is checked against their allowed egress.
 
 Agent runtimes and domain executors remain replaceable integrations. Bugyo and
 Tenkai provide software-delivery behavior, but repository, worktree, commit,
@@ -141,8 +149,9 @@ measurable system."
   verified outcomes rather than adopted on intuition.
 - Explainable decisions. Context, routing, access, actions, and outcomes remain
   inspectable after the fact.
-- Incremental adoption. Existing clients can use the gateway while deeper
-  integrations adopt the native execution API.
+- Incremental adoption. Existing clients send model calls through the gateway
+  and reach data through MCP while deeper integrations adopt the native
+  execution API.
 
 ## Non-Goals
 
@@ -168,7 +177,7 @@ The codebase already establishes the core direction:
   reusable surfaces) with links, datasets, virtual tables, lineage, audit,
   actions, and security controls
 - policy resolution, context enrichment, budget tracking, and model routing
-- governed native execution and a compatible HTTP gateway
+- governed native execution and a compatible HTTP egress gateway
 - evaluation, outcome, learning, and evolution primitives
 - provider adapters for OpenAI, Anthropic, Ollama-compatible, and native
   endpoints
