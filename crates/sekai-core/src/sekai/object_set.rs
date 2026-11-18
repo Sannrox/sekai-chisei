@@ -5,6 +5,10 @@
 
 use crate::domain::{self, ListFilter, PropertyFilter, is_valid_property_key};
 use crate::sekai::definition_branch::DefinitionMember;
+use crate::sekai::geospatial::{
+    GeospatialGeometry, GeospatialOperator, GeospatialQuery, evaluate_geospatial_match,
+    parse_geospatial_query,
+};
 use crate::sekai::object_security::object_query_digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +17,10 @@ use std::collections::BTreeMap;
 
 pub const CONTRACT_VERSION: &str = "sekai.object-set/v1";
 pub const CONTRACT_VERSION_V2: &str = "sekai.object-set/v2";
+/// Adds the spatial predicate (#2333) to everything v2 admits.
+pub const CONTRACT_VERSION_V3: &str = "sekai.object-set/v3";
+/// Most positions a spatial predicate's query geometry may hold.
+pub const MAX_SPATIAL_POSITIONS: usize = 1_000;
 /// `EvaluateObjectSetResponse.source` when the page came from `object_type_index*` (#2051).
 pub const EVALUATE_SOURCE_SQL_PROJECTION: &str = "sql_projection";
 /// `EvaluateObjectSetResponse.source` when the page came from the object log (#2051).
@@ -101,6 +109,20 @@ impl ObjectSetCostLimit {
     }
 }
 
+/// One spatial condition on a geospatial property of the set's kind
+/// (`sekai.object-set/v3`). It matches like a `sekai.geospatial-query/v1`
+/// with the same operator, geometry and distance.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectSetSpatialPredicate {
+    pub property: String,
+    /// `distance`, `contains`, or `intersects`.
+    pub operator: String,
+    /// A `sekai.geospatial-value/v1` document.
+    pub geometry_json: String,
+    /// Positive for `distance`, zero for the other operators.
+    pub max_distance_m: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectSetAggregateRow {
     pub group_key: String,
@@ -122,6 +144,8 @@ pub struct ObjectSetDescriptor {
     pub hops: Vec<ObjectSetTraversal>,
     pub aggregation: Option<ObjectSetAggregation>,
     pub cost_limit: ObjectSetCostLimit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spatial: Option<ObjectSetSpatialPredicate>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +154,21 @@ pub struct BoundObjectSet {
     pub filter: ListFilter,
     pub query_digest: String,
     pub member_kind: String,
+    /// The parsed spatial predicate, matched after authorization.
+    pub spatial: Option<GeospatialQuery>,
+}
+
+impl BoundObjectSet {
+    /// Whether `object` passes the spatial predicate. True without one; an
+    /// absent or unparsable property never matches.
+    pub fn spatial_matches(&self, object: &domain::Object) -> bool {
+        self.spatial.as_ref().is_none_or(|query| {
+            object
+                .properties
+                .get(&query.property)
+                .is_some_and(|stored| evaluate_geospatial_match(stored, query))
+        })
+    }
 }
 
 /// One object identity at the content version a query read.
@@ -249,7 +288,8 @@ impl ObjectSetDescriptor {
         published_digest: &str,
         members: &[DefinitionMember],
     ) -> Result<BoundObjectSet, ObjectSetError> {
-        let v2 = self.contract_version == CONTRACT_VERSION_V2;
+        let v3 = self.contract_version == CONTRACT_VERSION_V3;
+        let v2 = v3 || self.contract_version == CONTRACT_VERSION_V2;
         if self.contract_version != CONTRACT_VERSION && !v2 {
             return Err(ObjectSetError::Unsupported(
                 "unsupported object-set contract version",
@@ -264,6 +304,11 @@ impl ObjectSetDescriptor {
         {
             return Err(ObjectSetError::Unsupported(
                 "object-set aggregation and extra hops require sekai.object-set/v2",
+            ));
+        }
+        if !v3 && self.spatial.is_some() {
+            return Err(ObjectSetError::InvalidArgument(
+                "object-set spatial predicate requires sekai.object-set/v3".into(),
             ));
         }
         if self.namespace.trim().is_empty() {
@@ -322,6 +367,17 @@ impl ObjectSetDescriptor {
         if let Some(aggregation) = &self.aggregation {
             prepare_aggregation(aggregation)?;
         }
+        let spatial = match &self.spatial {
+            // Traversal and aggregation engines do not evaluate the
+            // predicate, so the combination fails closed.
+            Some(_) if !hops.is_empty() || self.aggregation.is_some() => {
+                return Err(ObjectSetError::Unsupported(
+                    "object-set spatial predicate does not combine with traversal or aggregation",
+                ));
+            }
+            Some(predicate) => Some(prepare_spatial(&self, object_type, predicate)?),
+            None => None,
+        };
         let member_kind = near;
         let filter = ListFilter {
             kind: Some(self.kind.clone()),
@@ -344,8 +400,52 @@ impl ObjectSetDescriptor {
             filter,
             query_digest,
             member_kind,
+            spatial,
         })
     }
+}
+
+fn prepare_spatial(
+    descriptor: &ObjectSetDescriptor,
+    object_type: &DefinitionMember,
+    predicate: &ObjectSetSpatialPredicate,
+) -> Result<GeospatialQuery, ObjectSetError> {
+    let invalid = |message: String| {
+        ObjectSetError::InvalidArgument(format!("object-set spatial predicate: {message}"))
+    };
+    if !is_valid_property_key(&predicate.property)
+        || declared_property_type(object_type, &predicate.property).is_none()
+    {
+        return Err(invalid("unknown property".into()));
+    }
+    let max_distance_m = (predicate.max_distance_m != 0.0).then_some(predicate.max_distance_m);
+    let query = parse_geospatial_query(
+        &descriptor.namespace,
+        Some(&descriptor.kind),
+        &predicate.property,
+        predicate.operator.trim(),
+        &predicate.geometry_json,
+        max_distance_m,
+        0,
+        0,
+    )
+    .map_err(invalid)?;
+    if query.operator == GeospatialOperator::Point {
+        return Err(invalid(
+            "operator must be distance, contains or intersects".into(),
+        ));
+    }
+    let positions = match &query.geometry.geometry {
+        GeospatialGeometry::Line(path) => path.len(),
+        GeospatialGeometry::Polygon(ring) => ring.len(),
+        _ => 1,
+    };
+    if positions > MAX_SPATIAL_POSITIONS {
+        return Err(invalid(format!(
+            "geometry exceeds {MAX_SPATIAL_POSITIONS} positions"
+        )));
+    }
+    Ok(query)
 }
 
 pub fn descriptor_query_digest(
@@ -367,6 +467,15 @@ pub fn descriptor_query_digest(
         hasher.update(aggregation.function.as_bytes());
         hasher.update(aggregation.property.as_bytes());
         hasher.update(aggregation.group_by.as_bytes());
+    }
+    // Hashed only when present, so v1 and v2 digests (and the cursors that
+    // carry them) are unchanged.
+    if let Some(spatial) = &descriptor.spatial {
+        hasher.update(b"spatial");
+        hasher.update(
+            serde_json::to_vec(spatial)
+                .map_err(|error| ObjectSetError::InvalidArgument(error.to_string()))?,
+        );
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -703,7 +812,7 @@ mod tests {
         let members = [
             member_input(
                 "Customer",
-                r#"{"name":"Customer","properties":{"region":{"type":"string"},"tier":{"type":"integer"}}}"#,
+                r#"{"name":"Customer","properties":{"region":{"type":"string"},"tier":{"type":"integer"},"site":{"type":"string"}}}"#,
             ),
             member_input(
                 "Order",
@@ -815,6 +924,7 @@ mod tests {
             hops: Vec::new(),
             aggregation: None,
             cost_limit: ObjectSetCostLimit::default(),
+            spatial: None,
         }
     }
 
@@ -882,6 +992,7 @@ mod tests {
             hops: Vec::new(),
             aggregation: None,
             cost_limit: ObjectSetCostLimit::default(),
+            spatial: None,
         };
         let bound = descriptor
             .prepare(&revision.revision_digest, std::slice::from_ref(&member))
@@ -961,5 +1072,142 @@ mod tests {
         assert!(denied.members.is_empty());
         assert!(denied.object_versions.is_empty());
         assert!(replay_object_set_query(&denied).unwrap().is_empty());
+    }
+
+    const SQUARE: &str = r#"{"type":"sekai.geospatial-value/v1","kind":"polygon","crs":"EPSG:4326","coordinates":[[13.0,52.0],[14.0,52.0],[14.0,53.0],[13.0,53.0],[13.0,52.0]]}"#;
+
+    fn geo_point(lon: f64, lat: f64) -> String {
+        format!(
+            r#"{{"type":"sekai.geospatial-value/v1","kind":"point","crs":"EPSG:4326","coordinates":[{lon},{lat}]}}"#
+        )
+    }
+
+    fn spatial_set(
+        digest: &str,
+        operator: &str,
+        geometry_json: &str,
+        distance: f64,
+    ) -> ObjectSetDescriptor {
+        ObjectSetDescriptor {
+            contract_version: CONTRACT_VERSION_V3.into(),
+            property_filters: Vec::new(),
+            order_by: String::new(),
+            traversal: None,
+            spatial: Some(ObjectSetSpatialPredicate {
+                property: "site".into(),
+                operator: operator.into(),
+                geometry_json: geometry_json.into(),
+                max_distance_m: distance,
+            }),
+            ..descriptor(digest)
+        }
+    }
+
+    fn customer_at(site: &str) -> domain::Object {
+        domain::Object {
+            id: "c1".into(),
+            kind: "Customer".into(),
+            name: "North".into(),
+            namespace: "sales".into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([("site".into(), site.into())]),
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    fn spatial_predicate_matches_distance_contains_and_intersects() {
+        let (digest, members) = catalog();
+        let berlin = geo_point(13.405, 52.52);
+        let near = spatial_set(&digest, "distance", &geo_point(13.41, 52.52), 1_000.0)
+            .prepare(&digest, &members)
+            .unwrap();
+        assert!(near.spatial_matches(&customer_at(&berlin)));
+        assert!(!near.spatial_matches(&customer_at(&geo_point(11.58, 48.14))));
+        let contains = spatial_set(&digest, "contains", SQUARE, 0.0)
+            .prepare(&digest, &members)
+            .unwrap();
+        assert!(contains.spatial_matches(&customer_at(SQUARE)));
+        assert!(!contains.spatial_matches(&customer_at(&berlin)));
+        let intersects = spatial_set(&digest, "intersects", SQUARE, 0.0)
+            .prepare(&digest, &members)
+            .unwrap();
+        assert!(intersects.spatial_matches(&customer_at(&berlin)));
+        assert!(!intersects.spatial_matches(&customer_at(&geo_point(11.58, 48.14))));
+        assert!(!intersects.spatial_matches(&customer_at("not geometry")));
+    }
+
+    #[test]
+    fn spatial_predicate_is_v3_only_and_rejects_invalid_geometry() {
+        let (digest, members) = catalog();
+        let mut v2 = spatial_set(&digest, "contains", SQUARE, 0.0);
+        v2.contract_version = CONTRACT_VERSION_V2.into();
+        assert!(matches!(
+            v2.prepare(&digest, &members),
+            Err(ObjectSetError::InvalidArgument(message)) if message.contains("v3")
+        ));
+        let open_ring = SQUARE.replace(",[13.0,52.0]]}", "]}");
+        for invalid in [
+            spatial_set(&digest, "contains", &open_ring, 0.0),
+            spatial_set(&digest, "distance", SQUARE, 1_000.0),
+            spatial_set(&digest, "distance", &geo_point(13.0, 52.0), 0.0),
+            spatial_set(&digest, "point", &geo_point(13.0, 52.0), 0.0),
+            ObjectSetDescriptor {
+                spatial: Some(ObjectSetSpatialPredicate {
+                    property: "undeclared".into(),
+                    ..spatial_set(&digest, "contains", SQUARE, 0.0)
+                        .spatial
+                        .unwrap()
+                }),
+                ..spatial_set(&digest, "contains", SQUARE, 0.0)
+            },
+        ] {
+            assert!(matches!(
+                invalid.prepare(&digest, &members),
+                Err(ObjectSetError::InvalidArgument(_))
+            ));
+        }
+        let ring = (0..=MAX_SPATIAL_POSITIONS)
+            .map(|step| {
+                let angle = step as f64 / MAX_SPATIAL_POSITIONS as f64 * std::f64::consts::TAU;
+                format!("[{},{}]", 13.0 + angle.cos(), 52.0 + angle.sin())
+            })
+            .chain(std::iter::once("[14,52]".to_string()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let huge = format!(
+            r#"{{"type":"sekai.geospatial-value/v1","kind":"polygon","crs":"EPSG:4326","coordinates":[{ring}]}}"#
+        );
+        assert!(matches!(
+            spatial_set(&digest, "contains", &huge, 0.0).prepare(&digest, &members),
+            Err(ObjectSetError::InvalidArgument(message)) if message.contains("positions")
+        ));
+        let mut traversed = spatial_set(&digest, "contains", SQUARE, 0.0);
+        traversed.traversal = descriptor(&digest).traversal;
+        assert!(matches!(
+            traversed.prepare(&digest, &members),
+            Err(ObjectSetError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn spatial_geometry_is_part_of_the_query_digest() {
+        let (digest, members) = catalog();
+        let plain = ObjectSetDescriptor {
+            spatial: None,
+            ..spatial_set(&digest, "contains", SQUARE, 0.0)
+        };
+        let digests = [
+            plain,
+            spatial_set(&digest, "contains", SQUARE, 0.0),
+            spatial_set(&digest, "intersects", SQUARE, 0.0),
+            spatial_set(&digest, "distance", &geo_point(13.0, 52.0), 1_000.0),
+            spatial_set(&digest, "distance", &geo_point(13.0, 52.5), 1_000.0),
+            spatial_set(&digest, "distance", &geo_point(13.0, 52.5), 2_000.0),
+        ]
+        .map(|set| set.prepare(&digest, &members).unwrap().query_digest);
+        let unique = digests.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), digests.len());
     }
 }

@@ -134,8 +134,8 @@ lives in the separate [research index](research/README.md).
 - [Ontology health](ontology-health.md): a 0-100 score per namespace from
   freshness, checks, contracts, lint and grants.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
-  `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
-  hops/aggregates, evaluated through authorized list and traverse.
+  `sekai.object-set/v1` one-hop descriptors, `sekai.object-set/v2`
+  hops/aggregates, and `sekai.object-set/v3` spatial predicates, evaluated through authorized list and traverse.
 - [Permission-aware search](search.md) — stable `Search` and
   `GetSearchIndexStatus` over objects and dataset metadata under the live read
   policy.

@@ -135,8 +135,8 @@ If you want to deploy or operate the control plane:
   diff, migration plan, backfill, and consumer impact in one read-only
   bundle.
 - [Revision-bound ObjectSet evaluation](object-set.md) — typed
-  `sekai.object-set/v1` one-hop descriptors and `sekai.object-set/v2`
-  hops/aggregates, evaluated through authorized list and traverse. A page
+  `sekai.object-set/v1` one-hop descriptors, `sekai.object-set/v2`
+  hops/aggregates, and `sekai.object-set/v3` spatial predicates, evaluated through authorized list and traverse. A page
   is not authority.
 - [Embedding index](embedding-index.md) — stored specs embedded through a
   hosted catalog route on a schedule, with governance tags on every vector.

@@ -548,6 +548,17 @@ message ObjectSetDescriptor {
   repeated ObjectSetTraversal hops = 10;
   ObjectSetAggregation aggregation = 11;
   ObjectSetCostLimit cost_limit = 12;
+  // sekai.object-set/v3 only (#2333). Unset matches every row.
+  ObjectSetSpatialPredicate spatial = 13;
+}
+// One spatial condition on a declared property holding a
+// sekai.geospatial-value/v1. operator is distance, contains or intersects;
+// max_distance_m is positive for distance and zero otherwise.
+message ObjectSetSpatialPredicate {
+  string property = 1;
+  string operator = 2;
+  string geometry_json = 3;
+  double max_distance_m = 4;
 }
 message EvaluateObjectSetRequest {
   ObjectSetDescriptor descriptor = 1;

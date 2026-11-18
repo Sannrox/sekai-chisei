@@ -18,6 +18,22 @@ and cost limits (`max_rows_scanned`, `max_depth`, `max_time_ms`). Hop-projection
 is the shipping default. See [object-type-index.md](object-type-index.md) for
 engine selection, reindex, and aggregation.
 
+`sekai.object-set/v3` adds one optional spatial predicate to everything v2
+admits: `property`, `operator` (`distance`, `contains`, or `intersects`),
+`geometry_json` (a `sekai.geospatial-value/v1`), and `max_distance_m` for
+`distance`. It matches like the [geospatial query](geospatial-queries.md)
+with the same operator. The property must be declared on the kind and passes
+the same property query and grant checks as a property filter, so an
+ungranted property is refused before any row is matched. Rows are matched
+after read authorization; denied rows are never matched or counted. The query
+geometry holds at most 1,000 positions, and the predicate is part of the
+query digest, the page cursor, and the query receipt. Matching runs in
+process over visible rows, so each visible row scanned counts against
+`max_rows_scanned` (default 10,000) and `max_time_ms`. v1 and v2 reject a
+predicate with invalid argument. Traversal and aggregation do not evaluate
+it, so combining them with a predicate fails closed, and object-set export
+and object-set inputs refuse it.
+
 ## Evaluate-once
 
 The server keeps no ObjectSet. Each `EvaluateObjectSet` call resolves

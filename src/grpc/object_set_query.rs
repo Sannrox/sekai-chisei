@@ -154,23 +154,42 @@ impl SekaiServiceImpl {
                 return Err(Status::failed_precondition("object type index is stale"));
             }
         }
-        let (near, total) = list_objects_with_marking(
-            self.db.runtime(),
-            &filter,
-            &principals,
-            &policy_context,
-            purpose.as_ref(),
-            tenant_context.as_ref(),
-            |objects, principals, tenant_context| {
-                self.resolve_computed_for_responses_with_policy(
-                    objects,
-                    principals,
-                    Some(&policy_context),
-                    tenant_context,
-                    purpose.as_ref(),
-                )
-            },
-        )?;
+        let (near, total) = if bound.spatial.is_some() {
+            spatial_list_page(
+                self.db.runtime(),
+                &bound,
+                filter.offset,
+                &policy_context,
+                &authority,
+                |objects, principals, tenant_context| {
+                    self.resolve_computed_for_responses_with_policy(
+                        objects,
+                        principals,
+                        Some(&policy_context),
+                        tenant_context,
+                        purpose.as_ref(),
+                    )
+                },
+            )?
+        } else {
+            list_objects_with_marking(
+                self.db.runtime(),
+                &filter,
+                &principals,
+                &policy_context,
+                purpose.as_ref(),
+                tenant_context.as_ref(),
+                |objects, principals, tenant_context| {
+                    self.resolve_computed_for_responses_with_policy(
+                        objects,
+                        principals,
+                        Some(&policy_context),
+                        tenant_context,
+                        purpose.as_ref(),
+                    )
+                },
+            )?
+        };
         let returned = near.len() as i32;
         let members = if bound.descriptor.traversal.is_some() {
             collect_one_hop_members(
@@ -508,6 +527,9 @@ impl SekaiServiceImpl {
             if let Some(order_property) = queried_order_property(&bound.filter.order_by) {
                 queried_properties.push(order_property);
             }
+            if let Some(spatial) = &bound.spatial {
+                queried_properties.push(spatial.property.clone());
+            }
             if let Some(aggregation) = &bound.descriptor.aggregation
                 && !aggregation.group_by.is_empty()
             {
@@ -619,6 +641,7 @@ impl SekaiServiceImpl {
             for member in members {
                 if let Some(object) =
                     self.authorized_index_object(&member, authority, status.indexed_at_ms)?
+                    && bound.spatial_matches(&object)
                 {
                     if total >= offset.max(0) && objects.len() < page_limit as usize {
                         objects.push(object);
@@ -1509,7 +1532,65 @@ fn parse_object_set_descriptor(
                 max_time_ms: limit.max_time_ms,
             })
             .unwrap_or_default(),
+        spatial: descriptor.spatial.map(|spatial| {
+            crate::sekai::object_set::ObjectSetSpatialPredicate {
+                property: spatial.property,
+                operator: spatial.operator,
+                geometry_json: spatial.geometry_json,
+                max_distance_m: spatial.max_distance_m,
+            }
+        }),
     })
+}
+
+/// One page of a spatially filtered list. The predicate cannot run in SQL,
+/// so this walks every visible row (read checks first, so denied rows are
+/// never matched or counted), charges the cost meter per visible row, and
+/// pages the matches. Returns the page and the matching total.
+fn spatial_list_page<F>(
+    db: &RuntimeDb,
+    bound: &BoundObjectSet,
+    offset: i32,
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    authority: &ObjectSetAuthority<'_>,
+    resolve: F,
+) -> Result<(Vec<domain::Object>, i32), Status>
+where
+    F: FnOnce(
+        Vec<domain::Object>,
+        &[String],
+        Option<&RequestEnterpriseContext>,
+    ) -> Result<Vec<domain::Object>, Status>,
+{
+    let mut meter = crate::sekai::object_set::CostMeter::new(bound.descriptor.cost_limit.clone());
+    let skip = offset.max(0) as usize;
+    let page_limit = bound.filter.limit.clamp(1, domain::MAX_LIST_LIMIT) as usize;
+    let mut matched = 0usize;
+    let mut page = Vec::new();
+    for_each_visible_object(
+        db,
+        &bound.filter,
+        authority.principals,
+        policy_context,
+        authority.purpose,
+        authority.tenant_context,
+        &mut |object| {
+            meter.charge(1).map_err(map_object_set_error)?;
+            if bound.spatial_matches(&object) {
+                if matched >= skip && page.len() < page_limit {
+                    page.push(object);
+                }
+                matched = matched.saturating_add(1);
+            }
+            Ok(true)
+        },
+        &mut || true,
+    )?;
+    let total = i32::try_from(matched).unwrap_or(i32::MAX);
+    Ok((
+        resolve(page, authority.principals, authority.tenant_context)?,
+        total,
+    ))
 }
 
 fn collect_one_hop_members(
@@ -1662,6 +1743,13 @@ impl SekaiServiceImpl {
             .map_err(Status::invalid_argument)?;
         let bound =
             self.authorize_object_set_read(&principals, tenant_context.as_ref(), inner.descriptor)?;
+        // The export scan does not evaluate the predicate; refuse rather
+        // than export rows it would have excluded.
+        if bound.spatial.is_some() {
+            return Err(Status::invalid_argument(
+                "object-set export does not support a spatial predicate",
+            ));
+        }
         let namespace = bound.descriptor.namespace.clone();
         // Fail closed: reading a set never entitles taking it out.
         let granted_via = export_grantee(
@@ -1837,6 +1925,9 @@ fn object_matches_bound_filters(object: &domain::Object, bound: &BoundObjectSet)
             .as_ref()
             .is_some_and(|namespace| object.namespace != *namespace)
     {
+        return false;
+    }
+    if !bound.spatial_matches(object) {
         return false;
     }
     bound.filter.property_filters.iter().all(|filter| {
@@ -2155,6 +2246,7 @@ mod tests {
 
     fn descriptor(digest: &str, limit: i32) -> ObjectSetDescriptor {
         ObjectSetDescriptor {
+            spatial: None,
             contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
             namespace: "sales".into(),
             kind: "Customer".into(),
@@ -2184,6 +2276,214 @@ mod tests {
             aggregation: None,
             cost_limit: None,
         }
+    }
+
+    const GEO_SQUARE: &str = r#"{"type":"sekai.geospatial-value/v1","kind":"polygon","crs":"EPSG:4326","coordinates":[[13.0,52.0],[14.0,52.0],[14.0,53.0],[13.0,53.0],[13.0,52.0]]}"#;
+
+    fn geo_point(lon: f64, lat: f64) -> String {
+        format!(
+            r#"{{"type":"sekai.geospatial-value/v1","kind":"point","crs":"EPSG:4326","coordinates":[{lon},{lat}]}}"#
+        )
+    }
+
+    /// A `sites` namespace whose Site kind declares `region` and `location`,
+    /// with two sites in Berlin, one in Munich and one without a location.
+    fn seed_sites(svc: &SekaiServiceImpl) -> String {
+        let members = vec![member(
+            "sites",
+            "object_type",
+            "Site",
+            r#"{"name":"Site","properties":{"region":{"type":"string"},"location":{"type":"string"}}}"#,
+        )];
+        let revision = prepare_revision(
+            "sites",
+            "",
+            members.iter().map(|item| DefinitionRevisionMember {
+                member_kind: item.member_kind.clone(),
+                member_id: item.member_id.clone(),
+                member_digest: item.member_digest.clone(),
+            }),
+            true,
+            "root",
+            1,
+        )
+        .unwrap();
+        svc.db
+            .runtime()
+            .seed_published_definition_revision(&revision, &members)
+            .unwrap();
+        for (id, location, created) in [
+            ("s-mitte", Some(geo_point(13.405, 52.52)), 10),
+            ("s-kreuzberg", Some(geo_point(13.41, 52.50)), 11),
+            ("s-munich", Some(geo_point(11.58, 48.14)), 12),
+            ("s-nowhere", None, 13),
+        ] {
+            let mut site = object(id, "Site", id, &[("region", "de")], created);
+            site.namespace = "sites".into();
+            site.external_id = format!("sites:{id}");
+            if let Some(location) = location {
+                site.properties.insert("location".into(), location);
+            }
+            svc.db.runtime().create_object(&site).unwrap();
+        }
+        revision.revision_digest
+    }
+
+    fn spatial_sites(
+        digest: &str,
+        operator: &str,
+        geometry_json: &str,
+        max_distance_m: f64,
+    ) -> ObjectSetDescriptor {
+        ObjectSetDescriptor {
+            contract_version: crate::sekai::object_set::CONTRACT_VERSION_V3.into(),
+            namespace: "sites".into(),
+            kind: "Site".into(),
+            definition_digest: digest.into(),
+            spatial: Some(ObjectSetSpatialPredicate {
+                property: "location".into(),
+                operator: operator.into(),
+                geometry_json: geometry_json.into(),
+                max_distance_m,
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn evaluate_sites(
+        svc: &SekaiServiceImpl,
+        descriptor: ObjectSetDescriptor,
+        page_token: String,
+    ) -> Result<EvaluateObjectSetResponse, Status> {
+        svc.evaluate_object_set(with_named_principal(
+            EvaluateObjectSetRequest {
+                descriptor: Some(descriptor),
+                page_token,
+                required_freshness_ms: 0,
+            },
+            "alice",
+        ))
+        .await
+        .map(Response::into_inner)
+    }
+
+    fn member_ids(response: &EvaluateObjectSetResponse) -> Vec<&str> {
+        response
+            .members
+            .iter()
+            .map(|member| member.id.as_str())
+            .collect()
+    }
+
+    /// #2333: the spatial predicate filters, counts and pages only matching
+    /// visible rows, and the property grant is checked before any match.
+    #[tokio::test]
+    async fn evaluate_object_set_spatial_predicate_matches_after_authorization() {
+        let svc = service();
+        grant_namespace(&svc, "sites", "alice");
+        let digest = seed_sites(&svc);
+
+        let mut near = spatial_sites(&digest, "distance", &geo_point(13.405, 52.52), 5_000.0);
+        near.limit = 1;
+        let first = evaluate_sites(&svc, near.clone(), String::new())
+            .await
+            .unwrap();
+        assert_eq!(first.total, 2);
+        assert_eq!(member_ids(&first), ["s-kreuzberg"]);
+        let second = evaluate_sites(&svc, near, first.next_page_token)
+            .await
+            .unwrap();
+        assert_eq!(member_ids(&second), ["s-mitte"]);
+        assert!(second.next_page_token.is_empty());
+
+        let contains = evaluate_sites(
+            &svc,
+            spatial_sites(&digest, "contains", GEO_SQUARE, 0.0),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(contains.total, 0);
+        let intersects = evaluate_sites(
+            &svc,
+            spatial_sites(&digest, "intersects", GEO_SQUARE, 0.0),
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(member_ids(&intersects), ["s-kreuzberg", "s-mitte"]);
+
+        let mut v2 = spatial_sites(&digest, "intersects", GEO_SQUARE, 0.0);
+        v2.contract_version = crate::sekai::object_set::CONTRACT_VERSION_V2.into();
+        let invalid_ring = GEO_SQUARE.replace(",[13.0,52.0]]}", "]}");
+        for rejected in [v2, spatial_sites(&digest, "intersects", &invalid_ring, 0.0)] {
+            let error = evaluate_sites(&svc, rejected, String::new())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+
+        // Only `region` is granted, so a predicate on `location` is refused
+        // before any row is matched.
+        // Activation needs one revision per instantiated kind, including the
+        // namespace's governance kinds; those allow everything.
+        let kinds = svc
+            .db
+            .runtime()
+            .list_objects(&domain::ListFilter {
+                namespace: Some("sites".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|object| object.kind)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut activation = BTreeMap::new();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let policy = crate::sekai::object_security::ObjectSecurityPolicy {
+                contract_version: crate::sekai::object_security::OBJECT_SECURITY_POLICY_VERSION
+                    .into(),
+                namespace: "sites".into(),
+                kind: kind.clone(),
+                rules: vec![crate::sekai::object_security::ObjectSecurityRule {
+                    operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
+                    predicates: vec![
+                        crate::sekai::object_security::ObjectSecurityPredicate::AllowAll,
+                    ],
+                }],
+                property_grants: (kind == "Site").then(|| {
+                    vec![crate::sekai::object_security::PropertyGrant {
+                        property: "region".into(),
+                        access: crate::sekai::object_security::PropertyGrantAccess::Read,
+                    }]
+                }),
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = svc
+                .db
+                .runtime()
+                .put_object_security_policy(
+                    &policy,
+                    "root",
+                    &format!("put-{kind}"),
+                    1 + index as i64,
+                )
+                .unwrap();
+            activation.insert(kind, revision.revision_digest);
+        }
+        svc.db
+            .runtime()
+            .activate_object_security_policies("sites", &activation, "root", "activate-sites", 40)
+            .unwrap();
+        let denied = evaluate_sites(
+            &svc,
+            spatial_sites(&digest, "intersects", GEO_SQUARE, 0.0),
+            String::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
