@@ -50,6 +50,13 @@ const FULL_SCAN_SQL: &[&str] = &[
     "min",
     "max",
     "total",
+    "limit",
+    "offset",
+    "group_concat",
+    "string_agg",
+    "array_agg",
+    "json_group_array",
+    "json_group_object",
 ];
 
 /// Compile `filter` / `project` steps to a single SELECT over `alias`.
@@ -124,11 +131,14 @@ pub fn validate_analytical_sql(sql: &str) -> Result<(), TransformError> {
 }
 
 /// True when the SQL is a row-local filter/project and can reuse the
-/// projection watermark. Joins and aggregates need a full recompute.
+/// projection watermark. Joins, aggregates, LIMIT/OFFSET and subqueries need
+/// a full recompute; any `select` after the first token fails closed.
 pub fn sql_is_row_local(sql: &str) -> bool {
-    tokenize_sql(sql)
+    let tokens = tokenize_sql(sql);
+    tokens
         .iter()
         .all(|token| !FULL_SCAN_SQL.contains(&token.as_str()))
+        && !tokens.iter().skip(1).any(|token| token == "select")
 }
 
 pub fn host_limit(requested: u64, max: u64) -> u64 {
@@ -273,4 +283,28 @@ fn tokenize_sql(sql: &str) -> Vec<String> {
     }
     push_sql_token(&mut current, &mut tokens);
     tokens
+}
+
+#[cfg(test)]
+mod row_local_tests {
+    use super::sql_is_row_local;
+
+    #[test]
+    fn limits_subqueries_and_string_aggregates_are_not_row_local() {
+        for sql in [
+            "SELECT * FROM input LIMIT 10",
+            "SELECT * FROM input LIMIT 10 OFFSET 5",
+            "SELECT * FROM input WHERE id IN (SELECT id FROM input WHERE keep = 'yes')",
+            "SELECT group_concat(name) FROM input",
+            "SELECT json_group_array(name) FROM input",
+            "SELECT json_group_object(id, name) FROM input",
+        ] {
+            assert!(!sql_is_row_local(sql), "{sql}");
+        }
+        assert!(sql_is_row_local("SELECT * FROM input WHERE keep = 'yes'"));
+        assert!(sql_is_row_local("SELECT id, name FROM input"));
+        assert!(sql_is_row_local(
+            "SELECT * FROM input WHERE note = 'select limit'"
+        ));
+    }
 }
