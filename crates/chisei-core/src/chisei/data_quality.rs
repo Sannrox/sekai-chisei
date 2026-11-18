@@ -160,19 +160,12 @@ pub fn publish_rule(
     if let Some(existing) = db.get_data_quality_rule(&request.namespace, &request.rule_id)?
         && existing.rule_digest == rule.rule_digest
     {
+        // Repairs an audit write that failed after the rule was stored.
+        audit_rule_publish(db, &existing)?;
         return Ok(existing);
     }
     db.put_data_quality_rule(&rule)?;
-    audit(
-        db,
-        actor,
-        "data_quality.rule_publish",
-        "published",
-        &rule.namespace,
-        &rule.rule_id,
-        &rule.rule_digest,
-        now_ms,
-    )?;
+    audit_rule_publish(db, &rule)?;
     Ok(rule)
 }
 
@@ -242,6 +235,8 @@ pub fn evaluate_rule(
         if started.status == STATUS_FAIL {
             emit_quality_violation(facts, &started, now_ms)?;
         }
+        // Repairs an audit write that failed after the result closed.
+        audit(db, "data_quality.result_evaluate", &started)?;
         return Ok(started);
     }
     finish_evaluation(db, facts, actor, &started.result_id, now_ms)
@@ -261,21 +256,16 @@ pub fn cancel_evaluation(
     if is_closed(&record.status) {
         return Err("closed data quality receipt is immutable".into());
     }
-    record.status = STATUS_CANCELLED.into();
-    record.evaluated_by = actor.into();
-    record.evaluated_at_ms = now_ms;
-    record.evidence_receipt_digest = receipt_digest(&record)?;
-    db.put_data_quality_result(&record)?;
-    audit(
-        db,
-        actor,
-        "data_quality.result_cancel",
-        STATUS_CANCELLED,
-        &record.namespace,
-        &record.rule_id,
-        &record.result_id,
-        now_ms,
-    )?;
+    // A repeated cancel returns the cancelled receipt and only repairs its
+    // audit, so a cancel whose audit write failed can be retried.
+    if record.status != STATUS_CANCELLED {
+        record.status = STATUS_CANCELLED.into();
+        record.evaluated_by = actor.into();
+        record.evaluated_at_ms = now_ms;
+        record.evidence_receipt_digest = receipt_digest(&record)?;
+        db.put_data_quality_result(&record)?;
+    }
+    audit(db, "data_quality.result_cancel", &record)?;
     Ok(record)
 }
 
@@ -365,16 +355,7 @@ fn finish_evaluation(
     // retries emit on an already-closed FAIL; insert is idempotent.
     db.put_data_quality_result(&record)?;
     emit_quality_violation(facts, &record, now_ms)?;
-    audit(
-        db,
-        actor,
-        "data_quality.result_evaluate",
-        &record.status,
-        &record.namespace,
-        &record.rule_id,
-        &record.result_id,
-        now_ms,
-    )?;
+    audit(db, "data_quality.result_evaluate", &record)?;
     Ok(record)
 }
 
@@ -644,40 +625,90 @@ fn required(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn audit(
-    db: &ChiseiStore,
-    actor: &str,
-    action: &str,
-    outcome: &str,
-    namespace: &str,
-    rule_id: &str,
-    target_id: &str,
-    now_ms: i64,
-) -> Result<(), String> {
-    db.record_decision(&Decision {
-        id: format!("{action}:{target_id}:{now_ms}"),
-        timestamp: now_ms,
-        actor: actor.into(),
-        action: action.into(),
-        reason: format!("recorded {RESULT_CONTRACT} {outcome}"),
+/// Audit one state of a result receipt. Every field comes from the stored
+/// receipt and the id is keyed by its receipt digest, so a retry after a
+/// failed audit write records the same decision once and a replay of an
+/// already audited receipt adds nothing.
+fn audit(db: &ChiseiStore, action: &str, record: &DataQualityResult) -> Result<(), String> {
+    record_audit(
+        db,
+        format!(
+            "{action}:{}:{}",
+            record.result_id, record.evidence_receipt_digest
+        ),
+        AuditFacts {
+            action,
+            outcome: &record.status,
+            actor: &record.evaluated_by,
+            at_ms: record.evaluated_at_ms,
+            namespace: &record.namespace,
+            rule_id: &record.rule_id,
+            target_id: &record.result_id,
+        },
+    )
+}
+
+/// Audit one publication of a rule, idempotently per publication: the id
+/// carries the digest and the publication time, so restoring an earlier
+/// version later is a new decision rather than a conflict with the first.
+fn audit_rule_publish(db: &ChiseiStore, rule: &DataQualityRule) -> Result<(), String> {
+    let action = "data_quality.rule_publish";
+    record_audit(
+        db,
+        format!(
+            "{action}:{}:{}:{}",
+            rule.namespace, rule.rule_digest, rule.published_at_ms
+        ),
+        AuditFacts {
+            action,
+            outcome: "published",
+            actor: &rule.published_by,
+            at_ms: rule.published_at_ms,
+            namespace: &rule.namespace,
+            rule_id: &rule.rule_id,
+            target_id: &rule.rule_digest,
+        },
+    )
+}
+
+struct AuditFacts<'a> {
+    action: &'a str,
+    outcome: &'a str,
+    actor: &'a str,
+    at_ms: i64,
+    namespace: &'a str,
+    rule_id: &'a str,
+    target_id: &'a str,
+}
+
+fn record_audit(db: &ChiseiStore, id: String, facts: AuditFacts<'_>) -> Result<(), String> {
+    db.record_decisions_idempotently(&[Decision {
+        id,
+        timestamp: facts.at_ms,
+        actor: facts.actor.into(),
+        action: facts.action.into(),
+        reason: format!("recorded {RESULT_CONTRACT} {}", facts.outcome),
         evidence: HashMap::from([
             ("contract_version".into(), RESULT_CONTRACT.into()),
-            ("namespace".into(), namespace.into()),
-            ("rule_id".into(), rule_id.into()),
+            ("namespace".into(), facts.namespace.into()),
+            ("rule_id".into(), facts.rule_id.into()),
             ("write_authority".into(), "false".into()),
             ("permit_authority".into(), "false".into()),
         ]),
-        target_id: target_id.into(),
-        outcome: outcome.into(),
-    })
+        target_id: facts.target_id.into(),
+        outcome: facts.outcome.into(),
+    }])
 }
+
+#[cfg(test)]
+#[path = "data_quality_tests.rs"]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         sekai_core::db::store::SekaiStore,
         ChiseiStore,
         crate::chisei::sekai_facts::SekaiFacts,
@@ -780,7 +811,11 @@ mod tests {
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
     }
 
-    fn put_dataset(sekai: &sekai_core::db::store::SekaiStore, rows: &str, extra: &[(&str, &str)]) {
+    pub(super) fn put_dataset(
+        sekai: &sekai_core::db::store::SekaiStore,
+        rows: &str,
+        extra: &[(&str, &str)],
+    ) {
         let mut properties = HashMap::from([("row_count".into(), rows.into())]);
         for (key, value) in extra {
             properties.insert((*key).into(), (*value).into());
@@ -799,7 +834,10 @@ mod tests {
             .unwrap();
     }
 
-    fn publish_pin(sekai: &sekai_core::db::store::SekaiStore, db: &ChiseiStore) -> DataQualityRule {
+    pub(super) fn publish_pin(
+        sekai: &sekai_core::db::store::SekaiStore,
+        db: &ChiseiStore,
+    ) -> DataQualityRule {
         let dataset = sekai
             .get_object(&dataset_object_id("quality", "orders"))
             .unwrap()
