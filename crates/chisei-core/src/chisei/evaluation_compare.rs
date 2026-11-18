@@ -131,8 +131,9 @@ pub enum Change {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// The gate verdict worsened, or a required node regressed or was added
-    /// without passing. Advisory movement never decides this.
+    /// The gate verdict worsened, a required node regressed or was added
+    /// without passing, or a node required in the baseline is missing from
+    /// the candidate. Advisory movement never decides this.
     Regressed,
     /// Nothing regressed, and the gate verdict or a required node improved.
     Improved,
@@ -184,6 +185,8 @@ pub struct ComparisonSummary {
     pub advisory_improvements: u32,
     pub required_regressions: u32,
     pub advisory_regressions: u32,
+    /// Nodes required in the baseline that the candidate no longer runs.
+    pub required_removals: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -244,6 +247,13 @@ pub fn compare(
         if candidate_blocks {
             summary.required_regressions += 1;
         }
+        // A candidate that stops running a required check must not pass a
+        // regression gate by omission.
+        if change == Change::Removed
+            && before.is_some_and(|step| step.classification == NODE_REQUIRED)
+        {
+            summary.required_removals += 1;
+        }
         if candidate_advisory_regression {
             summary.advisory_regressions += 1;
         }
@@ -279,7 +289,10 @@ pub fn compare(
         candidate_verdict: candidate.decision.verdict.clone(),
         change: verdict_change(&baseline.decision, &candidate.decision),
     };
-    let outcome = if gate.change == Change::Regressed || summary.required_regressions > 0 {
+    let outcome = if gate.change == Change::Regressed
+        || summary.required_regressions > 0
+        || summary.required_removals > 0
+    {
         Outcome::Regressed
     } else if gate.change == Change::Improved || summary.required_improvements > 0 {
         Outcome::Improved
@@ -640,6 +653,48 @@ mod tests {
                 .filter(|node| matches!(node.change, Change::Added | Change::Removed))
                 .all(|node| node.differs_in.is_empty())
         );
+    }
+
+    #[test]
+    fn dropping_a_required_node_regresses_and_dropping_an_advisory_one_does_not() {
+        for baseline_status in [STATUS_PASS, STATUS_FAIL] {
+            let baseline = execution(
+                'a',
+                VERDICT_DENY,
+                vec![
+                    step("kept", NODE_REQUIRED, STATUS_FAIL),
+                    step("dropped", NODE_REQUIRED, baseline_status),
+                ],
+            );
+            // The candidate stops running `dropped` and its other check now
+            // passes, which alone would read as an improvement.
+            let candidate = execution(
+                'b',
+                VERDICT_ALLOW,
+                vec![step("kept", NODE_REQUIRED, STATUS_PASS)],
+            );
+            let comparison = compare(&baseline, &candidate).unwrap();
+            assert_eq!(change_of(&comparison, "dropped"), Change::Removed);
+            assert_eq!(comparison.summary.required_removals, 1, "{baseline_status}");
+            assert_eq!(comparison.outcome, Outcome::Regressed, "{baseline_status}");
+        }
+
+        let baseline = execution(
+            'a',
+            VERDICT_ALLOW,
+            vec![
+                step("kept", NODE_REQUIRED, STATUS_PASS),
+                step("style", NODE_ADVISORY, STATUS_PASS),
+            ],
+        );
+        let candidate = execution(
+            'b',
+            VERDICT_ALLOW,
+            vec![step("kept", NODE_REQUIRED, STATUS_PASS)],
+        );
+        let comparison = compare(&baseline, &candidate).unwrap();
+        assert_eq!(comparison.summary.required_removals, 0);
+        assert_eq!(comparison.outcome, Outcome::Unchanged);
     }
 
     #[test]

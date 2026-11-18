@@ -550,6 +550,12 @@ fn print_comparison_output(
         summary.added,
         summary.removed
     );
+    if summary.required_removals > 0 {
+        println!(
+            "Required nodes no longer run: {} (counted as a regression)",
+            summary.required_removals
+        );
+    }
     if summary.advisory_regressions > 0 || summary.advisory_improvements > 0 {
         println!(
             "Advisory movement observed: {} regressed, {} improved (they do not decide the outcome)",
