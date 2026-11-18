@@ -399,8 +399,12 @@ fn proto_list_filter(filter: &ListFilter) -> ProtoListFilter {
     }
 }
 
+/// Build a hop request: the caller's trace context, then the hop credential.
 fn authorized<T>(message: T, credential: Option<String>) -> Result<tonic::Request<T>, String> {
+    let mut headers = http::HeaderMap::new();
+    crate::obs::otel::inject_current_context_into_headers(&mut headers);
     let mut request = tonic::Request::new(message);
+    *request.metadata_mut() = tonic::metadata::MetadataMap::from_headers(headers);
     if let Some(token) = credential {
         request.metadata_mut().insert(
             "authorization",
@@ -508,12 +512,27 @@ mod tests {
     /// trusted `local` principal and `Bearer reader-token` as the unprivileged
     /// `reader`; anything else is rejected by Sekai.
     async fn serve_sekai(sekai: SekaiStore) -> String {
+        serve_sekai_recording_traces(sekai, Default::default()).await
+    }
+
+    /// `serve_sekai`, also recording each request's `traceparent` into `traces`.
+    async fn serve_sekai_recording_traces(
+        sekai: SekaiStore,
+        traces: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> String {
         use crate::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let service =
             SekaiServiceServer::new(crate::grpc::sekai_service::SekaiServiceImpl::new(sekai));
-        let authenticate = |mut request: tonic::Request<()>| {
+        let authenticate = move |mut request: tonic::Request<()>| {
+            if let Some(traceparent) = request
+                .metadata()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok())
+            {
+                traces.lock().unwrap().push(traceparent.to_string());
+            }
             let bearer = request
                 .metadata()
                 .get("authorization")
@@ -587,6 +606,41 @@ mod tests {
         ));
         assert_eq!(result.steps[0].action, "enrich", "{:?}", result.steps[0]);
         assert!(result.prepared_spec.contains("hop verdict"));
+    }
+
+    /// #2685: a hop read made while serving a traced request continues the
+    /// caller's trace on the Sekai plane instead of starting a new one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hop_reads_carry_the_caller_trace() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        const CALLER_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let traces = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let endpoint = serve_sekai_recording_traces(seeded_sekai(), traces.clone()).await;
+        let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                format!("00-{CALLER_TRACE_ID}-00f067aa0ba902b7-01")
+                    .parse()
+                    .unwrap(),
+            );
+            let span = tracing::info_span!("caller");
+            crate::obs::otel::set_parent_from_headers(&span, &headers);
+            span.in_scope(|| reader.find_by_external_id("widget:lookup-root").unwrap());
+        });
+        let traces = traces.lock().unwrap();
+        assert!(!traces.is_empty(), "the hop sent no traceparent");
+        assert!(
+            traces
+                .iter()
+                .all(|traceparent| traceparent.split('-').nth(1) == Some(CALLER_TRACE_ID)),
+            "{traces:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

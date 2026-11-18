@@ -26,6 +26,11 @@ The generated span field `operation` remains an opaque process-local
 correlation id. It is not the cross-plane identity and is not derived from
 the caller key.
 
+The plane forwards the current W3C trace context on hops to services the
+operator runs: gateway recovery into Chisei, the Chisei-only plane's hop to
+Sekai, and external evaluator adapters. Trace headers sit outside the adapter
+signature. Model providers and connector sources never receive trace context.
+
 ## Object change history
 
 Each object change row stores the operation that produced it. An admitted or
