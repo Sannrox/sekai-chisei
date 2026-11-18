@@ -1179,6 +1179,58 @@ message GetGovernedTransformRunRequest {
 message GetGovernedTransformRunResponse {
   TransformRun run = 1;
 }
+// Experimental (#3020). A named tabular input of a model adapter.
+message ModelInput {
+  string name = 1;
+  repeated ColumnDef columns = 2;
+}
+// Experimental (#3020). What the plane sees of a model adapter: named tabular
+// inputs and one tabular output. Predict, save and load stay in the adapter.
+message ModelAdapterContract {
+  repeated ModelInput inputs = 1;
+  repeated ColumnDef output = 2;
+}
+// Experimental (#3020). A training dataset version a model was fitted on.
+message ModelTrainingInput {
+  string dataset_id = 1;
+  string version_id = 2;
+}
+// Experimental (#3020). A reference to a trained model; the bytes live in a
+// registry outside the plane at `registry_locator`. `run_id` names the run
+// receipt that trained it, and `marking` is that run's output marking.
+message ModelVersion {
+  string version_id = 1;
+  string namespace = 2;
+  string model_name = 3;
+  string digest = 4;
+  string adapter_id = 5;
+  string adapter_version = 6;
+  string registry_locator = 7;
+  ModelAdapterContract contract = 8;
+  string marking = 9;
+  string run_id = 10;
+  repeated ModelTrainingInput training_inputs = 11;
+  string actor = 12;
+  int64 created_at_ms = 13;
+}
+message GetModelVersionRequest {
+  string namespace = 1;
+  string version_id = 2;
+}
+message GetModelVersionResponse {
+  ModelVersion version = 1;
+}
+message ListModelVersionsRequest {
+  string namespace = 1;
+  // Empty lists every model in the namespace.
+  string model_name = 2;
+  int32 page_size = 3;
+  string page_token = 4;
+}
+message ListModelVersionsResponse {
+  repeated ModelVersion versions = 1;
+  string next_page_token = 2;
+}
 message TransformChainAssertion {
   string kind = 1;
   string column = 2;
@@ -5854,6 +5906,10 @@ service SekaiService {
   rpc PutTransformChain(PutTransformChainRequest) returns (PutTransformChainResponse);
   rpc RunTransformChain(RunTransformChainRequest) returns (RunTransformChainResponse);
   rpc GetTransformChainRun(GetTransformChainRunRequest) returns (GetTransformChainRunResponse);
+  // Experimental (#3020): model version references. A reader sees a version
+  // only with the marking it inherits from its training inputs.
+  rpc GetModelVersion(GetModelVersionRequest) returns (GetModelVersionResponse);
+  rpc ListModelVersions(ListModelVersionsRequest) returns (ListModelVersionsResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);

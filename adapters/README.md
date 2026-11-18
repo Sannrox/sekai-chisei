@@ -411,6 +411,21 @@ conformance:
 cargo test -p sekai-core --test model_platform_adapters
 ```
 
+## Model registry adapter
+
+`model_registry.rs` defines the two interfaces a trained model needs
+outside the plane (#3020). A `ModelAdapter` predicts over named tabular
+inputs and saves and loads its state in a directory; the plane sees only
+its `ModelAdapterContract`. A `ModelRegistry` stores that directory and
+resolves a model version's `registry_locator` and digest back to a
+loadable directory, refusing bytes that no longer match the digest.
+`LocalDirectoryRegistry` keeps versions under `<root>/<model>/<digest>/`
+and publishes each one by rename, so a crash leaves no partial version.
+
+```sh
+cargo test -p sekai-adapters --test model_registry
+```
+
 ## Autonomy envelope adapters
 
 `autonomy_simulate.rs` and `autonomy_evaluate.rs` map domain-neutral

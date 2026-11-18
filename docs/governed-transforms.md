@@ -297,6 +297,28 @@ The values live beside the run, written in the same transaction, so the
 run's receipts are unchanged. Transforms call no model, so runs carry no
 token counts.
 
+## Model versions
+
+A model version is a reference to a trained model, not its bytes (#3020).
+It records the model name, digest, adapter id and version, the registry
+locator, and the adapter contract: named tabular inputs and one output.
+The bytes live in a registry outside the plane (`adapters/model_registry.rs`).
+
+- **Registration.** A version is registered against the run receipt that
+  trained it. Its id derives from namespace, model name and digest, so
+  registering the same digest again returns the stored version and writes
+  nothing. A quarantined or unfinished run is refused.
+- **Lineage.** `run_id` names the training run receipt, and
+  `training_inputs` are the dataset versions that run pinned.
+- **Markings.** The version takes the run's output marking, the most
+  restrictive of its training inputs. A reader whose clearance does not
+  cover it sees the version as missing.
+- **Reads.** `GetModelVersion` and `ListModelVersions` are experimental:
+  start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` to call them. Both need
+  namespace read.
+
+Both community backends persist model versions.
+
 ## Operator path
 
 ```bash

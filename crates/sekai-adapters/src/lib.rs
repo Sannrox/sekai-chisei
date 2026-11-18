@@ -11,6 +11,8 @@ pub mod sdk;
 pub mod github_check_webhook;
 #[path = "../../../adapters/http_health_poll.rs"]
 pub mod http_health_poll;
+#[path = "../../../adapters/model_registry.rs"]
+pub mod model_registry;
 #[path = "../../../adapters/ontology_concept_catalog.rs"]
 pub mod ontology_concept_catalog;
 #[path = "../../../adapters/social_post_snapshot.rs"]

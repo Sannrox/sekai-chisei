@@ -22,6 +22,7 @@ pub mod json;
 pub mod lease;
 pub mod lineage;
 pub mod markings;
+pub mod model_version;
 pub mod object_change;
 pub mod object_schema;
 pub mod object_security;
