@@ -82,6 +82,7 @@ mod guarded_mutation_backend_conformance;
 mod host_executor_permit_conformance;
 mod hosted_provider_smoke;
 mod identity_assertion_conformance;
+mod index_range_filter_conformance;
 mod integration_contract;
 mod managed_shikigami_routing_fixture;
 mod mcp_adapter;

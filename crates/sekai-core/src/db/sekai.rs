@@ -129,6 +129,17 @@ fn register_sql_helpers(conn: &Connection) -> Result<(), rusqlite::Error> {
                 .map(|value| value.is_finite())
                 .unwrap_or(false))
         },
+    )?;
+    conn.create_scalar_function(
+        crate::sekai::object_type_index::SQLITE_NUMERIC_TEXT_FN,
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let value: Option<String> = ctx.get(0).ok();
+            Ok(value
+                .as_deref()
+                .is_some_and(crate::sekai::object_type_index::is_numeric_text))
+        },
     )
 }
 
