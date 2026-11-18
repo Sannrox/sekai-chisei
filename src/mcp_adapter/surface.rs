@@ -31,7 +31,10 @@ use crate::sekai::capability::CONTRACT_VERSION;
 
 use super::AdapterConfig;
 
+/// The native RPC a tool dispatches to. Non-exhaustive so a new MCP tool does
+/// not break callers outside the crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NativeRpc {
     GetObject,
     EvaluateObjectSet,
