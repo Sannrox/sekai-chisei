@@ -566,6 +566,14 @@ pub fn parse_timestamp_millis(value: &str) -> Option<i64> {
     parse_rfc3339_ms(trimmed)
 }
 
+/// A date or time component of exactly `width` ASCII digits. `str::parse`
+/// alone would also accept a sign or a different width.
+fn fixed_digits(component: &str, width: usize) -> Option<i64> {
+    (component.len() == width && component.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| component.parse().ok())
+        .flatten()
+}
+
 /// Minimal RFC3339 parser for `YYYY-MM-DDTHH:MM:SS[.sss]Z` or `±HH:MM`.
 pub fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
     let raw = raw.trim();
@@ -578,8 +586,8 @@ pub fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
             return None;
         }
         let (hours, minutes) = raw[sign_at + 1..].split_once(':')?;
-        let hours: i64 = hours.parse().ok()?;
-        let minutes: i64 = minutes.parse().ok()?;
+        let hours = fixed_digits(hours, 2)?;
+        let minutes = fixed_digits(minutes, 2)?;
         if hours > 23 || minutes > 59 {
             return None;
         }
@@ -593,9 +601,9 @@ pub fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
     };
     let (date, time) = datetime.split_once('T')?;
     let mut date = date.split('-');
-    let year: i64 = date.next()?.parse().ok()?;
-    let month: i64 = date.next()?.parse().ok()?;
-    let day: i64 = date.next()?.parse().ok()?;
+    let year = fixed_digits(date.next()?, 4)?;
+    let month = fixed_digits(date.next()?, 2)?;
+    let day = fixed_digits(date.next()?, 2)?;
     if date.next().is_some() || !(0..=9999).contains(&year) {
         return None;
     }
@@ -607,9 +615,9 @@ pub fn parse_rfc3339_ms(raw: &str) -> Option<i64> {
         return None;
     }
     let mut hms = hms.split(':');
-    let hour: i64 = hms.next()?.parse().ok()?;
-    let minute: i64 = hms.next()?.parse().ok()?;
-    let second: i64 = hms.next()?.parse().ok()?;
+    let hour = fixed_digits(hms.next()?, 2)?;
+    let minute = fixed_digits(hms.next()?, 2)?;
+    let second = fixed_digits(hms.next()?, 2)?;
     if hms.next().is_some() {
         return None;
     }
@@ -849,5 +857,27 @@ mod tests {
         );
         assert_eq!(parse_rfc3339_ms("10000-01-01T00:00:00Z"), None);
         assert!(parse_rfc3339_ms("9999-12-31T23:59:59Z").is_some());
+    }
+
+    #[test]
+    fn parse_rfc3339_ms_requires_fixed_width_digit_components() {
+        for raw in [
+            "2026-01-01T-01:00:00Z",
+            "2026-01-01T+1:00:00Z",
+            "2026-01-01T00:00:00+-1:00",
+            "2026-01-01T00:00:00+01:+0",
+            "2026-1-01T00:00:00Z",
+            "2026-01-1T00:00:00Z",
+            "+026-01-01T00:00:00Z",
+            "2026-01-01T00:0:00Z",
+            "2026-01-01T00:00:0Z",
+            "2026-01-01T001:00:00Z",
+        ] {
+            assert_eq!(parse_rfc3339_ms(raw), None, "{raw}");
+        }
+        assert_eq!(
+            parse_rfc3339_ms("2026-01-01T01:00:00+01:00"),
+            parse_rfc3339_ms("2026-01-01T00:00:00Z")
+        );
     }
 }
