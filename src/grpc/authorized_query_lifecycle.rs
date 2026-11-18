@@ -1139,6 +1139,7 @@ impl SekaiServiceImpl {
 const LINEAGE_DATASET: &str = "dataset";
 const LINEAGE_SOURCE: &str = "source";
 const LINEAGE_TRANSFORM: &str = "transform";
+const LINEAGE_MODEL_VERSION: &str = "model_version";
 
 /// A non-object lineage node: id, kind, namespace and `external_id` only.
 /// `external_id` is the resource id; `id` is `<kind>:<namespace>/<resource>`,
@@ -1165,8 +1166,9 @@ fn ephemeral_lineage_node(resource_id: &str, kind: &str, namespace: &str) -> dom
 
 /// The non-object nodes `node` came from: the dataset behind a
 /// dataset-backed object type, the source binding that lands a source-owned
-/// dataset, the transforms that write a dataset, and every dataset input of
-/// a transform.
+/// dataset, the transforms that write a dataset, every dataset input and
+/// model version a transform reads, and the training datasets of a model
+/// version.
 fn lineage_upstream(
     db: &RuntimeDb,
     node: &domain::Object,
@@ -1219,11 +1221,42 @@ fn lineage_upstream(
             .get_governed_transform(&node.namespace, resource_id)
             .map_err(Status::internal)?
             .map(|transform| {
+                let models = transform
+                    .isolated_process
+                    .iter()
+                    .flat_map(|spec| spec.model_inputs.values())
+                    .map(|version_id| {
+                        ephemeral_lineage_node(
+                            version_id,
+                            LINEAGE_MODEL_VERSION,
+                            &transform.namespace,
+                        )
+                    });
                 transform
                     .input_bindings()
                     .into_iter()
                     .map(|(_alias, dataset_id)| {
                         ephemeral_lineage_node(&dataset_id, LINEAGE_DATASET, &transform.namespace)
+                    })
+                    .chain(models)
+                    .collect()
+            })
+            .unwrap_or_default()),
+        // A model version came from the dataset versions it was trained on.
+        LINEAGE_MODEL_VERSION => Ok(db
+            .get_model_version(&node.namespace, resource_id)
+            .map_err(Status::internal)?
+            .map(|version| {
+                version
+                    .training_inputs
+                    .iter()
+                    .filter(|input| !crate::sekai::object_set_input::is_pin_key(&input.dataset_id))
+                    .map(|input| {
+                        ephemeral_lineage_node(
+                            &input.dataset_id,
+                            LINEAGE_DATASET,
+                            &version.namespace,
+                        )
                     })
                     .collect()
             })
@@ -1235,7 +1268,8 @@ fn lineage_upstream(
 /// Whether the caller may see a non-object lineage node. A dataset needs the
 /// dataset read and discovery checks `ListDatasets` applies; a source, a transform or a
 /// source-owned dataset needs read access to its namespace, as
-/// `ListGovernedTransforms` does. A failed check hides the node.
+/// `ListGovernedTransforms` does; a model version also needs clearance for
+/// its marking, as `GetModelVersion` does. A failed check hides the node.
 fn ephemeral_lineage_node_visible(
     db: &RuntimeDb,
     security: &SecurityChecker,
@@ -1264,7 +1298,19 @@ fn ephemeral_lineage_node_visible(
                     )
         );
     }
-    check_team_namespace(db, principals, &node.namespace, false).is_ok()
+    if check_team_namespace(db, principals, &node.namespace, false).is_err() {
+        return false;
+    }
+    // A model version also needs clearance for its marking.
+    if node.kind == LINEAGE_MODEL_VERSION {
+        return matches!(
+            db.get_model_version(&node.namespace, &node.external_id),
+            Ok(Some(version))
+                if super::model_version_rpc::version_visible(db, principals, &version)
+                    .unwrap_or(false)
+        );
+    }
+    true
 }
 
 fn hop_marking_permitted(

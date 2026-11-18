@@ -31,7 +31,7 @@ pub(super) async fn get_model_version(
         .get_model_version(&inner.namespace, &inner.version_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND))?;
-    if !version_visible(service, &principals, &version)? {
+    if !version_visible(service.db.runtime(), &principals, &version)? {
         return Err(Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND));
     }
     Ok(Response::new(GetModelVersionResponse {
@@ -70,7 +70,7 @@ pub(super) async fn list_model_versions(
         if after.is_some_and(|after| version.version_id.as_str() <= after) {
             continue;
         }
-        if version_visible(service, &principals, &version)? {
+        if version_visible(service.db.runtime(), &principals, &version)? {
             visible.push(version);
         }
         if visible.len() > page_size {
@@ -92,6 +92,35 @@ pub(super) async fn list_model_versions(
     }))
 }
 
+/// Refuses a transform that pins a model version missing from its
+/// namespace or hidden from the caller (#3074). Both read as missing, so a
+/// writer learns nothing about versions it may not see.
+pub(super) fn authorize_model_inputs(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<(), Status> {
+    for version_id in transform
+        .isolated_process
+        .iter()
+        .flat_map(|spec| spec.model_inputs.values())
+    {
+        let visible = match service
+            .db
+            .runtime()
+            .get_model_version(&transform.namespace, version_id)
+            .map_err(Status::internal)?
+        {
+            Some(version) => version_visible(service.db.runtime(), principals, &version)?,
+            None => false,
+        };
+        if !visible {
+            return Err(Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND));
+        }
+    }
+    Ok(())
+}
+
 /// Another tenant's namespace reads as missing, not as denied.
 fn authorize_namespace_read(
     service: &SekaiServiceImpl,
@@ -109,12 +138,13 @@ fn authorize_namespace_read(
     check_team_namespace(service.db.runtime(), principals, namespace, false)
 }
 
-fn version_visible(
-    service: &SekaiServiceImpl,
+/// Whether the caller's marking subject may see `version`; namespace access
+/// is checked by the caller.
+pub(super) fn version_visible(
+    db: &RuntimeDb,
     principals: &[String],
     version: &domain_model::ModelVersion,
 ) -> Result<bool, Status> {
-    let db = service.db.runtime();
     if version.marking.is_empty() {
         // A namespace that hides unmarked objects hides unmarked versions
         // too; versions carry no grants, so only trusted services read them.

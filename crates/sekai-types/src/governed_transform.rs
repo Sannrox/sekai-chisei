@@ -139,6 +139,15 @@ pub const OBJECT_SET_INPUTS_CAPABILITY: &str = "sekai.transforms.object-set-inpu
 /// ids beside object-set inputs, and new datasets, may not use it.
 pub const OBJECT_SET_PIN_PREFIX: &str = "object-set:";
 
+/// Placement label a runtime registers to be offered isolated work that
+/// scores with a pinned model version (#3074).
+pub const MODEL_INPUT_LABEL: &str = "sekai.input.model";
+/// The model input format a labelled runtime understands.
+pub const MODEL_INPUT_LABEL_VALUE: &str = "v1";
+/// Prefix of a model input's key in a run's `input_versions`; its value is
+/// the pinned model version id. Dataset ids beside model inputs may not use it.
+pub const MODEL_PIN_PREFIX: &str = "model:";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransformInput {
     pub alias: String,
@@ -187,6 +196,11 @@ pub struct IsolatedProcessSpec {
     /// their digest.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub code: String,
+    /// Model versions the code scores with, by input name (#3074). A run
+    /// pins each under [`MODEL_PIN_PREFIX`] in its `input_versions`. Empty
+    /// keeps the digest of definitions written before it existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_inputs: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +461,7 @@ impl GovernedTransform {
                     }
                 }
             }
+            prepare_model_inputs(spec)?;
             validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
@@ -855,6 +870,59 @@ fn prepare_analytical(
     spec.memory_limit_bytes = host_limit(spec.memory_limit_bytes, DEFAULT_MEMORY_LIMIT_BYTES);
     spec.time_limit_ms = host_limit(spec.time_limit_ms, DEFAULT_TIME_LIMIT_MS);
     Ok(())
+}
+
+/// Trims model input names and version ids, refuses blanks and dataset ids
+/// that collide with the model pin prefix, and requires the model placement
+/// label so only a runtime that can run a model claims the work.
+fn prepare_model_inputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
+    if spec.model_inputs.is_empty() {
+        return Ok(());
+    }
+    let mut trimmed = BTreeMap::new();
+    for (name, version_id) in &spec.model_inputs {
+        require_token("model input name", name)?;
+        require_token("model input version_id", version_id)?;
+        if trimmed
+            .insert(name.trim().to_string(), version_id.trim().to_string())
+            .is_some()
+        {
+            return Err(TransformError::InvalidArgument(
+                "model input names must be unique".into(),
+            ));
+        }
+    }
+    spec.model_inputs = trimmed;
+    if spec
+        .inputs
+        .iter()
+        .any(|input| input.dataset_id.starts_with(MODEL_PIN_PREFIX))
+    {
+        return Err(TransformError::InvalidArgument(format!(
+            "input dataset ids beside model inputs may not start with {MODEL_PIN_PREFIX}"
+        )));
+    }
+    match spec.requires.get(MODEL_INPUT_LABEL) {
+        Some(value) if value != MODEL_INPUT_LABEL_VALUE => Err(TransformError::InvalidArgument(
+            format!("model inputs require {MODEL_INPUT_LABEL}={MODEL_INPUT_LABEL_VALUE}"),
+        )),
+        _ => {
+            spec.requires
+                .insert(MODEL_INPUT_LABEL.into(), MODEL_INPUT_LABEL_VALUE.into());
+            Ok(())
+        }
+    }
+}
+
+/// The receipt pins of a definition's model inputs: `model:<name>` to the
+/// version id.
+pub fn model_input_pins(transform: &GovernedTransform) -> BTreeMap<String, String> {
+    transform
+        .isolated_process
+        .iter()
+        .flat_map(|spec| &spec.model_inputs)
+        .map(|(name, version_id)| (format!("{MODEL_PIN_PREFIX}{name}"), version_id.clone()))
+        .collect()
 }
 
 fn prepare_isolated(

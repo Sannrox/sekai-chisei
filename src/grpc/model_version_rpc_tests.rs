@@ -135,3 +135,42 @@ async fn deny_unmarked_namespace_hides_unmarked_versions() {
     store_version(&svc, "sha256:open", "");
     assert!(listed(&svc, "uncleared").await.is_empty());
 }
+
+/// A transform cannot pin a model version its writer may not see, nor one
+/// that does not exist; both read as missing (#3074).
+#[tokio::test]
+async fn model_inputs_refuse_a_hidden_or_missing_version() {
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, IsolatedProcessSpec};
+    let svc = service();
+    let marked = store_version(&svc, "sha256:marked", "confidential");
+    sealed_principal_profile(&svc, "cleared", "confidential");
+    let transform = |version_id: &str| crate::sekai::governed_transform::GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "ml".into(),
+        transform_id: "score".into(),
+        input_dataset_id: "features".into(),
+        output_dataset_id: "scores".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(IsolatedProcessSpec {
+            model_inputs: std::collections::BTreeMap::from([("scorer".into(), version_id.into())]),
+            ..Default::default()
+        }),
+        schedule: None,
+        trigger: None,
+    };
+    let authorize = |principal: &str, version_id: &str| {
+        super::model_version_rpc::authorize_model_inputs(
+            &svc,
+            &[principal.to_string()],
+            &transform(version_id),
+        )
+    };
+    let hidden = authorize("uncleared", &marked).unwrap_err();
+    assert_eq!(hidden.code(), tonic::Code::NotFound);
+    authorize("cleared", &marked).unwrap();
+    let missing = authorize("cleared", "mv_missing").unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+}

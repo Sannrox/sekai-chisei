@@ -2449,6 +2449,10 @@ fn admit_isolated_process_tx(
         loaded.push((set.alias.clone(), set.columns.clone(), set.records()));
         input_object_tokens.extend(set.marking_tokens.iter().cloned());
     }
+    // The output carries the marking of every model version it is scored with.
+    input_object_tokens.extend(crate::db::model_version_store::pinned_model_markings(
+        tx, transform,
+    )?);
     let lattice = load_lattice(tx, &transform.namespace)?;
     let output_object_id = load_dataset_object_id(tx, &transform.output_dataset_id)?;
     let prior_token = load_object_marking_token(tx, &output_object_id)?;
@@ -2479,6 +2483,10 @@ fn admit_isolated_process_tx(
     for set in object_sets {
         run.input_versions.insert(set.pin_key(), set.digest());
     }
+    run.input_versions
+        .extend(crate::sekai::governed_transform::model_input_pins(
+            transform,
+        ));
     insert_transform_run(tx, &run)?;
     persist_run_input_snapshot(tx, &run.run_id, &bindings, &loaded)?;
     let spec = transform
@@ -7222,6 +7230,7 @@ mod tests {
                 inputs: Vec::new(),
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -8806,6 +8815,7 @@ mod tests {
                 inputs: Vec::new(),
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: Some(TransformTrigger {
@@ -9029,6 +9039,7 @@ mod tests {
                 inputs: Vec::new(),
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9204,6 +9215,7 @@ mod tests {
                 ],
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9283,6 +9295,7 @@ mod tests {
                 ],
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -10456,6 +10469,7 @@ mod tests {
                 ],
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -10790,6 +10804,7 @@ mod tests {
                 }],
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -11114,6 +11129,7 @@ mod tests {
                 inputs: Vec::new(),
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,

@@ -490,6 +490,102 @@ async fn exercise_lineage_reaches_datasets(db: RuntimeDb) {
     );
 }
 
+/// A transform scoring with a pinned model version (#3074): lineage from its
+/// output reaches the model version and, through it, the dataset the model
+/// was trained on.
+async fn exercise_lineage_reaches_pinned_model_version(db: RuntimeDb) {
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform};
+    use crate::sekai::model_version as model;
+    let svc = service_on(db);
+    for id in ["ds-features", "ds-scores", "ds-train"] {
+        seed_dataset(&svc, id, "");
+    }
+    let column = |name: &str| model::ModelColumn {
+        name: name.into(),
+        col_type: "string".into(),
+    };
+    let version = svc
+        .db
+        .runtime()
+        .insert_model_version(
+            &model::ModelVersion::from_run(
+                model::ModelVersionRegistration {
+                    namespace: "sales".into(),
+                    model_name: "churn".into(),
+                    digest: "sha256:a".into(),
+                    adapter_id: "tabular".into(),
+                    adapter_version: "1".into(),
+                    registry_locator: "churn/a".into(),
+                    contract: model::AdapterContract {
+                        inputs: vec![model::ModelInput {
+                            name: "features".into(),
+                            columns: vec![column("order_id")],
+                        }],
+                        output: vec![column("score")],
+                    },
+                    run_id: "run-train".into(),
+                    actor: "trainer".into(),
+                },
+                "sales",
+                "",
+                &std::collections::BTreeMap::from([("ds-train".into(), "v1".into())]),
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let transform = GovernedTransform {
+        contract_version: CONTRACT_VERSION.into(),
+        namespace: "sales".into(),
+        transform_id: "tf-score".into(),
+        input_dataset_id: "ds-features".into(),
+        output_dataset_id: "ds-scores".into(),
+        steps: Vec::new(),
+        quality_rule: String::new(),
+        definition_digest: String::new(),
+        analytical: None,
+        isolated_process: Some(crate::sekai::governed_transform::IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            code: "score()".into(),
+            model_inputs: std::collections::BTreeMap::from([(
+                "scorer".into(),
+                version.version_id.clone(),
+            )]),
+            ..Default::default()
+        }),
+        schedule: None,
+        trigger: None,
+    }
+    .prepare()
+    .unwrap();
+    svc.db
+        .runtime()
+        .put_governed_transform(&transform, 10)
+        .unwrap();
+    seed_dataset_backed_object(&svc, "Score", "ds-scores").await;
+    let (_, edges) = lineage_shape(&lineage_of(&svc, "Score-1").await);
+    let model_node = format!("model_version:sales/{}", version.version_id);
+    for edge in [
+        "transform:sales/tf-score>dataset:sales/ds-features".to_string(),
+        format!("transform:sales/tf-score>{model_node}"),
+        format!("{model_node}>dataset:sales/ds-train"),
+    ] {
+        assert!(edges.contains(&edge), "{edge} missing from {edges:?}");
+    }
+}
+
+#[tokio::test]
+async fn lineage_reaches_pinned_model_version() {
+    exercise_lineage_reaches_pinned_model_version(RuntimeDb::memory()).await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_lineage_reaches_pinned_model_version() {
+    on_postgres(exercise_lineage_reaches_pinned_model_version);
+}
+
 #[tokio::test]
 async fn lineage_reaches_datasets() {
     exercise_lineage_reaches_datasets(RuntimeDb::memory()).await;
