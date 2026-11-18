@@ -119,6 +119,14 @@ pub trait Judge: Send + Sync {
     ) -> Result<JudgeVerdict, JudgeError>;
 }
 
+/// One judged observation's pending knowledge and portfolio writes, applied after its run commits.
+struct ScoredSideEffects<'a> {
+    obs: &'a SampleObservation,
+    score: i32,
+    passed: bool,
+    reasoning: String,
+}
+
 /// The scored fields needed to turn one observation into governed graph knowledge.
 /// Deliberately excludes the raw prompt and model output so writers cannot accidentally persist
 /// unbounded, unreviewed task content.
@@ -312,6 +320,7 @@ impl ScoringJob {
 
             let mut results = Vec::with_capacity(group.len());
             let mut scored_obs: Vec<&SampleObservation> = Vec::with_capacity(group.len());
+            let mut side_effects = Vec::with_capacity(group.len());
             for obs in &group {
                 // Per-observation isolation: a judge failure on one record (provider error,
                 // oversized content, misconfigured key/model) must not abort the batch or block
@@ -347,62 +356,15 @@ impl ScoringJob {
                 } else {
                     format!("{} | gate: {}", verdict.reasoning, gate_reason)
                 };
-                if let Some(writer) = &self.knowledge_writer {
-                    let write_request = KnowledgeWriteRequest {
-                        request_id: obs.request_id.clone(),
-                        namespace: obs.namespace.clone(),
-                        task_class: obs.task_class.clone(),
-                        model: obs.resolved_model.clone(),
-                        score: verdict.score,
-                        passed,
-                        reasoning: reason.clone(),
-                    };
-                    match writer.write_knowledge(&write_request).await {
-                        Ok(KnowledgeWriteOutcome::Accepted) => {}
-                        Ok(KnowledgeWriteOutcome::PolicyDenied) => {
-                            warn!(
-                                request_id = %obs.request_id,
-                                namespace = %namespace,
-                                "scoring knowledge write denied by policy; observation is terminal"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(
-                                request_id = %obs.request_id,
-                                namespace = %namespace,
-                                %error,
-                                "scoring knowledge write failed; retaining the evaluated result without a learning"
-                            );
-                        }
-                    }
-                }
-                if obs.cost_usd_micros > 0 && !obs.resolved_model.trim().is_empty() {
-                    let portfolio = crate::chisei::portfolio::PortfolioStore::new(self.db.clone());
-                    if let Err(error) = portfolio.record(&crate::chisei::portfolio::Observation {
-                        namespace: obs.namespace.clone(),
-                        task_class: obs.task_class.clone(),
-                        model: obs.resolved_model.clone(),
-                        prompt_variant: crate::chisei::portfolio::LEGACY_PROMPT_VARIANT.into(),
-                        // A judge score cannot override deterministic authored
-                        // assertions. Failed gates contribute zero portfolio
-                        // value so routing never optimizes toward outputs that
-                        // look plausible but violate the task contract.
-                        quality_score: if passed {
-                            verdict.score.clamp(0, 100) as f64
-                        } else {
-                            0.0
-                        },
-                        cost_usd_micros: obs.cost_usd_micros,
-                        sample_count: 1,
-                        updated_at: obs.timestamp,
-                    }) {
-                        warn!(
-                            request_id = %obs.request_id,
-                            %error,
-                            "scoring job failed to update portfolio frontier"
-                        );
-                    }
-                }
+                // Knowledge and portfolio writes are deferred until the run is recorded: a
+                // failed `emit_run` leaves the observations queued, and writing them now would
+                // repeat these side effects when the next cycle judges them again.
+                side_effects.push(ScoredSideEffects {
+                    obs,
+                    score: verdict.score,
+                    passed,
+                    reasoning: reason.clone(),
+                });
                 results.push(eval::CaseResult {
                     case_id: obs.request_id.clone(),
                     passed,
@@ -421,7 +383,19 @@ impl ScoringJob {
                 continue;
             }
 
-            self.emit_run(&namespace, &scored_obs, results)?;
+            // Per-namespace isolation: a failed run write leaves this group's observations queued
+            // for the next cycle and must not stop the remaining namespace groups.
+            if let Err(error) = self.emit_run(&namespace, &scored_obs, results) {
+                warn!(
+                    namespace = %namespace,
+                    %error,
+                    "scoring job failed to record the run; observations stay queued"
+                );
+                continue;
+            }
+            for effects in &side_effects {
+                self.apply_side_effects(effects).await;
+            }
 
             // Consumed rows are deleted — they are queue input, not durable state. The scored
             // outcome lives on in the eval run, iteration, and audit decision. This bounds the
@@ -451,6 +425,69 @@ impl ScoringJob {
             );
         }
         Ok(total_scored)
+    }
+
+    /// Write the governed knowledge and portfolio point for one judged observation. Called only
+    /// after its run is recorded, so each observation contributes once. Failures are logged and
+    /// never block the cycle.
+    async fn apply_side_effects(&self, effects: &ScoredSideEffects<'_>) {
+        let obs = effects.obs;
+        if let Some(writer) = &self.knowledge_writer {
+            let write_request = KnowledgeWriteRequest {
+                request_id: obs.request_id.clone(),
+                namespace: obs.namespace.clone(),
+                task_class: obs.task_class.clone(),
+                model: obs.resolved_model.clone(),
+                score: effects.score,
+                passed: effects.passed,
+                reasoning: effects.reasoning.clone(),
+            };
+            match writer.write_knowledge(&write_request).await {
+                Ok(KnowledgeWriteOutcome::Accepted) => {}
+                Ok(KnowledgeWriteOutcome::PolicyDenied) => {
+                    warn!(
+                        request_id = %obs.request_id,
+                        namespace = %obs.namespace,
+                        "scoring knowledge write denied by policy; observation is terminal"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        request_id = %obs.request_id,
+                        namespace = %obs.namespace,
+                        %error,
+                        "scoring knowledge write failed; retaining the evaluated result without a learning"
+                    );
+                }
+            }
+        }
+        if obs.cost_usd_micros > 0 && !obs.resolved_model.trim().is_empty() {
+            let portfolio = crate::chisei::portfolio::PortfolioStore::new(self.db.clone());
+            if let Err(error) = portfolio.record(&crate::chisei::portfolio::Observation {
+                namespace: obs.namespace.clone(),
+                task_class: obs.task_class.clone(),
+                model: obs.resolved_model.clone(),
+                prompt_variant: crate::chisei::portfolio::LEGACY_PROMPT_VARIANT.into(),
+                // A judge score cannot override deterministic authored
+                // assertions. Failed gates contribute zero portfolio
+                // value so routing never optimizes toward outputs that
+                // look plausible but violate the task contract.
+                quality_score: if effects.passed {
+                    effects.score.clamp(0, 100) as f64
+                } else {
+                    0.0
+                },
+                cost_usd_micros: obs.cost_usd_micros,
+                sample_count: 1,
+                updated_at: obs.timestamp,
+            }) {
+                warn!(
+                    request_id = %obs.request_id,
+                    %error,
+                    "scoring job failed to update portfolio frontier"
+                );
+            }
+        }
     }
 
     /// Handle a judge failure for one observation. Transient/infrastructure failures are retried
@@ -1089,6 +1126,10 @@ fn truncate(s: &str, max: usize) -> String {
     }
     format!("{}…", &s[..end])
 }
+
+#[cfg(test)]
+#[path = "scoring_tests.rs"]
+mod run_write_tests;
 
 #[cfg(test)]
 mod tests {
