@@ -315,7 +315,7 @@ claude_smoke() {
   ANTHROPIC_BASE_URL="$GATEWAY_ROOT_URL" \
   ANTHROPIC_CUSTOM_HEADERS=$'x-chisei-agent: '"$CHISEI_AGENT"$'\nx-chisei-project: '"$CHISEI_PROJECT" \
   ENABLE_TOOL_SEARCH=true \
-    claude --no-session-persistence "${model_args[@]}" -p "$prompt"
+    claude --no-session-persistence ${model_args[@]+"${model_args[@]}"} -p "$prompt"
 }
 
 claude_key_smoke() {
@@ -328,7 +328,7 @@ claude_key_smoke() {
   echo "Running Claude Code through $GATEWAY_ROOT_URL using a Chisei virtual key."
   ANTHROPIC_BASE_URL="$GATEWAY_ROOT_URL" \
   ANTHROPIC_API_KEY="$CLAUDE_KEY" \
-    claude "${model_args[@]}" -p "$prompt"
+    claude ${model_args[@]+"${model_args[@]}"} -p "$prompt"
 }
 
 cmd="${1:-}"
