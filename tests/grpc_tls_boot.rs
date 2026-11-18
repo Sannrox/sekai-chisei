@@ -153,14 +153,47 @@ fn client_tls(identity: Option<Identity>) -> ClientTlsConfig {
     }
 }
 
+/// Client connects that fail with a local `AddrInUse` before giving up.
+const CONNECT_ATTEMPTS: u32 = 10;
+
+/// True when `error`'s cause chain holds an `AddrInUse` I/O error. Under a
+/// full parallel suite, macOS can fail a client connect that way while
+/// ephemeral ports churn (#2688); it says nothing about the server's TLS.
+fn addr_in_use(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+        {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+
+/// Health status over TLS. A local `AddrInUse` on connect is retried a
+/// bounded number of times; every other failure, TLS refusals included,
+/// returns at once.
 async fn health_connect(port: u16, tls: ClientTlsConfig, log_path: &Path) -> Result<i32, String> {
-    let channel = Channel::from_shared(format!("https://127.0.0.1:{port}"))
+    let endpoint = Channel::from_shared(format!("https://127.0.0.1:{port}"))
         .map_err(|error| error.to_string())?
         .tls_config(tls)
-        .map_err(|error| error.to_string())?
-        .connect()
-        .await
-        .map_err(|error| format!("tls connect: {error}\n{}", read_log(log_path)))?;
+        .map_err(|error| error.to_string())?;
+    let mut attempt = 1;
+    let channel = loop {
+        match endpoint.connect().await {
+            Ok(channel) => break channel,
+            Err(error) if attempt < CONNECT_ATTEMPTS && addr_in_use(&error) => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(format!("tls connect: {error}\n{}", read_log(log_path)));
+            }
+        }
+    };
     let response = HealthClient::new(channel)
         .check(HealthCheckRequest {
             service: String::new(),
@@ -169,6 +202,26 @@ async fn health_connect(port: u16, tls: ClientTlsConfig, log_path: &Path) -> Res
         .map_err(|error| format!("health check: {error}\n{}", read_log(log_path)))?
         .into_inner();
     Ok(response.status)
+}
+
+#[test]
+fn addr_in_use_is_found_through_the_cause_chain() {
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("connect failed")
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let in_use = Wrapped(std::io::ErrorKind::AddrInUse.into());
+    let refused = Wrapped(std::io::ErrorKind::ConnectionRefused.into());
+    assert!(addr_in_use(&in_use));
+    assert!(!addr_in_use(&refused));
 }
 
 #[tokio::test(flavor = "multi_thread")]
