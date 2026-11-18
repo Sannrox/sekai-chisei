@@ -80,6 +80,50 @@ fn fewer_than_three_reports_is_refused() {
 }
 
 #[test]
+fn duplicate_workload_ids_are_refused() {
+    let dir = temp_dir("duplicate");
+    let workload = |p95: f64| {
+        serde_json::json!({
+            "id": "context_egress_filtering",
+            "budgets": {
+                "p50_latency_us": p95 / 2.0,
+                "p95_latency_us": p95,
+                "p99_latency_us": p95 * 1.5
+            }
+        })
+    };
+    let manifest = dir.join("manifest.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "workloads": [workload(500.0), workload(5_000.0)]
+        }))
+        .expect("serialize"),
+    )
+    .expect("write manifest");
+    let reports: Vec<PathBuf> = (1..=3)
+        .map(|n| write_report(&dir, &format!("run-{n}.json"), 30.0))
+        .collect();
+
+    let output = Command::new(binary())
+        .arg("--manifest")
+        .arg(&manifest)
+        .args(&reports)
+        .output()
+        .expect("run perf-gate");
+
+    assert!(
+        !output.status.success(),
+        "duplicate workload id was accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duplicate workload id \"context_egress_filtering\""),
+        "unhelpful error: {stderr}"
+    );
+}
+
+#[test]
 fn regression_fails_only_under_enforce() {
     let dir = temp_dir("enforce");
     let manifest = write_manifest(&dir, 500.0);
