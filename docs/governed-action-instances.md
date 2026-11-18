@@ -350,6 +350,15 @@ a plane without the RPC it falls back to `ListActionInstances` with
   and the `submit_action_instance` decision record carry the same fields as
   `approval_policy_scope`, `approval_rule`, `approvers`, and `approver_role`.
   Instances parked before this field existed have no `approval`.
+- **What the policy decided (#3016).** Every admission receipt's policy
+  event records what the resolved Action policy alone decided, before agent
+  autonomy, remediation, criteria, budget, or a freeze changed the instance:
+  `action_policy_decision` (`allow`, `deny`, `require_approval`, or `none`
+  when no policy resolved), `action_policy_rule`, `action_policy_scope`,
+  `action_policy_version` (a digest of the policy body), and `risk_class`.
+  `decision` keeps the final outcome, for example `auto_apply`. A grant or
+  deny of a parked instance keeps the admission's values. Receipts written
+  before this have none of them.
 - **Review queues (#1455).** A type may set `review_queue_id`, an optional
   numeric `review_threshold` on a parameter, an SLA, a pool, and escalation
   (`auto_deny` or `reassign`). Matching parked instances record the queue and

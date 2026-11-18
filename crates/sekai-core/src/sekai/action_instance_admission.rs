@@ -594,18 +594,13 @@ impl<'a> ActionInstanceAdmission<'a> {
             policy_stage.fail();
         }
         let resolved_policy = resolved_policy?;
-        let (policy_decision, policy_rule, policy_scope_label) = match &resolved_policy {
-            Some(policy) => {
-                let (decision, rule) =
-                    policy.decide_with_rule(SUBMIT_POLICY_ACTION, RiskClass::Write);
-                (decision, rule.to_string(), policy.scope.clone())
-            }
-            None => (
-                action_policy::ActionDecision::Allow,
-                String::new(),
-                String::new(),
-            ),
-        };
+        let policy_record = PolicyDecisionRecord::of(resolved_policy.as_ref());
+        // No resolved policy keeps the historical allow.
+        let policy_decision = policy_record
+            .decision
+            .unwrap_or(action_policy::ActionDecision::Allow);
+        let policy_rule = policy_record.rule.clone();
+        let policy_scope_label = policy_record.scope.clone();
         if policy_decision == action_policy::ActionDecision::Deny {
             policy_stage.refuse();
         }
@@ -1033,6 +1028,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             ontology_digest.clone(),
             budget_already_reserved,
             None,
+            Some(&policy_record),
             now,
         );
         // An admitted Action that wrote nothing commits at its receipt; a
@@ -1062,6 +1058,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                 ontology_digest,
                 budget_already_reserved,
                 None,
+                Some(&policy_record),
                 now,
             );
         }
@@ -1475,6 +1472,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             ontology_digest,
             instance.budget_decision != "deferred",
             Some(&approval),
+            None,
             now,
         ) {
             // Mirror admission: once the receipt records the approval the
@@ -1560,6 +1558,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             ontology_digest,
             false,
             Some(approval),
+            None,
             now,
         )?;
         self.remember_decision(&denied, approval.reason)?;
@@ -1881,12 +1880,14 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             type_def.policy_scope.clone()
         };
-        let policy_scope_label = self
+        // The abandoned attempt recorded no receipt; the policy in force now
+        // is the one this admission completes under.
+        let resolved_policy = self
             .db
             .resolve_action_policy(&instance.principal, &instance.namespace, &policy_project)
-            .map_err(ActionInstanceAdmissionError::Internal)?
-            .map(|policy| policy.scope)
-            .unwrap_or_default();
+            .map_err(ActionInstanceAdmissionError::Internal)?;
+        let policy_record = PolicyDecisionRecord::of(resolved_policy.as_ref());
+        let policy_scope_label = policy_record.scope.clone();
         let (budget_subject, budget_amount) = type_def
             .budget_charge(
                 &instance.namespace,
@@ -1907,6 +1908,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             instance.admission_ontology_digest.clone(),
             instance.admission_budget_already_reserved,
             None,
+            Some(&policy_record),
             now,
         )?;
         let present = applied.filter(|applied| applied.object_present);
@@ -2007,6 +2009,9 @@ impl<'a> ActionInstanceAdmission<'a> {
         ontology_digest: Option<String>,
         budget_already_reserved: bool,
         approval: Option<&ApprovalRecord<'_>>,
+        // `None` on a decision over a parked instance: the admission
+        // receipt's record is carried forward.
+        policy_record: Option<&PolicyDecisionRecord>,
         now: i64,
     ) -> Result<(), ActionInstanceAdmissionError> {
         #[cfg(test)]
@@ -2102,6 +2107,16 @@ impl<'a> ActionInstanceAdmission<'a> {
             ("decision".into(), stored.policy_decision.clone()),
             ("action".into(), SUBMIT_POLICY_ACTION.into()),
         ]);
+        let policy_record = match policy_record {
+            Some(record) => record.attributes(),
+            None => self
+                .db
+                .get_operation_receipt(operation_id)
+                .map_err(ActionInstanceAdmissionError::Internal)?
+                .map(|receipt| PolicyDecisionRecord::carried(&receipt))
+                .unwrap_or_default(),
+        };
+        policy_attributes.extend(policy_record);
         // A parked instance names what parked it and who may decide (#1867).
         if let Some(approval) = &stored.approval {
             for (key, value) in approval_attributes(approval) {
@@ -2697,6 +2712,89 @@ fn approval_attributes(approval: &ApprovalRequirement) -> Vec<(&'static str, Str
     .into_iter()
     .filter(|(_, value)| !value.is_empty())
     .collect()
+}
+
+/// What the resolved action policy alone decided for a submit, before
+/// autonomy, remediation, criteria, budget or a freeze changed the instance.
+/// The admission receipt's `PolicyDecided` event carries it, so a candidate
+/// policy can be replayed against past submits (#3016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyDecisionRecord {
+    /// `None` when no policy resolved; recorded as `none`.
+    decision: Option<action_policy::ActionDecision>,
+    rule: String,
+    scope: String,
+    version: String,
+}
+
+/// Receipt attribute keys of a `PolicyDecisionRecord`, in `attributes` order.
+const POLICY_RECORD_KEYS: [&str; 5] = [
+    "action_policy_decision",
+    "action_policy_rule",
+    "action_policy_scope",
+    "action_policy_version",
+    "risk_class",
+];
+
+impl PolicyDecisionRecord {
+    fn of(policy: Option<&action_policy::ActionPolicy>) -> Self {
+        match policy {
+            Some(policy) => {
+                let (decision, rule) =
+                    policy.decide_with_rule(SUBMIT_POLICY_ACTION, RiskClass::Write);
+                Self {
+                    decision: Some(decision),
+                    rule: rule.to_string(),
+                    scope: policy.scope.clone(),
+                    version: policy.version(),
+                }
+            }
+            None => Self {
+                decision: None,
+                rule: String::new(),
+                scope: String::new(),
+                version: String::new(),
+            },
+        }
+    }
+
+    fn attributes(&self) -> Vec<(String, String)> {
+        let values = [
+            self.decision
+                .map_or("none", action_policy::ActionDecision::as_str)
+                .into(),
+            self.rule.clone(),
+            self.scope.clone(),
+            self.version.clone(),
+            RiskClass::Write.as_str().into(),
+        ];
+        POLICY_RECORD_KEYS
+            .iter()
+            .map(|key| key.to_string())
+            .zip(values)
+            .collect()
+    }
+
+    /// The record an earlier receipt for the same operation carries; empty
+    /// for a receipt written before #3016.
+    fn carried(receipt: &OperationReceipt) -> Vec<(String, String)> {
+        let Some(event) = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+        else {
+            return Vec::new();
+        };
+        POLICY_RECORD_KEYS
+            .iter()
+            .filter_map(|key| {
+                event
+                    .attributes
+                    .get(*key)
+                    .map(|value| (key.to_string(), value.clone()))
+            })
+            .collect()
+    }
 }
 
 /// What a takeover found for an abandoned reservation.
@@ -5693,6 +5791,128 @@ mod tests {
                 )
                 .unwrap()
                 .replay
+        );
+    }
+
+    /// The `PolicyDecisionRecord` attributes on an operation's receipt.
+    fn policy_record_on_receipt(db: &RuntimeDb, operation_id: &str) -> HashMap<String, String> {
+        let receipt = db.get_operation_receipt(operation_id).unwrap().unwrap();
+        let event = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+            .unwrap();
+        POLICY_RECORD_KEYS
+            .iter()
+            .filter_map(|key| {
+                event
+                    .attributes
+                    .get(*key)
+                    .map(|value| (key.to_string(), value.clone()))
+            })
+            .collect()
+    }
+
+    fn expected_policy_record(
+        decision: &str,
+        rule: &str,
+        policy: Option<&crate::sekai::action_policy::ActionPolicy>,
+    ) -> HashMap<String, String> {
+        HashMap::from([
+            ("action_policy_decision".into(), decision.into()),
+            ("action_policy_rule".into(), rule.into()),
+            (
+                "action_policy_scope".into(),
+                policy
+                    .map(|policy| policy.scope.clone())
+                    .unwrap_or_default(),
+            ),
+            (
+                "action_policy_version".into(),
+                policy.map(|policy| policy.version()).unwrap_or_default(),
+            ),
+            ("risk_class".into(), "write".into()),
+        ])
+    }
+
+    #[test]
+    fn the_receipt_records_what_the_action_policy_alone_decided() {
+        use crate::sekai::action_policy::{ActionDecision, ActionPolicy};
+
+        // Parked by a risk override; the grant rewrites the receipt and keeps
+        // the admission's record.
+        let db = approval_setup("create", &["bob"]);
+        let mut policy = db.get_action_policy("acme").unwrap().unwrap();
+        policy
+            .risk_overrides
+            .insert(RiskClass::Write, ActionDecision::RequireApproval);
+        db.upsert_action_policy(&policy).unwrap();
+        let admission = ActionInstanceAdmission::new(&db, None);
+        let parked = admission
+            .admit(
+                record_request("customer.record.create", r#"{"object_id":"rec-30"}"#),
+                "alice",
+                10,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(parked.status, STATUS_PARKED);
+        let parked_record =
+            expected_policy_record("require_approval", "risk_override:write", Some(&policy));
+        assert_eq!(
+            policy_record_on_receipt(&db, &parked.operation_id),
+            parked_record
+        );
+        // The policy changes before the grant; the record names the one
+        // that decided the submit.
+        policy.action_overrides.insert(
+            "unrelated".into(),
+            crate::sekai::action_policy::ActionDecision::Deny,
+        );
+        db.upsert_action_policy(&policy).unwrap();
+        let granted = admission
+            .decide(
+                decision(&parked.instance_id, DECISION_GRANT, "bob"),
+                "bob",
+                11,
+            )
+            .unwrap()
+            .instance;
+        assert_eq!(granted.status, STATUS_ADMITTED);
+        assert_eq!(
+            policy_record_on_receipt(&db, &parked.operation_id),
+            parked_record
+        );
+
+        // Denied by the default; allowed by the default.
+        for (default, decision_text, status) in [
+            (ActionDecision::Deny, "deny", STATUS_DENIED),
+            (ActionDecision::Allow, "allow", STATUS_ADMITTED),
+        ] {
+            let db = setup();
+            let mut policy = ActionPolicy::allow_all("acme");
+            policy.default_decision = default;
+            db.upsert_action_policy(&policy).unwrap();
+            let instance = ActionInstanceAdmission::new(&db, None)
+                .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+                .unwrap()
+                .instance;
+            assert_eq!(instance.status, status);
+            assert_eq!(
+                policy_record_on_receipt(&db, &instance.operation_id),
+                expected_policy_record(decision_text, "default_decision", Some(&policy))
+            );
+        }
+
+        // No policy resolved.
+        let db = setup();
+        let instance = ActionInstanceAdmission::new(&db, None)
+            .admit(request(r#"{"runtime":"shikigami"}"#), "alice", 10)
+            .unwrap()
+            .instance;
+        assert_eq!(
+            policy_record_on_receipt(&db, &instance.operation_id),
+            expected_policy_record("none", "", None)
         );
     }
 
