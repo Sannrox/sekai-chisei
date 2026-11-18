@@ -25,8 +25,10 @@ closed result states, and the fixed reducer.
 Evaluator definitions register metadata and an exact implementation digest;
 they never upload code. A deployable evaluator is either a compiled Rust
 `DeterministicEvaluator` or an operator-deployed `external_adapter/v1` endpoint
-registered under that exact digest. The shipped server registers one deliberately
-narrow implementation:
+registered under that exact digest. The shipped server registers the
+parameterized output checks listed in
+[Built-in evaluators](evaluation-plans.md#built-in-evaluators) and one
+subject-identity check:
 `subject_content_digest_equals.v1`
 (`sha256:fb7617ab821a130efe66c43a22df2923e4648c1cb58ae2d793b958a31e94f155`).
 The registry also retains the previously published
@@ -243,7 +245,9 @@ receipts. Partially completed receipts remain resumable by a compatible
 executor; otherwise they remain readable evidence and correctly do not produce
 `allow`.
 
-Metrics expose only evaluator labels (`subject_digest_equality`,
+Metrics expose only evaluator labels (`subject_digest_equality`, the
+built-in kinds `exact_match`, `regex_match`, `numeric_range`, `date_range`,
+`edit_distance`, `token_overlap`, and `size_bounds`,
 `bounded_rubric_score`, `external_adapter`, or `custom_builtin` /
 `custom_stochastic` for unlabelled registrations),
 version labels, the closed status vocabulary, and latency. They contain no namespace,

@@ -138,6 +138,58 @@ values are required.
 This supports situation-specific tuning without admitting executable
 expressions or an open-ended schema engine.
 
+## Built-in evaluators
+
+The production registry compiles these parameterized deterministic
+evaluators. A definition selects one by naming its exact implementation digest
+with `deterministic_builtin/v1`, and its `parameter_schema_json` must equal the
+built-in's published schema (below), or publication fails. Plan publication
+also checks each node's parameters semantically (the pattern compiles, bounds
+are ordered, dates parse), so invalid parameters never reach execution.
+
+Each built-in reads one value from every bound evidence item's content at the
+JSON Pointer `path` (`""` is the whole document). The step passes only when
+every item passes. No bound evidence is `unknown` (`evidence_missing`); an
+absent value is `fail` (`value_missing`), and a value of the wrong type is
+`fail` (`value_type_mismatch`). Bounds are inclusive. Optional booleans
+default to `false`.
+
+| Kind | Digest | Parameters | Fails with |
+| --- | --- | --- | --- |
+| `exact_match.v1` | `sha256:0c63c8a1dac4e3a7db0022dcb10aef2154812ecd804fde881d609533dc057bd4` | `path`, `expected` (at most 4096 characters), `ignore_case`, `normalize_whitespace` | `value_mismatch` |
+| `regex_match.v1` | `sha256:027d48a71422eba2f48077a1d8d137aac946ef5a67d8a72c48459f469c35902f` | `path`, `pattern` (1 to 1024 characters), `ignore_case` | `pattern_not_matched` |
+| `numeric_range.v1` | `sha256:c3138ddbe9bda3dd3aad8e6cf970de103bc5dc868a4ee5d7d4278effa2458a16` | `path`, `minimum`, `maximum` (at least one) | `value_out_of_range` |
+| `date_range.v1` | `sha256:b53319ef47f40ea77672a92d18fb38e5311489a4154675ee8639a91e42123429` | `path`, `not_before`, `not_after` (at least one) | `value_out_of_range` |
+| `edit_distance.v1` | `sha256:65760e10a0f3b36d1bc718467a4330cd6d4592ca6139a9cf7627e94a924393e0` | `path`, `expected` (at most 4096 characters), `max_normalized_distance` (0 to 1), `ignore_case`, `normalize_whitespace` | `distance_exceeded` |
+| `token_overlap.v1` | `sha256:4277adf08bf9649c62d4e166f19c07c574bd28ae373654729a6ff9599881c1ed` | `path`, `reference` (at most 16384 characters, at least `n` tokens), `n` (1 to 4), `min_recall` (0 to 1), `ignore_case` | `overlap_below_minimum` |
+| `size_bounds.v1` | `sha256:671f12059f6d74eaff3430fe635fe5d537a4deb41e10b07584c5d9b61472265f` | `path`, `min_items`, `max_items` (at least one, 0 to 1000000), `distinct` | `size_out_of_bounds` |
+
+Each digest is SHA-256 of `chisei.builtin-evaluator/<kind>`. Changed
+behavior ships as a new kind version and digest beside the old one; the
+published digests stay executable.
+
+- **Text normalization.** `ignore_case` is Unicode lowercase and
+  `normalize_whitespace` trims and collapses Unicode whitespace to one space.
+  Neither depends on locale.
+- **Regular expressions** search the value (anchor with `^` and `$` for a full
+  match). The engine matches in time linear in the input and has no
+  backreferences or lookaround. A pattern whose compiled program exceeds the
+  size or nesting limit is refused at plan publication.
+- **Numbers** compare as IEEE-754 doubles. A value must be a JSON number.
+- **Dates** are RFC 3339 date-times or `YYYY-MM-DD` calendar dates, which
+  compare as midnight UTC. A value must be a string in one of those forms.
+- **Edit distance** is Levenshtein distance over Unicode scalar values divided
+  by the longer text's length. A value longer than 16384 characters whose
+  length alone does not decide the result is an `error` step.
+- **Token overlap** splits on non-alphanumeric characters and reports
+  clipped recall: the share of the reference's `n`-grams found in the value,
+  each counted at most as often as it appears in the value.
+- **Size bounds** require a JSON array. With `distinct`, items count once per
+  canonical JSON value.
+
+To read the exact schema for a digest, see `builtin_parameter_schema` in
+`crates/chisei-core/src/chisei/builtin_evaluators.rs`.
+
 ## Availability, disabling, and superseding
 
 Definitions are immutable. Availability is a separate mutable, audited record

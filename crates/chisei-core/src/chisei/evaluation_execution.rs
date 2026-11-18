@@ -968,6 +968,7 @@ pub fn production_evaluator_registry() -> Result<DeterministicEvaluatorRegistry,
             predicate_kind: SUBJECT_CONTENT_DIGEST_EQUALITY_PREDICATE,
         }),
     )?;
+    crate::chisei::builtin_evaluators::register_builtin_evaluators(&registry)?;
     Ok(registry)
 }
 
@@ -2931,7 +2932,7 @@ fn validate_metrics_label(field: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn canonicalize_value(value: &mut Value) {
+pub(crate) fn canonicalize_value(value: &mut Value) {
     match value {
         Value::Object(object) => {
             let mut ordered = BTreeMap::new();
