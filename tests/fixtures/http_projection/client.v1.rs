@@ -68,6 +68,7 @@ pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
         ("sekai.SekaiService", "DeleteGrant"),
         ("sekai.SekaiService", "ListGrants"),
         ("sekai.SekaiService", "CheckAccess"),
+        ("sekai.SekaiService", "RecordDecision"),
         ("sekai.SekaiService", "PutGovernedActionType"),
         ("sekai.SekaiService", "SubmitActionInstance"),
         ("sekai.SekaiService", "DecideActionInstance"),

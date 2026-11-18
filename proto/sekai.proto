@@ -6029,6 +6029,12 @@ service SekaiService {
   rpc ListWriteFreezes(ListWriteFreezesRequest) returns (ListWriteFreezesResponse);
   rpc EnsureTeamNamespace(EnsureTeamNamespaceRequest) returns (EnsureTeamNamespaceResponse);
 
+  // Appends one decision to the audit log as the caller. A target needs
+  // namespace access and write on the object. Limits: id 128 bytes,
+  // action, outcome and target_id 256 bytes, reason 4096 bytes, evidence
+  // 64 entries and 32 KiB of keys plus values; larger input is
+  // INVALID_ARGUMENT. Replaying an id with the same content returns the
+  // stored decision; other content under that id is ALREADY_EXISTS.
   rpc RecordDecision(RecordDecisionRequest) returns (RecordDecisionResponse);
   rpc ListDecisions(ListDecisionsRequest) returns (ListDecisionsResponse);
   rpc ListObjectChanges(ListObjectChangesRequest) returns (ListObjectChangesResponse);
