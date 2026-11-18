@@ -200,6 +200,9 @@ pub async fn run_report(
         .await?
         .into_inner();
 
+    if let Some(warning) = truncation_warning(resp.rows.len(), config.limit) {
+        eprintln!("{warning}");
+    }
     if let Some(path) = &config.html_output {
         let html = render_dashboard(&resp.rows, config.since_ms);
         std::fs::write(path, html)?;
@@ -209,6 +212,17 @@ pub async fn run_report(
         print_report(config.group_by, &rows);
     }
     Ok(())
+}
+
+/// Warning for a report whose row cap was reached, so partial totals are not read as
+/// complete. `limit` 0 means no cap, so it never warns.
+fn truncation_warning(rows: usize, limit: i32) -> Option<String> {
+    (limit > 0 && rows == limit as usize).then(|| {
+        format!(
+            "warning: the report reached --limit {limit}, so totals cover only the first {rows} \
+             rows in the window; rerun with a higher --limit (or 0 for no cap)"
+        )
+    })
 }
 
 pub fn render_egress_html(rows: &[Row]) -> String {
@@ -842,6 +856,13 @@ pub fn report_usage() -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn reaching_the_row_limit_warns_that_totals_are_partial() {
+        assert!(truncation_warning(10_000, 10_000).is_some());
+        assert!(truncation_warning(9_999, 10_000).is_none());
+        assert!(truncation_warning(10_000, 0).is_none());
+    }
 
     #[test]
     fn parses_report_args() {
