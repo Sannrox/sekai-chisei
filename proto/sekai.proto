@@ -2095,18 +2095,56 @@ message PolicySimulationDifference {
   string current_outcome = 5;
   string candidate_outcome = 6;
 }
+// A grant the simulation adds: `principal` gets `role` on `object_id`,
+// until `not_after_ms` (0 never expires). It replaces a stored grant on the
+// same object and principal, as CreateGrant does.
+message CandidateGrant {
+  string object_id = 1;
+  string principal = 2;
+  string role = 3;
+  int64 not_after_ms = 4;
+}
+// What one principal reads of one object kind, current versus candidate.
+// Counts cover every object of the kind in the namespace that the caller may
+// read, also when `differences` is truncated.
+message PolicySimulationKindSummary {
+  string principal = 1;
+  string object_kind = 2;
+  uint64 current_readable = 3;
+  uint64 candidate_readable = 4;
+  // Objects the candidate refuses, by the check that refused them:
+  // namespace_membership, object_grant, marking, object_row, purpose, ...
+  map<string, uint64> candidate_denied_by = 5;
+  // Candidate-readable objects that still hide a property, by property
+  // name; the object policy's property grants hide them.
+  map<string, uint64> candidate_hidden_properties = 6;
+}
 message SimulateObjectPolicyChangeRequest {
   string namespace = 1;
   repeated ObjectSecurityPolicyBinding candidate_policies = 2;
   string operation = 3;
   repeated string principals = 4;
+  // Maximum `differences` rows returned (default and cap 10000).
   int32 limit = 5;
+  // Candidate grant changes, applied over the stored grants. Each grant is
+  // on an object in `namespace`, its namespace boundary, or the principal
+  // profile of a simulated principal. Without candidate_policies the
+  // candidate keeps the active policies.
+  repeated CandidateGrant add_grants = 6;
+  repeated string remove_grant_ids = 7;
 }
 message SimulateObjectPolicyChangeResponse {
   string namespace = 1;
   string current_activation_digest = 2;
   string candidate_digest = 3;
   repeated PolicySimulationDifference differences = 4;
+  repeated PolicySimulationKindSummary kind_summaries = 5;
+  // The grant changes this server applied. A server that predates grant
+  // simulation leaves both empty, so a client can tell it was ignored.
+  repeated CandidateGrant applied_add_grants = 6;
+  repeated string applied_remove_grant_ids = 7;
+  // True when more differences exist than `limit` returned.
+  bool differences_truncated = 8;
 }
 // Candidate marking rule for a counterfactual view: objects of `kind` whose
 // properties equal every `property_equals` entry carry `marking` instead.

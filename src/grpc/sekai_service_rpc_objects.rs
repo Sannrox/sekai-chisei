@@ -534,135 +534,6 @@ pub(super) async fn get_classification_lattice(
     }))
 }
 
-pub(super) async fn simulate_object_policy_change(
-    service: &SekaiServiceImpl,
-    req: Request<SimulateObjectPolicyChangeRequest>,
-) -> Result<Response<SimulateObjectPolicyChangeResponse>, Status> {
-    let principals = caller_principals(&req);
-    require_authenticated(&principals)?;
-    require_credential_admin(&principals)?;
-    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
-    let input = req.into_inner();
-    enforce_namespace_tenant_context(
-        service.db.runtime(),
-        tenant_context.as_ref(),
-        &input.namespace,
-        false,
-    )?;
-    check_team_namespace(service.db.runtime(), &principals, &input.namespace, false)?;
-    let operation = if input.operation.trim().is_empty() {
-        crate::sekai::object_security::ObjectSecurityOperation::Read
-    } else {
-        crate::sekai::object_security::ObjectSecurityOperation::parse(&input.operation)
-            .map_err(Status::invalid_argument)?
-    };
-    let current_activation = service
-        .db
-        .runtime()
-        .get_object_security_activation(&input.namespace)
-        .map_err(map_object_security_error)?;
-    let current = snapshot_from_activation(
-        service.db.runtime(),
-        &input.namespace,
-        current_activation.as_ref(),
-    )?;
-    let mut candidate_policies = BTreeMap::new();
-    for binding in &input.candidate_policies {
-        if binding.kind.trim().is_empty() || binding.revision_digest.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "each candidate policy kind and revision is required",
-            ));
-        }
-        let revision = service
-            .db
-            .runtime()
-            .get_object_security_policy(&input.namespace, &binding.revision_digest)
-            .map_err(map_object_security_error)?
-            .ok_or_else(|| Status::not_found("candidate policy revision not found"))?;
-        let policy = crate::sekai::object_security::ObjectSecurityPolicy::from_canonical_input(
-            &revision.canonical_policy_json,
-        )
-        .map_err(Status::invalid_argument)?;
-        if policy.kind != binding.kind {
-            return Err(Status::invalid_argument(
-                "candidate policy kind does not match stored revision",
-            ));
-        }
-        if candidate_policies
-            .insert(binding.kind.clone(), policy)
-            .is_some()
-        {
-            return Err(Status::invalid_argument(
-                "each candidate policy kind must appear exactly once",
-            ));
-        }
-    }
-    let candidate = crate::sekai::policy_decision::PolicySnapshot {
-        namespace: input.namespace.clone(),
-        activation_digest: "candidate".into(),
-        policies: candidate_policies,
-        lattice: current.lattice.clone(),
-    };
-    let objects = service
-        .db
-        .runtime()
-        .list_objects(&crate::domain::ListFilter {
-            namespace: Some(input.namespace.clone()),
-            limit: if input.limit > 0 { input.limit } else { 10_000 },
-            ..crate::domain::ListFilter::default()
-        })
-        .map_err(Status::internal)?;
-    let mut simulated = Vec::new();
-    let named = if input.principals.is_empty() {
-        principals.clone()
-    } else {
-        input.principals.clone()
-    };
-    for principal in named {
-        let authority =
-            resolve_principal_authority(service.db.runtime(), std::slice::from_ref(&principal))?;
-        simulated.push(crate::sekai::policy_decision::SimulatedPrincipal {
-            principal: principal.clone(),
-            context: crate::sekai::object_security::PrincipalPolicyContext {
-                delegated_subject: None,
-                subjects: vec![principal],
-                scopes: Vec::new(),
-            }
-            .normalized(),
-            authority,
-            purpose: None,
-            purpose_authorization: None,
-            namespace_granted: true,
-        });
-    }
-    let report = crate::sekai::policy_decision::simulate_policy_change(
-        &objects,
-        &simulated,
-        &current,
-        &candidate,
-        operation,
-        now_millis(),
-    )
-    .map_err(Status::internal)?;
-    Ok(Response::new(SimulateObjectPolicyChangeResponse {
-        namespace: report.namespace,
-        current_activation_digest: report.current_activation_digest,
-        candidate_digest: report.candidate_digest,
-        differences: report
-            .differences
-            .into_iter()
-            .map(|diff| PolicySimulationDifference {
-                principal: diff.principal,
-                object_id: diff.object_id,
-                object_kind: diff.object_kind,
-                property: diff.property,
-                current_outcome: diff.current_outcome.as_str().into(),
-                candidate_outcome: diff.candidate_outcome.as_str().into(),
-            })
-            .collect(),
-    }))
-}
-
 /// Rebuild a namespace's objects as of a past time and compare each
 /// principal's view under the rules in effect then with the candidate rules.
 /// Read-only and recorded as a decision. Rules changed after `as_of_ms` fail
@@ -1048,7 +919,7 @@ pub(super) async fn query_object_policy_audit(
     }))
 }
 
-fn snapshot_from_activation(
+pub(super) fn snapshot_from_activation(
     db: &crate::db::runtime_db::RuntimeDb,
     namespace: &str,
     activation: Option<&crate::sekai::object_security::ObjectSecurityActivation>,
@@ -1231,7 +1102,7 @@ mod policy_decision_rpc_tests {
         .await
         .unwrap();
 
-        let simulated = simulate_object_policy_change(
+        let simulated = super::super::policy_simulation_rpc::simulate_object_policy_change(
             &svc,
             admin(SimulateObjectPolicyChangeRequest {
                 namespace: "acme".into(),
@@ -1242,6 +1113,7 @@ mod policy_decision_rpc_tests {
                 operation: "read".into(),
                 principals: vec!["alice".into(), "bob".into()],
                 limit: 100,
+                ..Default::default()
             }),
         )
         .await

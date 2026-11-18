@@ -341,13 +341,59 @@ pub(super) fn check_object_acl_with_audit(
     tenant_context: Option<&RequestEnterpriseContext>,
     operation: crate::sekai::object_security::ObjectSecurityOperation,
 ) -> Result<(), Status> {
-    let read = matches!(
+    check_object_acl_with_audit_in(
+        db,
+        security,
+        ReadGrants::Stored,
+        object_id,
+        principals,
+        tenant_context,
+        operation,
+    )
+}
+
+/// True when `operation` only reads, so ACL and team checks take the read role.
+pub(super) fn operation_reads(
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> bool {
+    matches!(
         operation,
         crate::sekai::object_security::ObjectSecurityOperation::Read
             | crate::sekai::object_security::ObjectSecurityOperation::Traverse
             | crate::sekai::object_security::ObjectSecurityOperation::Query
             | crate::sekai::object_security::ObjectSecurityOperation::Export
-    );
+    )
+}
+
+/// [`check_object_acl_with_audit`] over `grants`. Stored grants use the
+/// service's grant cache; an overlay checks the object's grants with the
+/// candidate changes applied, by the same rules.
+pub(super) fn check_object_acl_with_audit_in(
+    db: &RuntimeDb,
+    security: &SecurityChecker,
+    grants: ReadGrants<'_>,
+    object_id: &str,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+) -> Result<(), Status> {
+    let read = operation_reads(operation);
+    if let ReadGrants::Overlay(_) = grants {
+        let overlaid = SecurityChecker::new();
+        let object_grants = grants.on_object(db, object_id)?;
+        // No ACL is world-readable except a scratch output, which fails closed.
+        if object_grants.is_empty()
+            && crate::sekai::adhoc_transform::is_scratch_object_id(object_id)
+        {
+            return Err(Status::permission_denied("access denied"));
+        }
+        overlaid.load(&object_grants);
+        return if read {
+            check_read(&overlaid, object_id, principals)
+        } else {
+            check_write(&overlaid, object_id, principals)
+        };
+    }
     // A scratch output is checked against its stored grants; only its id
     // shape costs a store read.
     let scratch = if crate::sekai::adhoc_transform::is_scratch_object_id(object_id) {
@@ -378,6 +424,15 @@ pub(super) fn resolve_principal_authority(
     db: &RuntimeDb,
     principals: &[String],
 ) -> Result<markings::PrincipalAuthority, Status> {
+    resolve_principal_authority_in(db, ReadGrants::Stored, principals)
+}
+
+/// [`resolve_principal_authority`] with profile admin grants from `grants`.
+pub(super) fn resolve_principal_authority_in(
+    db: &RuntimeDb,
+    grants: ReadGrants<'_>,
+    principals: &[String],
+) -> Result<markings::PrincipalAuthority, Status> {
     let primary = principals.first().map(String::as_str).unwrap_or_default();
     let external_id = markings::principal_profile_external_id(primary);
     // Prefer an explicit kind-matched sealed profile over any colliding
@@ -397,8 +452,8 @@ pub(super) fn resolve_principal_authority(
         {
             continue;
         }
-        let grants = db.list_grants(&object.id).map_err(Status::internal)?;
         if grants
+            .on_object(db, &object.id)?
             .iter()
             .any(crate::sekai::security::grant_is_live_admin)
         {
@@ -555,10 +610,11 @@ pub(super) fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Re
 
 fn principal_has_explicit_object_grant(
     db: &RuntimeDb,
+    grants: ReadGrants<'_>,
     object_id: &str,
     principals: &[String],
 ) -> Result<bool, Status> {
-    let grants = db.list_grants(object_id).map_err(Status::internal)?;
+    let grants = grants.on_object(db, object_id)?;
     if grants.is_empty() {
         return Ok(false);
     }
@@ -573,12 +629,24 @@ fn evaluate_object_marking(
     principals: &[String],
     operation_id: &str,
 ) -> Result<markings::MarkingCheckResult, Status> {
+    evaluate_object_marking_in(db, ReadGrants::Stored, object, principals, operation_id)
+}
+
+/// [`evaluate_object_marking`] with explicit and profile grants from `grants`.
+pub(super) fn evaluate_object_marking_in(
+    db: &RuntimeDb,
+    grants: ReadGrants<'_>,
+    object: &domain::Object,
+    principals: &[String],
+    operation_id: &str,
+) -> Result<markings::MarkingCheckResult, Status> {
     if markings::object_marking_token(object).is_none() {
         let deny_unmarked = deny_unmarked_for_namespace(db, &object.namespace)?;
         let trusted = principals
             .iter()
             .any(|principal| markings::is_trusted_service_principal(principal));
-        let explicit_grant = principal_has_explicit_object_grant(db, &object.id, principals)?;
+        let explicit_grant =
+            principal_has_explicit_object_grant(db, grants, &object.id, principals)?;
         let decision_id = format!(
             "marking:{operation_id}:{}",
             uuid::Uuid::new_v4().as_simple()
@@ -596,7 +664,7 @@ fn evaluate_object_marking(
         });
     }
     let lattice = load_classification_lattice(db, &object.namespace)?;
-    let authority = resolve_principal_authority(db, principals)?;
+    let authority = resolve_principal_authority_in(db, grants, principals)?;
     Ok(
         crate::sekai::classification_lattice::evaluate_lattice_access(
             operation_id,
@@ -894,6 +962,39 @@ fn decide_object_access_cached(
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
     policy: PolicyCache<'_>,
 ) -> Result<crate::sekai::policy_decision::PolicyDecision, Status> {
+    decide_object_access_in(
+        db,
+        ReadGrants::Stored,
+        object,
+        principals,
+        tenant_context,
+        operation,
+        purpose,
+        policy,
+    )
+    .map(|(decision, _)| decision)
+}
+
+/// The object policy decision with marking clearance and the delegate's
+/// grants read from `grants`. Also returns the compiled access, which
+/// projects visible properties; `None` when the active policy is refused.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decide_object_access_in(
+    db: &RuntimeDb,
+    grants: ReadGrants<'_>,
+    object: &domain::Object,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    operation: crate::sekai::object_security::ObjectSecurityOperation,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    policy: PolicyCache<'_>,
+) -> Result<
+    (
+        crate::sekai::policy_decision::PolicyDecision,
+        Option<crate::sekai::policy_decision::CompiledObjectAccess>,
+    ),
+    Status,
+> {
     let fetched_policy;
     let policy = match policy {
         PolicyCache::Resolved(policy) => policy,
@@ -901,7 +1002,7 @@ fn decide_object_access_cached(
             fetched_policy = match db.active_object_policy(&object.namespace, &object.kind) {
                 Ok(policy) => policy,
                 Err(error) if error.starts_with("object_security_denied") => {
-                    return Ok(crate::sekai::policy_decision::PolicyDecision {
+                    let denied = crate::sekai::policy_decision::PolicyDecision {
                         contract_version: crate::sekai::policy_decision::POLICY_DECISION_CONTRACT
                             .into(),
                         namespace: object.namespace.clone(),
@@ -914,7 +1015,8 @@ fn decide_object_access_cached(
                         policy_revision_digest: String::new(),
                         outcome: crate::sekai::policy_decision::PolicyOutcome::Deny,
                         denied_by: Some(crate::sekai::policy_decision::PolicyLayer::ObjectRow),
-                    });
+                    };
+                    return Ok((denied, None));
                 }
                 Err(_) => return Err(Status::unavailable("object authorization unavailable")),
             };
@@ -922,7 +1024,7 @@ fn decide_object_access_cached(
         }
     };
     let lattice = load_classification_lattice(db, &object.namespace)?;
-    let authority = resolve_principal_authority(db, principals)?;
+    let authority = resolve_principal_authority_in(db, grants, principals)?;
     let context = principal_policy_context_from(principals, tenant_context);
     let activation = db
         .get_object_security_activation(&object.namespace)
@@ -983,31 +1085,29 @@ fn decide_object_access_cached(
     {
         let actor_principals = std::slice::from_ref(actor);
         let security = SecurityChecker::new();
-        security.load(&db.list_grants(&object.id).map_err(Status::internal)?);
-        let write = !matches!(
-            operation,
-            crate::sekai::object_security::ObjectSecurityOperation::Read
-                | crate::sekai::object_security::ObjectSecurityOperation::Traverse
-                | crate::sekai::object_security::ObjectSecurityOperation::Query
-                | crate::sekai::object_security::ObjectSecurityOperation::Export
-        );
+        security.load(&grants.on_object(db, &object.id)?);
+        let write = !operation_reads(operation);
         let acl_allowed = if write {
             check_write(&security, &object.id, actor_principals).is_ok()
         } else {
             check_read(&security, &object.id, actor_principals).is_ok()
         };
         if !acl_allowed
-            || check_team_namespace(db, actor_principals, &object.namespace, write).is_err()
+            || check_team_namespace_in(db, grants, actor_principals, &object.namespace, write)
+                .is_err()
         {
             decision.outcome = crate::sekai::policy_decision::PolicyOutcome::Deny;
             decision.denied_by = Some(crate::sekai::policy_decision::PolicyLayer::NamespaceGrant);
-        } else if !object_passes_marking(db, object, actor_principals)? {
+        } else if evaluate_object_marking_in(db, grants, object, actor_principals, "visibility")?
+            .decision
+            == markings::MarkingDecision::Deny
+        {
             decision.outcome = crate::sekai::policy_decision::PolicyOutcome::Deny;
             decision.denied_by = Some(crate::sekai::policy_decision::PolicyLayer::Marking);
         }
     }
     record_delegated_policy_decision(db, &context, &object.id, operation, decision.outcome)?;
-    Ok(decision)
+    Ok((decision, Some(compiled)))
 }
 pub(super) fn record_delegated_policy_decision(
     db: &RuntimeDb,
@@ -1183,41 +1283,18 @@ pub(super) fn require_visible_object_contents(
     operation_id: &str,
     purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
 ) -> Result<(domain::Object, markings::MarkingCheckResult), Status> {
-    if is_reserved_governance_kind(&object.kind)
-        || !collaboration_object_permitted(
-            db,
-            tenant_context,
-            &object,
-            crate::enterprise::NamespaceAction::Read,
-        )?
-    {
-        return Err(Status::not_found("not found"));
-    }
-    check_team_namespace(db, principals, &object.namespace, false)?;
-    check_object_acl_with_audit(
-        db,
-        security,
-        &object.id,
+    let request = ReadRequest {
         principals,
         tenant_context,
-        crate::sekai::object_security::ObjectSecurityOperation::Read,
-    )?;
-    if let Some(allowed) = evaluate_active_object_policy(
-        db,
-        &object,
-        principals,
-        tenant_context,
-        crate::sekai::object_security::ObjectSecurityOperation::Read,
+        operation: crate::sekai::object_security::ObjectSecurityOperation::Read,
         purpose,
-    )
-    .map_err(hide_read_root_as_missing)?
-    {
-        if !allowed {
-            return Err(Status::not_found("not found"));
-        }
+        operation_id,
+        policy: PolicyCache::Fetch,
+    };
+    match effective_object_read(db, security, ReadGrants::Stored, &object, &request)? {
+        ReadDecision::Allowed { marking, .. } => Ok((object, marking)),
+        ReadDecision::Denied { status, .. } => Err(status),
     }
-    let marking = enforce_object_marking_access(db, &object, principals, operation_id)?;
-    Ok((object, marking))
 }
 pub(super) fn retain_reachable_visible_objects(
     start_id: &str,
@@ -1639,6 +1716,15 @@ pub(super) fn team_namespace_memberships(
     db: &RuntimeDb,
     principals: &[String],
 ) -> Result<Vec<(String, security::Role)>, Status> {
+    team_namespace_memberships_in(db, ReadGrants::Stored, principals)
+}
+
+/// [`team_namespace_memberships`] with namespace grants from `grants`.
+fn team_namespace_memberships_in(
+    db: &RuntimeDb,
+    grants: ReadGrants<'_>,
+    principals: &[String],
+) -> Result<Vec<(String, security::Role)>, Status> {
     if principals
         .iter()
         .any(|principal| matches!(principal.as_str(), "root" | "local"))
@@ -1647,10 +1733,7 @@ pub(super) fn team_namespace_memberships(
     }
     let mut memberships = Vec::new();
     for principal in principals {
-        memberships.extend(
-            db.list_namespace_roles_for_principal(principal)
-                .map_err(Status::internal)?,
-        );
+        memberships.extend(grants.namespace_roles(db, principal)?);
     }
     Ok(memberships)
 }
@@ -1673,6 +1756,17 @@ pub(super) fn is_managed_team_principal(
 }
 pub(super) fn check_team_namespace(
     db: &RuntimeDb,
+    principals: &[String],
+    namespace: &str,
+    write: bool,
+) -> Result<(), Status> {
+    check_team_namespace_in(db, ReadGrants::Stored, principals, namespace, write)
+}
+
+/// [`check_team_namespace`] with namespace memberships from `grants`.
+pub(super) fn check_team_namespace_in(
+    db: &RuntimeDb,
+    grants: ReadGrants<'_>,
     principals: &[String],
     namespace: &str,
     write: bool,
@@ -1705,7 +1799,7 @@ pub(super) fn check_team_namespace(
     if !team_managed_namespace && !is_managed_team_principal(db, principals)? {
         return Ok(());
     }
-    let memberships = team_namespace_memberships(db, principals)?;
+    let memberships = team_namespace_memberships_in(db, grants, principals)?;
     let authorized = memberships.iter().any(|(member_namespace, role)| {
         member_namespace == canonical
             && (!write || matches!(role, security::Role::Editor | security::Role::Admin))
