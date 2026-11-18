@@ -304,6 +304,8 @@ dependencies = [
  "http",
  "metrics",
  "metrics-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "postgres",
  "regex",
  "reqwest 0.12.28",
@@ -320,6 +322,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2850,6 +2854,8 @@ dependencies = [
  "mikura-host",
  "mikura-ingest",
  "native-tls",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "pin-project-lite",
  "postgres",
  "postgres-native-tls",
@@ -2887,6 +2893,7 @@ dependencies = [
  "tonic-prost",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
 ]

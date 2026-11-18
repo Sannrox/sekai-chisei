@@ -119,6 +119,26 @@ pub fn inject_current_context(injector: &mut impl Injector) {
     }
 }
 
+/// Add the current W3C trace context to outbound HTTP headers. gRPC callers
+/// convert with `MetadataMap::into_headers` / `from_headers`. Sends nothing
+/// when no trace is active. Use only on hops to operator-owned services.
+pub fn inject_current_context_into_headers(headers: &mut HeaderMap) {
+    inject_current_context(&mut HeaderInjector(headers));
+}
+
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(key.as_bytes()),
+            http::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, value);
+        }
+    }
+}
+
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
 impl Extractor for HeaderExtractor<'_> {

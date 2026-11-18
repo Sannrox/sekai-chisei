@@ -135,8 +135,12 @@ chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway" }
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 sekai-parquet-export = { version = "1.0.0", path = "crates/sekai-parquet-export" }
 tempfile = "3"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
+    "registry",
     "std",
 ] }
 

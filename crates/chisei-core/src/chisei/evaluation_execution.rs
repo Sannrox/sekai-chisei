@@ -376,8 +376,12 @@ impl ExternalHttpEvaluator {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        // Trace headers stay outside the HMAC: they route telemetry, not the request.
+        let mut trace_headers = http::HeaderMap::new();
+        sekai_obs::otel::inject_current_context_into_headers(&mut trace_headers);
         let response = client
             .post(&self.endpoint)
+            .headers(trace_headers)
             .header("content-type", "application/json")
             .header(
                 "x-sekai-adapter-contract",
@@ -3290,6 +3294,11 @@ mod tests {
                 header_value("x-sekai-adapter-signature:"),
                 Some(expected_signature.as_str())
             );
+            assert_eq!(
+                header_value("traceparent:").and_then(|value| value.split('-').nth(1)),
+                Some(CALLER_TRACE_ID),
+                "the adapter call carries the caller's trace"
+            );
             let request_json: Value = serde_json::from_slice(body).unwrap();
             assert_eq!(request_json["namespace"], "acme");
             assert_eq!(request_json["input"]["parameters"]["threshold"], 1.5);
@@ -3321,10 +3330,34 @@ mod tests {
         let node = &manifest.nodes[0];
         let mut evaluator_input = input(&manifest, node);
         evaluator_input.parameters = serde_json::json!({"threshold": 1.5});
-        let output = evaluator.evaluate(&evaluator_input).unwrap();
+        let output = within_caller_trace(|| evaluator.evaluate(&evaluator_input)).unwrap();
         assert_eq!(output.status, STATUS_PASS);
         assert_eq!(output.reason_code, "fixture_pass");
         server.join().unwrap();
+    }
+
+    const CALLER_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+    /// Run `f` inside a span whose parent is the remote trace `CALLER_TRACE_ID`,
+    /// as an inbound request with `traceparent` would be.
+    fn within_caller_trace<T>(f: impl FnOnce() -> T) -> T {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                "traceparent",
+                format!("00-{CALLER_TRACE_ID}-00f067aa0ba902b7-01")
+                    .parse()
+                    .unwrap(),
+            );
+            let span = tracing::info_span!("caller");
+            sekai_obs::otel::set_parent_from_headers(&span, &headers);
+            span.in_scope(f)
+        })
     }
 
     #[test]

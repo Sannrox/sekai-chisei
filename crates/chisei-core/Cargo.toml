@@ -50,6 +50,8 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 sekai-adapters = { path = "../sekai-adapters" }
 sekai-proto = { version = "3.0.0", path = "../sekai-proto" }
 sekai-core = { version = "4.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
@@ -61,3 +63,5 @@ tokio = { version = "1", default-features = false, features = [
     "sync",
     "time",
 ] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
