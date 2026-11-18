@@ -43,6 +43,8 @@ mod explain_value_rpc;
 mod graph_explore_rpc;
 #[path = "media_upload_rpc.rs"]
 mod media_upload_rpc;
+#[path = "model_version_rpc.rs"]
+mod model_version_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
 #[path = "object_comment_rpc.rs"]
@@ -1611,6 +1613,18 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetTransformChainRunRequest>,
     ) -> Result<Response<GetTransformChainRunResponse>, Status> {
         rpc_data::get_transform_chain_run(self, req).await
+    }
+    async fn get_model_version(
+        &self,
+        req: Request<GetModelVersionRequest>,
+    ) -> Result<Response<GetModelVersionResponse>, Status> {
+        model_version_rpc::get_model_version(self, req).await
+    }
+    async fn list_model_versions(
+        &self,
+        req: Request<ListModelVersionsRequest>,
+    ) -> Result<Response<ListModelVersionsResponse>, Status> {
+        model_version_rpc::list_model_versions(self, req).await
     }
     async fn cancel_governed_transform_run(
         &self,

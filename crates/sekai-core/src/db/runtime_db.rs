@@ -113,6 +113,8 @@ mod images;
 mod lakehouse;
 #[path = "runtime_db_model_platform.rs"]
 mod model_platform;
+#[path = "runtime_db_model_versions.rs"]
+mod model_versions;
 #[path = "runtime_db_object_security.rs"]
 mod object_security;
 #[path = "runtime_db_objects.rs"]

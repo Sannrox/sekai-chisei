@@ -227,6 +227,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutTransformChain` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RunTransformChain` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformChainRun` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetModelVersion` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListModelVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ClaimTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.AdmitGovernedDocument` | `sekai.governed-document` | yes | cli, host | `stable` |
 | `SekaiService.AttachGovernedDocumentRendition` | `sekai.governed-document` | yes | cli, host | `stable` |

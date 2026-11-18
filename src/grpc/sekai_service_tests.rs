@@ -38455,6 +38455,8 @@ mod export_delivery_source_tests;
 
 #[path = "governed_document_rpc_tests.rs"]
 mod governed_document_rpc_tests;
+#[path = "model_version_rpc_tests.rs"]
+mod model_version_rpc_tests;
 
 #[path = "object_type_index_rpc_tests.rs"]
 mod object_type_index_rpc_tests;

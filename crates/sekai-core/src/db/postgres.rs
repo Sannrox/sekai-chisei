@@ -229,6 +229,7 @@ const OBJECT_LOG_INGEST_INTENTS_SCHEMA: &str =
     include_str!("postgres/0159_object_log_ingest_intents.sql");
 const ACTION_INSTANCE_DENIAL_INDEX_SCHEMA: &str =
     include_str!("postgres/0160_action_instance_denial_index.sql");
+const MODEL_VERSIONS_SCHEMA: &str = include_str!("postgres/0162_model_versions.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1160,6 +1161,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_eval_dataset_definitions",
         "",
         MigrationOwner::Chisei,
+    ),
+    mig(
+        161,
+        "model_versions",
+        MODEL_VERSIONS_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 
