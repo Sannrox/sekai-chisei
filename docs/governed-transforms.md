@@ -319,6 +319,18 @@ The bytes live in a registry outside the plane (`adapters/model_registry.rs`).
 
 Both community backends persist model versions.
 
+An isolated-process definition may pin model versions in `model_inputs`, a
+name to version id map (#3074). Put and ad-hoc runs refuse a version
+the caller cannot see as missing. The plane adds the placement label
+`sekai.input.model=v1` to `requires`, so only a runtime that registered it is
+offered the work. At admission each pin must still exist; the run's
+`input_versions` records it under `model:<name>`, and the version's marking
+joins the inputs that set `markings_out`. Lineage reaches from the transform
+to the model version and on to the datasets that trained it. The worker
+resolves the version with `GetModelVersion` and loads the bytes from the
+registry itself; the claim does not carry them. A dataset input id may not
+start with `model:` beside model inputs.
+
 ## Operator path
 
 ```bash

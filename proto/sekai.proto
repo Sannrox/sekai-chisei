@@ -1045,6 +1045,19 @@ message GovernedTransform {
   // with the definition, part of definition_digest, and returned with a
   // claimed transform so the claiming runner has what to execute.
   string code = 20;
+  // Experimental (#3074). Model versions the code scores with, by input
+  // name. Isolated-process profile only; each version must exist in the
+  // namespace and be visible to the writer. A run pins each under
+  // `model:<name>` in its input versions, and its output carries the
+  // version's marking. Adds the `sekai.input.model=v1` placement label, so
+  // only a runtime that can run a model claims the work. The claiming
+  // runner resolves each version with GetModelVersion.
+  repeated TransformModelInput model_inputs = 21;
+}
+// A model version a transform scores with (#3074).
+message TransformModelInput {
+  string name = 1;
+  string version_id = 2;
 }
 // One placement label: an exact key and value.
 message TransformLabel {

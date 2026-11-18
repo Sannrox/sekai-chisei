@@ -2449,6 +2449,7 @@ pub(super) async fn put_governed_transform(
         .and_then(|context| context.tenant.as_ref())
         .map(|tenant| tenant.tenant_id.as_str())
         .unwrap_or("");
+    super::model_version_rpc::authorize_model_inputs(service, &principals, &transform)?;
     // Object-set inputs are read as the caller, now to refuse a set they may
     // not read, and on every run as the principal recorded here (ADR 0140).
     let object_set_reader = if transform.object_set_inputs().is_empty() {
@@ -2569,6 +2570,7 @@ pub(super) async fn run_adhoc_governed_transform(
     // Read limits per input; the run refuses a row with any other key.
     let column_allowlists =
         authorize_preview_inputs(service, &principals, tenant_context.as_ref(), &transform)?;
+    super::model_version_rpc::authorize_model_inputs(service, &principals, &transform)?;
     // Object sets read as the caller on every request, a replay included:
     // the run pins row digests, not members, so a replay returns only while
     // the caller still reads exactly the rows it pinned (ADR 0140).
@@ -4935,6 +4937,15 @@ fn to_proto_transform(
             .as_ref()
             .map(|spec| spec.code.clone())
             .unwrap_or_default(),
+        model_inputs: transform
+            .isolated_process
+            .iter()
+            .flat_map(|spec| &spec.model_inputs)
+            .map(|(name, version_id)| TransformModelInput {
+                name: name.clone(),
+                version_id: version_id.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -4993,6 +5004,11 @@ fn from_proto_isolated(
                 "code applies only to the isolated_process profile",
             ));
         }
+        if !proto.model_inputs.is_empty() {
+            return Err(Status::invalid_argument(
+                "model_inputs apply only to the isolated_process profile",
+            ));
+        }
         return Ok(None);
     }
     // The engine needs something to run (#1605).
@@ -5019,8 +5035,25 @@ fn from_proto_isolated(
                 &proto.requires,
             )?,
             code: proto.code.clone(),
+            model_inputs: model_inputs_from_proto(&proto.model_inputs)?,
         },
     ))
+}
+
+/// Model inputs by name; a repeated name is refused rather than collapsed.
+fn model_inputs_from_proto(
+    inputs: &[TransformModelInput],
+) -> Result<std::collections::BTreeMap<String, String>, Status> {
+    let mut pins = std::collections::BTreeMap::new();
+    for input in inputs {
+        if pins
+            .insert(input.name.trim().to_string(), input.version_id.clone())
+            .is_some()
+        {
+            return Err(Status::invalid_argument("model input names must be unique"));
+        }
+    }
+    Ok(pins)
 }
 
 pub(super) fn caller_can_read_run_datasets(

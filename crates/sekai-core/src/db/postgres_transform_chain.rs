@@ -554,6 +554,7 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
                 inputs: Vec::new(),
                 requires: Default::default(),
                 code: String::new(),
+                model_inputs: Default::default(),
             }),
             schedule: None,
             trigger: None,

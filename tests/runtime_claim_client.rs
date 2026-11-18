@@ -298,6 +298,7 @@ fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             code: TRANSFORM_CODE.into(),
+            model_inputs: Default::default(),
         }),
         schedule: None,
         trigger: None,
@@ -700,6 +701,7 @@ async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
                     inputs: Vec::new(),
                     requires: Default::default(),
                     code: TRANSFORM_CODE.into(),
+                    model_inputs: Default::default(),
                 }),
                 schedule: None,
                 trigger: None,

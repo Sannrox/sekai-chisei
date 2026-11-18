@@ -18,6 +18,63 @@ fn decode(json: &str) -> Result<ModelVersion, String> {
     serde_json::from_str(json).map_err(|error| format!("decode model version: {error}"))
 }
 
+fn pinned_version_ids(
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> impl Iterator<Item = &String> {
+    transform
+        .isolated_process
+        .iter()
+        .flat_map(|spec| spec.model_inputs.values())
+}
+
+fn marking_token(version: ModelVersion) -> Option<String> {
+    (!version.marking.is_empty()).then_some(version.marking)
+}
+
+/// The marking token of each model version `transform` pins, read in the
+/// admitting transaction. A pin naming no version in the namespace refuses
+/// the run.
+pub(crate) fn pinned_model_markings(
+    conn: &rusqlite::Connection,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<Vec<Option<String>>, String> {
+    pinned_version_ids(transform)
+        .map(|version_id| {
+            conn.query_row(
+                "SELECT record_json FROM sekai_model_versions
+                 WHERE namespace = ?1 AND version_id = ?2",
+                params![transform.namespace, version_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| crate::sekai::model_version::MODEL_VERSION_NOT_FOUND.to_string())
+            .and_then(|json| decode(&json))
+            .map(marking_token)
+        })
+        .collect()
+}
+
+/// See [`pinned_model_markings`].
+pub(crate) fn pinned_model_markings_pg(
+    tx: &mut postgres::Transaction<'_>,
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+) -> Result<Vec<Option<String>>, String> {
+    let mut tokens = Vec::new();
+    for version_id in pinned_version_ids(transform) {
+        let row = tx
+            .query_opt(
+                "SELECT record_json FROM sekai_model_versions
+                 WHERE namespace = $1 AND version_id = $2",
+                &[&transform.namespace, version_id],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| crate::sekai::model_version::MODEL_VERSION_NOT_FOUND.to_string())?;
+        tokens.push(marking_token(decode(row.get(0))?));
+    }
+    Ok(tokens)
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_model_versions(&self) -> Result<(), String> {
         self.conn()
@@ -198,6 +255,103 @@ pub(crate) mod store_tests {
         .unwrap()
     }
 
+    /// A run of a transform pinning a model version records the pin and
+    /// carries the version's marking; a pin naming no version refuses the
+    /// run (#3074).
+    pub(crate) fn pinned_model_input_marks_and_pins_the_run(db: &RuntimeDb) {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{
+            CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, MODEL_INPUT_LABEL,
+        };
+        for id in ["in", "out"] {
+            db.create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        db.append_rows(
+            "in",
+            &[std::collections::HashMap::from([("id".into(), "1".into())])],
+        )
+        .unwrap();
+        let mut registration = registration("sha256:a", "run-1");
+        registration.namespace = "ops".into();
+        let pinned = db
+            .insert_model_version(
+                &crate::sekai::model_version::ModelVersion::from_run(
+                    registration,
+                    "ops",
+                    "confidential",
+                    &BTreeMap::new(),
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let transform = |transform_id: &str, version_id: &str| {
+            GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: transform_id.into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: Vec::new(),
+                quality_rule: String::new(),
+                definition_digest: String::new(),
+                analytical: None,
+                isolated_process: Some(IsolatedProcessSpec {
+                    engine: "python".into(),
+                    runtime_image: "runner:1".into(),
+                    code: "score()".into(),
+                    model_inputs: BTreeMap::from([("scorer".into(), version_id.into())]),
+                    ..Default::default()
+                }),
+                schedule: None,
+                trigger: None,
+            }
+            .prepare()
+            .unwrap()
+        };
+        let scoring = transform("score", &pinned.version_id);
+        assert_eq!(
+            scoring.isolated_process.as_ref().unwrap().requires[MODEL_INPUT_LABEL],
+            "v1"
+        );
+        db.put_governed_transform(&scoring, 10).unwrap();
+        let run = db
+            .run_governed_transform("ops", "score", false, 20)
+            .unwrap();
+        assert_eq!(run.input_versions["model:scorer"], pinned.version_id);
+        assert_eq!(run.markings_out, "confidential");
+
+        db.put_governed_transform(&transform("dangling", "mv_missing"), 30)
+            .unwrap();
+        let refused = db
+            .run_governed_transform("ops", "dangling", false, 40)
+            .unwrap_err();
+        assert!(refused.contains("model version not found"), "{refused}");
+
+        // A dataset input may not shadow a model pin in the receipt.
+        let mut shadowing = transform("shadow", &pinned.version_id);
+        shadowing.definition_digest.clear();
+        let spec = shadowing.isolated_process.as_mut().unwrap();
+        spec.inputs = vec![crate::sekai::governed_transform::TransformInput {
+            alias: "features".into(),
+            dataset_id: "model:scorer".into(),
+            ..Default::default()
+        }];
+        assert!(shadowing.prepare().is_err());
+    }
+
     /// A repeat insert of one digest keeps the first record and writes no
     /// second row; another digest is a second version.
     pub(crate) fn repeat_insert_keeps_one_record(db: &RuntimeDb) {
@@ -322,6 +476,20 @@ mod tests {
             .register_model_version(store_tests::registration("sha256:c", "nope"), 8)
             .unwrap_err();
         assert!(missing.contains("not found"), "{missing}");
+    }
+
+    #[test]
+    fn sqlite_pinned_model_input_marks_and_pins_the_run() {
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+        store_tests::pinned_model_input_marks_and_pins_the_run(&db);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_pinned_model_input_marks_and_pins_the_run() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        store_tests::pinned_model_input_marks_and_pins_the_run(&db);
     }
 
     #[test]
