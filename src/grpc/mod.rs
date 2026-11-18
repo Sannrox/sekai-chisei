@@ -27,6 +27,7 @@ use crate::rpc_maturity::RpcMaturityLayer;
 use crate::sekai::credentials::PrincipalCredentialStore;
 use axum::response::IntoResponse;
 use sekai_domain::gateway_keys::hash_gateway_key;
+use sekai_obs::jobs::{JobKind, JobOutcome, JobPass};
 use std::convert::Infallible;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -1933,6 +1934,29 @@ fn spawn_service_background_tasks(
     }
 }
 
+/// What a pass over several namespaces or specs saw, for its job span:
+/// any failure fails the pass; otherwise work another instance held marks
+/// it held when it handled nothing.
+#[derive(Default)]
+struct PassTally {
+    items: u64,
+    held: bool,
+    failed: bool,
+}
+
+impl PassTally {
+    fn finish(self, pass: JobPass) {
+        let outcome = if self.failed {
+            JobOutcome::Failed
+        } else if self.held && self.items == 0 {
+            JobOutcome::Held
+        } else {
+            JobOutcome::Ok
+        };
+        pass.finish(outcome, self.items);
+    }
+}
+
 /// Embed every stored spec on a schedule (#1609). Combined mode only: it
 /// needs the Sekai change feed and the Chisei route catalog. Safe on every
 /// instance at once; catch-up writes are fenced per spec.
@@ -1946,32 +1970,42 @@ fn spawn_embedding_catch_up(db: Arc<RuntimeDb>, chisei: Arc<chisei_service::Chis
             interval.tick().await;
             let route = |stored| hosted(stored);
             let now = || chrono::Utc::now().timestamp_millis();
+            let pass = JobPass::start(JobKind::EmbeddingCatchUp);
+            let mut tally = PassTally::default();
             // Another pass while any spec has more pending, up to a bound.
             for _ in 0..8 {
                 let outcomes = match catch_up_stored_specs(&db, &route, &now).await {
                     Ok(outcomes) => outcomes,
                     Err(error) => {
                         tracing::error!(%error, "embedding specs unavailable");
+                        tally.failed = true;
                         break;
                     }
                 };
                 let mut more = false;
                 for (stored, outcome) in outcomes {
                     match outcome {
-                        Ok(report) => more |= report.more,
-                        Err(EmbeddingError::Conflict(_)) => {}
-                        Err(error) => tracing::warn!(
-                            namespace = %stored.spec.namespace,
-                            spec = %stored.spec.id,
-                            %error,
-                            "embedding catch-up failed; retrying next pass"
-                        ),
+                        Ok(report) => {
+                            more |= report.more;
+                            tally.items += report.consumed_changes.max(0) as u64;
+                        }
+                        Err(EmbeddingError::Conflict(_)) => tally.held = true,
+                        Err(error) => {
+                            tally.failed = true;
+                            tracing::warn!(
+                                namespace = %stored.spec.namespace,
+                                spec = %stored.spec.id,
+                                %error,
+                                "embedding catch-up failed; retrying next pass"
+                            )
+                        }
                     }
                 }
                 if !more {
                     break;
                 }
             }
+            tally.finish(pass);
         }
     });
 }
@@ -1994,6 +2028,7 @@ fn spawn_search_catch_up(db: Arc<RuntimeDb>) {
             interval.tick().await;
             let db = db.clone();
             let cursor = after.clone();
+            let pass = JobPass::start(JobKind::SearchCatchUp);
             let result = tokio::task::spawn_blocking(move || {
                 catch_up_search_pass(&db, &cursor, SEARCH_CATCH_UP_NAMESPACES_PER_PASS, &|| {
                     chrono::Utc::now().timestamp_millis()
@@ -2004,10 +2039,12 @@ fn spawn_search_catch_up(db: Arc<RuntimeDb>) {
                 Ok(Ok(outcomes)) => outcomes,
                 Ok(Err(error)) => {
                     tracing::error!(%error, "search index namespaces unavailable");
+                    pass.finish(JobOutcome::Failed, 0);
                     continue;
                 }
                 Err(error) => {
                     tracing::error!(%error, "search catch-up task failed");
+                    pass.finish(JobOutcome::Failed, 0);
                     continue;
                 }
             };
@@ -2019,17 +2056,22 @@ fn spawn_search_catch_up(db: Arc<RuntimeDb>) {
                     .map(|(namespace, _)| namespace.clone())
                     .unwrap_or_default()
             };
+            let mut tally = PassTally::default();
             for (namespace, outcome) in outcomes {
                 match outcome {
-                    Ok(_) => {}
-                    Err(error) if error.is_conflict() => {}
-                    Err(error) => tracing::warn!(
-                        %namespace,
-                        %error,
-                        "search catch-up failed; retrying next pass"
-                    ),
+                    Ok(report) => tally.items += report.consumed_changes.max(0) as u64,
+                    Err(error) if error.is_conflict() => tally.held = true,
+                    Err(error) => {
+                        tally.failed = true;
+                        tracing::warn!(
+                            %namespace,
+                            %error,
+                            "search catch-up failed; retrying next pass"
+                        )
+                    }
                 }
             }
+            tally.finish(pass);
         }
     });
 }
@@ -2042,17 +2084,32 @@ fn spawn_admission_reconciler(
         loop {
             interval.tick().await;
             let clerk = clerk.clone();
+            let mut pass = JobPass::start(JobKind::AdmissionReconcile);
             let result = tokio::task::spawn_blocking(move || {
                 clerk.reconcile_pending(chrono::Utc::now().timestamp_millis())
             })
             .await;
             match result {
-                Ok(Ok(_)) => {}
+                Ok(Ok(listed)) => {
+                    // Every pending reservation comes back; only those this
+                    // pass finalized, settled, or released count as work.
+                    let mut handled = 0;
+                    for reservation in listed.iter().filter(|reservation| {
+                        reservation.status
+                            != crate::chisei_store::operation_reservation::RESERVATION_PENDING
+                    }) {
+                        handled += 1;
+                        pass.on_behalf_of(reservation.operation_id.clone());
+                    }
+                    pass.finish(JobOutcome::Ok, handled);
+                }
                 Ok(Err(error)) => {
-                    tracing::error!(?error, "admission reservation reconciliation failed")
+                    tracing::error!(?error, "admission reservation reconciliation failed");
+                    pass.finish(JobOutcome::Failed, 0);
                 }
                 Err(error) => {
-                    tracing::error!(%error, "admission reservation reconciliation task failed")
+                    tracing::error!(%error, "admission reservation reconciliation task failed");
+                    pass.finish(JobOutcome::Failed, 0);
                 }
             }
         }
@@ -2060,20 +2117,32 @@ fn spawn_admission_reconciler(
 }
 
 /// Archive only when the restore fence admits the mutation. `dry_run` skips
-/// the fence because it writes nothing. The retention tick below and
-/// `sekaictl admin retention run` share it.
+/// the fence because it writes nothing. `sekaictl admin retention run` uses
+/// it and waits on the retention lock; the tick uses [`archive_tick`].
 pub(crate) fn archive_admitted(
     db: &RuntimeDb,
     stores: &CombinedStoreLayout,
     now: i64,
     dry_run: bool,
-    skip_if_busy: bool,
 ) -> Result<crate::sekai::retention::ArchiveRun, String> {
     crate::db::postgres::off_runtime(|| {
         if !dry_run {
             crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
         }
-        db.archive_retained_records_locked(now, dry_run, skip_if_busy)
+        db.archive_retained_records(now, dry_run)
+    })
+}
+
+/// One scheduled retention run behind the same fence: `None` when another
+/// replica holds the retention lock.
+fn archive_tick(
+    db: &RuntimeDb,
+    stores: &CombinedStoreLayout,
+    now: i64,
+) -> Result<Option<crate::sekai::retention::ArchiveRun>, String> {
+    crate::db::postgres::off_runtime(|| {
+        crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
+        db.archive_retained_records_tick(now)
     })
 }
 
@@ -2091,27 +2160,40 @@ fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
             interval.tick().await;
             let db = db.clone();
             let stores = stores.clone();
+            let pass = JobPass::start(JobKind::Retention);
             let result = tokio::task::spawn_blocking(move || {
-                archive_admitted(
-                    &db,
-                    &stores,
-                    chrono::Utc::now().timestamp_millis(),
-                    false,
-                    true,
-                )
+                archive_tick(&db, &stores, chrono::Utc::now().timestamp_millis())
             })
             .await;
             match result {
-                Ok(Ok(run)) if run.batches == 0 => {}
-                Ok(Ok(run)) => tracing::info!(
-                    batches = run.batches,
-                    audit = run.audit_archived,
-                    llm_calls = run.llm_calls_archived,
-                    content_events = run.content_events_archived,
-                    "retention tick archived"
-                ),
-                Ok(Err(error)) => tracing::error!(%error, "retention tick failed"),
-                Err(error) => tracing::error!(%error, "retention tick task failed"),
+                Ok(Ok(None)) => pass.finish(JobOutcome::Held, 0),
+                Ok(Ok(Some(run))) if run.batches == 0 => pass.finish(JobOutcome::Ok, 0),
+                Ok(Ok(Some(run))) => {
+                    tracing::info!(
+                        batches = run.batches,
+                        audit = run.audit_archived,
+                        llm_calls = run.llm_calls_archived,
+                        content_events = run.content_events_archived,
+                        "retention tick archived"
+                    );
+                    let archived = [
+                        run.audit_archived,
+                        run.llm_calls_archived,
+                        run.task_observations_archived,
+                        run.task_observations_redacted,
+                        run.content_events_archived,
+                    ];
+                    let items = archived.iter().map(|n| (*n).max(0) as u64).sum();
+                    pass.finish(JobOutcome::Ok, items);
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "retention tick failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "retention tick task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2126,6 +2208,8 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
         loop {
             interval.tick().await;
             let db = db.clone();
+            // The sweep reports no count, so only a failed pass is traced.
+            let pass = JobPass::start(JobKind::ExportSweep);
             let result = tokio::task::spawn_blocking(move || {
                 let now = chrono::Utc::now().timestamp_millis();
                 crate::sekai::data_export::recover_abandoned_exports(&db, now)?;
@@ -2133,9 +2217,15 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
             })
             .await;
             match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::error!(%error, "export sweep failed"),
-                Err(error) => tracing::error!(%error, "export sweep task failed"),
+                Ok(Ok(())) => pass.finish(JobOutcome::Ok, 0),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "export sweep failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "export sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2150,14 +2240,21 @@ fn spawn_consumer_violation_sweeper(db: Arc<RuntimeDb>) {
         loop {
             interval.tick().await;
             let db = db.clone();
+            let pass = JobPass::start(JobKind::ConsumerViolationSweep);
             let result = tokio::task::spawn_blocking(move || {
                 db.sweep_consumer_violation_deliveries(chrono::Utc::now().timestamp_millis())
             })
             .await;
             match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::error!(%error, "consumer violation sweep failed"),
-                Err(error) => tracing::error!(%error, "consumer violation sweep task failed"),
+                Ok(Ok(deleted)) => pass.finish(JobOutcome::Ok, deleted as u64),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "consumer violation sweep failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "consumer violation sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2173,18 +2270,25 @@ fn spawn_criticality_outbox_sweeper(db: Arc<RuntimeDb>) {
         loop {
             interval.tick().await;
             let db = db.clone();
+            let pass = JobPass::start(JobKind::CriticalityOutbox);
             let result = tokio::task::spawn_blocking(move || {
                 let now = chrono::Utc::now().timestamp_millis();
                 let reconciled = crate::sekai::catalog_criticality::reconcile_outbox(&db, now)
                     .map_err(|error| format!("{error:?}"));
                 let swept = db.sweep_catalog_criticality_outbox(now);
-                reconciled.and(swept)
+                Ok::<_, String>(reconciled? + swept?)
             })
             .await;
             match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::error!(%error, "criticality outbox sweep failed"),
-                Err(error) => tracing::error!(%error, "criticality outbox sweep task failed"),
+                Ok(Ok(handled)) => pass.finish(JobOutcome::Ok, handled as u64),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "criticality outbox sweep failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "criticality outbox sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2201,13 +2305,26 @@ fn spawn_object_log_ingest_sweeper(db: Arc<RuntimeDb>) {
         loop {
             interval.tick().await;
             let db = db.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::sekai::object_log_ingest::sweep(&db))
-                    .await;
+            let mut pass = JobPass::start(JobKind::ObjectLogIngest);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::sekai::object_log_ingest::sweep_pass(&db)
+            })
+            .await;
             match result {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::error!(%error, "object-log ingest sweep failed"),
-                Err(error) => tracing::error!(%error, "object-log ingest sweep task failed"),
+                Ok(Ok(drained)) => {
+                    for operation_id in drained.operation_ids {
+                        pass.on_behalf_of(operation_id);
+                    }
+                    pass.finish(JobOutcome::Ok, drained.drained as u64);
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "object-log ingest sweep failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "object-log ingest sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2237,17 +2354,26 @@ fn spawn_security_reopener(db: Arc<RuntimeDb>, sekai: Arc<sekai_service::SekaiSe
         loop {
             interval.tick().await;
             let (db, sekai, run_as) = (db.clone(), sekai.clone(), run_as.clone());
+            // The pass reports only skipped namespaces, so only those trace.
+            let pass = JobPass::start(JobKind::SecurityReopen);
             let result = tokio::task::spawn_blocking(move || {
                 run_security_reopen(&db, &sekai, &run_as, chrono::Utc::now().timestamp_millis())
             })
             .await;
             match result {
-                Ok(Ok(skipped)) if skipped.is_empty() => {}
+                Ok(Ok(skipped)) if skipped.is_empty() => pass.finish(JobOutcome::Ok, 0),
                 Ok(Ok(skipped)) => {
-                    tracing::warn!(?skipped, "security reopen skipped namespaces")
+                    tracing::warn!(?skipped, "security reopen skipped namespaces");
+                    pass.finish(JobOutcome::Failed, skipped.len() as u64);
                 }
-                Ok(Err(error)) => tracing::error!(%error, "security reopen failed"),
-                Err(error) => tracing::error!(%error, "security reopen task failed"),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "security reopen failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "security reopen task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });
@@ -2307,6 +2433,8 @@ fn spawn_catalog_reconciler(db: Arc<RuntimeDb>) {
         loop {
             interval.tick().await;
             let db = db.clone();
+            // The pass reports only failed namespaces, so only those trace.
+            let pass = JobPass::start(JobKind::CatalogReconcile);
             let result = tokio::task::spawn_blocking(move || {
                 crate::sekai::catalog::reconcile_ontology_entries(
                     &db,
@@ -2315,12 +2443,19 @@ fn spawn_catalog_reconciler(db: Arc<RuntimeDb>) {
             })
             .await;
             match result {
-                Ok(Ok(failed)) if failed.is_empty() => {}
+                Ok(Ok(failed)) if failed.is_empty() => pass.finish(JobOutcome::Ok, 0),
                 Ok(Ok(failed)) => {
-                    tracing::warn!(?failed, "catalog reconciliation failed for namespaces")
+                    tracing::warn!(?failed, "catalog reconciliation failed for namespaces");
+                    pass.finish(JobOutcome::Failed, failed.len() as u64);
                 }
-                Ok(Err(error)) => tracing::error!(%error, "catalog reconciliation failed"),
-                Err(error) => tracing::error!(%error, "catalog reconciliation task failed"),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "catalog reconciliation failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "catalog reconciliation task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
             }
         }
     });

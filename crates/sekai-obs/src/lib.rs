@@ -5,6 +5,7 @@
 
 pub mod build_info;
 pub mod correlation;
+pub mod jobs;
 pub mod labels;
 pub mod logging;
 pub mod metrics;

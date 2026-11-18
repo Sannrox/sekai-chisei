@@ -37,6 +37,9 @@ fn init_with_format<L>(
 {
     let subscriber = tracing_subscriber::registry().with(format_layer);
     if let Some(provider) = provider {
+        // Background passes build their spans through the global provider
+        // (see `jobs`); request spans go through the layer below.
+        opentelemetry::global::set_tracer_provider(provider.clone());
         let tracer = provider.tracer(default_service_name);
         // Export only spans whose fields are deliberately bounded below. In
         // particular, do not turn arbitrary tracing events into OTel events:

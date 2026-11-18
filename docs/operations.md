@@ -147,6 +147,19 @@ that refused it.
 the other stages record them as `failed`. A server-side fault (internal,
 unavailable, deadline) is `failed` at every stage.
 
+Each background pass that handled work, failed, or found its work held by
+another instance exports one root span named after its job kind:
+`embedding_catch_up`, `search_catch_up`, `admission_reconcile`, `retention`,
+`export_sweep`, `consumer_violation_sweep`, `criticality_outbox`,
+`object_log_ingest`, `security_reopen`, or `catalog_reconcile`. It carries
+`job.kind`, `job.outcome` (`ok`, `held`, or `failed`), and `job.items`. A
+pass with nothing to do exports nothing. Passes that report no count
+(`export_sweep`, `security_reopen`, `catalog_reconcile`) export only when
+they fail. A pass that worked for recorded operations, such as an
+object-log ingest drain or an admission reconciliation, has one child span
+per operation (at most 32) carrying `sekai.operation_id`, the key that joins
+it to that operation's request trace.
+
 The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
 

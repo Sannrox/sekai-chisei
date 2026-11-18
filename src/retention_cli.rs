@@ -32,7 +32,6 @@ pub fn run_retention_command(args: Vec<String>) -> Result<(), BoxErr> {
                     layout,
                     Utc::now().timestamp_millis(),
                     false,
-                    false,
                 )
                 .map_err(std::io::Error::other)?,
             )
@@ -463,10 +462,10 @@ mod tests {
         crate::store_relocate::write_runtime_generation(&layout.sekai_runtime(), 9).unwrap();
         let db = layout.sekai_runtime();
         let before = db.retention_archive_status().unwrap();
-        let err = archive_admitted(&db, &layout, 2 * DAY_MS, false, false).unwrap_err();
+        let err = archive_admitted(&db, &layout, 2 * DAY_MS, false).unwrap_err();
         assert!(err.contains("restamp"), "{err}");
         assert_eq!(db.retention_archive_status().unwrap(), before);
-        let dry = archive_admitted(&db, &layout, 2 * DAY_MS, true, false).unwrap();
+        let dry = archive_admitted(&db, &layout, 2 * DAY_MS, true).unwrap();
         assert!(dry.dry_run);
         assert_eq!(db.retention_archive_status().unwrap(), before);
         let policy = RetentionPolicy {
@@ -532,8 +531,7 @@ mod tests {
             }
             .opens_split()
         );
-        let run =
-            archive_admitted(layout.sekai_runtime().as_ref(), &layout, 1, false, false).unwrap();
+        let run = archive_admitted(layout.sekai_runtime().as_ref(), &layout, 1, false).unwrap();
         assert!(!run.dry_run);
     }
 }

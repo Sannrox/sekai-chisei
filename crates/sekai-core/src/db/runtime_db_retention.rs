@@ -64,6 +64,19 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.archive_retained_records(now, dry_run),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.archive_retained_records_locked(now, dry_run, skip_if_busy)
+                    .map(Option::unwrap_or_default)
+            }),
+        }
+    }
+
+    /// One scheduled retention run: `None` when another PostgreSQL replica
+    /// holds the retention lock, so this tick skipped. SQLite's writer
+    /// serializes runs, so it always runs.
+    pub fn archive_retained_records_tick(&self, now: i64) -> Result<Option<ArchiveRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.archive_retained_records(now, false).map(Some),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.archive_retained_records_locked(now, false, true)
             }),
         }
     }
