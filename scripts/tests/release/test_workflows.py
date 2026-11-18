@@ -5,6 +5,7 @@ from bypassing the scripts. Assert on structure (triggers, permissions, job
 graph, step order), not on the wording of a step.
 """
 
+import shlex
 import unittest
 
 import yaml
@@ -194,6 +195,56 @@ class Release(unittest.TestCase):
                 "image": {"packages"},
                 "image-manifest": {"packages"},
             },
+        )
+
+
+def perf_gate_calls(step: dict) -> list:
+    """The argument lists of every perf-gate invocation in a step's script."""
+    script = runs(step).replace("\\\n", " ")
+    calls = []
+    for line in script.splitlines():
+        try:
+            tokens = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        for index, token in enumerate(tokens):
+            if token.endswith("/perf-gate"):
+                calls.append(tokens[index + 1 :])
+    return calls
+
+
+def option(args: list, name: str):
+    return args[args.index(name) + 1] if name in args else None
+
+
+class Performance(unittest.TestCase):
+    """The scheduled object-path matrix gates regressions at 20% (#3004)."""
+
+    def setUp(self):
+        self.workflow = load("performance.yml")
+
+    def test_object_path_regression_gate_enforces_twenty_percent_on_its_manifest(self):
+        steps = self.workflow["jobs"]["object-path"]["steps"]
+        gates = [
+            args
+            for step in steps
+            for args in perf_gate_calls(step)
+            if option(args, "--manifest") == "benchmarks/manifest-object-path-v1.json"
+        ]
+        self.assertEqual(len(gates), 1)
+        self.assertIn("--enforce", gates[0])
+        self.assertEqual(option(gates[0], "--regression-threshold-percent"), "20")
+
+    def test_object_path_matrix_runs_behind_the_postgres_wrapper(self):
+        steps = self.workflow["jobs"]["object-path"]["steps"]
+        self.assertTrue(
+            any("scripts/object-path-with-postgres.sh" in runs(step) for step in steps)
+        )
+
+    def test_smoke_job_runs_the_smoke_manifest(self):
+        steps = self.workflow["jobs"]["object-path-smoke"]["steps"]
+        self.assertTrue(
+            any("benchmarks/manifest-object-path-smoke-v1.json" in runs(step) for step in steps)
         )
 
 

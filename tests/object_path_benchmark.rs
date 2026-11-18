@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 
 const MANIFEST: &str = include_str!("../benchmarks/manifest-object-path-v1.json");
 const SMOKE: &str = include_str!("../benchmarks/manifest-object-path-smoke-v1.json");
-const WORKFLOW: &str = include_str!("../.github/workflows/performance.yml");
 const POSTGRES_WRAPPER: &str = include_str!("../scripts/object-path-with-postgres.sh");
 
 #[test]
@@ -100,14 +99,9 @@ fn object_path_smoke_manifest_is_a_wide_budget_subset() {
 }
 
 #[test]
-fn scheduled_performance_workflow_enforces_object_path_at_twenty_percent() {
-    assert!(WORKFLOW.contains("manifest-object-path-v1.json"));
-    assert!(WORKFLOW.contains("manifest-object-path-smoke-v1.json"));
-    assert!(WORKFLOW.contains("--enforce"));
-    assert!(WORKFLOW.contains("--regression-threshold-percent"));
-    assert!(WORKFLOW.contains("20"));
-    assert!(WORKFLOW.contains("scripts/object-path-with-postgres.sh"));
-    assert!(WORKFLOW.contains("dropped every postgres workload"));
+fn object_path_postgres_wrapper_uses_tls_and_an_ephemeral_port() {
+    // The performance workflow's gate is asserted on parsed YAML in
+    // scripts/tests/release/test_workflows.py.
     assert!(POSTGRES_WRAPPER.contains("SEKAI_BENCH_POSTGRES_URL"));
     assert!(POSTGRES_WRAPPER.contains("ssl=on"));
     assert!(POSTGRES_WRAPPER.contains("hostssl"));
