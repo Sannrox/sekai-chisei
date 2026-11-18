@@ -217,17 +217,17 @@ fn query_quality_trends_with_access(
         .iter()
         .map(|receipt| receipt.operation_id.as_str())
         .collect::<HashSet<_>>();
-    let baseline_receipts = db.list_operation_receipts_in_window(
+    // Newest first, so a busy namespace drops the oldest baselines instead of
+    // failing the request; the report then marks baselines it cannot vouch for
+    // as unavailable.
+    let mut baseline_receipts = db.list_newest_operation_receipts_in_window(
         namespace,
         since_ms.saturating_sub(MAX_QUALITY_TREND_WINDOW_MS),
         since_ms,
         MAX_QUALITY_TREND_RECEIPTS.saturating_add(1),
     )?;
-    if baseline_receipts.len() > MAX_QUALITY_TREND_RECEIPTS {
-        return Err(format!(
-            "quality trend baseline receipt limit exceeded ({MAX_QUALITY_TREND_RECEIPTS})"
-        ));
-    }
+    let baseline_truncated = baseline_receipts.len() > MAX_QUALITY_TREND_RECEIPTS;
+    baseline_receipts.truncate(MAX_QUALITY_TREND_RECEIPTS);
     let historical = baseline_receipts
         .into_iter()
         .filter(|receipt| !selected_operation_ids.contains(receipt.operation_id.as_str()))
@@ -239,13 +239,14 @@ fn query_quality_trends_with_access(
         .filter(|receipt| receipt.operation_class == EXECUTION_OPERATION_CLASS)
         .map(|receipt| load_evaluated_receipt(db, receipt))
         .collect::<Result<Vec<_>, _>>()?;
-    build_report(
+    build_report_with_baseline(
         namespace,
         since_ms,
         until_ms,
         receipts_scanned,
         evaluated,
         historical,
+        baseline_truncated,
     )
 }
 
@@ -295,6 +296,7 @@ fn manifest_digest_from_receipt(receipt: &OperationReceipt) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn build_report(
     namespace: &str,
     since_ms: i64,
@@ -302,6 +304,28 @@ fn build_report(
     receipts_scanned: u64,
     evaluated: Vec<EvaluatedReceipt>,
     historical: Vec<EvaluatedReceipt>,
+) -> Result<QualityTrendReport, String> {
+    build_report_with_baseline(
+        namespace,
+        since_ms,
+        until_ms,
+        receipts_scanned,
+        evaluated,
+        historical,
+        false,
+    )
+}
+
+/// `baseline_truncated` means older baseline receipts were dropped at the cap,
+/// so a missing baseline cannot be claimed as "no prior run".
+fn build_report_with_baseline(
+    namespace: &str,
+    since_ms: i64,
+    until_ms: i64,
+    receipts_scanned: u64,
+    evaluated: Vec<EvaluatedReceipt>,
+    historical: Vec<EvaluatedReceipt>,
+    baseline_truncated: bool,
 ) -> Result<QualityTrendReport, String> {
     let mut totals = QualityTrendTotals {
         receipts_scanned,
@@ -312,7 +336,7 @@ fn build_report(
     let mut grouped: BTreeMap<QualityTrendSeriesKey, Vec<QualityTrendPoint>> = BTreeMap::new();
     let mut historical_grouped: BTreeMap<QualityTrendSeriesKey, Vec<QualityTrendPoint>> =
         BTreeMap::new();
-    let mut baseline_history_complete = true;
+    let mut baseline_history_complete = !baseline_truncated;
 
     totals.baseline_history_receipts = historical.len() as u64;
     for source in historical {
@@ -925,6 +949,27 @@ mod tests {
             manifest: Box::new(manifest),
             projection: Box::new(projection),
         }
+    }
+
+    #[test]
+    fn truncated_baseline_history_reports_unavailable_not_missing() {
+        let report = build_report_with_baseline(
+            "acme",
+            100,
+            1_000,
+            1,
+            vec![source("current", 200, STATUS_PASS)],
+            vec![],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.totals.baseline_missing, 0);
+        assert_eq!(report.totals.baseline_unavailable, 1);
+        assert_eq!(
+            report.series[0].points[0].baseline_state,
+            BASELINE_UNAVAILABLE
+        );
     }
 
     #[test]
