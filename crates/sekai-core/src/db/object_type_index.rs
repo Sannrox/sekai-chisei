@@ -86,36 +86,25 @@ impl SekaiDb {
                 ",
             )
             .map_err(|error| error.to_string())?;
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_index_join_status
+        {
+            let conn = self.conn();
+            for statement in [
+                "ALTER TABLE sekai_object_type_index_join_status
              ADD COLUMN generation TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_datasource
+                "ALTER TABLE sekai_object_type_datasource
              ADD COLUMN conflict_rule TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_datasource
+                "ALTER TABLE sekai_object_type_datasource
              ADD COLUMN source_timestamp_property TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_index_edit
+                "ALTER TABLE sekai_object_type_index_edit
              ADD COLUMN action_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_index_edit
+                "ALTER TABLE sekai_object_type_index_edit
              ADD COLUMN edited_at_ms INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
-        let _ = self.conn().execute(
-            "ALTER TABLE sekai_object_type_index_edit
+                "ALTER TABLE sekai_object_type_index_edit
              ADD COLUMN property_edited_at_ms TEXT NOT NULL DEFAULT '{}'",
-            [],
-        );
+            ] {
+                crate::db::add_sqlite_column(&conn, statement)?;
+            }
+        }
         Ok(())
     }
 

@@ -210,3 +210,36 @@ mod older_than_tests {
         }
     }
 }
+
+/// Run an additive `ALTER TABLE ... ADD COLUMN`, treating an already-present
+/// column as success. Any other failure (busy, I/O, read-only) is returned so
+/// a migration never reports Ok over a missing column.
+pub(crate) fn add_sqlite_column(
+    conn: &rusqlite::Connection,
+    statement: &str,
+) -> Result<(), String> {
+    match conn.execute(statement, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("duplicate column name") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod add_sqlite_column_tests {
+    use super::add_sqlite_column;
+
+    #[test]
+    fn an_existing_column_is_success_and_other_failures_are_returned() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT)").unwrap();
+        add_sqlite_column(&conn, "ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+        add_sqlite_column(&conn, "ALTER TABLE t ADD COLUMN b TEXT").unwrap();
+        let error = add_sqlite_column(&conn, "ALTER TABLE missing ADD COLUMN b TEXT").unwrap_err();
+        assert!(error.contains("no such table"), "{error}");
+    }
+}
