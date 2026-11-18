@@ -433,7 +433,7 @@ pub(super) fn resolve_principal_authority_in(
     grants: ReadGrants<'_>,
     principals: &[String],
 ) -> Result<markings::PrincipalAuthority, Status> {
-    let primary = principals.first().map(String::as_str).unwrap_or_default();
+    let primary = marking_subject(principals);
     let external_id = markings::principal_profile_external_id(primary);
     // Prefer an explicit kind-matched sealed profile over any colliding
     // external_id on ordinary objects (external IDs are indexed, not unique).
@@ -608,19 +608,24 @@ pub(super) fn deny_unmarked_for_namespace(db: &RuntimeDb, namespace: &str) -> Re
     ))
 }
 
+/// The one subject marking checks evaluate: the caller's first principal
+/// (the authenticated subject, or the first `x-principal` entry on the
+/// local path). Other listed principals never widen marking clearance,
+/// trust or the explicit grant that admits an unmarked object.
+pub(super) fn marking_subject(principals: &[String]) -> &str {
+    principals.first().map(String::as_str).unwrap_or_default()
+}
+
 fn principal_has_explicit_object_grant(
     db: &RuntimeDb,
     grants: ReadGrants<'_>,
     object_id: &str,
-    principals: &[String],
+    subject: &str,
 ) -> Result<bool, Status> {
-    let grants = grants.on_object(db, object_id)?;
-    if grants.is_empty() {
-        return Ok(false);
-    }
     Ok(grants
+        .on_object(db, object_id)?
         .iter()
-        .any(|grant| principals.contains(&grant.principal)))
+        .any(|grant| grant.principal == subject))
 }
 
 fn evaluate_object_marking(
@@ -642,11 +647,9 @@ pub(super) fn evaluate_object_marking_in(
 ) -> Result<markings::MarkingCheckResult, Status> {
     if markings::object_marking_token(object).is_none() {
         let deny_unmarked = deny_unmarked_for_namespace(db, &object.namespace)?;
-        let trusted = principals
-            .iter()
-            .any(|principal| markings::is_trusted_service_principal(principal));
-        let explicit_grant =
-            principal_has_explicit_object_grant(db, grants, &object.id, principals)?;
+        let subject = marking_subject(principals);
+        let trusted = markings::is_trusted_service_principal(subject);
+        let explicit_grant = principal_has_explicit_object_grant(db, grants, &object.id, subject)?;
         let decision_id = format!(
             "marking:{operation_id}:{}",
             uuid::Uuid::new_v4().as_simple()

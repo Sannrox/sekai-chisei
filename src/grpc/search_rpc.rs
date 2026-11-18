@@ -94,11 +94,7 @@ pub(super) async fn search(
         namespace: namespace.to_string(),
         namespace_authorized: true,
         kinds: Vec::new(),
-        subjects: if policy_context.subjects.is_empty() {
-            principals.clone()
-        } else {
-            policy_context.subjects.clone()
-        },
+        subjects: marking_subject_first(&principals, &policy_context.subjects),
         scopes: policy_context.scopes.clone(),
         clearance: authority.classification_ceiling_token(),
         visible_property_names: None,
@@ -1037,6 +1033,22 @@ fn search_status(error: SearchIndexError) -> Status {
     }
 }
 
+/// Search subjects with the request's marking subject first, as
+/// `SearchPolicyFilter::marking_subject` reads it. Policy context subjects
+/// arrive sorted, so the caller's first principal is moved to the front.
+fn marking_subject_first(principals: &[String], subjects: &[String]) -> Vec<String> {
+    let mut subjects = if subjects.is_empty() {
+        principals.to_vec()
+    } else {
+        subjects.to_vec()
+    };
+    let first = marking_subject(principals);
+    if let Some(index) = subjects.iter().position(|subject| subject == first) {
+        subjects[..=index].rotate_right(1);
+    }
+    subjects
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,6 +1061,18 @@ mod tests {
     use crate::sekai::search_index::ANALYZER_VERSION;
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
+
+    #[test]
+    fn search_subjects_put_the_marking_subject_first() {
+        let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let subjects = marking_subject_first(&owned(&["zoe", "root"]), &owned(&["root", "zoe"]));
+        assert_eq!(subjects, owned(&["zoe", "root"]));
+        let policy = SearchPolicyFilter {
+            subjects,
+            ..Default::default()
+        };
+        assert_eq!(policy.marking_subject(), "zoe");
+    }
 
     /// One pass of the scheduled worker over every namespace, as a replica
     /// would run it before the request.

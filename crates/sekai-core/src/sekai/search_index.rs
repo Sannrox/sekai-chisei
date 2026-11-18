@@ -8,8 +8,8 @@ use crate::sekai::classification_lattice::{ClassificationLattice, evaluate_latti
 use crate::sekai::dataset::Dataset;
 use crate::sekai::embedding_index::EmbeddingChunk;
 use crate::sekai::markings::{
-    MarkingDecision, PrincipalAuthority, is_trusted_service_principal, object_marking_token,
-    parse_optional_classification, trusted_service_authority,
+    MarkingDecision, PrincipalAuthority, object_marking_token, parse_optional_classification,
+    trusted_service_authority,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -138,6 +138,8 @@ pub struct SearchPolicyFilter {
     pub namespace: String,
     pub namespace_authorized: bool,
     pub kinds: Vec<String>,
+    /// Subjects for ACLs, grants and row policy. The first entry is the
+    /// request's one marking subject ([`Self::marking_subject`]).
     pub subjects: Vec<String>,
     pub scopes: Vec<String>,
     pub clearance: Option<String>,
@@ -300,16 +302,23 @@ pub trait SearchIndex {
     ) -> Result<BoundedCandidates<VectorCandidate>, SearchIndexError>;
 }
 
-/// The marking authority a search policy carries: a trusted service
-/// principal's, or the caller's clearance.
+impl SearchPolicyFilter {
+    /// The one subject marking checks evaluate: the first entry of
+    /// `subjects`. Other subjects never widen marking clearance, trust or
+    /// the explicit grant that admits an unmarked object under
+    /// `deny_unmarked`.
+    pub fn marking_subject(&self) -> &str {
+        self.subjects
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+}
+
+/// The marking authority a search policy carries: the marking subject's,
+/// trusted when that subject is a trusted service principal.
 fn search_authority(policy: &SearchPolicyFilter) -> PrincipalAuthority {
-    let subject = policy
-        .subjects
-        .iter()
-        .find(|subject| is_trusted_service_principal(subject))
-        .cloned()
-        .or_else(|| policy.subjects.first().cloned())
-        .unwrap_or_default();
+    let subject = policy.marking_subject().to_string();
     if let Some(trusted) = trusted_service_authority(&subject) {
         return trusted;
     }

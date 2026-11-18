@@ -4702,6 +4702,61 @@ fn read_root_hides_denials_and_preserves_outages() {
     );
 }
 
+#[test]
+fn marking_checks_evaluate_only_the_first_principal() {
+    let svc = service();
+    let db = svc.db.runtime();
+    let object = |id: &str, properties: HashMap<String, String>| domain::Object {
+        id: id.into(),
+        kind: "artifact".into(),
+        name: id.into(),
+        namespace: "ns".into(),
+        external_id: format!("artifact:{id}"),
+        properties,
+        created: 1,
+        updated: 1,
+    };
+    db.create_object(&domain::Object {
+        kind: "namespace".into(),
+        external_id: "namespace:ns".into(),
+        ..object(
+            "namespace-ns",
+            HashMap::from([(markings::DENY_UNMARKED_PROPERTY.into(), "true".into())]),
+        )
+    })
+    .unwrap();
+    let unmarked = object("unmarked", HashMap::new());
+    let marked = object(
+        "marked",
+        HashMap::from([(
+            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+            "confidential".into(),
+        )]),
+    );
+    db.create_object(&unmarked).unwrap();
+    db.create_object(&marked).unwrap();
+    grant_object_role(&svc, "unmarked", "bob", security::Role::Viewer);
+
+    let decide = |object: &domain::Object, principals: &[&str]| {
+        let principals: Vec<String> = principals.iter().map(|p| p.to_string()).collect();
+        evaluate_object_marking_in(db, ReadGrants::Stored, object, &principals, "op")
+            .unwrap()
+            .decision
+    };
+    for object in [&unmarked, &marked] {
+        let alone = decide(object, &["alice"]);
+        assert_eq!(alone, markings::MarkingDecision::Deny, "{}", object.id);
+        // A grant or trust held only by a later principal changes nothing.
+        assert_eq!(decide(object, &["alice", "bob"]), alone, "{}", object.id);
+        assert_eq!(decide(object, &["alice", "root"]), alone, "{}", object.id);
+    }
+    // The first principal is the subject: its own grant admits the object.
+    assert_ne!(
+        decide(&unmarked, &["bob", "alice"]),
+        markings::MarkingDecision::Deny
+    );
+}
+
 #[tokio::test]
 async fn deny_unmarked_denies_unmarked_reads_and_keeps_marked_rules() {
     let svc = service();

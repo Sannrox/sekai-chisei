@@ -617,19 +617,10 @@ impl PostgresDb {
                 env_deny_unmarked(),
                 namespace_deny_unmarked(namespace_object.as_ref()),
             );
-            let trusted = query
-                .policy
-                .subjects
-                .iter()
-                .any(|subject| is_trusted_service_principal(subject));
+            let subject = query.policy.marking_subject();
+            let trusted = is_trusted_service_principal(subject);
             let grants = self.list_grants(&object.id)?;
-            let explicit = grants.iter().any(|grant| {
-                query
-                    .policy
-                    .subjects
-                    .iter()
-                    .any(|subject| subject == &grant.principal)
-            });
+            let explicit = grants.iter().any(|grant| grant.principal == subject);
             if unmarked_access_decision(deny, trusted, explicit) == MarkingDecision::Deny {
                 return Ok(None);
             }
