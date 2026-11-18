@@ -90,6 +90,22 @@ pub(super) async fn redeem_external_action_permit(
         service.redeem_from_authenticated(actor, req.into_inner())?,
     ))
 }
+/// Records the decision before the state change it covers, so a failed audit
+/// write leaves the state untouched (the decision-first rule). The caller
+/// leaves `id` empty; each attempt gets its own.
+fn record_permit_decision(
+    service: &ChiseiServiceImpl,
+    mut decision: crate::sekai::audit::Decision,
+) -> Result<(), Status> {
+    decision.id = format!("external-permit-{}", uuid::Uuid::new_v4().simple());
+    crate::sekai::audit::validate_decision(&decision)
+        .map_err(|error| Status::invalid_argument(format!("cannot audit change: {error}")))?;
+    service
+        .db
+        .record_decisions_idempotently(&[decision])
+        .map_err(Status::internal)
+}
+
 pub(super) async fn set_external_action_policy(
     service: &ChiseiServiceImpl,
     req: Request<SetExternalActionPolicyRequest>,
@@ -97,6 +113,7 @@ pub(super) async fn set_external_action_policy(
     require_control_plane_admin(&req, "external action policy mutation")?;
     let actor = required_authenticated_actor(&req)?;
     let input = req.into_inner();
+    let now = chrono::Utc::now().timestamp_millis();
     match input.operation.as_str() {
         "set_policy" => {
             let input_policy = input
@@ -110,9 +127,22 @@ pub(super) async fn set_external_action_policy(
                 permitted_delegators: input_policy.permitted_delegators,
                 max_delegation_depth: input_policy.max_delegation_depth,
             };
+            record_permit_decision(
+                service,
+                crate::sekai::audit::Decision {
+                    id: String::new(),
+                    timestamp: now,
+                    actor,
+                    action: "external_action_permit/set_policy".into(),
+                    reason: input.reason,
+                    evidence: HashMap::from([("scope".into(), policy.scope.clone())]),
+                    target_id: policy.scope.clone(),
+                    outcome: "set".into(),
+                },
+            )?;
             service
                 .db
-                .set_external_permit_policy(&policy, chrono::Utc::now().timestamp_millis())
+                .set_external_permit_policy(&policy, now)
                 .map_err(Status::invalid_argument)?;
             Ok(Response::new(SetExternalActionPolicyResponse {
                 policy: Some(external_permit_policy_to_proto(&policy)),
@@ -123,7 +153,22 @@ pub(super) async fn set_external_action_policy(
             if input.scope_value.trim().is_empty() || input.reason.trim().is_empty() {
                 return Err(Status::invalid_argument("scope_value and reason required"));
             }
-            let now = chrono::Utc::now().timestamp_millis();
+            record_permit_decision(
+                service,
+                crate::sekai::audit::Decision {
+                    id: String::new(),
+                    timestamp: now,
+                    actor,
+                    action: "external_action_permit/kill_switch".into(),
+                    reason: input.reason.clone(),
+                    evidence: HashMap::from([
+                        ("scope_kind".into(), input.scope_kind.clone()),
+                        ("scope_value".into(), input.scope_value.clone()),
+                    ]),
+                    target_id: input.scope_value.clone(),
+                    outcome: if input.enabled { "enabled" } else { "disabled" }.into(),
+                },
+            )?;
             let changed = service
                 .db
                 .set_permit_kill_switch(
@@ -134,26 +179,6 @@ pub(super) async fn set_external_action_policy(
                     now,
                 )
                 .map_err(Status::invalid_argument)?;
-            service
-                .db
-                .record_decisions_idempotently(&[crate::sekai::audit::Decision {
-                    id: format!("external-kill-{}", uuid::Uuid::new_v4().simple()),
-                    timestamp: now,
-                    actor,
-                    action: "external_action_permit/kill_switch".into(),
-                    reason: input.reason,
-                    evidence: HashMap::from([
-                        ("scope_kind".into(), input.scope_kind.clone()),
-                        ("scope_value".into(), input.scope_value.clone()),
-                    ]),
-                    target_id: input.scope_value,
-                    outcome: if input.enabled {
-                        "enabled".into()
-                    } else {
-                        "disabled".into()
-                    },
-                }])
-                .map_err(Status::internal)?;
             Ok(Response::new(SetExternalActionPolicyResponse {
                 policy: None,
                 changed,
