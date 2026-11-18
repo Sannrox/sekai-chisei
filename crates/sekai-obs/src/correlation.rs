@@ -80,6 +80,7 @@ impl Stage {
 
 /// How a stage ended. Closed, like [`Stage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StageOutcome {
     Ok,
     Refused,

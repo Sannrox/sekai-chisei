@@ -345,6 +345,20 @@ impl DeterministicEvaluator for ExternalHttpEvaluator {
         input: &DeterministicEvaluatorInput,
         timeout: Duration,
     ) -> Result<DeterministicEvaluatorOutput, String> {
+        sekai_core::obs::correlation::in_stage(
+            sekai_core::obs::correlation::Stage::OutboundCall,
+            || self.request(input, timeout),
+        )
+    }
+}
+
+impl ExternalHttpEvaluator {
+    /// Send one signed evaluation request; runs as an `outbound_call` stage.
+    fn request(
+        &self,
+        input: &DeterministicEvaluatorInput,
+        timeout: Duration,
+    ) -> Result<DeterministicEvaluatorOutput, String> {
         let Some(secret) = self.request_secret() else {
             return Err(REASON_EVALUATOR_UNAVAILABLE.into());
         };
@@ -357,33 +371,26 @@ impl DeterministicEvaluator for ExternalHttpEvaluator {
         let body = sekai_core::shomei::canonical_json_with_finite_numbers(&request)?;
         let request_digest = format!("sha256:{:x}", Sha256::digest(&body));
         let signature = Self::signature(&secret, &request_digest);
-        let response = sekai_core::obs::correlation::in_stage(
-            sekai_core::obs::correlation::Stage::OutboundCall,
-            || {
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(timeout.max(Duration::from_millis(1)))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
-                let response = client
-                    .post(&self.endpoint)
-                    .header("content-type", "application/json")
-                    .header(
-                        "x-sekai-adapter-contract",
-                        EXTERNAL_ADAPTER_REQUEST_CONTRACT,
-                    )
-                    .header("x-sekai-adapter-request-digest", &request_digest)
-                    .header("x-sekai-adapter-signature", signature)
-                    .body(body)
-                    .send()
-                    .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
-                if response.status().is_success() {
-                    Ok(response)
-                } else {
-                    Err(REASON_EVALUATOR_UNAVAILABLE.to_string())
-                }
-            },
-        )?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout.max(Duration::from_millis(1)))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        let response = client
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .header(
+                "x-sekai-adapter-contract",
+                EXTERNAL_ADAPTER_REQUEST_CONTRACT,
+            )
+            .header("x-sekai-adapter-request-digest", &request_digest)
+            .header("x-sekai-adapter-signature", signature)
+            .body(body)
+            .send()
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
+        if !response.status().is_success() {
+            return Err(REASON_EVALUATOR_UNAVAILABLE.into());
+        }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESULT_BYTES as u64)
