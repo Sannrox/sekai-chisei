@@ -1282,6 +1282,18 @@ mod tests {
             .instance;
         assert_eq!(auto.status, STATUS_ADMITTED);
         assert_eq!(auto.policy_decision, "auto_apply");
+        // The receipt keeps what the policy alone decided (#3016).
+        let receipt = db
+            .get_operation_receipt(&auto.operation_id)
+            .unwrap()
+            .unwrap();
+        let policy_event = receipt
+            .events
+            .iter()
+            .find(|event| event.kind == sekai_domain::receipt::ReceiptEventKind::PolicyDecided)
+            .unwrap();
+        assert_eq!(policy_event.attributes["decision"], "auto_apply");
+        assert_eq!(policy_event.attributes["action_policy_decision"], "allow");
         assert_eq!(auto.autonomous_envelope_id, "auto:dispatch");
         let other = admission
             .admit(req("notify", "agent-3"), "agent:fixture", 41)

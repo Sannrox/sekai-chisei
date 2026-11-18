@@ -9,6 +9,7 @@
 
 use crate::risk_class::RiskClass;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 pub const ACTION_POLICY_KIND: &str = "action_policy";
@@ -113,6 +114,26 @@ impl ActionPolicy {
             return (*decision, PolicyRule::RiskOverride(risk));
         }
         (self.default_decision, PolicyRule::Default)
+    }
+
+    /// A stable digest of the policy body (default, overrides and caps, not
+    /// the scope). Receipts name the policy that decided a submit by it, so
+    /// a later replay can tell which body was in force (#3016).
+    pub fn version(&self) -> String {
+        let mut properties: Vec<(String, String)> = self
+            .to_properties()
+            .into_iter()
+            .filter(|(key, _)| key != "scope")
+            .collect();
+        properties.sort();
+        let mut hasher = Sha256::new();
+        for (key, value) in properties {
+            hasher.update(key.as_bytes());
+            hasher.update([0]);
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        format!("sha256:{:x}", hasher.finalize())
     }
 
     /// Serialize to a Sekai object property map (mirrors namespace policy
@@ -299,6 +320,20 @@ pub fn action_policy_external_id(scope: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_tracks_the_body_not_the_scope() {
+        let mut policy = ActionPolicy::allow_all("agent:a");
+        let base = policy.version();
+        assert_eq!(base, ActionPolicy::allow_all("ns").version());
+        policy
+            .risk_overrides
+            .insert(RiskClass::Write, ActionDecision::RequireApproval);
+        let with_override = policy.version();
+        assert_ne!(base, with_override);
+        policy.default_decision = ActionDecision::Deny;
+        assert_ne!(with_override, policy.version());
+    }
 
     #[test]
     fn action_override_name_with_colon_round_trips() {
