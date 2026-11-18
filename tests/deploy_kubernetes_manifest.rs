@@ -1,8 +1,9 @@
 //! Kubernetes packaging (#1313): TLS StatefulSet, dest-pair, in-process Tenkai.
+//! Probe, pod security, and Service port checks run on the parsed YAML in
+//! scripts/tests/test_kubernetes_manifests.py.
 
 const TENKAI: &str = include_str!("../deploy/kubernetes/tenkai.toml");
 const STATEFULSET: &str = include_str!("../deploy/kubernetes/manifests/10-statefulset.yaml");
-const SERVICE: &str = include_str!("../deploy/kubernetes/manifests/20-service.yaml");
 const CARGO: &str = include_str!("../Cargo.toml");
 
 fn quoted_assignment<'a>(src: &'a str, key: &str) -> Option<&'a str> {
@@ -62,28 +63,7 @@ fn kubernetes_product_uses_inprocess_executor_and_matches_crate_version() {
 }
 
 #[test]
-fn statefulset_meets_pod_security_restricted() {
-    for required in [
-        "runAsNonRoot: true",
-        "runAsUser: 999",
-        "fsGroup: 999",
-        "type: RuntimeDefault",
-        "allowPrivilegeEscalation: false",
-        "drop: [\"ALL\"]",
-    ] {
-        assert!(
-            STATEFULSET.contains(required),
-            "restricted pod security needs {required}"
-        );
-    }
-    assert!(
-        !STATEFULSET.contains("runAsUser: 0") && !STATEFULSET.contains("initContainers"),
-        "no root init container; fsGroup owns /data"
-    );
-}
-
-#[test]
-fn statefulset_is_single_replica_sqlite_tls_with_ops_probes() {
+fn statefulset_is_single_replica_sqlite_tls() {
     let version = crate_version();
     let image = format!("ghcr.io/sannrox/sekai-chisei:v{version}");
     assert!(
@@ -123,20 +103,8 @@ fn statefulset_is_single_replica_sqlite_tls_with_ops_probes() {
         "bare-image dest-pair must set the Chisei dest"
     );
     assert!(
-        STATEFULSET.contains("OPS_BIND") && STATEFULSET.contains("value: \"0.0.0.0\""),
-        "kubelet probes require OPS_BIND on a non-loopback address"
-    );
-    assert!(
         !STATEFULSET.contains("SEKAI_BIND"),
         "leave SEKAI_BIND unset so first boot is UDS-only until a credential exists"
-    );
-    assert!(
-        STATEFULSET.contains("path: /healthz") && STATEFULSET.contains("port: ops"),
-        "liveness uses the ops /healthz port"
-    );
-    assert!(
-        STATEFULSET.contains("path: /readyz"),
-        "readiness uses the ops /readyz port"
     );
     assert!(
         !STATEFULSET.contains("SEKAI_INSECURE"),
@@ -154,12 +122,4 @@ fn statefulset_is_single_replica_sqlite_tls_with_ops_probes() {
         !STATEFULSET.contains("SEKAI_SHARED_STORE"),
         "retired single-store variables must stay unset"
     );
-}
-
-#[test]
-fn service_exposes_grpc_and_ops() {
-    assert!(SERVICE.contains("kind: Service"));
-    assert!(SERVICE.contains("name: grpc") && SERVICE.contains("port: 50051"));
-    assert!(SERVICE.contains("name: ops") && SERVICE.contains("port: 9464"));
-    assert!(SERVICE.contains("app: sekai-chisei"));
 }
