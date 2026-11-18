@@ -126,6 +126,27 @@ error messages; outcome values that are not short tokens are reported as
 The response model is not reported: providers' response model fields are not
 parsed today.
 
+Inside a request, each stage is one child span named after the stage, with a
+`stage` attribute and an `outcome` of `ok`, `refused`, or `failed`; a stage
+that did not end `ok` also sets the span status to error. Stage spans carry no
+object ids, namespaces, content, or digests. A refused request shows the stage
+that refused it.
+
+| Stage | Covers |
+| --- | --- |
+| `authorization` | namespace access for a model call; Action submission authorization, catalog capability, tenant, and service-principal checks |
+| `policy_decision` | effective model-call policy, impact routing, and context admission; Action policy resolution and decision |
+| `budget` | model-call budget reservation; Action budget checks |
+| `routing` | model and route selection for a model call |
+| `evaluation_step` | one evaluation graph node |
+| `stochastic_trial` | one stochastic evaluator trial |
+| `outbound_call` | an external evaluator request |
+| `persistence` | one store connection checkout inside a request; the span lasts while the connection is held, and its outcome reports the checkout only. Background work outside a request opens none. |
+
+`authorization`, `policy_decision`, and `budget` record errors as `refused`;
+the other stages record them as `failed`. A server-side fault (internal,
+unavailable, deadline) is `failed` at every stage.
+
 The standard gRPC health service is available without the application auth
 interceptor so native gRPC probes can call `grpc.health.v1.Health/Check`.
 

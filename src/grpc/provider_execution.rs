@@ -129,9 +129,11 @@ pub async fn execute_native_content_request_stream(
         &request.model,
         LocalEndpoints::from_config(config),
     )?;
-    budget
-        .check_and_reserve(&user_id, estimated)
-        .map_err(Status::resource_exhausted)?;
+    crate::obs::correlation::in_grpc_stage(crate::obs::correlation::Stage::Budget, || {
+        budget
+            .check_and_reserve(&user_id, estimated)
+            .map_err(Status::resource_exhausted)
+    })?;
     let provider = match llm::resolve_with_registry_and_provider_credential(
         &request.model,
         &registry,
@@ -265,9 +267,11 @@ async fn execute_chat_request_stream_with_cache(
         &r.model,
         LocalEndpoints::from_config(config),
     )?;
-    budget
-        .check_and_reserve(&user_id, estimated)
-        .map_err(Status::resource_exhausted)?;
+    crate::obs::correlation::in_grpc_stage(crate::obs::correlation::Stage::Budget, || {
+        budget
+            .check_and_reserve(&user_id, estimated)
+            .map_err(Status::resource_exhausted)
+    })?;
     let provider = match llm::resolve_with_registry_and_provider_credential(
         &r.model,
         &registry,

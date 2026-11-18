@@ -7,6 +7,7 @@
 //! use.
 
 use crate::db::runtime_db::RuntimeDb;
+use crate::obs::correlation::{Stage, StageGuard};
 use crate::sekai::action::RiskClass;
 use crate::sekai::action_instance::{
     ActionInstance, ApprovalRequirement, DECISION_DENY, DECISION_GRANT, RULE_AGENT_PROPOSE_ONLY,
@@ -582,10 +583,17 @@ impl<'a> ActionInstanceAdmission<'a> {
         } else {
             type_def.policy_scope.clone()
         };
-        let resolved_policy = self
-            .db
-            .resolve_action_policy(actor, &namespace, &policy_project)
-            .map_err(ActionInstanceAdmissionError::Internal)?;
+        let mut policy_stage = StageGuard::open(Stage::PolicyDecision);
+        let resolved_policy = policy_stage.in_scope(|| {
+            self.db
+                .resolve_action_policy(actor, &namespace, &policy_project)
+                .map_err(ActionInstanceAdmissionError::Internal)
+        });
+        if resolved_policy.is_err() {
+            // A store fault resolving policy is a failure, not a refusal.
+            policy_stage.fail();
+        }
+        let resolved_policy = resolved_policy?;
         let (policy_decision, policy_rule, policy_scope_label) = match &resolved_policy {
             Some(policy) => {
                 let (decision, rule) =
@@ -598,6 +606,10 @@ impl<'a> ActionInstanceAdmission<'a> {
                 String::new(),
             ),
         };
+        if policy_decision == action_policy::ActionDecision::Deny {
+            policy_stage.refuse();
+        }
+        drop(policy_stage);
 
         let instance_id = format!("gai-{}", uuid::Uuid::new_v4().simple());
         let operation_id = resolve_operation_id(&request.request_id)?;
@@ -663,7 +675,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
             && !budget_already_reserved
-            && budget.check(&budget_subject, budget_amount).is_err()
+            && budget_exhausted(budget, &budget_subject, budget_amount)
         {
             status = STATUS_DENIED.into();
             deny_reason = format!("action budget exhausted for {budget_subject}");
@@ -705,7 +717,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
             && !budget_already_reserved
-            && budget.check(&budget_subject, budget_amount).is_err()
+            && budget_exhausted(budget, &budget_subject, budget_amount)
         {
             status = STATUS_DENIED.into();
             deny_reason = format!("action budget exhausted for {budget_subject}");
@@ -3267,6 +3279,17 @@ fn load_offline_object(
                 "object {object_id} not found"
             ))
         })
+}
+
+/// One `budget` stage: whether `subject` lacks `amount`, recorded as a
+/// refusal when it does.
+fn budget_exhausted(budget: &dyn ActionBudgetPort, subject: &str, amount: i32) -> bool {
+    let mut stage = StageGuard::open(Stage::Budget);
+    let exhausted = stage.in_scope(|| budget.check(subject, amount).is_err());
+    if exhausted {
+        stage.refuse();
+    }
+    exhausted
 }
 
 #[cfg(test)]

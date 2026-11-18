@@ -2797,11 +2797,6 @@ impl KiokuSekaiDbExt2 for SekaiDb {
         actor: &str,
         recorded_at_ms: i64,
     ) -> Result<(), String> {
-        let _span = tracing::info_span!(
-            "stage",
-            stage = sekai_core::obs::correlation::Stage::Persistence.as_str(),
-        )
-        .entered();
         if actor.trim().is_empty() {
             return Err("holdout actor is required".into());
         }

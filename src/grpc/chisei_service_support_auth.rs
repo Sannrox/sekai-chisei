@@ -686,6 +686,18 @@ pub(super) fn require_execution_namespace_access_with_context(
     context: Option<&crate::enterprise::AuthenticatedContext>,
     namespace: &str,
 ) -> Result<(), Status> {
+    crate::obs::correlation::in_grpc_stage(crate::obs::correlation::Stage::Authorization, || {
+        execution_namespace_access(db, facts, config, actor, context, namespace)
+    })
+}
+fn execution_namespace_access(
+    db: &RuntimeDb,
+    facts: &dyn SekaiFactReader,
+    config: &Config,
+    actor: &str,
+    context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
+) -> Result<(), Status> {
     if let Some(context) = context {
         context
             .authorize_space(crate::enterprise::NamespaceAction::Write)

@@ -174,39 +174,51 @@ impl ChiseiServiceImpl {
             .scope_pressure(&format!("project:{}", input.namespace.trim()));
         let budget_pressure = strongest_pressure(scoped_pressure, namespace_pressure);
         let namespace_hint = input.namespace.trim().to_string();
-        let effective_policy = self.policy.effective_policy(&input.namespace);
+        let mut policy_stage = crate::obs::correlation::StageGuard::open(
+            crate::obs::correlation::Stage::PolicyDecision,
+        );
+        let effective_policy =
+            policy_stage.in_scope(|| self.policy.effective_policy(&input.namespace));
         // The namespace's impact route rule narrows the models every route
         // below may use (#1861).
         // An unreadable rule refuses, and the refusal is audited like any
         // other.
-        let impact_routing = self
-            .impact_routing(&input.namespace, action_impact.class())
-            .map_err(|error| {
-                Status::failed_precondition(self.record_impact_route_refusal(
-                    &action_impact,
-                    authenticated_actor,
-                    RouteClass::of(action_impact.class()),
-                    &input,
-                    unreadable_impact_route(&error),
-                ))
-            })?;
+        let impact_routing = policy_stage.in_scope(|| {
+            self.impact_routing(&input.namespace, action_impact.class())
+                .map_err(|error| {
+                    Status::failed_precondition(self.record_impact_route_refusal(
+                        &action_impact,
+                        authenticated_actor,
+                        RouteClass::of(action_impact.class()),
+                        &input,
+                        unreadable_impact_route(&error),
+                    ))
+                })
+        });
+        let impact_routing =
+            crate::obs::correlation::check_status(&mut policy_stage, impact_routing)?;
         let impact_call = impact_routing.as_ref().map(|routing| ImpactRouteCall {
             routing,
             impact: &action_impact,
             actor: authenticated_actor,
         });
-        let route_policy = match impact_call.as_ref() {
-            Some(call) => Some(
-                call.routing
-                    .narrow(effective_policy.as_ref())
-                    .map_err(|reason| self.refuse_impact_route(call, &input, reason))?,
-            ),
-            None => effective_policy.clone(),
-        };
-        let context_admission_policy = self
-            .policy
-            .context_admission_policy(&input.namespace)
-            .map_err(Status::failed_precondition)?;
+        let route_policy = policy_stage.in_scope(|| match impact_call.as_ref() {
+            Some(call) => call
+                .routing
+                .narrow(effective_policy.as_ref())
+                .map(Some)
+                .map_err(|reason| self.refuse_impact_route(call, &input, reason)),
+            None => Ok(effective_policy.clone()),
+        });
+        let route_policy = crate::obs::correlation::check_status(&mut policy_stage, route_policy)?;
+        let context_admission_policy = policy_stage.in_scope(|| {
+            self.policy
+                .context_admission_policy(&input.namespace)
+                .map_err(Status::failed_precondition)
+        });
+        let context_admission_policy =
+            crate::obs::correlation::check_status(&mut policy_stage, context_admission_policy)?;
+        drop(policy_stage);
         let data_class = self.data_class(effective_policy.as_ref());
         let task_class = TaskClass::parse(&input.task_class);
         let safe_providers = crate::chisei::privacy::safe_providers(&self.config);
@@ -1275,6 +1287,32 @@ impl ChiseiServiceImpl {
     /// call's class.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_model_for_run(
+        &self,
+        input: &ExecutionInput,
+        fallback_runtime: &str,
+        run: &pipe::RunResult,
+        policy: Option<&crate::chisei::policy::Policy>,
+        impact: Option<&ImpactRouteCall<'_>>,
+        safe_only: bool,
+        safe_providers: &std::collections::HashSet<String>,
+    ) -> Result<(String, String, String, String, Option<ImpactRouteOutcome>), Status> {
+        crate::obs::correlation::in_stage_async(
+            crate::obs::correlation::Stage::Routing,
+            self.select_model_for_run(
+                input,
+                fallback_runtime,
+                run,
+                policy,
+                impact,
+                safe_only,
+                safe_providers,
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn select_model_for_run(
         &self,
         input: &ExecutionInput,
         fallback_runtime: &str,

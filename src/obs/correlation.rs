@@ -18,7 +18,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::HeaderMap;
 
-pub use sekai_obs::correlation::Stage;
+pub use sekai_obs::correlation::{Stage, StageGuard, StageOutcome, in_stage, in_stage_async};
+
+/// [`StageGuard::check`] for a gRPC result. A server-side fault (internal,
+/// unknown, unavailable, data loss, deadline) records `failed` even at a
+/// deciding stage, so an outage is not traced as a refusal.
+pub fn check_status<T>(
+    guard: &mut StageGuard,
+    result: Result<T, tonic::Status>,
+) -> Result<T, tonic::Status> {
+    if let Err(status) = &result
+        && matches!(
+            status.code(),
+            tonic::Code::Internal
+                | tonic::Code::Unknown
+                | tonic::Code::Unavailable
+                | tonic::Code::DataLoss
+                | tonic::Code::DeadlineExceeded
+        )
+    {
+        guard.fail();
+    }
+    guard.check(result)
+}
+
+/// [`in_stage`] for gRPC work; see [`check_status`] for the outcome.
+pub fn in_grpc_stage<T>(
+    stage: Stage,
+    work: impl FnOnce() -> Result<T, tonic::Status>,
+) -> Result<T, tonic::Status> {
+    let mut guard = StageGuard::open(stage);
+    let result = guard.in_scope(work);
+    check_status(&mut guard, result)
+}
 
 /// Caller-supplied cross-plane operation identity. Opaque; never derived
 /// from request content. Distinct from the generated [`CorrelationId`].

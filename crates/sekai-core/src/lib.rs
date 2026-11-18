@@ -17,7 +17,9 @@ pub mod obs {
     pub use sekai_obs::{labels, signals};
 
     pub mod correlation {
-        pub use sekai_obs::correlation::Stage;
+        pub use sekai_obs::correlation::{
+            Stage, StageGuard, StageOutcome, in_stage, in_stage_async,
+        };
     }
 
     /// Metrics wrapper so `sekai_build_info.version` is this crate when tests

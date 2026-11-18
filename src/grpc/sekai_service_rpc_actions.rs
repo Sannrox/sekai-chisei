@@ -192,43 +192,52 @@ pub(super) async fn submit_action_instance(
     if namespace.is_empty() {
         return Err(Status::invalid_argument("namespace required"));
     }
-    let actor = authorize_action_instance_submit(service, &principals, &namespace)?;
-    if let Some(capability_name) = catalog_capability {
-        let expected = crate::sekai::capability::action_capability_name(&inner.type_id);
-        // MCP v1 binds SubmitActionInstance as `sekai.actions.submit`. Skip
-        // the type-specific live catalog check only when that allowlist name
-        // is not also the native entry for this type_id.
-        if capability_name != "sekai.actions.submit" || capability_name == expected {
-            let catalog_namespace = catalog_namespace.unwrap_or_else(|| namespace.clone());
-            if catalog_namespace != namespace {
-                return Err(Status::invalid_argument(
-                    "catalog namespace metadata must match request namespace",
-                ));
-            }
-            let visible = service
-                .discoverable_capabilities(&namespace, &principals, tenant_context.as_ref())?
-                .into_iter()
-                .any(|entry| {
-                    entry.name == capability_name
-                        && capability_name == expected
-                        && entry.action_version == inner.version
-                });
-            if !visible {
-                return Err(Status::failed_precondition("capability unavailable"));
+    // Namespace, catalog, tenant, and service-principal checks are one
+    // `authorization` stage; a refusal here ends it as `refused`.
+    let mut authorization =
+        crate::obs::correlation::StageGuard::open(crate::obs::correlation::Stage::Authorization);
+    let authorized = authorization.in_scope(|| -> Result<String, Status> {
+        let actor = authorize_action_instance_submit(service, &principals, &namespace)?;
+        if let Some(capability_name) = catalog_capability {
+            let expected = crate::sekai::capability::action_capability_name(&inner.type_id);
+            // MCP v1 binds SubmitActionInstance as `sekai.actions.submit`. Skip
+            // the type-specific live catalog check only when that allowlist name
+            // is not also the native entry for this type_id.
+            if capability_name != "sekai.actions.submit" || capability_name == expected {
+                let catalog_namespace = catalog_namespace.unwrap_or_else(|| namespace.clone());
+                if catalog_namespace != namespace {
+                    return Err(Status::invalid_argument(
+                        "catalog namespace metadata must match request namespace",
+                    ));
+                }
+                let visible = service
+                    .discoverable_capabilities(&namespace, &principals, tenant_context.as_ref())?
+                    .into_iter()
+                    .any(|entry| {
+                        entry.name == capability_name
+                            && capability_name == expected
+                            && entry.action_version == inner.version
+                    });
+                if !visible {
+                    return Err(Status::failed_precondition("capability unavailable"));
+                }
             }
         }
-    }
-    enforce_namespace_tenant_context(
-        service.db.runtime(),
-        tenant_context.as_ref(),
-        &namespace,
-        true,
-    )?;
-    enforce_service_principal_action_type(
-        service.db.runtime(),
-        tenant_context.as_ref(),
-        &inner.type_id,
-    )?;
+        enforce_namespace_tenant_context(
+            service.db.runtime(),
+            tenant_context.as_ref(),
+            &namespace,
+            true,
+        )?;
+        enforce_service_principal_action_type(
+            service.db.runtime(),
+            tenant_context.as_ref(),
+            &inner.type_id,
+        )?;
+        Ok(actor)
+    });
+    let actor = crate::obs::correlation::check_status(&mut authorization, authorized)?;
+    drop(authorization);
     let operation_id = crate::sekai::operation_correlation::bind_submit_identity(
         header_operation_id.as_deref(),
         &inner.request_id,

@@ -21,11 +21,6 @@ impl SekaiDb {
         receipt: &OperationReceipt,
         ingest: Option<&str>,
     ) -> Result<(), String> {
-        let _span = tracing::info_span!(
-            "stage",
-            stage = crate::obs::correlation::Stage::Persistence.as_str(),
-        )
-        .entered();
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
