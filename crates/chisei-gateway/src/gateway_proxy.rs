@@ -513,54 +513,62 @@ pub(super) async fn proxy_gateway_inner_scoped(
         .map(|model| model.canonical_model.as_str())
         .or(requested_model.as_deref())
         .unwrap_or("");
-    let gateway_admit = match gateway_decision_preflight(
-        &state.config,
-        &state.runtime,
-        &identity,
-        preferred_runtime,
-        preferred_model,
-        request_bytes,
-        work_unit_id.as_deref().unwrap_or(""),
-        &task_class,
-        &request_id,
-        route_override.as_deref(),
-        capability_requirements_json,
-        model_metadata_request,
-        &pipeline_spec,
-    )
-    .await
-    {
-        Ok(admit) => admit,
-        Err(rejection) => {
-            record_refusal_and_append(
-                &state.config,
-                &state.runtime,
-                &identity,
-                &preflight_context,
-                &rejection,
-            )
-            .await;
-            return rejection.response();
-        }
+    // Policy mode admits against the gateway's own policy; otherwise the
+    // control plane decides.
+    let decided = match &state.runtime.policy {
+        Some(policy) => policy_preflight(
+            policy,
+            &identity,
+            &mut preflight_context,
+            body.to_vec(),
+            requested_provider,
+            requested_registry_model
+                .as_ref()
+                .map(|model| model.canonical_model.as_str()),
+            model_metadata_request,
+            context_request.is_some(),
+            &caller_data_class,
+        ),
+        None => match gateway_decision_preflight(
+            &state.config,
+            &state.runtime,
+            &identity,
+            preferred_runtime,
+            preferred_model,
+            request_bytes,
+            work_unit_id.as_deref().unwrap_or(""),
+            &task_class,
+            &request_id,
+            route_override.as_deref(),
+            capability_requirements_json,
+            model_metadata_request,
+            &pipeline_spec,
+        )
+        .await
+        {
+            Ok(gateway_admit) => {
+                apply_gateway_decision(
+                    &state.config,
+                    &state.runtime,
+                    &identity,
+                    &mut preflight_context,
+                    &registry_snapshot,
+                    gateway_admit,
+                    body.to_vec(),
+                    requested_provider,
+                    client_provider,
+                    capability_surface,
+                    context_request.as_ref(),
+                    requested_model.as_deref(),
+                    &request_id,
+                    work_unit_id.as_deref(),
+                )
+                .await
+            }
+            Err(rejection) => Err(rejection),
+        },
     };
-    let (mut resolved, mut egress, budget) = match apply_gateway_decision(
-        &state.config,
-        &state.runtime,
-        &identity,
-        &mut preflight_context,
-        &registry_snapshot,
-        gateway_admit,
-        body.to_vec(),
-        requested_provider,
-        client_provider,
-        capability_surface,
-        context_request.as_ref(),
-        requested_model.as_deref(),
-        &request_id,
-        work_unit_id.as_deref(),
-    )
-    .await
-    {
+    let (mut resolved, mut egress, budget) = match decided {
         Ok(triple) => triple,
         Err(rejection) => {
             record_refusal_and_append(
@@ -772,8 +780,12 @@ pub(super) async fn proxy_gateway_inner_scoped(
 
     // Atomically bind the opaque alias and claim its one provider dispatch only
     // after every fallible pre-dispatch step has completed.
+    // Policy mode has no control plane to claim the alias with; a request id
+    // is not deduplicated there until the gateway keeps its own log.
     let dispatch_token = uuid::Uuid::new_v4().to_string();
-    if let Err(error) = claim_gateway_dispatch(&state.config, &alias_context, &dispatch_token).await
+    if state.runtime.policy.is_none()
+        && let Err(error) =
+            claim_gateway_dispatch(&state.config, &alias_context, &dispatch_token).await
     {
         return alias_reservation_error_response(error);
     }

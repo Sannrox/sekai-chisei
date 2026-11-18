@@ -14,7 +14,17 @@ pub(super) fn validate_gateway_security(
     gateway_keys: &HashMap<String, GatewayIdentity>,
     allow_auth_passthrough: bool,
     admin_token: Option<&str>,
+    policy_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if policy_mode && !gateway_keys.is_empty() {
+        return Err(format!("GATEWAY_KEYS cannot be combined with {POLICY_PATH_ENV}; name principals and keys in the policy").into());
+    }
+    if policy_mode && allow_auth_passthrough {
+        return Err(format!(
+            "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH cannot be combined with {POLICY_PATH_ENV}"
+        )
+        .into());
+    }
     if let Some(token) = admin_token.map(str::trim).filter(|token| !token.is_empty())
         && (token == "change-me" || token.len() < MIN_ADMIN_TOKEN_BYTES)
     {
@@ -25,7 +35,7 @@ pub(super) fn validate_gateway_security(
     }
 
     if !bind_addr.ip().is_loopback() {
-        if gateway_keys.is_empty() {
+        if gateway_keys.is_empty() && !policy_mode {
             return Err(
                 "an exposed gateway requires at least one authenticated GATEWAY_KEYS entry".into(),
             );
@@ -195,7 +205,11 @@ pub(super) fn app_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -
             axum::routing::get(gateway_status),
         ),
         (COMMUNITY_GATEWAY_ROUTES[3], post(refresh_gateway_admin)),
-        (COMMUNITY_GATEWAY_ROUTES[4], any(proxy_gateway)),
+        (
+            COMMUNITY_GATEWAY_ROUTES[4],
+            axum::routing::get(published_policy),
+        ),
+        (COMMUNITY_GATEWAY_ROUTES[5], any(proxy_gateway)),
     ];
     routes
         .into_iter()
@@ -260,6 +274,10 @@ pub(super) async fn gateway_readiness(State(state): State<GatewayState>) -> Resp
                 "detail": reason
             }),
         );
+    }
+    if let Some(policy) = &state.runtime.policy {
+        let (status, body) = policy.readiness();
+        return json_response(status, body);
     }
     let Some(target) = state.config.chisei_grpc_target.as_deref() else {
         return json_response(
@@ -333,7 +351,11 @@ pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Erro
         &config.gateway_keys,
         config.allow_auth_passthrough,
         runtime.admin_token.as_deref(),
+        runtime.policy.is_some(),
     )?;
+    if let Some(policy) = &runtime.policy {
+        policy.spawn_watcher();
+    }
     let bind_addr = config.bind_addr;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     info!(addr = %bind_addr, "chisei-gateway listening");

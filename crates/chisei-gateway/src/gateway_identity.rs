@@ -8,6 +8,11 @@ pub(super) async fn resolve_identity(
     let Some(key) = client_key(headers) else {
         return Err(IdentityError::MissingKey);
     };
+    if let Some(policy) = &state.runtime.policy {
+        return policy
+            .identify(key, &config.default_project)
+            .map(|identity| IdentityContext::machine(identity, UpstreamAuthMode::GatewayKey));
+    }
     if config.allow_auth_passthrough
         && let Some(identity) = passthrough_identity(headers, &config.default_project)
     {

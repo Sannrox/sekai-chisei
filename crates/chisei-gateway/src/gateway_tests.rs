@@ -898,11 +898,17 @@ fn correlation_scope_uses_resolved_identity_only() {
 fn rejects_weak_admin_tokens() {
     let bind = "127.0.0.1:8788".parse().unwrap();
     let keys = HashMap::new();
-    assert!(validate_gateway_security(bind, &keys, false, Some("change-me")).is_err());
-    assert!(validate_gateway_security(bind, &keys, false, Some("too-short")).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, Some("change-me"), false).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, Some("too-short"), false).is_err());
     assert!(
-        validate_gateway_security(bind, &keys, false, Some("0123456789abcdef0123456789abcdef"),)
-            .is_ok()
+        validate_gateway_security(
+            bind,
+            &keys,
+            false,
+            Some("0123456789abcdef0123456789abcdef"),
+            false
+        )
+        .is_ok()
     );
 }
 
@@ -953,7 +959,7 @@ fn recovery_paths_use_canonical_configuration() {
 fn exposed_gateway_requires_keys_and_no_auth_passthrough() {
     let bind = "0.0.0.0:8788".parse().unwrap();
     let mut keys = HashMap::new();
-    assert!(validate_gateway_security(bind, &keys, false, None).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, None, false).is_err());
     keys.insert(
         "hash".to_string(),
         GatewayIdentity {
@@ -964,8 +970,18 @@ fn exposed_gateway_requires_keys_and_no_auth_passthrough() {
             tier: DEFAULT_GATEWAY_TIER.to_string(),
         },
     );
-    assert!(validate_gateway_security(bind, &keys, true, None).is_err());
-    assert!(validate_gateway_security(bind, &keys, false, None).is_ok());
+    assert!(validate_gateway_security(bind, &keys, true, None, false).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, None, false).is_ok());
+}
+
+#[test]
+fn policy_mode_owns_keys_and_refuses_passthrough() {
+    let bind = "0.0.0.0:8788".parse().unwrap();
+    let no_keys = HashMap::new();
+    assert!(validate_gateway_security(bind, &no_keys, false, None, true).is_ok());
+    assert!(validate_gateway_security(bind, &no_keys, true, None, true).is_err());
+    let keys = parse_gateway_keys("k=agent", "default").unwrap();
+    assert!(validate_gateway_security(bind, &keys, false, None, true).is_err());
 }
 
 #[test]
@@ -4088,4 +4104,185 @@ async fn spawn_fake_sekai_plane(plane: FakeSekaiPlane) -> String {
             .unwrap();
     });
     format!("http://{addr}")
+}
+
+const POLICY_KEY: &str = "sk-policy-coder";
+
+fn write_policy(path: &Path, generation: u64, model: &str, limits: serde_json::Value) {
+    let policy = serde_json::json!({
+        "format": POLICY_FORMAT,
+        "generation": generation,
+        "principals": [{
+            "name": "coder",
+            "key_sha256": [hash_gateway_key(POLICY_KEY)],
+            "routes": [{"provider": "openai", "models": [model]}],
+            "limits": limits,
+        }],
+        "egress": [{"provider": "openai", "data_classes": ["unknown", "internal"]}],
+    });
+    std::fs::write(path, serde_json::to_vec(&policy).unwrap()).unwrap();
+}
+
+/// A policy-mode gateway with no control-plane target and a fake OpenAI
+/// upstream that records every request it receives.
+async fn spawn_policy_gateway(policy: PolicyStore) -> (String, Arc<Mutex<Vec<String>>>) {
+    let (upstream_base, requests) = spawn_fake_upstream(
+        r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+        "application/json",
+    )
+    .await;
+    let mut config = routing_config();
+    config.openai_base_url = upstream_base;
+    config.openai_api_key = Some("sk-upstream".into());
+    config.allow_auth_passthrough = false;
+    let mut runtime = test_gateway_runtime();
+    runtime.policy = Some(policy);
+    (spawn_gateway_with_runtime(config, runtime).await, requests)
+}
+
+async fn policy_chat(
+    gateway: &str,
+    model: &str,
+    data_class: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .bearer_auth(POLICY_KEY)
+        .json(&serde_json::json!({"model": model, "messages": []}));
+    if let Some(class) = data_class {
+        request = request.header(X_CHISEI_DATA_CLASS.as_str(), class);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap_or_default())
+}
+
+#[tokio::test]
+async fn policy_mode_admits_its_routes_alone_and_publishes_no_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    write_policy(&path, 1, "gpt-5.5", serde_json::json!([]));
+    let (gateway, upstream) = spawn_policy_gateway(PolicyStore::open(path)).await;
+
+    let (status, body) = policy_chat(&gateway, "gpt-5.5", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(upstream.lock().unwrap().len(), 1);
+
+    let (status, body) = policy_chat(&gateway, "gpt-5.5-mini", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = policy_chat(&gateway, "gpt-5.5", Some("sensitive")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "data_class_denied", "{body}");
+    assert_eq!(upstream.lock().unwrap().len(), 1);
+
+    let view: serde_json::Value = reqwest::Client::new()
+        .get(format!("{gateway}/_chisei/policy"))
+        .bearer_auth(POLICY_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["generation"], 1);
+    assert_eq!(view["principals"][0]["name"], "coder");
+    assert!(!view.to_string().contains(&hash_gateway_key(POLICY_KEY)));
+}
+
+#[tokio::test]
+async fn policy_limit_denies_before_provider_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    write_policy(
+        &path,
+        1,
+        "*",
+        serde_json::json!([{"requests": 1, "window_secs": 3600}]),
+    );
+    let (gateway, upstream) = spawn_policy_gateway(PolicyStore::open(path)).await;
+
+    assert_eq!(
+        policy_chat(&gateway, "gpt-5.5", None).await.0,
+        StatusCode::OK
+    );
+    let (status, body) = policy_chat(&gateway, "gpt-5.5-mini", None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(upstream.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn policy_mode_denies_without_a_valid_policy_and_keeps_the_last_good_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    let store = PolicyStore::open(path.clone());
+    let (gateway, upstream) = spawn_policy_gateway(store.clone()).await;
+
+    let (status, body) = policy_chat(&gateway, "gpt-5.5", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(store.readiness().0, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(upstream.lock().unwrap().is_empty());
+
+    write_policy(&path, 1, "gpt-5.5", serde_json::json!([]));
+    assert_eq!(store.reload(), Some(1));
+
+    // A broken file, and a changed file that keeps its generation, are both
+    // rejected whole; generation 1 stays active and admitting.
+    std::fs::write(
+        &path,
+        br#"{"format":"chisei.gateway-policy/v1","generation":2"#,
+    )
+    .unwrap();
+    assert_eq!(store.reload(), Some(1));
+    write_policy(&path, 1, "*", serde_json::json!([]));
+    assert_eq!(store.reload(), Some(1));
+    let (status, ready) = store.readiness();
+    assert_eq!(status, StatusCode::OK);
+    assert!(ready["policy_reload_error"].is_string(), "{ready}");
+    assert_eq!(
+        policy_chat(&gateway, "gpt-5.5", None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        policy_chat(&gateway, "gpt-5.5-mini", None).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    write_policy(&path, 2, "*", serde_json::json!([]));
+    assert_eq!(store.reload(), Some(2));
+    assert!(store.readiness().1["policy_reload_error"].is_null());
+}
+
+#[test]
+fn policy_model_limit_survives_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    let write = |generation: u64| {
+        let policy = serde_json::json!({
+            "format": POLICY_FORMAT,
+            "generation": generation,
+            "principals": [{
+                "name": "coder",
+                "key_sha256": [hash_gateway_key(POLICY_KEY)],
+                "routes": [{"provider": "openai", "models": ["*"]}],
+            }],
+            "models": [{"model": "gpt-5.5", "limits": [{"requests": 1, "window_secs": 3600}]}],
+            "egress": [{"provider": "openai", "data_classes": ["unknown"]}],
+        });
+        std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    };
+    write(1);
+    let store = PolicyStore::open(path.clone());
+    let request = || PolicyRequest {
+        principal: "coder",
+        provider: "openai",
+        model: Some("openai/gpt-5.5"),
+        data_class: "unknown",
+    };
+    assert_eq!(store.admit(request()), Ok(1));
+    write(2);
+    assert_eq!(store.reload(), Some(2));
+    assert!(matches!(
+        store.admit(request()),
+        Err(PolicyDenial::LimitExceeded(_))
+    ));
 }
