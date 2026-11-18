@@ -7,7 +7,8 @@ control plane.
 
 Direction: [ADR 0152](decisions/0152-gateway-is-the-model-egress-layer.md)
 makes the gateway the model egress layer with its own egress policy, no calls
-into Sekai or Chisei, and no `chisei_context`. This page describes the current
+into Sekai or Chisei, and no `chisei_context`. [Policy mode](#policy-mode) is
+that admission path. The rest of this page describes the current
 `gateway.decide/v2` path, which stays supported until it is drained.
 
 It exposes:
@@ -232,6 +233,82 @@ cargo run -p chisei-gateway --bin chisei-gateway -- refresh
 `GATEWAY_KEYS=key=agent:project` remains an explicit environment allowlist for
 development and Docker Compose. Do not confuse it with control-plane
 principal credentials.
+
+## Policy mode
+
+Set `CHISEI_GATEWAY_POLICY_PATH` to a policy file and the gateway admits
+requests against that file alone. It does not need, and does not call, Sekai
+or Chisei: `CHISEI_GRPC_URL` and `SEKAI_SOCKET` are ignored, and requests keep
+flowing while the control plane is down. Policy mode refuses to start with
+`GATEWAY_KEYS` or `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`; the policy names
+every principal and key.
+
+```json
+{
+  "format": "chisei.gateway-policy/v1",
+  "generation": 1,
+  "instances": 2,
+  "principals": [
+    {
+      "name": "codex-app",
+      "project": "sekai-chisei",
+      "sekai_principal": "agent:codex-app",
+      "key_sha256": ["<sha256 hex of the client key>"],
+      "routes": [
+        {"provider": "openai", "models": ["gpt-5.5", "gpt-5.5-mini"]},
+        {"provider": "ollama", "models": ["*"]}
+      ],
+      "limits": [
+        {"requests": 60, "window_secs": 60},
+        {"requests": 5000, "window_secs": 86400}
+      ]
+    }
+  ],
+  "models": [
+    {"model": "gpt-5.5", "limits": [{"requests": 600, "window_secs": 60}]}
+  ],
+  "egress": [
+    {"provider": "openai", "data_classes": ["unknown", "public", "internal"]},
+    {"provider": "ollama", "data_classes": ["unknown", "public", "internal", "sensitive"]}
+  ]
+}
+```
+
+- `key_sha256` holds `printf %s "$KEY" | shasum -a 256` of each client key.
+  Keys are never stored or published in clear.
+- A route names a provider (`openai`, `anthropic`, `ollama`, `native`, `xai`,
+  `meta`) and the models the principal may reach there, by the name within the
+  provider (`gpt-5.5`), the canonical id (`openai/gpt-5.5`), or `*`. Policy
+  mode never rewrites the requested model, and `auto` is refused.
+- `limits` are fixed request windows. A short window is a rate limit, a long
+  one a quota. Principal limits count that principal's requests; `models`
+  limits count every principal's requests to that model. Each instance
+  enforces `ceil(requests / instances)` with its own counter, so traffic
+  spread across instances can overshoot slightly.
+- `egress` lists, per provider, the data classes a request may carry there. A
+  request's class comes from `x-chisei-data-class`, or `unknown` without one.
+  Every provider a route names needs an egress rule.
+- `sekai_principal` maps the principal to a Sekai principal; it defaults to
+  the name.
+
+Every denial (unknown key, route, data class, limit, no valid policy) returns
+before any provider contact: `401`, `403 policy_denied`,
+`403 data_class_denied`, `429 rate_limit_exceeded`, or
+`503 policy_unavailable`.
+
+The gateway reads the file at start and checks it for changes every two
+seconds. A changed file must raise `generation`. A file that does not parse,
+fails validation, or keeps the active generation is rejected whole: the
+previous generation stays active and `/readyz` reports `policy_reload_error`.
+Without any valid generation, every request is denied and `/readyz` returns
+`503 no_valid_policy`.
+
+`GET /_chisei/policy` returns the active generation without keys to any
+principal of the policy. Chisei reads it there.
+
+Not yet in policy mode: usage, receipts, and audit records (they move to the
+gateway's own log in #2698), `x-chisei-request-id` dispatch deduplication,
+`chisei_context` (refused), and cost or token quotas.
 
 ## Context selection and egress
 

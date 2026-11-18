@@ -138,6 +138,9 @@ use usage::*;
 #[path = "gateway_recovery.rs"]
 mod recovery;
 use recovery::*;
+#[path = "gateway_policy.rs"]
+mod policy;
+use policy::*;
 #[path = "gateway_response.rs"]
 mod response;
 use response::*;
@@ -216,10 +219,17 @@ impl GatewayConfig {
         {
             return Err("a configured provider API key is required for chisei-gateway".into());
         }
-        let chisei_grpc_target = required_control_plane_target(
-            std::env::var("CHISEI_GRPC_URL").ok(),
-            std::env::var("SEKAI_SOCKET").ok(),
-        )?;
+        // Policy mode admits against the gateway's own policy and never calls
+        // the control plane, so it needs no control-plane target.
+        let policy_mode = policy_path_from_env().is_some();
+        let chisei_grpc_target = if policy_mode {
+            None
+        } else {
+            Some(required_control_plane_target(
+                std::env::var("CHISEI_GRPC_URL").ok(),
+                std::env::var("SEKAI_SOCKET").ok(),
+            )?)
+        };
         let default_project =
             std::env::var("GATEWAY_DEFAULT_PROJECT").unwrap_or_else(|_| "default".to_string());
         let gateway_keys = parse_gateway_keys(
@@ -241,6 +251,7 @@ impl GatewayConfig {
             &gateway_keys,
             allow_auth_passthrough,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
+            policy_mode,
         )?;
 
         Ok(Self {
@@ -251,7 +262,7 @@ impl GatewayConfig {
             anthropic_api_key,
             ollama_base_url,
             native_base_url,
-            chisei_grpc_target: Some(chisei_grpc_target),
+            chisei_grpc_target,
             default_project,
             gateway_keys,
             allow_auth_passthrough,
@@ -353,6 +364,9 @@ struct GatewayRuntime {
     readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
     upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
     resilience: ResilienceConfig,
+    /// Set in policy mode: the gateway-owned egress policy replaces every
+    /// control-plane call on the request path.
+    policy: Option<PolicyStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -607,6 +621,7 @@ impl GatewayRuntime {
             positive_env("CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS")
                 .unwrap_or(DEFAULT_RATE_LIMIT_WINDOW_SECS as usize) as u64,
         );
+        runtime.policy = policy_path_from_env().map(PolicyStore::open);
         runtime
     }
 
@@ -640,6 +655,7 @@ impl GatewayRuntime {
             readiness_probe: Arc::new(Mutex::new(None)),
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
             resilience: ResilienceConfig::default(),
+            policy: None,
         }
     }
 
@@ -764,6 +780,7 @@ pub const COMMUNITY_GATEWAY_ROUTES: &[&str] = &[
     "/readyz",
     "/statusz",
     "/_chisei/admin/refresh",
+    "/_chisei/policy",
     "/{*path}",
 ];
 
@@ -1293,6 +1310,7 @@ enum IdentityError {
     MissingKey,
     UnknownKey,
     KeyStoreUnavailable,
+    NoValidPolicy,
 }
 
 impl IdentityError {
@@ -1301,6 +1319,7 @@ impl IdentityError {
             Self::MissingKey => "missing gateway key",
             Self::UnknownKey => "unknown chisei gateway key",
             Self::KeyStoreUnavailable => "gateway key store unavailable",
+            Self::NoValidPolicy => "the gateway has no valid egress policy",
         }
     }
 
@@ -1323,7 +1342,7 @@ impl IdentityError {
 
     fn response(self) -> Response<Body> {
         let status = match self {
-            Self::KeyStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::KeyStoreUnavailable | Self::NoValidPolicy => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
         json_error(status, "authentication_error", self.reason())
