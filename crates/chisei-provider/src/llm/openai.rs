@@ -405,6 +405,13 @@ fn content_chat_completions_body(req: &ContentChatRequest) -> Result<Value, Stri
     Ok(body)
 }
 
+/// Parses a tool call's `arguments` string; a missing or empty string means no
+/// arguments. Shared by the streaming and non-streaming paths so invalid JSON
+/// fails the same way in both.
+fn parse_tool_call_arguments(raw: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str(if raw.is_empty() { "{}" } else { raw })
+}
+
 fn parse_openai_chat_response(text: &str) -> Result<ChatResponse, String> {
     let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     let message = &value["choices"][0]["message"];
@@ -414,16 +421,21 @@ fn parse_openai_chat_response(text: &str) -> Result<ChatResponse, String> {
         .map(|calls| {
             calls
                 .iter()
-                .map(|call| ToolCall {
-                    id: call["id"].as_str().unwrap_or("").into(),
-                    name: call["function"]["name"].as_str().unwrap_or("").into(),
-                    args: serde_json::from_str(
-                        call["function"]["arguments"].as_str().unwrap_or("{}"),
+                .map(|call| {
+                    let name: String = call["function"]["name"].as_str().unwrap_or("").into();
+                    let args = parse_tool_call_arguments(
+                        call["function"]["arguments"].as_str().unwrap_or(""),
                     )
-                    .unwrap_or_default(),
+                    .map_err(|_| format!("openai tool call {name:?} has invalid arguments"))?;
+                    Ok(ToolCall {
+                        id: call["id"].as_str().unwrap_or("").into(),
+                        name,
+                        args,
+                    })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, String>>()
         })
+        .transpose()?
         .unwrap_or_default();
     Ok(ChatResponse {
         content,
@@ -552,12 +564,8 @@ fn completed_openai_tool_calls(
             if call.id.is_empty() || call.name.is_empty() {
                 return Err("openai stream ended with incomplete tool-call identity".into());
             }
-            let args = serde_json::from_str(if call.arguments.is_empty() {
-                "{}"
-            } else {
-                &call.arguments
-            })
-            .map_err(|_| "openai stream ended with invalid tool-call arguments".to_string())?;
+            let args = parse_tool_call_arguments(&call.arguments)
+                .map_err(|_| "openai stream ended with invalid tool-call arguments".to_string())?;
             Ok(ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -987,6 +995,17 @@ mod tests {
         assert_eq!(chunks[0].content, "hello");
         assert_eq!(chunks[0].input_tokens, 7);
         assert_eq!(chunks[0].output_tokens, 5);
+    }
+
+    #[test]
+    fn non_streaming_tool_call_with_invalid_arguments_is_an_error_not_null() {
+        let body = r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","function":{"name":"write","arguments":"{bad"}}]},"finish_reason":"tool_calls"}]}"#;
+        let error = crate::llm::openai::parse_openai_chat_response(body).unwrap_err();
+        assert!(error.contains("write"), "{error}");
+
+        let ok = r#"{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","function":{"name":"read"}}]},"finish_reason":"tool_calls"}]}"#;
+        let response = crate::llm::openai::parse_openai_chat_response(ok).unwrap();
+        assert_eq!(response.tool_calls[0].args, serde_json::json!({}));
     }
 
     #[test]
