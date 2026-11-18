@@ -22,7 +22,9 @@ ADR 0038.
 
 A stored geometry is a `sekai.geospatial-value/v1` JSON claim on a named object
 property. Version 1 admits `point` and `polygon` in `EPSG:4326` only. The claim
-stays on the object. There is no spatial index table and no second ACL.
+stays on the object. Amended by #2334: version 1 also admits `line`. A new
+kind stays in version 1 because a reader that predates it already treats an
+unknown kind as invalid stored geometry, which is a non-match. There is no spatial index table and no second ACL.
 
 A spatial comparison is a `sekai.geospatial-query/v1` effect identified by
 `(namespace, kind?, property, operator, geometry, max_distance_m?)`. Operators

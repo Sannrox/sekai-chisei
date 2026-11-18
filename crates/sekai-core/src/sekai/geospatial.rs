@@ -18,6 +18,8 @@ pub const CRS_EPSG_4326: &str = "EPSG:4326";
 const EARTH_RADIUS_M: f64 = 6_371_000.0;
 const COORD_EPSILON: f64 = 1e-9;
 const BOUNDARY_EPSILON: f64 = 1e-12;
+/// Most positions a `line` value may hold.
+pub const MAX_LINE_POSITIONS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeoPoint {
@@ -25,9 +27,14 @@ pub struct GeoPoint {
     pub lat: f64,
 }
 
+/// One admitted `sekai.geospatial-value/v1` shape. Non-exhaustive so a new
+/// kind does not break callers outside the crate.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum GeospatialGeometry {
     Point(GeoPoint),
+    /// An ordered path of at least two positions (#2334).
+    Line(Vec<GeoPoint>),
     Polygon(Vec<GeoPoint>),
 }
 
@@ -137,8 +144,9 @@ fn parse_geospatial_value_json(raw: &str, query: bool) -> Result<GeospatialValue
         .ok_or_else(|| invalid("geometry coordinates are required"))?;
     let geometry = match kind {
         "point" => GeospatialGeometry::Point(parse_point(coordinates, &invalid)?),
+        "line" => GeospatialGeometry::Line(parse_line(coordinates, &invalid)?),
         "polygon" => GeospatialGeometry::Polygon(parse_polygon(coordinates, &invalid)?),
-        _ => return Err(invalid("geometry kind must be point or polygon")),
+        _ => return Err(invalid("geometry kind must be point, line, or polygon")),
     };
     Ok(GeospatialValue { geometry })
 }
@@ -153,6 +161,28 @@ fn parse_point(value: &Value, invalid: &dyn Fn(&str) -> String) -> Result<GeoPoi
     read_point(coords, invalid)
 }
 
+fn parse_line(value: &Value, invalid: &dyn Fn(&str) -> String) -> Result<Vec<GeoPoint>, String> {
+    let coords = value
+        .as_array()
+        .ok_or_else(|| invalid("line coordinates must be a list of positions"))?;
+    if coords.len() < 2 {
+        return Err(invalid("line must contain at least two positions"));
+    }
+    if coords.len() > MAX_LINE_POSITIONS {
+        return Err(invalid("line must contain at most 1000 positions"));
+    }
+    let path = read_positions(coords, "line", invalid)?;
+    // Matching interpolates raw longitudes, so a segment must take the short
+    // way round; one spanning more than 180 degrees would cross the antimeridian.
+    if path
+        .windows(2)
+        .any(|edge| (edge[1].lon - edge[0].lon).abs() > 180.0)
+    {
+        return Err(invalid("line segments must not cross the antimeridian"));
+    }
+    Ok(path)
+}
+
 fn parse_polygon(value: &Value, invalid: &dyn Fn(&str) -> String) -> Result<Vec<GeoPoint>, String> {
     let coords = value
         .as_array()
@@ -160,20 +190,27 @@ fn parse_polygon(value: &Value, invalid: &dyn Fn(&str) -> String) -> Result<Vec<
     if coords.len() < 4 {
         return Err(invalid("polygon must contain at least four positions"));
     }
-    let mut ring = Vec::with_capacity(coords.len());
-    for position in coords {
-        let pair = position
-            .as_array()
-            .ok_or_else(|| invalid("polygon position must be [lon, lat]"))?;
-        if pair.len() != 2 {
-            return Err(invalid("polygon position must be [lon, lat]"));
-        }
-        ring.push(read_point(pair, invalid)?);
-    }
+    let ring = read_positions(coords, "polygon", invalid)?;
     if !points_equal(ring[0], *ring.last().expect("closed ring")) {
         return Err(invalid("polygon ring must be closed"));
     }
     Ok(ring)
+}
+
+fn read_positions(
+    coords: &[Value],
+    kind: &str,
+    invalid: &dyn Fn(&str) -> String,
+) -> Result<Vec<GeoPoint>, String> {
+    let mut points = Vec::with_capacity(coords.len());
+    for position in coords {
+        let pair = position
+            .as_array()
+            .filter(|pair| pair.len() == 2)
+            .ok_or_else(|| invalid(&format!("{kind} position must be [lon, lat]")))?;
+        points.push(read_point(pair, invalid)?);
+    }
+    Ok(points)
 }
 
 fn read_point(coords: &[Value], invalid: &dyn Fn(&str) -> String) -> Result<GeoPoint, String> {
@@ -274,12 +311,18 @@ pub fn evaluate_geospatial_match(stored: &str, query: &GeospatialQuery) -> bool 
             }
             _ => false,
         },
-        GeospatialOperator::Distance => match (&value.geometry, &query.geometry.geometry) {
-            (GeospatialGeometry::Point(stored), GeospatialGeometry::Point(origin)) => {
-                haversine_m(*stored, *origin) <= query.max_distance_m.unwrap_or(0.0)
+        GeospatialOperator::Distance => {
+            let max_distance_m = query.max_distance_m.unwrap_or(0.0);
+            match (&value.geometry, &query.geometry.geometry) {
+                (GeospatialGeometry::Point(stored), GeospatialGeometry::Point(origin)) => {
+                    haversine_m(*stored, *origin) <= max_distance_m
+                }
+                (GeospatialGeometry::Line(path), GeospatialGeometry::Point(origin)) => path
+                    .windows(2)
+                    .any(|edge| distance_to_segment_m(*origin, edge[0], edge[1]) <= max_distance_m),
+                _ => false,
             }
-            _ => false,
-        },
+        }
         GeospatialOperator::Contains => {
             geometry_contains(&value.geometry, &query.geometry.geometry)
         }
@@ -387,38 +430,131 @@ fn haversine_m(left: GeoPoint, right: GeoPoint) -> f64 {
     EARTH_RADIUS_M * central
 }
 
+/// Meters from `point` to the nearest point of the segment. The nearest point
+/// is found in an equirectangular projection centred on `point`, which is
+/// accurate for segments short against the Earth's radius; the distance to it
+/// is great-circle.
+fn distance_to_segment_m(point: GeoPoint, start: GeoPoint, end: GeoPoint) -> f64 {
+    // The segment is moved whole by a multiple of 360 degrees so its midpoint
+    // lies within 180 degrees of `point`; that copy is the one nearest the
+    // point, so a query point across the antimeridian still sees the line as
+    // near. The segment keeps its own span (at most 180 degrees, checked at
+    // parse), so it is never turned the long way round.
+    let half = (end.lon - start.lon) / 2.0;
+    let middle = point.lon + (start.lon + half - point.lon + 540.0).rem_euclid(360.0) - 180.0;
+    let start = GeoPoint {
+        lon: middle - half,
+        lat: start.lat,
+    };
+    let end = GeoPoint {
+        lon: middle + half,
+        lat: end.lat,
+    };
+    let scale = point.lat.to_radians().cos();
+    let (ax, ay) = ((start.lon - point.lon) * scale, start.lat - point.lat);
+    let (bx, by) = ((end.lon - point.lon) * scale, end.lat - point.lat);
+    let (dx, dy) = (bx - ax, by - ay);
+    let length = dx * dx + dy * dy;
+    let t = if length == 0.0 {
+        0.0
+    } else {
+        (-(ax * dx + ay * dy) / length).clamp(0.0, 1.0)
+    };
+    let nearest = GeoPoint {
+        lon: start.lon + (end.lon - start.lon) * t,
+        lat: start.lat + (end.lat - start.lat) * t,
+    };
+    haversine_m(point, nearest)
+}
+
 fn points_equal(left: GeoPoint, right: GeoPoint) -> bool {
     (left.lon - right.lon).abs() <= COORD_EPSILON && (left.lat - right.lat).abs() <= COORD_EPSILON
 }
 
+/// Whether `outer` holds all of `inner`. A line holds a point on it; a polygon
+/// holds a line or another polygon when every segment of it lies inside the
+/// ring. A point or line never holds a line or polygon.
 fn geometry_contains(outer: &GeospatialGeometry, inner: &GeospatialGeometry) -> bool {
+    use GeospatialGeometry::{Line, Point, Polygon};
     match (outer, inner) {
-        (GeospatialGeometry::Point(left), GeospatialGeometry::Point(right)) => {
-            points_equal(*left, *right)
+        (Point(left), Point(right)) => points_equal(*left, *right),
+        (Line(path), Point(point)) => on_path(*point, path),
+        (Polygon(ring), Point(point)) => point_in_polygon(*point, ring),
+        // A polygon holds another when it holds the other's whole ring.
+        (Polygon(ring), Line(path) | Polygon(path)) => {
+            !paths_cross(path, ring)
+                && path
+                    .windows(2)
+                    .all(|edge| segment_in_polygon(edge[0], edge[1], ring))
         }
-        (GeospatialGeometry::Point(_), GeospatialGeometry::Polygon(_)) => false,
-        (GeospatialGeometry::Polygon(ring), GeospatialGeometry::Point(point)) => {
-            point_in_polygon(*point, ring)
-        }
-        (GeospatialGeometry::Polygon(ring), GeospatialGeometry::Polygon(inner)) => {
-            inner.iter().all(|point| point_in_polygon(*point, ring))
-        }
+        (Point(_) | Line(_), Line(_) | Polygon(_)) => false,
     }
 }
 
 fn geometries_intersect(left: &GeospatialGeometry, right: &GeospatialGeometry) -> bool {
+    use GeospatialGeometry::{Line, Point, Polygon};
     match (left, right) {
-        (GeospatialGeometry::Point(left), GeospatialGeometry::Point(right)) => {
-            points_equal(*left, *right)
-        }
-        (GeospatialGeometry::Point(point), GeospatialGeometry::Polygon(ring))
-        | (GeospatialGeometry::Polygon(ring), GeospatialGeometry::Point(point)) => {
+        (Point(left), Point(right)) => points_equal(*left, *right),
+        (Point(point), Line(path)) | (Line(path), Point(point)) => on_path(*point, path),
+        (Point(point), Polygon(ring)) | (Polygon(ring), Point(point)) => {
             point_in_polygon(*point, ring)
         }
-        (GeospatialGeometry::Polygon(left), GeospatialGeometry::Polygon(right)) => {
-            polygons_intersect(left, right)
+        (Line(left), Line(right)) => paths_touch(left, right),
+        (Line(path), Polygon(ring)) | (Polygon(ring), Line(path)) => {
+            path.iter().any(|point| point_in_polygon(*point, ring)) || paths_touch(path, ring)
         }
+        (Polygon(left), Polygon(right)) => polygons_intersect(left, right),
     }
+}
+
+/// Whether the whole segment lies in the ring, given that no ring edge properly
+/// crosses it. The segment can still leave a concave ring through a vertex or
+/// along an edge, so it is split wherever a ring vertex lies on it and the
+/// middle of every piece must be inside.
+fn segment_in_polygon(start: GeoPoint, end: GeoPoint, ring: &[GeoPoint]) -> bool {
+    let (dx, dy) = (end.lon - start.lon, end.lat - start.lat);
+    let length = dx * dx + dy * dy;
+    let mut cuts = vec![0.0, 1.0];
+    if length > 0.0 {
+        cuts.extend(
+            ring.iter()
+                .filter(|vertex| point_on_segment(**vertex, start, end))
+                .map(|vertex| {
+                    ((vertex.lon - start.lon) * dx + (vertex.lat - start.lat) * dy) / length
+                }),
+        );
+    }
+    cuts.sort_by(f64::total_cmp);
+    let at = |t: f64| GeoPoint {
+        lon: start.lon + dx * t,
+        lat: start.lat + dy * t,
+    };
+    point_in_polygon(start, ring)
+        && point_in_polygon(end, ring)
+        && cuts
+            .windows(2)
+            .all(|pair| point_in_polygon(at((pair[0] + pair[1]) / 2.0), ring))
+}
+
+fn on_path(point: GeoPoint, path: &[GeoPoint]) -> bool {
+    path.windows(2)
+        .any(|edge| point_on_segment(point, edge[0], edge[1]))
+}
+
+/// Whether a segment of `left` properly crosses a segment of `right`.
+fn paths_cross(left: &[GeoPoint], right: &[GeoPoint]) -> bool {
+    left.windows(2).any(|a| {
+        right
+            .windows(2)
+            .any(|b| segments_intersect(a[0], a[1], b[0], b[1]))
+    })
+}
+
+/// Whether two paths cross or share a point, including an end on the other path.
+fn paths_touch(left: &[GeoPoint], right: &[GeoPoint]) -> bool {
+    paths_cross(left, right)
+        || left.iter().any(|point| on_path(*point, right))
+        || right.iter().any(|point| on_path(*point, left))
 }
 
 fn polygons_intersect(left: &[GeoPoint], right: &[GeoPoint]) -> bool {
@@ -466,6 +602,10 @@ fn on_boundary(point: GeoPoint, ring: &[GeoPoint]) -> bool {
 }
 
 fn point_on_segment(point: GeoPoint, start: GeoPoint, end: GeoPoint) -> bool {
+    // A repeated position leaves a zero-length segment, which holds only itself.
+    if points_equal(start, end) {
+        return points_equal(point, start);
+    }
     let cross = (point.lon - start.lon) * (end.lat - start.lat)
         - (point.lat - start.lat) * (end.lon - start.lon);
     if cross.abs() > BOUNDARY_EPSILON {
@@ -630,6 +770,174 @@ mod tests {
         ));
     }
 
+    fn geometry(kind: &str, coordinates: &str) -> String {
+        format!(
+            r#"{{"type":"sekai.geospatial-value/v1","kind":"{kind}","crs":"EPSG:4326","coordinates":{coordinates}}}"#
+        )
+    }
+
+    #[test]
+    fn line_values_need_two_to_max_valid_positions() {
+        assert!(parse_geospatial_value(&geometry("line", "[[13.0,52.0],[14.0,52.0]]")).is_ok());
+        for (coordinates, detail) in [
+            ("[[13.0,52.0]]", "at least two"),
+            ("[[13.0,52.0],[14.0]]", "position must be [lon, lat]"),
+            ("[[13.0,52.0],[14.0,95.0]]", "valid EPSG:4326"),
+            ("[[179.0,0.0],[-179.0,0.0]]", "antimeridian"),
+        ] {
+            let err = parse_geospatial_value(&geometry("line", coordinates)).unwrap_err();
+            assert!(err.contains(detail), "{coordinates}: {err}");
+        }
+        let too_many = format!(
+            "[{}]",
+            (0..=MAX_LINE_POSITIONS)
+                .map(|i| format!("[{}.0,0.0]", i % 180))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let err = parse_geospatial_value(&geometry("line", &too_many)).unwrap_err();
+        assert!(err.contains("at most 1000"), "{err}");
+    }
+
+    #[test]
+    fn line_distance_contains_and_intersects() {
+        // An east-west road through Berlin's latitude, past both sides of
+        // BERLIN_RING.
+        let road = geometry("line", "[[12.5,52.52],[14.5,52.52]]");
+        let outside = geometry("line", "[[2.0,48.0],[3.0,48.0]]");
+        // About 556 m north of the road's middle, far from both ends.
+        let north = geometry("point", "[13.5,52.525]");
+        assert!(evaluate_geospatial_match(
+            &road,
+            &point_query("distance", &north, Some(600.0))
+        ));
+        assert!(!evaluate_geospatial_match(
+            &road,
+            &point_query("distance", &north, Some(500.0))
+        ));
+        // The query point is across the antimeridian from a line about 2 km away.
+        let date_line = geometry("line", "[[-179.99,0.0],[-179.0,0.0]]");
+        assert!(evaluate_geospatial_match(
+            &date_line,
+            &point_query(
+                "distance",
+                &geometry("point", "[179.99,0.0]"),
+                Some(5_000.0)
+            )
+        ));
+        // A repeated position, as a GPS track may hold, is no wildcard.
+        let repeated = geometry("line", "[[13.0,52.0],[13.0,52.0],[14.0,52.0]]");
+        for query in [
+            point_query("intersects", PARIS, None),
+            point_query("contains", PARIS, None),
+            point_query("intersects", &outside, None),
+        ] {
+            assert!(!evaluate_geospatial_match(&repeated, &query), "{query:?}");
+        }
+        assert!(evaluate_geospatial_match(
+            &repeated,
+            &point_query("intersects", &geometry("point", "[13.5,52.0]"), None)
+        ));
+        // The near end of a segment almost 180 degrees long, about 1,670 km away.
+        assert!(evaluate_geospatial_match(
+            &geometry("line", "[[-170.0,0.0],[5.0,0.0]]"),
+            &point_query(
+                "distance",
+                &geometry("point", "[20.0,0.0]"),
+                Some(2_000_000.0)
+            )
+        ));
+        // A short line across the query point's antipodal meridian is far away.
+        assert!(!evaluate_geospatial_match(
+            &geometry("line", "[[-90.0,0.0],[-70.0,0.0]]"),
+            &point_query(
+                "distance",
+                &geometry("point", "[100.0,0.0]"),
+                Some(1_000_000.0)
+            )
+        ));
+        // The road crosses this ring with no position of its own inside it.
+        let pierced = geometry(
+            "polygon",
+            "[[13.4,52.4],[13.6,52.4],[13.6,52.6],[13.4,52.6],[13.4,52.4]]",
+        );
+        assert!(evaluate_geospatial_match(
+            &road,
+            &point_query("intersects", &pierced, None)
+        ));
+        assert!(!evaluate_geospatial_match(
+            &outside,
+            &point_query("intersects", BERLIN_RING, None)
+        ));
+        let inner = geometry("line", "[[13.2,52.2],[13.8,52.8]]");
+        assert!(evaluate_geospatial_match(
+            BERLIN_RING,
+            &point_query("contains", &inner, None)
+        ));
+        assert!(!evaluate_geospatial_match(
+            BERLIN_RING,
+            &point_query("contains", &road, None)
+        ));
+        assert!(!evaluate_geospatial_match(
+            BERLIN_RING,
+            &point_query("contains", &outside, None)
+        ));
+        // Both ends inside a U-shaped ring, but the line crosses its notch.
+        let u_ring = geometry(
+            "polygon",
+            "[[0.0,0.0],[3.0,0.0],[3.0,3.0],[2.0,3.0],[2.0,1.0],[1.0,1.0],[1.0,3.0],[0.0,3.0],[0.0,0.0]]",
+        );
+        let across_notch = geometry("line", "[[0.5,2.0],[2.5,2.0]]");
+        assert!(!evaluate_geospatial_match(
+            &u_ring,
+            &point_query("contains", &across_notch, None)
+        ));
+        // Along the top edges and across the notch's open mouth: every touch
+        // is on the boundary, yet the middle is outside.
+        let across_mouth = geometry("line", "[[0.5,3.0],[2.5,3.0]]");
+        assert!(!evaluate_geospatial_match(
+            &u_ring,
+            &point_query("contains", &across_mouth, None)
+        ));
+        // A rectangle with corners in both arms spans the notch.
+        let spanning = geometry(
+            "polygon",
+            "[[0.5,1.5],[2.5,1.5],[2.5,2.5],[0.5,2.5],[0.5,1.5]]",
+        );
+        assert!(!evaluate_geospatial_match(
+            &u_ring,
+            &point_query("contains", &spanning, None)
+        ));
+        let along_left_arm = geometry("line", "[[0.5,0.5],[0.5,2.5]]");
+        assert!(evaluate_geospatial_match(
+            &u_ring,
+            &point_query("contains", &along_left_arm, None)
+        ));
+        // Touching a corner, or running along an edge, shares a point.
+        let square = geometry(
+            "polygon",
+            "[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]",
+        );
+        for touching in ["[[-1.0,0.0],[2.0,0.0]]", "[[-1.0,1.0],[1.0,-1.0]]"] {
+            assert!(
+                evaluate_geospatial_match(
+                    &geometry("line", touching),
+                    &point_query("intersects", &square, None)
+                ),
+                "{touching}"
+            );
+        }
+        let crossing = geometry("line", "[[13.5,52.0],[13.5,53.0]]");
+        assert!(evaluate_geospatial_match(
+            &road,
+            &point_query("intersects", &crossing, None)
+        ));
+        assert!(evaluate_geospatial_match(
+            &road,
+            &point_query("contains", &geometry("point", "[13.25,52.52]"), None)
+        ));
+    }
+
     #[test]
     fn invalid_query_fails_before_objects_are_examined() {
         let db = RuntimeDb::memory();
@@ -676,6 +984,12 @@ mod tests {
             &query
         ));
         assert!(!evaluate_geospatial_match(BERLIN_RING, &query));
+        // A kind this binary does not know, as a newer writer may store, is a
+        // non-match rather than an error or a misread shape.
+        assert!(!evaluate_geospatial_match(
+            &geometry("curve", "[[13.405,52.52],[13.5,52.6]]"),
+            &query
+        ));
     }
 
     #[test]
