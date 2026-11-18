@@ -288,6 +288,42 @@ fn exercise_grant(db: &RuntimeDb) {
     );
 }
 
+/// Every stored export record under `digest`, read straight from the table:
+/// no store call reads exports back.
+fn stored_snapshot_exports(db: &RuntimeDb, digest: &str) -> Vec<SnapshotExportRecord> {
+    let rows: Vec<String> = match db {
+        RuntimeDb::Sqlite(sqlite) => {
+            let conn = sqlite.conn();
+            let mut statement = conn
+                .prepare(
+                    "SELECT record_json FROM sekai_federation_snapshot_exports
+                     WHERE snapshot_digest = ?1",
+                )
+                .unwrap();
+            statement
+                .query_map([digest], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+        RuntimeDb::Postgres(postgres) => postgres
+            .connection()
+            .unwrap()
+            .query(
+                "SELECT record_json FROM sekai_federation_snapshot_exports
+                 WHERE snapshot_digest = $1",
+                &[&digest],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect(),
+    };
+    rows.iter()
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect()
+}
+
 fn exercise_snapshot(db: &RuntimeDb) {
     assert_eq!(db.reserve_federation_snapshot_sequence("sales").unwrap(), 1);
     assert_eq!(db.reserve_federation_snapshot_sequence("sales").unwrap(), 2);
@@ -307,6 +343,12 @@ fn exercise_snapshot(db: &RuntimeDb) {
     let mut again = export.clone();
     again.fact_count = 2;
     db.put_federation_snapshot_export(&again).unwrap();
+    // A re-export under the same digest replaces the stored record on both
+    // backends (upsert, not keep-first), leaving one row.
+    let stored = stored_snapshot_exports(db, &export.snapshot_digest);
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].snapshot_id, "snap:sales:1");
+    assert_eq!(stored[0].fact_count, 2);
 
     let fact = SnapshotFact {
         object_id: "obj:sales:1".into(),
