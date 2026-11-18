@@ -312,7 +312,7 @@ pub fn on_task_completed(db: &RuntimeDb, event: &TaskCompletion) {
     let components = db
         .get_linked_objects(&namespace_obj.id, REL_CONTAINS, &Direction::Outgoing)
         .unwrap_or_default();
-    for mut comp in components {
+    for comp in components {
         if comp.kind != KIND_COMPONENT {
             continue;
         }
@@ -335,21 +335,9 @@ pub fn on_task_completed(db: &RuntimeDb, event: &TaskCompletion) {
         if db.insert_task_observation(&observation).is_err() {
             continue;
         }
-        let Ok(stats) = task_observation_stats(db, &comp.id) else {
-            continue;
-        };
-        comp.properties
-            .insert("task_total".into(), stats.task_total.to_string());
-        comp.properties
-            .insert("task_succeeded".into(), stats.task_succeeded.to_string());
-        comp.properties
-            .insert("success_rate".into(), stats.success_rate.to_string());
-        comp.properties.insert(
-            "consecutive_failures".into(),
-            stats.consecutive_failures.to_string(),
-        );
-        comp.updated = now;
-        db.update_object(&comp).ok();
+        if let Err(error) = write_component_task_stats(db, &comp.id, now) {
+            tracing::warn!(component_id = %comp.id, %error, "task stats write failed");
+        }
     }
 
     // Ensure model object
@@ -369,6 +357,51 @@ pub fn on_task_completed(db: &RuntimeDb, event: &TaskCompletion) {
             db.create_object(&obj).ok();
         }
     }
+}
+
+/// Attempts before a stats write gives up on a component that keeps changing.
+const STATS_WRITE_ATTEMPTS: usize = 5;
+
+/// Writes the stats keys onto the component as it is now. The write is
+/// guarded by the snapshot it was built from, so a concurrent edit is never
+/// overwritten and a stale total never lands after a newer one; on a changed
+/// snapshot the component and its stats are read again. The guarded write is
+/// the audited one, so each stats change is recorded under the `observation`
+/// actor rather than landing as an unattributed rewrite.
+fn write_component_task_stats(db: &RuntimeDb, component_id: &str, now: i64) -> Result<(), String> {
+    for _ in 0..STATS_WRITE_ATTEMPTS {
+        let Some(current) = db.get_object(component_id)? else {
+            return Ok(());
+        };
+        let stats = task_observation_stats(db, component_id)?;
+        let mut updated = current.clone();
+        for (key, value) in [
+            ("task_total", stats.task_total.to_string()),
+            ("task_succeeded", stats.task_succeeded.to_string()),
+            ("success_rate", stats.success_rate.to_string()),
+            (
+                "consecutive_failures",
+                stats.consecutive_failures.to_string(),
+            ),
+        ] {
+            updated.properties.insert(key.into(), value);
+        }
+        updated.updated = now;
+        match db.update_object_with_authorized_snapshot(
+            &updated,
+            Some(&current),
+            "observation",
+            None,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.contains(crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(format!(
+        "component kept changing across {STATS_WRITE_ATTEMPTS} stats writes"
+    ))
 }
 
 fn preserve_legacy_task_observation_baseline_if_needed(
@@ -643,6 +676,66 @@ mod tests {
         assert_eq!(comp.properties["task_succeeded"], "80");
         assert_eq!(comp.properties["success_rate"], "79");
         assert_eq!(comp.properties["consecutive_failures"], "3");
+    }
+
+    #[test]
+    fn concurrent_completions_keep_edits_and_count_every_observation() {
+        let db = setup();
+        let completions = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|worker| {
+                    let db = &db;
+                    scope.spawn(move || {
+                        for index in 0..10 {
+                            on_task_completed(
+                                db,
+                                &TaskCompletion {
+                                    request_id: format!("w{worker}-{index}"),
+                                    namespace: "my-namespace".into(),
+                                    model: String::new(),
+                                    status: "done".into(),
+                                    packages: vec![],
+                                    context: HashMap::new(),
+                                },
+                            );
+                        }
+                    })
+                })
+                .collect();
+            // An operator edit racing the stats writes.
+            scope.spawn(|| {
+                for revision in 0..20 {
+                    loop {
+                        let current = db.get_object("c1").unwrap().unwrap();
+                        let mut edited = current.clone();
+                        edited
+                            .properties
+                            .insert("owner".into(), format!("team-{revision}"));
+                        match db.update_object_with_authorized_snapshot(
+                            &edited,
+                            Some(&current),
+                            "editor",
+                            None,
+                        ) {
+                            Ok(_) => break,
+                            Err(error) => assert!(
+                                error.contains(
+                                    crate::sekai::lease::OBJECT_CHANGED_SINCE_AUTHORIZATION
+                                ),
+                                "{error}"
+                            ),
+                        }
+                    }
+                }
+            });
+            workers.len() * 10
+        });
+
+        let comp = db.get_object("c1").unwrap().unwrap();
+        assert_eq!(comp.properties["owner"], "team-19");
+        let stored = db.list_task_observations_for_component("c1").unwrap().len();
+        assert_eq!(stored, completions);
+        assert_eq!(comp.properties["task_total"], stored.to_string());
     }
 
     #[test]
