@@ -31,6 +31,37 @@ fn removed_top_level_aliases_fail_with_their_canonical_replacement() {
 }
 
 #[test]
+fn gateway_key_help_reaches_the_key_usage() {
+    for args in [
+        &["admin", "gateway", "key", "--help"][..],
+        &["admin", "gateway", "key", "create", "--help"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+            .args(args)
+            .output()
+            .expect("sekaictl should run");
+        assert!(output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .starts_with("Usage: sekaictl admin gateway key create"),
+            "{args:?}"
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        .args(["admin", "gateway", "--help"])
+        .output()
+        .expect("sekaictl should run");
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8(output.stdout)
+            .unwrap()
+            .starts_with("Usage: sekaictl admin gateway key create")
+    );
+}
+
+#[test]
 fn canonical_admin_paths_still_render_command_specific_help() {
     let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
         .args(["admin", "access", "credential", "--help"])

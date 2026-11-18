@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         eprintln!("{help}");
         std::process::exit(2);
     }
-    let has_help = args.iter().any(|arg| arg == "--help" || arg == "-h");
+    let has_help = help_requested(&args);
     if is_admin_path && has_help && expand_admin_args(args.clone()).is_err() {
         print_admin_usage();
         return Ok(());
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         print_admin_usage();
         std::io::Error::other(error)
     })?;
-    if has_help || (is_admin_path && args.len() == 1) {
+    if (has_help && !handles_own_help(&args)) || (is_admin_path && args.len() == 1) {
         if let Some(usage) = expert_usage(&args[0]) {
             println!("{usage}");
         } else {
@@ -526,7 +526,16 @@ async fn run_gateway_command(
         print_gateway_usage();
         return Ok(());
     }
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if args[0] == "key" {
+        // `gateway key` prints its own usage for help anywhere in its
+        // arguments, so `key create --help` never runs a create.
+        if help_requested(&args[1..]) {
+            println!("{}", key_usage());
+            return Ok(());
+        }
+        return run_gateway_key_command(args.into_iter().skip(1)).await;
+    }
+    if help_requested(&args) {
         print_gateway_usage();
         return Ok(());
     }
@@ -536,16 +545,6 @@ async fn run_gateway_command(
             let config = GatewaySetupConfig::from_env_and_args(args.into_iter().skip(1))
                 .map_err(std::io::Error::other)?;
             run_setup(config).await
-        }
-        "key" => {
-            if args
-                .get(1)
-                .is_some_and(|arg| arg == "--help" || arg == "-h")
-            {
-                println!("{}", key_usage());
-                return Ok(());
-            }
-            run_gateway_key_command(args.into_iter().skip(1)).await
         }
         "report" => {
             let config = GatewayReportConfig::from_env_and_args(args.into_iter().skip(1))
@@ -691,6 +690,21 @@ fn print_admin_usage() {
     );
 }
 
+/// Whether the arguments ask for help. Scanning stops at `--`, so a `--help`
+/// after it is passed through as a value.
+fn help_requested(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--help" || arg == "-h")
+}
+
+/// Whether the dispatched command prints a more specific usage than its
+/// top-level expert usage, so `main` must hand the help request through.
+fn handles_own_help(args: &[String]) -> bool {
+    args.first().is_some_and(|command| command == "gateway")
+        && args.get(1).is_some_and(|sub| sub == "key")
+}
+
 fn expert_usage(command: &str) -> Option<String> {
     match command {
         "credential" => Some(credential_usage().to_string()),
@@ -799,7 +813,32 @@ fn gateway_usage() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_admin_path, expand_admin_args, expert_usage, removed_alias_help};
+    use super::{
+        canonical_admin_path, expand_admin_args, expert_usage, handles_own_help, help_requested,
+        removed_alias_help,
+    };
+
+    fn strings(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn help_after_double_dash_is_a_value() {
+        assert!(help_requested(&strings(&["gateway", "--help"])));
+        assert!(help_requested(&strings(&[
+            "gateway", "key", "create", "-h"
+        ])));
+        assert!(!help_requested(&strings(&[
+            "action", "submit", "--", "--help"
+        ])));
+    }
+
+    #[test]
+    fn only_gateway_key_takes_over_its_help() {
+        assert!(handles_own_help(&strings(&["gateway", "key", "--help"])));
+        assert!(!handles_own_help(&strings(&["gateway", "--help"])));
+        assert!(!handles_own_help(&strings(&["credential", "--help"])));
+    }
 
     #[test]
     fn expands_every_canonical_admin_path_to_the_existing_dispatcher() {
