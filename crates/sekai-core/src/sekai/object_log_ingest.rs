@@ -56,26 +56,54 @@ pub fn drain_instance(db: &RuntimeDb, instance_id: &str) {
 /// up to [`SWEEP_BATCH`] ready ones, then sets the backlog gauge. Safe on
 /// every replica at once.
 pub fn sweep(db: &RuntimeDb) -> Result<usize, String> {
+    sweep_pass(db).map(|pass| pass.drained)
+}
+
+/// What one [`sweep_pass`] drained.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct SweepPass {
+    pub drained: usize,
+    /// Operation ids of the drained admissions, where their instance
+    /// records one, in drain order.
+    pub operation_ids: Vec<String>,
+}
+
+/// [`sweep`], also naming the operations whose intents it drained.
+pub fn sweep_pass(db: &RuntimeDb) -> Result<SweepPass, String> {
     db.prune_object_log_ingest_intents()?;
-    let mut drained = 0;
+    let mut pass = SweepPass::default();
     for _ in 0..SWEEP_BATCH {
         match drain_one(db, IntentScope::Next, process_owner())? {
-            Some(true) => drained += 1,
-            Some(false) => {}
+            Some((true, instance_id)) => {
+                pass.drained += 1;
+                // Naming the operation is diagnostic; a failed read must not
+                // fail a sweep whose drain already completed.
+                if let Some(instance) = db.get_action_instance(&instance_id).ok().flatten()
+                    && !instance.operation_id.is_empty()
+                {
+                    pass.operation_ids.push(instance.operation_id);
+                }
+            }
+            Some((false, _)) => {}
             None => break,
         }
     }
     crate::obs::metrics::set_object_log_ingest_backlog(db.count_object_log_ingest_intents()?);
-    Ok(drained)
+    Ok(pass)
 }
 
 /// Claims one intent `scope` selects and ingests it. `None` when nothing
-/// was claimable, else whether the intent completed. Each claim covers one
+/// was claimable, else whether the intent completed, with its instance. Each claim covers one
 /// ingest, so its lease never has to outlast a batch. A failed ingest
 /// hands its intent back: the sweep retries it after [`RETRY_DELAY_MS`],
 /// behind intents not yet tried, so refused records cannot starve the
 /// backlog.
-fn drain_one(db: &RuntimeDb, scope: IntentScope<'_>, owner: &str) -> Result<Option<bool>, String> {
+fn drain_one(
+    db: &RuntimeDb,
+    scope: IntentScope<'_>,
+    owner: &str,
+) -> Result<Option<(bool, String)>, String> {
     let now_ms = crate::sekai::action_instance::lease_clock_ms();
     let Some(intent) = db.claim_object_log_ingest_intent(scope, owner, now_ms, LEASE_MS)? else {
         return Ok(None);
@@ -84,7 +112,7 @@ fn drain_one(db: &RuntimeDb, scope: IntentScope<'_>, owner: &str) -> Result<Opti
         Ok(true) => {
             return db
                 .complete_object_log_ingest_intent(&intent, owner)
-                .map(Some);
+                .map(|completed| Some((completed, intent.instance_id.clone())));
         }
         Ok(false) => {}
         Err(error) => tracing::error!(
@@ -107,7 +135,7 @@ fn drain_one(db: &RuntimeDb, scope: IntentScope<'_>, owner: &str) -> Result<Opti
         owner,
         crate::sekai::action_instance::lease_clock_ms().saturating_add(RETRY_DELAY_MS),
     )?;
-    Ok(Some(false))
+    Ok(Some((false, intent.instance_id.clone())))
 }
 
 /// Appends the intent's snapshot unless the log already holds this write

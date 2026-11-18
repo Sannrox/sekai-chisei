@@ -328,30 +328,28 @@ impl PostgresDb {
     /// refuses naming a verification failure.
     pub fn archive_retained_records(&self, now: i64, dry_run: bool) -> Result<ArchiveRun, String> {
         self.archive_retained_records_locked(now, dry_run, false)
+            .map(Option::unwrap_or_default)
     }
 
     /// Scheduled ticks pass `skip_if_busy` so a replica that loses the
-    /// session lock returns an empty run. Operator `run` waits.
+    /// session lock returns `None` without running. Operator `run` waits.
     pub(crate) fn archive_retained_records_locked(
         &self,
         now: i64,
         dry_run: bool,
         skip_if_busy: bool,
-    ) -> Result<ArchiveRun, String> {
+    ) -> Result<Option<ArchiveRun>, String> {
         if dry_run {
-            return self.archive_retained_batch(
-                now,
-                true,
-                i64::MAX,
-                &mut RetentionCursor::default(),
-            );
+            return self
+                .archive_retained_batch(now, true, i64::MAX, &mut RetentionCursor::default())
+                .map(Some);
         }
         let policies = self.list_retention_policies()?;
         if policies.is_empty() {
-            return Ok(ArchiveRun {
+            return Ok(Some(ArchiveRun {
                 dry_run,
                 ..ArchiveRun::default()
-            });
+            }));
         }
         // One checkout owns the session lock, every batch, and finish. A
         // second checkout while the lock is held deadlocks a size-1 pool.
@@ -359,7 +357,7 @@ impl PostgresDb {
         let mut tick = if skip_if_busy {
             match RetentionTickGuard::try_acquire(connection)? {
                 Some(tick) => tick,
-                None => return Ok(ArchiveRun::default()),
+                None => return Ok(None),
             }
         } else {
             RetentionTickGuard::acquire(connection)?
@@ -383,7 +381,7 @@ impl PostgresDb {
         if dataset_has_policy(&policies, LLM_CALLS_DATASET) {
             finish_retention_run_on(tick.client(), &policies, now, total.llm_calls_archived > 0)?;
         }
-        Ok(total)
+        Ok(Some(total))
     }
 
     /// One batch: at most `limit` records per dataset, moved and removed in
@@ -2685,6 +2683,34 @@ mod tests {
                  DELETE FROM sekai_dataset_branches WHERE name='{branch}';"
             ))
             .unwrap();
+    }
+
+    /// A tick that finds the retention lock held by another replica reports
+    /// it as held (`None`) instead of an empty run (#2643).
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_tick_reports_a_lock_another_replica_holds() {
+        let _serial = archiving();
+        let db = database();
+        assert!(
+            !db.list_retention_policies().unwrap().is_empty(),
+            "default policies make a tick contend for the lock"
+        );
+        let mut replica = db.connection().unwrap();
+        replica
+            .query_one(
+                "SELECT pg_advisory_lock($1, $2)",
+                &[&RETENTION_TICK_LOCK_CLASS, &RETENTION_TICK_LOCK_ID],
+            )
+            .unwrap();
+        let held = db.archive_retained_records_locked(100 * DAY_MS, false, true);
+        replica
+            .query_one(
+                "SELECT pg_advisory_unlock($1, $2)",
+                &[&RETENTION_TICK_LOCK_CLASS, &RETENTION_TICK_LOCK_ID],
+            )
+            .unwrap();
+        assert!(held.unwrap().is_none());
     }
 
     #[test]

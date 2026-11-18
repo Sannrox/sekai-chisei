@@ -4994,7 +4994,11 @@ mod tests {
             assert!(!log.exists());
             assert_eq!(db.count_object_log_ingest_intents().unwrap(), 1);
 
-            assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 1);
+            // The drain names the admitting operation, which its trace
+            // joins on (#2643).
+            let pass = crate::sekai::object_log_ingest::sweep_pass(&db).unwrap();
+            assert_eq!(pass.drained, 1);
+            assert_eq!(pass.operation_ids, ["operation-crash-log"]);
             assert_eq!(crate::sekai::object_log_ingest::sweep(&db).unwrap(), 0);
             assert_eq!(db.count_object_log_ingest_intents().unwrap(), 0);
             crate::sekai::object_log::release_process_object_log_cache();
