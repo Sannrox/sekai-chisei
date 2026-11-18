@@ -623,7 +623,7 @@ impl SekaiServiceImpl {
         let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
-        let session_namespace = Self::mcp_link_session_namespace(&req);
+        let session_namespace = Self::mcp_session_namespace(&req);
         let r = req.into_inner();
         let root = self
             .db
@@ -1008,12 +1008,19 @@ impl SekaiServiceImpl {
         let purpose = request_purpose_presentation(&req, &principals);
         let revision_pin = ontology_revision_pin(&req);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let session_namespace = Self::mcp_session_namespace(&req);
+        let in_session = |object: &domain::Object| {
+            session_namespace
+                .as_deref()
+                .is_none_or(|namespace| namespace == object.namespace)
+        };
         let r = req.into_inner();
         let root = self
             .db
             .runtime()
             .get_object_with_policy_context(&r.object_id, &policy_context)
             .map_err(Status::internal)?
+            .filter(in_session)
             .ok_or(Status::not_found("not found"))?;
         require_purpose_for_kind(
             self.db.runtime(),
@@ -1054,6 +1061,9 @@ impl SekaiServiceImpl {
             },
             |node, ephemeral| lineage_upstream(db, node, ephemeral),
             |object, ephemeral| {
+                if !in_session(object) {
+                    return Ok(false);
+                }
                 if ephemeral {
                     return Ok(ephemeral_lineage_node_visible(
                         db,

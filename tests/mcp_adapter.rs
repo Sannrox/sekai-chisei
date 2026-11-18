@@ -33,6 +33,10 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.definitions.impact",
             "sekai.definitions.proposal.create",
             "sekai.search.query",
+            "sekai.lineage.get",
+            "sekai.ontology.classes.list",
+            "sekai.ontology.classes.get",
+            "sekai.relations.neighborhood",
             "sekai.transforms.chain.run",
             "sekai.transforms.chain.status"
         ]

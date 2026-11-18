@@ -273,7 +273,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutSyncScope` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncSnapshot` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncDeltas` | `sekai.graph` | yes | none | `experimental` |
-| `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | mcp | `experimental` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
 | `SekaiService.ExpandRelations` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
@@ -283,8 +283,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.ResolveInvariantSet` | `sekai.graph, sekai.authorization` | yes | none | `experimental` |
 | `SekaiService.ListSchemaTypes` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.CreateSchemaType` | `sekai.graph` | yes | sdk, cli | `stable` |
-| `SekaiService.ListOntologyClasses` | `sekai.ontology-definitions` | yes | none | `experimental` |
-| `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | none | `experimental` |
+| `SekaiService.ListOntologyClasses` | `sekai.ontology-definitions` | yes | mcp | `experimental` |
+| `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | mcp | `experimental` |
 | `SekaiService.CreateOntologyClass` | `sekai.ontology-definitions` | yes | cli | `stable` |
 | `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | sqlite only | none | `experimental` |
 | `SekaiService.ListOntologyRelations` | `sekai.ontology-definitions` | yes | none | `experimental` |
@@ -369,7 +369,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListActionPolicies` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
-| `SekaiService.GetLineage` | `sekai.graph, sekai.audit` | yes | host | `stable` |
+| `SekaiService.GetLineage` | `sekai.graph, sekai.audit` | yes | host, mcp | `stable` |
 | `SekaiService.CreateContentionScope` | `sekai.coordination` | yes | none | `experimental` |
 | `SekaiService.UpdateContentionScope` | `sekai.coordination` | yes | none | `experimental` |
 | `SekaiService.GetContentionScope` | `sekai.coordination` | yes | none | `experimental` |

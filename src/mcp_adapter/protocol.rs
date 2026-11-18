@@ -29,6 +29,19 @@ pub const CREATE_DEFINITION_PROPOSAL_TOOL: &str = "sekai.definitions.proposal.cr
 /// Hybrid search (#1683): object references under the Search RPC's read
 /// policy and fusion profile, never vectors. The backing RPC is stable (#2243).
 pub const SEARCH_TOOL: &str = "sekai.search.query";
+/// Ontology discovery (#2430): read-only tools under the caller's own
+/// authorization. Lineage backs onto a stable RPC; the class and neighborhood
+/// RPCs are still experimental, so those tools are listed only when
+/// experimental RPCs are enabled. The neighborhood tool reuses the catalog
+/// capability name, and the server binds it and lineage to the session
+/// namespace.
+pub const LIST_CLASSES_TOOL: &str = "sekai.ontology.classes.list";
+pub const GET_CLASS_TOOL: &str = "sekai.ontology.classes.get";
+pub const NEIGHBORHOOD_TOOL: &str = "sekai.relations.neighborhood";
+pub const GET_LINEAGE_TOOL: &str = "sekai.lineage.get";
+/// Upper bound on `max_nodes` for the lineage tool. The RPC clamps larger
+/// values to the same cap; the tool refuses them instead of truncating.
+pub const MAX_LINEAGE_NODES: i64 = 500;
 /// Experimental (#2119). Listed only when experimental RPCs are enabled.
 pub const RUN_TRANSFORM_CHAIN_TOOL: &str = "sekai.transforms.chain.run";
 pub const GET_TRANSFORM_CHAIN_RUN_TOOL: &str = "sekai.transforms.chain.status";
@@ -45,7 +58,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 16] {
+pub fn well_known_tools() -> [&'static str; 17] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -63,6 +76,7 @@ pub fn well_known_tools() -> [&'static str; 16] {
         IMPACT_DEFINITIONS_TOOL,
         CREATE_DEFINITION_PROPOSAL_TOOL,
         SEARCH_TOOL,
+        GET_LINEAGE_TOOL,
     ]
 }
 
@@ -84,6 +98,10 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         IMPACT_DEFINITIONS_TOOL => Some(NativeRpc::ReportDefinitionConsumerImpact),
         CREATE_DEFINITION_PROPOSAL_TOOL => Some(NativeRpc::CreateDefinitionProposal),
         SEARCH_TOOL => Some(NativeRpc::Search),
+        LIST_CLASSES_TOOL => Some(NativeRpc::ListOntologyClasses),
+        GET_CLASS_TOOL => Some(NativeRpc::GetOntologyClass),
+        NEIGHBORHOOD_TOOL => Some(NativeRpc::ExpandNeighborhood),
+        GET_LINEAGE_TOOL => Some(NativeRpc::GetLineage),
         RUN_TRANSFORM_CHAIN_TOOL => Some(NativeRpc::RunTransformChain),
         GET_TRANSFORM_CHAIN_RUN_TOOL => Some(NativeRpc::GetTransformChainRun),
         _ => None,
@@ -137,7 +155,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -288,6 +306,66 @@ fn bind_session_input(
             }
         }
         NativeRpc::GetTransformChainRun => {}
+        NativeRpc::ListOntologyClasses => {
+            if !object.is_empty() {
+                return Err(json!({"code":-32602,"message":"listing classes takes no input"}));
+            }
+        }
+        NativeRpc::GetOntologyClass => {
+            let name = session_string(object, "name")?.ok_or_else(
+                || json!({"code":-32602,"message":"reading a class requires input.name"}),
+            )?;
+            *object = serde_json::Map::from_iter([("name".into(), json!(name))]);
+        }
+        NativeRpc::ExpandNeighborhood => {
+            // Every request field, defaulted; the RPC enforces the bounds
+            // and refuses an over-limit request rather than truncating.
+            let seeds = session_strings(object, "seed_ids", "seedIds")?;
+            if seeds.is_empty() {
+                return Err(
+                    json!({"code":-32602,"message":"neighborhood requires input.seed_ids"}),
+                );
+            }
+            *object = serde_json::Map::from_iter([
+                ("seedIds".into(), json!(seeds)),
+                (
+                    "relations".into(),
+                    json!(session_strings(object, "relations", "relations")?),
+                ),
+                (
+                    "objectKinds".into(),
+                    json!(session_strings(object, "object_kinds", "objectKinds")?),
+                ),
+                (
+                    "depth".into(),
+                    json!(session_int(object, "depth", "depth")?),
+                ),
+                (
+                    "fanOutCap".into(),
+                    json!(session_int(object, "fan_out_cap", "fanOutCap")?),
+                ),
+                (
+                    "limit".into(),
+                    json!(session_int(object, "limit", "limit")?),
+                ),
+            ]);
+        }
+        NativeRpc::GetLineage => {
+            let object_id = session_string(object, "object_id")?.ok_or_else(
+                || json!({"code":-32602,"message":"lineage requires input.object_id"}),
+            )?;
+            let max_nodes = session_int(object, "max_nodes", "maxNodes")?;
+            if !(0..=MAX_LINEAGE_NODES).contains(&max_nodes) {
+                return Err(json!({
+                    "code":-32602,
+                    "message": format!("input.max_nodes must be 0 to {MAX_LINEAGE_NODES}")
+                }));
+            }
+            *object = serde_json::Map::from_iter([
+                ("objectId".into(), json!(object_id)),
+                ("maxNodes".into(), json!(max_nodes)),
+            ]);
+        }
         NativeRpc::Search => {
             // Only these fields cross the adapter. The session fixes the
             // namespace; the tool always searches objects, hybrid by default.
@@ -471,6 +549,42 @@ fn session_string(
     }
 }
 
+/// A string array under either spelling, empty when absent; any other type
+/// is an error.
+fn session_strings(
+    object: &serde_json::Map<String, Value>,
+    snake: &str,
+    camel: &str,
+) -> Result<Vec<String>, Value> {
+    let invalid =
+        || json!({"code":-32602,"message": format!("input.{snake} must be an array of strings")});
+    match object.get(snake).or_else(|| object.get(camel)) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string).ok_or_else(invalid))
+            .collect(),
+        Some(_) => Err(invalid()),
+    }
+}
+
+/// An integer under either spelling, 0 when absent; any other type is an error.
+fn session_int(
+    object: &serde_json::Map<String, Value>,
+    snake: &str,
+    camel: &str,
+) -> Result<i64, Value> {
+    match object.get(snake).or_else(|| object.get(camel)) {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value
+            .as_i64()
+            .filter(|value| i32::try_from(*value).is_ok())
+            .ok_or_else(
+                || json!({"code":-32602,"message": format!("input.{snake} must be an integer")}),
+            ),
+    }
+}
+
 fn contains_reserved_metadata(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;
@@ -612,11 +726,43 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "sekai.SearchResponse",
             "read",
         ),
+        capability_entry(
+            GET_LINEAGE_TOOL,
+            "Read where one authorized object came from: its sources, transforms, and upstream objects.",
+            "query",
+            "sekai.GetLineageRequest",
+            "sekai.GetLineageResponse",
+            "read",
+        ),
     ]
 }
 
 fn experimental_entries() -> Vec<CapabilityEntry> {
     vec![
+        capability_entry(
+            LIST_CLASSES_TOOL,
+            "List the ontology classes the caller may read.",
+            "query",
+            "sekai.ListOntologyClassesRequest",
+            "sekai.ListOntologyClassesResponse",
+            "read",
+        ),
+        capability_entry(
+            GET_CLASS_TOOL,
+            "Read one ontology class with its properties.",
+            "query",
+            "sekai.GetOntologyClassRequest",
+            "sekai.GetOntologyClassResponse",
+            "read",
+        ),
+        capability_entry(
+            NEIGHBORHOOD_TOOL,
+            "Expand the authorized neighborhood of objects, bounded in depth, fan-out, and size.",
+            "query",
+            "sekai.ExpandNeighborhoodRequest",
+            "sekai.ExpandNeighborhoodResponse",
+            "read",
+        ),
         capability_entry(
             RUN_TRANSFORM_CHAIN_TOOL,
             "Run one registered transform chain as a governed, receipted operation.",
@@ -866,6 +1012,7 @@ mod tests {
                 IMPACT_DEFINITIONS_TOOL,
                 CREATE_DEFINITION_PROPOSAL_TOOL,
                 SEARCH_TOOL,
+                GET_LINEAGE_TOOL,
             ]
         );
         assert_eq!(

@@ -15,7 +15,7 @@ impl SekaiServiceImpl {
         let principals = caller_principals(&req);
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         require_authenticated(&principals)?;
-        let session_namespace = Self::mcp_link_session_namespace(&req);
+        let session_namespace = Self::mcp_session_namespace(&req);
         let inner = req.into_inner();
         let fail_if_exists = inner.fail_if_exists;
         let mut l = inner

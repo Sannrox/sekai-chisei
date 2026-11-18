@@ -31,7 +31,10 @@ use crate::sekai::capability::CONTRACT_VERSION;
 
 use super::AdapterConfig;
 
+/// The native RPC a tool dispatches to. Non-exhaustive so a new MCP tool does
+/// not break callers outside the crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NativeRpc {
     GetObject,
     EvaluateObjectSet,
@@ -49,6 +52,10 @@ pub enum NativeRpc {
     ReportDefinitionConsumerImpact,
     CreateDefinitionProposal,
     Search,
+    ListOntologyClasses,
+    GetOntologyClass,
+    ExpandNeighborhood,
+    GetLineage,
     RunTransformChain,
     GetTransformChainRun,
 }
@@ -73,6 +80,10 @@ impl NativeRpc {
             Self::ReportDefinitionConsumerImpact => "ReportDefinitionConsumerImpact",
             Self::CreateDefinitionProposal => "CreateDefinitionProposal",
             Self::Search => "Search",
+            Self::ListOntologyClasses => "ListOntologyClasses",
+            Self::GetOntologyClass => "GetOntologyClass",
+            Self::ExpandNeighborhood => "ExpandNeighborhood",
+            Self::GetLineage => "GetLineage",
             Self::RunTransformChain => "RunTransformChain",
             Self::GetTransformChainRun => "GetTransformChainRun",
         }
@@ -334,6 +345,18 @@ pub async fn dispatch_native(
                 .map_err(status_error)?
                 .into_inner(),
         )),
+        NativeRpc::ListOntologyClasses => {
+            dispatch_sekai_json(sekai.list_ontology_classes(bind_json(&invocation)?).await)
+        }
+        NativeRpc::GetOntologyClass => {
+            dispatch_sekai_json(sekai.get_ontology_class(bind_json(&invocation)?).await)
+        }
+        NativeRpc::ExpandNeighborhood => {
+            dispatch_sekai_json(sekai.expand_neighborhood(bind_json(&invocation)?).await)
+        }
+        NativeRpc::GetLineage => {
+            dispatch_sekai_json(sekai.get_lineage(bind_json(&invocation)?).await)
+        }
         NativeRpc::RunTransformChain => {
             dispatch_sekai_json(sekai.run_transform_chain(bind_json(&invocation)?).await)
         }
@@ -656,6 +679,15 @@ impl NativeSurface for FixtureSurface {
                     ..Default::default()
                 }))
             }
+            NativeRpc::ListOntologyClasses
+            | NativeRpc::GetOntologyClass
+            | NativeRpc::ExpandNeighborhood
+            | NativeRpc::GetLineage => Err(projected(
+                "unimplemented",
+                "the fixture surface holds no ontology or graph",
+                &invocation.capability,
+                &invocation.operation_id,
+            )),
             NativeRpc::RunTransformChain => Err(projected(
                 "permission_denied",
                 "access denied",
@@ -983,6 +1015,50 @@ impl NativeSurface for SdkSurface {
                 )
                 .await?;
                 Ok(search_references(response))
+            }
+            NativeRpc::ListOntologyClasses => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.list_ontology_classes(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::GetOntologyClass => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.get_ontology_class(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ExpandNeighborhood => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.expand_neighborhood(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::GetLineage => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.get_lineage(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
             }
             NativeRpc::RunTransformChain => {
                 let channel = self.channel().await?;

@@ -921,4 +921,195 @@ mod tests {
         .unwrap();
         assert_eq!(called["error"]["code"], -32602, "{called}");
     }
+
+    async fn call(surface: &InProcessSurface, tool: &str, input: Value) -> Value {
+        handle_message(
+            surface,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": {"operation_id": format!("op-{tool}"), "input": input}
+                }
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The synthetic plane plus a `Visible` class the session may read, a
+    /// `Hidden` class only another reader may, and a widget-1 -> widget-2 link.
+    async fn discovery_surface() -> InProcessSurface {
+        use crate::grpc::pb::sekai::{
+            CreateGrantRequest, CreateOntologyClassRequest, OntologyClass,
+        };
+        let surface = InProcessSurface::synthetic().await.unwrap();
+        for (name, reader) in [("Visible", PRINCIPAL), ("Hidden", "other-reader")] {
+            surface
+                .sekai
+                .create_ontology_class(with_identity(
+                    CreateOntologyClassRequest {
+                        class: Some(OntologyClass {
+                            name: name.into(),
+                            description: format!("{name} class"),
+                            mapped_kind: "widget".into(),
+                            ..Default::default()
+                        }),
+                    },
+                    "local",
+                    NAMESPACE,
+                ))
+                .await
+                .unwrap();
+            surface
+                .sekai
+                .create_grant(with_identity(
+                    CreateGrantRequest {
+                        grant: Some(crate::grpc::pb::sekai::Grant {
+                            id: format!("class-reader-{name}"),
+                            object_id: format!("ontology:class:{name}"),
+                            principal: reader.into(),
+                            role: "viewer".into(),
+                            ..Default::default()
+                        }),
+                    },
+                    "local",
+                    NAMESPACE,
+                ))
+                .await
+                .unwrap();
+        }
+        surface
+            .db
+            .create_link(&domain::Link {
+                id: "widget-pair".into(),
+                from_id: OBJECT_ID.into(),
+                to_id: PEER_OBJECT_ID.into(),
+                relation: "pairs_with".into(),
+                created: 1,
+            })
+            .unwrap();
+        surface
+    }
+
+    #[tokio::test]
+    async fn an_agent_discovers_a_class_and_walks_from_an_object_to_its_neighbors() {
+        use crate::mcp_adapter::protocol::{GET_CLASS_TOOL, LIST_CLASSES_TOOL, NEIGHBORHOOD_TOOL};
+        let surface = discovery_surface().await;
+
+        let listed = call_output(call(&surface, LIST_CLASSES_TOOL, json!({})).await).unwrap();
+        let names = listed["output"]["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|class| class["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Visible"], "{listed}");
+
+        let class =
+            call_output(call(&surface, GET_CLASS_TOOL, json!({"name": "Visible"})).await).unwrap();
+        assert_eq!(class["output"]["class"]["mappedKind"], "widget", "{class}");
+
+        let walked = call_output(
+            call(
+                &surface,
+                NEIGHBORHOOD_TOOL,
+                json!({"seed_ids": [OBJECT_ID], "depth": 1}),
+            )
+            .await,
+        )
+        .unwrap();
+        let ids = walked["output"]["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        // The foreign object the store also links is outside the session,
+        // though the principal may read it over direct gRPC.
+        assert_eq!(ids, BTreeSet::from([OBJECT_ID, PEER_OBJECT_ID]), "{walked}");
+        assert!(!walked.to_string().contains(FOREIGN_OBJECT_ID), "{walked}");
+    }
+
+    #[tokio::test]
+    async fn graph_tools_refuse_a_start_object_outside_the_session_namespace() {
+        use crate::mcp_adapter::protocol::{GET_LINEAGE_TOOL, NEIGHBORHOOD_TOOL};
+        let surface = discovery_surface().await;
+        for (tool, input) in [
+            (NEIGHBORHOOD_TOOL, json!({"seed_ids": [FOREIGN_OBJECT_ID]})),
+            (GET_LINEAGE_TOOL, json!({"object_id": FOREIGN_OBJECT_ID})),
+        ] {
+            let called = call(&surface, tool, input).await;
+            let refused = call_output(called.clone()).unwrap_err();
+            assert!(refused.contains("not_found"), "{tool}: {called}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hidden_class_is_refused_as_the_rpc_refuses_it() {
+        use crate::grpc::pb::sekai::GetOntologyClassRequest;
+        let surface = discovery_surface().await;
+        let rpc = surface
+            .sekai
+            .get_ontology_class(with_identity(
+                GetOntologyClassRequest {
+                    name: "Hidden".into(),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap_err();
+        let called = call(
+            &surface,
+            crate::mcp_adapter::protocol::GET_CLASS_TOOL,
+            json!({"name": "Hidden"}),
+        )
+        .await;
+        let refused = call_output(called.clone()).unwrap_err();
+        assert!(!refused.contains("Hidden class"), "{called}");
+        let AdapterError::Projected(expected) = status_error(rpc) else {
+            unreachable!()
+        };
+        assert!(
+            refused.contains(&format!("\"{}\"", expected.code)),
+            "{called}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_bounds_beyond_the_rpc_limits_are_refused() {
+        use crate::mcp_adapter::protocol::{GET_LINEAGE_TOOL, NEIGHBORHOOD_TOOL};
+        let surface = discovery_surface().await;
+        let deep = call(
+            &surface,
+            NEIGHBORHOOD_TOOL,
+            json!({"seed_ids": [OBJECT_ID], "depth": 5}),
+        )
+        .await;
+        assert!(call_output(deep.clone()).is_err(), "{deep}");
+        let wide = call(
+            &surface,
+            GET_LINEAGE_TOOL,
+            json!({"object_id": OBJECT_ID, "max_nodes": 501}),
+        )
+        .await;
+        assert_eq!(wide["error"]["code"], -32602, "{wide}");
+    }
+
+    #[tokio::test]
+    async fn lineage_runs_while_experimental_rpcs_are_disabled_and_discovery_does_not() {
+        use crate::mcp_adapter::protocol::{GET_LINEAGE_TOOL, LIST_CLASSES_TOOL};
+        let mut surface = discovery_surface().await;
+        surface.experimental_rpcs = false;
+        let lineage = call(&surface, GET_LINEAGE_TOOL, json!({"object_id": OBJECT_ID})).await;
+        assert!(call_output(lineage.clone()).is_ok(), "{lineage}");
+        let listed = call(&surface, LIST_CLASSES_TOOL, json!({})).await;
+        assert!(
+            listed.get("error").is_some() || call_output(listed.clone()).is_err(),
+            "{listed}"
+        );
+    }
 }
