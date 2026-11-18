@@ -48,6 +48,11 @@ impl Serialize for Wire {
         match &self.0.kind {
             Some(Kind::StringValue(text)) => text.serialize(serializer),
             Some(Kind::IntValue(int)) => int.serialize(serializer),
+            // JSON has no NaN or infinity; serde_json would write `null`,
+            // which parses back as an unset value. Refuse, as parsing does.
+            Some(Kind::FloatValue(float)) if !float.is_finite() => Err(serde::ser::Error::custom(
+                "property value float must be finite",
+            )),
             Some(Kind::FloatValue(float)) => float.serialize(serializer),
             Some(Kind::BoolValue(flag)) => flag.serialize(serializer),
             Some(Kind::StructValue(nested)) => StructEnvelope {
@@ -241,4 +246,30 @@ fn take_bool(fields: &mut Map<String, Value>, keys: &[&str]) -> Result<Option<bo
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn float(value: f64) -> Wire {
+        Wire(PropertyValue {
+            kind: Some(Kind::FloatValue(value)),
+        })
+    }
+
+    #[test]
+    fn non_finite_floats_do_not_serialize() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(serde_json::to_string(&float(value)).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn finite_floats_round_trip() {
+        let json = serde_json::to_string(&float(1.5)).unwrap();
+        assert_eq!(json, "1.5");
+        let parsed: Wire = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.0.kind, Some(Kind::FloatValue(1.5)));
+    }
 }
