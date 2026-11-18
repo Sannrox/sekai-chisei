@@ -3595,8 +3595,17 @@ mod tests {
         .unwrap();
     }
 
+    /// Serializes the tests that set and read the process-wide
+    /// `SAMPLE_TICK`; run in parallel, one test samples on another's tick.
+    fn sample_tick_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn dual_read_refuses_unbounded_and_skips_unsampled_without_opening() {
+        let _tick = sample_tick_lock();
         SAMPLE_TICK.store(0, Ordering::Relaxed);
         let config = ObjectLogDualRead {
             enabled: true,
@@ -3667,6 +3676,7 @@ mod tests {
 
     #[test]
     fn unsampled_canary_does_not_load_active_object_policy() {
+        let _tick = sample_tick_lock();
         SAMPLE_TICK.store(1, Ordering::Relaxed);
         let config = ObjectLogDualRead {
             enabled: true,
@@ -3691,6 +3701,7 @@ mod tests {
 
     #[test]
     fn unexpressible_canary_skips_policy_after_sample() {
+        let _tick = sample_tick_lock();
         SAMPLE_TICK.store(0, Ordering::Relaxed);
         let config = ObjectLogDualRead {
             enabled: true,
@@ -3715,6 +3726,7 @@ mod tests {
 
     #[test]
     fn sampled_expressible_canary_loads_policy() {
+        let _tick = sample_tick_lock();
         SAMPLE_TICK.store(0, Ordering::Relaxed);
         let config = ObjectLogDualRead {
             enabled: true,
