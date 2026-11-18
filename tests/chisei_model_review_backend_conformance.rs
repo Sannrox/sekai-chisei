@@ -39,6 +39,8 @@ fn family(
 fn exercise(store: &ChiseiStore, prefix: &str) {
     let namespace = format!("{prefix}-sales");
     let foreign = format!("{prefix}-ops");
+    // The PostgreSQL database is shared with other runs: count from here.
+    let rows_before = store.model_review_row_count().unwrap();
     model_review::set_model_review(
         store,
         review(&namespace, "gpt-4", ModelReviewStatus::Reviewed, 1),
@@ -83,41 +85,49 @@ fn exercise(store: &ChiseiStore, prefix: &str) {
     assert_eq!(families.len(), 1);
     assert_eq!(families[0].region_label, "us");
 
-    let decisions = store
-        .list_decisions(&DecisionFilter {
-            actor: Some("root".into()),
-            action: None,
-            target_id: None,
-            after: 0,
-            limit: 20,
-            offset: 0,
-        })
-        .unwrap();
-    assert!(
-        decisions
-            .iter()
-            .any(|row| row.action == model_review::ACTION_SET)
-    );
-    assert!(
-        decisions
-            .iter()
-            .any(|row| row.action == model_review::ACTION_REVOKE)
-    );
-    assert!(
-        decisions
-            .iter()
-            .any(|row| row.action == model_review::ACTION_FAMILY_SET)
-    );
-    assert!(
-        decisions
-            .iter()
-            .filter(|row| {
-                row.action.starts_with("model_review.") || row.action.starts_with("model_family.")
+    // Only this run's targets carry the prefix, so other runs' decisions
+    // can neither crowd these out nor satisfy the assertions.
+    let actions = |target_id: String| {
+        let decisions = store
+            .list_decisions(&DecisionFilter {
+                actor: Some("root".into()),
+                action: None,
+                target_id: Some(target_id),
+                after: 0,
+                limit: 20,
+                offset: 0,
             })
-            .all(|row| row.evidence.get("contract_version")
-                == Some(&MODEL_REVIEW_CONTRACT.to_string()))
+            .unwrap();
+        assert!(decisions.iter().all(|row| {
+            row.evidence.get("contract_version") == Some(&MODEL_REVIEW_CONTRACT.to_string())
+        }));
+        let mut actions = decisions
+            .into_iter()
+            .map(|row| row.action)
+            .collect::<Vec<_>>();
+        actions.sort();
+        actions
+    };
+    let mut expected = vec![
+        model_review::ACTION_SET.to_string(),
+        model_review::ACTION_SET.to_string(),
+        model_review::ACTION_REVOKE.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        actions(review(&namespace, "gpt-4", ModelReviewStatus::Enabled, 0).target_id()),
+        expected
     );
-    assert!(store.model_review_row_count().unwrap() >= 2);
+    assert_eq!(
+        actions(review(&foreign, "gpt-4", ModelReviewStatus::Enabled, 0).target_id()),
+        vec![model_review::ACTION_SET.to_string()]
+    );
+    assert_eq!(
+        actions(family(&namespace, "us", ModelReviewStatus::Enabled, 0).target_id()),
+        vec![model_review::ACTION_FAMILY_SET.to_string()]
+    );
+    // One row per (namespace, model): the set, re-set, and revoke upsert it.
+    assert_eq!(store.model_review_row_count().unwrap(), rows_before + 2);
 }
 
 #[test]
