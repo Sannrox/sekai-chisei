@@ -517,7 +517,6 @@ pub(super) async fn preview_object_action(
     }
     let mut parameters_json = inner.parameters_json;
     let mut proposed_parameters_json = String::new();
-    let mut fill_audit = None;
     if crate::chisei::system_one_action::should_fill(&type_def, &parameters_json) {
         let object_type = service
             .db
@@ -541,12 +540,12 @@ pub(super) async fn preview_object_action(
                 Status::unavailable(error)
             }
         })?;
-        fill_audit = Some((
-            record,
-            crate::chisei::system_one_action::bind_of(&type_def)
-                .map(|bind| bind.model.clone())
-                .unwrap_or_else(|| "typesafe".into()),
-        ));
+        // The context has left the system, so the egress is audited whatever
+        // the preview outcome, and an unrecorded egress fails the request.
+        let model = crate::chisei::system_one_action::bind_of(&type_def)
+            .map(|bind| bind.model.clone())
+            .unwrap_or_else(|| "typesafe".into());
+        record_system_one_egress_audit(service.db.runtime(), &record, &model, &object.id)?;
         parameters_json = filled;
         proposed_parameters_json.clone_from(&parameters_json);
     }
@@ -574,8 +573,6 @@ pub(super) async fn preview_object_action(
     let mut proto = object_action_preview_to_proto(preview);
     if proto.outcome != crate::sekai::action_describe_preview::PREVIEW_VALID {
         proposed_parameters_json.clear();
-    } else if let Some((record, model)) = fill_audit {
-        record_system_one_egress_audit(service.db.runtime(), &record, &model, &object.id);
     }
     proto.proposed_parameters_json = proposed_parameters_json;
     Ok(Response::new(proto))
@@ -586,7 +583,7 @@ fn record_system_one_egress_audit(
     record: &crate::chisei::egress::ContextEgressRecord,
     model: &str,
     request_id: &str,
-) {
+) -> Result<(), Status> {
     let mut evidence = std::collections::HashMap::new();
     evidence.insert("provider".into(), "typesafe".into());
     evidence.insert("model".into(), model.into());
@@ -606,7 +603,7 @@ fn record_system_one_egress_audit(
         "redacted_fields".into(),
         serde_json::to_string(&record.redacted_fields).unwrap_or_else(|_| "[]".into()),
     );
-    let _ = db.record_decision(&crate::sekai::audit::Decision {
+    db.record_decision(&crate::sekai::audit::Decision {
         id: uuid::Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis(),
         actor: "chisei.egress".into(),
@@ -619,7 +616,24 @@ fn record_system_one_egress_audit(
         } else {
             "redacted".into()
         },
-    });
+    })
+    .map_err(|error| Status::internal(format!("record egress audit: {error}")))
+}
+
+#[cfg(test)]
+mod egress_audit_tests {
+    use super::*;
+
+    #[test]
+    fn an_egress_the_ledger_refuses_to_record_fails_the_request() {
+        let db = crate::db::runtime_db::RuntimeDb::memory();
+        let record = crate::chisei::egress::ContextEgressRecord::default();
+        // The ledger refuses secret-shaped evidence.
+        let error =
+            record_system_one_egress_audit(&db, &record, "sk-not-a-model", "obj-1").unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+        record_system_one_egress_audit(&db, &record, "typesafe", "obj-1").unwrap();
+    }
 }
 pub(super) async fn get_action_instance(
     service: &SekaiServiceImpl,
