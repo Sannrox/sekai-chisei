@@ -72,8 +72,16 @@ verify_release_tag() {
     [[ "$peeled" == "$expected_commit" ]] || fail "tag ${tag} resolves to ${peeled}, expected ${expected_commit}"
   fi
 
-  raw="$(git verify-tag --raw "$tag" 2>&1)" || true
-  [[ "$raw" == *VALIDSIG* ]] || fail "tag ${tag} is unsigned or the signature is not valid"
+  # Fail closed: a failing verify-tag exit, any revoked, expired, bad, or
+  # unverifiable signature status, or a missing GOODSIG/VALIDSIG pair refuses
+  # the tag. An expired key or signature is refused too; rotate the key.
+  raw="$(git verify-tag --raw "$tag" 2>&1)" || fail "tag ${tag} is unsigned or the signature is not valid"
+  local refused
+  refused="$(awk '$1 == "[GNUPG:]" && $2 ~ /^(REVKEYSIG|BADSIG|ERRSIG|EXPKEYSIG|EXPSIG)$/ { print $2; exit }' <<<"$raw")"
+  [[ -z "$refused" ]] || fail "tag ${tag} signature status is ${refused}"
+  if ! grep -q '^\[GNUPG:\] GOODSIG ' <<<"$raw" || ! grep -q '^\[GNUPG:\] VALIDSIG ' <<<"$raw"; then
+    fail "tag ${tag} is unsigned or the signature is not valid"
+  fi
   status_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $3; exit }' <<<"$raw")"
   primary_fpr="$(awk '/^\[GNUPG:\] VALIDSIG / { print $12; exit }' <<<"$raw")"
   status_fpr="$(normalize_fpr "$status_fpr")"

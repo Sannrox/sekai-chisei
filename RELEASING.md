@@ -11,7 +11,10 @@ repository. Agents never push `v*` tags.
 After the version-bump pull request merges, the maintainer creates an
 annotated, signed `vX.Y.Z` tag with the registered release-signing key.
 The tag must equal the workspace version in the root `Cargo.toml`
-`[package]` table. The workflow refuses unsigned or lightweight tags.
+`[package]` table. The workflow refuses unsigned or lightweight tags, a
+failing `git verify-tag`, and a signature whose key is revoked or expired or
+whose signature itself has expired. Rotate an expired key; do not extend the
+check to accept it.
 
 ## Prepare
 
