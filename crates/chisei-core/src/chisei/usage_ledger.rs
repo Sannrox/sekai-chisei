@@ -222,20 +222,38 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<UsageAggregate, String> {
-        let events = self.list_usage_events_for_tenant(tenant_id, start_ms, end_ms, 5_000)?;
+        if tenant_id.is_empty() {
+            return Err("tenant_id required".into());
+        }
         let mut agg = UsageAggregate {
             tenant_id: tenant_id.into(),
             unit: unit.as_str().into(),
             ..Default::default()
         };
-        for event in events.into_iter().filter(|e| e.unit == unit) {
-            match event.source {
-                UsageSource::Measured => agg.measured += event.quantity,
-                UsageSource::ProviderReported => agg.provider_reported += event.quantity,
-                UsageSource::Estimated => agg.estimated += event.quantity,
-                UsageSource::Correction => agg.corrections += event.quantity,
+        // Summed in SQL so the result never depends on how many events the period holds.
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source, SUM(quantity) FROM chisei_usage_events
+                 WHERE tenant_id = ?1 AND unit = ?2 AND event_time_ms >= ?3 AND event_time_ms < ?4
+                 GROUP BY source",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![tenant_id, unit.as_str(), start_ms, end_ms], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (source_raw, quantity) = row.map_err(|e| e.to_string())?;
+            match UsageSource::parse(&source_raw) {
+                Some(UsageSource::Measured) => agg.measured += quantity,
+                Some(UsageSource::ProviderReported) => agg.provider_reported += quantity,
+                Some(UsageSource::Estimated) => agg.estimated += quantity,
+                Some(UsageSource::Correction) => agg.corrections += quantity,
+                None => {}
             }
-            agg.net += event.quantity;
+            agg.net += quantity;
         }
         Ok(agg)
     }
@@ -289,10 +307,43 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<String, String> {
-        let events = self.list_usage_events_for_tenant(tenant_id, start_ms, end_ms, 5_000)?;
+        // Page through the whole period in (event_time_ms, event_id) order so a large
+        // tenant is never truncated at the per-call cap.
+        const PAGE: i64 = 5_000;
         let mut lines = Vec::new();
-        for event in events {
-            lines.push(serde_json::to_string(&event).map_err(|e| e.to_string())?);
+        let mut cursor = (i64::MIN, String::new());
+        loop {
+            let page = {
+                let conn = self.conn();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
+                                receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id
+                         FROM chisei_usage_events
+                         WHERE tenant_id = ?1 AND event_time_ms >= ?2 AND event_time_ms < ?3
+                           AND (event_time_ms, event_id) > (?4, ?5)
+                         ORDER BY event_time_ms ASC, event_id ASC
+                         LIMIT ?6",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(
+                        params![tenant_id, start_ms, end_ms, cursor.0, cursor.1, PAGE],
+                        row_to_event,
+                    )
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            for event in &page {
+                lines.push(serde_json::to_string(event).map_err(|e| e.to_string())?);
+            }
+            match page.last() {
+                Some(last) if page.len() as i64 == PAGE => {
+                    cursor = (last.event_time_ms, last.event_id.clone());
+                }
+                _ => break,
+            }
         }
         Ok(lines.join("\n"))
     }
@@ -515,6 +566,36 @@ mod tests {
         receipt.events.extend([second, third]);
         // 100 (total wins over parts) + 50 (30 + 20) + 100 (total wins over input).
         assert_eq!(measured_tokens_from_receipt(&receipt), 250);
+    }
+
+    #[test]
+    fn aggregate_and_export_cover_more_than_one_page_of_events() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        let total = 5_003i64;
+        for i in 0..total {
+            let event = UsageEvent {
+                version: USAGE_EVENT_VERSION.into(),
+                event_id: format!("ev-{i:05}"),
+                tenant_id: "tenant-a".into(),
+                namespace: "ns".into(),
+                unit: UsageUnit::Requests,
+                quantity: 1,
+                source: UsageSource::Measured,
+                receipt_operation_id: format!("op-{i}"),
+                dedupe_key: format!("dk-{i}"),
+                // Shared timestamps exercise the event_id tiebreak in paging.
+                event_time_ms: 1_000 + i / 3,
+                corrects_event_id: None,
+            };
+            assert!(db.append_usage_event(&event).unwrap());
+        }
+        let agg = db
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::Requests, 0, i64::MAX)
+            .unwrap();
+        assert_eq!(agg.measured, total);
+        assert_eq!(agg.net, total);
+        let exported = db.export_usage_period("tenant-a", 0, i64::MAX).unwrap();
+        assert_eq!(exported.lines().count() as i64, total);
     }
 
     #[test]
