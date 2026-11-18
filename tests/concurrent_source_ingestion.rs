@@ -6,11 +6,14 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
 
 use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::domain::ListFilter;
+use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
+use sekai_chisei::grpc::pb::sekai::{self as pb, ListObjectsRequest};
+use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectQueryCursor, ObjectSecurityOperation,
     ObjectSecurityPolicy, ObjectSecurityPredicate, ObjectSecurityRule, PrincipalPolicyContext,
-    object_query_digest, object_security_activation_digest,
 };
 use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
@@ -18,9 +21,12 @@ use sekai_chisei::sekai::object_sync::{
     SourceBatchStatus, SourceRecord,
 };
 use sekai_chisei::sekai::source_health::{SourceHealthQuery, project_source_health};
+use tonic::metadata::MetadataValue;
+use tonic::{Code, Request};
 
 const PRODUCER: &str = "connector/github-primary";
 const NAMESPACE: &str = "ops";
+const VIEWER: &str = "viewer";
 const SOURCE_INSTANCE: &str = "acme/ops";
 const PAYLOAD_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PAYLOAD_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -328,39 +334,51 @@ fn exercise_size(size: usize) {
             .unwrap_err()
             .starts_with("stale_cursor:")
     );
+}
 
-    let filter = ListFilter {
-        namespace: Some(NAMESPACE.into()),
-        kind: Some("Issue".into()),
-        limit: 4,
-        offset: 0,
-        ..Default::default()
-    };
-    let query_digest = object_query_digest(&filter).unwrap();
-    let activation = db
-        .get_object_security_activation(NAMESPACE)
+fn list_issues(page_token: String, kind: &str) -> Request<ListObjectsRequest> {
+    let mut request = Request::new(ListObjectsRequest {
+        filter: Some(pb::ListFilter {
+            namespace: NAMESPACE.into(),
+            kind: kind.into(),
+            order_by: "name".into(),
+            limit: 2,
+            ..Default::default()
+        }),
+        page_token,
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", MetadataValue::from_static(VIEWER));
+    request
+}
+
+/// A page token is bound to its query and to the policy activation it was
+/// issued under; presenting it after either changes is refused, as is an
+/// expired token.
+#[tokio::test]
+async fn stale_object_query_cursor_is_refused() {
+    let db = Arc::new(RuntimeDb::memory());
+    seed_graph(&db, 8);
+    let svc = SekaiServiceImpl::new(SekaiStore::from_shared_runtime(Arc::clone(&db)));
+
+    let first = svc
+        .list_objects(list_issues(String::new(), "Issue"))
+        .await
         .unwrap()
-        .unwrap();
-    let activation_digest = object_security_activation_digest(&activation).unwrap();
-    let key = db.object_query_cursor_key().unwrap();
-    let token = ObjectQueryCursor::issue(
-        4,
-        "a".repeat(64),
-        NAMESPACE.into(),
-        activation_digest.clone(),
-        query_digest.clone(),
-        1_000,
-    )
-    .unwrap()
-    .encode(&key)
-    .unwrap();
-    let decoded = ObjectQueryCursor::decode(&token, &key, 1_001).unwrap();
-    assert_eq!(decoded.query_digest, query_digest);
+        .into_inner();
+    let token = first.next_page_token;
+    assert!(!token.is_empty());
+    svc.list_objects(list_issues(token.clone(), "Issue"))
+        .await
+        .expect("the unchanged query resumes from its token");
 
-    let mut changed = filter.clone();
-    changed.kind = Some("PullRequest".into());
-    let changed_digest = object_query_digest(&changed).unwrap();
-    assert_ne!(changed_digest, query_digest);
+    let changed = svc
+        .list_objects(list_issues(token.clone(), "PullRequest"))
+        .await
+        .unwrap_err();
+    assert_eq!(changed.code(), Code::FailedPrecondition);
+    assert!(changed.message().contains("has changed"), "{changed:?}");
 
     let replacement = ObjectSecurityPolicy {
         contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
@@ -385,14 +403,22 @@ fn exercise_size(size: usize) {
         9_200,
     )
     .unwrap();
-    let next_activation = db
-        .get_object_security_activation(NAMESPACE)
-        .unwrap()
-        .unwrap();
-    assert_ne!(
-        object_security_activation_digest(&next_activation).unwrap(),
-        activation_digest
+    let reactivated = svc
+        .list_objects(list_issues(token.clone(), "Issue"))
+        .await
+        .unwrap_err();
+    assert_eq!(reactivated.code(), Code::FailedPrecondition);
+    assert!(
+        reactivated.message().contains("has changed"),
+        "{reactivated:?}"
     );
+
+    let key = db.object_query_cursor_key().unwrap();
+    let expires_at_ms = ObjectQueryCursor::decode(&token, &key, 0)
+        .unwrap()
+        .expires_at_ms;
+    assert!(ObjectQueryCursor::decode(&token, &key, expires_at_ms - 1).is_ok());
+    assert!(ObjectQueryCursor::decode(&token, &key, expires_at_ms).is_err());
 }
 
 #[test]
