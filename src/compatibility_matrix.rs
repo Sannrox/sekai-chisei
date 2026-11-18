@@ -668,18 +668,49 @@ fn json_dependency_version(value: &serde_json::Value, name: &str) -> Option<Stri
 fn python_dependency_version(body: &str, name: &str) -> Option<String> {
     let project = uncomment(table_body(body, "project")?);
     let after = assignment_after(&project, "dependencies")?;
-    for item in toml_string_array(after)? {
-        let Some(rest) = item.trim().strip_prefix(name) else {
-            continue;
-        };
-        if let Some(version) = rest.trim_start().strip_prefix("==") {
-            let version = version.trim().to_string();
-            if !version.is_empty() {
-                return Some(version);
+    let wanted = normalize_python_name(name);
+    toml_string_array(after)?
+        .iter()
+        .find_map(|item| python_exact_pin(item, &wanted))
+}
+
+/// Reads `name[extras] ==version ; marker` and returns the version when the
+/// normalized name is `wanted` and the only specifier is an exact `==` or
+/// `===` pin. Ranges, multiple specifiers, and URL requirements return None.
+fn python_exact_pin(requirement: &str, wanted: &str) -> Option<String> {
+    let requirement = requirement.split(';').next()?.trim();
+    let name_end = requirement
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        .unwrap_or(requirement.len());
+    if normalize_python_name(&requirement[..name_end]) != wanted {
+        return None;
+    }
+    let mut rest = requirement[name_end..].trim_start();
+    if rest.starts_with('[') {
+        rest = rest[rest.find(']')? + 1..].trim_start();
+    }
+    let version = rest
+        .strip_prefix("===")
+        .or_else(|| rest.strip_prefix("=="))?
+        .trim();
+    let valid = !version.is_empty() && !version.contains([',', ' ', '*', '<', '>', '=', '!', '~']);
+    valid.then(|| version.to_string())
+}
+
+/// The standard Python name normalization: lowercase, with every run of `-`,
+/// `_`, or `.` treated as one `-`.
+fn normalize_python_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !normalized.ends_with('-') {
+                normalized.push('-');
             }
+        } else {
+            normalized.push(ch.to_ascii_lowercase());
         }
     }
-    None
+    normalized
 }
 
 fn toml_string_array(src: &str) -> Option<Vec<String>> {
@@ -1346,6 +1377,38 @@ mod tests {
         .unwrap();
         let check = check_consumer(&matrix, &consumer).unwrap();
         assert!(check.is_on_matrix(), "{}", check.report());
+    }
+
+    #[test]
+    fn python_pin_reads_extras_markers_and_name_spellings() {
+        let wanted = normalize_python_name(PYTHON_PACKAGE);
+        for requirement in [
+            "sekai-chisei-sdk==0.1.0",
+            "sekai-chisei-sdk[grpc]==0.1.0",
+            "sekai-chisei-sdk [grpc, otel] == 0.1.0",
+            "sekai-chisei-sdk==0.1.0; python_version >= \"3.10\"",
+            "Sekai_Chisei.SDK===0.1.0",
+        ] {
+            assert_eq!(
+                python_exact_pin(requirement, &wanted).as_deref(),
+                Some("0.1.0"),
+                "{requirement}"
+            );
+        }
+        for requirement in [
+            "sekai-chisei-sdk-extra==0.1.0",
+            "sekai-chisei-sdkx==0.1.0",
+            "sekai-chisei-sdk>=0.1.0",
+            "sekai-chisei-sdk==0.1.0,<0.2",
+            "sekai-chisei-sdk==0.1.*",
+            "sekai-chisei-sdk @ https://example.invalid/sdk.whl",
+        ] {
+            assert_eq!(
+                python_exact_pin(requirement, &wanted),
+                None,
+                "{requirement}"
+            );
+        }
     }
 
     #[test]
