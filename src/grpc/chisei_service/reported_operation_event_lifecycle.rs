@@ -322,6 +322,9 @@ pub(super) fn record_reported_memory_outcomes(
     if validate_only {
         return Ok(Vec::new());
     }
+    // Lifecycle rows have no unique key. A replay does not push these again:
+    // `list_kioku_outcome_assignments` reads them back as this operation's
+    // assignments, so the checks above skip a memory already written.
     for event in pending_lifecycle_events {
         db.record_kioku_lifecycle_event(&event)?;
     }
@@ -748,4 +751,208 @@ async fn report_operation_event(
             .map(|surface| surface.as_str().to_string())
             .collect(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chisei::kioku::{
+        HumanMemoryReview, HumanReviewAction, KIOKU_MEMORY_VERSION, KiokuEvidenceLink, KiokuMemory,
+        MemoryEvidenceStance, MemoryKind, MemoryLifecycleState,
+    };
+    use crate::sekai::evidence::EvidenceClassification;
+    use sekai_domain::receipt::{GovernedReference, OperationReceiptEvent};
+
+    const METRIC: &str = "deployment verification passed";
+
+    fn active_memory(db: &ChiseiStore) -> KiokuMemory {
+        let memory = KiokuMemory {
+            contract_version: KIOKU_MEMORY_VERSION.into(),
+            id: "memory".into(),
+            version: 1,
+            kind: MemoryKind::Warning,
+            claim: "Verify generated migrations before deployment".into(),
+            namespace: "ns".into(),
+            operation_classes: vec!["schema_change".into()],
+            affinity_object_ids: vec!["component:migrations".into()],
+            outcome_definition: METRIC.into(),
+            confidence_bps: 10_000,
+            sample_size: 1,
+            uncertainty: "single verified operation".into(),
+            producer_identity: "kioku:test".into(),
+            derivation_method: "verified_binary_outcomes/v1".into(),
+            classification: EvidenceClassification::Internal,
+            retention_until_ms: None,
+            state: MemoryLifecycleState::Candidate,
+            created_at_ms: 100,
+            reviewed_at_ms: None,
+            expires_at_ms: None,
+            last_confirmed_at_ms: Some(100),
+            supersedes: None,
+            evidence_basis: vec![],
+            evidence_basis_digest: String::new(),
+            reassessment_key: String::new(),
+            reassessment_actor: String::new(),
+        };
+        let link = KiokuEvidenceLink {
+            memory_id: memory.id.clone(),
+            memory_version: 1,
+            operation_id: "source-op".into(),
+            verification_event_id: "verify-1".into(),
+            evidence_reference: "artifact://verification".into(),
+            evidence_digest: "abc123".into(),
+            stance: MemoryEvidenceStance::Supporting,
+            outcome_metric: METRIC.into(),
+            outcome_value: 1.0,
+            observed_at_ms: 100,
+        };
+        db.insert_kioku_memory(&memory, &[link]).unwrap();
+        db.review_kioku_candidate(
+            &memory.id,
+            1,
+            HumanMemoryReview {
+                action: HumanReviewAction::Promote,
+                reviewer: "reviewer".into(),
+                rationale: "verified".into(),
+                reviewed_at_ms: 120,
+            },
+        )
+        .unwrap()
+    }
+
+    fn event(
+        id: &str,
+        at: i64,
+        kind: ReceiptEventKind,
+        references: Vec<GovernedReference>,
+        attributes: &[(&str, &str)],
+    ) -> OperationReceiptEvent {
+        OperationReceiptEvent {
+            event_id: id.into(),
+            operation_id: "op".into(),
+            parent_event_id: (kind != ReceiptEventKind::IntentRecorded).then(|| "intent".into()),
+            timestamp_ms: at,
+            kind,
+            surface: kind.surface(),
+            actor: "root".into(),
+            references,
+            attributes: attributes
+                .iter()
+                .map(|(key, value)| ((*key).into(), (*value).into()))
+                .collect(),
+        }
+    }
+
+    fn receipt(memory: &KiokuMemory) -> OperationReceipt {
+        OperationReceipt {
+            version: sekai_domain::receipt::OPERATION_RECEIPT_VERSION.into(),
+            operation_id: "op".into(),
+            parent_operation_id: None,
+            namespace: "ns".into(),
+            operation_class: "schema_change".into(),
+            initiating_actor: "root".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 140,
+            completed_at_ms: Some(180),
+            events: vec![
+                event(
+                    "intent",
+                    140,
+                    ReceiptEventKind::IntentRecorded,
+                    vec![],
+                    &[("request_id", "req")],
+                ),
+                event(
+                    "context",
+                    150,
+                    ReceiptEventKind::ContextGoverned,
+                    vec![GovernedReference {
+                        kind: "kioku_memory".into(),
+                        reference: "memory:memory@1".into(),
+                        content_hash: Some(crate::chisei::kioku::memory_claim_digest(memory)),
+                        disclosed_fields: vec![],
+                        omitted: false,
+                        omission_reason: None,
+                    }],
+                    &[],
+                ),
+                event("policy", 141, ReceiptEventKind::PolicyDecided, vec![], &[]),
+                event("route", 142, ReceiptEventKind::RouteSelected, vec![], &[]),
+                event("budget", 143, ReceiptEventKind::BudgetDecided, vec![], &[]),
+                event(
+                    "attempt",
+                    160,
+                    ReceiptEventKind::AttemptStarted,
+                    vec![],
+                    &[],
+                ),
+                event(
+                    "outcome",
+                    170,
+                    ReceiptEventKind::OutcomeRecorded,
+                    vec![],
+                    &[
+                        ("outcome_metric", METRIC),
+                        ("outcome_value", "1"),
+                        ("passed", "true"),
+                    ],
+                ),
+            ],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+            ontology_digest: None,
+            artifact: None,
+        }
+    }
+
+    /// #2715: a report whose outcome write failed after its lifecycle
+    /// events were written is replayed without duplicating those events,
+    /// and the replay records the outcome.
+    #[test]
+    fn replayed_memory_outcome_report_does_not_duplicate_lifecycle_events() {
+        let db = ChiseiStore::memory();
+        let memory = active_memory(&db);
+        let receipt = receipt(&memory);
+        assert!(
+            receipt.completeness().complete,
+            "{:?}",
+            receipt.completeness()
+        );
+        db.put_operation_receipt(&receipt).unwrap();
+        let report =
+            || record_reported_memory_outcomes(&db, &receipt, "root", 200, false, None, false);
+        let conn = || db.runtime().conn();
+        conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_outcome BEFORE INSERT ON chisei_kioku_outcomes
+                 BEGIN SELECT RAISE(ABORT, 'injected outcome write failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            report()
+                .unwrap_err()
+                .contains("injected outcome write failure")
+        );
+        conn().execute_batch("DROP TRIGGER fail_outcome;").unwrap();
+        report().unwrap();
+        report().unwrap();
+
+        let injected = db
+            .list_kioku_lifecycle_events(&memory.id, 1)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action == "injected")
+            .count();
+        assert_eq!(injected, 1);
+        assert_eq!(db.list_kioku_outcome_assignments("op").unwrap().len(), 1);
+        let outcomes: i64 = conn()
+            .query_row(
+                "SELECT count(*) FROM chisei_kioku_outcomes WHERE operation_id = 'op'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcomes, 1);
+    }
 }
