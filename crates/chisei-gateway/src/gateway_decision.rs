@@ -125,6 +125,16 @@ pub(super) fn is_transient_governance_status(status: &tonic::Status) -> bool {
             | tonic::Code::Internal
     )
 }
+/// Feed a control-plane RPC error to the shared circuit. Only transient statuses count
+/// as failures; a client or policy fault proves the control plane answered, so it resets
+/// the circuit instead of letting one caller's bad requests shut out everyone else.
+pub(super) async fn record_control_plane_status(runtime: &GatewayRuntime, status: &tonic::Status) {
+    if is_transient_governance_status(status) {
+        record_control_plane_failure(runtime, status).await;
+    } else {
+        record_control_plane_success(runtime).await;
+    }
+}
 pub(super) fn governance_status_rejection(status: &tonic::Status) -> GatewayRejection {
     if status.code() == tonic::Code::FailedPrecondition
         && status.message().starts_with("capability_unsupported:")
@@ -527,7 +537,7 @@ pub(super) async fn gateway_decision_preflight(
                     }
                 }
                 Err(err) => {
-                    record_control_plane_failure(runtime, &err).await;
+                    record_control_plane_status(runtime, &err).await;
                     Err(governance_status_rejection(&err))
                 }
             }
