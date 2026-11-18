@@ -18,12 +18,11 @@ use sekai_chisei::grpc::pb::chisei::{
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ActionApprovalRequirement, ActionInstance, ClaimActionWorkRequest,
-    ClassificationIncomparablePair, ClassificationLattice, ClassificationParentEdge,
-    CreateObjectRequest, DecideActionInstanceRequest, EnsureTeamNamespaceRequest,
-    GetActionInstanceRequest, GetObjectRequest, ListActionEffectsRequest,
-    ListActionInstancesRequest, Object, PutClassificationLatticeRequest,
-    SubmitActionInstanceRequest,
+    ActionApprovalRequirement, ActionInstance, ClaimWorkRequest, ClassificationIncomparablePair,
+    ClassificationLattice, ClassificationParentEdge, CreateObjectRequest,
+    DecideActionInstanceRequest, EnsureTeamNamespaceRequest, GetActionInstanceRequest,
+    GetObjectRequest, ListActionEffectsRequest, ListActionInstancesRequest, Object,
+    PutClassificationLatticeRequest, SubmitActionInstanceRequest, WorkKind, claim_work_response,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -755,18 +754,23 @@ impl RoutedGame {
             .into_iter()
             .find(|effect| effect.kind == "runtime_dispatch")
             .expect("invasion runtime dispatch");
-        let claimed = sekai
-            .claim_action_work(ClaimActionWorkRequest {
-                effect_id: effect.effect_id,
+        let Some(claim_work_response::Payload::Action(claimed)) = sekai
+            .claim_work(ClaimWorkRequest {
+                kind: WorkKind::Action.into(),
+                work_id: effect.effect_id,
                 runtime_id: "default".into(),
                 request_id: format!("claim-{key}"),
                 ttl_ms: 60_000,
+                ..Default::default()
             })
             .await
             .unwrap_or_else(|error| panic!("claim: {error}\n{}", logs()))
             .into_inner()
-            .effect
-            .expect("claimed effect");
+            .payload
+        else {
+            panic!("claimed Action work");
+        };
+        let claimed = claimed.effect.expect("claimed effect");
         ActionClaimRef {
             effect_id: claimed.effect_id,
             claim_generation: claimed.claim_generation,

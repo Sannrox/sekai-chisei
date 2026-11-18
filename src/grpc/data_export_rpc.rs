@@ -1541,11 +1541,13 @@ impl SekaiServiceImpl {
         let mut artifacts = self.deliverable_artifacts(req, namespace, |source| {
             self.delivery_runtime_admitted(namespace, runtime_id, source, types.as_deref())
         })?;
-        if let Ok(limit) = usize::try_from(limit)
-            && limit > 0
-        {
-            artifacts.truncate(limit);
-        }
+        // The same bounds as every other kind: 50 by default, at most 500.
+        let limit = usize::try_from(limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .unwrap_or(50)
+            .min(500);
+        artifacts.truncate(limit);
         Ok(artifacts)
     }
 

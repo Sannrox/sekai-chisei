@@ -909,36 +909,36 @@
       "rpc": "ListClaimableWork",
       "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "SekaiService",
       "rpc": "ClaimWork",
       "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "SekaiService",
       "rpc": "HeartbeatWorkClaim",
       "storage_path": "sekai.datasets, sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "SekaiService",
       "rpc": "AckWork",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
-      "product_tier": "experimental"
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
     },
     {
       "service": "SekaiService",
