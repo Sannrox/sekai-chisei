@@ -34,6 +34,7 @@ use std::sync::{
     mpsc,
 };
 use std::time::{Duration, Instant};
+use tracing::Instrument as _;
 
 pub const EXECUTION_REQUEST_CONTRACT: &str = "chisei.evaluation-execution-request/v1";
 pub const EXECUTOR_VERSION: &str = "chisei.deterministic-evaluation-executor/v1";
@@ -340,6 +341,20 @@ impl DeterministicEvaluator for ExternalHttpEvaluator {
     }
 
     fn evaluate_with_timeout(
+        &self,
+        input: &DeterministicEvaluatorInput,
+        timeout: Duration,
+    ) -> Result<DeterministicEvaluatorOutput, String> {
+        sekai_core::obs::correlation::in_stage(
+            sekai_core::obs::correlation::Stage::OutboundCall,
+            || self.request(input, timeout),
+        )
+    }
+}
+
+impl ExternalHttpEvaluator {
+    /// Send one signed evaluation request; runs as an `outbound_call` stage.
+    fn request(
         &self,
         input: &DeterministicEvaluatorInput,
         timeout: Duration,
@@ -1188,7 +1203,18 @@ impl<'a> EvaluationExecutionEngine<'a> {
         }
     }
 
+    /// Run one plan node as an `evaluation_step` stage.
     pub fn execute_node(
+        &self,
+        execution: EvaluationNodeExecution<'_>,
+    ) -> Result<NodeExecution, EvaluationExecutionError> {
+        sekai_core::obs::correlation::in_stage(
+            sekai_core::obs::correlation::Stage::EvaluationStep,
+            || self.run_node(execution),
+        )
+    }
+
+    fn run_node(
         &self,
         execution: EvaluationNodeExecution<'_>,
     ) -> Result<NodeExecution, EvaluationExecutionError> {
@@ -1560,9 +1586,11 @@ pub fn execute_registered_node(
 
     let started = Instant::now();
     let (sender, receiver) = mpsc::sync_channel(1);
+    let span = tracing::Span::current();
     std::thread::Builder::new()
         .name(format!("chisei-evaluator-{}", node.node_id))
         .spawn(move || {
+            let _entered = span.entered();
             let _thread_permit = thread_permit;
             let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 evaluator.evaluate_with_timeout(&input, node_budget)
@@ -1839,8 +1867,12 @@ pub fn execute_stochastic_node(
             };
             let evaluator = evaluator.clone();
             let attempt_budget = remaining.min(Duration::from_millis(limits.timeout_ms.max(1)));
-            let evaluation =
-                AssertUnwindSafe(evaluator.evaluate_trial(&trial_input)).catch_unwind();
+            let mut trial_stage = sekai_core::obs::correlation::StageGuard::open(
+                sekai_core::obs::correlation::Stage::StochasticTrial,
+            );
+            let evaluation = AssertUnwindSafe(evaluator.evaluate_trial(&trial_input))
+                .catch_unwind()
+                .instrument(trial_stage.span().clone());
             let received = runtime.block_on(async {
                 tokio::select! {
                     result = evaluation => Some(Some(result)),
@@ -1853,6 +1885,10 @@ pub fn execute_stochastic_node(
                 }
             });
             drop(evaluator_permit);
+            if !matches!(received, Some(Some(Ok(Ok(_))))) {
+                trial_stage.fail();
+            }
+            drop(trial_stage);
             match received {
                 None => {
                     final_trial = Some(stochastic_failure_evidence(

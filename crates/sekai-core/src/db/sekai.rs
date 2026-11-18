@@ -21,6 +21,10 @@ thread_local! {
 pub struct SqliteConn {
     inner: PooledConnection<SqliteConnectionManager>,
     memory_pool_id: Option<u64>,
+    /// `persistence` stage span from checkout until the connection returns
+    /// to the pool, opened only inside a request span, so a trace shows each store transaction. Its outcome
+    /// reports the checkout; work on the connection does not mark it failed.
+    _stage: Option<crate::obs::correlation::StageGuard>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -358,6 +362,9 @@ impl SekaiDb {
 
     pub fn conn(&self) -> SqliteConn {
         let started = Instant::now();
+        let stage = crate::obs::correlation::StageGuard::open_nested(
+            crate::obs::correlation::Stage::Persistence,
+        );
         // In-memory pools are single-connection. A nested checkout from the
         // same thread waits forever on the default 30s timeout loop. Fail
         // immediately so a missed `drop` cannot hang a test for tens of minutes.
@@ -390,6 +397,7 @@ impl SekaiDb {
                     return SqliteConn {
                         inner: conn,
                         memory_pool_id,
+                        _stage: stage,
                         _not_send: PhantomData,
                     };
                 }

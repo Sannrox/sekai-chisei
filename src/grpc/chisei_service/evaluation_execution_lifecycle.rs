@@ -342,7 +342,10 @@ impl EvaluationExecutionLifecycle {
         let budget = self.budget.clone();
         let evaluator_registry = self.evaluator_registry.clone();
         let stochastic_evaluator_registry = self.stochastic_evaluator_registry.clone();
+        // The worker's stage spans stay under this request's trace.
+        let span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
+            let _entered = span.entered();
             let engine = evaluation_execution_domain::EvaluationExecutionEngine::new(
                 &evaluator_registry,
                 &stochastic_evaluator_registry,

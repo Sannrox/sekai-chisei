@@ -1165,6 +1165,46 @@ const MIGRATIONS: &[Migration] = &[
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
 
+/// A pooled PostgreSQL connection that holds a `persistence` stage span until
+/// it returns to the pool, so a trace shows each store transaction. Outside a
+/// request span it holds none.
+pub struct PgConn {
+    inner: PooledConnection<Manager>,
+    _stage: Option<crate::obs::correlation::StageGuard>,
+}
+
+impl std::ops::Deref for PgConn {
+    type Target = postgres::Client;
+
+    fn deref(&self) -> &postgres::Client {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PgConn {
+    fn deref_mut(&mut self) -> &mut postgres::Client {
+        &mut self.inner
+    }
+}
+
+fn traced_checkout(
+    checkout: impl FnOnce() -> Result<PooledConnection<Manager>, String>,
+) -> Result<PgConn, String> {
+    use crate::obs::correlation::{Stage, StageGuard};
+    let Some(mut stage) = StageGuard::open_nested(Stage::Persistence) else {
+        return Ok(PgConn {
+            inner: checkout()?,
+            _stage: None,
+        });
+    };
+    let result = stage.in_scope(checkout);
+    let inner = stage.check(result)?;
+    Ok(PgConn {
+        inner,
+        _stage: Some(stage),
+    })
+}
+
 fn legacy_tenant_state_message() -> String {
     "legacy PostgreSQL tenant state detected; Sekai owns no tenant state on any backend (ADR 0099). Back up the database and move tenant records to the identity extension (docs/tenant-migration.md) before starting this version; no legacy tenant data was changed".into()
 }
@@ -1674,20 +1714,23 @@ impl PostgresDb {
     }
 
     /// A connection checked out within `deadline`; the wait counts against it.
-    pub fn connection_by(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<PooledConnection<Manager>, String> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("acquire PostgreSQL connection: deadline exceeded".into());
-        }
-        self.pool
-            .get_timeout(remaining)
-            .map_err(|error| format!("acquire PostgreSQL connection: {error}"))
+    pub fn connection_by(&self, deadline: std::time::Instant) -> Result<PgConn, String> {
+        traced_checkout(|| {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("acquire PostgreSQL connection: deadline exceeded".into());
+            }
+            self.pool
+                .get_timeout(remaining)
+                .map_err(|error| format!("acquire PostgreSQL connection: {error}"))
+        })
     }
 
-    pub fn connection(&self) -> Result<PooledConnection<Manager>, String> {
+    pub fn connection(&self) -> Result<PgConn, String> {
+        traced_checkout(|| self.untraced_connection())
+    }
+
+    fn untraced_connection(&self) -> Result<PooledConnection<Manager>, String> {
         use crate::obs::labels::{Outcome, PoolPlane};
         let started = std::time::Instant::now();
         let plane = self.plane.get().copied().unwrap_or(PoolPlane::Shared);
