@@ -30,7 +30,31 @@ Compatible clients still need governed model egress. MCP gives them governed
 data and actions but leaves their model calls ungoverned, so removing the
 gateway is not an option.
 
+Today the gateway sits between clients and both planes:
+
+```mermaid
+flowchart LR
+  CL["compatible client"] -->|HTTP| GW["chisei-gateway"]
+  GW -->|"decide, claim, record usage"| CH["Chisei"]
+  GW -->|"identity, context, usage rows, receipts, audit"| SE["Sekai"]
+  GW -->|"provider HTTP"| PR["provider"]
+  CH -->|"native execution"| PR
+```
+
 ## Decision
+
+After this decision every model call leaves through the gateway, and Chisei
+only reads from it:
+
+```mermaid
+flowchart LR
+  CL["compatible client"] -->|HTTP| GW["chisei-gateway<br/>own egress policy and log"]
+  CH["Chisei"] -->|"native execution, as a principal"| GW
+  GW -->|"provider HTTP"| PR["provider"]
+  CH -.->|"reads log and published policy"| GW
+  CH -->|"receipts, usage rows, audit"| SE["Sekai"]
+  MC["MCP client"] -->|"reads, disclosure checked"| SE
+```
 
 1. **One egress layer.** Every governed model call leaves through the
    gateway: compatible clients and Chisei's native execution alike. Chisei
