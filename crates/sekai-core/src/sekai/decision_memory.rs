@@ -72,8 +72,9 @@ pub fn similar_parameters(left: &str, right: &str) -> bool {
 
 impl SekaiDb {
     pub fn migrate_decision_memory(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
+        let conn = self.conn();
+        drop_unguarded_writer_indexes(&conn)?;
+        conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS sekai_action_decision_memory (
                     memory_id TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,
@@ -87,7 +88,9 @@ impl SekaiDb {
                 CREATE INDEX IF NOT EXISTS idx_decision_memory_writer_parameters_object
                     ON sekai_action_decision_memory (
                         namespace,
-                        json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id')
+                        CASE WHEN json_valid(json_extract(body_json, '$.parameters_json'))
+                            THEN json_extract(json_extract(body_json, '$.parameters_json'), '$.object_id')
+                        END
                     )
                     WHERE type_id IN (
                         'site_agent.memory.create',
@@ -97,15 +100,17 @@ impl SekaiDb {
                 CREATE INDEX IF NOT EXISTS idx_decision_memory_writer_facts_object
                     ON sekai_action_decision_memory (
                         namespace,
-                        json_extract(json_extract(body_json, '$.facts_json'), '$.object_id')
+                        CASE WHEN json_valid(json_extract(body_json, '$.facts_json'))
+                            THEN json_extract(json_extract(body_json, '$.facts_json'), '$.object_id')
+                        END
                     )
                     WHERE type_id IN (
                         'site_agent.memory.create',
                         'site_agent.memory.update',
                         'site_agent.memory.forget'
                     );",
-            )
-            .map_err(|error| error.to_string())
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub fn put_decision_memory(&self, memory: &DecisionMemory) -> Result<(), String> {
@@ -190,6 +195,30 @@ impl SekaiDb {
         self.put_decision_memory(&memory)?;
         Ok(true)
     }
+}
+
+/// Drop writer object indexes created before their expressions guarded
+/// non-JSON `parameters_json`/`facts_json` (#3028); `migrate_decision_memory`
+/// recreates them guarded. An unguarded index fails inserts on `''`.
+fn drop_unguarded_writer_indexes(conn: &rusqlite::Connection) -> Result<(), String> {
+    for name in [
+        "idx_decision_memory_writer_parameters_object",
+        "idx_decision_memory_writer_facts_object",
+    ] {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if sql.is_some_and(|sql| !sql.contains("json_valid")) {
+            conn.execute_batch(&format!("DROP INDEX {name}"))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_decision_memory(
@@ -330,6 +359,32 @@ mod tests {
                 .any(|row| row.superseded && row.instance_id == "ai-2")
         );
         assert!(!shown.iter().any(|row| row.instance_id == "ai-3"));
+    }
+
+    #[test]
+    fn writer_memory_with_empty_facts_json_inserts_on_an_upgraded_database() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        // Recreate the pre-#3028 unguarded index, as an upgraded database has it.
+        db.conn()
+            .execute_batch(
+                "DROP INDEX idx_decision_memory_writer_facts_object;
+                 CREATE INDEX idx_decision_memory_writer_facts_object
+                     ON sekai_action_decision_memory (
+                         namespace,
+                         json_extract(json_extract(body_json, '$.facts_json'), '$.object_id')
+                     )
+                     WHERE type_id IN ('site_agent.memory.forget');",
+            )
+            .unwrap();
+        let mut row = memory("m1", "ai-1", r#"{"object_id":"x"}"#, false);
+        row.type_id = "site_agent.memory.forget".into();
+        row.facts_json = String::new();
+        db.put_decision_memory(&row).unwrap();
+        assert_eq!(
+            db.list_decision_memory("acme", "site_agent.memory.forget")
+                .unwrap(),
+            vec![row]
+        );
     }
 
     #[test]
