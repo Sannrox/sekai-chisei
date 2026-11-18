@@ -3130,6 +3130,24 @@ fn project_evaluation_evidence(
     expires_at_ms: i64,
     idempotency_key: &str,
 ) -> String {
+    project_evaluation_evidence_with_content(
+        svc,
+        target_external_id,
+        classification,
+        expires_at_ms,
+        idempotency_key,
+        serde_json::json!({"result": "passed"}),
+    )
+}
+
+fn project_evaluation_evidence_with_content(
+    svc: &ChiseiServiceImpl,
+    target_external_id: &str,
+    classification: crate::sekai::evidence::EvidenceClassification,
+    expires_at_ms: i64,
+    idempotency_key: &str,
+    content: serde_json::Value,
+) -> String {
     use crate::sekai::evidence::{
         EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal,
         EvidenceTarget, SchemaCompatibility,
@@ -3200,7 +3218,6 @@ fn project_evaluation_evidence(
         )
         .unwrap();
     let now = chrono::Utc::now().timestamp_millis();
-    let content = serde_json::json!({"result": "passed"});
     let envelope = EvidenceEnvelope {
         contract_version: EVIDENCE_ENVELOPE_VERSION.into(),
         source_type: "verification_system".into(),
@@ -3952,6 +3969,232 @@ async fn get_quality_trend_matches_canonical_reducer_digest() {
         .insert("x-principal", "local".parse().unwrap());
     let invalid = svc.get_quality_trend(invalid).await.unwrap_err();
     assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+}
+
+/// Publishes an evaluator definition for one built-in implementation digest.
+async fn put_builtin_definition(
+    svc: &ChiseiServiceImpl,
+    evaluator_id: &str,
+    implementation_digest: &str,
+    parameter_schema_json: &str,
+) -> Result<String, Status> {
+    let mut request = evaluator_definition_request("acme");
+    let definition = request.definition.as_mut().unwrap();
+    definition.evaluator_id = evaluator_id.into();
+    definition.implementation_digest = implementation_digest.into();
+    definition.parameter_schema_json = parameter_schema_json.into();
+    definition
+        .supported_input_schemas
+        .push("schema://evidence/schema-check/v1".into());
+    definition.resource_limits.as_mut().unwrap().max_input_bytes = 16_384;
+    Ok(svc
+        .put_evaluator_definition(Request::new(request))
+        .await?
+        .into_inner()
+        .record
+        .unwrap()
+        .definition
+        .unwrap()
+        .definition_id)
+}
+
+#[tokio::test]
+async fn builtin_evaluators_execute_by_digest_and_refuse_invalid_parameters() {
+    use crate::chisei::builtin_evaluators as builtin;
+    use crate::sekai::evidence::EvidenceClassification;
+
+    let svc = memory_service();
+    let invariant_id = install_invariant_with_contract(
+        &svc,
+        "acme",
+        "document-output-checks",
+        vec![],
+        vec![],
+        vec!["schema-check.record".into()],
+        vec![],
+    );
+    // One passing parameter set and one failing value per built-in.
+    let builtins = [
+        (
+            "exact-match",
+            builtin::EXACT_MATCH_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/answer","expected":"hello world","ignore_case":true}"#,
+            r#"{"path":"/answer","expected":"goodbye"}"#,
+        ),
+        (
+            "regex-match",
+            builtin::REGEX_MATCH_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/invoice","pattern":"^INV-[0-9]{4}$"}"#,
+            r#"{"path":"/invoice","pattern":"^PO-"}"#,
+        ),
+        (
+            "numeric-range",
+            builtin::NUMERIC_RANGE_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/total","minimum":0,"maximum":100}"#,
+            r#"{"path":"/total","minimum":50}"#,
+        ),
+        (
+            "date-range",
+            builtin::DATE_RANGE_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/due","not_before":"2026-01-01","not_after":"2026-12-31"}"#,
+            r#"{"path":"/due","not_after":"2025-12-31"}"#,
+        ),
+        (
+            "edit-distance",
+            builtin::EDIT_DISTANCE_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/answer","expected":"Hello Wrld","max_normalized_distance":0.1}"#,
+            r#"{"path":"/answer","expected":"Help","max_normalized_distance":0.1}"#,
+        ),
+        (
+            "token-overlap",
+            builtin::TOKEN_OVERLAP_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/answer","reference":"hello world","n":1,"min_recall":1,"ignore_case":true}"#,
+            r#"{"path":"/answer","reference":"brave new world","n":1,"min_recall":0.5}"#,
+        ),
+        (
+            "size-bounds",
+            builtin::SIZE_BOUNDS_IMPLEMENTATION_DIGEST,
+            r#"{"path":"/lines","min_items":2,"max_items":2,"distinct":true}"#,
+            r#"{"path":"/lines","max_items":2}"#,
+        ),
+    ];
+    let mut definitions = Vec::new();
+    for (name, digest, _, _) in builtins {
+        let schema = builtin::builtin_parameter_schema(digest).unwrap();
+        definitions.push(
+            put_builtin_definition(&svc, name, digest, schema)
+                .await
+                .unwrap(),
+        );
+    }
+    // A definition naming a built-in digest must declare its published schema.
+    let wrong_schema = put_builtin_definition(
+        &svc,
+        "regex-loose",
+        builtin::REGEX_MATCH_IMPLEMENTATION_DIGEST,
+        r#"{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}"#,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(wrong_schema.code(), tonic::Code::InvalidArgument);
+
+    let evidence_id = project_evaluation_evidence_with_content(
+        &svc,
+        "document:42",
+        EvidenceClassification::Internal,
+        chrono::Utc::now().timestamp_millis() + 60_000,
+        "builtin-output",
+        serde_json::json!({
+            "answer": "Hello World",
+            "invoice": "INV-2026",
+            "total": 42.5,
+            "due": "2026-03-01",
+            "lines": ["a", "b", "b"],
+        }),
+    );
+    let plan_request = |version: &str, parameters: &dyn Fn(usize) -> &'static str| {
+        let mut request = evaluation_plan_request("acme", "", &invariant_id, version);
+        let plan = request.plan.as_mut().unwrap();
+        let template = plan.nodes.remove(0);
+        plan.nodes = builtins
+            .iter()
+            .enumerate()
+            .map(|(index, (name, ..))| {
+                let mut node = template.clone();
+                node.node_id = (*name).into();
+                node.evaluator_definition_id = definitions[index].clone();
+                node.parameters_json = parameters(index).into();
+                node.input_bindings.push(EvaluationInputBinding {
+                    name: "output".into(),
+                    source_kind: evaluation_plan_domain::INPUT_EVIDENCE.into(),
+                    schema_id: "schema://evidence/schema-check/v1".into(),
+                });
+                node
+            })
+            .collect();
+        request
+    };
+    let execute = async |version: &str, parameters: &dyn Fn(usize) -> &'static str| {
+        let plan = svc
+            .put_evaluation_plan(Request::new(plan_request(version, parameters)))
+            .await
+            .unwrap()
+            .into_inner()
+            .plan
+            .unwrap();
+        let mut resolution = evaluation_resolution_request(
+            "acme",
+            &format!("builtin-{version}"),
+            &plan.plan_version_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        resolution.resolution.as_mut().unwrap().evidence_object_ids = vec![evidence_id.clone()];
+        let manifest = svc
+            .resolve_evaluation_plan(Request::new(resolution))
+            .await
+            .unwrap()
+            .into_inner()
+            .manifest
+            .unwrap();
+        svc.execute_evaluation_manifest(Request::new(ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest.clone(),
+                max_total_duration_ms: 10_000,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap()
+    };
+
+    let passing = execute("1.0.0", &|index| builtins[index].2).await;
+    assert_eq!(passing.status, evaluation_execution_domain::VERDICT_ALLOW);
+    assert_eq!(passing.steps.len(), builtins.len());
+    for step in &passing.steps {
+        assert_eq!(
+            (step.status.as_str(), step.reason_code.as_str()),
+            (evaluation_execution_domain::STATUS_PASS, "all_items_passed"),
+            "{}",
+            step.node_id
+        );
+        assert!(step.step_receipt_digest.starts_with("sha256:"));
+    }
+
+    let failing = execute("2.0.0", &|index| builtins[index].3).await;
+    assert_eq!(failing.status, evaluation_execution_domain::VERDICT_DENY);
+    for step in &failing.steps {
+        assert_eq!(
+            step.status,
+            evaluation_execution_domain::STATUS_FAIL,
+            "{}",
+            step.node_id
+        );
+    }
+
+    // Invalid parameters are refused at plan publication, before execution.
+    let invalid: [&'static str; 3] = [
+        r#"{"path":"/invoice","pattern":"("}"#,
+        r#"{"path":"/invoice","pattern":"(?:a{1000}){1000}"}"#,
+        r#"{"path":"/invoice","pattern":"x","unknown":true}"#,
+    ];
+    for parameters in invalid {
+        let error = svc
+            .put_evaluation_plan(Request::new(plan_request("3.0.0", &|index| {
+                if index == 1 {
+                    parameters
+                } else {
+                    builtins[index].2
+                }
+            })))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{parameters}");
+    }
 }
 
 #[tokio::test]

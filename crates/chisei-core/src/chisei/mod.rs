@@ -3,6 +3,7 @@ pub mod action_policy;
 pub mod affinity;
 pub mod billing_adapter;
 pub mod budget;
+pub mod builtin_evaluators;
 pub mod cache_policy;
 pub mod capacity;
 pub mod controller;

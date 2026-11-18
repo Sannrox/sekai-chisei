@@ -11,6 +11,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::chisei::builtin_evaluators::{builtin_parameter_schema, validate_builtin_parameters};
 use sekai_core::sekai::parameter_schema::parse_parameter_schema;
 pub use sekai_core::sekai::parameter_schema::{validate_parameter_schema, validate_parameters};
 
@@ -267,6 +268,20 @@ pub fn prepare_definition(
     }
     validate_reference("source_ref", &definition.source_ref)?;
     let parameter_schema = parse_parameter_schema(&definition.parameter_schema_json)?;
+    if let Some(builtin_schema) = builtin_parameter_schema(&definition.implementation_digest) {
+        if definition.execution_class != DETERMINISTIC_EXECUTION_CLASS {
+            return Err(
+                "a built-in implementation digest requires deterministic_builtin/v1".into(),
+            );
+        }
+        if canonical_schema(parameter_schema.clone())
+            != canonical_schema(parse_parameter_schema(builtin_schema)?)
+        {
+            return Err(
+                "parameter_schema_json must equal the built-in evaluator's published schema".into(),
+            );
+        }
+    }
     definition.parameter_schema_json =
         serde_json::to_string(&parameter_schema).map_err(|error| error.to_string())?;
     if actor.trim().is_empty() || now_ms <= 0 {
@@ -321,6 +336,25 @@ pub fn prepare_definition(
     definition.created_at_ms = now_ms;
     ensure_size(&definition, "evaluator definition")?;
     Ok(definition)
+}
+
+/// Plan-time parameter check for one node: the definition's declared schema,
+/// then a built-in implementation's semantic rules (for example a pattern that
+/// must compile), so invalid parameters never reach execution.
+pub fn validate_node_parameters(
+    definition: &EvaluatorDefinition,
+    parameters_json: &str,
+) -> Result<(), String> {
+    validate_parameters(&definition.parameter_schema_json, parameters_json)?;
+    validate_builtin_parameters(&definition.implementation_digest, parameters_json)
+}
+
+/// Schema equality ignores the order of `required` names.
+fn canonical_schema(mut schema: Value) -> Value {
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
+    }
+    schema
 }
 
 pub fn validate_stochastic_policy(
