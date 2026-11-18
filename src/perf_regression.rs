@@ -208,7 +208,9 @@ pub fn evaluate_workload(
     }
 }
 
-/// Gate every workload that appears in both the repeated runs and the budgets.
+/// Gate every budgeted workload. One with no samples in any run still gets a
+/// decision (`NotGateable(InsufficientSamples)`, zero repetitions), so a workload
+/// that was never measured shows up in `ungateable()` instead of vanishing.
 pub fn evaluate(
     runs: &[Vec<WorkloadSample>],
     budgets: &BTreeMap<String, WorkloadBudget>,
@@ -225,10 +227,9 @@ pub fn evaluate(
 
     let decisions = budgets
         .iter()
-        .filter_map(|(id, budget)| {
-            by_workload
-                .get(id)
-                .map(|samples| evaluate_workload(id, samples, budget))
+        .map(|(id, budget)| {
+            let samples = by_workload.get(id).map_or(&[][..], Vec::as_slice);
+            evaluate_workload(id, samples, budget)
         })
         .collect();
 
@@ -760,6 +761,22 @@ mod tests {
         assert_eq!(report.regressions()[0].id, "slow");
         assert_eq!(report.improvements().len(), 1);
         assert_eq!(report.improvements()[0].id, "fast");
+    }
+
+    #[test]
+    fn budgeted_workload_missing_from_every_run_is_reported_not_dropped() {
+        let mut budgets = BTreeMap::new();
+        budgets.insert("never-ran".to_string(), budget(30.0));
+
+        let report = evaluate(&[vec![]], &budgets);
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(report.decisions[0].repetitions, 0);
+        assert_eq!(
+            report.decisions[0].outcome,
+            GateOutcome::NotGateable(Ineligibility::InsufficientSamples)
+        );
+        assert_eq!(report.ungateable().len(), 1);
+        assert_eq!(report.ungateable()[0].id, "never-ran");
     }
 
     #[test]
