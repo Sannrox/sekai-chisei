@@ -185,9 +185,11 @@ fn pending_transform_redactions(
     };
     let mut pending = Vec::new();
     for (namespace, seq, receipt_json) in rows {
-        let Ok(mut run) = serde_json::from_str::<TransformRun>(&receipt_json) else {
-            continue;
-        };
+        // A chained transform receipt we cannot decode might reference the
+        // dataset; skipping it would leave it unredacted, so fail instead.
+        let mut run = serde_json::from_str::<TransformRun>(&receipt_json).map_err(|error| {
+            format!("transform receipt {namespace}#{seq} cannot be decoded for redaction: {error}")
+        })?;
         if !redact_run_partition_receipts(
             dataset_id,
             &mut run.input_partitions,
@@ -937,6 +939,32 @@ mod tests {
         let hex = keys.current_public_key_hex();
         verify_bundle(&bundle, &[hex.as_str()]).unwrap();
         assert!(bundle.entries[0].receipt_json.contains("east"));
+    }
+
+    #[test]
+    fn sqlite_redaction_fails_on_an_undecodable_chained_transform_receipt() {
+        let db = SekaiDb::memory_for_chisei_sql_functions();
+        let keys = SigningKeySet::from_seed_hex(SEED, 1).unwrap();
+        let run = isolated_run("run-iso");
+        let mut conn = db.conn();
+        {
+            let _guard = install_test_signer(keys);
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            insert_transform_run(&tx, &run).unwrap();
+            tx.commit().unwrap();
+        }
+        conn.execute(
+            "UPDATE chisei_receipt_chain SET receipt_json = 'not json' WHERE kind = 'transform_run'",
+            [],
+        )
+        .unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let error = redact_transform_partition_receipts(&tx, "in", true).unwrap_err();
+        assert!(error.contains("cannot be decoded"), "{error}");
     }
 
     #[test]

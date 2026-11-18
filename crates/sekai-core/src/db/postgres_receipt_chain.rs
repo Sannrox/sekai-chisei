@@ -142,9 +142,11 @@ fn pending_transform_redactions<C: GenericClient>(
         let namespace: String = row.get(0);
         let seq: i64 = row.get(1);
         let receipt_json: String = row.get(2);
-        let Ok(mut run) = serde_json::from_str::<TransformRun>(&receipt_json) else {
-            continue;
-        };
+        // A chained transform receipt we cannot decode might reference the
+        // dataset; skipping it would leave it unredacted, so fail instead.
+        let mut run = serde_json::from_str::<TransformRun>(&receipt_json).map_err(|error| {
+            format!("transform receipt {namespace}#{seq} cannot be decoded for redaction: {error}")
+        })?;
         if !redact_run_partition_receipts(
             dataset_id,
             &mut run.input_partitions,
