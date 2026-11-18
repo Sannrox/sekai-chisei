@@ -26,7 +26,24 @@ Each workload records its fixture version, dataset size, concurrency, explicit
 domain operations per iteration, sample count, nearest-rank p50/p95/p99
 control-plane latency, throughput, sample standard deviation, and relative
 standard deviation. The `observes` field states which
-additional operational signals are meaningful to the workload. Streaming
+additional operational signals are meaningful to the workload. Three of those
+names are the plane's own signals, read from an in-process metrics recorder
+over the sampled iterations (warmup is excluded) and written to the report's
+per-workload `signals` object:
+
+| Name | Value | Source signal |
+| --- | --- | --- |
+| `database_wait_time` | microseconds of database wait per sampled iteration | `sekai_db_wait_seconds` |
+| `queue_depth` | highest queue depth set during the samples | `sekai_queue_depth` |
+| `cache_hit_rate` | hits over hits plus misses | `sekai_cache_events_total` |
+
+A workload that names one of these but never emits it fails the run, so
+`observes` cannot claim a signal the fixture does not exercise. Other names
+describe what the bench measures directly. A workload may set
+`signal_budgets` (for example `{"database_wait_time": 25}`) for any plane
+signal it observes: a ceiling for wait and depth, a floor in `(0, 1]` for the
+hit rate. Reports carrying signals use contract
+`sekai.performance-report/v2`; v1 reports still load. Streaming
 fixtures contain no simulated network wait, so their measurements are Chisei
 assembly overhead rather than provider time-to-first-token.
 
@@ -290,6 +307,11 @@ Two gates run over the same reports:
 2. **Baseline gate** — median p95 against the recorded baseline, threshold
    derived from combined dispersion and floored at 5%. This caught the
    regression.
+
+Signals run through the same two gates. `perf-gate` prints a signal budget
+table and, with `--baseline`, a signal baseline table. Signal regressions count
+toward `--enforce`. A baseline recorded before signals existed reports each
+signal comparison as `skipped: absent from baseline` until it is re-captured.
 
 The budget gate is retained because "is it fast enough" stays a real question,
 but it cannot detect a regression at current headroom. The two workloads with

@@ -62,6 +62,7 @@ pub mod operation_report;
 pub mod operation_statistics;
 pub mod perf_object_path;
 pub mod perf_regression;
+pub mod perf_signals;
 pub mod plane;
 pub use chisei_provider::pricing;
 pub mod provenance;

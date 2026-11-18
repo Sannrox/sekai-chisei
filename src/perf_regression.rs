@@ -125,7 +125,7 @@ impl GateReport {
     }
 }
 
-fn median(values: &mut [f64]) -> f64 {
+pub(crate) fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|left, right| left.partial_cmp(right).expect("finite latency samples"));
     let middle = values.len() / 2;
     if values.len().is_multiple_of(2) {
@@ -135,7 +135,7 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
-fn spread_percent(values: &[f64], median_value: f64) -> f64 {
+pub(crate) fn spread_percent(values: &[f64], median_value: f64) -> f64 {
     if median_value <= 0.0 {
         return f64::INFINITY;
     }

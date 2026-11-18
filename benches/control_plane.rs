@@ -8,6 +8,7 @@ use sekai_chisei::chisei::receipt::{
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{ListFilter, Object};
 use sekai_chisei::harness::{HarnessEvent, RetrySafety, StreamAssembly, retry_disposition};
+use sekai_chisei::perf_signals::{SignalDirection, SignalRecorder, plane_signal_direction};
 use sekai_chisei::sekai::attestation::{PolicyAttestation, attestation_content_hash};
 use sekai_chisei::sekai::evidence::{
     EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
@@ -36,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const MANIFEST_VERSION: &str = "sekai.performance-manifest/v1";
-const REPORT_VERSION: &str = "sekai.performance-report/v1";
+const REPORT_VERSION: &str = "sekai.performance-report/v2";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +62,9 @@ struct Workload {
     fixture: String,
     observes: Vec<String>,
     budgets: Budgets,
+    /// Worst acceptable value per plane signal named in `observes`.
+    #[serde(default)]
+    signal_budgets: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +112,8 @@ struct ResultRow<'a> {
     relative_standard_deviation_percent: f64,
     throughput_operations_per_second: f64,
     within_budget: bool,
+    /// Plane signals named in `observes`, read over the sampled iterations.
+    signals: BTreeMap<String, f64>,
 }
 
 fn main() -> Result<(), String> {
@@ -122,6 +128,9 @@ fn main() -> Result<(), String> {
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|error| format!("parse benchmark manifest {manifest_path}: {error}"))?;
     validate_manifest(&manifest)?;
+    let recorder = SignalRecorder::default();
+    metrics::set_global_recorder(recorder.clone())
+        .map_err(|error| format!("install signal recorder: {error}"))?;
     let workloads = selected_workloads(&manifest)?;
     for workload in &workloads {
         drop(workload_factory(workload)?);
@@ -141,7 +150,7 @@ fn main() -> Result<(), String> {
         crate_version: env!("CARGO_PKG_VERSION"),
         results: selected_workloads(&manifest)?
             .iter()
-            .map(|workload| run_workload(workload))
+            .map(|workload| run_workload(workload, &recorder))
             .collect::<Result<Vec<_>, _>>()?,
         uncertainty: "Sample standard deviation and relative standard deviation describe run-to-run variance; provider delay is excluded because all fixtures are local.",
     };
@@ -241,6 +250,20 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         {
             return Err(format!("benchmark workload {} is incomplete", workload.id));
         }
+        for (signal, budget) in &workload.signal_budgets {
+            let direction = plane_signal_direction(signal);
+            if !workload.observes.contains(signal)
+                || direction.is_none()
+                || !budget.is_finite()
+                || *budget <= 0.0
+                || (direction == Some(SignalDirection::HigherIsBetter) && *budget > 1.0)
+            {
+                return Err(format!(
+                    "benchmark workload {} has an invalid budget for signal {signal}",
+                    workload.id
+                ));
+            }
+        }
         let budgets = &workload.budgets;
         if !budgets.p50_latency_us.is_finite()
             || !budgets.p95_latency_us.is_finite()
@@ -260,16 +283,35 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
 
 type Benchmark = Box<dyn FnMut() -> Result<(), String>>;
 
-fn run_workload(workload: &Workload) -> Result<ResultRow<'_>, String> {
+fn run_workload<'a>(
+    workload: &'a Workload,
+    recorder: &SignalRecorder,
+) -> Result<ResultRow<'a>, String> {
     let mut benchmark = workload_factory(workload)?;
     for _ in 0..workload.warmup_iterations {
         benchmark()?;
     }
+    recorder.reset();
     let mut samples = Vec::with_capacity(workload.sample_iterations);
     for _ in 0..workload.sample_iterations {
         let started = Instant::now();
         benchmark()?;
         samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+    }
+    let mut signals = BTreeMap::new();
+    for name in &workload.observes {
+        if plane_signal_direction(name).is_none() {
+            continue;
+        }
+        let value = recorder
+            .read(name, workload.sample_iterations)?
+            .ok_or_else(|| {
+                format!(
+                    "benchmark workload {} names plane signal {name} in observes, but the run did not emit it",
+                    workload.id
+                )
+            })?;
+        signals.insert(name.clone(), rounded(value));
     }
     samples.sort_by(f64::total_cmp);
     let p50 = percentile(&samples, 0.50);
@@ -302,6 +344,7 @@ fn run_workload(workload: &Workload) -> Result<ResultRow<'_>, String> {
         within_budget: p50 <= workload.budgets.p50_latency_us
             && p95 <= workload.budgets.p95_latency_us
             && p99 <= workload.budgets.p99_latency_us,
+        signals,
     })
 }
 
