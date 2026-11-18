@@ -144,11 +144,20 @@ pub fn import_compliance_bundle(
         imported_at_ms: now_ms,
     };
 
-    // Idempotent: same digest + signer → same import record.
+    // Idempotent: same digest + signer → same import record. The audit is
+    // asserted on every path and comes first, so a lost or failed audit write
+    // is repaired by a replay instead of leaving an unaudited import. Its id is
+    // deterministic, so repeating it is a no-op.
     if let Some(existing) = db.get_peer_import(&import_id)? {
         if existing.bundle_content_digest == record.bundle_content_digest
             && existing.peer_site_identity == record.peer_site_identity
         {
+            audit_import(
+                db,
+                &existing.imported_by,
+                &existing,
+                existing.imported_at_ms,
+            )?;
             return Ok(PeerImportResult {
                 record: existing,
                 verification,
@@ -157,8 +166,8 @@ pub fn import_compliance_bundle(
         return Err("import id collision with different payload".into());
     }
 
-    db.put_peer_import(&record)?;
     audit_import(db, actor, &record, now_ms)?;
+    db.put_peer_import(&record)?;
     Ok(PeerImportResult {
         record,
         verification,
@@ -202,7 +211,7 @@ fn audit_import(
         target_id: record.import_id.clone(),
         outcome: "imported".into(),
     };
-    db.record_decision(&decision)
+    db.record_decisions_idempotently(&[decision])
 }
 
 fn import_id_for(namespace: &str, digest: &str, identity: &str, key_id: &str) -> String {
@@ -340,6 +349,45 @@ mod tests {
         // Idempotent re-import
         let again = import_compliance_bundle(&db, "admin", "support", &bundle, 6_001).unwrap();
         assert_eq!(again.record.import_id, result.record.import_id);
+    }
+
+    #[test]
+    fn an_import_whose_audit_was_lost_is_audited_on_replay() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let trust = PeerTrustRoot {
+            namespace: "support".into(),
+            site_identity: "peer-site-a".into(),
+            key_id: "k1".into(),
+            public_key_hex: public_key_hex(&signing),
+            enabled: true,
+            created_by: "admin".into(),
+            created_at_ms: 1,
+        };
+        let bundle = signed_bundle("support", &signing);
+        let source = db();
+        put_trust_root(&source, &trust).unwrap();
+        let imported =
+            import_compliance_bundle(&source, "admin", "support", &bundle, 6_000).unwrap();
+
+        // A second store holds the record but never got its audit write.
+        let db = db();
+        put_trust_root(&db, &trust).unwrap();
+        db.put_peer_import(&imported.record).unwrap();
+        let audited = || {
+            db.list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some(IMPORT_ACTION.into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len()
+        };
+        assert_eq!(audited(), 0);
+
+        for now_ms in [7_000, 8_000] {
+            let again = import_compliance_bundle(&db, "admin", "support", &bundle, now_ms).unwrap();
+            assert_eq!(again.record, imported.record);
+        }
+        assert_eq!(audited(), 1);
     }
 
     #[test]
