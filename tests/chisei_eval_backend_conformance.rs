@@ -108,9 +108,10 @@ fn exercise(db: &dyn EvalHarness, prefix: &str) {
     assert!(listed.iter().any(|item| item.id == iteration.id));
 
     let request_id = format!("{prefix}-sample");
+    let namespace = format!("{prefix}-ns");
     db.put_sample_observation(&SampleObservation {
         request_id: request_id.clone(),
-        namespace: format!("{prefix}-ns"),
+        namespace: namespace.clone(),
         spec: "hello".into(),
         resolved_model: "model".into(),
         output_content: "world".into(),
@@ -141,9 +142,25 @@ fn exercise(db: &dyn EvalHarness, prefix: &str) {
         cost_usd_micros: 0,
     })
     .unwrap();
+    // Keep-first on both backends: the second insert changes nothing.
+    let stored = db.get_sample_observation(&request_id).unwrap().unwrap();
+    assert_eq!(stored.namespace, namespace);
+    assert_eq!(stored.output_content, "world");
+    assert_eq!(stored.cost_usd_micros, 10);
+    assert!(
+        db.get_sample_observation_in_namespace(&request_id, "other")
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(db.bump_observation_attempts(&request_id).unwrap(), 1);
     assert_eq!(db.bump_observation_attempts(&request_id).unwrap(), 2);
     db.delete_observation(&request_id).unwrap();
+    assert!(db.get_sample_observation(&request_id).unwrap().is_none());
+    assert!(
+        db.get_sample_observation_in_namespace(&request_id, &namespace)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
