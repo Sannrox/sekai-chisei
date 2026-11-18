@@ -169,7 +169,16 @@ fn exercise_datasets(db: &dyn DatasetBackend, prefix: &str) {
         created: 11,
     })
     .unwrap();
-    assert_eq!(db.list_virtual_tables().unwrap().len(), 1);
+    // Count only this run's table: a shared PostgreSQL database keeps the
+    // tables earlier runs created under their own prefixes.
+    let virtual_id = format!("{prefix}-virtual");
+    let ours: Vec<_> = db
+        .list_virtual_tables()
+        .unwrap()
+        .into_iter()
+        .filter(|table| table.id == virtual_id)
+        .collect();
+    assert_eq!(ours.len(), 1);
 }
 
 fn exercise_ontology(db: &dyn OntologyBackend, prefix: &str) {
