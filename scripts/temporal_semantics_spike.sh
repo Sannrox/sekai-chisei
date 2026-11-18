@@ -79,8 +79,19 @@ CREATE INDEX assertions_as_of
 VACUUM;
 SQL
 
-current_bytes="$(stat -f %z "$current_db" 2>/dev/null || stat -c %s "$current_db")"
-selective_bytes="$(stat -f %z "$selective_db" 2>/dev/null || stat -c %s "$selective_db")"
+# Prints a file's size in bytes. `wc -c` is portable across GNU and BSD;
+# BSD pads the count with spaces, so whitespace is stripped before the check.
+file_bytes() {
+  local bytes
+  bytes="$(wc -c < "$1" | tr -d '[:space:]')"
+  case "$bytes" in
+    ''|*[!0-9]*) echo "could not read the size of $1: got '$bytes'" >&2; exit 1 ;;
+  esac
+  printf '%s' "$bytes"
+}
+
+current_bytes="$(file_bytes "$current_db")"
+selective_bytes="$(file_bytes "$selective_db")"
 history_rows="$(sqlite3 "$selective_db" "SELECT COUNT(*) FROM temporal_assertions;")"
 printf 'rows=%s coverage=%s%% history_rows=%s current_bytes=%s selective_bytes=%s ratio=' \
   "$row_count" "$coverage_percent" "$history_rows" "$current_bytes" "$selective_bytes"
