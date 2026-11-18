@@ -59,6 +59,13 @@ pub(super) async fn apply_definition_change_bundle(
     if let Some((apply, _)) = &stored
         && apply.status == STATUS_COMPLETED
     {
+        // A completed apply answers only for the bundle it applied; another
+        // digest is refused like the resume path refuses it.
+        if apply.bundle_digest != input.bundle_digest {
+            return Err(Status::failed_precondition(
+                "definition_bundle_apply_unapproved_bundle: the regenerated bundle is not the one the proposal carries",
+            ));
+        }
         return Ok(Response::new(ApplyDefinitionChangeBundleResponse {
             apply: Some(to_proto_apply(apply)),
         }));
