@@ -235,12 +235,24 @@ impl EvidenceEnvelope {
                     limits.max_subject_references
                 ));
             }
+            // An absent optional id is fine; a present but blank one would
+            // make lineage join on an empty id.
+            for (field, id) in [
+                ("operation_id", &causality.operation_id),
+                ("parent_operation_id", &causality.parent_operation_id),
+                ("attempt_id", &causality.attempt_id),
+                ("model_call_id", &causality.model_call_id),
+            ] {
+                if id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+                    errors.push(format!("{field} cannot be blank"));
+                }
+            }
             if causality
-                .operation_id
-                .as_ref()
-                .is_some_and(|id| id.trim().is_empty())
+                .subject_references
+                .iter()
+                .any(|reference| reference.trim().is_empty())
             {
-                errors.push("operation_id cannot be blank".to_string());
+                errors.push("subject_references cannot contain a blank entry".to_string());
             }
         }
         if errors.is_empty() {
@@ -330,6 +342,42 @@ mod tests {
             .unwrap_err();
         assert!(errors.iter().any(|error| error.contains("byte limit")));
         assert!(errors.iter().any(|error| error.contains("relationships")));
+    }
+
+    #[test]
+    fn causality_refuses_blank_ids_and_subject_references() {
+        type Blank = fn(&mut EvidenceCausality);
+        let cases: [(&str, Blank); 5] = [
+            ("operation_id", |c| c.operation_id = Some(" ".into())),
+            ("parent_operation_id", |c| {
+                c.parent_operation_id = Some(String::new())
+            }),
+            ("attempt_id", |c| c.attempt_id = Some("\t".into())),
+            ("model_call_id", |c| c.model_call_id = Some(String::new())),
+            ("subject_references", |c| {
+                c.subject_references.push(" ".into())
+            }),
+        ];
+        for (field, blank) in cases {
+            let mut evidence = envelope();
+            blank(evidence.causality.as_mut().unwrap());
+            let errors = evidence
+                .validate_contract(EvidenceLimits::default())
+                .unwrap_err();
+            assert!(
+                errors.iter().any(|error| error.starts_with(field)),
+                "{field}: {errors:?}"
+            );
+        }
+
+        let mut evidence = envelope();
+        let causality = evidence.causality.as_mut().unwrap();
+        causality.operation_id = None;
+        causality.attempt_id = None;
+        assert_eq!(
+            evidence.validate_contract(EvidenceLimits::default()),
+            Ok(())
+        );
     }
 
     #[test]
