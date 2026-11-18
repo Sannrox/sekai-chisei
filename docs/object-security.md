@@ -26,6 +26,37 @@ RPCs (`GetObjectSecurityPolicyRevision`, `PutPurposeAuthorization`,
 generic object mutation cannot edit policy, purpose-authorization, or lattice
 state.
 
+## Simulating a grant change
+
+`SimulateObjectPolicyChange` also takes `add_grants` (object, principal, role,
+expiry) and `remove_grant_ids`. Both sides of the comparison decide through the
+same function single-object reads use: tenant collaboration, the team
+namespace membership gate, the object's own grants, the object policy, and
+marking clearance from the principal's sealed profile. The current side reads
+the stored grants and active policies. The candidate side reads the stored
+grants with the additions and removals applied, and the candidate policies
+(the active ones when none are given). An added grant replaces a stored grant
+on the same object and principal, as `CreateGrant` does.
+
+- Each candidate grant is on an object of the namespace or its namespace
+  boundary that the caller may read, or on the principal profile of a
+  simulated principal. Any other target, missing or not, is `NotFound`. At
+  most 100 principals, added grants, and removed grants each.
+- `kind_summaries` counts, per principal and kind, the objects readable now and
+  under the candidate, the candidate's refusals by check (`namespace_membership`,
+  `object_grant`, `marking`, `object_row`, `purpose`), and the properties the
+  candidate still hides.
+- Only objects the caller may read itself are counted or listed.
+- `limit` caps `differences` (default and maximum 10000);
+  `differences_truncated` says rows were cut. Counts stay exact: a namespace
+  with more than 10000 objects is refused.
+- `applied_add_grants` and `applied_remove_grant_ids` echo the change the
+  server evaluated. A server without grant simulation leaves them empty.
+- Nothing is changed. Each call records a `simulate_object_policy_change`
+  decision naming the principals and the candidate grants.
+
+`CheckAccess` still answers from per-object grants only.
+
 ## Counterfactual views
 
 `QueryCounterfactualView` answers what each principal could have read in a

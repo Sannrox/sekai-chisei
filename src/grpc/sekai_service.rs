@@ -75,14 +75,19 @@ use scored_knowledge_admission::{
 };
 #[path = "sekai_service_db_work.rs"]
 mod db_work;
+#[path = "effective_read.rs"]
+mod effective_read;
 #[path = "external_effect_rpc.rs"]
 mod external_effect_rpc;
 #[path = "ontology_health_rpc.rs"]
 mod ontology_health_rpc;
+#[path = "policy_simulation_rpc.rs"]
+mod policy_simulation_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
 #[path = "source_rpc.rs"]
 mod source_rpc;
+use effective_read::*;
 #[path = "sekai_service_support_access.rs"]
 mod support_access;
 #[path = "trust_score_rpc.rs"]
@@ -842,7 +847,7 @@ impl SekaiService for SekaiServiceImpl {
         &self,
         req: Request<SimulateObjectPolicyChangeRequest>,
     ) -> Result<Response<SimulateObjectPolicyChangeResponse>, Status> {
-        rpc_objects::simulate_object_policy_change(self, req).await
+        policy_simulation_rpc::simulate_object_policy_change(self, req).await
     }
 
     async fn query_counterfactual_view(
