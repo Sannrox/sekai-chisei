@@ -1,5 +1,6 @@
 //! sekaictl admin assurance compliance export/verify/report commands (#297, #1468).
 
+use crate::cli_args::require_value;
 use crate::compliance_export::{
     ComplianceExportBundle, ComplianceExportRequest, RedactionMode, compliance_bundle_bytes,
     export_compliance_from_db, record_compliance_export_success, sign_compliance_export,
@@ -763,12 +764,6 @@ fn parse_report_verify(args: &[String]) -> Result<ReportVerifyConfig, String> {
         bundle: bundle.ok_or("--bundle required")?,
         trusted_key,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn parse_i64(value: &str) -> Result<i64, String> {

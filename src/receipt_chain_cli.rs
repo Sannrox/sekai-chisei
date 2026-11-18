@@ -1,6 +1,7 @@
 //! sekaictl admin assurance receipts export/verify commands (#1449).
 
 use crate::chisei_store::ChiseiRuntimeDb;
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use sekai_types::receipt_chain::{ReceiptChainBundle, verify_bundle};
@@ -170,12 +171,6 @@ fn parse_verify(args: &[String]) -> Result<VerifyConfig, BoxErr> {
         bundle: bundle.ok_or_else(|| std::io::Error::other(usage()))?,
         trusted_keys,
     })
-}
-
-fn require_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str, BoxErr> {
-    args.get(index + 1)
-        .map(String::as_str)
-        .ok_or_else(|| std::io::Error::other(format!("{flag} requires a value")).into())
 }
 
 #[cfg(test)]

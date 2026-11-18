@@ -1,5 +1,6 @@
 //! sekaictl admin streams commands (#684, #691).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::event_stream::{self, EventStreamBatch, EventStreamBinding};
@@ -205,10 +206,4 @@ fn parse_subscription_ref(args: &[String]) -> Result<SubscriptionRef, String> {
             .ok_or_else(|| "--subscription-id is required".to_string())?,
         actor,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }

@@ -1,5 +1,6 @@
 //! sekaictl admin packages commands (#707).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::capability_package::{self, CapabilityPackageCertification};
@@ -232,13 +233,6 @@ fn parse_revoke(args: &[String]) -> Result<RevokeConfig, String> {
         reason: reason.ok_or("--reason is required")?,
         actor,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]

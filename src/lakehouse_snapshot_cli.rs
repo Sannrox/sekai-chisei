@@ -1,5 +1,6 @@
 //! sekaictl admin lakehouse commands (#712).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::lakehouse_snapshot::{self, LakehouseSnapshot};
@@ -247,13 +248,6 @@ fn parse_identity_inner(args: &[String]) -> Result<(Identity, Option<String>), S
         },
         None,
     ))
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]

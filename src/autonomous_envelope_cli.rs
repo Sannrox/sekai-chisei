@@ -1,5 +1,6 @@
 //! sekaictl admin autonomy commands (#715, #1469, #1990, #1991).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::agent_autonomy::{self, AutonomyThreshold};
@@ -349,13 +350,6 @@ fn parse_identity(args: &[String]) -> Result<Identity, String> {
         envelope_id: envelope_id.ok_or("--envelope-id is required")?,
         actor,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 #[cfg(test)]

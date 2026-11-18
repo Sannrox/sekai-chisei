@@ -1,5 +1,6 @@
 //! sekaictl admin images commands (#696).
 
+use crate::cli_args::require_value;
 use crate::config::Config;
 use crate::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
 use crate::sekai::image::{self, GovernedImage, ImageAnnotation, ImageRendition, ImageRetrieve};
@@ -365,11 +366,4 @@ fn parse_image_actor(args: &[String]) -> Result<ImageActor, String> {
         image_id: image_id.ok_or("--image-id is required")?,
         actor,
     })
-}
-
-fn require_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
-    args.get(index + 1)
-        .cloned()
-        .filter(|value| !value.is_empty() && !value.starts_with("--"))
-        .ok_or_else(|| format!("{flag} requires a value"))
 }

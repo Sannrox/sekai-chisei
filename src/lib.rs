@@ -75,6 +75,7 @@ pub mod tenant_lifecycle;
 pub use chisei_provider::provider_profile;
 pub use chisei_provider::provider_resolution;
 pub mod capability_package_cli;
+mod cli_args;
 pub mod client_package_cli;
 pub mod combined_stores;
 pub mod compatibility_cli;
