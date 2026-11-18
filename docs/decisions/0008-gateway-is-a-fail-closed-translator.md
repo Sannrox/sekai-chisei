@@ -1,11 +1,11 @@
 # ADR 0008: Keep the gateway a fail-closed protocol translator
 
-- Status: accepted
+- Status: superseded by ADR 0152
 - Date: 2026-07-29
 - Owners: @Sannrox
 - Discussion: https://github.com/Sannrox/sekai-chisei/issues/424
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0152](0152-gateway-is-the-model-egress-layer.md)
 
 ## Context
 
