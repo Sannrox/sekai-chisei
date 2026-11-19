@@ -41,14 +41,15 @@ use crate::protocol::sekai::{
     ClaimAgentTurnRequest, ClaimAgentTurnResponse, ClaimTransformWorkRequest,
     ClaimTransformWorkResponse, ClaimWorkRequest, ClaimWorkResponse, ConnectorSource,
     ConnectorTypeRef, DeliverableExportArtifact, ExportDeliveryWorkOptions, ExternalEffectWork,
-    ExternalEffectWorkOptions, HeartbeatActionClaimRequest, HeartbeatActionClaimResponse,
-    HeartbeatAgentTurnClaimRequest, HeartbeatAgentTurnClaimResponse,
-    HeartbeatTransformClaimRequest, HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest,
-    HeartbeatWorkClaimResponse, ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
+    ExternalEffectWorkOptions, GetModelVersionRequest, GetModelVersionResponse,
+    HeartbeatActionClaimRequest, HeartbeatActionClaimResponse, HeartbeatAgentTurnClaimRequest,
+    HeartbeatAgentTurnClaimResponse, HeartbeatTransformClaimRequest,
+    HeartbeatTransformClaimResponse, HeartbeatWorkClaimRequest, HeartbeatWorkClaimResponse,
+    ListClaimableActionWorkRequest, ListClaimableActionWorkResponse,
     ListClaimableAgentTurnsRequest, ListClaimableAgentTurnsResponse,
     ListClaimableTransformWorkRequest, ListClaimableTransformWorkResponse,
-    ListClaimableWorkRequest, ListClaimableWorkResponse, ReadTransformRunInputsRequest,
-    ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
+    ListClaimableWorkRequest, ListClaimableWorkResponse, ModelVersion,
+    ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
     ReportActionClaimEventResponse, SourceSyncWorkOptions, StreamingTransformInputPosition,
     StreamingTransformObjectEdit, TransformLabel, TransformRunInputRow,
@@ -93,6 +94,7 @@ const CLAIM_TRANSFORM: &str = "/sekai.SekaiService/ClaimTransformWork";
 const READ_TRANSFORM: &str = "/sekai.SekaiService/ReadTransformRunInputs";
 const WRITE_TRANSFORM: &str = "/sekai.SekaiService/WriteTransformRunResult";
 const APPLY_STREAMING_TRANSFORM: &str = "/sekai.SekaiService/ApplyStreamingTransformBatch";
+const GET_MODEL_VERSION: &str = "/sekai.SekaiService/GetModelVersion";
 
 /// Dispatch kind a worker lists or claims. Transform work uses the isolated
 /// JobSpec profile; Action work uses `runtime_dispatch`.
@@ -1430,6 +1432,50 @@ impl<'a> RuntimeClaimClient<'a> {
             true,
         )
         .await
+    }
+
+    /// The model version a claimed transform's model input pins (#3075).
+    /// The runner resolves its stored state by the version's locator and
+    /// digest before scoring.
+    pub async fn get_model_version(
+        &self,
+        version_id: &str,
+    ) -> Result<ModelVersion, RuntimeClaimError> {
+        let request = GetModelVersionRequest {
+            namespace: self.namespace()?.to_string(),
+            version_id: version_id.into(),
+        };
+        self.call::<_, GetModelVersionResponse>(GET_MODEL_VERSION, request, true)
+            .await
+            .map_err(|error| RuntimeClaimError::from_sdk(error, false))?
+            .version
+            .ok_or_else(|| RuntimeClaimError::Invalid(SdkError::new(SdkErrorCode::Internal)))
+    }
+
+    /// Ends a claimed isolated-process run for good with a reason code of
+    /// lowercase letters, digits and `_`, such as `model_digest_mismatch`
+    /// (#3075). The run reads `refused` with that code and writes no output.
+    /// Needs a plane that serves the work family.
+    pub async fn fail_transform(
+        &self,
+        fence: &TransformFence,
+        reason_code: &str,
+    ) -> Result<(), RuntimeClaimError> {
+        let request = AckWorkRequest {
+            kind: WorkKind::Transform.into(),
+            namespace: self.namespace()?.to_string(),
+            work_id: fence.run_id.clone(),
+            runtime_id: fence.runtime_id.clone(),
+            claim_generation: fence.generation,
+            fencing_token: fence.fencing_token.clone(),
+            outcome: "failed".into(),
+            reason: reason_code.into(),
+            options: None,
+        };
+        self.call::<_, AckWorkResponse>(ACK_WORK, request, false)
+            .await
+            .map(drop)
+            .map_err(|error| RuntimeClaimError::from_sdk(error, true))
     }
 
     pub async fn apply_streaming_transform_batch(

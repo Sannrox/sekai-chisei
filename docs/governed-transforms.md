@@ -331,6 +331,20 @@ resolves the version with `GetModelVersion` and loads the bytes from the
 registry itself; the claim does not carry them. A dataset input id may not
 start with `model:` beside model inputs.
 
+The worker runs each pinned model in its own process (#3075,
+`adapters/model_process.rs`). `ModelProcess::start` resolves the version
+through the registry, which refuses bytes that no longer match the digest,
+starts the model command with the state directory in
+`SEKAI_MODEL_STATE_DIR`, and refuses a model that announces a different
+contract. The model side calls `serve_model` with its adapter. Each predict
+call must name exactly the contract's inputs and get back rows with exactly
+its output columns. Dropping the process ends the model. When a model cannot
+score, the worker ends the run with `AckWork` of kind transform, outcome
+`failed`, and a reason code (`model_digest_mismatch`,
+`model_contract_mismatch`, `model_process_failed`); the client call is
+`fail_transform`. The run then reads `refused` with that code, writes no
+output, and returns its quota reservation.
+
 ## Operator path
 
 ```bash

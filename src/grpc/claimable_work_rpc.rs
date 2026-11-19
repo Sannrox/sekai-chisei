@@ -369,10 +369,22 @@ impl SekaiServiceImpl {
         let (metadata, extensions, inner) = req.into_parts();
         let mismatched = || Status::invalid_argument("options do not match the work kind");
         let payload = match kind {
+            // A transform completes through WriteTransformRunResult; AckWork
+            // only ends it as failed, and the response carries no payload.
             Kind::Transform => {
-                return Err(Status::invalid_argument(
-                    "transform work is acknowledged by WriteTransformRunResult",
-                ));
+                if inner.outcome != "failed" || inner.options.is_some() {
+                    return Err(Status::invalid_argument(
+                        "transform work completes by WriteTransformRunResult; AckWork takes only failed with a reason code",
+                    ));
+                }
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                rpc_data::fail_transform_claim(self, &req, &inner.work_id, fence, &inner.reason)?;
+                return Ok(Response::new(AckWorkResponse { payload: None }));
             }
             Kind::Action => {
                 let options = match inner.options {

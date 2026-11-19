@@ -3928,6 +3928,49 @@ pub(super) async fn heartbeat_transform_claim(
         work: Some(to_proto_transform_work(&work)),
     }))
 }
+/// A worker ends its claimed isolated-process run for good with a typed
+/// reason (`AckWork` with outcome `failed`, #3075): the run reads `refused`
+/// with that code, writes no output, and releases its quota. Fenced and
+/// authorized as the heartbeat is.
+pub(super) fn fail_transform_claim(
+    service: &SekaiServiceImpl,
+    req: &Request<()>,
+    run_id: &str,
+    fence: crate::sekai::work_claim::Fence<'_>,
+    reason: &str,
+) -> Result<(), Status> {
+    let principals = caller_principals(req);
+    require_authenticated(&principals)?;
+    require_credential_admin(&principals)?;
+    let run = load_transform_run_or_preview(service, run_id)?;
+    check_team_namespace(service.db.runtime(), &principals, &run.namespace, true)?;
+    let refusal = crate::enterprise::IsolatedProcessRefusal {
+        code: reason.trim().to_string(),
+        details: Default::default(),
+    };
+    refusal.validate().map_err(|error| {
+        Status::invalid_argument(format!(
+            "a failed transform needs a reason code of lowercase letters, digits and _: {error}"
+        ))
+    })?;
+    service
+        .db
+        .runtime()
+        .refuse_transform_claim(
+            run_id,
+            fence.owner,
+            fence.generation,
+            fence.token,
+            &refusal,
+            now_millis(),
+        )
+        .map_err(transform_work_status)?;
+    release_failed_transform_quota(
+        service.db.runtime(),
+        service.quota_runtime(),
+        &[run_id.to_string()],
+    )
+}
 pub(super) async fn read_transform_run_inputs(
     service: &SekaiServiceImpl,
     req: Request<ReadTransformRunInputsRequest>,

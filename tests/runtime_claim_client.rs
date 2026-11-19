@@ -2,12 +2,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use sekai_adapters::model_process::{ModelProcess, ModelRunError, serve_model};
+use sekai_adapters::model_registry::{
+    LocalDirectoryRegistry, ModelAdapter, ModelRegistry, ModelRow,
+};
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
@@ -19,12 +24,13 @@ use sekai_chisei::sekai::dataset::{ColumnDef, Dataset};
 use sekai_chisei::sekai::governed_transform::{
     CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, rows_digest,
 };
+use sekai_chisei::sekai::model_version;
 use sekai_chisei::sekai::security::Role;
 use sekai_client::claim::{
     ActionAck, ActionFence, ClaimAttempt, DELEGATOR_DISABLED, RuntimeClaimError, TransformFence,
     TransformWrite, WorkFence,
 };
-use sekai_client::protocol::sekai::TransformRunInputRow;
+use sekai_client::protocol::sekai::{ModelAdapterContract, ModelInput, TransformRunInputRow};
 use sekai_client::{ClientConfig, CoreLoopClient};
 use sekai_domain::gateway_keys::hash_gateway_key;
 use tokio::net::TcpListener;
@@ -257,7 +263,12 @@ fn seed_dataset_rows(db: &RuntimeDb, dataset_id: &str, rows: &[HashMap<String, S
 /// The code the seeded isolated-process transform runs (#1605).
 const TRANSFORM_CODE: &str = "print('transform')";
 
-fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
+fn seed_transform(
+    db: &RuntimeDb,
+    prefix: &str,
+    requires: &[(&str, &str)],
+    model_inputs: &[(&str, &str)],
+) {
     db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
     let dataset = |id: &str| Dataset {
@@ -298,7 +309,10 @@ fn seed_transform(db: &RuntimeDb, prefix: &str, requires: &[(&str, &str)]) {
                 .map(|(key, value)| (key.to_string(), value.to_string()))
                 .collect(),
             code: TRANSFORM_CODE.into(),
-            model_inputs: Default::default(),
+            model_inputs: model_inputs
+                .iter()
+                .map(|(name, version)| (name.to_string(), version.to_string()))
+                .collect(),
         }),
         schedule: None,
         trigger: None,
@@ -416,7 +430,7 @@ async fn exercise_delegator_claim_refusal(db: RuntimeDb, prefix: &str) {
 }
 
 async fn exercise_transform(db: RuntimeDb, prefix: &str) {
-    seed_transform(&db, prefix, &[]);
+    seed_transform(&db, prefix, &[], &[]);
     let plane = ServingPlane::start(db.clone()).await;
     let client = plane.client().await;
     let claim = client.runtime_claim();
@@ -488,7 +502,7 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
 /// A run requiring `accelerator=gpu` is offered to and claimed by a runtime
 /// only once it registers that label (#1733).
 async fn exercise_transform_placement(db: RuntimeDb, prefix: &str) {
-    seed_transform(&db, prefix, &[("accelerator", "gpu")]);
+    seed_transform(&db, prefix, &[("accelerator", "gpu")], &[]);
     let plane = ServingPlane::start(db.clone()).await;
     let client = plane.client().await;
     let claim = client.runtime_claim();
@@ -855,5 +869,267 @@ fn postgres_runtime_claim_adhoc_isolated_conformance() {
         .build()
         .unwrap()
         .block_on(exercise_adhoc_isolated(db.clone(), &prefix));
+    drop(db);
+}
+
+/// Prefixes each `id` with the word it learned, so tampering with the stored
+/// word changes both the digest and the output (#3075).
+struct PrefixModel {
+    word: String,
+}
+
+impl ModelAdapter for PrefixModel {
+    fn contract(&self) -> ModelAdapterContract {
+        let id = || sekai_client::protocol::sekai::ColumnDef {
+            name: "id".into(),
+            r#type: "string".into(),
+            ..Default::default()
+        };
+        ModelAdapterContract {
+            inputs: vec![ModelInput {
+                name: "features".into(),
+                columns: vec![id()],
+            }],
+            output: vec![id()],
+        }
+    }
+
+    fn predict(&self, inputs: &HashMap<String, Vec<ModelRow>>) -> std::io::Result<Vec<ModelRow>> {
+        Ok(inputs["features"]
+            .iter()
+            .map(|row| HashMap::from([("id".into(), format!("{}-{}", self.word, row["id"]))]))
+            .collect())
+    }
+
+    fn save(&self, dir: &Path) -> std::io::Result<()> {
+        std::fs::write(dir.join("word"), &self.word)
+    }
+
+    fn load(dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            word: std::fs::read_to_string(dir.join("word"))?,
+        })
+    }
+}
+
+const MODEL_CHILD_ENV: &str = "SEKAI_TEST_MODEL_CHILD";
+
+/// The model process: this test binary re-run with only this test selected.
+/// Run by the test suite without [`MODEL_CHILD_ENV`], it does nothing.
+#[test]
+fn model_child_process() {
+    if std::env::var_os(MODEL_CHILD_ENV).is_some() {
+        serve_model::<PrefixModel>(std::io::stdin().lock(), std::io::stdout()).unwrap();
+    }
+}
+
+fn model_command() -> std::process::Command {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "runtime_claim_client::model_child_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MODEL_CHILD_ENV, "1");
+    command
+}
+
+/// Stores a `PrefixModel` in a fresh local registry and records its version
+/// in the namespace.
+fn seed_model_version(db: &RuntimeDb, prefix: &str) -> SeededModel {
+    let scratch = std::env::temp_dir().join(format!(
+        "sekai-model-scoring-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    PrefixModel {
+        word: "scored".into(),
+    }
+    .save(&state)
+    .unwrap();
+    let registry = LocalDirectoryRegistry::new(scratch.join("registry"));
+    let stored = registry.store("prefixer", &state).unwrap();
+    let stored_dir = registry
+        .resolve(&stored.registry_locator, &stored.digest)
+        .unwrap();
+    let id = || model_version::ModelColumn {
+        name: "id".into(),
+        col_type: "string".into(),
+    };
+    let version = model_version::ModelVersion::from_run(
+        model_version::ModelVersionRegistration {
+            namespace: NAMESPACE.into(),
+            model_name: "prefixer".into(),
+            digest: stored.digest,
+            adapter_id: "prefix".into(),
+            adapter_version: "1".into(),
+            registry_locator: stored.registry_locator,
+            contract: model_version::AdapterContract {
+                inputs: vec![model_version::ModelInput {
+                    name: "features".into(),
+                    columns: vec![id()],
+                }],
+                output: vec![id()],
+            },
+            run_id: format!("{prefix}-training"),
+            actor: PRINCIPAL.into(),
+        },
+        NAMESPACE,
+        "",
+        &Default::default(),
+        1,
+    )
+    .unwrap();
+    SeededModel {
+        version_id: db.insert_model_version(&version).unwrap().version_id,
+        registry,
+        stored_dir,
+        scratch,
+    }
+}
+
+struct SeededModel {
+    registry: LocalDirectoryRegistry,
+    version_id: String,
+    /// The registry's copy of the model state.
+    stored_dir: PathBuf,
+    /// Holds the registry and the saved state; removed by the test.
+    scratch: PathBuf,
+}
+
+/// What a model worker does with one claimed run: resolve its pinned
+/// version through the plane, start the model in its own process, and score
+/// the run's inputs. A failure carries the fence so the run can be failed.
+async fn score_claimed_run(
+    claim: &sekai_client::claim::RuntimeClaimClient<'_>,
+    registry: &LocalDirectoryRegistry,
+) -> (TransformFence, Result<Vec<ModelRow>, ModelRunError>) {
+    let claimed = match claim
+        .claim_transform_work("runner-a", "", Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        ClaimAttempt::Claimed(claimed) => claimed,
+        other => panic!("expected claimed transform, got {other:?}"),
+    };
+    let fence = TransformFence::from_work(claimed.work.as_ref().unwrap(), "runner-a");
+    let pinned = &claimed.transform.as_ref().unwrap().model_inputs[0];
+    let version = claim.get_model_version(&pinned.version_id).await.unwrap();
+    let mut model = match ModelProcess::start(registry, &version, model_command()) {
+        Ok(model) => model,
+        Err(error) => return (fence, Err(error)),
+    };
+    let mut stream = claim
+        .read_transform_inputs(&fence, "", "", 0, 100)
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(item) = stream.next().await {
+        rows.push(item.unwrap().row.unwrap().values);
+    }
+    let scored = model.predict(HashMap::from([(pinned.name.clone(), rows)]));
+    (fence, scored)
+}
+
+/// A worker claims a run that pins a model version, resolves it through the
+/// plane and the registry, scores in a separate model process and writes the
+/// result. When the stored bytes no longer match the digest, the worker
+/// fails the run instead and the run names the cause (#3075).
+async fn exercise_model_scoring(db: RuntimeDb, prefix: &str) {
+    db.ensure_team_namespace(NAMESPACE, PRINCIPAL, Role::Admin, PRINCIPAL)
+        .unwrap();
+    let model = seed_model_version(&db, prefix);
+    seed_transform(&db, prefix, &[], &[("features", &model.version_id)]);
+    let plane = ServingPlane::start(db.clone()).await;
+    let client = plane.client().await;
+    let claim = client.runtime_claim();
+    claim
+        .register_transform_runtime("runner-a", [("sekai.input.model", "v1")])
+        .await
+        .unwrap();
+
+    let (fence, scored) = score_claimed_run(&claim, &model.registry).await;
+    let scored = scored.unwrap();
+    assert_eq!(
+        scored,
+        vec![HashMap::from([("id".to_string(), "scored-1".to_string())])]
+    );
+    let write = TransformWrite {
+        rows: vec![TransformRunInputRow {
+            alias: String::new(),
+            dataset_id: format!("{prefix}-out"),
+            row_id: 0,
+            values: scored[0].clone(),
+            partition_key: String::new(),
+        }],
+        output_digest: rows_digest(&scored),
+        quarantined: false,
+        quality_rule: String::new(),
+        partitions: Vec::new(),
+    };
+    let run = claim
+        .write_transform_result(&fence, write)
+        .await
+        .unwrap()
+        .run
+        .expect("completed run");
+    assert_eq!(run.dispatch_status, "completed");
+    assert_eq!(
+        db.get_governed_transform_run(&fence.run_id)
+            .unwrap()
+            .unwrap()
+            .input_versions
+            .get("model:features"),
+        Some(&model.version_id)
+    );
+
+    std::fs::write(model.stored_dir.join("word"), "tampered").unwrap();
+    db.run_governed_transform(NAMESPACE, &format!("{prefix}-iso"), false, 30)
+        .unwrap();
+    let (fence, scored) = score_claimed_run(&claim, &model.registry).await;
+    let error = scored.expect_err("tampered state must not score");
+    assert!(matches!(error, ModelRunError::DigestMismatch), "{error}");
+    claim.fail_transform(&fence, error.code()).await.unwrap();
+    let failed = db
+        .get_governed_transform_run(&fence.run_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.dispatch_status, "refused");
+    assert_eq!(
+        db.transform_run_refusal(&fence.run_id)
+            .unwrap()
+            .unwrap()
+            .code,
+        "model_digest_mismatch"
+    );
+    assert!(
+        failed.output_digest.is_empty(),
+        "a failed run writes no output"
+    );
+
+    std::fs::remove_dir_all(model.scratch).unwrap();
+    plane.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_model_worker_scores_a_pinned_version_in_its_own_process() {
+    exercise_model_scoring(RuntimeDb::memory(), "sqlite-model").await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_model_worker_scores_a_pinned_version_in_its_own_process() {
+    let scratch = ScratchDatabase::create();
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-m-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_model_scoring(db.clone(), &prefix));
     drop(db);
 }
