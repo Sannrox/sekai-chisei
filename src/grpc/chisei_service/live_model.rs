@@ -82,23 +82,11 @@ impl ChiseiServiceImpl {
             safe_providers,
             impact,
         };
-        let needs_ollama_first = !model.contains('/')
-            && model != "native-default"
-            && model != "cheap"
-            && model != "capable"
-            && crate::llm::provider_name(model) == "native";
         if exact_override {
-            return crate::chisei::model_routing::resolve_override(base_context);
+            crate::chisei::model_routing::resolve_override(base_context)
+        } else {
+            crate::chisei::model_routing::resolve_model(base_context)
         }
-        if !needs_ollama_first
-            && let Ok(resolved) = crate::chisei::model_routing::resolve_model(base_context.clone())
-        {
-            return Ok(resolved);
-        }
-
-        crate::chisei::model_routing::resolve_model(crate::chisei::model_routing::RoutingContext {
-            ..base_context
-        })
     }
 
     pub(super) async fn refresh_provider_registry_for_resolution(
