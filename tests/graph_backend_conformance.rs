@@ -318,4 +318,23 @@ fn postgres_conflicting_updates_do_not_lose_a_revision() {
             .count(),
         1
     );
+
+    // The stored object and its change log both belong to the winner.
+    let winner = if results[0].is_ok() {
+        "first"
+    } else {
+        "second"
+    };
+    let stored = db.get_object(&original.id).unwrap().unwrap();
+    assert_eq!(stored.name, winner);
+    assert_eq!(stored.updated, 11);
+    let renames: Vec<_> = db
+        .list_object_changes(&original.id, 100, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|change| change.field == "name")
+        .collect();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(renames[0].new_value, winner);
+    assert_eq!(renames[0].changed_by, winner);
 }
