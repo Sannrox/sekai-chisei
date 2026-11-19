@@ -70,7 +70,8 @@ impl SekaiDb {
 
     /// Resolve the effective policy for an actor/namespace/project, honoring
     /// agent-then-project-then-namespace precedence. Returns `None` when no
-    /// policy applies. Admission callers must fail closed on `None`.
+    /// policy restricts the action; callers apply allow. A store fault is an
+    /// `Err`, which callers fail closed on.
     pub fn resolve_action_policy(
         &self,
         actor: &str,
