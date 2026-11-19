@@ -512,6 +512,9 @@ fn existing_federation_contracts_preserve_epistemic_profiles_without_new_authori
             .is_err()
     );
 
+    // Residency is Chisei route policy held by the resolver itself; it has no
+    // connection to the Sekai store an evidence import writes, so an import
+    // cannot change it by construction. This checks only the local deny.
     let resolver = PolicyResolver::new();
     resolver
         .set_residency_policy(
@@ -526,13 +529,6 @@ fn existing_federation_contracts_preserve_epistemic_profiles_without_new_authori
             },
         )
         .expect("local residency policy should validate");
-    assert!(
-        resolver
-            .enforce_residency(NAMESPACE, "openai", "gpt-4o-mini", "research")
-            .is_err()
-    );
-    // The imported evidence does not alter the local route policy or provide
-    // a promotion/permit path, so the same deny remains after import.
     assert!(
         resolver
             .enforce_residency(NAMESPACE, "openai", "gpt-4o-mini", "research")
