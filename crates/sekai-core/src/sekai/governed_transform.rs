@@ -709,6 +709,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: engine.into(),
                 runtime_image: runtime_image.into(),
                 inputs: Vec::new(),

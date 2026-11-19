@@ -3,8 +3,10 @@
 //!
 //! The configuration names the plane, this runtime's id, principal,
 //! namespaces and placement labels, and the operator's credential
-//! bindings, and optionally a CA file relational Sources trust. The plane
-//! bearer comes from `SEKAI_CREDENTIAL`, never from the file.
+//! bindings, and optionally a CA file relational Sources trust and a
+//! `gateway_url` model steps call (#3025). The plane bearer comes from
+//! `SEKAI_CREDENTIAL` and the gateway key from `CHISEI_GATEWAY_KEY`, never
+//! from the file.
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -14,7 +16,8 @@ use sekai_client::ClientConfig;
 use std::path::PathBuf;
 
 use sekai_connector_runtime::{
-    Connectors, CredentialBindings, Runtime, RuntimeOptions, github, relational,
+    Connectors, CredentialBindings, Runtime, RuntimeOptions, github, llm_rows::GatewayRoute,
+    relational,
 };
 use sekai_source_sdk::{GITHUB_CONNECTOR, RELATIONAL_CONNECTOR};
 use serde::Deserialize;
@@ -38,6 +41,22 @@ struct Config {
     /// roots, for a database behind a private CA.
     #[serde(default)]
     relational_ca_file: Option<PathBuf>,
+    /// The model egress gateway's compatible surface, such as
+    /// `http://127.0.0.1:8788/v1`. When set, the runtime runs `llm-rows`
+    /// transform steps through it with the key in `CHISEI_GATEWAY_KEY`.
+    #[serde(default)]
+    gateway_url: Option<String>,
+}
+
+/// The gateway route for `url`, refusing a URL with no key.
+fn gateway_route(url: Option<String>, key: Option<String>) -> Result<Option<GatewayRoute>, String> {
+    let Some(base_url) = url.filter(|url| !url.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let key = key
+        .filter(|key| !key.trim().is_empty())
+        .ok_or("gateway_url needs the gateway key in CHISEI_GATEWAY_KEY")?;
+    Ok(Some(GatewayRoute { base_url, key }))
 }
 
 fn default_lease_ms() -> u64 {
@@ -93,6 +112,7 @@ async fn serve() -> Result<(), String> {
         .transpose()
         .map_err(|error| format!("read relational CA file: {error}"))?;
     let tls = relational::tls(ca.as_deref())?;
+    let gateway = gateway_route(config.gateway_url, std::env::var("CHISEI_GATEWAY_KEY").ok())?;
     let connectors = Connectors::default()
         .with(&GITHUB_CONNECTOR, github::open)
         .with(&RELATIONAL_CONNECTOR, move |prepared| {
@@ -111,6 +131,10 @@ async fn serve() -> Result<(), String> {
     )
     .await
     .map_err(|error| error.to_string())?;
+    let runtime = match gateway {
+        Some(route) => runtime.with_gateway(route),
+        None => runtime,
+    };
     runtime
         .register()
         .await
@@ -125,7 +149,18 @@ async fn serve() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_config;
+    use super::{gateway_route, parse_config};
+
+    #[test]
+    fn a_gateway_url_without_a_key_is_refused() {
+        assert!(gateway_route(None, None).unwrap().is_none());
+        let refused = gateway_route(Some("http://127.0.0.1:8788/v1".into()), None).unwrap_err();
+        assert!(refused.contains("CHISEI_GATEWAY_KEY"), "{refused}");
+        let route = gateway_route(Some("http://127.0.0.1:8788/v1".into()), Some("k".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.base_url, "http://127.0.0.1:8788/v1");
+    }
 
     fn config(timers: &str) -> String {
         format!(

@@ -209,6 +209,11 @@ pub struct IsolatedProcessSpec {
     /// definitions written before it existed.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub model_outputs: BTreeSet<String>,
+    /// The row-wise model step an `llm-rows` engine runs (#3025): `code` is
+    /// its prompt template. Required for that engine and refused for any
+    /// other. Absent keeps the digest of definitions written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_step: Option<crate::transform_llm_step::LlmRowStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +479,7 @@ impl GovernedTransform {
             }
             prepare_model_inputs(spec)?;
             prepare_model_outputs(spec)?;
+            prepare_llm_step(spec)?;
             validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
@@ -671,6 +677,12 @@ pub fn definition_digest(transform: &GovernedTransform) -> String {
         }
         // Hashed only when present, so unconstrained definitions keep their
         // earlier digest and admitted runs stay valid.
+        if let Some(step) = &spec.llm_step {
+            hash_field(&mut hasher, "llm_step");
+            hash_field(&mut hasher, &step.model);
+            hash_field(&mut hasher, &step.output_column);
+            hash_field(&mut hasher, step.output_type.as_str());
+        }
         if !spec.requires.is_empty() {
             hash_field(&mut hasher, "requires");
             hasher.update((spec.requires.len() as u64).to_le_bytes());
@@ -884,9 +896,6 @@ fn prepare_analytical(
     Ok(())
 }
 
-/// Trims model input names and version ids, refuses blanks and dataset ids
-/// that collide with the model pin prefix, and requires the model placement
-/// label so only a runtime that can run a model claims the work.
 /// Trims model output names and refuses blanks and names that collapse
 /// into one after trimming.
 fn prepare_model_outputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
@@ -903,6 +912,52 @@ fn prepare_model_outputs(spec: &mut IsolatedProcessSpec) -> Result<(), Transform
     Ok(())
 }
 
+/// An `llm-rows` engine needs a model step and a prompt template as its
+/// code, and requires the model step placement label so only a runtime
+/// holding a gateway route claims the work. Any other engine refuses a step.
+fn prepare_llm_step(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
+    use crate::transform_llm_step::{
+        LLM_ROWS_ENGINE, LLM_STEP_LABEL, LLM_STEP_LABEL_VALUE, validate_prompt,
+    };
+    let llm_engine = spec.engine.trim() == LLM_ROWS_ENGINE;
+    let Some(step) = spec.llm_step.as_mut() else {
+        return if llm_engine {
+            Err(TransformError::InvalidArgument(format!(
+                "the {LLM_ROWS_ENGINE} engine requires llm_step"
+            )))
+        } else {
+            Ok(())
+        };
+    };
+    if !llm_engine {
+        return Err(TransformError::InvalidArgument(format!(
+            "llm_step applies only to the {LLM_ROWS_ENGINE} engine"
+        )));
+    }
+    if spec.inputs.len() != 1 {
+        return Err(TransformError::InvalidArgument(
+            "llm_step reads exactly one input".into(),
+        ));
+    }
+    step.model = step.model.trim().to_string();
+    step.output_column = step.output_column.trim().to_string();
+    step.validate().map_err(TransformError::InvalidArgument)?;
+    validate_prompt(&spec.code).map_err(TransformError::InvalidArgument)?;
+    match spec.requires.get(LLM_STEP_LABEL) {
+        Some(value) if value != LLM_STEP_LABEL_VALUE => Err(TransformError::InvalidArgument(
+            format!("llm_step requires {LLM_STEP_LABEL}={LLM_STEP_LABEL_VALUE}"),
+        )),
+        _ => {
+            spec.requires
+                .insert(LLM_STEP_LABEL.into(), LLM_STEP_LABEL_VALUE.into());
+            Ok(())
+        }
+    }
+}
+
+/// Trims model input names and version ids, refuses blanks and dataset ids
+/// that collide with the model pin prefix, and requires the model placement
+/// label so only a runtime that can run a model claims the work.
 fn prepare_model_inputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
     if spec.model_inputs.is_empty() {
         return Ok(());
@@ -1269,6 +1324,20 @@ pub fn apply_steps(
         }
     }
     out
+}
+
+/// Why rows a runtime wrote for an `llm-rows` definition cannot commit: a
+/// row whose output column is not a canonical value of the step's type
+/// (#3025). `None` for any other definition.
+pub fn llm_step_output_error(
+    transform: &GovernedTransform,
+    rows: &[HashMap<String, String>],
+) -> Option<String> {
+    transform
+        .isolated_process
+        .as_ref()
+        .and_then(|spec| spec.llm_step.as_ref())
+        .and_then(|step| step.check_written(rows).err())
 }
 
 pub fn evaluate_quality(

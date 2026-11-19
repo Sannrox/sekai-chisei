@@ -301,6 +301,7 @@ fn seed_transform(
         definition_digest: String::new(),
         analytical: None,
         isolated_process: Some(IsolatedProcessSpec {
+            llm_step: None,
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
@@ -726,6 +727,7 @@ async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),

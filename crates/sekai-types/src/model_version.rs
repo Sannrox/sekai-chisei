@@ -318,6 +318,7 @@ impl ModelVersion {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: MODEL_ENGINE.into(),
                 runtime_image: binding.runtime_image,
                 inputs: Vec::new(),

@@ -25,12 +25,12 @@ use crate::sekai::governed_transform::{
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
     derive_transform_markings, evaluate_quality, fold_live_output_marking, fold_output_digest,
-    input_partition_receipts, is_preview_id, new_preview_id, partition_records, partition_value,
-    placement_admits, prepare_partition_commit, preview_output_schema_json,
-    preview_result_from_writeback, preview_schema_from_rows, preview_writeback_run,
-    receipts_for_touched_partitions, redact_run_partition_receipts, refuse_dependency_cycle,
-    registered_transform_runtime, require_bound_output_for_markings, rows_digest,
-    schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
+    input_partition_receipts, is_preview_id, llm_step_output_error, new_preview_id,
+    partition_records, partition_value, placement_admits, prepare_partition_commit,
+    preview_output_schema_json, preview_result_from_writeback, preview_schema_from_rows,
+    preview_writeback_run, receipts_for_touched_partitions, redact_run_partition_receipts,
+    refuse_dependency_cycle, registered_transform_runtime, require_bound_output_for_markings,
+    rows_digest, schedule_due_bucket, transform_claim_fence_matches, transform_claim_is_current,
     transform_completed_write_matches, transform_pool_depths, transform_quota_hold_status_allows,
     transform_runtime_decision, transform_work_is_claimable, trigger_is_due, trim_page_to_bytes,
 };
@@ -3131,9 +3131,12 @@ fn write_preview_transform_run_pg(
     let inputs = snapshot_input_stats_pg(tx, &command.run_id)?;
     let admitted_auth = load_preview_auth_pg(tx, &command.run_id)?;
     let transform = load_admitted_transform_pg(tx, &done)?;
-    let quality_error = evaluate_quality(&command.rows, &transform.quality_rule)
-        .err()
-        .map(|error| error.message())
+    let quality_error = llm_step_output_error(&transform, &command.rows)
+        .or_else(|| {
+            evaluate_quality(&command.rows, &transform.quality_rule)
+                .err()
+                .map(|error| error.message())
+        })
         .unwrap_or_default();
     delete_run_input_snapshot_pg(tx, &command.run_id)?;
     let mut result = preview_result_from_writeback(&command.run_id, command, inputs);
@@ -3219,9 +3222,13 @@ fn write_transform_run_pg(
         .as_ref()
         .map(|commit| commit.merged_rows.as_slice())
         .unwrap_or(command.rows.as_slice());
-    let quality_error = evaluate_quality(quality_rows, &transform.quality_rule)
-        .err()
-        .map(|error| error.message());
+    // A model step's reply that is not its declared type quarantines the
+    // run before any quality rule (#3025).
+    let quality_error = llm_step_output_error(&transform, &command.rows).or_else(|| {
+        evaluate_quality(quality_rows, &transform.quality_rule)
+            .err()
+            .map(|error| error.message())
+    });
     // An ad-hoc run's output over the plane budget fails the run and writes
     // nothing; it keeps no checkpoint and fires nothing downstream (ADR 0138).
     let adhoc = run.trigger_cause == crate::sekai::adhoc_transform::TRANSFORM_TRIGGER_ADHOC;
@@ -5859,6 +5866,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
@@ -6623,6 +6631,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
@@ -6771,6 +6780,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: vec![
@@ -7357,6 +7367,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
@@ -7994,6 +8005,7 @@ mod tests {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),

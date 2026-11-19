@@ -23479,6 +23479,7 @@ async fn isolated_process_claim_and_write_back_are_namespace_authorized() {
         definition_digest: String::new(),
         analytical: None,
         isolated_process: Some(IsolatedProcessSpec {
+            llm_step: None,
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
@@ -23673,6 +23674,7 @@ async fn isolated_process_input_stream_requires_dataset_read() {
         definition_digest: String::new(),
         analytical: None,
         isolated_process: Some(IsolatedProcessSpec {
+            llm_step: None,
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
@@ -24537,6 +24539,7 @@ async fn isolated_claim_admits_quota_and_write_records_usage() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -24706,6 +24709,7 @@ async fn isolated_write_records_usage_for_the_claiming_tenant() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -24844,6 +24848,7 @@ async fn isolated_claim_without_tenant_context_meters_the_owner() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -24999,6 +25004,7 @@ async fn isolated_write_records_owner_usage_without_quota_limits() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -25539,6 +25545,7 @@ async fn isolated_claim_without_limits_binds_the_claiming_tenant() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -25656,6 +25663,7 @@ async fn isolated_quota_exhaustion_leaves_work_claimable() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -25766,6 +25774,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),
@@ -25971,6 +25980,7 @@ async fn enqueue_isolated_claim(svc: &SekaiServiceImpl, transform_id: &str) {
         definition_digest: String::new(),
         analytical: None,
         isolated_process: Some(IsolatedProcessSpec {
+            llm_step: None,
             engine: "python".into(),
             runtime_image: "runner:1".into(),
             inputs: Vec::new(),
@@ -26204,6 +26214,7 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -26338,6 +26349,7 @@ async fn triggered_isolated_claim_uses_the_put_owner() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -26446,6 +26458,7 @@ async fn isolated_expired_claim_releases_concurrency_for_reclaim() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -26556,6 +26569,7 @@ async fn isolated_terminal_lease_failure_releases_concurrency() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -26691,6 +26705,7 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -28913,6 +28928,7 @@ async fn apply_streaming_transform_batch_is_fenced_and_idempotent() {
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
@@ -29118,6 +29134,7 @@ async fn apply_streaming_transform_batch_stamps_markings_and_refuses_declassify(
                 definition_digest: String::new(),
                 analytical: None,
                 isolated_process: Some(IsolatedProcessSpec {
+                    llm_step: None,
                     engine: "python".into(),
                     runtime_image: "runner:1".into(),
                     inputs: Vec::new(),
