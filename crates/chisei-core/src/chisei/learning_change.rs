@@ -113,9 +113,10 @@ pub fn propose_change(
 
     let learning = visible_learning(facts, &request.namespace, &request.learning_id)?;
     let candidate_digest = learning_digest(&learning)?;
-    let baseline_digest = live_baseline_digest(db, &request.namespace, &request.learning_id)?;
     let change_id = change_id_for(&request.namespace, &request.learning_id);
-    if let Some(mut existing) = db.get_learning_change(&change_id)? {
+    let existing = db.get_learning_change(&change_id)?;
+    let baseline_digest = own_baseline_digest(existing.as_ref());
+    if let Some(mut existing) = existing {
         if existing.namespace != request.namespace || existing.learning_id != request.learning_id {
             return Err(UNAVAILABLE.into());
         }
@@ -509,19 +510,23 @@ fn deny_if_unusable(record: &LearningChange) -> Result<(), String> {
     Ok(())
 }
 
-fn live_baseline_digest(
-    db: &ChiseiStore,
-    namespace: &str,
-    learning_id: &str,
-) -> Result<String, String> {
-    let current = change_id_for(namespace, learning_id);
-    Ok(db
-        .list_learning_changes(Some(namespace))?
-        .into_iter()
-        .filter(|record| record.status == STATUS_ACTIVE && record.change_id != current)
-        .map(|record| record.candidate_digest)
-        .next()
-        .unwrap_or_default())
+/// Baseline for a (re-)proposal: the candidate digest this learning had when
+/// it was last active, or empty when it never was. A rolled-back record's
+/// candidate is that digest; a record re-proposed after a rollback already
+/// carries it. Other learnings in the namespace never feed it.
+fn own_baseline_digest(existing: Option<&LearningChange>) -> String {
+    match existing {
+        Some(record) if record.status == STATUS_ROLLED_BACK => record.candidate_digest.clone(),
+        Some(record)
+            if record
+                .lineage
+                .iter()
+                .any(|entry| entry.action == "activate") =>
+        {
+            record.baseline_digest.clone()
+        }
+        _ => String::new(),
+    }
 }
 
 fn set_learning_status(
