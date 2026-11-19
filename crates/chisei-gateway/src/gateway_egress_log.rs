@@ -81,6 +81,13 @@ pub(super) enum LogEntry {
         total_tokens: u64,
         latency_ms: i64,
         at_ms: i64,
+        /// The Operation Receipt the gateway builds for this attempt (#3132).
+        /// Absent on an accounting-only attempt, which has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<Box<OperationReceipt>>,
+        /// The attempt's `llm_calls` row, as the gateway builds it (#3132).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        llm_calls_row: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -548,7 +555,8 @@ pub(super) async fn acknowledge_egress_log(
     }
 }
 
-/// Appends the usage record of a provider attempt whose admission was logged.
+/// Appends the usage record of a provider attempt whose admission was logged,
+/// with the receipt and `llm_calls` row built for it, if any.
 /// A failure shows on `/readyz`; the response already sent stands.
 pub(super) async fn log_attempt_usage(
     runtime: &GatewayRuntime,
@@ -557,6 +565,7 @@ pub(super) async fn log_attempt_usage(
     outcome: &str,
     reason: Option<&str>,
     usage: Option<&ResponseUsage>,
+    built: Option<(&OperationReceipt, &HashMap<String, String>)>,
 ) {
     let Some(log) = runtime
         .egress_log
@@ -579,6 +588,8 @@ pub(super) async fn log_attempt_usage(
         total_tokens: tokens(usage.map(|usage| usage.total_tokens)),
         latency_ms: now - context.started_ms,
         at_ms: now,
+        receipt: built.map(|(receipt, _)| Box::new(receipt.clone())),
+        llm_calls_row: built.map(|(_, row)| row.clone().into_iter().collect()),
     };
     let _ = log.append(entry).await;
 }

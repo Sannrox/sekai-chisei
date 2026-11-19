@@ -56,6 +56,46 @@ pub(super) async fn record_usage_and_append(
         GatewayUsageOutcome::Interrupted(status, reason) => (*status, "interrupted", Some(reason)),
         GatewayUsageOutcome::AccountingOnly(status) => (*status, "accounting_only", None),
     };
+    // The receipt and `llm_calls` row are built once: the egress log carries
+    // them, and the Chisei and Sekai writes below use the same values.
+    let terminal = match &outcome {
+        GatewayUsageOutcome::Success(_) => Some(None),
+        GatewayUsageOutcome::Incomplete(_, reason) => {
+            Some(Some(ReceiptTerminalOutcome::Incomplete(reason)))
+        }
+        GatewayUsageOutcome::TerminalFailure(_, reason) if reason == "response_cancelled" => {
+            Some(Some(ReceiptTerminalOutcome::Cancelled))
+        }
+        GatewayUsageOutcome::TerminalFailure(_, _) => Some(Some(ReceiptTerminalOutcome::Failed)),
+        GatewayUsageOutcome::Interrupted(_, reason) => {
+            Some(Some(ReceiptTerminalOutcome::Interrupted(reason)))
+        }
+        GatewayUsageOutcome::AccountingOnly(_) => None,
+    };
+    let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
+    let receipt = terminal.map(|terminal| {
+        gateway_operation_receipt(
+            config,
+            identity,
+            context,
+            log_status,
+            usage.as_ref(),
+            response_observation.as_ref(),
+            None,
+            terminal,
+        )
+    });
+    let row = receipt.is_some().then(|| {
+        llm_calls_row(
+            config,
+            identity,
+            context,
+            log_status,
+            &outcome,
+            usage.as_ref(),
+            elapsed_ms,
+        )
+    });
     log_attempt_usage(
         runtime,
         context,
@@ -63,77 +103,15 @@ pub(super) async fn record_usage_and_append(
         log_outcome,
         log_reason.map(String::as_str),
         usage.as_ref(),
+        receipt.as_ref().zip(row.as_ref()),
     )
     .await;
     let Some(target) = &config.chisei_grpc_target else {
         return;
     };
-    let status = match outcome {
-        GatewayUsageOutcome::Success(status)
-        | GatewayUsageOutcome::Incomplete(status, _)
-        | GatewayUsageOutcome::TerminalFailure(status, _)
-        | GatewayUsageOutcome::Interrupted(status, _)
-        | GatewayUsageOutcome::AccountingOnly(status) => status,
-    };
-    if matches!(outcome, GatewayUsageOutcome::Success(_)) {
-        record_gateway_operation_receipt(
-            config,
-            Some(runtime),
-            identity,
-            context,
-            status,
-            usage.as_ref(),
-            response_observation.as_ref(),
-            None,
-            None,
-        )
-        .await;
-    } else if let GatewayUsageOutcome::Incomplete(_, ref reason) = outcome {
-        record_gateway_operation_receipt(
-            config,
-            Some(runtime),
-            identity,
-            context,
-            status,
-            usage.as_ref(),
-            response_observation.as_ref(),
-            None,
-            Some(ReceiptTerminalOutcome::Incomplete(reason)),
-        )
-        .await;
-    } else if let GatewayUsageOutcome::TerminalFailure(_, ref reason) = outcome {
-        let terminal = if reason == "response_cancelled" {
-            ReceiptTerminalOutcome::Cancelled
-        } else {
-            ReceiptTerminalOutcome::Failed
-        };
-        record_gateway_operation_receipt(
-            config,
-            Some(runtime),
-            identity,
-            context,
-            status,
-            usage.as_ref(),
-            response_observation.as_ref(),
-            None,
-            Some(terminal),
-        )
-        .await;
-    } else if let GatewayUsageOutcome::Interrupted(_, ref reason) = outcome {
-        record_gateway_operation_receipt(
-            config,
-            Some(runtime),
-            identity,
-            context,
-            status,
-            usage.as_ref(),
-            response_observation.as_ref(),
-            None,
-            Some(ReceiptTerminalOutcome::Interrupted(reason)),
-        )
-        .await;
+    if let Some(receipt) = &receipt {
+        persist_operation_receipt(config, runtime, identity, receipt, false).await;
     }
-    let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
     let total_tokens = usage.as_ref().map(|usage| usage.total_tokens).unwrap_or(0);
     let request_usage = RecordUsageRequest {
         user_id: identity.user_id.clone(),
@@ -191,9 +169,9 @@ pub(super) async fn record_usage_and_append(
                     }
                 }
             }
-            if matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
+            let Some(values) = row else {
                 return;
-            }
+            };
             let non_success = matches!(
                 outcome,
                 GatewayUsageOutcome::Incomplete(_, _)
@@ -220,127 +198,6 @@ pub(super) async fn record_usage_and_append(
                     &mut chisei,
                 )
                 .await;
-            }
-
-            let mut values = HashMap::new();
-            values.insert("request_id".to_string(), context.request_id.clone());
-            values.insert(
-                "receipt_id".to_string(),
-                gateway_provider_receipt_id(
-                    &context.operation_id,
-                    &context.request_id,
-                    context.attempt,
-                    context.provider_ordinal,
-                ),
-            );
-            insert_correlation_values(&mut values, context);
-            values.insert(
-                "timestamp_ms".to_string(),
-                Utc::now().timestamp_millis().to_string(),
-            );
-            values.insert("agent".to_string(), identity.agent.clone());
-            values.insert("project".to_string(), identity.project.clone());
-            values.insert("data_class".to_string(), context.data_class.clone());
-            values.insert("user_id".to_string(), identity.user_id.clone());
-            if !identity.key_id.is_empty() {
-                values.insert("key_id".to_string(), identity.key_id.clone());
-            }
-            values.insert(
-                "provider".to_string(),
-                capability_provider_id(context.provider).to_string(),
-            );
-            if let Some(model) = &context.requested_model {
-                values.insert("model".to_string(), model.clone());
-            }
-            if let Some(model) = &context.resolved_model {
-                values.insert("resolved_model".to_string(), model.clone());
-            }
-            if let Some(profile_version) = &context.profile_version {
-                values.insert("profile_version".to_string(), profile_version.clone());
-            }
-            if let Some(pricing_version) = &context.pricing_snapshot_version {
-                values.insert(
-                    "pricing_snapshot_version".to_string(),
-                    pricing_version.clone(),
-                );
-            }
-            if let Some(snapshot_version) = &context.capability_snapshot_version {
-                values.insert(
-                    "capability_snapshot_version".to_string(),
-                    snapshot_version.clone(),
-                );
-            }
-            if let Some(work_unit_id) = &context.work_unit_id {
-                values.insert("work_unit_id".to_string(), work_unit_id.clone());
-            }
-            if let Some(route_bias) = context
-                .route_bias
-                .as_deref()
-                .filter(|bias| !bias.is_empty())
-            {
-                values.insert("route_bias".to_string(), route_bias.to_string());
-            }
-            if let Some(policy_scope) = context
-                .policy_scope
-                .as_deref()
-                .filter(|scope| !scope.is_empty())
-            {
-                values.insert("policy_scope".to_string(), policy_scope.to_string());
-            }
-            if let Some(policy_version) = context
-                .policy_version
-                .as_deref()
-                .filter(|version| !version.is_empty())
-            {
-                values.insert("policy_version".to_string(), policy_version.to_string());
-            }
-            if let Some(observation) = &pipeline_observation {
-                values.insert(
-                    "pipeline_sampled".to_string(),
-                    observation.sampled.to_string(),
-                );
-                values.insert("sample_reason".to_string(), observation.reason.clone());
-                values.insert("sample_rate".to_string(), observation.rate.to_string());
-            }
-            values.insert("status".to_string(), status.as_u16().to_string());
-            match &outcome {
-                GatewayUsageOutcome::Incomplete(_, _) => {
-                    values.insert("terminal_outcome".into(), "incomplete".into());
-                }
-                GatewayUsageOutcome::TerminalFailure(_, reason) => {
-                    values.insert(
-                        "terminal_outcome".into(),
-                        if reason == "response_cancelled" {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        }
-                        .into(),
-                    );
-                }
-                GatewayUsageOutcome::Interrupted(_, _) => {
-                    values.insert("terminal_outcome".into(), "interrupted".into());
-                }
-                _ => {}
-            }
-            values.insert(
-                "request_bytes".to_string(),
-                context.request_bytes.to_string(),
-            );
-            values.insert("latency_ms".to_string(), elapsed_ms.max(0).to_string());
-            if let Some(usage) = usage {
-                insert_normalized_usage_values(&mut values, &usage);
-                if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
-                    values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
-                    values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
-                }
-                if usage.cache_read_input_tokens > 0
-                    && let Some(savings) =
-                        estimate_cache_savings_usd_micros(config, context, &usage)
-                {
-                    values.insert("cache_savings_usd_micros".to_string(), savings.to_string());
-                    values.insert("cache_savings_usd".to_string(), format_usd_micros(savings));
-                }
             }
 
             let mut sekai = SekaiServiceClient::new(channel);
@@ -379,16 +236,7 @@ pub(super) async fn record_usage_and_append(
                     "chisei-gateway usage recovery queue saturated; additional recovery refused"
                 );
             }
-            if !matches!(outcome, GatewayUsageOutcome::AccountingOnly(_)) {
-                let mut values = gateway_recovery_llm_values(
-                    config,
-                    identity,
-                    context,
-                    status,
-                    &outcome,
-                    usage.as_ref(),
-                    elapsed_ms,
-                );
+            if let Some(mut values) = row {
                 values.insert("control_plane_error".into(), "unavailable".into());
                 if !append_gateway_recovery(runtime, GatewayRecoveryRecord::LlmRow { values }).await
                 {
@@ -399,7 +247,8 @@ pub(super) async fn record_usage_and_append(
         }
     }
 }
-pub(super) fn gateway_recovery_llm_values(
+/// The `llm_calls` row of a provider attempt that was not refused.
+pub(super) fn llm_calls_row(
     config: &GatewayConfig,
     identity: &GatewayIdentity,
     context: &UsageContext,
@@ -518,21 +367,8 @@ pub(super) async fn record_refusal_with_usage_and_append(
         record_genai_usage(&context.genai_span, usage);
     }
     chisei_provider::genai::record_error(&context.genai_span, &rejection.error_type);
-    log_attempt_usage(
-        runtime,
-        context,
-        rejection.status,
-        "refused",
-        Some(&rejection.error_type),
-        usage.as_ref(),
-    )
-    .await;
-    let Some(target) = &config.chisei_grpc_target else {
-        return;
-    };
-    record_gateway_operation_receipt(
+    let receipt = gateway_operation_receipt(
         config,
-        Some(runtime),
         identity,
         context,
         rejection.status,
@@ -543,9 +379,74 @@ pub(super) async fn record_refusal_with_usage_and_append(
             model_attempted,
         }),
         None,
+    );
+    let values = refusal_llm_calls_row(
+        config,
+        identity,
+        context,
+        rejection,
+        usage.as_ref(),
+        Utc::now().timestamp_millis() - context.started_ms,
+    );
+    log_attempt_usage(
+        runtime,
+        context,
+        rejection.status,
+        "refused",
+        Some(&rejection.error_type),
+        usage.as_ref(),
+        Some((&receipt, &values)),
     )
     .await;
-    let elapsed_ms = Utc::now().timestamp_millis() - context.started_ms;
+    let Some(target) = &config.chisei_grpc_target else {
+        return;
+    };
+    persist_operation_receipt(config, runtime, identity, &receipt, true).await;
+
+    match connect_sekai_with_timeout(target, Some(configured_control_plane_timeout())).await {
+        Ok(channel) => {
+            spawn_gateway_recovery_replay(config.clone(), runtime.clone());
+            let mut sekai = SekaiServiceClient::new(channel);
+            let append = AppendRowsRequest {
+                dataset_id: "llm_calls".to_string(),
+                rows: vec![Row {
+                    values: values.clone(),
+                }],
+            };
+            let append_result = append_llm_calls_rows(runtime, &mut sekai, append.clone()).await;
+            if let Err(append_err) = append_result {
+                warn!(error = %append_err, "chisei-gateway refusal append failed");
+                if !append_gateway_recovery(
+                    runtime,
+                    GatewayRecoveryRecord::LlmRow {
+                        values: values.clone(),
+                    },
+                )
+                .await
+                {
+                    error!("chisei-gateway refusal recovery spool write failed");
+                }
+                return;
+            }
+            link_work_unit_usage(&mut sekai, identity, context, &values).await;
+        }
+        Err(err) => {
+            if !append_gateway_recovery(runtime, GatewayRecoveryRecord::LlmRow { values }).await {
+                error!("chisei-gateway refusal recovery spool write failed");
+            }
+            warn!(error = %err, "chisei-gateway refusal append skipped; Chisei unavailable");
+        }
+    }
+}
+/// The `llm_calls` row of a refused request or attempt.
+fn refusal_llm_calls_row(
+    config: &GatewayConfig,
+    identity: &GatewayIdentity,
+    context: &UsageContext,
+    rejection: &GatewayRejection,
+    usage: Option<&ResponseUsage>,
+    elapsed_ms: i64,
+) -> HashMap<String, String> {
     let mut values = HashMap::new();
     values.insert("request_id".to_string(), context.request_id.clone());
     values.insert(
@@ -606,53 +507,19 @@ pub(super) async fn record_refusal_with_usage_and_append(
     );
     values.insert("latency_ms".to_string(), elapsed_ms.max(0).to_string());
     if let Some(usage) = usage {
-        insert_normalized_usage_values(&mut values, &usage);
-        if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, &usage) {
+        insert_normalized_usage_values(&mut values, usage);
+        if let Some(cost_usd_micros) = estimate_cost_usd_micros(config, context, usage) {
             values.insert("cost_usd_micros".to_string(), cost_usd_micros.to_string());
             values.insert("cost_usd".to_string(), format_usd_micros(cost_usd_micros));
         }
         if usage.cache_read_input_tokens > 0
-            && let Some(savings) = estimate_cache_savings_usd_micros(config, context, &usage)
+            && let Some(savings) = estimate_cache_savings_usd_micros(config, context, usage)
         {
             values.insert("cache_savings_usd_micros".to_string(), savings.to_string());
             values.insert("cache_savings_usd".to_string(), format_usd_micros(savings));
         }
     }
-
-    match connect_sekai_with_timeout(target, Some(configured_control_plane_timeout())).await {
-        Ok(channel) => {
-            spawn_gateway_recovery_replay(config.clone(), runtime.clone());
-            let mut sekai = SekaiServiceClient::new(channel);
-            let append = AppendRowsRequest {
-                dataset_id: "llm_calls".to_string(),
-                rows: vec![Row {
-                    values: values.clone(),
-                }],
-            };
-            let append_result = append_llm_calls_rows(runtime, &mut sekai, append.clone()).await;
-            if let Err(append_err) = append_result {
-                warn!(error = %append_err, "chisei-gateway refusal append failed");
-                if !append_gateway_recovery(
-                    runtime,
-                    GatewayRecoveryRecord::LlmRow {
-                        values: values.clone(),
-                    },
-                )
-                .await
-                {
-                    error!("chisei-gateway refusal recovery spool write failed");
-                }
-                return;
-            }
-            link_work_unit_usage(&mut sekai, identity, context, &values).await;
-        }
-        Err(err) => {
-            if !append_gateway_recovery(runtime, GatewayRecoveryRecord::LlmRow { values }).await {
-                error!("chisei-gateway refusal recovery spool write failed");
-            }
-            warn!(error = %err, "chisei-gateway refusal append skipped; Chisei unavailable");
-        }
-    }
+    values
 }
 pub(super) fn insert_correlation_values(
     values: &mut HashMap<String, String>,
@@ -1125,10 +992,11 @@ pub(super) fn build_gateway_operation_receipt(
         artifact: None,
     }
 }
+/// Builds the receipt of a provider attempt, priced from the gateway's
+/// pricing table.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn record_gateway_operation_receipt(
+pub(super) fn gateway_operation_receipt(
     config: &GatewayConfig,
-    runtime: Option<&GatewayRuntime>,
     identity: &GatewayIdentity,
     context: &UsageContext,
     status: StatusCode,
@@ -1136,8 +1004,8 @@ pub(super) async fn record_gateway_operation_receipt(
     observation: Option<&ResponseObservation>,
     rejection: Option<ReceiptRejection<'_>>,
     terminal_outcome: Option<ReceiptTerminalOutcome<'_>>,
-) {
-    let receipt = build_gateway_operation_receipt(
+) -> OperationReceipt {
+    build_gateway_operation_receipt(
         identity,
         context,
         status,
@@ -1147,17 +1015,22 @@ pub(super) async fn record_gateway_operation_receipt(
         terminal_outcome,
         usage.and_then(|usage| estimate_cost_usd_micros(config, context, usage)),
         usage.and_then(|usage| estimate_cache_savings_usd_micros(config, context, usage)),
-    );
-    let Ok(receipt_json) = serde_json::to_string(&receipt) else {
+    )
+}
+
+/// Sends a receipt to Chisei, spooling it for replay when that fails.
+pub(super) async fn persist_operation_receipt(
+    config: &GatewayConfig,
+    runtime: &GatewayRuntime,
+    identity: &GatewayIdentity,
+    receipt: &OperationReceipt,
+    denied: bool,
+) {
+    let Ok(receipt_json) = serde_json::to_string(receipt) else {
         error!(operation_id = %receipt.operation_id, "gateway operation receipt serialization failed");
         return;
     };
     let operation_id = receipt.operation_id.clone();
-    let outcome = if rejection.is_some() {
-        "denied"
-    } else {
-        "recorded"
-    };
     let persisted = persist_gateway_receipt(
         config,
         &identity.user_id,
@@ -1168,14 +1041,13 @@ pub(super) async fn record_gateway_operation_receipt(
     )
     .await;
     if !persisted
-        && let Some(runtime) = runtime
         && !append_gateway_recovery(
             runtime,
             GatewayRecoveryRecord::Receipt {
                 actor: identity.agent.clone(),
                 operation_id,
                 receipt_json,
-                outcome: outcome.into(),
+                outcome: if denied { "denied" } else { "recorded" }.into(),
             },
         )
         .await

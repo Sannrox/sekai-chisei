@@ -1412,7 +1412,7 @@ fn recovery_llm_row_carries_the_live_rows_data_class_and_pipeline_fields() {
     };
     let config = routing_config();
     let row = |outcome: &GatewayUsageOutcome| {
-        gateway_recovery_llm_values(
+        llm_calls_row(
             &config,
             &identity,
             &context,
@@ -4439,6 +4439,15 @@ async fn policy_mode_logs_each_call_before_and_after_provider_contact() {
     assert_eq!(records[1]["outcome"], "success");
     assert_eq!(records[1]["total_tokens"], 7);
     assert_eq!(records[0]["request_id"], records[1]["request_id"]);
+    // The usage record carries the receipt and `llm_calls` row the gateway
+    // builds for the attempt, so a reader writes them as they are (#3132).
+    let receipt = &records[1]["receipt"];
+    let row = records[1]["llm_calls_row"].as_object().unwrap();
+    assert_eq!(row["receipt_id"], receipt["operation_id"], "{page}");
+    assert_eq!(row["request_id"], records[1]["request_id"]);
+    assert_eq!(row["agent"], "coder");
+    let receipt: OperationReceipt = serde_json::from_value(receipt.clone()).unwrap();
+    assert!(receipt.completeness().complete, "{receipt:?}");
 
     let acked: serde_json::Value = reqwest::Client::new()
         .post(format!("{gateway}/_chisei/log/ack"))

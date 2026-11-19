@@ -330,7 +330,10 @@ A `log_reader` principal reads records in order:
 - `GET /_chisei/log?after=<seq>&limit=<n>` returns `chisei.gateway-log/v1`
   records with a sequence after `after`, at most `n` (default 100, maximum
   1000). Each record names its `kind` (`admission` or `usage`) and its
-  `request_id`.
+  `request_id`. A usage record also carries the attempt's Operation Receipt
+  (`receipt`) and `llm_calls` row (`llm_calls_row`), built by the same code
+  that sends them to Chisei and Sekai, so a reader can write them as they are
+  (#3132). An accounting-only attempt has neither.
 - `POST /_chisei/log/ack` with `{"seq": N}` tells the gateway that records up
   to `N` are committed elsewhere. They are no longer served and may be
   deleted. Nothing unacknowledged is ever deleted. Acknowledging a sequence
