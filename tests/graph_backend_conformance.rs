@@ -260,11 +260,72 @@ fn exercise_batch_object_read(db: &dyn GraphBackend, prefix: &str) {
     );
 }
 
+/// Grant expiry, the strict admin role set, the team-managed namespace gate
+/// and the `root`/`local` bypass of that gate.
+fn exercise_authorization(db: &dyn GraphBackend, prefix: &str) {
+    let grant = |id: &str, object_id: &str, principal: &str, role: Role, not_after_ms: i64| {
+        db.create_grant(&Grant {
+            id: format!("{prefix}-{id}"),
+            object_id: object_id.into(),
+            principal: principal.into(),
+            role,
+            created: 13,
+            not_after_ms,
+            ..Default::default()
+        })
+        .unwrap();
+    };
+
+    // An ungranted object is open to read and write but never to admin.
+    let open_namespace = format!("{prefix}-open");
+    let open = object(prefix, "open", "component", &open_namespace, 10);
+    db.create_object(&open, "conformance").unwrap();
+    assert!(db.can_access(&open.id, &["stranger"]).unwrap());
+    assert!(db.can_write(&open.id, &["stranger"]).unwrap());
+    assert!(!db.can_admin(&open.id, &["stranger"]).unwrap());
+
+    // Once granted, only live grants count, and admin needs the admin role.
+    let granted = object(prefix, "granted", "component", &open_namespace, 10);
+    db.create_object(&granted, "conformance").unwrap();
+    grant("viewer", &granted.id, "viewer", Role::Viewer, 0);
+    grant("admin", &granted.id, "admin", Role::Admin, 0);
+    grant("expired", &granted.id, "expired", Role::Admin, 1);
+    assert!(db.can_access(&granted.id, &["viewer"]).unwrap());
+    assert!(!db.can_write(&granted.id, &["viewer"]).unwrap());
+    assert!(!db.can_admin(&granted.id, &["viewer"]).unwrap());
+    assert!(db.can_admin(&granted.id, &["admin"]).unwrap());
+    assert!(!db.can_access(&granted.id, &["expired"]).unwrap());
+    assert!(!db.can_admin(&granted.id, &["expired"]).unwrap());
+    assert!(!db.can_access(&granted.id, &["stranger"]).unwrap());
+    // The privileged bypass covers the namespace gate, not object grants.
+    assert!(!db.can_access(&granted.id, &["root"]).unwrap());
+
+    // A team-managed namespace admits only principals with a live namespace
+    // grant, or a privileged principal.
+    let team_namespace = format!("{prefix}-team");
+    let mut boundary = object(prefix, "team", "namespace", &team_namespace, 10);
+    boundary.external_id = format!("namespace:{team_namespace}");
+    boundary
+        .properties
+        .insert("team_managed".into(), "true".into());
+    db.create_object(&boundary, "conformance").unwrap();
+    let inside = object(prefix, "inside", "component", &team_namespace, 10);
+    db.create_object(&inside, "conformance").unwrap();
+    grant("member", &boundary.id, "member", Role::Viewer, 0);
+    grant("former", &boundary.id, "former", Role::Viewer, 1);
+    assert!(db.can_access(&inside.id, &["member"]).unwrap());
+    assert!(!db.can_access(&inside.id, &["outsider"]).unwrap());
+    assert!(!db.can_access(&inside.id, &["former"]).unwrap());
+    assert!(db.can_access(&inside.id, &["root"]).unwrap());
+    assert!(db.can_access(&inside.id, &["local"]).unwrap());
+}
+
 #[test]
 fn sqlite_core_graph_conformance() {
     let db = SekaiDb::new(":memory:").unwrap();
     exercise_graph_backend(&db, "sqlite");
     exercise_batch_object_read(&db, "sqlite");
+    exercise_authorization(&db, "sqlite");
 }
 
 fn postgres_test_database() -> PostgresDb {
@@ -284,6 +345,7 @@ fn postgres_core_graph_conformance() {
     let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
     exercise_graph_backend(&db, &prefix);
     exercise_batch_object_read(&db, &prefix);
+    exercise_authorization(&db, &prefix);
 }
 
 #[test]

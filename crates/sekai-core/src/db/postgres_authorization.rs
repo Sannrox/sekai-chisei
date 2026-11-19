@@ -81,14 +81,3 @@ impl PostgresDb {
             && (!namespace_restricted || privileged || namespace_allowed))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn role_sets_keep_admin_strict_and_reads_open() {
-        let read_roles = ["viewer", "editor", "admin"];
-        let admin_roles = ["admin"];
-        assert!(read_roles.contains(&"viewer"));
-        assert!(!admin_roles.contains(&"editor"));
-    }
-}
