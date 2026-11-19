@@ -46,6 +46,7 @@ pub mod model_version_store;
 pub mod namespace_snapshot_store;
 pub mod object_log_ingest;
 pub mod object_security;
+pub mod object_source_record;
 pub mod object_sync;
 pub mod object_type_index;
 pub mod ontology;
