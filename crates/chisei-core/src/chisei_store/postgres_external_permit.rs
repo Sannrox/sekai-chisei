@@ -310,7 +310,6 @@ impl PostgresExternalPermitPostgresDbExt for PostgresDb {
         if permit.delegation_depth == 0 || permit.parent_permit_id.is_empty() {
             return Err("delegated permit must name its parent".into());
         }
-        self.validate_delegation_chain(permit)?;
         let json = serde_json::to_string(permit).map_err(|error| error.to_string())?;
         let mut connection = self.connection()?;
         let mut tx = connection
@@ -319,6 +318,8 @@ impl PostgresExternalPermitPostgresDbExt for PostgresDb {
         // Mirror SQLite Immediate: lock the parent before checking consumption
         // so a concurrent redeem cannot consume the same authority.
         lock_permit_authority(&mut tx, &permit.parent_permit_id)?;
+        // Validate in the transaction that stores the child, as redemption does (#2719).
+        validate_delegation_chain_on(&mut tx, permit)?;
         let parent_redemptions: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM chisei_external_action_redemptions WHERE permit_id=$1",
