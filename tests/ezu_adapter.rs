@@ -41,7 +41,12 @@ const ADAPTER: &str = "svc-ezu";
 const VEHICLE: &str = "vehicle";
 const FENCE: &str = "geofence";
 const ACTION: &str = "fleet.fence.alert";
-const LEASE_TTL_MS: i64 = 200;
+/// A lease that outlives any test. Steps refresh it, so a slow machine only
+/// delays a test; it never loses the lease.
+const HELD_TTL_MS: i64 = 60_000;
+/// A lease a test lets expire. Each step refreshes it, so it only has to
+/// outlast the pause between two steps.
+const EXPIRING_TTL_MS: i64 = 2_000;
 
 /// Plane RPCs the transport fails once, standing in for a crash.
 #[derive(Clone, Default)]
@@ -541,7 +546,16 @@ fn alerts() -> FenceBinding {
 }
 
 async fn geo_runner(plane: &Plane, feed: GeoFeed, owner: &str) -> Option<GeoFeedRunner> {
-    GeoFeedRunner::start(plane.as_principal(ADAPTER), feed, owner, LEASE_TTL_MS)
+    expiring_geo_runner(plane, feed, owner, HELD_TTL_MS).await
+}
+
+async fn expiring_geo_runner(
+    plane: &Plane,
+    feed: GeoFeed,
+    owner: &str,
+    ttl_ms: i64,
+) -> Option<GeoFeedRunner> {
+    GeoFeedRunner::start(plane.as_principal(ADAPTER), feed, owner, ttl_ms)
         .await
         .unwrap()
 }
@@ -565,7 +579,7 @@ async fn drain_fences(runner: &mut FenceRunner, ezu: &FakeEzu) {
 }
 
 async fn wait_for_lease_expiry() {
-    tokio::time::sleep(Duration::from_millis(LEASE_TTL_MS as u64 + 100)).await;
+    tokio::time::sleep(Duration::from_millis(EXPIRING_TTL_MS as u64 + 100)).await;
 }
 
 /// What Ezu must hold for the feed: every live vehicle the adapter can see.
@@ -587,7 +601,9 @@ async fn a_crash_mid_page_and_a_takeover_converge_and_the_old_runner_writes_noth
     for id in ["v1", "v2", "v3"] {
         plane.put(vehicle(id, &point(13.0, 52.0))).await;
     }
-    let mut first = geo_runner(&plane, vehicles(), "a").await.unwrap();
+    let mut first = expiring_geo_runner(&plane, vehicles(), "a", EXPIRING_TTL_MS)
+        .await
+        .unwrap();
     drain_geo(&mut first, &ezu).await;
     assert_eq!(ezu.live("vehicles"), expected(&plane, &["v1", "v2", "v3"]));
 
@@ -659,7 +675,9 @@ async fn changed_feed_settings_rewrite_unchanged_objects() {
     let mut v1 = vehicle("v1", &point(13.0, 52.0));
     v1.properties.insert("status".into(), "moving".into());
     plane.put(v1).await;
-    let mut runner = geo_runner(&plane, vehicles(), "a").await.unwrap();
+    let mut runner = expiring_geo_runner(&plane, vehicles(), "a", EXPIRING_TTL_MS)
+        .await
+        .unwrap();
     drain_geo(&mut runner, &ezu).await;
     plane.update("v1", "location", &point(13.1, 52.1)).await;
     drain_geo(&mut runner, &ezu).await;
@@ -692,7 +710,7 @@ async fn fence_events_submit_once_and_only_for_bound_plane_fences() {
     ezu.emit("f-ezu-only", "v1");
     ezu.emit("f-other-type", "v1");
     ezu.emit("f-plane", "v1");
-    let mut first = FenceRunner::start(plane.as_principal(ADAPTER), alerts(), "a", LEASE_TTL_MS)
+    let mut first = FenceRunner::start(plane.as_principal(ADAPTER), alerts(), "a", EXPIRING_TTL_MS)
         .await
         .unwrap()
         .unwrap();
@@ -705,7 +723,7 @@ async fn fence_events_submit_once_and_only_for_bound_plane_fences() {
     assert_eq!(plane.admitted().len(), 2);
 
     wait_for_lease_expiry().await;
-    let mut second = FenceRunner::start(plane.as_principal(ADAPTER), alerts(), "b", LEASE_TTL_MS)
+    let mut second = FenceRunner::start(plane.as_principal(ADAPTER), alerts(), "b", HELD_TTL_MS)
         .await
         .unwrap()
         .unwrap();
