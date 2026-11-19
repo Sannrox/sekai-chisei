@@ -190,4 +190,50 @@ mod tests {
         assert!(usage.contains("exchange"));
         assert!(usage.contains("peer-loss"));
     }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn file_parser_defaults_the_actor_and_refuses_bad_input() {
+        let parsed = parse_file(&args(&["--contract", "c.json"]), "--contract").unwrap();
+        assert_eq!(parsed.path, PathBuf::from("c.json"));
+        assert_eq!(parsed.actor, "operator");
+        let refused = |raw: &[&str]| parse_file(&args(raw), "--contract").err().unwrap();
+        assert_eq!(refused(&[]), "--contract is required");
+        assert_eq!(refused(&["--contract"]), "--contract requires a value");
+        assert_eq!(
+            refused(&["--envelope", "c.json"]),
+            "unknown option --envelope"
+        );
+        // A flag never takes the next flag as its value.
+        assert_eq!(
+            refused(&["--actor", "--contract", "c.json"]),
+            "--actor requires a value"
+        );
+    }
+
+    #[test]
+    fn contract_actor_parser_requires_both_flags_and_refuses_bad_input() {
+        let parsed =
+            parse_contract_actor(&args(&["--namespace", "ops", "--contract-id", "c-1"])).unwrap();
+        assert_eq!(parsed.namespace, "ops");
+        assert_eq!(parsed.contract_id, "c-1");
+        assert_eq!(parsed.actor, "operator");
+        let refused = |raw: &[&str]| parse_contract_actor(&args(raw)).err().unwrap();
+        assert_eq!(
+            refused(&["--contract-id", "c-1"]),
+            "--namespace is required"
+        );
+        assert_eq!(
+            refused(&["--namespace", "ops"]),
+            "--contract-id is required"
+        );
+        assert_eq!(
+            refused(&["--namespace", "ops", "--contract-id"]),
+            "--contract-id requires a value"
+        );
+        assert_eq!(refused(&["--ns", "ops"]), "unknown option --ns");
+    }
 }
