@@ -170,12 +170,31 @@ mod tests {
         path
     }
 
+    /// Run the adapter at `path`, retrying while exec reports the file busy:
+    /// another test thread forking between our write and our exec briefly
+    /// holds the script's write descriptor (ETXTBSY on Linux).
+    #[cfg(unix)]
+    fn run(path: &std::path::Path, timeout: std::time::Duration) -> Result<String, Box<dyn Error>> {
+        for _ in 0..50 {
+            match run_secret_command(path.to_str().unwrap(), "ref-1", timeout) {
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::ExecutableFileBusy) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+        run_secret_command(path.to_str().unwrap(), "ref-1", timeout)
+    }
+
     #[cfg(unix)]
     #[test]
     fn secret_command_returns_its_trimmed_value() {
         let adapter = script("ok", r#"printf '  value-for-%s \n' "$1""#);
-        let value =
-            run_secret_command(adapter.to_str().unwrap(), "ref-1", SECRET_COMMAND_TIMEOUT).unwrap();
+        let value = run(&adapter, SECRET_COMMAND_TIMEOUT).unwrap();
         assert_eq!(value, "value-for-ref-1");
     }
 
@@ -184,12 +203,7 @@ mod tests {
     fn a_hung_secret_command_is_killed_at_the_deadline() {
         let adapter = script("hang", "exec sleep 30");
         let started = std::time::Instant::now();
-        let error = run_secret_command(
-            adapter.to_str().unwrap(),
-            "ref-1",
-            std::time::Duration::from_millis(200),
-        )
-        .unwrap_err();
+        let error = run(&adapter, std::time::Duration::from_millis(200)).unwrap_err();
         assert!(error.to_string().contains("did not exit"), "{error}");
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
@@ -201,7 +215,7 @@ mod tests {
             "fail",
             "printf 'leaked-secret'\nprintf 'backend unreachable' >&2\nhead -c 4000 /dev/zero | tr '\\0' x >&2\nexit 3",
         );
-        let error = run_secret_command(adapter.to_str().unwrap(), "ref-1", SECRET_COMMAND_TIMEOUT)
+        let error = run(&adapter, SECRET_COMMAND_TIMEOUT)
             .unwrap_err()
             .to_string();
         assert!(error.contains("backend unreachable"), "{error}");
