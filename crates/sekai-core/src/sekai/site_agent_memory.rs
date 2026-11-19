@@ -415,8 +415,9 @@ pub fn restore_writer_instance(
     instance.parameters_json = restored;
     if let Some(offline) = instance.offline.as_mut()
         && let Some(stored) = offline.base_properties.get_mut(CONTENT_PROPERTY)
-        && stored.as_ref().is_none_or(|value| value.is_empty())
+        && stored.as_deref() == Some("")
     {
+        // Redaction only clears a present value, so a missing base stays missing.
         *stored = Some(content.to_string());
     }
     instance
@@ -1105,6 +1106,106 @@ mod tests {
         assert!(restored.erased_properties.is_empty());
         verify_writer_request_digest(&restored).unwrap();
         assert!(db.get_action_instance("forget-1").unwrap().is_none());
+    }
+
+    /// #2729: releasing a forget restores an offline base value the
+    /// redaction cleared and keeps a missing one missing.
+    #[test]
+    fn release_after_forget_restores_only_a_cleared_offline_base() {
+        for base in [None, Some("valve 3 sticks")] {
+            let db = setup();
+            let created = admit(
+                &db,
+                ACTION_CREATE,
+                json!({"object_id": "note-1", "instance_id": "line-7", "content": "valve 3 sticks"}),
+                "create",
+                AGENT,
+            )
+            .unwrap();
+            set_offline_base(&db, &created.instance.instance_id, base);
+            let previous = db.get_object("note-1").unwrap().unwrap();
+            let lease = AdmissionLease::first();
+            let mut forget = writer_action(
+                "forget-1",
+                ACTION_FORGET,
+                "forget-undo",
+                "",
+                STATUS_ADMITTED,
+            );
+            forget.admission_lease = Some(lease.clone());
+            db.put_action_instance(&forget).unwrap();
+            let mut forgotten = previous.clone();
+            forgotten.updated += 1;
+            forgotten
+                .properties
+                .insert(CONTENT_PROPERTY.into(), String::new());
+            forgotten
+                .properties
+                .insert(FORGOTTEN_PROPERTY.into(), "true".into());
+            db.apply_admission_object_write(
+                "forget-1",
+                &lease,
+                &ParkedGrantWrite::Update(forgotten.clone()),
+                Some(&previous),
+                &[],
+                AGENT,
+                &crate::sekai::audit::ChangeAttribution::default(),
+            )
+            .unwrap();
+
+            assert!(
+                db.release_admission(
+                    "forget-1",
+                    &lease,
+                    &AdmissionUndo::RestoreUpdate {
+                        previous: previous.clone(),
+                        applied_updated: forgotten.updated,
+                    },
+                    AGENT,
+                )
+                .unwrap()
+            );
+            let restored = db
+                .get_action_instance(&created.instance.instance_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                restored
+                    .offline
+                    .as_ref()
+                    .and_then(|offline| offline.base_properties.get(CONTENT_PROPERTY).cloned())
+                    .flatten()
+                    .as_deref(),
+                base
+            );
+        }
+    }
+
+    fn set_offline_base(db: &RuntimeDb, instance_id: &str, base: Option<&str>) {
+        let RuntimeDb::Sqlite(inner) = db else {
+            panic!("sqlite fixture");
+        };
+        let conn = inner.conn();
+        let body: String = conn
+            .query_row(
+                "SELECT body_json FROM sekai_action_instances WHERE instance_id = ?1",
+                [instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut instance: ActionInstance = serde_json::from_str(&body).unwrap();
+        instance.offline = Some(crate::sekai::offline_action::OfflineSubmission {
+            prepared_at_ms: 5,
+            base_updated_ms: 1,
+            base_properties: [(CONTENT_PROPERTY.into(), base.map(str::to_owned))].into(),
+            lease_id: String::new(),
+            device_id: String::new(),
+        });
+        conn.execute(
+            "UPDATE sekai_action_instances SET body_json = ?2 WHERE instance_id = ?1",
+            rusqlite::params![instance_id, serde_json::to_string(&instance).unwrap()],
+        )
+        .unwrap();
     }
 
     /// Undo restores the latest writer and leaves earlier writers erased.
