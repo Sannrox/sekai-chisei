@@ -568,6 +568,100 @@ fn postgres_concurrent_redeem_and_delegate_cannot_split_authority() {
     );
 }
 
+/// A delegation waits for the parent's permit lock and validates the chain after it, in
+/// the transaction that stores the child (#2719). The revoker holds that lock while its
+/// revocation is uncommitted, so a check made before the lock would still see a live parent.
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_delegation_validates_the_parent_in_the_storing_transaction() {
+    let db = Arc::new(postgres());
+    let prefix = format!("pg-revoke-{}", uuid::Uuid::new_v4().simple());
+    let record = authorization(&prefix, 10_000, 1);
+    let (root, key) = signed(&record, &format!("{prefix}-root"), &format!("{prefix}-n"));
+    persist_authorization(db.as_ref(), &record);
+    let policy = ExternalPermitPolicy {
+        scope: record.decision.policy_scope.clone(),
+        offline_action_types: vec!["repository.read/v1".into()],
+        offline_max_duration_ms: 2_000,
+        offline_max_invocations: 2,
+        permitted_delegators: vec![record.request.actor.clone()],
+        max_delegation_depth: 1,
+    };
+    db.set_external_permit_policy(&policy, 2_500).unwrap();
+    db.put_permit(&root, &format!("{prefix}-issue"), &record.request.actor)
+        .unwrap();
+    let child = delegate(
+        &root,
+        &policy,
+        &key,
+        Delegation {
+            delegator: &record.request.actor,
+            subject_actor: &format!("{prefix}-child"),
+            permit_id: format!("{prefix}-child"),
+            nonce: format!("{prefix}-child-n"),
+            now_ms: 3_000,
+            expires_at_ms: 8_000,
+            target_selectors: root.target_selectors.clone(),
+            allowed_effects: root.allowed_effects.clone(),
+            budget_micros: 5,
+            volume_limit: 512,
+            blast_radius_limit: 1,
+            max_invocations: 1,
+            risk_class: &root.risk_class,
+        },
+    )
+    .unwrap();
+
+    let mut revoker = db.connection().unwrap();
+    let mut revocation = revoker.transaction().unwrap();
+    let lock_key =
+        sekai_chisei::db::postgres::advisory_lock_key(&["external_action_permit", &root.permit_id]);
+    revocation
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&lock_key],
+        )
+        .unwrap();
+    revocation
+        .execute(
+            "INSERT INTO chisei_external_action_revocations(revocation_handle, reason, revoked_at_ms)
+             VALUES($1, 'root revoked', 2900)",
+            &[&root.revocation_handle],
+        )
+        .unwrap();
+    let delegate_db = Arc::clone(&db);
+    let delegated_child = child.clone();
+    let child_actor = record.request.actor.clone();
+    let delegation =
+        thread::spawn(move || delegate_db.put_delegated_permit(&delegated_child, &child_actor));
+    thread::sleep(std::time::Duration::from_millis(300));
+    revocation.commit().unwrap();
+    drop(revoker);
+
+    assert!(
+        delegation
+            .join()
+            .expect("delegate thread")
+            .unwrap_err()
+            .contains("revoked")
+    );
+    let stored: i64 = db
+        .connection()
+        .unwrap()
+        .query_one(
+            "SELECT COUNT(*) FROM chisei_external_action_delegated_permits WHERE permit_id = $1",
+            &[&child.permit_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, 0);
+    assert!(
+        db.get_decision(&format!("{}:audit:delegated", child.permit_id))
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_concurrent_redeems_serialize_ordinal_and_replay() {

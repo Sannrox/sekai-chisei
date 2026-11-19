@@ -464,12 +464,14 @@ impl ExternalPermitSekaiDbExt for SekaiDb {
         if permit.delegation_depth == 0 || permit.parent_permit_id.is_empty() {
             return Err("delegated permit must name its parent".into());
         }
-        self.validate_delegation_chain(permit)?;
         let json = serde_json::to_string(permit).map_err(|error| error.to_string())?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        // Validate under the write lock that stores the child, as redemption does, so a
+        // parent revoked after an earlier check cannot get a stored, audited child (#2719).
+        validate_delegation_chain_on(&tx, permit)?;
         let parent_redemptions: u32 = tx
             .query_row(
                 "SELECT COUNT(*) FROM chisei_external_action_redemptions WHERE permit_id=?1",
