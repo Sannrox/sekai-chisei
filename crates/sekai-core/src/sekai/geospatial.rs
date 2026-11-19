@@ -399,7 +399,12 @@ fn audit_query(
     now_ms: i64,
 ) -> Result<(), String> {
     db.record_decision(&Decision {
-        id: format!("geospatial.query:{}:{now_ms}", query.namespace),
+        // A query per millisecond is not unique; the UUID keeps each its own decision.
+        id: format!(
+            "geospatial.query:{}:{now_ms}:{}",
+            query.namespace,
+            uuid::Uuid::new_v4().simple()
+        ),
         timestamp: now_ms,
         actor: actor.to_string(),
         action: "geospatial.query".into(),
@@ -1059,6 +1064,37 @@ mod tests {
                 .iter()
                 .map(|hit| hit.id.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn two_queries_in_one_millisecond_record_two_decisions() {
+        let db = RuntimeDb::memory();
+        db.create_object(&site("berlin", "alice", BERLIN)).unwrap();
+        activate_policy(
+            &db,
+            "location-same-ms",
+            &[("location", PropertyGrantAccess::Read)],
+            false,
+        );
+        let query = point_query("distance", BERLIN, Some(1_000.0));
+        query_geospatial(&db, "alice", &query, 60).unwrap();
+        query_geospatial(&db, "alice", &query, 60).unwrap();
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                action: Some("geospatial.query".into()),
+                target_id: Some(query.namespace.clone()),
+                limit: 8,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert_ne!(decisions[0].id, decisions[1].id);
+        let prefix = format!("geospatial.query:{}:60:", query.namespace);
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.id.starts_with(&prefix))
         );
     }
 
