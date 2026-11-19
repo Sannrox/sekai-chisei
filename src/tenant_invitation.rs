@@ -709,10 +709,11 @@ mod tests {
                 SecretValue::new("token-aaaaaaaaaaaa"),
             )
             .unwrap();
-        assert!(matches!(
-            hooks.inspect_by_secret(raw.expose(), 1_200),
-            Err(InvitationError::NotFound) | Ok(_)
-        ));
+        // Inspecting a known secret past its expiry shows the invitation as
+        // expired; the secret still resolves.
+        let inspected = hooks.inspect_by_secret(raw.expose(), 1_200).unwrap();
+        assert_eq!(inspected.invitation_id, view.invitation_id);
+        assert_eq!(inspected.status, InvitationStatus::Expired);
         // After expiry materialization via accept
         let bob = human_context("bob");
         assert!(matches!(
