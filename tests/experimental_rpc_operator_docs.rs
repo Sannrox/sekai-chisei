@@ -35,20 +35,40 @@ fn names_rpc(text: &str, rpc: &str) -> bool {
     })
 }
 
-#[test]
-fn operator_docs_name_experimental_gate_when_they_name_gated_rpcs() {
-    let table = RpcMaturityTable::load().expect("maturity table");
-    let gated: Vec<&str> = table
+/// RPCs classified Experimental or Remove. Fails when there are none, so the
+/// doc checks cannot pass vacuously.
+fn gated_rpcs() -> Vec<String> {
+    let gated: Vec<String> = RpcMaturityTable::load()
+        .expect("maturity table")
         .entries
-        .iter()
+        .into_iter()
         .filter(|entry| {
             matches!(
                 entry.classification,
                 RpcClassification::Experimental | RpcClassification::Remove
             )
         })
-        .map(|entry| entry.rpc.as_str())
+        .map(|entry| entry.rpc)
         .collect();
+    assert!(!gated.is_empty(), "maturity table has no gated RPCs");
+    gated
+}
+
+/// Whether a Markdown table row has a cell reading `supported`, ignoring
+/// padding, case and `*`/`_` emphasis.
+fn row_claims_supported(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|')
+        && trimmed.split('|').any(|cell| {
+            cell.trim()
+                .trim_matches(['*', '_'])
+                .eq_ignore_ascii_case("supported")
+        })
+}
+
+#[test]
+fn operator_docs_name_experimental_gate_when_they_name_gated_rpcs() {
+    let gated = gated_rpcs();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut missing = Vec::new();
     for page in operator_pages(root) {
@@ -75,18 +95,7 @@ fn operator_docs_name_experimental_gate_when_they_name_gated_rpcs() {
 
 #[test]
 fn operator_docs_do_not_claim_supported_for_gated_rpcs() {
-    let table = RpcMaturityTable::load().expect("maturity table");
-    let gated: Vec<&str> = table
-        .entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.classification,
-                RpcClassification::Experimental | RpcClassification::Remove
-            )
-        })
-        .map(|entry| entry.rpc.as_str())
-        .collect();
+    let gated = gated_rpcs();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut bad = Vec::new();
     for page in operator_pages(root) {
@@ -98,13 +107,9 @@ fn operator_docs_do_not_claim_supported_for_gated_rpcs() {
             .unwrap_or(&page)
             .display()
             .to_string();
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if !trimmed.starts_with('|') || !trimmed.contains("| supported |") {
-                continue;
-            }
+        for line in text.lines().filter(|line| row_claims_supported(line)) {
             for rpc in &gated {
-                if names_rpc(trimmed, rpc) {
+                if names_rpc(line, rpc) {
                     bad.push(format!("{rel}: {rpc}"));
                 }
             }
@@ -114,4 +119,23 @@ fn operator_docs_do_not_claim_supported_for_gated_rpcs() {
         bad.is_empty(),
         "operator docs claim supported for gated RPCs: {bad:?}"
     );
+}
+
+#[test]
+fn supported_cells_match_through_padding_case_and_emphasis() {
+    for row in [
+        "| GetX | supported |",
+        "|GetX|  Supported  |",
+        "| GetX | **Supported** |",
+        "| GetX | _supported_ |",
+    ] {
+        assert!(row_claims_supported(row), "{row}");
+    }
+    for row in [
+        "| GetX | unsupported |",
+        "| GetX | supported behind the gate |",
+        "supported | GetX |",
+    ] {
+        assert!(!row_claims_supported(row), "{row}");
+    }
 }
