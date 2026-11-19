@@ -9,6 +9,8 @@ use sekai_chisei::sekai::attestation::{
 use sekai_chisei::sekai::audit::{Decision, DecisionFilter};
 use std::collections::HashMap;
 
+use crate::postgres_scratch::ScratchDatabase;
+
 trait DecisionHarness: DecisionBackend + AttestationBackend {}
 impl DecisionHarness for SekaiDb {}
 impl DecisionHarness for PostgresDb {}
@@ -29,6 +31,7 @@ fn decision(id: &str, actor: &str, action: &str, target: &str, ts: i64) -> Decis
     }
 }
 
+// Each backend starts empty, so every list below is exact.
 fn exercise(db: &dyn DecisionHarness, prefix: &str) {
     let a = decision(&format!("{prefix}-a"), "human:alice", "create", "obj-1", 10);
     let b = decision(&format!("{prefix}-b"), "human:bob", "update", "obj-1", 20);
@@ -90,7 +93,6 @@ fn exercise(db: &dyn DecisionHarness, prefix: &str) {
         })
         .unwrap()
         .into_iter()
-        .filter(|item| item.id.starts_with(prefix))
         .collect::<Vec<_>>();
     assert_eq!(
         by_actor
@@ -111,7 +113,6 @@ fn exercise(db: &dyn DecisionHarness, prefix: &str) {
         })
         .unwrap()
         .into_iter()
-        .filter(|item| item.id.starts_with(prefix))
         .map(|item| item.id)
         .collect::<Vec<_>>();
     assert_eq!(by_action, vec![d.id.clone(), a.id.clone()]);
@@ -127,7 +128,6 @@ fn exercise(db: &dyn DecisionHarness, prefix: &str) {
         })
         .unwrap()
         .into_iter()
-        .filter(|item| item.id.starts_with(prefix))
         .map(|item| item.id)
         .collect::<Vec<_>>();
     assert_eq!(by_target, vec![b.id.clone(), a.id.clone()]);
@@ -141,7 +141,6 @@ fn exercise(db: &dyn DecisionHarness, prefix: &str) {
         })
         .unwrap()
         .into_iter()
-        .filter(|item| item.id.starts_with(prefix))
         .map(|item| item.id)
         .collect::<Vec<_>>();
     // same-ms decisions stay ordered by insertion/seq
@@ -156,11 +155,10 @@ fn exercise(db: &dyn DecisionHarness, prefix: &str) {
         })
         .unwrap()
         .into_iter()
-        .filter(|item| item.id.starts_with(prefix))
         .map(|item| item.id)
         .collect::<Vec<_>>();
-    // page is filtered after global offset, so only assert size bound
-    assert!(page.len() <= 2);
+    // Newest first, same-ms ties by insertion: skip d, then take c and b.
+    assert_eq!(page, vec![c.id.clone(), b.id.clone()]);
 
     // optional attestation remains transactionally coupled
     let mut attested = decision(
@@ -224,22 +222,13 @@ fn sqlite_decision_conformance() {
     exercise(&db, "sqlite");
 }
 
-fn postgres() -> PostgresDb {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
-    } else {
-        PostgresDb::connect(&url, 8).unwrap()
-    }
-}
-
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_decision_conformance_and_restart() {
-    let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
-    exercise(&postgres(), &prefix);
-    let restarted = postgres();
+    let scratch = ScratchDatabase::create();
+    let prefix = "pg";
+    exercise(&scratch.connect(8), prefix);
+    let restarted = scratch.connect(8);
     assert_eq!(
         restarted
             .get_decision(&format!("{prefix}-a"))

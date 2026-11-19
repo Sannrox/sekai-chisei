@@ -1,8 +1,10 @@
 use sekai_chisei::db::action_governance::ActionGovernanceBackend;
-use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::sekai::action::RiskClass;
 use sekai_chisei::sekai::action_policy::{ActionDecision, ActionPolicy};
 use std::sync::{Arc, Barrier};
+
+use crate::postgres_scratch::ScratchDatabase;
 
 fn exercise(db: &dyn ActionGovernanceBackend, prefix: &str) {
     let namespace = format!("{prefix}-namespace");
@@ -27,7 +29,18 @@ fn exercise(db: &dyn ActionGovernanceBackend, prefix: &str) {
     db.upsert_action_policy(&actor_policy).unwrap();
     db.upsert_action_policy(&actor_policy).unwrap();
 
-    assert_eq!(db.list_action_policies().unwrap().len(), 3);
+    // Each backend starts empty, so the list is exactly these three scopes;
+    // the repeated actor upsert replaced its row instead of adding one.
+    let mut scopes: Vec<String> = db
+        .list_action_policies()
+        .unwrap()
+        .into_iter()
+        .map(|policy| policy.scope)
+        .collect();
+    scopes.sort();
+    let mut expected = vec![namespace.clone(), project.clone(), actor_scope.clone()];
+    expected.sort();
+    assert_eq!(scopes, expected);
     let resolved = db
         .resolve_action_policy(
             &format!("{prefix}-actor"),
@@ -53,22 +66,13 @@ fn sqlite_action_governance_conformance() {
     exercise(&SekaiDb::new(":memory:").unwrap(), "sqlite");
 }
 
-fn postgres() -> PostgresDb {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
-    } else {
-        PostgresDb::connect(&url, 8).unwrap()
-    }
-}
-
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_action_governance_conformance_and_restart() {
-    let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
-    exercise(&postgres(), &prefix);
-    let restarted = postgres();
+    let scratch = ScratchDatabase::create();
+    let prefix = "pg";
+    exercise(&scratch.connect(8), prefix);
+    let restarted = scratch.connect(8);
     assert_eq!(
         restarted
             .get_blast_radius(&format!("{prefix}-work"))
@@ -80,8 +84,9 @@ fn postgres_action_governance_conformance_and_restart() {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_blast_radius_updates_do_not_get_lost() {
-    let db = Arc::new(postgres());
-    let work = format!("race-{}", uuid::Uuid::new_v4().simple());
+    let scratch = ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let work = "race".to_string();
     let barrier = Arc::new(Barrier::new(9));
     let handles: Vec<_> = (0..8)
         .map(|_| {

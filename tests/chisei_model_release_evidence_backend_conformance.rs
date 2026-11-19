@@ -126,23 +126,18 @@ fn exercise(store: &ChiseiStore) {
     .unwrap();
     assert_eq!(exported.outcome, EvaluationOutcome::Passed);
 
-    model_release_evidence::record_model_release_feedback(
-        store,
-        ModelReleaseFeedback {
-            id: "fb-1".into(),
-            namespace: "sales".into(),
-            identity: identity(),
-            actor: "root".into(),
-            note: "latency within bound".into(),
-            recorded_at_ms: NOW_MS,
-        },
-    )
-    .unwrap();
+    let feedback = ModelReleaseFeedback {
+        id: "fb-1".into(),
+        namespace: "sales".into(),
+        identity: identity(),
+        actor: "root".into(),
+        note: "latency within bound".into(),
+        recorded_at_ms: NOW_MS,
+    };
+    model_release_evidence::record_model_release_feedback(store, feedback.clone()).unwrap();
     assert_eq!(
-        model_release_evidence::list_model_release_feedback(store, "sales")
-            .unwrap()
-            .len(),
-        1
+        model_release_evidence::list_model_release_feedback(store, "sales").unwrap(),
+        vec![feedback]
     );
 }
 
@@ -154,16 +149,9 @@ fn sqlite_model_release_evidence_conformance() {
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_model_release_evidence_backend_conformance() {
-    use sekai_chisei::db::postgres::PostgresDb;
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    let postgres = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-        PostgresDb::connect_with_ca_certificate(&url, 4, &std::fs::read(path).unwrap()).unwrap()
-    } else {
-        PostgresDb::connect(&url, 4).unwrap()
-    };
+    let scratch = crate::postgres_scratch::ScratchDatabase::create();
     let store = ChiseiStore::from_shared_runtime(std::sync::Arc::new(RuntimeDb::Postgres(
-        std::sync::Arc::new(postgres),
+        std::sync::Arc::new(scratch.connect(4)),
     )));
     exercise(&store);
 }
