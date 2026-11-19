@@ -419,6 +419,14 @@ impl AssertionAuthority {
         if assertion.nonce.is_empty() {
             return Err(AssertionReject::Replay);
         }
+        // One normalization point: identities downstream compare exactly, so a
+        // padded subject or act is a malformed issuer claim.
+        if std::iter::once(assertion.subject.as_str())
+            .chain(assertion.act.as_deref())
+            .any(|identity| identity.trim() != identity)
+        {
+            return Err(AssertionReject::Issuer);
+        }
         let device = assertion
             .device
             .as_ref()
@@ -672,6 +680,22 @@ mod tests {
             Some("tenant-test")
         );
         assert_eq!(context.contract_version, IDENTITY_EXTENSION_VERSION);
+    }
+
+    #[test]
+    fn padded_subject_or_act_is_refused() {
+        let authority = authority();
+        for (subject, act) in [(" subject-a", None), ("subject-a", Some("subject-a "))] {
+            let mut claims = claims(&uuid::Uuid::new_v4().to_string(), 100);
+            claims.subject = subject.into();
+            claims.act = act.map(Into::into);
+            let token = authority.sign(&claims).unwrap();
+            assert_eq!(
+                authority.verify(&token, 50, None).unwrap_err(),
+                AssertionReject::Issuer,
+                "{subject:?} / {act:?}"
+            );
+        }
     }
 
     #[test]
