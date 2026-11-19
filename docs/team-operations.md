@@ -54,7 +54,8 @@ both windows hold at least `--min-count` instances in its denominator
 (default 30) and the share moved by more than `--max-share-shift-bps`
 (default 1500); otherwise it is `stable` or `low_count`. `--fail-on-drift`
 exits non-zero after printing a report with a drifted series, so any
-scheduler can alert on it.
+scheduler can alert on it. An unknown or misspelled option fails instead of
+being ignored.
 
 Instances the caller may not read are excluded and counted as `withheld`.
 A window holding more than 4,096 instances, withheld ones included, fails

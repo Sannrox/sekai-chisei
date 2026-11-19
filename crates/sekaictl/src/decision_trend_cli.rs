@@ -379,24 +379,25 @@ async fn report_command(
     client: &mut SekaiServiceClient<GatewayClient>,
     args: &[String],
 ) -> Result<(), BoxErr> {
+    // A misspelled --fail-on-drift must fail, not silently turn off the alert.
+    let value_args: Vec<String> = args
+        .iter()
+        .filter(|arg| !SWITCHES.contains(&arg.as_str()))
+        .cloned()
+        .collect();
+    crate::value_flags::check_value_flags(&value_args, &VALUE_FLAGS)
+        .map_err(std::io::Error::other)?;
     let namespace = flag(args, "--namespace")
         .ok_or_else(|| std::io::Error::other("--namespace is required"))?;
     let window_ms = parse_duration_ms(
         &flag(args, "--window").ok_or_else(|| std::io::Error::other("--window is required"))?,
     )?;
-    let until_ms = match flag(args, "--until-ms") {
-        Some(value) => value.parse::<i64>()?,
-        None => chrono::Utc::now().timestamp_millis(),
-    };
+    let until_ms =
+        number_flag(args, "--until-ms")?.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let defaults = Thresholds::default();
     let thresholds = Thresholds {
-        min_count: flag(args, "--min-count")
-            .map(|value| value.parse())
-            .transpose()?
-            .unwrap_or(defaults.min_count),
-        max_share_shift_bps: flag(args, "--max-share-shift-bps")
-            .map(|value| value.parse())
-            .transpose()?
+        min_count: number_flag(args, "--min-count")?.unwrap_or(defaults.min_count),
+        max_share_shift_bps: number_flag(args, "--max-share-shift-bps")?
             .unwrap_or(defaults.max_share_shift_bps),
     };
     let report = decision_trend(client, &namespace, window_ms, until_ms, thresholds).await?;
@@ -491,6 +492,26 @@ fn render(report: &DecisionTrendReport) -> String {
         }
     }
     out
+}
+
+const VALUE_FLAGS: [&str; 6] = [
+    "--namespace",
+    "--window",
+    "--until-ms",
+    "--min-count",
+    "--max-share-shift-bps",
+    "--output",
+];
+const SWITCHES: [&str; 2] = ["--json", "--fail-on-drift"];
+
+fn number_flag<T: std::str::FromStr>(args: &[String], name: &str) -> Result<Option<T>, BoxErr> {
+    flag(args, name)
+        .map(|value| {
+            value.parse().map_err(|_| {
+                std::io::Error::other(format!("{name} {value} is not a number")).into()
+            })
+        })
+        .transpose()
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -648,10 +669,17 @@ mod tests {
             "--json",
         ]);
         report_command(&mut client, &check).await.unwrap();
-        let failed = report_command(&mut client, &[check, args(&["--fail-on-drift"])].concat())
+        let failed = report_command(
+            &mut client,
+            &[check.clone(), args(&["--fail-on-drift"])].concat(),
+        )
+        .await
+        .unwrap_err();
+        assert!(failed.to_string().contains("series drifted"), "{failed}");
+        let misspelled = report_command(&mut client, &[check, args(&["--fail-on-drft"])].concat())
             .await
             .unwrap_err();
-        assert!(failed.to_string().contains("series drifted"), "{failed}");
+        assert_eq!(misspelled.to_string(), "unknown option --fail-on-drft");
     }
 
     /// A verifier who fetched the listed instances, in any order, recomputes
