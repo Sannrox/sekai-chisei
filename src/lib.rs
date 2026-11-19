@@ -1,5 +1,6 @@
 pub mod action_cli;
 pub mod attest_cli;
+pub mod audit_export_cli;
 pub mod autonomous_envelope_cli;
 pub mod budget_cli;
 pub mod build_info {

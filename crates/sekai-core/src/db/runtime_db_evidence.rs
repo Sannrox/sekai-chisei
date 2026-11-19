@@ -316,6 +316,28 @@ impl RuntimeDb {
         }
     }
 
+    /// One page of `namespace`'s audit export after `cursor`, verified
+    /// against the chain (#2638).
+    pub fn export_namespace_audit(
+        &self,
+        namespace: &str,
+        cursor: Option<&crate::sekai::audit_export::AuditCursor>,
+        page_size: usize,
+    ) -> Result<
+        crate::sekai::audit_export::AuditExportPage,
+        crate::sekai::audit_export::AuditExportError,
+    > {
+        use crate::sekai::audit_export::{AuditExportError, SCAN_BUDGET, walk};
+        let snapshot = match self {
+            Self::Sqlite(db) => db.audit_chain_snapshot(cursor, SCAN_BUDGET),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.audit_chain_snapshot(cursor, SCAN_BUDGET))
+            }
+        }
+        .map_err(AuditExportError::Store)?;
+        walk(cursor, snapshot, namespace, page_size)
+    }
+
     pub fn get_decision(&self, id: &str) -> Result<Option<Decision>, String> {
         match self {
             Self::Sqlite(db) => db.get_decision(id),

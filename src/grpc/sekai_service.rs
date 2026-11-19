@@ -111,6 +111,8 @@ use support_credentials::*;
 pub(in crate::grpc) use support_credentials::enforce_namespace_tenant_context_for;
 #[path = "sekai_service_rpc_actions.rs"]
 mod rpc_actions;
+#[path = "sekai_service_rpc_audit_export.rs"]
+mod rpc_audit_export;
 #[path = "sekai_service_rpc_coordination.rs"]
 mod rpc_coordination;
 #[path = "sekai_service_rpc_data.rs"]
@@ -276,6 +278,7 @@ impl SekaiService for SekaiServiceImpl {
         get_model_version => get_model_version_rpc(GetModelVersionRequest) -> GetModelVersionResponse;
         rebase_definition_branch => rebase_definition_branch_rpc(RebaseDefinitionBranchRequest) -> RebaseDefinitionBranchResponse;
         set_definition_branch_archived => set_definition_branch_archived_rpc(SetDefinitionBranchArchivedRequest) -> SetDefinitionBranchArchivedResponse;
+        export_namespace_audit => export_namespace_audit_rpc(ExportNamespaceAuditRequest) -> ExportNamespaceAuditResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;

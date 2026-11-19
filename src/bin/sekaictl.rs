@@ -84,6 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             sekai_chisei::compliance_cli::run_compliance_command(args.into_iter().skip(1).collect())
                 .await
         }
+        "audit" => {
+            sekai_chisei::audit_export_cli::run_audit_command(args.into_iter().skip(1).collect())
+                .await
+        }
         "receipts" => {
             sekai_chisei::receipt_chain_cli::run_receipts_command(
                 args.into_iter().skip(1).collect(),
@@ -411,6 +415,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("assurance"), Some("attest")) => ("attest", 3),
         (Some("assurance"), Some("compliance")) => ("compliance", 3),
         (Some("assurance"), Some("receipts")) => ("receipts", 3),
+        (Some("assurance"), Some("audit")) => ("audit", 3),
         (Some("assurance"), Some("probes")) => ("probes", 3),
         (Some("assurance"), Some("provenance")) => ("provenance", 3),
         (Some("assurance"), Some("replay")) => ("replay", 3),
@@ -607,7 +612,7 @@ fn print_admin_usage() {
            sekaictl admin evaluation plan ...\n\
          \n\
          Assurance:\n\
-           sekaictl admin assurance <attest|compliance|provenance|replay|receipts|probes> ...\n\
+           sekaictl admin assurance <attest|audit|compliance|provenance|replay|receipts|probes> ...\n\
          \n\
          Federation:\n\
            sekaictl admin federation ...\n\
@@ -719,6 +724,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "attest" => Some(sekai_chisei::attest_cli::usage().to_string()),
         "compliance" => Some(sekai_chisei::compliance_cli::usage().to_string()),
         "receipts" => Some(sekai_chisei::receipt_chain_cli::usage().to_string()),
+        "audit" => Some(sekai_chisei::audit_export_cli::usage().to_string()),
         "probes" => Some(sekai_chisei::probe_cli::usage().to_string()),
         "provenance" => Some("usage: sekaictl admin assurance provenance <work-unit>".to_string()),
         "replay" => Some(sekai_chisei::replay_cli::usage().to_string()),
@@ -855,6 +861,7 @@ mod tests {
             (vec!["assurance", "attest"], "attest"),
             (vec!["assurance", "compliance"], "compliance"),
             (vec!["assurance", "receipts"], "receipts"),
+            (vec!["assurance", "audit"], "audit"),
             (vec!["assurance", "probes"], "probes"),
             (vec!["assurance", "provenance"], "provenance"),
             (vec!["assurance", "replay"], "replay"),
@@ -917,6 +924,7 @@ mod tests {
             "attest",
             "compliance",
             "receipts",
+            "audit",
             "provenance",
             "replay",
             "federation",

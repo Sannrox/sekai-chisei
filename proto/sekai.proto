@@ -2596,6 +2596,49 @@ message QueryObjectPolicyAuditResponse {
   repeated ObjectPolicyAuditEvent events = 1;
   bytes export_json = 2;
 }
+// Experimental (#2638): one page of a namespace's audit decisions, in chain
+// order, resumable from an opaque cursor. Needs namespace admin; every call
+// is itself recorded as an audit decision in that namespace.
+message ExportNamespaceAuditRequest {
+  string namespace = 1;
+  // Empty starts at the oldest retained decision; otherwise next_cursor of
+  // the previous page.
+  string cursor = 2;
+  // Records per page; 0 means 100, at most 1000.
+  uint32 page_size = 3;
+}
+// A chained decision with every input of its entry hash, so a reader can
+// recompute it.
+message AuditExportRecord {
+  int64 seq = 1;
+  string prev_hash = 2;
+  string entry_hash = 3;
+  string id = 4;
+  int64 timestamp = 5;
+  string actor = 6;
+  string action = 7;
+  string reason = 8;
+  // The hashed evidence text, byte for byte.
+  string evidence_json = 9;
+  string target_id = 10;
+  string outcome = 11;
+}
+message ExportNamespaceAuditResponse {
+  repeated AuditExportRecord records = 1;
+  string next_cursor = 2;
+  // Nonzero when decisions through this seq were archived by retention
+  // before this page could read them.
+  int64 archived_through_seq = 3;
+  // The plane verified every chain entry after verified_from_seq through
+  // verified_through_seq, other namespaces' entries included; the gaps
+  // between returned seqs are those entries.
+  int64 verified_from_seq = 4;
+  string verified_from_hash = 5;
+  int64 verified_through_seq = 6;
+  string verified_through_hash = 7;
+  // The page reached the ledger head; a later call returns newer decisions.
+  bool caught_up = 8;
+}
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -6128,6 +6171,7 @@ service SekaiService {
   rpc SimulateObjectPolicyChange(SimulateObjectPolicyChangeRequest) returns (SimulateObjectPolicyChangeResponse);
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
+  rpc ExportNamespaceAudit(ExportNamespaceAuditRequest) returns (ExportNamespaceAuditResponse);
   rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
   rpc GetCatalogEntryLineage(GetCatalogEntryLineageRequest) returns (GetCatalogEntryLineageResponse);
   rpc ListCatalogCriticalityOutbox(ListCatalogCriticalityOutboxRequest) returns (ListCatalogCriticalityOutboxResponse);

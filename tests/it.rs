@@ -19,6 +19,7 @@ mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
 mod action_policy_dry_run_backend_conformance;
 mod agent_instruction_sync;
+mod audit_export_conformance;
 mod binary_argument_refusal;
 mod capability_authoring;
 mod capability_package_backend_conformance;
