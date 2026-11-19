@@ -30,6 +30,14 @@ pub fn handle(pkg_version: &'static str) -> &'static PrometheusHandle {
             "sekai_search_index_lag_ms",
             "Maximum search index lag across namespaces"
         );
+        describe_gauge!(
+            "sekai_embedding_index_lag_ms",
+            "Age of the oldest object change an embedding catch-up consumed"
+        );
+        describe_gauge!(
+            "sekai_object_log_ingest_backlog",
+            "Admitted objects still waiting to reach the object log"
+        );
         crate::signals::describe_all();
         gauge!(
             "sekai_build_info",
@@ -79,4 +87,33 @@ pub fn spawn_upkeep_task(pkg_version: &'static str) {
             handle.run_upkeep();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each metric this module emits carries HELP text in a scrape.
+    #[test]
+    fn every_emitted_metric_is_described() {
+        // Same version as the build-info test: the recorder is process-global.
+        let handle = handle("9.9.9-test");
+        record_db_lock_poisoned();
+        set_search_index_lag_ms(1);
+        set_embedding_index_lag_ms(1);
+        set_object_log_ingest_backlog(1);
+        let rendered = handle.render();
+        for name in [
+            "sekai_build_info",
+            "db_lock_poisoned_total",
+            "sekai_search_index_lag_ms",
+            "sekai_embedding_index_lag_ms",
+            "sekai_object_log_ingest_backlog",
+        ] {
+            assert!(
+                rendered.contains(&format!("# HELP {name} ")),
+                "{name} has no HELP text:\n{rendered}"
+            );
+        }
+    }
 }
