@@ -14,6 +14,34 @@ impl RuntimeDb {
         }
     }
 
+    pub fn insert_governed_image(
+        &self,
+        image: &crate::sekai::image::GovernedImage,
+    ) -> Result<Option<crate::sekai::image::GovernedImage>, String> {
+        match self {
+            Self::Sqlite(db) => db.insert_governed_image(image),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.insert_governed_image(image))
+            }
+        }
+    }
+
+    pub fn update_governed_image(
+        &self,
+        namespace: &str,
+        image_id: &str,
+        update: impl FnOnce(
+            crate::sekai::image::GovernedImage,
+        ) -> Result<crate::sekai::image::GovernedImage, String>,
+    ) -> Result<crate::sekai::image::GovernedImage, String> {
+        match self {
+            Self::Sqlite(db) => db.update_governed_image(namespace, image_id, update),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.update_governed_image(namespace, image_id, update)
+            }),
+        }
+    }
+
     pub fn get_governed_image(
         &self,
         namespace: &str,

@@ -162,9 +162,81 @@ fn exercise(db: &RuntimeDb) {
     );
 }
 
+/// Insert-or-read and the transactional lifecycle update (#2717).
+fn exercise_atomic_writes(db: &RuntimeDb) {
+    let id = "img:atomic";
+    let first = GovernedImage {
+        image_id: id.into(),
+        ..image("analyst")
+    };
+    assert_eq!(db.insert_governed_image(&first).unwrap(), None);
+    let retitled = GovernedImage {
+        title: "second".into(),
+        ..first.clone()
+    };
+    assert_eq!(
+        db.insert_governed_image(&retitled).unwrap(),
+        Some(first.clone())
+    );
+
+    assert_eq!(
+        db.update_governed_image("records", "img:missing", Ok)
+            .unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert_eq!(
+        db.update_governed_image("records", id, |mut image| {
+            image.owner = "other".into();
+            Ok(image)
+        })
+        .unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert_eq!(
+        db.update_governed_image("records", id, |_| Err("refused".into()))
+            .unwrap_err(),
+        "refused"
+    );
+    assert_eq!(
+        db.get_governed_image("records", id).unwrap(),
+        Some(first.clone())
+    );
+
+    db.put_governed_image_rendition(&ImageRendition {
+        image_id: id.into(),
+        ..rendition()
+    })
+    .unwrap();
+    db.put_governed_image_annotation(&ImageAnnotation {
+        image_id: id.into(),
+        ..annotation()
+    })
+    .unwrap();
+    let deleted = db
+        .update_governed_image("records", id, |mut image| {
+            image.deleted_at_ms = 4_000;
+            Ok(image)
+        })
+        .unwrap();
+    assert_eq!(deleted.deleted_at_ms, 4_000);
+    assert_eq!(db.get_governed_image("records", id).unwrap(), Some(deleted));
+    assert!(
+        db.list_governed_image_renditions("records", id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.list_governed_image_annotations("records", id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn sqlite_governed_image_backend_conformance() {
-    exercise(&RuntimeDb::memory());
+    let db = RuntimeDb::memory();
+    exercise(&db);
+    exercise_atomic_writes(&db);
 }
 
 #[test]
@@ -173,4 +245,5 @@ fn postgres_governed_image_backend_conformance() {
     let scratch = ScratchDatabase::create();
     let db = RuntimeDb::Postgres(Arc::new(scratch.connect(8)));
     exercise(&db);
+    exercise_atomic_writes(&db);
 }
