@@ -505,3 +505,66 @@ fn a_retry_after_an_audit_failure_records_the_audit_once() {
         );
     }
 }
+
+fn record_second_learning(db: &ChiseiStore) {
+    record_learning(
+        db.runtime(),
+        &SchemaRegistry::new(),
+        &HashMap::from([
+            ("id".into(), "learning-2".into()),
+            ("target_id".into(), "target-1".into()),
+            ("title".into(), "Bound the batch".into()),
+            ("prevention".into(), "Cap the page size".into()),
+            ("reasoning".into(), "An unbounded page timed out".into()),
+            ("source_request_id".into(), "request-43".into()),
+            ("score".into(), "60".into()),
+            ("passed".into(), "false".into()),
+            ("task_class".into(), "reasoning".into()),
+            ("model".into(), "judge-model".into()),
+            ("producer".into(), "scoring-job".into()),
+            ("status".into(), "candidate".into()),
+        ]),
+        "worker-1",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_learning_baseline_is_its_own_previously_active_candidate() {
+    let db = db();
+    record_candidate(&db);
+    record_second_learning(&db);
+    let first = propose(&db, 1_000);
+    assert_eq!(first.baseline_digest, "");
+
+    // Activating another learning in the namespace leaves this one's
+    // baseline alone, so an unchanged re-proposal replays.
+    let other = ProposeLearningChange {
+        namespace: "payments".into(),
+        learning_id: "learning-2".into(),
+        evidence_digest: evidence(),
+    };
+    propose_change(&db, "operator", &other, 1_100).unwrap();
+    approve_change(&db, "reviewer", "payments", "learning-2", 1_200).unwrap();
+    activate_change(&db, "operator", "payments", "learning-2", 1_300).unwrap();
+    let replay = propose(&db, 1_400);
+    assert_eq!(replay.baseline_digest, "");
+    assert_eq!(replay.updated_at_ms, first.updated_at_ms);
+    assert_eq!(replay.lineage, first.lineage);
+
+    // After this learning was active and rolled back, its baseline is the
+    // candidate it had while active.
+    approve_change(&db, "reviewer", "payments", "learning-1", 2_000).unwrap();
+    activate_change(&db, "operator", "payments", "learning-1", 3_000).unwrap();
+    rollback_change(&db, "operator", "payments", "learning-1", 4_000).unwrap();
+    let reproposed = propose(&db, 5_000);
+    assert_eq!(reproposed.baseline_digest, first.candidate_digest);
+    assert!(
+        !inspect_change(&db, "payments", "learning-1")
+            .unwrap()
+            .changed
+    );
+    let replay = propose(&db, 5_100);
+    assert_eq!(replay.updated_at_ms, 5_000);
+    assert_eq!(replay.baseline_digest, first.candidate_digest);
+}
