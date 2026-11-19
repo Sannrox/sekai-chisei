@@ -64,6 +64,7 @@ pub(super) async fn get_ontology_health(
         )?;
         (vec![input.namespace], true)
     };
+    let rows = HealthRows::load(service.db.runtime())?;
     let mut scored = Vec::new();
     for namespace in namespaces {
         let lint_request = Request::from_parts(
@@ -78,6 +79,7 @@ pub(super) async fn get_ontology_health(
             service,
             &principals,
             tenant_context.as_ref(),
+            &rows,
             &namespace,
             lint_request,
         )
@@ -104,16 +106,75 @@ struct Scored {
     inputs: ScoreInputs,
 }
 
+/// The store-wide dataset and grant rows health scoring reads, with the
+/// objects they point at, read once per request and filtered per namespace in
+/// memory.
+struct HealthRows {
+    /// Each dataset with the namespace of the object it is bound to; `None`
+    /// when it is unbound or the object is gone.
+    datasets: Vec<(crate::sekai::dataset::Dataset, Option<String>)>,
+    /// Grants with their target objects (`None` when gone), read on first
+    /// use: only a namespace administrator's access part needs them.
+    grants: std::sync::OnceLock<GrantRows>,
+}
+
+struct GrantRows {
+    grants: Vec<crate::sekai::security::Grant>,
+    targets: HashMap<String, Option<domain::Object>>,
+}
+
+impl HealthRows {
+    fn load(db: &RuntimeDb) -> Result<Self, Status> {
+        let mut datasets = Vec::new();
+        let mut bound: HashMap<String, Option<String>> = HashMap::new();
+        for dataset in db.list_datasets().map_err(Status::internal)? {
+            let namespace = match bound.get(&dataset.object_id) {
+                _ if dataset.object_id.is_empty() => None,
+                Some(namespace) => namespace.clone(),
+                None => {
+                    let namespace = db
+                        .get_object(&dataset.object_id)
+                        .map_err(Status::internal)?
+                        .map(|object| object.namespace);
+                    bound.insert(dataset.object_id.clone(), namespace.clone());
+                    namespace
+                }
+            };
+            datasets.push((dataset, namespace));
+        }
+        Ok(Self {
+            datasets,
+            grants: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn grants(&self, db: &RuntimeDb) -> Result<&GrantRows, Status> {
+        if let Some(rows) = self.grants.get() {
+            return Ok(rows);
+        }
+        let grants = db.list_all_grants().map_err(Status::internal)?;
+        let mut targets = HashMap::new();
+        for grant in &grants {
+            if !targets.contains_key(&grant.object_id) {
+                let target = db.get_object(&grant.object_id).map_err(Status::internal)?;
+                targets.insert(grant.object_id.clone(), target);
+            }
+        }
+        Ok(self.grants.get_or_init(|| GrantRows { grants, targets }))
+    }
+}
+
 async fn namespace_parts(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
+    rows: &HealthRows,
     namespace: &str,
     lint_request: Request<GetOntologyLintReportRequest>,
 ) -> Result<Scored, Status> {
     let db = service.db.runtime();
     let (datasets, datasets_complete) =
-        dataset_signals(service, principals, tenant_context, namespace)?;
+        dataset_signals(service, principals, tenant_context, rows, namespace)?;
     let mut parts = vec![
         ontology_health::freshness(&datasets, datasets_complete),
         ontology_health::quality(&datasets, datasets_complete),
@@ -182,7 +243,7 @@ async fn namespace_parts(
     });
     // Trust scores are computed per object on request and not stored.
     parts.push(Part::unavailable(PART_TRUST, "not_stored"));
-    parts.push(access_part(service, principals, namespace)?);
+    parts.push(access_part(service, principals, rows, namespace)?);
     let (sources, sources_complete) = source_reports(db, namespace, now_millis())?;
     parts.push(ontology_health::source(&sources, sources_complete));
     Ok(Scored {
@@ -316,21 +377,32 @@ fn dataset_readable(
     namespace: &str,
     dataset: &crate::sekai::dataset::Dataset,
 ) -> Result<bool, Status> {
-    let db = service.db.runtime();
     let in_namespace = !dataset.object_id.is_empty()
-        && db
+        && service
+            .db
+            .runtime()
             .get_object(&dataset.object_id)
             .map_err(Status::internal)?
             .is_some_and(|object| object.namespace == namespace);
-    Ok(in_namespace
-        && check_dataset_access(db, &service.security, principals, dataset, false).is_ok()
+    Ok(in_namespace && dataset_visible(service, principals, tenant_context, dataset))
+}
+
+/// Whether the caller may see `dataset`, as `ListDatasets` would show it.
+fn dataset_visible(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    dataset: &crate::sekai::dataset::Dataset,
+) -> bool {
+    let db = service.db.runtime();
+    check_dataset_access(db, &service.security, principals, dataset, false).is_ok()
         && catalog_binding_discoverable(
             db,
             &service.security,
             tenant_context,
             &dataset.object_id,
             principals,
-        ))
+        )
 }
 
 /// Visible datasets bound into `namespace`, as `ListDatasets` shows them,
@@ -339,6 +411,7 @@ fn dataset_signals(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
+    rows: &HealthRows,
     namespace: &str,
 ) -> Result<(Vec<DatasetSignals>, bool), Status> {
     use crate::sekai::dataset_health::{
@@ -346,8 +419,10 @@ fn dataset_signals(
     };
     let db = service.db.runtime();
     let mut signals = Vec::new();
-    for dataset in db.list_datasets().map_err(Status::internal)? {
-        if !dataset_readable(service, principals, tenant_context, namespace, &dataset)? {
+    for (dataset, bound) in &rows.datasets {
+        if bound.as_deref() != Some(namespace)
+            || !dataset_visible(service, principals, tenant_context, dataset)
+        {
             continue;
         }
         if signals.len() == MAX_HEALTH_DATASETS {
@@ -394,7 +469,7 @@ fn dataset_signals(
                 .map_err(Status::internal)?
                 .quarantined
                 || failed(false),
-            id: dataset.id,
+            id: dataset.id.clone(),
         });
     }
     Ok((signals, true))
@@ -416,6 +491,7 @@ fn bound_target(object: &domain::Object) -> BoundTarget {
 fn access_part(
     service: &SekaiServiceImpl,
     principals: &[String],
+    rows: &HealthRows,
     namespace: &str,
 ) -> Result<Part, Status> {
     let db = service.db.runtime();
@@ -433,13 +509,16 @@ fn access_part(
     let mut targets: HashMap<String, Option<bool>> = HashMap::new();
     let mut grants = Vec::new();
     let mut complete = true;
-    for grant in db.list_all_grants().map_err(Status::internal)? {
+    let rows = rows.grants(db)?;
+    for grant in &rows.grants {
         let visible = match targets.get(&grant.object_id) {
             Some(visible) => *visible,
             None => {
-                let visible = db
-                    .get_object(&grant.object_id)
-                    .map_err(Status::internal)?
+                let visible = rows
+                    .targets
+                    .get(&grant.object_id)
+                    .cloned()
+                    .flatten()
                     .filter(|target| target.namespace == namespace || target.id == boundary.id)
                     .map(|target| {
                         let tier = if target.kind == "namespace" {
@@ -459,7 +538,7 @@ fn access_part(
             None => {}
             Some(false) => complete = false,
             Some(true) if grants.len() == MAX_HEALTH_GRANTS => complete = false,
-            Some(true) => grants.push(grant),
+            Some(true) => grants.push(grant.clone()),
         }
     }
     let require_terms = db
@@ -688,7 +767,16 @@ async fn score_as_caller(
             branch_id: String::new(),
         },
     );
-    namespace_parts(service, principals, tenant_context, namespace, lint_request).await
+    let rows = HealthRows::load(service.db.runtime())?;
+    namespace_parts(
+        service,
+        principals,
+        tenant_context,
+        &rows,
+        namespace,
+        lint_request,
+    )
+    .await
 }
 
 /// `RecordOntologyHealthSnapshot` (#1694): scores the namespace as its
