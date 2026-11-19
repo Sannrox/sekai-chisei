@@ -7047,6 +7047,49 @@ mod tests {
         assert_eq!(second[0].trigger_ref, "2");
     }
 
+    /// #3092: replica A dies holding an uncommitted tick (its backend is
+    /// terminated), and replica B on its own pool admits that bucket once.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_a_replica_killed_mid_tick_leaves_its_bucket_to_the_survivor() {
+        let scratch = ScratchDatabase::create();
+        let a = std::sync::Arc::new(scratch.connect());
+        let b = scratch.connect();
+        a.create_dataset(&dataset("in")).unwrap();
+        a.create_dataset(&dataset("out")).unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        a.put_governed_transform(&transform.prepare().unwrap(), 10)
+            .unwrap();
+        let (ready, wait_ready) = std::sync::mpsc::sync_channel(1);
+        let holder = {
+            let a = a.clone();
+            std::thread::spawn(move || {
+                let mut connection = a.connection().unwrap();
+                let mut tx = connection.transaction().unwrap();
+                let admitted = tick_governed_transforms_pg(&mut tx, 1_500).unwrap();
+                let pid: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).unwrap().get(0);
+                ready.send((pid, admitted.len())).unwrap();
+                let _ = tx.batch_execute("SELECT pg_sleep(30)");
+            })
+        };
+        let (pid, admitted) = wait_ready.recv().unwrap();
+        assert_eq!(admitted, 1);
+        let terminated: bool = b
+            .connection()
+            .unwrap()
+            .query_one("SELECT pg_terminate_backend($1, 5000)", &[&pid])
+            .unwrap()
+            .get(0);
+        assert!(terminated);
+        holder.join().unwrap();
+        let survivor = b.tick_governed_transforms(1_600).unwrap();
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor[0].trigger_ref, "1");
+        assert_eq!(b.list_governed_transform_runs("ops", 10).unwrap().len(), 1);
+    }
+
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
     fn postgres_concurrent_first_registrations_record_one_replacement() {

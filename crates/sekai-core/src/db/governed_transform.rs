@@ -9584,6 +9584,32 @@ mod tests {
         assert_ne!(second[0].run_id, first[0].run_id);
     }
 
+    /// #3092: a replica that dies inside the tick transaction admits
+    /// nothing, and the next tick admits that bucket once.
+    #[test]
+    fn a_tick_that_dies_before_commit_leaves_its_bucket_to_the_next() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        let mut transform = projection("t1", "in", "out");
+        transform.schedule = Some(TransformSchedule { every_ms: 1_000 });
+        transform.definition_digest.clear();
+        db.put_governed_transform(&transform.prepare().unwrap(), 10)
+            .unwrap();
+        {
+            let mut conn = db.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(tick_governed_transforms_tx(&tx, 1_500).unwrap().len(), 1);
+            // Dropped uncommitted, as a crash leaves it.
+        }
+        let survivor = db.tick_governed_transforms(1_600).unwrap();
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor[0].trigger_ref, "1");
+        assert_eq!(db.list_governed_transform_runs("ops", 10).unwrap().len(), 1);
+    }
+
     #[test]
     fn schedule_partitioned_run_records_partition_digest() {
         let db = db();

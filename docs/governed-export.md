@@ -141,7 +141,8 @@ deliver. The plane holds no destination credentials.
   against. A definition saved anew under the same id meanwhile is kept.
 - A definition with `every_ms` greater than zero joins the transform
   schedule graph ([ADR 0103](decisions/0103-transform-schedule-and-dependency-graph.md)).
-  `TickGovernedTransforms` admits one run per due bucket for its owner,
+  The schedule tick every plane runs (and `TickGovernedTransforms` on
+  demand) admits one run per due bucket for its owner,
   the same way it admits a due transform: a replica tick is idempotent, and
   a revoked export grant fails that run closed with a receipt.
 - Delivery is claimable work, the `export_delivery` kind of the one work

@@ -116,7 +116,7 @@ mod rpc_audit_export;
 #[path = "sekai_service_rpc_coordination.rs"]
 mod rpc_coordination;
 #[path = "sekai_service_rpc_data.rs"]
-mod rpc_data;
+pub(crate) mod rpc_data;
 #[path = "sekai_service_rpc_definition_package.rs"]
 mod rpc_definition_package;
 #[path = "sekai_service_rpc_definition_rebase.rs"]

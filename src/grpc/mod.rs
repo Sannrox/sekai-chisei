@@ -1965,6 +1965,7 @@ fn spawn_service_background_tasks(
         spawn_execution_evidence_reconciler(db.clone());
         spawn_security_reopener(db.clone(), sekai_svc.clone());
         spawn_search_catch_up(db.clone());
+        spawn_schedule_tick(sekai_svc.clone());
     }
     if plane == ProcessPlane::Combined
         && let Some(clerk) = &sekai_svc.cross_store
@@ -2256,6 +2257,35 @@ fn spawn_retention_tick(db: Arc<RuntimeDb>, stores: Arc<CombinedStoreLayout>) {
                 }
                 Err(error) => {
                     tracing::error!(%error, "retention tick task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+            }
+        }
+    });
+}
+
+/// The actor the background schedule tick admits work as.
+const SCHEDULE_TICK_ACTOR: &str = "system:transform-scheduler";
+
+/// Run the schedule graph once a minute on every Sekai instance (#3092), the
+/// body `TickGovernedTransforms` runs: due transform runs, health checks,
+/// export schedules, agent wakes, the scratch sweep and quota releases. No
+/// leader: each due bucket is claimed in the store, so instances ticking at
+/// once admit it once, and a tick that dies before its claim commits leaves
+/// the bucket to the next one. Missed ticks delay rather than burst.
+fn spawn_schedule_tick(sekai: Arc<sekai_service::SekaiServiceImpl>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let pass = JobPass::start(JobKind::ScheduleTick);
+            let now = chrono::Utc::now().timestamp_millis();
+            match sekai_service::rpc_data::run_schedule_tick(&sekai, now, SCHEDULE_TICK_ACTOR).await
+            {
+                Ok(runs) => pass.finish(JobOutcome::Ok, runs.len() as u64),
+                Err(error) => {
+                    tracing::error!(error = %error.message(), "schedule tick failed");
                     pass.finish(JobOutcome::Failed, 0);
                 }
             }

@@ -5465,6 +5465,30 @@ pub(super) async fn tick_governed_transforms(
             now_millis()
         }
     };
+    let runs = run_schedule_tick(service, now_ms, &actor).await?;
+    let runs = runs
+        .iter()
+        .map(|run| {
+            let reveal = caller_can_read_run_datasets(service, &principals, run);
+            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
+        })
+        .collect::<Result<_, Status>>()?;
+    Ok(Response::new(TickGovernedTransformsResponse { runs }))
+}
+
+/// One pass of the schedule graph at `now_ms`, acting as `actor`: due
+/// transform runs, export schedules, agent wakes, the scratch sweep,
+/// quota releases, pending usage, and the health and Source members.
+/// The `TickGovernedTransforms` RPC and the background schedule tick on
+/// every replica both call it. Each step claims or keys its due work in
+/// the store, so replicas ticking at once do each due bucket once.
+/// Returns the transform runs admitted.
+pub(crate) async fn run_schedule_tick(
+    service: &SekaiServiceImpl,
+    now_ms: i64,
+    actor: &str,
+) -> Result<Vec<crate::sekai::governed_transform::TransformRun>, Status> {
+    let actor = actor.to_string();
     let runtime = service.db.runtime();
     let quota = service.quota_runtime();
     let mut runs = runtime
@@ -5597,14 +5621,7 @@ pub(super) async fn tick_governed_transforms(
     datasets?;
     sources?;
     ontology?;
-    let runs = runs
-        .iter()
-        .map(|run| {
-            let reveal = caller_can_read_run_datasets(service, &principals, run);
-            with_run_outcome(service, run, to_proto_transform_run(run, reveal))
-        })
-        .collect::<Result<_, Status>>()?;
-    Ok(Response::new(TickGovernedTransformsResponse { runs }))
+    Ok(runs)
 }
 
 pub(super) async fn get_transform_output_state(

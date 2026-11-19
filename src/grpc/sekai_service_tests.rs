@@ -768,10 +768,9 @@ fn seed_definition_parent(
         1,
     )
     .unwrap();
-    let RuntimeDb::Sqlite(db) = svc.db.runtime() else {
-        panic!("test service must use SQLite");
-    };
-    db.seed_published_definition_revision(&revision, &[member])
+    svc.db
+        .runtime()
+        .seed_published_definition_revision(&revision, &[member])
         .unwrap();
     revision
 }
@@ -39137,4 +39136,207 @@ async fn object_source_record_returns_the_retained_payload_under_get_object_rule
         read("missing", producer).await.unwrap_err().code(),
         tonic::Code::NotFound
     );
+}
+
+/// A plane over a shared runtime, as each replica opens one.
+fn plane_over(db: Arc<RuntimeDb>) -> Arc<SekaiServiceImpl> {
+    crate::chisei_store::apply_chisei_schema(&db);
+    Arc::new(SekaiServiceImpl::new(
+        crate::db::store::SekaiStore::from_shared_runtime(db),
+    ))
+}
+
+/// #3092: two planes over one store run the schedule tick body the
+/// background loop runs on every replica, with no outside caller. A due
+/// bucket admits one transform run, one agent schedule turn and one export
+/// across both. A plane that dies after its transform step commits leaves
+/// the rest of the bucket to the survivor, which does not admit the run
+/// again. After several missed buckets, one tick admits one of each.
+async fn two_planes_tick_each_due_bucket_once(a: Arc<SekaiServiceImpl>, b: Arc<SekaiServiceImpl>) {
+    use crate::sekai::dataset::{ColumnDef, Dataset};
+    use crate::sekai::governed_transform::CONTRACT_VERSION;
+    const ACTOR: &str = "system:transform-scheduler";
+    let runtime = a.db.runtime();
+    for id in ["in", "out"] {
+        runtime
+            .create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+    }
+    runtime
+        .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+        .unwrap();
+    a.put_governed_transform(with_named_principal(
+        PutGovernedTransformRequest {
+            transform: Some(GovernedTransform {
+                contract_version: CONTRACT_VERSION.into(),
+                namespace: "ops".into(),
+                transform_id: "hourly".into(),
+                input_dataset_id: "in".into(),
+                output_dataset_id: "out".into(),
+                steps: vec![TransformStep {
+                    kind: "project".into(),
+                    columns: vec!["id".into()],
+                    ..Default::default()
+                }],
+                schedule_every_ms: 60_000,
+                ..Default::default()
+            }),
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    runtime
+        .create_object(&crate::domain::Object {
+            id: "line-7".into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: "line-7".into(),
+            namespace: "ops".into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".to_string(), "agent:line-7".to_string()),
+                ("wake_policies".to_string(), "schedule:60000".to_string()),
+            ]),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let digest = export_fixture(&a, 2, "row").await;
+    a.grant_namespace_export(with_named_principal(
+        GrantNamespaceExportRequest {
+            namespace: "exp".into(),
+            principal: "tester".into(),
+            reason: "nightly extract".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    a.put_export_definition(with_named_principal(
+        PutExportDefinitionRequest {
+            definition: Some(ExportDefinition {
+                namespace: "exp".into(),
+                definition_id: "nightly".into(),
+                every_ms: 60_000,
+                object_set: Some(ExportObjectSetRequest {
+                    format: "csv".into(),
+                    ..export_request(&digest)
+                }),
+                ..Default::default()
+            }),
+        },
+        "tester",
+    ))
+    .await
+    .unwrap();
+    // Transform runs, agent turns and export artifacts in the shared store.
+    let admitted = |now_ms: i64| {
+        let a = a.clone();
+        async move {
+            let runtime = a.db.runtime();
+            let runs = runtime.list_governed_transform_runs("ops", 100).unwrap();
+            let turns =
+                crate::sekai::agent_turn::list_claimable(runtime, "ops", now_ms, 100).unwrap();
+            let exports = a
+                .list_deliverable_export_artifacts(with_named_principal(
+                    ListDeliverableExportArtifactsRequest {
+                        namespace: "exp".into(),
+                    },
+                    "tester",
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .artifacts;
+            (runs.len(), turns.len(), exports.len())
+        }
+    };
+
+    // Both planes tick the same bucket at once.
+    let ticks = [a.clone(), b.clone()].map(|plane| {
+        tokio::spawn(async move {
+            rpc_data::run_schedule_tick(&plane, 90_000, ACTOR)
+                .await
+                .map(|r| r.len())
+        })
+    });
+    let mut runs = 0;
+    for tick in ticks {
+        runs += tick.await.unwrap().unwrap();
+    }
+    assert_eq!(runs, 1, "one plane admits the due run");
+    assert_eq!(admitted(90_000).await, (1, 1, 1));
+
+    // Plane A dies after its transform step commits bucket 2; B ticks.
+    assert_eq!(
+        a.db.runtime()
+            .tick_governed_transforms(150_000)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        rpc_data::run_schedule_tick(&b, 150_000, ACTOR)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(admitted(150_000).await, (2, 2, 2));
+
+    // Down from bucket 3 through 9: the next tick admits one of each,
+    // and another plane ticking that instant finds nothing more due.
+    assert_eq!(
+        rpc_data::run_schedule_tick(&b, 570_000, ACTOR)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        rpc_data::run_schedule_tick(&a, 570_000, ACTOR)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(admitted(570_000).await, (3, 3, 3));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_sqlite_planes_tick_each_due_bucket_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sekai.db");
+    let open = || {
+        Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )))
+    };
+    two_planes_tick_each_due_bucket_once(plane_over(open()), plane_over(open())).await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_two_planes_tick_each_due_bucket_once() {
+    let scratch = crate::db::ScratchDatabase::create();
+    let open = || Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+    let (a, b) = (open(), open());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(two_planes_tick_each_due_bucket_once(
+            plane_over(a.clone()),
+            plane_over(b.clone()),
+        ));
+    drop((a, b));
 }

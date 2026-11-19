@@ -151,11 +151,12 @@ Each background pass that handled work, failed, or found its work held by
 another instance exports one root span named after its job kind:
 `embedding_catch_up`, `search_catch_up`, `admission_reconcile`, `retention`,
 `export_sweep`, `consumer_violation_sweep`, `criticality_outbox`,
-`object_log_ingest`, `security_reopen`, or `catalog_reconcile`. It carries
-`job.kind`, `job.outcome` (`ok`, `held`, or `failed`), and `job.items`. A
-pass with nothing to do exports nothing. Passes that report no count
-(`export_sweep`, `security_reopen`, `catalog_reconcile`) export only when
-they fail. A pass that worked for recorded operations, such as an
+`object_log_ingest`, `security_reopen`, `catalog_reconcile`, or
+`schedule_tick`. It carries `job.kind`, `job.outcome` (`ok`, `held`, or
+`failed`), and `job.items`. A pass with nothing to do exports nothing.
+Passes that report no count (`export_sweep`, `security_reopen`,
+`catalog_reconcile`) export only when they fail; `schedule_tick` counts the
+transform runs it admitted. A pass that worked for recorded operations, such as an
 object-log ingest drain or an admission reconciliation, has one child span
 per operation (at most 32) carrying `sekai.operation_id`, the key that joins
 it to that operation's request trace.
