@@ -8,6 +8,10 @@ use rusqlite::{OptionalExtension, params};
 
 use super::postgres::PostgresDb;
 use super::sekai::SekaiDb;
+use std::collections::BTreeMap;
+
+use super::model_stage_store::{stage_version_pg, stage_version_sqlite};
+use crate::sekai::model_stage::parse_stage_pin;
 use crate::sekai::model_version::ModelVersion;
 
 fn encode(version: &ModelVersion) -> Result<String, String> {
@@ -18,29 +22,67 @@ fn decode(json: &str) -> Result<ModelVersion, String> {
     serde_json::from_str(json).map_err(|error| format!("decode model version: {error}"))
 }
 
-fn pinned_version_ids(
+/// The model inputs of `transform` as `(name, pinned value)`: a version id or
+/// a [`stage pin`](crate::sekai::model_stage::parse_stage_pin).
+fn pinned_model_inputs(
     transform: &crate::sekai::governed_transform::GovernedTransform,
-) -> impl Iterator<Item = &String> {
+) -> impl Iterator<Item = (&String, &String)> {
     transform
         .isolated_process
         .iter()
-        .flat_map(|spec| spec.model_inputs.values())
+        .flat_map(|spec| spec.model_inputs.iter())
 }
 
 fn marking_token(version: ModelVersion) -> Option<String> {
     (!version.marking.is_empty()).then_some(version.marking)
 }
 
-/// The marking token of each model version `transform` pins, read in the
-/// admitting transaction. A pin naming no version in the namespace refuses
-/// the run.
-pub(crate) fn pinned_model_markings(
+/// What a run admission pins for its model inputs, read in the admitting
+/// transaction.
+pub(crate) struct ModelInputPins {
+    /// The marking token of each pinned version, folded into the output marking.
+    pub markings: Vec<Option<String>>,
+    /// `model:<name>` to the version id the run uses, for `input_versions`.
+    pub pins: BTreeMap<String, String>,
+}
+
+impl ModelInputPins {
+    fn new() -> Self {
+        Self {
+            markings: Vec::new(),
+            pins: BTreeMap::new(),
+        }
+    }
+
+    fn push(&mut self, name: &str, version: ModelVersion) {
+        self.pins.insert(
+            format!(
+                "{}{name}",
+                crate::sekai::governed_transform::MODEL_PIN_PREFIX
+            ),
+            version.version_id.clone(),
+        );
+        self.markings.push(marking_token(version));
+    }
+}
+
+/// Resolves each model input `transform` pins. A stage pin resolves to the
+/// stage's current version (#3023); a stage with no version yet, or a pin
+/// naming no version in the namespace, refuses the run.
+pub(crate) fn resolve_model_input_pins(
     conn: &rusqlite::Connection,
     transform: &crate::sekai::governed_transform::GovernedTransform,
-) -> Result<Vec<Option<String>>, String> {
-    pinned_version_ids(transform)
-        .map(|version_id| {
-            conn.query_row(
+) -> Result<ModelInputPins, String> {
+    let mut resolved = ModelInputPins::new();
+    for (name, pinned) in pinned_model_inputs(transform) {
+        let version_id = match parse_stage_pin(pinned) {
+            Some((model_name, stage)) => {
+                stage_version_sqlite(conn, &transform.namespace, model_name, stage)?
+            }
+            None => pinned.clone(),
+        };
+        let json = conn
+            .query_row(
                 "SELECT record_json FROM sekai_model_versions
                  WHERE namespace = ?1 AND version_id = ?2",
                 params![transform.namespace, version_id],
@@ -48,31 +90,36 @@ pub(crate) fn pinned_model_markings(
             )
             .optional()
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| crate::sekai::model_version::MODEL_VERSION_NOT_FOUND.to_string())
-            .and_then(|json| decode(&json))
-            .map(marking_token)
-        })
-        .collect()
+            .ok_or_else(|| crate::sekai::model_version::MODEL_VERSION_NOT_FOUND.to_string())?;
+        resolved.push(name, decode(&json)?);
+    }
+    Ok(resolved)
 }
 
-/// See [`pinned_model_markings`].
-pub(crate) fn pinned_model_markings_pg(
+/// See [`resolve_model_input_pins`].
+pub(crate) fn resolve_model_input_pins_pg(
     tx: &mut postgres::Transaction<'_>,
     transform: &crate::sekai::governed_transform::GovernedTransform,
-) -> Result<Vec<Option<String>>, String> {
-    let mut tokens = Vec::new();
-    for version_id in pinned_version_ids(transform) {
+) -> Result<ModelInputPins, String> {
+    let mut resolved = ModelInputPins::new();
+    for (name, pinned) in pinned_model_inputs(transform) {
+        let version_id = match parse_stage_pin(pinned) {
+            Some((model_name, stage)) => {
+                stage_version_pg(tx, &transform.namespace, model_name, stage)?
+            }
+            None => pinned.clone(),
+        };
         let row = tx
             .query_opt(
                 "SELECT record_json FROM sekai_model_versions
                  WHERE namespace = $1 AND version_id = $2",
-                &[&transform.namespace, version_id],
+                &[&transform.namespace, &version_id],
             )
             .map_err(|error| error.to_string())?
             .ok_or_else(|| crate::sekai::model_version::MODEL_VERSION_NOT_FOUND.to_string())?;
-        tokens.push(marking_token(decode(row.get(0))?));
+        resolved.push(name, decode(row.get(0))?);
     }
-    Ok(tokens)
+    Ok(resolved)
 }
 
 impl SekaiDb {
@@ -92,20 +139,32 @@ impl SekaiDb {
     }
 
     /// Stores `version` unless its id is already held; returns the stored record.
+    /// A newly stored version moves the model's gateless stages to it in the
+    /// same transaction (#3023); a repeat registration moves nothing.
     pub fn insert_model_version(&self, version: &ModelVersion) -> Result<ModelVersion, String> {
-        self.conn()
-            .execute(
-                "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (version_id) DO NOTHING",
-                params![
-                    version.version_id,
-                    version.namespace,
-                    version.model_name,
-                    encode(version)?
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT (version_id) DO NOTHING",
+                    params![
+                        version.version_id,
+                        version.namespace,
+                        version.model_name,
+                        encode(version)?
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 1 {
+                super::model_stage_store::follow_gateless_stages_sqlite(&tx, version)?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+        }
         self.get_model_version(&version.namespace, &version.version_id)?
             .ok_or_else(|| "model version vanished after insert".into())
     }
@@ -155,19 +214,27 @@ impl SekaiDb {
 impl PostgresDb {
     /// See [`SekaiDb::insert_model_version`].
     pub fn insert_model_version(&self, version: &ModelVersion) -> Result<ModelVersion, String> {
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (version_id) DO NOTHING",
-                &[
-                    &version.version_id,
-                    &version.namespace,
-                    &version.model_name,
-                    &encode(version)?,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        {
+            let mut conn = self.connection()?;
+            let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (version_id) DO NOTHING",
+                    &[
+                        &version.version_id,
+                        &version.namespace,
+                        &version.model_name,
+                        &encode(version)?,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if inserted == 1 {
+                super::model_stage_store::follow_gateless_stages_pg(&mut tx, version)?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
+        }
         self.get_model_version(&version.namespace, &version.version_id)?
             .ok_or_else(|| "model version vanished after insert".into())
     }
@@ -339,6 +406,52 @@ pub(crate) mod store_tests {
             .run_governed_transform("ops", "dangling", false, 40)
             .unwrap_err();
         assert!(refused.contains("model version not found"), "{refused}");
+
+        // A stage pin (#3023) refuses until the stage has a version, then
+        // resolves to whatever version the stage holds when each run is admitted.
+        let mut gated =
+            super::super::model_stage_store::store_tests::stage("production", "suite-a");
+        gated.namespace = "ops".into();
+        db.put_model_stage(&gated).unwrap();
+        db.put_governed_transform(&transform("staged", "stage:churn/production"), 50)
+            .unwrap();
+        let unpromoted = db
+            .run_governed_transform("ops", "staged", false, 60)
+            .unwrap_err();
+        assert!(unpromoted.contains("model stage not found"), "{unpromoted}");
+        let promote = |version_id: &str, expected: &str, operation_id: &str| {
+            let stage = crate::sekai::model_stage::ModelStage {
+                version_id: version_id.into(),
+                ..gated.clone()
+            };
+            let mut receipt = super::super::model_stage_store::store_tests::receipt(operation_id);
+            receipt.namespace = "ops".into();
+            assert!(db.promote_model_stage(&stage, expected, &receipt).unwrap());
+        };
+        promote(&pinned.version_id, "", "op-staged-1");
+        let run = db
+            .run_governed_transform("ops", "staged", false, 70)
+            .unwrap();
+        assert_eq!(run.input_versions["model:scorer"], pinned.version_id);
+        let mut next = self::registration("sha256:b", "run-1");
+        next.namespace = "ops".into();
+        let next = db
+            .insert_model_version(
+                &crate::sekai::model_version::ModelVersion::from_run(
+                    next,
+                    "ops",
+                    "",
+                    &BTreeMap::new(),
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        promote(&next.version_id, &pinned.version_id, "op-staged-2");
+        let run = db
+            .run_governed_transform("ops", "staged", false, 80)
+            .unwrap();
+        assert_eq!(run.input_versions["model:scorer"], next.version_id);
 
         // A dataset input may not shadow a model pin in the receipt.
         let mut shadowing = transform("shadow", &pinned.version_id);

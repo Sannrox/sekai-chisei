@@ -231,6 +231,7 @@ const ACTION_INSTANCE_DENIAL_INDEX_SCHEMA: &str =
     include_str!("postgres/0160_action_instance_denial_index.sql");
 const MODEL_VERSIONS_SCHEMA: &str = include_str!("postgres/0162_model_versions.sql");
 const GATEWAY_LOG_CURSORS_SCHEMA: &str = include_str!("postgres/0163_gateway_log_cursors.sql");
+const MODEL_STAGES_SCHEMA: &str = include_str!("postgres/0164_model_stages.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1173,6 +1174,12 @@ const MIGRATIONS: &[Migration] = &[
         162,
         "gateway_log_cursors",
         GATEWAY_LOG_CURSORS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        163,
+        "model_stages",
+        MODEL_STAGES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

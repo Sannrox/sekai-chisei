@@ -7,11 +7,12 @@
 //! namespace reader unless the namespace denies unmarked reads.
 
 use super::*;
+use crate::sekai::model_stage as domain_stage;
 use crate::sekai::model_version as domain_model;
 
 const MODEL_VERSION_PAGE_MAX: usize = 100;
 
-pub(super) async fn get_model_version(
+async fn get_model_version(
     service: &SekaiServiceImpl,
     req: Request<GetModelVersionRequest>,
 ) -> Result<Response<GetModelVersionResponse>, Status> {
@@ -39,7 +40,7 @@ pub(super) async fn get_model_version(
     }))
 }
 
-pub(super) async fn list_model_versions(
+async fn list_model_versions(
     service: &SekaiServiceImpl,
     req: Request<ListModelVersionsRequest>,
 ) -> Result<Response<ListModelVersionsResponse>, Status> {
@@ -94,17 +95,35 @@ pub(super) async fn list_model_versions(
 
 /// Refuses a transform that pins a model version missing from its
 /// namespace or hidden from the caller (#3074). Both read as missing, so a
-/// writer learns nothing about versions it may not see.
+/// writer learns nothing about versions it may not see. A stage pin (#3023)
+/// needs the stage to exist; its current version, when it has one, must be
+/// visible. Run admission resolves the pin again when it runs.
 pub(super) fn authorize_model_inputs(
     service: &SekaiServiceImpl,
     principals: &[String],
     transform: &crate::sekai::governed_transform::GovernedTransform,
 ) -> Result<(), Status> {
-    for version_id in transform
+    for pinned in transform
         .isolated_process
         .iter()
         .flat_map(|spec| spec.model_inputs.values())
     {
+        let version_id = match domain_stage::parse_stage_pin(pinned) {
+            Some((model_name, stage)) => {
+                let stage = service
+                    .db
+                    .runtime()
+                    .get_model_stage(&transform.namespace, model_name, stage)
+                    .map_err(Status::internal)?
+                    .ok_or_else(|| Status::not_found(domain_stage::MODEL_STAGE_NOT_FOUND))?;
+                if stage.version_id.is_empty() {
+                    continue;
+                }
+                stage.version_id
+            }
+            None => pinned.clone(),
+        };
+        let version_id = &version_id;
         let visible = match service
             .db
             .runtime()
@@ -122,7 +141,7 @@ pub(super) fn authorize_model_inputs(
 }
 
 /// Another tenant's namespace reads as missing, not as denied.
-fn authorize_namespace_read(
+pub(super) fn authorize_namespace_read(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
@@ -211,5 +230,21 @@ fn to_proto_model_version(version: domain_model::ModelVersion) -> ModelVersion {
             .collect(),
         actor: version.actor,
         created_at_ms: version.created_at_ms,
+    }
+}
+
+/// Trait routes for the facade's `delegate_rpcs!` list.
+impl SekaiServiceImpl {
+    pub(super) async fn get_model_version_rpc(
+        &self,
+        req: Request<GetModelVersionRequest>,
+    ) -> Result<Response<GetModelVersionResponse>, Status> {
+        get_model_version(self, req).await
+    }
+    pub(super) async fn list_model_versions_rpc(
+        &self,
+        req: Request<ListModelVersionsRequest>,
+    ) -> Result<Response<ListModelVersionsResponse>, Status> {
+        list_model_versions(self, req).await
     }
 }

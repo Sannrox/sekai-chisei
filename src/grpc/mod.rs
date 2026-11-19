@@ -1064,6 +1064,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // version's marking.
             | "GetModelVersion"
             | "ListModelVersions"
+            // Model stages (#3023) check namespace read or write.
+            | "PutModelStage"
+            | "ListModelStages"
+            | "PromoteModelVersion"
             | "ListDatasets"
             // Dataset rows, versions, rollback, health (#2097), catalog
             // writes (#2105) and branches (#2104): each handler authorizes
@@ -3625,6 +3629,9 @@ mod tests {
             "GetTransformChainRun",
             "GetModelVersion",
             "ListModelVersions",
+            "PutModelStage",
+            "ListModelStages",
+            "PromoteModelVersion",
         ] {
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));
             assert!(!enterprise_namespace_rpc("chisei.ChiseiService", method));

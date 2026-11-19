@@ -331,6 +331,32 @@ resolves the version with `GetModelVersion` and loads the bytes from the
 registry itself; the claim does not carry them. A dataset input id may not
 start with `model:` beside model inputs.
 
+### Model stages
+
+A stage such as `staging` or `production` names the version of one model
+that consumers use (#3023). `PutModelStage` creates a stage or changes its
+gate and needs namespace write; `ListModelStages` needs namespace read. All
+three stage RPCs are experimental and need `SEKAI_EXPERIMENTAL_RPCS=1`.
+
+- **Gated stages.** A stage with an `evaluation_suite_id` moves only through
+  `PromoteModelVersion` with an evaluation run of that suite whose
+  `config_ref` is the version id and in which every case passed. A missing,
+  dry-run or shadow run refuses with `model_stage.suite_missing`, a run of
+  another version with `model_stage.evaluation_version_mismatch`, and a failed
+  case with `model_stage.suite_failed`.
+- **Gateless stages.** A stage without a suite follows each newly registered
+  version of its model, in the registering transaction.
+- **Receipts.** Every promotion records an operation receipt of class
+  `model_stage_promotion`. An admitted promotion moves the stage with a
+  compare-and-set and writes the receipt in the same transaction; a promotion
+  that lost a race refuses with `model_stage.stage_moved`. A refusal leaves
+  the stage on its previous version.
+- **Stage pins.** A `model_inputs` value of `stage:<model>/<stage>` pins a
+  stage instead of a version. Each run admission resolves it to the stage's
+  current version and records that version in `input_versions`, so the next
+  run after a promotion uses the new version. A stage with no version yet
+  refuses the run. A claimed work item names the resolved version.
+
 The worker runs each pinned model in its own process (#3075,
 `adapters/model_process.rs`). `ModelProcess::start` resolves the version
 through the registry, which refuses bytes that no longer match the digest,
