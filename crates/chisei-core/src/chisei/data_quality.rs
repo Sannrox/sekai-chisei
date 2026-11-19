@@ -339,12 +339,23 @@ fn finish_evaluation(
     let rule = db
         .get_data_quality_rule(&record.namespace, &record.rule_id)?
         .ok_or_else(|| UNAVAILABLE.to_string())?;
-    if rule.rule_digest != record.rule_digest {
-        record.status = STATUS_UNKNOWN.into();
-        record.population = POPULATION_MISSING.into();
-    } else {
+    let dataset = if rule.rule_digest == record.rule_digest {
         let dataset = authorized_dataset(facts, actor, &rule.namespace, &rule.dataset_id)?;
-        apply_evaluator(&rule, dataset.as_ref(), &mut record);
+        let revision = match &dataset {
+            Some(object) => dataset_revision_digest(object)?,
+            None => missing_revision_digest(&rule.namespace, &rule.dataset_id),
+        };
+        // The receipt names the start revision, so it never closes on newer data.
+        (revision == record.dataset_revision_digest).then_some(dataset)
+    } else {
+        None
+    };
+    match dataset {
+        Some(dataset) => apply_evaluator(&rule, dataset.as_ref(), &mut record),
+        None => {
+            record.status = STATUS_UNKNOWN.into();
+            record.population = POPULATION_MISSING.into();
+        }
     }
     record.prior_receipt_digest = prior;
     record.evaluated_by = actor.into();
@@ -1270,6 +1281,43 @@ mod tests {
             )
             .unwrap_err(),
             STATUS_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn restart_after_the_dataset_changed_closes_unknown_at_the_start_revision() {
+        let (sekai, db, facts) = fixture();
+        put_dataset(&sekai, "3", &[("region", "eu")]);
+        publish_pin(&sekai, &db);
+        let running = start_evaluation(
+            &db,
+            facts.reader(),
+            "analyst",
+            "quality",
+            "orders-pin",
+            None,
+            41,
+        )
+        .unwrap();
+        assert_eq!(running.status, STATUS_RUNNING);
+        let mut dataset = sekai
+            .get_object(&dataset_object_id("quality", "orders"))
+            .unwrap()
+            .unwrap();
+        dataset.properties.insert("row_count".into(), "4".into());
+        dataset.updated = 2;
+        sekai.update_object(&dataset).unwrap();
+
+        let restarted =
+            restart_evaluation(&db, facts.reader(), "analyst", &running.result_id, 42).unwrap();
+        assert_eq!(restarted.status, STATUS_UNKNOWN);
+        assert_eq!(
+            restarted.dataset_revision_digest,
+            running.dataset_revision_digest
+        );
+        assert_ne!(
+            dataset_revision_digest(&dataset).unwrap(),
+            running.dataset_revision_digest
         );
     }
 
