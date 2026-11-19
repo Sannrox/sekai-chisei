@@ -135,15 +135,6 @@ fn exercise(db: &dyn PermitHarness, prefix: &str) {
             .unwrap()
     );
 
-    assert!(
-        db.set_permit_kill_switch("namespace", &scope, true, "halt", 3_000)
-            .unwrap()
-    );
-    assert!(
-        db.set_permit_kill_switch("namespace", &scope, false, "resume", 3_001)
-            .unwrap()
-    );
-
     exercise_redeem_reconcile_delegation(db, prefix);
 }
 
@@ -268,17 +259,32 @@ fn exercise_redeem_reconcile_delegation(db: &dyn PermitHarness, prefix: &str) {
         &record.request.actor,
     )
     .unwrap();
-    let first = db
-        .redeem_permit(
+    let redeem_first = |now_ms| {
+        db.redeem_permit(
             &permit,
             &host_context(&permit),
             &key.verifying_key(),
             &format!("{prefix}-redeem-1"),
             &format!("{prefix}-exec-1"),
             "local",
-            3_000,
+            now_ms,
         )
-        .unwrap();
+    };
+    // The store enforces the namespace kill switch: redemption is refused
+    // while it is on, and the same redemption succeeds once it is off.
+    assert!(
+        db.set_permit_kill_switch("namespace", &permit.namespace, true, "halt", 2_900)
+            .unwrap()
+    );
+    assert_eq!(
+        redeem_first(2_950).unwrap_err(),
+        "namespace kill switch active: halt"
+    );
+    assert!(
+        db.set_permit_kill_switch("namespace", &permit.namespace, false, "resume", 2_990)
+            .unwrap()
+    );
+    let first = redeem_first(3_000).unwrap();
     assert_eq!(first.invocation_ordinal, 1);
     let retry = db
         .redeem_permit(
