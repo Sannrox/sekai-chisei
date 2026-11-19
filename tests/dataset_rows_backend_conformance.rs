@@ -30,16 +30,24 @@ fn exercise(db: &RuntimeDb, id: &str) {
         partition_keys: Vec::new(),
     })
     .unwrap();
+    let versions = || db.list_dataset_versions(id).unwrap().len();
+    let initial = versions();
     assert_eq!(
         db.append_rows(id, &[row("a", "1"), row("b", "2"), row("a", "3")])
             .unwrap(),
         3
     );
+    let after_first = versions();
+    assert!(after_first > initial, "{initial} -> {after_first}");
     assert_eq!(db.append_rows(id, &[row("a", "4")]).unwrap(), 1);
-    let versions = db.list_dataset_versions(id).unwrap().len();
+    let versions_before_empty = versions();
+    assert!(
+        versions_before_empty > after_first,
+        "{after_first} -> {versions_before_empty}"
+    );
     // An empty append is no change and no new version.
     assert_eq!(db.append_rows(id, &[]).unwrap(), 0);
-    assert_eq!(db.list_dataset_versions(id).unwrap().len(), versions);
+    assert_eq!(versions(), versions_before_empty);
 
     let all = db.query_rows(id, &RowQuery::default()).unwrap();
     let ns: Vec<&str> = all.iter().map(|row| row["n"].as_str()).collect();
@@ -55,17 +63,16 @@ fn exercise(db: &RuntimeDb, id: &str) {
                     value: "a".into(),
                 }],
                 columns: vec!["n".into()],
-                limit: 2,
+                limit: 1,
                 offset: 1,
             },
         )
         .unwrap();
+    // Rows of kind "a" are 1, 3, 4: the offset drops "1" and the limit drops
+    // "4", which the query would otherwise return.
     assert_eq!(
         filtered,
-        [
-            HashMap::from([("n".to_string(), "3".to_string())]),
-            HashMap::from([("n".to_string(), "4".to_string())]),
-        ]
+        [HashMap::from([("n".to_string(), "3".to_string())])]
     );
     // An omitted operator means equality on both backends.
     let implicit = db
