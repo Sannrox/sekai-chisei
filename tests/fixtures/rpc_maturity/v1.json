@@ -501,6 +501,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "GetObjectSourceRecord",
+      "storage_path": "sekai.graph, sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "UpdateObject",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

@@ -38932,3 +38932,142 @@ async fn action_policy_dry_run_rpc_reports_like_the_console_and_mutates_nothing(
         .unwrap_err();
     assert_eq!(ungranted.code(), tonic::Code::PermissionDenied);
 }
+
+#[tokio::test]
+async fn object_source_record_returns_the_retained_payload_under_get_object_rules() {
+    use sha2::{Digest, Sha256};
+    let svc = service();
+    let namespace = "sync-source-record";
+    let producer = "connector/github-primary";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let payload = r#"{"state":"open","title":"Bounded sync","unmapped":"kept"}"#;
+    let mut batch = source_batch(namespace, producer, "", "cursor:1", "batch-v3");
+    batch.contract_version = source_sync_domain::SOURCE_BATCH_V3_VERSION.into();
+    batch.records[0].payload = Some(payload.into());
+    batch.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::Snapshot as i32,
+        sync_generation: 1,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: None,
+        offset_end: Some(40),
+        snapshot_complete: true,
+    });
+    batch.records[0].payload_digest = format!("sha256:{:x}", Sha256::digest(payload.as_bytes()));
+    redigest_source_batch(&mut batch);
+    svc.apply_source_batch(with_named_principal(
+        ApplySourceBatchRequest { batch: Some(batch) },
+        producer,
+    ))
+    .await
+    .unwrap();
+    let object_id = svc
+        .db
+        .runtime()
+        .list_all_objects(&crate::domain::ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|object| object.namespace == namespace && object.kind == "Issue")
+        .expect("synced issue")
+        .id;
+    let read = |id: &str, principal: &str| {
+        svc.get_object_source_record(with_named_principal(
+            GetObjectSourceRecordRequest { id: id.into() },
+            principal,
+        ))
+    };
+
+    let record = read(&object_id, producer).await.unwrap().into_inner();
+    assert!(record.source_bound);
+    assert_eq!(record.object_id, object_id);
+    assert_eq!(record.source, source_sync_domain::SOURCE_GITHUB);
+    assert_eq!(record.source_instance, "acme/ops");
+    assert_eq!(record.source_version, "node-v1");
+    assert!(!record.source_id.is_empty());
+    assert_eq!(record.payload_state, "retained");
+    assert_eq!(record.payload, payload);
+
+    // Once the kind restricts any property for the caller, the payload is
+    // withheld, even when this object holds no value for that property: the
+    // raw record may carry it unmapped. The source identity still reads.
+    let restricted = |name: &str, classification: &str| PropertyDef {
+        name: name.into(),
+        r#type: "string".into(),
+        required: false,
+        description: String::new(),
+        enum_values: Vec::new(),
+        link_kind: String::new(),
+        compute_expr: String::new(),
+        classification: classification.into(),
+        struct_fields: Vec::new(),
+    };
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "Issue".into(),
+                description: "An issue".into(),
+                properties: vec![
+                    restricted("ssn", "sensitive"),
+                    restricted("state", "public"),
+                ],
+                ..Default::default()
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let withheld = read(&object_id, producer).await.unwrap().into_inner();
+    assert!(withheld.source_bound);
+    assert_eq!(withheld.payload_state, "withheld");
+    assert!(withheld.payload.is_empty());
+    assert_eq!(
+        read(&object_id, "root").await.unwrap().into_inner().payload,
+        payload
+    );
+
+    // A caller GetObject refuses is refused here with the same code.
+    let outsider = "connector/outsider";
+    let get_object = svc
+        .get_object(with_named_principal(
+            GetObjectRequest {
+                id: object_id.clone(),
+            },
+            outsider,
+        ))
+        .await
+        .unwrap_err();
+    let refused = read(&object_id, outsider).await.unwrap_err();
+    assert_eq!(refused.code(), get_object.code());
+
+    // An object no source wrote has no source record; that is not an error.
+    // Copying a synced object's sync_* properties does not change that.
+    let synced = svc.db.runtime().get_object(&object_id).unwrap().unwrap();
+    for (id, properties) in [
+        (
+            "plain-issue",
+            HashMap::from([("title".into(), "plain".into())]),
+        ),
+        ("forged-issue", synced.properties.clone()),
+    ] {
+        svc.db
+            .runtime()
+            .create_object(&crate::domain::Object {
+                id: id.into(),
+                kind: "Issue".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: String::new(),
+                properties,
+                created: 1,
+                updated: 1,
+            })
+            .unwrap();
+        let unbound = read(id, "root").await.unwrap().into_inner();
+        assert!(!unbound.source_bound, "{id}");
+        assert!(unbound.payload.is_empty(), "{id}");
+    }
+    assert_eq!(
+        read("missing", producer).await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+}

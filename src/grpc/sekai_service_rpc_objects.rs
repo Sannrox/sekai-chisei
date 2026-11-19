@@ -994,6 +994,118 @@ pub(super) async fn get_linked_objects(
     service.get_visible_linked_objects(req).await
 }
 
+/// `payload_state` values of `GetObjectSourceRecord`.
+const PAYLOAD_RETAINED: &str = "retained";
+const PAYLOAD_ABSENT: &str = "absent";
+const PAYLOAD_WITHHELD: &str = "withheld";
+
+/// Trait route for the facade's `delegate_rpcs!` list.
+impl SekaiServiceImpl {
+    /// The source record behind one object (#3058). The object is read through
+    /// `GetObject`'s path first, so visibility, markings and refusals match it.
+    /// Source fields come from the properties that read returned; the payload
+    /// is withheld when any stored property was redacted from it.
+    pub(super) async fn get_object_source_record_rpc(
+        &self,
+        req: Request<GetObjectSourceRecordRequest>,
+    ) -> Result<Response<GetObjectSourceRecordResponse>, Status> {
+        let service = self.clone();
+        self.spawn_db(move || {
+            let principals = caller_principals(&req);
+            let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+            let (metadata, extensions, input) = req.into_parts();
+            let visible = service
+                .get_visible_object_blocking(Request::from_parts(
+                    metadata,
+                    extensions,
+                    GetObjectRequest { id: input.id },
+                ))?
+                .into_inner()
+                .object
+                .ok_or_else(|| Status::not_found("not found"))?;
+            let db = service.db.runtime();
+            let mut response = GetObjectSourceRecordResponse {
+                object_id: visible.id.clone(),
+                ..Default::default()
+            };
+            let Some(record) = crate::db::object_source_record::object_source_record(
+                db,
+                &visible.id,
+                &visible.namespace,
+                &visible.kind,
+                &visible.properties,
+            )
+            .map_err(Status::internal)?
+            else {
+                return Ok(Response::new(response));
+            };
+            let withheld = record.hidden
+                || service.source_payload_restricted(
+                    &visible.id,
+                    &principals,
+                    tenant_context.as_ref(),
+                )?;
+            (response.payload_state, response.payload) = match record.payload {
+                _ if withheld => (PAYLOAD_WITHHELD.into(), String::new()),
+                Some(payload) => (PAYLOAD_RETAINED.into(), payload),
+                None => (PAYLOAD_ABSENT.into(), String::new()),
+            };
+            response.source_bound = true;
+            response.source = record.source;
+            response.source_instance = record.source_instance;
+            response.source_id = record.source_id;
+            response.source_version = record.source_version;
+            response.payload_digest = record.payload_digest;
+            Ok(Response::new(response))
+        })
+        .await
+    }
+
+    /// Whether a source payload behind object `id` must be withheld from
+    /// `principals`. The payload is the raw record, including fields the
+    /// adapter never mapped, so the gate is per kind, not per value: any
+    /// property grant policy on the kind, or any restricted schema property
+    /// the caller (or the request's actor) may not read, withholds it.
+    fn source_payload_restricted(
+        &self,
+        id: &str,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+    ) -> Result<bool, Status> {
+        let db = self.db.runtime();
+        let Some(object) = db.get_object(id).map_err(Status::internal)? else {
+            return Ok(true);
+        };
+        if db
+            .active_object_policy(&object.namespace, &object.kind)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?
+            .is_some_and(|policy| {
+                policy.property_grants_enforced() || policy.value_instance_grants_enforced()
+            })
+        {
+            return Ok(true);
+        }
+        let schema = self
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        if restricted_property_names_for_kind(&schema, &object.kind).is_empty() {
+            return Ok(false);
+        }
+        let actor = tenant_context.and_then(|context| context.act.as_ref());
+        Ok(
+            !can_read_restricted_properties(&self.security, &object, principals)
+                || actor.is_some_and(|actor| {
+                    !can_read_restricted_properties(
+                        &self.security,
+                        &object,
+                        std::slice::from_ref(actor),
+                    )
+                }),
+        )
+    }
+}
+
 #[cfg(test)]
 mod policy_decision_rpc_tests {
     use super::*;

@@ -18,7 +18,7 @@ impl SekaiServiceImpl {
             .await
     }
 
-    fn get_visible_object_blocking(
+    pub(super) fn get_visible_object_blocking(
         &self,
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {

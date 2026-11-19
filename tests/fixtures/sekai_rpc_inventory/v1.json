@@ -758,6 +758,21 @@
       "product_tier": "core"
     },
     {
+      "rpc": "GetObjectSourceRecord",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/object_source_record.rs",
+        "src/grpc/sekai_service_tests.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "UpdateObject",
       "kind": "persistent",
       "surfaces": [

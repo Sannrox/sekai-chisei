@@ -167,6 +167,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetDefinitionFactMigration` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.CreateObject` | `sekai.graph` | yes | sdk, host, cli | `stable` |
 | `SekaiService.GetObject` | `sekai.graph` | yes | host, example | `stable` |
+| `SekaiService.GetObjectSourceRecord` | `sekai.graph, sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.UpdateObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.DeleteObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.ListObjects` | `sekai.graph` | yes | none | `stable` |

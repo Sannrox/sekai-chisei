@@ -502,6 +502,27 @@ message CreateObjectRequest {
 message CreateObjectResponse { Object object = 1; }
 message GetObjectRequest { string id = 1; }
 message GetObjectResponse { Object object = 1; }
+// Experimental (#3058). The source record behind one synced object, read
+// under the same visibility, markings and redaction as GetObject: a caller who
+// cannot read the object gets the same refusal.
+message GetObjectSourceRecordRequest { string id = 1; }
+message GetObjectSourceRecordResponse {
+  string object_id = 1;
+  // False when no source binding wrote the object (or the caller may not
+  // read its sync properties); the source fields below are then empty.
+  bool source_bound = 2;
+  string source = 3;
+  string source_instance = 4;
+  string source_id = 5;
+  // The source revision that last wrote the object.
+  string source_version = 6;
+  string payload_digest = 7;
+  // `retained`: `payload` holds the original record. `absent`: none was
+  // retained (a v1 or v2 batch). `withheld`: the record is hidden or
+  // tombstoned, or a property of the object is redacted for the caller.
+  string payload_state = 8;
+  string payload = 9;
+}
 message UpdateObjectRequest {
   Object object = 1;
   LeasePrecondition lease_precondition = 2;
@@ -6084,6 +6105,7 @@ service SekaiService {
   rpc GetDefinitionFactMigration(GetDefinitionFactMigrationRequest) returns (GetDefinitionFactMigrationResponse);
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
+  rpc GetObjectSourceRecord(GetObjectSourceRecordRequest) returns (GetObjectSourceRecordResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);

@@ -5374,6 +5374,109 @@ pub mod tests {
         );
     }
 
+    fn source_record(
+        db: &RuntimeDb,
+    ) -> Option<crate::db::object_source_record::ObjectSourceRecord> {
+        let object = db.get_object(&issue_object_id()).unwrap().unwrap();
+        crate::db::object_source_record::object_source_record(
+            db,
+            &object.id,
+            &object.namespace,
+            &object.kind,
+            &object.properties,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_record_returns_the_retained_payload_of_a_v3_record() {
+        let payload = r#"{"state":"open","title":"Bounded sync","unmapped":"kept"}"#;
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("record-v3", payload, false),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let record = source_record(&db).expect("synced object has a source record");
+        assert_eq!(record.source, SOURCE_GITHUB);
+        assert_eq!(record.source_instance, "acme/ops");
+        assert_eq!(record.source_id, source_id(SOURCE_GITHUB, "acme/ops", "12"));
+        assert!(!record.source_version.is_empty());
+        assert_eq!(
+            record.payload_digest,
+            format!("sha256:{:x}", Sha256::digest(payload.as_bytes()))
+        );
+        assert_eq!(record.payload.as_deref(), Some(payload));
+        assert!(!record.hidden);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_source_record_returns_the_retained_payload_of_a_v3_record() {
+        let payload = r#"{"state":"open","title":"Bounded sync","unmapped":"kept"}"#;
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("record-v3-pg", payload, false),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let record = source_record(&db).expect("synced object has a source record");
+        assert_eq!(record.payload.as_deref(), Some(payload));
+        assert!(!record.hidden);
+    }
+
+    #[test]
+    fn source_record_without_a_retained_payload_says_so() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &snapshot_batch("", "cursor:1", "record-v2", 1, true, Some(40)),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        let record = source_record(&db).expect("v2 object still has a source record");
+        assert_eq!(record.payload, None);
+        assert!(!record.hidden);
+    }
+
+    #[test]
+    fn source_record_of_a_tombstone_is_hidden() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("record-gone", r#"{"title":"gone"}"#, true),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        assert!(source_record(&db).unwrap().hidden);
+    }
+
+    #[test]
+    fn copied_sync_properties_do_not_reach_another_objects_record() {
+        let db = RuntimeDb::memory();
+        db.apply_source_batch(
+            &v3_snapshot_with_payload("record-forged", r#"{"title":"secret"}"#, false),
+            PRODUCER,
+            100,
+        )
+        .unwrap();
+        // Ordinary object writes may carry sync_* keys; only the id the
+        // binding derives ties an object to its landed row.
+        let synced = db.get_object(&issue_object_id()).unwrap().unwrap();
+        let read = |object_id: &str, properties: &HashMap<String, String>| {
+            crate::db::object_source_record::object_source_record(
+                &db, object_id, "acme", "Issue", properties,
+            )
+            .unwrap()
+        };
+        assert_eq!(read("forged-copy", &synced.properties), None);
+        let plain = HashMap::from([("title".to_string(), "plain".to_string())]);
+        assert_eq!(read(&synced.id, &plain), None);
+    }
+
     #[test]
     fn mapping_change_same_source_version_refresh_succeeds() {
         let db = RuntimeDb::memory();

@@ -132,6 +132,15 @@ A mapping change plus `full_rebuild` may read a previously unmapped field from
 that JSON object. v1 and v2 stay accepted and cannot carry a payload. Adapters
 still map; the plane does not interpret payloads.
 
+`GetObjectSourceRecord` (experimental, #3058) reads the source record behind
+one object: source, source instance, source identity, the source revision that
+last wrote it, the payload digest, and the retained payload. The object is read
+through `GetObject` first, so a caller refused there is refused here.
+`payload_state` is `retained` with the payload, `absent` when none was retained
+(a v1 or v2 batch), or `withheld` when the record is hidden or tombstoned or a
+property of the object is redacted for the caller. An object no source wrote
+returns `source_bound = false`, not an error.
+
 ## Version 2 ordered synchronization
 
 `sekai.source-batch/v2` adds a replay-relevant `delivery` window and an optional
