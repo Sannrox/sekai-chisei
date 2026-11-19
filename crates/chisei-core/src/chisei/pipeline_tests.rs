@@ -402,6 +402,15 @@ fn kioku_enrichment_is_eval_gated_scoped_and_side_effect_free() {
     );
     assert_eq!(result.memory_references.len(), 1);
     assert_eq!(result.memory_references[0].memory_id, "memory-migrations");
+    // The memory's classification authorizes the memory, not its linked
+    // evidence: the projection keeps the operation reference and drops the
+    // evidence digest and reference the actor was never authorized to read.
+    let descriptor = &result.memory_references[0].descriptor;
+    assert_eq!(descriptor.source_refs, vec!["operation-1"]);
+    assert!(descriptor.source_digests.is_empty(), "{descriptor:?}");
+    let projected = serde_json::to_string(descriptor).unwrap();
+    assert!(!projected.contains("digest-1"), "{projected}");
+    assert!(!projected.contains("evidence:operation-1"), "{projected}");
     assert_eq!(
         result.egress_records[0].included_fields,
         vec![
