@@ -575,6 +575,166 @@ async fn exercise_lineage_reaches_pinned_model_version(db: RuntimeDb) {
     }
 }
 
+/// A model trained by a transform (#3021): the runner's write-back
+/// publishes one version through `WriteTransformRunResult`, and lineage from
+/// a transform scoring with it reaches the training transform and its
+/// training dataset.
+async fn exercise_trained_model_publishes_with_lineage(db: RuntimeDb) {
+    use crate::sekai::governed_transform::{CONTRACT_VERSION, GovernedTransform};
+    let svc = service_on(db);
+    for id in ["ds-train", "ds-fit", "ds-features", "ds-scores"] {
+        seed_dataset(&svc, id, "");
+    }
+    let rows = vec![std::collections::HashMap::from([(
+        "order_id".to_string(),
+        "1".to_string(),
+    )])];
+    svc.db.runtime().append_rows("ds-train", &rows).unwrap();
+    let isolated = |transform_id: &str, input: &str, output: &str, spec| {
+        GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "sales".into(),
+            transform_id: transform_id.into(),
+            input_dataset_id: input.into(),
+            output_dataset_id: output.into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(spec),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap()
+    };
+    let training = isolated(
+        "tf-train",
+        "ds-train",
+        "ds-fit",
+        crate::sekai::governed_transform::IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "trainer:1".into(),
+            code: "fit()".into(),
+            model_outputs: ["churn".to_string()].into(),
+            ..Default::default()
+        },
+    );
+    svc.db
+        .runtime()
+        .put_governed_transform(&training, 10)
+        .unwrap();
+    // The definition's model outputs reach clients.
+    let listed = svc
+        .list_governed_transforms(with_named_principal(
+            ListGovernedTransformsRequest {
+                namespace: "sales".into(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.transforms[0].model_outputs, ["churn"]);
+    let run = svc
+        .db
+        .runtime()
+        .run_governed_transform("sales", "tf-train", false, 20)
+        .unwrap();
+    let (work, _) = svc
+        .db
+        .runtime()
+        // The RPC write-back checks the lease at wall-clock time.
+        .claim_transform_work(
+            "sales",
+            "trainer-1",
+            "",
+            60_000,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap()
+        .expect("claimable training run");
+    let column = |name: &str| ColumnDef {
+        name: name.into(),
+        r#type: "string".into(),
+        ..Default::default()
+    };
+    svc.write_transform_run_result(with_named_principal(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            rows: rows
+                .iter()
+                .map(|values| TransformRunInputRow {
+                    values: values.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+            output_digest: crate::sekai::governed_transform::rows_digest(&rows),
+            model_outputs: vec![TransformModelOutput {
+                model_name: "churn".into(),
+                digest: "sha256:trained".into(),
+                adapter_id: "tabular".into(),
+                adapter_version: "1".into(),
+                registry_locator: "churn/trained".into(),
+                contract: Some(ModelAdapterContract {
+                    inputs: vec![ModelInput {
+                        name: "features".into(),
+                        columns: vec![column("order_id")],
+                    }],
+                    output: vec![column("score")],
+                }),
+            }],
+            ..Default::default()
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let [version] = svc
+        .db
+        .runtime()
+        .list_model_versions("sales", "churn")
+        .unwrap()
+        .try_into()
+        .expect("one published version");
+    assert_eq!(version.run_id, run.run_id);
+
+    let scoring = isolated(
+        "tf-score",
+        "ds-features",
+        "ds-scores",
+        crate::sekai::governed_transform::IsolatedProcessSpec {
+            engine: "python".into(),
+            runtime_image: "runner:1".into(),
+            code: "score()".into(),
+            model_inputs: [("scorer".to_string(), version.version_id.clone())].into(),
+            ..Default::default()
+        },
+    );
+    svc.db
+        .runtime()
+        .put_governed_transform(&scoring, 40)
+        .unwrap();
+    seed_dataset_backed_object(&svc, "Score", "ds-scores").await;
+    let (_, edges) = lineage_shape(&lineage_of(&svc, "Score-1").await);
+    let model_node = format!("model_version:sales/{}", version.version_id);
+    for edge in [
+        format!("transform:sales/tf-score>{model_node}"),
+        format!("{model_node}>dataset:sales/ds-train"),
+        format!("{model_node}>transform:sales/tf-train"),
+    ] {
+        assert!(edges.contains(&edge), "{edge} missing from {edges:?}");
+    }
+}
+
+#[tokio::test]
+async fn trained_model_publishes_with_lineage() {
+    exercise_trained_model_publishes_with_lineage(RuntimeDb::memory()).await;
+}
+
 #[tokio::test]
 async fn lineage_reaches_pinned_model_version() {
     exercise_lineage_reaches_pinned_model_version(RuntimeDb::memory()).await;

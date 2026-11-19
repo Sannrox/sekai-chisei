@@ -6,11 +6,11 @@
 //! adapter outside the plane (ADR 0147) stores the bytes.
 
 use crate::governed_transform::{
-    CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, TransformSchedule,
+    CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, MODEL_PIN_PREFIX, TransformSchedule,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MODEL_VERSION_NOT_FOUND: &str = "model version not found";
 
@@ -111,6 +111,86 @@ impl ModelVersionRegistration {
             }
         }
         self.contract.validate()
+    }
+}
+
+/// A model a transform run trained, as its runner reports it on write-back
+/// (#3021). The runner stores the bytes in the registry first; the plane
+/// fills the namespace, run, actor, markings and training inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOutputWrite {
+    pub model_name: String,
+    pub digest: String,
+    pub adapter_id: String,
+    pub adapter_version: String,
+    pub registry_locator: String,
+    pub contract: AdapterContract,
+}
+
+/// The versions a successful run of a transform declaring `declared` model
+/// outputs publishes: exactly one per declared model, no other. Each version
+/// takes the run's namespace and output marking, names the run, and records
+/// the run's pinned inputs except the model versions it scored with as its
+/// training inputs.
+pub struct RunModelOutputs<'a> {
+    pub declared: &'a BTreeSet<String>,
+    pub writes: &'a [ModelOutputWrite],
+    pub namespace: &'a str,
+    pub run_id: &'a str,
+    pub actor: &'a str,
+    pub run_marking: &'a str,
+    pub run_inputs: &'a BTreeMap<String, String>,
+    pub now_ms: i64,
+}
+
+impl RunModelOutputs<'_> {
+    pub fn versions(&self) -> Result<Vec<ModelVersion>, String> {
+        let written: BTreeSet<&str> = self
+            .writes
+            .iter()
+            .map(|write| write.model_name.trim())
+            .collect();
+        if written.len() != self.writes.len() {
+            return Err("a run publishes one version per model output".into());
+        }
+        if !written
+            .iter()
+            .copied()
+            .eq(self.declared.iter().map(String::as_str))
+        {
+            return Err(format!(
+                "model outputs must match the definition's declared models {:?}",
+                self.declared
+            ));
+        }
+        let training: BTreeMap<String, String> = self
+            .run_inputs
+            .iter()
+            .filter(|(key, _)| !key.starts_with(MODEL_PIN_PREFIX))
+            .map(|(key, version)| (key.clone(), version.clone()))
+            .collect();
+        self.writes
+            .iter()
+            .map(|write| {
+                ModelVersion::from_run(
+                    ModelVersionRegistration {
+                        namespace: self.namespace.to_string(),
+                        model_name: write.model_name.trim().to_string(),
+                        digest: write.digest.trim().to_string(),
+                        adapter_id: write.adapter_id.trim().to_string(),
+                        adapter_version: write.adapter_version.trim().to_string(),
+                        registry_locator: write.registry_locator.trim().to_string(),
+                        contract: write.contract.clone(),
+                        run_id: self.run_id.to_string(),
+                        actor: self.actor.to_string(),
+                    },
+                    self.namespace,
+                    self.run_marking,
+                    &training,
+                    self.now_ms,
+                )
+            })
+            .collect()
     }
 }
 
@@ -244,6 +324,7 @@ impl ModelVersion {
                 requires: BTreeMap::new(),
                 code: input.name.clone(),
                 model_inputs: BTreeMap::from([(input.name.clone(), self.version_id.clone())]),
+                model_outputs: Default::default(),
             }),
             schedule: binding.schedule,
             trigger: None,

@@ -197,6 +197,44 @@ fn to_proto_columns(columns: Vec<domain_model::ModelColumn>) -> Vec<ColumnDef> {
         .collect()
 }
 
+/// A trained model a runner reports on write-back (#3021).
+pub(super) fn model_output_from_proto(
+    output: TransformModelOutput,
+) -> Result<domain_model::ModelOutputWrite, Status> {
+    let contract = output
+        .contract
+        .ok_or_else(|| Status::invalid_argument("model output contract is required"))?;
+    let columns = |columns: Vec<ColumnDef>| {
+        columns
+            .into_iter()
+            .map(|column| domain_model::ModelColumn {
+                name: column.name,
+                col_type: column.r#type,
+            })
+            .collect()
+    };
+    let contract = domain_model::AdapterContract {
+        inputs: contract
+            .inputs
+            .into_iter()
+            .map(|input| domain_model::ModelInput {
+                name: input.name,
+                columns: columns(input.columns),
+            })
+            .collect(),
+        output: columns(contract.output),
+    };
+    contract.validate().map_err(Status::invalid_argument)?;
+    Ok(domain_model::ModelOutputWrite {
+        model_name: output.model_name,
+        digest: output.digest,
+        adapter_id: output.adapter_id,
+        adapter_version: output.adapter_version,
+        registry_locator: output.registry_locator,
+        contract,
+    })
+}
+
 fn to_proto_model_version(version: domain_model::ModelVersion) -> ModelVersion {
     ModelVersion {
         version_id: version.version_id,

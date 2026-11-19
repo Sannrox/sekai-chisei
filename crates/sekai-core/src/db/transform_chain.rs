@@ -1140,6 +1140,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,

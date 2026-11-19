@@ -122,6 +122,88 @@ pub(crate) fn resolve_model_input_pins_pg(
     Ok(resolved)
 }
 
+/// Stores `version` in `tx` unless its id is already held. A newly stored
+/// version moves the model's gateless stages to it (#3023); a repeat
+/// registration moves nothing. Model registration and a training run's
+/// write-back (#3021) share it.
+pub(crate) fn insert_model_version_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    version: &ModelVersion,
+) -> Result<(), String> {
+    let inserted = tx
+        .execute(
+            "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (version_id) DO NOTHING",
+            params![
+                version.version_id,
+                version.namespace,
+                version.model_name,
+                encode(version)?
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted == 1 {
+        super::model_stage_store::follow_gateless_stages_sqlite(tx, version)?;
+    }
+    Ok(())
+}
+
+/// See [`insert_model_version_sqlite`].
+pub(crate) fn insert_model_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    version: &ModelVersion,
+) -> Result<(), String> {
+    let inserted = tx
+        .execute(
+            "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (version_id) DO NOTHING",
+            &[
+                &version.version_id,
+                &version.namespace,
+                &version.model_name,
+                &encode(version)?,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if inserted == 1 {
+        super::model_stage_store::follow_gateless_stages_pg(tx, version)?;
+    }
+    Ok(())
+}
+
+/// The versions a successful write-back of `run` publishes for the model
+/// outputs `transform` declares (#3021); empty when it declares none.
+pub(crate) fn run_model_outputs(
+    transform: &crate::sekai::governed_transform::GovernedTransform,
+    run: &crate::sekai::governed_transform::TransformRun,
+    command: &crate::sekai::governed_transform::WriteTransformRunCommand,
+    now_ms: i64,
+) -> Result<Vec<ModelVersion>, String> {
+    let declared = transform
+        .isolated_process
+        .as_ref()
+        .map(|spec| &spec.model_outputs);
+    let Some(declared) = declared.filter(|declared| !declared.is_empty()) else {
+        if command.model_outputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err("the transform declares no model outputs".into());
+    };
+    crate::sekai::model_version::RunModelOutputs {
+        declared,
+        writes: &command.model_outputs,
+        namespace: &run.namespace,
+        run_id: &run.run_id,
+        actor: &command.runtime_id,
+        run_marking: &run.markings_out,
+        run_inputs: &run.input_versions,
+        now_ms,
+    }
+    .versions()
+}
+
 impl SekaiDb {
     pub(crate) fn migrate_model_versions(&self) -> Result<(), String> {
         self.conn()
@@ -147,22 +229,7 @@ impl SekaiDb {
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| error.to_string())?;
-            let inserted = tx
-                .execute(
-                    "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT (version_id) DO NOTHING",
-                    params![
-                        version.version_id,
-                        version.namespace,
-                        version.model_name,
-                        encode(version)?
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-            if inserted == 1 {
-                super::model_stage_store::follow_gateless_stages_sqlite(&tx, version)?;
-            }
+            insert_model_version_sqlite(&tx, version)?;
             tx.commit().map_err(|error| error.to_string())?;
         }
         self.get_model_version(&version.namespace, &version.version_id)?
@@ -217,22 +284,7 @@ impl PostgresDb {
         {
             let mut conn = self.connection()?;
             let mut tx = conn.transaction().map_err(|error| error.to_string())?;
-            let inserted = tx
-                .execute(
-                    "INSERT INTO sekai_model_versions (version_id, namespace, model_name, record_json)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (version_id) DO NOTHING",
-                    &[
-                        &version.version_id,
-                        &version.namespace,
-                        &version.model_name,
-                        &encode(version)?,
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-            if inserted == 1 {
-                super::model_stage_store::follow_gateless_stages_pg(&mut tx, version)?;
-            }
+            insert_model_version_pg(&mut tx, version)?;
             tx.commit().map_err(|error| error.to_string())?;
         }
         self.get_model_version(&version.namespace, &version.version_id)?
@@ -322,6 +374,164 @@ pub(crate) mod store_tests {
         .unwrap()
     }
 
+    /// A training run publishes exactly one version per declared model
+    /// output with its write-back (#3021): a killed host's stale claim
+    /// publishes nothing, a write naming other models is refused whole, a
+    /// retried write adds nothing, and a quarantined run publishes none.
+    pub(crate) fn training_run_publishes_one_version(db: &RuntimeDb) {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{
+            CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, WriteTransformRunCommand,
+            rows_digest,
+        };
+        use crate::sekai::model_version::ModelOutputWrite;
+        for id in ["in", "out"] {
+            db.create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: vec![ColumnDef {
+                    name: "id".into(),
+                    col_type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        let rows = vec![std::collections::HashMap::from([(
+            "id".to_string(),
+            "1".to_string(),
+        )])];
+        db.append_rows("in", &rows).unwrap();
+        let transform = GovernedTransform {
+            contract_version: CONTRACT_VERSION.into(),
+            namespace: "ml".into(),
+            transform_id: "train".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: Vec::new(),
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: Some(IsolatedProcessSpec {
+                engine: "python".into(),
+                runtime_image: "trainer:1".into(),
+                code: "fit()".into(),
+                model_outputs: [" churn ".to_string()].into(),
+                ..Default::default()
+            }),
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        assert_eq!(
+            transform.isolated_process.as_ref().unwrap().model_outputs,
+            ["churn".to_string()].into()
+        );
+        db.put_governed_transform(&transform, 10).unwrap();
+        let trained = |model_name: &str, digest: &str| {
+            let registration = registration(digest, "");
+            ModelOutputWrite {
+                model_name: model_name.into(),
+                digest: digest.into(),
+                adapter_id: registration.adapter_id,
+                adapter_version: registration.adapter_version,
+                registry_locator: registration.registry_locator,
+                contract: registration.contract,
+            }
+        };
+        let write = |work: &crate::sekai::governed_transform::TransformWork,
+                     quarantined: bool,
+                     outputs: Vec<ModelOutputWrite>,
+                     now_ms: i64| {
+            db.write_transform_run(
+                WriteTransformRunCommand {
+                    run_id: work.run_id.clone(),
+                    runtime_id: work.claim_owner.clone(),
+                    claim_generation: work.claim_generation,
+                    fencing_token: work.fencing_token.clone(),
+                    rows: rows.clone(),
+                    output_digest: rows_digest(&rows),
+                    quarantined,
+                    model_outputs: outputs,
+                    ..WriteTransformRunCommand::default()
+                },
+                now_ms,
+            )
+        };
+        let versions = || db.list_model_versions("ml", "churn").unwrap();
+
+        let run = db.run_governed_transform("ml", "train", false, 20).unwrap();
+        let (killed, _) = db
+            .claim_transform_work("ml", "host-a", "", 1_000, 30)
+            .unwrap()
+            .expect("claimable work");
+        // host-a dies mid-training; its lease lapses and host-b takes over.
+        let (retry, _) = db
+            .claim_transform_work("ml", "host-b", "", 60_000, 5_000)
+            .unwrap()
+            .expect("expired work is claimable again");
+        assert_eq!(retry.run_id, run.run_id);
+        assert!(write(&killed, false, vec![trained("churn", "sha256:a")], 5_100).is_err());
+        assert!(versions().is_empty(), "a stale claim publishes nothing");
+
+        for wrong in [
+            Vec::new(),
+            vec![trained("churn", "sha256:a"), trained("other", "sha256:o")],
+            vec![trained("churn", "sha256:a"), trained("churn", "sha256:b")],
+        ] {
+            let refused = write(&retry, false, wrong, 5_200).unwrap_err();
+            assert!(refused.contains("model output"), "{refused}");
+        }
+        assert!(versions().is_empty(), "a refused write publishes nothing");
+        assert!(
+            db.query_rows("out", &Default::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        let committed = write(&retry, false, vec![trained("churn", "sha256:a")], 5_300).unwrap();
+        let [version] = versions().try_into().expect("exactly one version");
+        assert_eq!(version.run_id, run.run_id);
+        assert_eq!(version.actor, "host-b");
+        assert_eq!(version.marking, committed.markings_out);
+        assert_eq!(
+            version
+                .training_inputs
+                .iter()
+                .map(|input| (input.dataset_id.as_str(), input.version_id.as_str()))
+                .collect::<Vec<_>>(),
+            committed
+                .input_versions
+                .iter()
+                .map(|(dataset, version)| (dataset.as_str(), version.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(version.training_inputs[0].dataset_id, "in");
+        // A repeated write-back of the committed run adds nothing.
+        write(&retry, false, vec![trained("churn", "sha256:a")], 5_400).unwrap();
+        assert_eq!(versions().len(), 1);
+
+        db.run_governed_transform("ml", "train", false, 6_000)
+            .unwrap();
+        let (quarantined, _) = db
+            .claim_transform_work("ml", "host-b", "", 60_000, 6_100)
+            .unwrap()
+            .expect("second run");
+        let run = write(
+            &quarantined,
+            true,
+            vec![trained("churn", "sha256:q")],
+            6_200,
+        )
+        .unwrap();
+        assert!(run.quarantined);
+        assert_eq!(versions().len(), 1, "a quarantined run publishes nothing");
+    }
+
     /// A run of a transform pinning a model version records the pin and
     /// carries the version's marking; a pin naming no version refuses the
     /// run (#3074).
@@ -380,6 +590,7 @@ pub(crate) mod store_tests {
                     runtime_image: "runner:1".into(),
                     code: "score()".into(),
                     model_inputs: BTreeMap::from([("scorer".into(), version_id.into())]),
+                    model_outputs: Default::default(),
                     ..Default::default()
                 }),
                 schedule: None,
@@ -589,6 +800,20 @@ mod tests {
             .register_model_version(store_tests::registration("sha256:c", "nope"), 8)
             .unwrap_err();
         assert!(missing.contains("not found"), "{missing}");
+    }
+
+    #[test]
+    fn sqlite_training_run_publishes_one_version() {
+        let db = RuntimeDb::Sqlite(Arc::new(SekaiDb::new(":memory:").unwrap()));
+        store_tests::training_run_publishes_one_version(&db);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_training_run_publishes_one_version() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        store_tests::training_run_publishes_one_version(&db);
     }
 
     #[test]

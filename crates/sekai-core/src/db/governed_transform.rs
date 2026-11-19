@@ -2992,6 +2992,15 @@ fn write_transform_run_tx(
     run.markings_out =
         fold_live_output_marking(lattice.as_ref(), &run.markings_out, live_output.as_deref())?;
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
+    // Each model the run trained is published with the output it commits,
+    // under its final marking (#3021); an ad-hoc run publishes none.
+    if !adhoc {
+        for version in
+            crate::db::model_version_store::run_model_outputs(&transform, &run, command, now_ms)?
+        {
+            crate::db::model_version_store::insert_model_version_sqlite(tx, &version)?;
+        }
+    }
     if let Some(commit) = partition_commit {
         replace_output_partitions(tx, &transform.output_dataset_id, &commit.replacements)?;
         run.output_digest = commit.envelope_digest.clone();
@@ -7227,6 +7236,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -8812,6 +8822,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: Some(TransformTrigger {
@@ -9036,6 +9047,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9212,6 +9224,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -9292,6 +9305,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -10466,6 +10480,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -10801,6 +10816,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -11126,6 +11142,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,

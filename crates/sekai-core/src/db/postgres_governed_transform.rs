@@ -3294,6 +3294,14 @@ fn write_transform_run_pg(
     let live_output = load_object_marking_token(tx, &output_object_id)?;
     run.markings_out = fold_live_output_marking(None, &run.markings_out, live_output.as_deref())?;
     require_bound_output_for_markings(&output_object_id, &run.markings_out)?;
+    // See the SQLite write-back: models publish with the output (#3021).
+    if !adhoc {
+        for version in
+            crate::db::model_version_store::run_model_outputs(&transform, &run, command, now_ms)?
+        {
+            crate::db::model_version_store::insert_model_version_pg(tx, &version)?;
+        }
+    }
     if let Some(commit) = partition_commit {
         replace_output_partitions_pg(tx, &transform.output_dataset_id, &commit.replacements)?;
         run.output_digest = commit.envelope_digest.clone();
@@ -5857,6 +5865,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -6620,6 +6629,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -6778,6 +6788,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
@@ -7352,6 +7363,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: Some(TransformTrigger {
@@ -7988,6 +8000,7 @@ mod tests {
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,
