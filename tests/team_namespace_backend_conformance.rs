@@ -79,6 +79,65 @@ fn exercise(db: &dyn TeamNamespaceHarness, prefix: &str) {
             .any(|grant| grant.principal == principal && grant.role == Role::Admin)
     );
 
+    // an expired member grant is renewed with the bootstrap's attributes, and the
+    // overwritten values stay in the boundary's change log (#2718)
+    db.create_grant(&sekai_chisei::sekai::security::Grant {
+        id: format!("team:{namespace}:{principal}"),
+        object_id: created.id.clone(),
+        principal: principal.clone(),
+        role: Role::Admin,
+        created: 1,
+        purpose: "expired pilot".into(),
+        not_after_ms: 2,
+        exception_reason: "pilot exception".into(),
+    })
+    .unwrap();
+    let (_, renewed) = db
+        .ensure_team_namespace(&namespace, &principal, Role::Admin, "local")
+        .unwrap();
+    let member = renewed
+        .iter()
+        .find(|grant| grant.principal == principal)
+        .unwrap();
+    let bootstrap_root = renewed
+        .iter()
+        .find(|grant| grant.principal == "root")
+        .unwrap();
+    assert_eq!(
+        (
+            member.not_after_ms,
+            member.purpose.as_str(),
+            member.exception_reason.as_str()
+        ),
+        (
+            bootstrap_root.not_after_ms,
+            "team namespace membership",
+            "team-managed namespace bootstrap"
+        )
+    );
+    let changes = db.list_object_changes(&created.id, 100, 0).unwrap();
+    let change = |field: &str| {
+        changes
+            .iter()
+            .find(|change| change.field == format!("grants.{principal}.{field}"))
+            .map(|change| (change.old_value.as_str(), change.new_value.as_str()))
+    };
+    assert_eq!(change("not_after_ms"), Some(("2", "0")));
+    assert_eq!(
+        change("purpose"),
+        Some(("expired pilot", "team namespace membership"))
+    );
+    assert_eq!(
+        change("exception_reason"),
+        Some(("pilot exception", "team-managed namespace bootstrap"))
+    );
+    assert!(
+        !changes
+            .iter()
+            .any(|change| change.field.starts_with("grants.root.")),
+        "an unchanged grant records no change"
+    );
+
     // duplicate canonical namespace identities fail closed: PostgreSQL's
     // unique canonical-namespace index refuses the second boundary at write,
     // and SQLite refuses to bootstrap over the ambiguous pair.
