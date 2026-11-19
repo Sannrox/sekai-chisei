@@ -4,7 +4,8 @@ use crate::cli_args::require_value;
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::Config;
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::governed_transform::{GovernedTransform, TransformRun};
+use crate::sekai::governed_transform::{GovernedTransform, TransformRun, TransformSchedule};
+use crate::sekai::model_version::ModelBinding;
 use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,13 +13,14 @@ use std::sync::Arc;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl admin transform put --file <json>\n  sekaictl admin transform run --namespace <ns> --transform-id <id> [--incremental]\n  sekaictl admin transform get --run-id <id>\n  sekaictl admin transform list --namespace <ns>"
+    "sekaictl admin transform put --file <json>\n  sekaictl admin transform run --namespace <ns> --transform-id <id> [--incremental]\n  sekaictl admin transform bind-model --namespace <ns> --model-version <id> --transform-id <id> --input <dataset> --output <dataset> --runtime-image <image> [--every-ms <ms>]\n  sekaictl admin transform get --run-id <id>\n  sekaictl admin transform list --namespace <ns>"
 }
 
 pub async fn run_transform_command(args: Vec<String>) -> Result<(), BoxErr> {
     match args.first().map(String::as_str) {
         Some("put") => put(parse_put(&args[1..])?).await,
         Some("run") => run(parse_run(&args[1..])?).await,
+        Some("bind-model") => bind_model(parse_bind_model(&args[1..])?).await,
         Some("get") => get_run(parse_get(&args[1..])?).await,
         Some("list") => list_ns(parse_list(&args[1..])?).await,
         _ => Err(std::io::Error::other(usage()).into()),
@@ -40,6 +42,22 @@ pub fn put_definition(
     let prepared = transform.prepare().map_err(|error| error.message())?;
     db.put_governed_transform(&prepared, now_ms)?;
     Ok(prepared)
+}
+
+/// Puts the batch transform that scores a dataset with a single-table model
+/// version (#3076). Refuses a missing version and a model with more than one
+/// input table.
+pub fn bind_model_version(
+    db: &RuntimeDb,
+    namespace: &str,
+    version_id: &str,
+    binding: ModelBinding,
+    now_ms: i64,
+) -> Result<GovernedTransform, String> {
+    let version = db
+        .get_model_version(namespace, version_id)?
+        .ok_or(crate::sekai::model_version::MODEL_VERSION_NOT_FOUND)?;
+    put_definition(db, version.bind(binding)?, now_ms)
 }
 
 pub fn run_named(
@@ -194,6 +212,26 @@ async fn run(config: RunConfig) -> Result<(), BoxErr> {
     Ok(())
 }
 
+struct BindModelConfig {
+    namespace: String,
+    version_id: String,
+    binding: ModelBinding,
+}
+
+async fn bind_model(config: BindModelConfig) -> Result<(), BoxErr> {
+    let layout = open_layout().await?;
+    let stored = bind_model_version(
+        layout.sekai_runtime().as_ref(),
+        &config.namespace,
+        &config.version_id,
+        config.binding,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&stored)?);
+    Ok(())
+}
+
 struct GetConfig {
     run_id: String,
 }
@@ -267,6 +305,46 @@ fn parse_run(args: &[String]) -> Result<RunConfig, String> {
         namespace: namespace.ok_or_else(|| "run requires --namespace".to_string())?,
         transform_id: transform_id.ok_or_else(|| "run requires --transform-id".to_string())?,
         incremental,
+    })
+}
+
+fn parse_bind_model(args: &[String]) -> Result<BindModelConfig, String> {
+    let mut values: std::collections::HashMap<&str, String> = Default::default();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        match flag {
+            "--namespace" | "--model-version" | "--transform-id" | "--input" | "--output"
+            | "--runtime-image" | "--every-ms" => {
+                values.insert(flag, require_value(args, i, flag)?);
+                i += 2;
+            }
+            other => return Err(format!("unknown flag {other}")),
+        }
+    }
+    let mut take = |flag: &str| {
+        values
+            .remove(flag)
+            .ok_or_else(|| format!("bind-model requires {flag}"))
+    };
+    let schedule = match take("--every-ms") {
+        Ok(every) => Some(TransformSchedule {
+            every_ms: every
+                .parse()
+                .map_err(|_| "--every-ms takes milliseconds".to_string())?,
+        }),
+        Err(_) => None,
+    };
+    Ok(BindModelConfig {
+        namespace: take("--namespace")?,
+        version_id: take("--model-version")?,
+        binding: ModelBinding {
+            transform_id: take("--transform-id")?,
+            input_dataset_id: take("--input")?,
+            output_dataset_id: take("--output")?,
+            runtime_image: take("--runtime-image")?,
+            schedule,
+        },
     })
 }
 
@@ -374,6 +452,81 @@ mod tests {
         assert_eq!(transforms.len(), 1);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, run.run_id);
+    }
+
+    /// A bound model's runs pin its version in their receipts (#3076).
+    #[test]
+    fn a_bound_model_runs_with_its_version_pinned() {
+        use crate::sekai::model_version::{
+            AdapterContract, ModelColumn, ModelInput, ModelVersion, ModelVersionRegistration,
+        };
+        let db = runtime();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+            .unwrap();
+        let id = || ModelColumn {
+            name: "id".into(),
+            col_type: "string".into(),
+        };
+        let version = ModelVersion::from_run(
+            ModelVersionRegistration {
+                namespace: "ops".into(),
+                model_name: "scorer".into(),
+                digest: "sha256:abc".into(),
+                adapter_id: "prefix".into(),
+                adapter_version: "1".into(),
+                registry_locator: "scorer/abc".into(),
+                contract: AdapterContract {
+                    inputs: vec![ModelInput {
+                        name: "features".into(),
+                        columns: vec![id()],
+                    }],
+                    output: vec![id()],
+                },
+                run_id: "training".into(),
+                actor: "trainer".into(),
+            },
+            "ops",
+            "",
+            &Default::default(),
+            1,
+        )
+        .unwrap();
+        let version_id = db.insert_model_version(&version).unwrap().version_id;
+        let binding = parse_bind_model(
+            &[
+                "--namespace",
+                "ops",
+                "--model-version",
+                &version_id,
+                "--transform-id",
+                "score",
+                "--input",
+                "in",
+                "--output",
+                "out",
+                "--runtime-image",
+                "model-runner:1",
+                "--every-ms",
+                "60000",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        assert!(
+            bind_model_version(&db, "ops", "missing", binding.binding.clone(), 10)
+                .unwrap_err()
+                .contains("not found")
+        );
+        let stored =
+            bind_model_version(&db, "ops", &binding.version_id, binding.binding, 10).unwrap();
+        assert_eq!(
+            stored.schedule,
+            Some(TransformSchedule { every_ms: 60_000 })
+        );
+        let run = run_named(&db, "ops", "score", false, 20).unwrap();
+        assert_eq!(run.input_versions.get("model:features"), Some(&version_id));
     }
 
     #[test]

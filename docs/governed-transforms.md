@@ -345,12 +345,24 @@ score, the worker ends the run with `AckWork` of kind transform, outcome
 `fail_transform`. The run then reads `refused` with that code, writes no
 output, and returns its quota reservation.
 
+A single-table model can be bound to a dataset instead of writing the
+transform by hand (#3076). `sekaictl admin transform bind-model` generates an
+isolated-process transform with engine `model`, the operator's runtime image,
+the version pinned under the contract's input name, and code that is that
+name. A runtime that runs engine `model` feeds the input dataset's rows to the
+model under that name and writes the rows it returns. The transform is
+scheduled like any other with `--every-ms`. Binding refuses a missing version
+and a model with more than one input table.
+
 ## Operator path
 
 ```bash
 sekaictl admin transform put --file transform.json
 sekaictl admin transform run --namespace ops --transform-id t1
 sekaictl admin transform run --namespace ops --transform-id t1 --incremental
+sekaictl admin transform bind-model --namespace ops --model-version <version> \
+  --transform-id score --input customers --output churn-scores \
+  --runtime-image model-runner:1 --every-ms 3600000
 sekaictl admin transform get --run-id <run>
 sekaictl admin transform list --namespace ops
 ```
