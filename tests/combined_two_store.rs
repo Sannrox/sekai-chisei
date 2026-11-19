@@ -48,7 +48,7 @@ fn destination_sources(sekai: &Path, chisei: &Path) -> CombinedStoreSources {
 }
 
 fn test_config() -> Config {
-    let mut config = Config::from_env();
+    let mut config = Config::from_lookup(&|_| Err(std::env::VarError::NotPresent));
     config.scoring_enabled = false;
     config.ops_port = None;
     config.http_port = None;

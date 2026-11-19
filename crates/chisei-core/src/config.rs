@@ -91,20 +91,36 @@ pub struct GrpcTcpMode {
 }
 
 impl Config {
+    /// Configuration from the process environment.
     pub fn from_env() -> Self {
         Self {
+            routing_credential_refs: crate::chisei::routing_profiles::resolvable_credential_refs(),
+            ..Self::from_lookup(&|key| env::var(key))
+        }
+    }
+
+    /// Configuration read through `lookup` instead of the process
+    /// environment, so tests can build one that ambient variables cannot
+    /// change: `Config::from_lookup(&|_| Err(std::env::VarError::NotPresent))`
+    /// gives the defaults. `lookup` has the shape of [`std::env::var`].
+    /// `routing_credential_refs` needs every variable name, not one key, so it
+    /// is empty here and filled by [`Self::from_env`].
+    pub fn from_lookup(lookup: Lookup<'_>) -> Self {
+        let env = |key: &str, default: &str| env_or(lookup, key, default);
+        let var = |key: &str| lookup(key);
+        Self {
             grpc_port: env("GRPC_PORT", "50051").parse().unwrap_or(50051),
-            sekai_bind: optional_env("SEKAI_BIND"),
-            ops_port: optional_port("OPS_PORT", "9464"),
+            sekai_bind: optional_env(lookup, "SEKAI_BIND"),
+            ops_port: optional_port(lookup, "OPS_PORT", "9464"),
             ops_bind: env("OPS_BIND", "127.0.0.1"),
-            http_port: optional_port("SEKAI_HTTP_PORT", "50080"),
+            http_port: optional_port(lookup, "SEKAI_HTTP_PORT", "50080"),
             http_bind: env("SEKAI_HTTP_BIND", "127.0.0.1"),
-            sekai_socket: socket_path("SEKAI_SOCKET", "./data/sekai.sock"),
-            db_path: default_sekai_sqlite_path(),
-            anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
-            openai_api_key: env::var("OPENAI_API_KEY").ok(),
+            sekai_socket: socket_path(lookup, "SEKAI_SOCKET", "./data/sekai.sock"),
+            db_path: default_sekai_sqlite_path(lookup),
+            anthropic_api_key: var("ANTHROPIC_API_KEY").ok(),
+            openai_api_key: var("OPENAI_API_KEY").ok(),
             ollama_url: env("OLLAMA_URL", "http://localhost:11434"),
-            native_llm_url: env::var("NATIVE_LLM_URL").ok(),
+            native_llm_url: var("NATIVE_LLM_URL").ok(),
             sample_rate: env("SAMPLE_RATE", "0.05").parse().unwrap_or(0.05),
             sample_risk_threshold: env("SAMPLE_RISK_THRESHOLD", "0.7").parse().unwrap_or(0.7),
             scoring_enabled: env("SCORING_ENABLED", "false").parse().unwrap_or(false),
@@ -112,55 +128,64 @@ impl Config {
             scoring_model: env("SCORING_MODEL", "claude-opus-4-8"),
             scoring_batch_size: env("SCORING_BATCH_SIZE", "16").parse().unwrap_or(16),
             default_data_class: env("CHISEI_DEFAULT_DATA_CLASS", "unclassified"),
-            safe_egress_providers: csv_env("CHISEI_SAFE_EGRESS_PROVIDERS"),
-            gateway_provided_providers: csv_env("CHISEI_GATEWAY_PROVIDED_PROVIDERS"),
-            gateway_key: optional_env("CHISEI_GATEWAY_KEY"),
+            safe_egress_providers: csv_env(lookup, "CHISEI_SAFE_EGRESS_PROVIDERS"),
+            gateway_provided_providers: csv_env(lookup, "CHISEI_GATEWAY_PROVIDED_PROVIDERS"),
+            gateway_key: optional_env(lookup, "CHISEI_GATEWAY_KEY"),
             gateway_url: env("CHISEI_GATEWAY_URL", DEFAULT_GATEWAY_URL),
-            routing_endpoint_allowlist: crate::chisei::routing_profiles::endpoint_allowlist(),
-            routing_credential_refs: crate::chisei::routing_profiles::resolvable_credential_refs(),
-            gateway_receipt_principals: identity_csv_env("CHISEI_GATEWAY_RECEIPT_PRINCIPALS"),
-            leak_review_model: env::var("LEAK_REVIEW_MODEL")
+            routing_endpoint_allowlist: crate::chisei::routing_profiles::endpoint_allowlist_from(
+                &var(crate::chisei::routing_profiles::ENDPOINT_ALLOWLIST_ENV).unwrap_or_default(),
+            ),
+            routing_credential_refs: Vec::new(),
+            gateway_receipt_principals: identity_csv_env(
+                lookup,
+                "CHISEI_GATEWAY_RECEIPT_PRINCIPALS",
+            ),
+            leak_review_model: var("LEAK_REVIEW_MODEL")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            tls_cert: env::var("SEKAI_TLS_CERT")
+            tls_cert: var("SEKAI_TLS_CERT")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            tls_key: env::var("SEKAI_TLS_KEY")
+            tls_key: var("SEKAI_TLS_KEY")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            allow_plaintext: env::var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
-            insecure: env::var("SEKAI_INSECURE").unwrap_or_default() == "1",
-            permit_signing_key: optional_env("CHISEI_PERMIT_SIGNING_KEY"),
+            allow_plaintext: var("SEKAI_ALLOW_PLAINTEXT").unwrap_or_default() == "1",
+            insecure: var("SEKAI_INSECURE").unwrap_or_default() == "1",
+            permit_signing_key: optional_env(lookup, "CHISEI_PERMIT_SIGNING_KEY"),
             permit_issuer: env("CHISEI_PERMIT_ISSUER", "chisei.local"),
             permit_key_id: env("CHISEI_PERMIT_KEY_ID", "permit-key-1"),
             governed_subject_provenance_signing_key: optional_env(
+                lookup,
                 "CHISEI_GOVERNED_SUBJECT_PROVENANCE_SIGNING_KEY",
             ),
             governed_subject_provenance_key_not_before_ms: security_i64_env(
+                lookup,
                 "CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_NOT_BEFORE_MS",
                 0,
                 i64::MAX,
             ),
             governed_subject_provenance_key_expires_at_ms: security_i64_env(
+                lookup,
                 "CHISEI_GOVERNED_SUBJECT_PROVENANCE_KEY_EXPIRES_AT_MS",
                 i64::MAX,
                 i64::MIN,
             ),
             governed_subject_provenance_ttl_ms: security_i64_env(
+                lookup,
                 "CHISEI_GOVERNED_SUBJECT_PROVENANCE_TTL_MS",
                 24 * 60 * 60 * 1_000,
                 0,
             ),
-            site_id: site_id_env("SEKAI_SITE_ID", "local"),
-            budget_topology: BudgetTopologyConfig::from_env().unwrap_or_else(|err| {
+            site_id: site_id_env(lookup, "SEKAI_SITE_ID", "local"),
+            budget_topology: BudgetTopologyConfig::from_lookup(lookup).unwrap_or_else(|err| {
                 warn!(error = %err, "invalid budget topology config; using single_region");
                 BudgetTopologyConfig::single_region()
             }),
-            assertion_issuer: optional_env("SEKAI_ASSERTION_ISSUER"),
-            assertion_audience: optional_env("SEKAI_ASSERTION_AUDIENCE"),
-            assertion_hmac_key: optional_env("SEKAI_ASSERTION_HMAC_KEY"),
-            sekai_endpoint: optional_env("SEKAI_ENDPOINT"),
-            actor_chain_enforcement: env::var("SEKAI_ACTOR_CHAIN_ENFORCEMENT").unwrap_or_default()
+            assertion_issuer: optional_env(lookup, "SEKAI_ASSERTION_ISSUER"),
+            assertion_audience: optional_env(lookup, "SEKAI_ASSERTION_AUDIENCE"),
+            assertion_hmac_key: optional_env(lookup, "SEKAI_ASSERTION_HMAC_KEY"),
+            sekai_endpoint: optional_env(lookup, "SEKAI_ENDPOINT"),
+            actor_chain_enforcement: var("SEKAI_ACTOR_CHAIN_ENFORCEMENT").unwrap_or_default()
                 == "1",
             principal_requests_per_minute: env("SEKAI_PRINCIPAL_REQUESTS_PER_MINUTE", "60")
                 .parse()
@@ -178,8 +203,8 @@ impl Config {
         &self,
     ) -> Result<Option<crate::identity_assertion::AssertionAuthority>, String> {
         self.assertion_authority_with(
-            optional_env("SEKAI_ASSERTION_ED25519_KEYS").as_deref(),
-            optional_env("SEKAI_ASSERTION_ACCEPT_HMAC").as_deref(),
+            optional_env(&|key| env::var(key), "SEKAI_ASSERTION_ED25519_KEYS").as_deref(),
+            optional_env(&|key| env::var(key), "SEKAI_ASSERTION_ACCEPT_HMAC").as_deref(),
         )
     }
 
@@ -291,8 +316,8 @@ impl Config {
 /// Shortest `SEKAI_ASSERTION_HMAC_KEY` the assertion authority accepts.
 pub const MIN_ASSERTION_HMAC_KEY_BYTES: usize = 32;
 
-fn security_i64_env(name: &str, default: i64, invalid: i64) -> i64 {
-    match std::env::var(name) {
+fn security_i64_env(lookup: Lookup<'_>, name: &str, default: i64, invalid: i64) -> i64 {
+    match lookup(name) {
         Ok(value) => match value.parse() {
             Ok(value) => value,
             Err(error) => {
@@ -319,12 +344,15 @@ fn security_i64_env(name: &str, default: i64, invalid: i64) -> i64 {
 /// Gateway origin when `CHISEI_GATEWAY_URL` is unset; the gateway's own default bind.
 pub const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8788";
 
-fn env(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+/// A variable source with the shape of [`std::env::var`]; see [`Config::from_lookup`].
+pub type Lookup<'a> = &'a dyn Fn(&str) -> Result<String, env::VarError>;
+
+fn env_or(lookup: Lookup<'_>, key: &str, default: &str) -> String {
+    lookup(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn optional_env(key: &str) -> Option<String> {
-    env::var(key)
+fn optional_env(lookup: Lookup<'_>, key: &str) -> Option<String> {
+    lookup(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -356,8 +384,8 @@ fn require_valid_site_id(raw: Option<&str>) -> Result<(), String> {
 }
 
 /// Resolve and validate `SEKAI_SITE_ID` (non-empty, no wildcards).
-fn site_id_env(key: &str, default: &str) -> String {
-    let raw = env::var(key).unwrap_or_else(|_| default.to_string());
+fn site_id_env(lookup: Lookup<'_>, key: &str, default: &str) -> String {
+    let raw = lookup(key).unwrap_or_else(|_| default.to_string());
     match validate_site_id(&raw) {
         Ok(value) => value,
         Err(error) => {
@@ -372,11 +400,11 @@ pub fn validate_site_id(value: &str) -> Result<String, String> {
     sekai_core::sekai::lease::validate_site_id(value)
 }
 
-fn default_sekai_sqlite_path() -> String {
-    match env::var("SEKAI_DB_PATH") {
+fn default_sekai_sqlite_path(lookup: Lookup<'_>) -> String {
+    match lookup("SEKAI_DB_PATH") {
         Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
         _ => {
-            let dir = match env::var("SEKAI_DATA_DIR") {
+            let dir = match lookup("SEKAI_DATA_DIR") {
                 Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
                 _ => "./data".into(),
             };
@@ -388,16 +416,16 @@ fn default_sekai_sqlite_path() -> String {
     }
 }
 
-fn socket_path(key: &str, default: &str) -> Option<String> {
-    match env::var(key) {
+fn socket_path(lookup: Lookup<'_>, key: &str, default: &str) -> Option<String> {
+    match lookup(key) {
         Ok(value) if value.trim().is_empty() => None,
         Ok(value) => Some(value),
         Err(_) => Some(default.to_string()),
     }
 }
 
-fn optional_port(key: &str, default: &str) -> Option<u16> {
-    match env::var(key) {
+fn optional_port(lookup: Lookup<'_>, key: &str, default: &str) -> Option<u16> {
+    match lookup(key) {
         Ok(value) if value.trim().is_empty() => None,
         Ok(value) => match value.trim().parse() {
             Ok(port) => Some(port),
@@ -416,8 +444,8 @@ fn optional_port(key: &str, default: &str) -> Option<u16> {
     }
 }
 
-fn csv_env(key: &str) -> Vec<String> {
-    env::var(key)
+fn csv_env(lookup: Lookup<'_>, key: &str) -> Vec<String> {
+    lookup(key)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -426,8 +454,8 @@ fn csv_env(key: &str) -> Vec<String> {
         .collect()
 }
 
-fn identity_csv_env(key: &str) -> Vec<String> {
-    env::var(key)
+fn identity_csv_env(lookup: Lookup<'_>, key: &str) -> Vec<String> {
+    lookup(key)
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -443,13 +471,29 @@ mod tests {
     const TEST_HMAC_KEY: &str = "test-hmac-key-of-at-least-32-bytes";
 
     fn test_config() -> Config {
-        let mut config = Config::from_env();
-        config.sekai_bind = None;
-        config.insecure = false;
-        config.assertion_issuer = None;
-        config.assertion_audience = None;
-        config.assertion_hmac_key = None;
-        config
+        Config::from_lookup(&|_| Err(env::VarError::NotPresent))
+    }
+
+    // #2945: a config built from a lookup reads only that lookup.
+    #[test]
+    fn from_lookup_reads_the_given_source_not_the_process_environment() {
+        let config = Config::from_lookup(&|key| match key {
+            "SEKAI_INSECURE" => Ok("1".into()),
+            "SEKAI_BIND" => Ok("10.0.0.1".into()),
+            "SEKAI_BUDGET_TOPOLOGY" => Ok("regional_pinned".into()),
+            "SEKAI_BUDGET_SITE_ID" => Ok("eu-west-1".into()),
+            _ => Err(env::VarError::NotPresent),
+        });
+        assert!(config.insecure);
+        assert_eq!(config.sekai_bind.as_deref(), Some("10.0.0.1"));
+        assert_eq!(config.budget_topology.site_id, "eu-west-1");
+
+        let defaults = test_config();
+        assert!(!defaults.insecure);
+        assert_eq!(defaults.sekai_bind, None);
+        assert_eq!(defaults.grpc_port, 50051);
+        assert_eq!(defaults.db_path, "./data/sekai.db");
+        assert!(defaults.routing_credential_refs.is_empty());
     }
 
     // #2468

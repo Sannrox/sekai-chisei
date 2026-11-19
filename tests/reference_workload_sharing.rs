@@ -216,7 +216,7 @@ impl Server {
         let extension = extension.map(|extension| extension as Arc<dyn EnterpriseExtension>);
         let backend =
             RuntimeBackend::from_sqlite_with_enterprise_extension(&store, extension).unwrap();
-        let mut config = Config::from_env();
+        let mut config = Config::from_lookup(&|_| Err(std::env::VarError::NotPresent));
         config.sekai_socket = Some(socket.clone());
         config.db_path = store;
         config.ops_port = None;

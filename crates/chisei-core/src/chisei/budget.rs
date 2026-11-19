@@ -69,17 +69,22 @@ pub struct BudgetTopologyConfig {
 
 impl BudgetTopologyConfig {
     pub fn from_env() -> Result<Self, String> {
-        let mode_raw = std::env::var("SEKAI_BUDGET_TOPOLOGY")
-            .or_else(|_| std::env::var("BUDGET_TOPOLOGY_MODE"))
+        Self::from_lookup(&|key| std::env::var(key))
+    }
+
+    /// [`Self::from_env`] reading through `lookup`; see `Config::from_lookup`.
+    pub fn from_lookup(lookup: crate::config::Lookup<'_>) -> Result<Self, String> {
+        let mode_raw = lookup("SEKAI_BUDGET_TOPOLOGY")
+            .or_else(|_| lookup("BUDGET_TOPOLOGY_MODE"))
             .unwrap_or_default();
         let mode = BudgetTopologyMode::parse(&mode_raw)?;
-        let site_id = std::env::var("SEKAI_BUDGET_SITE_ID")
-            .or_else(|_| std::env::var("BUDGET_SITE_ID"))
+        let site_id = lookup("SEKAI_BUDGET_SITE_ID")
+            .or_else(|_| lookup("BUDGET_SITE_ID"))
             .unwrap_or_default()
             .trim()
             .to_string();
         let partition_simulated = matches!(
-            std::env::var("SEKAI_BUDGET_PARTITION_SIMULATED")
+            lookup("SEKAI_BUDGET_PARTITION_SIMULATED")
                 .unwrap_or_default()
                 .trim(),
             "1" | "true" | "TRUE" | "yes" | "YES"
