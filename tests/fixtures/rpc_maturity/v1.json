@@ -9,8 +9,8 @@
       "rpc": "AcquireLease",
       "storage_path": "sekai.leases",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -18,8 +18,8 @@
       "rpc": "GetLease",
       "storage_path": "sekai.leases",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -27,8 +27,8 @@
       "rpc": "RefreshLease",
       "storage_path": "sekai.leases",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -36,8 +36,8 @@
       "rpc": "ReleaseLease",
       "storage_path": "sekai.leases",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -45,8 +45,8 @@
       "rpc": "TakeoverExpiredLease",
       "storage_path": "sekai.leases",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {

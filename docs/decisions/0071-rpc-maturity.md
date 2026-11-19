@@ -169,3 +169,18 @@ the shrink-only SQLite-only list.
   `LineageNode.object` with `id`, `kind`, `namespace` and `external_id`.
   `native_server_smoke` consumes it on the spawned binary. The HTTP/JSON
   projection and generated stable SDKs pick it up as a unary stable.
+- 2026-11-19, Issue [#3266](https://github.com/Sannrox/sekai-chisei/issues/3266):
+  `AcquireLease`, `GetLease`, `RefreshLease`, `ReleaseLease`, and
+  `TakeoverExpiredLease` become `stable` after meeting the #2089 promotion
+  criteria. Every call checks namespace tenant context and team namespace,
+  and object-bound keys (`object:<id>`) need object read or write (ADR
+  0005). Lease state, retry results, and audit commit together, a stale
+  generation can neither refresh, release, nor take over, and a crashed
+  owner's lease is taken over at the next generation. Inputs are bounded
+  the same way on both backends: text fields at most 512 bytes and `ttl_ms`
+  at most 24 hours. RPC-level tests run on SQLite and PostgreSQL. Messages
+  were reviewed once before the freeze and stay as they are: `Lease.status`
+  stays a string (`active`, `released`). `native_server_smoke` consumes all
+  five on a spawned default plane, ahead of the external runner adapter
+  (#2182). The HTTP/JSON projection and generated stable SDKs pick them up
+  as unary stables.

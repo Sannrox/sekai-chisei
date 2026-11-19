@@ -3,6 +3,11 @@
 
 export const HTTP_PROJECTION_CONTRACT = "sekai.http-projection/v1";
 export const HTTP_UNARY_METHODS = [
+  { service: "sekai.SekaiService", rpc: "AcquireLease" },
+  { service: "sekai.SekaiService", rpc: "GetLease" },
+  { service: "sekai.SekaiService", rpc: "RefreshLease" },
+  { service: "sekai.SekaiService", rpc: "ReleaseLease" },
+  { service: "sekai.SekaiService", rpc: "TakeoverExpiredLease" },
   { service: "sekai.SekaiService", rpc: "ApplySourceBatch" },
   { service: "sekai.SekaiService", rpc: "GetSourceSyncState" },
   { service: "sekai.SekaiService", rpc: "CreateDefinitionBranch" },

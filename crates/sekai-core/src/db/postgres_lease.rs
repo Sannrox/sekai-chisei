@@ -1,8 +1,6 @@
 use crate::db::postgres::PostgresDb;
-use crate::sekai::lease::{Lease, LeaseError};
+use crate::sekai::lease::{Lease, LeaseError, checked_expiry, validate, validate_text};
 use sha2::{Digest, Sha256};
-
-const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 
 impl PostgresDb {
     #[allow(clippy::too_many_arguments)]
@@ -344,39 +342,6 @@ fn new_lease(
         released_at_ms: 0,
         site_id: site_id.into(),
     })
-}
-
-fn checked_expiry(now_ms: i64, ttl_ms: i64) -> Result<i64, LeaseError> {
-    now_ms
-        .checked_add(ttl_ms)
-        .ok_or_else(|| LeaseError::Invalid("lease expiry overflow".into()))
-}
-
-fn validate(
-    namespace: &str,
-    key: &str,
-    owner: &str,
-    ttl_ms: i64,
-    request_id: &str,
-) -> Result<(), LeaseError> {
-    validate_text(namespace, "namespace")?;
-    validate_text(key, "key")?;
-    validate_text(owner, "owner")?;
-    validate_text(request_id, "request_id")?;
-    if !(1..=MAX_TTL_MS).contains(&ttl_ms) {
-        return Err(LeaseError::Invalid(format!(
-            "ttl_ms must be between 1 and {MAX_TTL_MS}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_text(value: &str, field: &str) -> Result<(), LeaseError> {
-    if value.trim().is_empty() {
-        Err(LeaseError::Invalid(format!("{field} must not be empty")))
-    } else {
-        Ok(())
-    }
 }
 
 fn row_to_lease(row: postgres::Row) -> Lease {

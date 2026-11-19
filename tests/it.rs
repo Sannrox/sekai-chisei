@@ -127,6 +127,7 @@ mod hosted_provider_smoke;
 mod identity_assertion_conformance;
 mod index_range_filter_conformance;
 mod integration_contract;
+mod lease_rpc_backend_conformance;
 mod managed_shikigami_routing_fixture;
 mod mcp_adapter;
 mod mcp_definition_branch;

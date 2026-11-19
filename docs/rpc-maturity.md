@@ -83,8 +83,9 @@ An `experimental` RPC moves to `stable` only when it meets the
    results, and index size are enforced and documented.
 
 Search (#2243), the governed-document RPCs (#2266), the datasource
-index RPCs (#2282), the dataset version and health RPCs (#2415), and
-`GetLineage` (#2416) met these criteria and are `stable`. Status of the
+index RPCs (#2282), the dataset version and health RPCs (#2415),
+`GetLineage` (#2416), and the lease RPCs (#3266) met these criteria and are
+`stable`. Status of the
 remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
@@ -112,11 +113,11 @@ Edit the fixture, then regenerate with
 
 | RPC | Storage path | Real backend | Known consumer | Classification |
 | --- | --- | --- | --- | --- |
-| `SekaiService.AcquireLease` | `sekai.leases` | yes | none | `experimental` |
-| `SekaiService.GetLease` | `sekai.leases` | yes | none | `experimental` |
-| `SekaiService.RefreshLease` | `sekai.leases` | yes | none | `experimental` |
-| `SekaiService.ReleaseLease` | `sekai.leases` | yes | none | `experimental` |
-| `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | none | `experimental` |
+| `SekaiService.AcquireLease` | `sekai.leases` | yes | host | `stable` |
+| `SekaiService.GetLease` | `sekai.leases` | yes | host | `stable` |
+| `SekaiService.RefreshLease` | `sekai.leases` | yes | host | `stable` |
+| `SekaiService.ReleaseLease` | `sekai.leases` | yes | host | `stable` |
+| `SekaiService.TakeoverExpiredLease` | `sekai.leases` | yes | host | `stable` |
 | `SekaiService.ApplySourceBatch` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.GetSourceSyncState` | `sekai.object-sync` | yes | example | `stable` |
 | `SekaiService.ListSourceBatchTransactions` | `sekai.object-sync` | yes | none | `experimental` |

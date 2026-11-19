@@ -9,6 +9,11 @@ from typing import Any
 
 HTTP_PROJECTION_CONTRACT = "sekai.http-projection/v1"
 HTTP_UNARY_METHODS = (
+    ("sekai.SekaiService", "AcquireLease"),
+    ("sekai.SekaiService", "GetLease"),
+    ("sekai.SekaiService", "RefreshLease"),
+    ("sekai.SekaiService", "ReleaseLease"),
+    ("sekai.SekaiService", "TakeoverExpiredLease"),
     ("sekai.SekaiService", "ApplySourceBatch"),
     ("sekai.SekaiService", "GetSourceSyncState"),
     ("sekai.SekaiService", "CreateDefinitionBranch"),
