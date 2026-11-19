@@ -271,11 +271,9 @@ fn malformed_and_mixed_authorization_descriptors_fail_closed_and_stay_bounded() 
     assert_eq!(descriptor.contract_version, EPISTEMIC_DESCRIPTOR_VERSION);
     descriptor.validate().expect("unknown descriptor is valid");
 
-    for count in [MAX_SOURCE_REFS + 1, MAX_SOURCE_ROWS + 1] {
-        let mut candidate = descriptor.clone();
-        candidate.source_refs = vec!["source".into(); count];
-        assert!(candidate.validate().is_err(), "source count {count}");
-    }
+    let mut too_many_refs = descriptor.clone();
+    too_many_refs.source_refs = vec!["source".into(); MAX_SOURCE_REFS + 1];
+    assert!(too_many_refs.validate().is_err());
     let mut row_count = descriptor.clone();
     row_count.source_row_count = Some((MAX_SOURCE_ROWS + 1) as u32);
     assert!(row_count.validate().is_err());
@@ -305,10 +303,7 @@ fn malformed_and_mixed_authorization_descriptors_fail_closed_and_stay_bounded() 
     assert!(candidate.validate().is_err());
     let encoded = serde_json::to_vec(&EpistemicDescriptor::unknown()).expect("descriptor JSON");
     assert!(encoded.len() <= MAX_DESCRIPTOR_BYTES);
-
-    // A mixed-authorization Kioku-like projection may expose counts and
-    // operation references, but never linked evidence digests without an
-    // independent source authorization check.
-    let mixed = EpistemicDescriptor::unknown();
-    assert!(mixed.source_digests.is_empty());
+    // That a governed-memory projection drops the digests of linked evidence
+    // the actor cannot read is checked on the real pipeline path in
+    // chisei-core's `pipeline_tests`.
 }
