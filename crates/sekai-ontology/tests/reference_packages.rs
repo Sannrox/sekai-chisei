@@ -78,6 +78,29 @@ fn items<'a>(value: &'a Value, field: &str) -> &'a Vec<Value> {
         .unwrap_or_else(|| panic!("{field} must be a list"))
 }
 
+/// An optional list: a missing or null field reads as empty, any other
+/// non-list value fails.
+fn optional_items<'a>(value: &'a Value, field: &str) -> &'a [Value] {
+    match &value[field] {
+        Value::Null => &[],
+        Value::Array(items) => items,
+        other => panic!("{field} must be a list when present, got {other}"),
+    }
+}
+
+/// The approver names of an Action type; each must be a non-empty string.
+fn approvers(type_def: &Value) -> Vec<&str> {
+    optional_items(type_def, "approvers")
+        .iter()
+        .map(|approver| {
+            approver
+                .as_str()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| panic!("approver must be a non-empty string, got {approver}"))
+        })
+        .collect()
+}
+
 fn text<'a>(value: &'a Value, field: &str) -> &'a str {
     value[field]
         .as_str()
@@ -182,11 +205,7 @@ fn game_policy_pack_matches_its_package() {
                 "{type_id}"
             );
         }
-        for criterion in type_def["submission_criteria"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        for criterion in optional_items(type_def, "submission_criteria") {
             text(criterion, "criterion_id");
             assert!(
                 [
@@ -199,9 +218,7 @@ fn game_policy_pack_matches_its_package() {
                 "{type_id}"
             );
         }
-        for approver in type_def["approvers"].as_array().into_iter().flatten() {
-            assert!(approver.as_str().is_some_and(|name| !name.is_empty()));
-        }
+        approvers(type_def);
     }
     for budget in items(&pack, "action_budgets") {
         assert!(
@@ -306,4 +323,27 @@ fn game_routing_config_uses_only_known_routes_and_budgets() {
             );
         }
     }
+}
+
+#[test]
+fn optional_lists_accept_missing_or_null() {
+    let type_def = serde_json::json!({ "approvers": null });
+    assert!(optional_items(&type_def, "approvers").is_empty());
+    assert!(optional_items(&type_def, "submission_criteria").is_empty());
+    assert!(approvers(&type_def).is_empty());
+}
+
+#[test]
+#[should_panic(expected = "submission_criteria must be a list when present")]
+fn optional_list_with_wrong_type_fails() {
+    optional_items(
+        &serde_json::json!({ "submission_criteria": { "kind": "allow_all" } }),
+        "submission_criteria",
+    );
+}
+
+#[test]
+#[should_panic(expected = "approver must be a non-empty string")]
+fn whitespace_approver_fails() {
+    approvers(&serde_json::json!({ "approvers": ["lead", "  "] }));
 }
