@@ -210,16 +210,17 @@ impl<'a> CompactReader<'a> {
                 Ok(())
             }
             T_MAP => {
-                let header = self.read_u8()?;
-                let key_ty = header >> 4;
-                let val_ty = header & 0x0f;
-                let len = if header == 0 {
-                    0
-                } else {
-                    usize::try_from(self.read_varint()?)
-                        .map_err(|_| DecodeError("count exceeds input"))?
-                };
+                // Compact maps write the size varint first; the key/value type
+                // byte follows only when the map is non-empty.
+                let len = usize::try_from(self.read_varint()?)
+                    .map_err(|_| DecodeError("count exceeds input"))?;
+                if len == 0 {
+                    return Ok(());
+                }
                 let len = self.bound_len(len)?;
+                let types = self.read_u8()?;
+                let key_ty = types >> 4;
+                let val_ty = types & 0x0f;
                 for _ in 0..len {
                     self.skip_value_at(key_ty, depth + 1)?;
                     self.skip_value_at(val_ty, depth + 1)?;
@@ -362,6 +363,39 @@ mod tests {
         let mut reader = CompactReader::new(&[0xf1, 0x80, 0x80, 0x08]);
         let err = reader.skip_value(T_LIST).unwrap_err();
         assert_eq!(err.0, "count exceeds input");
+    }
+
+    #[test]
+    fn skipping_an_unknown_map_field_keeps_the_following_fields() {
+        // Field 1: map<i32,i32> {1: 2}; field 2: i32 7; then an empty map in
+        // field 3 (one size byte) and i32 9 in field 4.
+        let bytes = [
+            0x10 | T_MAP,
+            0x01,
+            (T_I32 << 4) | T_I32,
+            0x02,
+            0x04,
+            0x10 | T_I32,
+            0x0E,
+            0x10 | T_MAP,
+            0x00,
+            0x10 | T_I32,
+            0x12,
+            T_STOP,
+        ];
+        let mut reader = CompactReader::new(&bytes);
+        reader.begin_struct();
+        let mut seen = Vec::new();
+        while let Some((id, ty)) = reader.next_field().unwrap() {
+            if ty == T_I32 {
+                seen.push((id, reader.read_i32().unwrap()));
+            } else {
+                reader.skip_value(ty).unwrap();
+            }
+        }
+        reader.end_struct().unwrap();
+        assert_eq!(seen, [(2, 7), (4, 9)]);
+        assert_eq!(reader.remaining(), 0);
     }
 
     #[test]
