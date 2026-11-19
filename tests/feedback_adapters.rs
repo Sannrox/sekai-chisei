@@ -88,6 +88,10 @@ const SIGNATURE: &str = "api:tenkai_failed";
 struct Plane {
     db: Arc<RuntimeDb>,
     sekai: SekaiServiceImpl,
+    /// One clock reading per test. Every observation and investigation run
+    /// uses it, so a test that crosses UTC midnight stays in one recurrence
+    /// window.
+    now: i64,
 }
 
 fn plane() -> Plane {
@@ -110,6 +114,7 @@ fn plane() -> Plane {
     Plane {
         db,
         sekai: SekaiServiceImpl::new(store),
+        now,
     }
 }
 
@@ -165,9 +170,9 @@ fn producer() -> EvidenceProducerCapability {
     }
 }
 
-/// One attempt of `operation` in the `prod` scope, observed now.
-fn observe(db: &RuntimeDb, id: &str, operation: &str, classification: &str) {
-    observe_at(db, id, operation, "prod", now_ms(), classification);
+/// One attempt of `operation` in the `prod` scope, observed at the plane's clock.
+fn observe(plane: &Plane, id: &str, operation: &str, classification: &str) {
+    observe_at(&plane.db, id, operation, "prod", plane.now, classification);
 }
 
 /// Seed one observation the way a producer delivers it: accepted evidence,
@@ -346,7 +351,7 @@ async fn drain(
     runtime.run_binding(&plane.sekai).await.unwrap();
     let mut reports = Vec::new();
     while let Some(dispatch) = runtime
-        .run_once(&plane.sekai, analyzer, now_ms())
+        .run_once(&plane.sekai, analyzer, plane.now)
         .await
         .unwrap()
     {
@@ -361,7 +366,7 @@ async fn drain(
 async fn three_operations_qualify_with_one_model_call() {
     let plane = armed_plane().await;
     for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
-        observe(&plane.db, id, op, "defect");
+        observe(&plane, id, op, "defect");
     }
     let analyzer = Scripted::tenkai();
     let reports = drain(&plane, &analyzer).await;
@@ -394,9 +399,9 @@ async fn three_operations_qualify_with_one_model_call() {
 #[tokio::test]
 async fn retries_of_one_operation_stay_internal() {
     let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
-    observe(&plane.db, "o-2", "op-1", "defect");
-    observe(&plane.db, "o-3", "op-1", "defect");
+    observe(&plane, "o-1", "op-1", "defect");
+    observe(&plane, "o-2", "op-1", "defect");
+    observe(&plane, "o-3", "op-1", "defect");
     let reports = drain(&plane, &Scripted::tenkai()).await;
     assert_eq!(reports.len(), 3);
     assert!(
@@ -410,7 +415,7 @@ async fn retries_of_one_operation_stay_internal() {
 async fn a_drained_backlog_is_not_recurrence() {
     let plane = armed_plane().await;
     let day = feedback_investigation::RECURRENCE_WINDOW_MS;
-    let now = now_ms();
+    let now = plane.now;
     for (index, (id, op)) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")]
         .into_iter()
         .enumerate()
@@ -439,13 +444,13 @@ async fn a_drained_backlog_is_not_recurrence() {
 #[tokio::test]
 async fn a_blank_scope_is_never_investigated() {
     let plane = armed_plane().await;
-    observe_at(&plane.db, "o-1", "op-1", " ", now_ms(), "defect");
+    observe_at(&plane.db, "o-1", "op-1", " ", plane.now, "defect");
     let runtime = investigator();
     runtime.run_binding(&plane.sekai).await.unwrap();
     let analyzer = Scripted::tenkai();
     assert!(
         runtime
-            .run_once(&plane.sekai, &analyzer, now_ms())
+            .run_once(&plane.sekai, &analyzer, plane.now)
             .await
             .is_err()
     );
@@ -455,7 +460,7 @@ async fn a_blank_scope_is_never_investigated() {
 #[tokio::test]
 async fn one_signature_in_two_scopes_is_two_problems() {
     let plane = armed_plane().await;
-    let now = now_ms();
+    let now = plane.now;
     for (id, op, scope) in [
         ("o-1", "op-1", "prod"),
         ("o-2", "op-2", "prod"),
@@ -496,39 +501,38 @@ async fn record_investigation(plane: &Plane, principal: &str, parameters: serde_
 #[tokio::test]
 async fn an_object_planted_at_the_bucket_id_is_never_trusted() {
     let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
-    let window = now_ms().div_euclid(feedback_investigation::RECURRENCE_WINDOW_MS);
-    // Both windows, so a run that crosses midnight still meets the plant.
-    for window in [window, window + 1] {
-        let request = AnalysisRequest {
-            namespace: NAMESPACE.into(),
-            signature: SIGNATURE.into(),
-            scope: "prod".into(),
-            observations: Vec::new(),
-            distinct_operations: 0,
-            window,
-        };
-        let request_id = analysis_input(&request, INVESTIGATION_RUNTIME).request_id;
-        let key = request_id.strip_prefix("feedback-inv-").unwrap();
-        record_investigation(
-            &plane,
-            OPERATOR,
-            json!({
-                "object_id": format!("fb-inv-{key}"),
-                "name": SIGNATURE,
-                "observation_id": "o-1",
-                "outcome": "{\"attribution\":\"tenkai\"}",
-                "measured": false,
-            }),
-        )
-        .await;
-    }
+    observe(&plane, "o-1", "op-1", "defect");
+    let window = plane
+        .now
+        .div_euclid(feedback_investigation::RECURRENCE_WINDOW_MS);
+    let request = AnalysisRequest {
+        namespace: NAMESPACE.into(),
+        signature: SIGNATURE.into(),
+        scope: "prod".into(),
+        observations: Vec::new(),
+        distinct_operations: 0,
+        window,
+    };
+    let request_id = analysis_input(&request, INVESTIGATION_RUNTIME).request_id;
+    let key = request_id.strip_prefix("feedback-inv-").unwrap();
+    record_investigation(
+        &plane,
+        OPERATOR,
+        json!({
+            "object_id": format!("fb-inv-{key}"),
+            "name": SIGNATURE,
+            "observation_id": "o-1",
+            "outcome": "{\"attribution\":\"tenkai\"}",
+            "measured": false,
+        }),
+    )
+    .await;
     let runtime = investigator();
     runtime.run_binding(&plane.sekai).await.unwrap();
     let analyzer = Scripted::tenkai();
     assert!(
         runtime
-            .run_once(&plane.sekai, &analyzer, now_ms())
+            .run_once(&plane.sekai, &analyzer, plane.now)
             .await
             .is_err()
     );
@@ -547,7 +551,7 @@ async fn an_object_planted_at_the_bucket_id_is_never_trusted() {
 #[tokio::test]
 async fn a_writer_submitted_measurement_does_not_qualify() {
     let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
+    observe(&plane, "o-1", "op-1", "defect");
     plane
         .sekai
         .submit_action_instance(with_principal(
@@ -579,7 +583,7 @@ async fn a_writer_submitted_measurement_does_not_qualify() {
 async fn application_failures_never_qualify() {
     let plane = armed_plane().await;
     for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
-        observe(&plane.db, id, op, "cancelled");
+        observe(&plane, id, op, "cancelled");
     }
     let reports = drain(&plane, &Scripted::tenkai()).await;
     assert_eq!(reports.last().unwrap().filing, FilingDecision::Internal);
@@ -610,14 +614,14 @@ async fn budget_and_outages_write_nothing_and_leave_the_dispatch_for_retry() {
     ];
     for refusal in refusals {
         let plane = armed_plane().await;
-        observe(&plane.db, "o-1", "op-1", "defect");
+        observe(&plane, "o-1", "op-1", "defect");
         let runtime = investigator();
         runtime.run_binding(&plane.sekai).await.unwrap();
         let dispatch = claimable(&plane).await.remove(0).effect_id;
         let analyzer = Scripted::failing(refusal);
         assert!(
             runtime
-                .run_once(&plane.sekai, &analyzer, now_ms())
+                .run_once(&plane.sekai, &analyzer, plane.now)
                 .await
                 .is_err()
         );
@@ -644,7 +648,7 @@ async fn budget_and_outages_write_nothing_and_leave_the_dispatch_for_retry() {
 #[tokio::test]
 async fn two_processes_never_share_a_live_claim() {
     let plane = armed_plane().await;
-    observe(&plane.db, "o-1", "op-1", "defect");
+    observe(&plane, "o-1", "op-1", "defect");
     let (first, second) = (investigator(), investigator());
     first.run_binding(&plane.sekai).await.unwrap();
     // Both list the dispatch before either claims it.
@@ -669,7 +673,7 @@ async fn two_processes_never_share_a_live_claim() {
 async fn a_crashed_claim_is_taken_over_without_duplicate_records() {
     let plane = armed_plane().await;
     for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
-        observe(&plane.db, id, op, "defect");
+        observe(&plane, id, op, "defect");
     }
     let runtime = investigator();
     runtime.run_binding(&plane.sekai).await.unwrap();
@@ -844,7 +848,7 @@ struct Publication {
 async fn publication() -> Publication {
     let plane = armed_plane().await;
     for (id, op) in [("o-1", "op-1"), ("o-2", "op-2"), ("o-3", "op-3")] {
-        observe(&plane.db, id, op, "defect");
+        observe(&plane, id, op, "defect");
     }
     let finding_id = drain(&plane, &Scripted::tenkai())
         .await
@@ -1067,7 +1071,7 @@ async fn a_new_occurrence_updates_the_managed_section_and_keeps_maintainer_text(
             .push_str("\n\nMaintainer: tracked in the next release.");
         issues[0].updated_ms += 1;
     }
-    observe(&publication.plane.db, "o-4", "op-4", "defect");
+    observe(&publication.plane, "o-4", "op-4", "defect");
     let intent = written(publication.decide().await);
     assert_ne!(intent.expected_version, ABSENT);
     publication.write(&intent).await.unwrap();
@@ -1112,7 +1116,7 @@ async fn a_lost_end_marker_refuses_the_update_and_keeps_maintainer_text() {
         issues[0].updated_ms += 1;
         issues[0].body.clone()
     };
-    observe(&publication.plane.db, "o-4", "op-4", "defect");
+    observe(&publication.plane, "o-4", "op-4", "defect");
     let error = publication
         .publisher
         .decide(
