@@ -378,7 +378,25 @@ records the cursor does not cover.
 Not yet in policy mode: `x-chisei-request-id` dispatch deduplication and
 cost or token quotas.
 
-## No graph context
+## Native execution through the gateway
+
+Native execution (`PlanExecution`, then `ExecutePlanStream`) can egress through
+the gateway so provider keys live only there (ADR 0152, #2700). Configure the
+control plane with:
+
+- `CHISEI_GATEWAY_KEY`: a gateway client key for the control plane;
+- `CHISEI_GATEWAY_URL`: the gateway origin (default `http://127.0.0.1:8788`);
+- `CHISEI_GATEWAY_PROVIDED_PROVIDERS`: the providers to send there, for example
+  `openai,anthropic`.
+
+Chisei still plans, admits, and budgets the call. It then sends the
+provider-shaped request to the gateway as an ordinary principal. The gateway
+applies its own governance, swaps in the provider key it holds, and records its
+usage row. The native receipt still names the plan. Only `openai` and
+`anthropic` are routed this way. Other providers, hosted routing profiles, and
+hosted embedding catch-up keep calling their endpoints directly with the keys
+this process holds.
+
 
 The gateway injects no graph data (ADR 0152, #2696). A request with a
 top-level `chisei_context` field is refused with `400 invalid_request_error`

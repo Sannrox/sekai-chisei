@@ -120,6 +120,7 @@ pub async fn execute_native_content_request_stream(
         .clone()
         .unwrap_or_else(|| "default".to_string());
     let estimated = estimate_content_request(&request);
+    let gateway = gateway_egress(config, &registry, &request.model);
     let provider_credential = execution_provider_credential(
         Some(ExecutionAuthentication {
             db,
@@ -128,28 +129,38 @@ pub async fn execute_native_content_request_stream(
         &registry,
         &request.model,
         LocalEndpoints::from_config(config),
+        gateway,
     )?;
     crate::obs::correlation::in_grpc_stage(crate::obs::correlation::Stage::Budget, || {
         budget
             .check_and_reserve(&user_id, estimated)
             .map_err(Status::resource_exhausted)
     })?;
-    let provider = match llm::resolve_with_registry_and_provider_credential(
-        &request.model,
-        &registry,
-        Some(&registry_state_path),
-        config.anthropic_api_key.as_deref(),
-        config.openai_api_key.as_deref(),
-        &config.ollama_url,
-        config.native_llm_url.as_deref(),
-        request
-            .hosted
-            .as_ref()
-            .map(|hosted| hosted.credential.expose())
-            .or(provider_credential
+    let resolved_provider = match gateway {
+        Some(gateway) => llm::resolve_through_gateway(
+            &request.model,
+            &registry,
+            Some(&registry_state_path),
+            gateway,
+        ),
+        None => llm::resolve_with_registry_and_provider_credential(
+            &request.model,
+            &registry,
+            Some(&registry_state_path),
+            config.anthropic_api_key.as_deref(),
+            config.openai_api_key.as_deref(),
+            &config.ollama_url,
+            config.native_llm_url.as_deref(),
+            request
+                .hosted
                 .as_ref()
-                .map(|credential| credential.secret.expose())),
-    ) {
+                .map(|hosted| hosted.credential.expose())
+                .or(provider_credential
+                    .as_ref()
+                    .map(|credential| credential.secret.expose())),
+        ),
+    };
+    let provider = match resolved_provider {
         Ok(provider) => provider,
         Err(error) => {
             budget.adjust(&user_id, estimated, 0);
@@ -261,32 +272,40 @@ async fn execute_chat_request_stream_with_cache(
         crate::provider_profile::provider_registry_state_path(&config.db_path);
     let user_id = r.user_id.clone().unwrap_or_else(|| "default".to_string());
     let estimated = estimate_chat_request(&r);
+    let gateway = gateway_egress(config, &registry, &r.model);
     let provider_credential = execution_provider_credential(
         execution_authentication,
         &registry,
         &r.model,
         LocalEndpoints::from_config(config),
+        gateway,
     )?;
     crate::obs::correlation::in_grpc_stage(crate::obs::correlation::Stage::Budget, || {
         budget
             .check_and_reserve(&user_id, estimated)
             .map_err(Status::resource_exhausted)
     })?;
-    let provider = match llm::resolve_with_registry_and_provider_credential(
-        &r.model,
-        &registry,
-        Some(&registry_state_path),
-        config.anthropic_api_key.as_deref(),
-        config.openai_api_key.as_deref(),
-        &config.ollama_url,
-        config.native_llm_url.as_deref(),
-        r.hosted
-            .as_ref()
-            .map(|hosted| hosted.credential.expose())
-            .or(provider_credential
+    let resolved_provider = match gateway {
+        Some(gateway) => {
+            llm::resolve_through_gateway(&r.model, &registry, Some(&registry_state_path), gateway)
+        }
+        None => llm::resolve_with_registry_and_provider_credential(
+            &r.model,
+            &registry,
+            Some(&registry_state_path),
+            config.anthropic_api_key.as_deref(),
+            config.openai_api_key.as_deref(),
+            &config.ollama_url,
+            config.native_llm_url.as_deref(),
+            r.hosted
                 .as_ref()
-                .map(|credential| credential.secret.expose())),
-    ) {
+                .map(|hosted| hosted.credential.expose())
+                .or(provider_credential
+                    .as_ref()
+                    .map(|credential| credential.secret.expose())),
+        ),
+    };
+    let provider = match resolved_provider {
         Ok(p) => p,
         Err(e) => {
             budget.adjust(&user_id, estimated, 0);
@@ -365,14 +384,38 @@ async fn execute_chat_request_stream_with_cache(
     Ok(Box::pin(ReceiverStream::new(rx)))
 }
 
+/// The gateway a native call for `model` egresses through (ADR 0152, #2700):
+/// set when a gateway key is configured and the resolved provider is one the
+/// gateway both provides (`CHISEI_GATEWAY_PROVIDED_PROVIDERS`) and serves.
+fn gateway_egress<'a>(
+    config: &'a Config,
+    registry: &crate::provider_profile::ProviderRegistry,
+    model: &str,
+) -> Option<llm::GatewayEgress<'a>> {
+    let key = config.gateway_key.as_deref()?;
+    let provider = registry.resolve_model(model).ok()?.provider;
+    (llm::gateway_serves_provider(&provider)
+        && config
+            .gateway_provided_providers
+            .iter()
+            .any(|provided| provided == &provider))
+    .then_some(llm::GatewayEgress {
+        base_url: &config.gateway_url,
+        key,
+    })
+}
+
 /// Admits the resolved model with the enterprise extension, then resolves the provider
 /// credential. With an extension installed, a refused model or any credential error
 /// refuses execution; the process environment key serves only the community runtime.
+/// A call that egresses through `gateway` is admitted against the gateway endpoint
+/// and resolves no provider credential: the gateway holds it.
 fn execution_provider_credential(
     authentication: Option<ExecutionAuthentication<'_>>,
     registry: &crate::provider_profile::ProviderRegistry,
     model: &str,
     local_endpoints: LocalEndpoints<'_>,
+    gateway: Option<llm::GatewayEgress<'_>>,
 ) -> Result<Option<crate::provider_credentials::ResolvedProviderCredential>, Status> {
     let Some(authentication) = authentication else {
         return Ok(None);
@@ -392,13 +435,16 @@ fn execution_provider_credential(
         .ok_or_else(|| Status::failed_precondition("provider profile unavailable"))?;
     let extension = authentication.db.enterprise_extension();
     if let Some(extension) = extension {
-        let endpoint = llm::execution_endpoint(
-            &resolved,
-            registry,
-            local_endpoints.ollama,
-            local_endpoints.native,
-        )
-        .map_err(Status::failed_precondition)?;
+        let endpoint = match gateway {
+            Some(gateway) => gateway.origin().to_string(),
+            None => llm::execution_endpoint(
+                &resolved,
+                registry,
+                local_endpoints.ollama,
+                local_endpoints.native,
+            )
+            .map_err(Status::failed_precondition)?,
+        };
         extension
             .admit_model(context, &model_identity(&resolved, &profile, endpoint))
             .map_err(|error| match error {
@@ -408,7 +454,7 @@ fn execution_provider_credential(
                 _ => Status::permission_denied("model not admitted"),
             })?;
     }
-    if profile.endpoint.api_key_env.is_none() {
+    if gateway.is_some() || profile.endpoint.api_key_env.is_none() {
         return Ok(None);
     }
     let credential = match extension {
@@ -855,6 +901,7 @@ mod tests {
             &registry,
             "openai/gpt-5.5",
             TEST_ENDPOINTS,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -866,6 +913,7 @@ mod tests {
             &registry,
             "openai/gpt-5.5",
             TEST_ENDPOINTS,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -899,6 +947,7 @@ mod tests {
             &registry,
             "openai/gpt-5.5",
             TEST_ENDPOINTS,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -925,6 +974,7 @@ mod tests {
                     &registry,
                     "openai/gpt-5.5",
                     TEST_ENDPOINTS,
+                    None,
                 )
                 .unwrap()
                 .unwrap();
@@ -957,11 +1007,59 @@ mod tests {
                     &registry,
                     "openai/gpt-5.5",
                     TEST_ENDPOINTS,
+                    None,
                 )
                 .unwrap_err();
                 assert_eq!(status.code(), tonic::Code::Unavailable);
             },
         );
+    }
+
+    /// A gateway-routed call never resolves a tenant provider credential, so
+    /// no provider key is sent to the gateway (#2700).
+    #[test]
+    fn gateway_egress_resolves_no_provider_credential() {
+        let db = RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new_with_enterprise_extension(
+                ":memory:",
+                Some(Arc::new(TenantCredentialExtension)),
+            )
+            .unwrap(),
+        ));
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let credential = execution_provider_credential(
+            Some(ExecutionAuthentication {
+                db: &db,
+                context: Some(&tenant_context("tenant-c")),
+            }),
+            &registry,
+            "openai/gpt-5.5",
+            TEST_ENDPOINTS,
+            Some(llm::GatewayEgress {
+                base_url: "http://127.0.0.1:8788/v1",
+                key: "sk-gateway",
+            }),
+        )
+        .unwrap();
+        assert!(credential.is_none());
+    }
+
+    /// Only a configured key plus a provider the gateway provides and serves
+    /// routes through the gateway.
+    #[test]
+    fn gateway_egress_needs_a_key_and_a_provided_served_provider() {
+        let registry = crate::provider_profile::ProviderRegistry::built_in();
+        let mut config = Config::from_env();
+        config.gateway_key = Some("sk-gateway".into());
+        config.gateway_url = "http://127.0.0.1:8788".into();
+        config.gateway_provided_providers = vec!["openai".into(), "ollama".into()];
+        let egress = gateway_egress(&config, &registry, "openai/gpt-5.5").expect("routed");
+        assert_eq!(egress.origin(), "http://127.0.0.1:8788");
+        assert_eq!(egress.key, "sk-gateway");
+        assert!(gateway_egress(&config, &registry, "anthropic/claude-opus-4-8").is_none());
+        assert!(gateway_egress(&config, &registry, "ollama/llama3.2").is_none());
+        config.gateway_key = None;
+        assert!(gateway_egress(&config, &registry, "openai/gpt-5.5").is_none());
     }
 
     const TEST_ENDPOINTS: LocalEndpoints<'static> = LocalEndpoints {
@@ -1066,6 +1164,7 @@ mod tests {
                 registry,
                 model,
                 TEST_ENDPOINTS,
+                None,
             )
         };
 

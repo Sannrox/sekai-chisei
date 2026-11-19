@@ -449,6 +449,8 @@ fn test_config() -> Config {
         default_data_class: "unclassified".into(),
         safe_egress_providers: vec![],
         gateway_provided_providers: vec![],
+        gateway_key: None,
+        gateway_url: sekai_chisei::config::DEFAULT_GATEWAY_URL.into(),
         routing_endpoint_allowlist: vec![],
         routing_credential_refs: vec![],
         gateway_receipt_principals: vec![],
@@ -3446,4 +3448,98 @@ async fn retryable_responses_errors_are_normalized() {
     let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "rate_limited");
     assert_eq!(body["error"]["message"], "try later");
+}
+
+/// #2700: with a gateway key, native execution reaches the provider only
+/// through the gateway, and a Chisei process with no provider keys completes
+/// the plan. The gateway swaps its own provider key in; the native receipt
+/// still names the plan.
+#[tokio::test]
+async fn native_execution_egresses_through_the_gateway_without_provider_keys() {
+    use sekai_proto::chisei::{
+        ChatMessage, ExecutePlanRequest, ExecutionInput, GetOperationReceiptRequest,
+        PlanExecutionRequest,
+    };
+    const SSE: &str = concat!(
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.5\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"via gateway\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.5\",",
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (upstream_base, requests) = spawn_fake_upstream(SSE, "text/event-stream").await;
+    let gateway_base = spawn_gateway(upstream_base).await;
+    let mut config = test_config();
+    config.openai_api_key = None;
+    config.anthropic_api_key = None;
+    config.gateway_provided_providers = vec!["openai".into()];
+    config.gateway_key = Some("sk-chisei-codex-app".into());
+    config.gateway_url = format!("{gateway_base}/v1");
+    let (target, _db) = spawn_control_plane_with_config(config).await;
+    let mut chisei = ChiseiServiceClient::new(connect_sekai(&target).await.unwrap());
+
+    let request_id = format!("native-gateway-{}", uuid::Uuid::new_v4().simple());
+    let plan = chisei
+        .plan_execution(PlanExecutionRequest {
+            input: Some(ExecutionInput {
+                request_id: request_id.clone(),
+                namespace: "default".into(),
+                spec: "Reply.".into(),
+                preferred_model: "openai/gpt-5.5".into(),
+                task_type: "question".into(),
+                user_id: "native-user".into(),
+                max_tokens: 32,
+                messages: vec![ChatMessage {
+                    role: "user".into(),
+                    content: "Reply.".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .expect("plan");
+    assert!(plan.executable, "{plan:?}");
+    let plan_id = plan.plan_id.clone();
+    let mut stream = chisei
+        .execute_plan_stream(ExecutePlanRequest { plan: Some(plan) })
+        .await
+        .unwrap()
+        .into_inner();
+    let mut reply = String::new();
+    while let Some(event) = stream.message().await.unwrap() {
+        if let Some(response) = event.response {
+            reply = response.content;
+        }
+    }
+    assert_eq!(reply, "via gateway");
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "only the gateway reaches the upstream");
+        assert_eq!(requests[0].path, "/v1/chat/completions");
+        assert_eq!(
+            requests[0].authorization.as_deref(),
+            Some("Bearer real-openai-key"),
+            "the gateway supplies the provider key"
+        );
+    }
+    let receipt = chisei
+        .get_operation_receipt(GetOperationReceiptRequest {
+            request_id,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        receipt.receipt_json.contains(&plan_id),
+        "native receipt names the plan: {}",
+        receipt.receipt_json
+    );
 }

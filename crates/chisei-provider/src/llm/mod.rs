@@ -802,6 +802,61 @@ pub fn resolve_with_registry_and_provider_credential(
     }))
 }
 
+/// The gateway a native call egresses through when the gateway, not this
+/// process, holds the provider key (ADR 0152, #2700).
+#[derive(Clone, Copy)]
+pub struct GatewayEgress<'a> {
+    /// Gateway origin; a trailing `/v1` is accepted and stripped.
+    pub base_url: &'a str,
+    /// Gateway client key this process presents as an ordinary principal.
+    pub key: &'a str,
+}
+
+impl GatewayEgress<'_> {
+    /// Origin the provider clients append their API paths to.
+    pub fn origin(&self) -> &str {
+        openai_compatible_api_root(self.base_url)
+    }
+}
+
+/// Providers whose request shape the gateway serves for native egress.
+pub fn gateway_serves_provider(provider: &str) -> bool {
+    matches!(provider, "openai" | "anthropic")
+}
+
+/// Resolve `model` to a provider client that sends its request to the gateway
+/// with the gateway key. The request keeps the provider's own shape, so the
+/// gateway routes it and swaps in the provider key it holds.
+pub fn resolve_through_gateway(
+    model: &str,
+    registry: &crate::provider_profile::ProviderRegistry,
+    registry_state_path: Option<&std::path::Path>,
+    gateway: GatewayEgress<'_>,
+) -> Result<Box<dyn Provider>, String> {
+    let resolved = registry.resolve_model(model)?;
+    let inner: Box<dyn Provider> = match resolved.provider.as_str() {
+        "anthropic" => Box::new(anthropic::Anthropic::with_base_url_and_timeouts(
+            gateway.key,
+            gateway.origin(),
+            HttpTimeouts::from_env(),
+        )),
+        "openai" => Box::new(openai::OpenAI::new(gateway.key, Some(gateway.origin()))),
+        provider => {
+            return Err(format!(
+                "provider {provider:?} cannot egress through the gateway"
+            ));
+        }
+    };
+    Ok(Box::new(ResolvedModelProvider {
+        inner,
+        provider: resolved.provider,
+        upstream_model: resolved.upstream_model,
+        canonical_model: resolved.canonical_model,
+        registry_state_path: registry_state_path.map(std::path::Path::to_path_buf),
+        hosted_profile: None,
+    }))
+}
+
 /// Base URL a call for `resolved` reaches. Provider construction and enterprise model
 /// admission both use it, so admission sees the endpoint that receives the prompt.
 pub fn execution_endpoint(
