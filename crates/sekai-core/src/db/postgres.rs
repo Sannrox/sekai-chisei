@@ -1182,6 +1182,12 @@ const MIGRATIONS: &[Migration] = &[
         MODEL_STAGES_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        164,
+        "chisei_evaluation_rationales",
+        "",
+        MigrationOwner::Chisei,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

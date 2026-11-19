@@ -25,6 +25,15 @@ pub const STOCHASTIC_RESULT_SCHEMA: &str = "chisei.stochastic-trial-result/v1";
 pub const STOCHASTIC_EGRESS_LOCAL_ONLY: &str = "local_only/v1";
 pub const STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL: &str = "allowlisted_external/v1";
 pub const STOCHASTIC_RAW_RETENTION_NONE: &str = "none/v1";
+/// Retains only the judge's bounded `rationale` per trial (#2630, ADR 0012),
+/// in the dedicated evaluation rationale store, for [`RATIONALE_TTL_MS`].
+pub const STOCHASTIC_RETENTION_RATIONALE: &str = "rationale/v1";
+/// How long `rationale/v1` keeps a rationale. Fixed by the policy version, so
+/// the immutable policy freezes it.
+pub const RATIONALE_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+/// Upper bound on one retained rationale, in UTF-8 bytes: 1,024 characters
+/// of at most four bytes each.
+pub const MAX_RATIONALE_BYTES: usize = 4_096;
 pub const FIXED_REDUCER: &str = "required_all_pass_advisory_observed/v1";
 pub const AVAILABILITY_ENABLED: &str = "enabled";
 pub const AVAILABILITY_DISABLED: &str = "disabled";
@@ -453,9 +462,12 @@ pub fn validate_stochastic_policy(
         }
         _ => return Err("unsupported stochastic egress_policy".into()),
     }
-    if policy.raw_response_retention != STOCHASTIC_RAW_RETENTION_NONE {
+    if !matches!(
+        policy.raw_response_retention.as_str(),
+        STOCHASTIC_RAW_RETENTION_NONE | STOCHASTIC_RETENTION_RATIONALE
+    ) {
         return Err(
-            "stochastic v1 supports only no raw prompt/response retention; encrypted retention requires a dedicated governed store"
+            "stochastic raw_response_retention must be none/v1 or rationale/v1; prompts and responses are never retained"
                 .into(),
         );
     }
@@ -1020,10 +1032,16 @@ mod tests {
             .unwrap()
             .raw_response_retention = "plaintext/v1".into();
         assert!(
-            prepare_definition(stochastic, "operator", 10)
+            prepare_definition(stochastic.clone(), "operator", 10)
                 .unwrap_err()
-                .contains("no raw prompt/response retention")
+                .contains("prompts and responses are never retained")
         );
+        stochastic
+            .stochastic_policy
+            .as_mut()
+            .unwrap()
+            .raw_response_retention = STOCHASTIC_RETENTION_RATIONALE.into();
+        prepare_definition(stochastic, "operator", 10).unwrap();
 
         let mut overflowing_seed = definition();
         overflowing_seed.execution_class = STOCHASTIC_EXECUTION_CLASS.into();

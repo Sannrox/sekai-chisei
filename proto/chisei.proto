@@ -617,6 +617,10 @@ message StochasticTrialEvidence {
   // Full per-attempt ceiling charged when a retryable provider error cannot
   // report partial usage.
   uint32 retry_accounted_tokens = 10;
+  // Digest of the judge rationale retained under a `rationale/v1` policy;
+  // empty when none was retained. The rationale itself is read through
+  // GetEvaluationRationale.
+  string rationale_digest = 11;
 }
 message StochasticStepEvidence {
   string contract_version = 1; // chisei.stochastic-step-evidence/v1
@@ -909,6 +913,24 @@ message CancelEvaluationExecutionRequest {
 }
 message CancelEvaluationExecutionResponse {
   EvaluationExecutionProjection execution = 1;
+}
+
+// Reads the judge rationale a `rationale/v1` stochastic step retained for one
+// trial. Requires namespace read access and clearance for every evidence
+// object the step read; a refused, expired, or source-withdrawn rationale
+// reads as not found.
+message GetEvaluationRationaleRequest {
+  string namespace = 1;
+  string manifest_digest = 2;
+  string node_id = 3;
+  uint32 trial_index = 4;
+}
+message GetEvaluationRationaleResponse {
+  string rationale = 1;
+  string rationale_digest = 2;
+  int64 expires_at_ms = 3;
+  // The most restrictive classification among the step's source evidence.
+  string classification = 4;
 }
 
 message GateDecision {
@@ -1969,6 +1991,7 @@ service ChiseiService {
   rpc ListEvalDatasetDefinitions(ListEvalDatasetDefinitionsRequest) returns (ListEvalDatasetDefinitionsResponse);
   rpc ListEvalDatasetCases(ListEvalDatasetCasesRequest) returns (ListEvalDatasetCasesResponse);
   rpc CancelEvaluationExecution(CancelEvaluationExecutionRequest) returns (CancelEvaluationExecutionResponse);
+  rpc GetEvaluationRationale(GetEvaluationRationaleRequest) returns (GetEvaluationRationaleResponse);
   rpc AuthorizeExternalAction(AuthorizeExternalActionRequest) returns (AuthorizeExternalActionResponse);
   rpc TransitionExternalAction(TransitionExternalActionRequest) returns (TransitionExternalActionResponse);
   rpc RedeemExternalActionPermit(RedeemExternalActionPermitRequest) returns (RedeemExternalActionPermitResponse);

@@ -23,6 +23,7 @@ pub mod evaluation_compare;
 pub mod evaluation_execution;
 pub mod evaluation_manifest;
 pub mod evaluation_plan;
+pub mod evaluation_rationale;
 pub mod evidence_vocabulary;
 pub use sekai_types::evolve;
 pub mod external_action;

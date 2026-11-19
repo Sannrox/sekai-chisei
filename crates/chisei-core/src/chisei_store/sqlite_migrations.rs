@@ -1036,8 +1036,10 @@ impl ChiseiSqliteSchema for SekaiDb {
     }
 
     fn migrate_eval_runs(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(EVAL_RUN_SQLITE)
+        let conn = self.conn();
+        conn.execute_batch(EVAL_RUN_SQLITE)
+            .map_err(|error| error.to_string())?;
+        conn.execute_batch(crate::chisei_store::evaluation_rationale::SQLITE_SCHEMA)
             .map_err(|error| error.to_string())
     }
 

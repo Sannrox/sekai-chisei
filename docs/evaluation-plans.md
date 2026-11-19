@@ -107,10 +107,12 @@ A required node may reference a stochastic definition only when
 stochastic policy in a required position. Advisory nodes can record the same
 statistical evidence without changing the fixed reducer.
 
-Raw prompt and response retention is `none/v1` in this contract. Encrypted
-retention is intentionally unavailable until a governed encrypted store and
-retention lifecycle exist. Publishing a different retention value fails
-closed.
+Raw prompt and response retention is `none/v1` by default. A stochastic node
+may instead declare `rationale/v1`, which keeps only the judge's bounded
+rationale for each completed trial for 30 days when the evaluator uses the
+`chisei.bounded-rubric-rationale/v1` prompt profile; see
+[evaluation execution](evaluation-execution.md#retained-judge-rationale).
+Publishing any other retention value fails closed.
 
 The fixed reducer is fail closed: required failures deny; required
 unavailability or execution errors are unavailable; insufficient, stale,

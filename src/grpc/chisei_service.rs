@@ -87,6 +87,8 @@ mod rpc_model_release_evidence;
 mod rpc_model_review;
 #[path = "chisei_service_rpc_policy_shadow.rs"]
 mod rpc_policy_shadow;
+#[path = "chisei_service_rpc_rationale.rs"]
+mod rpc_rationale;
 
 #[cfg(test)]
 use crate::chisei::policy::ContextAdmissionAction;
@@ -974,8 +976,18 @@ impl ChiseiService for ChiseiServiceImpl {
     ) -> Result<Response<CancelEvaluationExecutionResponse>, Status> {
         rpc_execution::cancel_evaluation_execution(self, req).await
     }
+
+    async fn get_evaluation_rationale(
+        &self,
+        req: Request<GetEvaluationRationaleRequest>,
+    ) -> Result<Response<GetEvaluationRationaleResponse>, Status> {
+        rpc_rationale::get_evaluation_rationale(self, req).await
+    }
 }
 
+#[cfg(test)]
+#[path = "evaluation_rationale_rpc_tests.rs"]
+mod evaluation_rationale_rpc_tests;
 #[cfg(test)]
 #[path = "chisei_service_tests.rs"]
 mod tests;

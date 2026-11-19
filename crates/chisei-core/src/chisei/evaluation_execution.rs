@@ -170,6 +170,10 @@ pub struct StochasticTrialOutput {
     pub result: Value,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The judge's bounded explanation, from a rationale prompt profile. It is
+    /// kept only under `rationale/v1` retention and never enters a receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +453,9 @@ pub struct StochasticTrialEvidence {
     pub output_tokens: u32,
     pub retry_accounted_tokens: u32,
     pub result_digest: String,
+    /// Digest of the retained rationale (#2630); empty when none was kept.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rationale_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1138,6 +1145,22 @@ pub fn projection_from_receipt(
 pub struct NodeExecution {
     pub receipt: EvaluationStepReceipt,
     pub elapsed: Duration,
+    /// Rationales a `rationale/v1` stochastic step retains, one per completed
+    /// trial that returned one. The caller stores them once the step is durable.
+    pub rationales: Vec<TrialRationale>,
+}
+
+/// One judge rationale and the digest the step receipt records for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrialRationale {
+    pub trial_index: u32,
+    pub rationale: String,
+    pub rationale_digest: String,
+}
+
+/// The digest a step receipt records for a retained rationale.
+pub fn rationale_digest(rationale: &str) -> Result<String, String> {
+    digest_json(&rationale)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1809,6 +1832,7 @@ pub fn execute_stochastic_node(
         .build()
         .map_err(|error| format!("start stochastic evaluator runtime: {error}"))?;
     let mut trials = Vec::with_capacity(policy.trial_count as usize);
+    let mut rationales = Vec::new();
     let mut terminal_failure = false;
     let mut total_tokens = 0u64;
     for trial_index in 0..policy.trial_count {
@@ -2030,12 +2054,26 @@ pub fn execute_stochastic_node(
                         )?);
                         break;
                     }
+                    // Only a rationale/v1 policy keeps the judge's rationale.
+                    let kept = output.rationale.clone().filter(|_| {
+                        policy.raw_response_retention
+                            == crate::chisei::evaluation_plan::STOCHASTIC_RETENTION_RATIONALE
+                    });
+                    let digest = kept.as_deref().map(rationale_digest).transpose()?;
+                    if let (Some(rationale), Some(digest)) = (kept, digest.clone()) {
+                        rationales.push(TrialRationale {
+                            trial_index,
+                            rationale,
+                            rationale_digest: digest,
+                        });
+                    }
                     final_trial = Some(stochastic_success_evidence(
                         trial_index,
                         seed,
                         attempt,
                         retry_accounted_tokens,
                         output,
+                        digest.unwrap_or_default(),
                     )?);
                     break;
                 }
@@ -2094,6 +2132,7 @@ pub fn execute_stochastic_node(
         started.elapsed(),
     )?;
     execution.receipt.stochastic_evidence = Some(stochastic);
+    execution.rationales = rationales;
     execution.receipt.step_receipt_digest = step_receipt_digest(&execution.receipt)?;
     ensure_document_size(
         &execution.receipt,
@@ -2195,6 +2234,7 @@ fn stochastic_failure_evidence_with_usage(
         score_micros: 0,
         input_tokens,
         output_tokens,
+        rationale_digest: String::new(),
         retry_accounted_tokens,
         result_digest,
     })
@@ -2206,6 +2246,7 @@ fn stochastic_success_evidence(
     attempt_count: u32,
     retry_accounted_tokens: u32,
     output: StochasticTrialOutput,
+    rationale_digest: String,
 ) -> Result<StochasticTrialEvidence, String> {
     let status = if output.passed {
         STATUS_PASS
@@ -2236,6 +2277,7 @@ fn stochastic_success_evidence(
         output_tokens: output.output_tokens,
         retry_accounted_tokens,
         result_digest,
+        rationale_digest,
     })
 }
 
@@ -2248,6 +2290,10 @@ fn validate_stochastic_output(
         || output.score_micros > 1_000_000
         || validate_reason_code(&output.reason_code).is_err()
         || output.input_tokens.saturating_add(output.output_tokens) > policy.max_tokens_per_trial
+        || output.rationale.as_deref().is_some_and(|rationale| {
+            rationale.trim().is_empty()
+                || rationale.len() > crate::chisei::evaluation_plan::MAX_RATIONALE_BYTES
+        })
     {
         return Err(REASON_STOCHASTIC_SCHEMA_INVALID);
     }
@@ -2428,6 +2474,17 @@ fn validate_stochastic_step_evidence(
         }
         validate_reason_code(&trial.reason_code)?;
         validate_digest("stochastic trial result_digest", &trial.result_digest)?;
+        if !trial.rationale_digest.is_empty() {
+            if !completed
+                || policy.raw_response_retention
+                    != crate::chisei::evaluation_plan::STOCHASTIC_RETENTION_RATIONALE
+            {
+                return Err(
+                    "stochastic trial records a rationale its policy does not retain".into(),
+                );
+            }
+            validate_digest("stochastic trial rationale_digest", &trial.rationale_digest)?;
+        }
     }
     let aggregate = derive_stochastic_aggregate(policy, &evidence.trials);
     if evidence.completed_trial_count != aggregate.completed_trial_count
@@ -2539,7 +2596,11 @@ pub fn make_framework_step(
         "evaluation step receipt",
         MAX_EXECUTION_DOCUMENT_BYTES,
     )?;
-    Ok(NodeExecution { receipt, elapsed })
+    Ok(NodeExecution {
+        receipt,
+        elapsed,
+        rationales: Vec::new(),
+    })
 }
 
 fn step_receipt_digest(receipt: &EvaluationStepReceipt) -> Result<String, String> {
@@ -3111,6 +3172,7 @@ mod tests {
             result: serde_json::json!({"private_model_text": raw_marker}),
             input_tokens: 10,
             output_tokens: 5,
+            rationale: None,
         }
     }
 
@@ -3531,6 +3593,73 @@ mod tests {
         assert!(!persisted.contains("raw-secret"));
         assert!(!persisted.contains("private_model_text"));
         validate_step_for_node(&manifest, &manifest.nodes[0], &execution.receipt).unwrap();
+    }
+
+    /// Only a rationale/v1 policy keeps the judge's rationale, and its receipt
+    /// carries the rationale's digest, never its text (#2630).
+    #[test]
+    fn rationale_is_kept_only_under_rationale_retention() {
+        let run = |retention: &str| {
+            let registry = StochasticEvaluatorRegistry::default();
+            let explained = |passed, score, rationale: &str| {
+                let mut output = stochastic_output(passed, score, "raw");
+                output.rationale = Some(rationale.into());
+                Ok(output)
+            };
+            registry
+                .register(
+                    &digest('e'),
+                    Arc::new(ScriptedStochasticEvaluator {
+                        calls: Arc::new(Mutex::new(Vec::new())),
+                        results: Mutex::new(VecDeque::from([
+                            explained(true, 900_000, "judge-why-one"),
+                            explained(false, 200_000, "judge-why-two"),
+                            explained(false, 100_000, "judge-why-three"),
+                        ])),
+                        delay: Duration::ZERO,
+                    }),
+                )
+                .unwrap();
+            let mut node = stochastic_node();
+            node.evaluator
+                .stochastic_policy
+                .as_mut()
+                .unwrap()
+                .raw_response_retention = retention.into();
+            let manifest = manifest(vec![node]);
+            let execution = execute_stochastic_node(
+                &registry,
+                &manifest,
+                &manifest.nodes[0],
+                input(&manifest, &manifest.nodes[0]),
+                &limits(),
+                Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            validate_step_for_node(&manifest, &manifest.nodes[0], &execution.receipt).unwrap();
+            let persisted = serde_json::to_string(&execution.receipt).unwrap();
+            assert!(!persisted.contains("judge-why"));
+            execution
+        };
+
+        let kept = run(crate::chisei::evaluation_plan::STOCHASTIC_RETENTION_RATIONALE);
+        assert_eq!(kept.receipt.status, STATUS_FAIL);
+        assert_eq!(kept.rationales.len(), 3);
+        let trials = &kept.receipt.stochastic_evidence.as_ref().unwrap().trials;
+        for (rationale, trial) in kept.rationales.iter().zip(trials) {
+            assert_eq!(rationale.trial_index, trial.trial_index);
+            assert_eq!(rationale.rationale_digest, trial.rationale_digest);
+            assert_eq!(
+                rationale.rationale_digest,
+                rationale_digest(&rationale.rationale).unwrap()
+            );
+        }
+
+        let dropped = run(crate::chisei::evaluation_plan::STOCHASTIC_RAW_RETENTION_NONE);
+        assert!(dropped.rationales.is_empty());
+        let trials = &dropped.receipt.stochastic_evidence.as_ref().unwrap().trials;
+        assert!(trials.iter().all(|trial| trial.rationale_digest.is_empty()));
     }
 
     #[test]

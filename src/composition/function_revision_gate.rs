@@ -506,6 +506,7 @@ mod tests {
                         == Some(expected)
                 });
             Ok(StochasticTrialOutput {
+                rationale: None,
                 contract_version: STOCHASTIC_TRIAL_RESULT_CONTRACT.into(),
                 passed,
                 score_micros: if passed { 900_000 } else { 100_000 },
