@@ -121,6 +121,38 @@ class VerifyTag(unittest.TestCase):
     def test_refuses_a_tag_for_another_commit(self):
         self.assertRefused(self.run_script("verify", "v0.1.0", self.rc), f"resolves to {self.first}, expected {self.rc}")
 
+    def run_with_recorded_status(self, status: str, exit_code: int) -> subprocess.CompletedProcess:
+        """Run `verify v0.1.0` with `git verify-tag` replaced by recorded status output and exit code."""
+        shim = pathlib.Path(tempfile.mkdtemp(prefix="shim-", dir=self.tmp))
+        self.addCleanup(shutil.rmtree, shim, True)
+        (shim / "status").write_text(status)
+        git = shim / "git"
+        git.write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [[ "$1" == verify-tag ]]; then cat {shim / "status"}; exit {exit_code}; fi\n'
+            f'exec {shutil.which("git")} "$@"\n'
+        )
+        git.chmod(0o755)
+        return self.run_script("verify", "v0.1.0", self.first, env={"PATH": f"{shim}:{os.environ['PATH']}"})
+
+    def status(self, *lines: str) -> str:
+        validsig = f"[GNUPG:] VALIDSIG {self.fpr} 2026-01-01 1767225600 0 4 0 22 10 00 {self.fpr}"
+        good = f"[GNUPG:] GOODSIG {self.fpr[-16:]} Release test"
+        return "\n".join([f"[GNUPG:] NEWSIG", *lines, good, validsig]) + "\n"
+
+    def test_recorded_good_status_passes(self):
+        result = self.run_with_recorded_status(self.status(), 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_refuses_revoked_or_expired_status_even_with_validsig(self):
+        for keyword in ("REVKEYSIG", "EXPKEYSIG", "EXPSIG", "BADSIG", "ERRSIG"):
+            with self.subTest(keyword=keyword):
+                status = self.status(f"[GNUPG:] {keyword} {self.fpr[-16:]} Release test")
+                self.assertRefused(self.run_with_recorded_status(status, 0), f"signature status is {keyword}")
+
+    def test_refuses_a_failing_verify_tag_exit_regardless_of_output(self):
+        self.assertRefused(self.run_with_recorded_status(self.status(), 1), "signature is not valid")
+
 
 class Ancestry(unittest.TestCase):
     """A release commit must be on main or on its own release-X.Y line."""
