@@ -350,17 +350,19 @@ pub fn export_namespace_snapshot(
         .into_iter()
         .map(|object| fact_from_object(object, &local.site_id))
         .collect();
+    let room = MAX_SNAPSHOT_FACTS.saturating_sub(facts.len());
     let (replicas, replica_hidden) =
-        collect_imported_replica_facts(db, request, &occupied, now_ms)?;
+        collect_imported_replica_facts(db, request, &occupied, now_ms, room)?;
     facts.extend(replicas);
     let hidden_omitted = hidden_omitted || replica_hidden;
-    for fact in &mut facts {
-        fact.provenance = bind_export_provenance(fact, &local, signing_key)?;
-    }
+    // Refuse before signing so an over-limit export does no per-fact work.
     if facts.len() > MAX_SNAPSHOT_FACTS {
         return Err(format!(
             "snapshot exceeds fact limit ({MAX_SNAPSHOT_FACTS})"
         ));
+    }
+    for fact in &mut facts {
+        fact.provenance = bind_export_provenance(fact, &local, signing_key)?;
     }
 
     let sequence = db.reserve_federation_snapshot_sequence(&request.namespace)?;
@@ -862,11 +864,15 @@ fn fact_from_object(object: Object, source_site_id: &str) -> SnapshotFact {
     }
 }
 
+/// Collect re-exportable replica facts, newest import first. `room` is how many
+/// facts the snapshot can still hold after the local ones; collection stops
+/// with the fact-limit error as soon as it would exceed that.
 fn collect_imported_replica_facts(
     db: &RuntimeDb,
     request: &ExportSnapshotRequest,
     occupied: &BTreeSet<String>,
     now_ms: i64,
+    room: usize,
 ) -> Result<(Vec<SnapshotFact>, bool), String> {
     let kinds: BTreeSet<String> = request.object_kinds.iter().cloned().collect();
     let mut records = db.list_federation_snapshot_imports(Some(&request.namespace))?;
@@ -904,6 +910,11 @@ fn collect_imported_replica_facts(
                 continue;
             }
             facts.push(fact);
+            if facts.len() > room {
+                return Err(format!(
+                    "snapshot exceeds fact limit ({MAX_SNAPSHOT_FACTS})"
+                ));
+            }
         }
     }
     facts.sort_by(|left, right| left.object_id.cmp(&right.object_id));
@@ -1921,6 +1932,35 @@ mod tests {
         let included = export_from(&hop, 2, 22_300);
         assert_eq!(included.facts.len(), 1);
         assert_eq!(included.facts[0].object_id, "visible-1");
+    }
+
+    #[test]
+    fn replica_collection_stops_once_the_snapshot_is_full() {
+        let (exporter, hop) = two_planes();
+        for id in ["visible-1", "visible-2", "visible-3"] {
+            put_object(&exporter, id, None);
+        }
+        let first = export_from(&exporter, 1, 22_500);
+        import_namespace_snapshot(&hop, "admin-b", "ops", &first, 22_600).unwrap();
+        let request = ExportSnapshotRequest {
+            namespace: "ops".into(),
+            actor: "local".into(),
+            object_kinds: vec![],
+            policy_pack: pack_pin(),
+            not_before_ms: 0,
+            not_after_ms: None,
+        };
+        let occupied = BTreeSet::new();
+
+        let (facts, _) =
+            collect_imported_replica_facts(&hop, &request, &occupied, 22_700, 3).unwrap();
+        assert_eq!(facts.len(), 3);
+        let error =
+            collect_imported_replica_facts(&hop, &request, &occupied, 22_700, 2).unwrap_err();
+        assert_eq!(
+            error,
+            format!("snapshot exceeds fact limit ({MAX_SNAPSHOT_FACTS})")
+        );
     }
 
     #[test]
