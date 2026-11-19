@@ -26,15 +26,16 @@ fn interceptor() -> TokenAuthInterceptor {
     )
 }
 
-fn rejected_unauthorized_count(rendered: &str) -> Option<u64> {
+/// Every rendered `REJECTED_WORK_TOTAL` sample in the gRPC subsystem.
+fn grpc_rejection_lines(rendered: &str) -> Vec<&str> {
     rendered
         .lines()
-        .find(|line| {
-            line.starts_with(signals::REJECTED_WORK_TOTAL)
+        .filter(|line| {
+            line.strip_prefix(signals::REJECTED_WORK_TOTAL)
+                .is_some_and(|rest| rest.starts_with('{'))
                 && line.contains(r#"subsystem="grpc""#)
-                && line.contains(r#"reason="unauthorized""#)
         })
-        .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+        .collect()
 }
 
 // Both assertions live in one test on purpose. Tests in a binary share the
@@ -46,9 +47,8 @@ fn authentication_refusals_record_one_indistinct_rejection_each() {
     sekai_chisei::obs::metrics::handle();
 
     let before = sekai_chisei::obs::metrics::handle().render();
-    assert_eq!(
-        rejected_unauthorized_count(&before),
-        None,
+    assert!(
+        grpc_rejection_lines(&before).is_empty(),
         "rejection series existed before any request:\n{before}"
     );
 
@@ -67,20 +67,22 @@ fn authentication_refusals_record_one_indistinct_rejection_each() {
     assert!(invalid.is_err(), "request with bad token was accepted");
 
     let after = sekai_chisei::obs::metrics::handle().render();
-    let count = rejected_unauthorized_count(&after)
-        .unwrap_or_else(|| panic!("no unauthorized rejection series:\n{after}"));
-    assert_eq!(
-        count, 2,
-        "expected exactly one rejection per refused request:\n{after}"
-    );
-
     // Separating "missing header" from "invalid token" would let a reader of
     // the metrics endpoint probe which tokens exist. Every authentication
-    // refusal must collapse to the same series.
-    for forbidden in ["missing", "invalid_token", "bad_token", "token"] {
-        assert!(
-            !after.contains(&format!(r#"reason="{forbidden}""#)),
-            "rejection reason leaked credential detail {forbidden:?}:\n{after}"
-        );
-    }
+    // refusal must collapse to one series, counted once per refused request.
+    let [series] = grpc_rejection_lines(&after)[..] else {
+        panic!("expected exactly one gRPC rejection series:\n{after}");
+    };
+    assert!(
+        series.contains(r#"reason="unauthorized""#),
+        "rejection series is not the indistinct unauthorized reason: {series}"
+    );
+    assert_eq!(
+        series
+            .rsplit(' ')
+            .next()
+            .and_then(|value| value.parse::<u64>().ok()),
+        Some(2),
+        "expected exactly one rejection per refused request: {series}"
+    );
 }
