@@ -112,6 +112,7 @@ pub struct AuditExportPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuditExportError {
     InvalidCursor,
     /// The chain does not verify at `seq`; nothing past it is returned.

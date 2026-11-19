@@ -114,6 +114,7 @@ fn export_status(error: AuditExportError) -> Status {
         AuditExportError::InvalidCursor => Status::invalid_argument(error.to_string()),
         AuditExportError::Chain { .. } => Status::data_loss(error.to_string()),
         AuditExportError::Store(error) => Status::internal(error),
+        error => Status::internal(error.to_string()),
     }
 }
 
