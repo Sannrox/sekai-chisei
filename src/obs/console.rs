@@ -1472,14 +1472,16 @@ async fn policy_action_dry_run(
     ]);
     let report = crate::sekai::action_policy::ActionPolicy::from_properties(&scope, &properties)
         .and_then(|candidate| {
-            crate::obs::console_policy::run_console_action_dry_run(
+            crate::composition::action_policy_dry_run::run_action_policy_dry_run(
                 &state.db,
                 &session.principal,
                 &namespace,
                 start,
                 end,
                 &candidate,
+                "console",
             )
+            .map_err(|error| error.to_string())
         });
     dry_run_response(
         &state,

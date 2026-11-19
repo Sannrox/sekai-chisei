@@ -377,6 +377,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ListActionPolicies` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.DryRunActionPolicy` | `sekai.action-definitions, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.GetLineage` | `sekai.graph, sekai.audit` | yes | host, mcp | `stable` |
 | `SekaiService.CreateContentionScope` | `sekai.coordination` | yes | none | `experimental` |
 | `SekaiService.UpdateContentionScope` | `sekai.coordination` | yes | none | `experimental` |

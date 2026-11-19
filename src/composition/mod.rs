@@ -5,6 +5,7 @@
 //! and Chisei features that answer directly from the Sekai graph live here,
 //! next to the gRPC wiring that assembles the planes.
 
+pub mod action_policy_dry_run;
 pub mod capability;
 pub mod cross_store_admission;
 pub mod embedding_catch_up;

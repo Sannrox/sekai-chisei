@@ -4,7 +4,7 @@
 //! promote/rollback. UI is not a privilege escalation path: same membership
 //! and write checks as gRPC.
 
-use crate::chisei::action_policy_dry_run::{self, ActionPolicyDryRunReport};
+use crate::chisei::action_policy_dry_run::ActionPolicyDryRunReport;
 use crate::chisei::gunshi_auto::{self, NamespaceAllocationStatus, PromoteRequest};
 use crate::chisei::gunshi_policy::{
     AllocationPolicySnapshot, PolicyEvaluation, PolicyEvaluationGate,
@@ -16,7 +16,6 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::domain::{ListFilter, Object};
 use crate::obs::console::{is_safe_namespace, principal_can_access_namespace};
 use crate::obs::console_pressure::principal_can_write_namespace;
-use crate::sekai::action_policy::ActionPolicy;
 use crate::sekai::audit::Decision;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -226,90 +225,6 @@ pub fn run_console_dry_run(
             ),
             ("evaluated".into(), report.counts.evaluated.to_string()),
             ("would_deny".into(), report.counts.would_deny.to_string()),
-            ("request_id".into(), request_id),
-            ("surface".into(), "console".into()),
-        ]),
-        target_id: report.namespace.clone(),
-        outcome: "completed".into(),
-    })?;
-    Ok(report)
-}
-
-/// Dry-run a candidate Action policy over the namespace's past action
-/// submits (#2121). Same guarantees as the route dry-run: namespace grant
-/// required, nothing but the `action_policy.dry_run` decision is written,
-/// and the run fails when that audit write fails.
-pub fn run_console_action_dry_run(
-    db: &RuntimeDb,
-    principal: &str,
-    namespace: &str,
-    start_timestamp_ms: i64,
-    end_timestamp_ms: i64,
-    candidate: &ActionPolicy,
-) -> Result<ActionPolicyDryRunReport, String> {
-    if !principal_can_access_namespace(db, principal, namespace).unwrap_or(false) {
-        return Err("namespace access denied".into());
-    }
-    if end_timestamp_ms <= start_timestamp_ms {
-        return Err("end_timestamp_ms must be greater than start_timestamp_ms".into());
-    }
-    let receipts = db.list_operation_receipts_in_window(
-        namespace,
-        start_timestamp_ms,
-        end_timestamp_ms,
-        policy_dry_run::MAX_DRY_RUN_RECEIPTS.saturating_add(1),
-    )?;
-    let report = action_policy_dry_run::dry_run_action_policy_over_receipts(
-        namespace,
-        start_timestamp_ms,
-        end_timestamp_ms,
-        candidate,
-        &receipts,
-    )?;
-    let request_id = dry_run_request_id("console-action-policy-dry-run");
-    let decision_id = format!(
-        "action-policy-dry-run:{:x}",
-        Sha256::digest(format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
-            report.namespace,
-            principal,
-            request_id,
-            report.candidate_scope,
-            report.candidate_policy_version,
-            report.start_timestamp_ms,
-            report.end_timestamp_ms
-        ))
-    );
-    let counts = &report.counts;
-    db.record_decision(&Decision {
-        id: decision_id,
-        timestamp: chrono::Utc::now().timestamp_millis(),
-        actor: principal.into(),
-        action: "action_policy.dry_run".into(),
-        reason: "console historical action policy dry-run".into(),
-        evidence: HashMap::from([
-            ("namespace".into(), report.namespace.clone()),
-            ("candidate_scope".into(), report.candidate_scope.clone()),
-            (
-                "candidate_policy_version".into(),
-                report.candidate_policy_version.clone(),
-            ),
-            ("evaluated".into(), counts.evaluated.to_string()),
-            ("unchanged".into(), counts.unchanged.to_string()),
-            ("would_deny".into(), counts.would_deny.to_string()),
-            ("would_allow".into(), counts.would_allow.to_string()),
-            (
-                "would_require_approval".into(),
-                counts.would_require_approval.to_string(),
-            ),
-            (
-                "would_skip_approval".into(),
-                counts.would_skip_approval.to_string(),
-            ),
-            (
-                "insufficient_history".into(),
-                counts.insufficient_history.to_string(),
-            ),
             ("request_id".into(), request_id),
             ("surface".into(), "console".into()),
         ]),
@@ -850,11 +765,19 @@ mod tests {
             default_model: "llama".into(),
             data_class: "internal".into(),
         };
-        let action_candidate = ActionPolicy::allow_all("alpha");
+        let action_candidate = crate::sekai::action_policy::ActionPolicy::allow_all("alpha");
         for _ in 0..2 {
             run_console_dry_run(&db, "alice", "alpha", 0, 10_000, &candidate).unwrap();
-            run_console_action_dry_run(&db, "alice", "alpha", 0, 10_000, &action_candidate)
-                .unwrap();
+            crate::composition::action_policy_dry_run::run_action_policy_dry_run(
+                &db,
+                "alice",
+                "alpha",
+                0,
+                10_000,
+                &action_candidate,
+                "console",
+            )
+            .unwrap();
         }
         for action in ["policy.dry_run", "action_policy.dry_run"] {
             let recorded = db
