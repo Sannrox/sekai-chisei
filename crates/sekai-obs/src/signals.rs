@@ -18,26 +18,38 @@ use metrics::{
 };
 use std::time::Duration;
 
-pub const CONTROL_PLANE_OVERHEAD: &str = "sekai_control_plane_overhead_seconds";
-pub const SATURATION_RATIO: &str = "sekai_saturation_ratio";
-pub const DB_WAIT: &str = "sekai_db_wait_seconds";
-pub const POOL_CHECKOUT: &str = "sekai_db_pool_checkout_seconds";
-pub const POOL_IN_USE_RATIO: &str = "sekai_db_pool_in_use_ratio";
-pub const QUEUE_DEPTH: &str = "sekai_queue_depth";
-pub const CACHE_EVENTS: &str = "sekai_cache_events_total";
-pub const DURABILITY_LAG: &str = "sekai_durability_lag_seconds";
-pub const FALLBACK_TOTAL: &str = "sekai_fallback_total";
-/// 1 when a named upstream provider circuit is open, else 0.
-pub const PROVIDER_CIRCUIT_OPEN: &str = "sekai_provider_circuit_open";
-pub const REJECTED_WORK_TOTAL: &str = "sekai_rejected_work_total";
-pub const DEDUPLICATION_TOTAL: &str = "sekai_deduplication_events_total";
-pub const LOOKUP_FIRST_TOTAL: &str = "sekai_lookup_first_total";
-pub const EVALUATION_STEP_TOTAL: &str = "sekai_evaluation_step_total";
-pub const EVALUATION_STEP_DURATION: &str = "sekai_evaluation_step_duration_seconds";
-pub const TRANSFORM_WORK_QUEUED: &str = "sekai_transform_work_queued";
-pub const TRANSFORM_WORK_CLAIMABLE: &str = "sekai_transform_work_claimable";
-pub const TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE: &str =
-    "sekai_transform_work_oldest_claimable_age_seconds";
+/// Declares each signal name constant and [`ALL_SIGNAL_NAMES`] from one list,
+/// so a signal cannot exist without being in the slice the name test checks.
+macro_rules! signal_names {
+    ($($(#[$meta:meta])* $name:ident = $value:literal;)+) => {
+        $($(#[$meta])* pub const $name: &str = $value;)+
+        /// Every signal metric name this module emits.
+        pub const ALL_SIGNAL_NAMES: &[&str] = &[$($name),+];
+    };
+}
+
+signal_names! {
+    CONTROL_PLANE_OVERHEAD = "sekai_control_plane_overhead_seconds";
+    SATURATION_RATIO = "sekai_saturation_ratio";
+    DB_WAIT = "sekai_db_wait_seconds";
+    POOL_CHECKOUT = "sekai_db_pool_checkout_seconds";
+    POOL_IN_USE_RATIO = "sekai_db_pool_in_use_ratio";
+    QUEUE_DEPTH = "sekai_queue_depth";
+    CACHE_EVENTS = "sekai_cache_events_total";
+    DURABILITY_LAG = "sekai_durability_lag_seconds";
+    FALLBACK_TOTAL = "sekai_fallback_total";
+    /// 1 when a named upstream provider circuit is open, else 0.
+    PROVIDER_CIRCUIT_OPEN = "sekai_provider_circuit_open";
+    REJECTED_WORK_TOTAL = "sekai_rejected_work_total";
+    DEDUPLICATION_TOTAL = "sekai_deduplication_events_total";
+    LOOKUP_FIRST_TOTAL = "sekai_lookup_first_total";
+    EVALUATION_STEP_TOTAL = "sekai_evaluation_step_total";
+    EVALUATION_STEP_DURATION = "sekai_evaluation_step_duration_seconds";
+    TRANSFORM_WORK_QUEUED = "sekai_transform_work_queued";
+    TRANSFORM_WORK_CLAIMABLE = "sekai_transform_work_claimable";
+    TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE = "sekai_transform_work_oldest_claimable_age_seconds";
+}
+
 /// Named worker pools exported per profile besides `default`; later pools
 /// in label order fold into [`TRANSFORM_POOL_OTHER`].
 pub const MAX_TRANSFORM_POOLS: usize = 32;
@@ -353,25 +365,7 @@ mod tests {
 
     #[test]
     fn signal_names_are_prometheus_compatible() {
-        for name in [
-            CONTROL_PLANE_OVERHEAD,
-            SATURATION_RATIO,
-            DB_WAIT,
-            POOL_CHECKOUT,
-            QUEUE_DEPTH,
-            CACHE_EVENTS,
-            DURABILITY_LAG,
-            FALLBACK_TOTAL,
-            PROVIDER_CIRCUIT_OPEN,
-            REJECTED_WORK_TOTAL,
-            DEDUPLICATION_TOTAL,
-            LOOKUP_FIRST_TOTAL,
-            EVALUATION_STEP_TOTAL,
-            EVALUATION_STEP_DURATION,
-            TRANSFORM_WORK_QUEUED,
-            TRANSFORM_WORK_CLAIMABLE,
-            TRANSFORM_WORK_OLDEST_CLAIMABLE_AGE,
-        ] {
+        for &name in ALL_SIGNAL_NAMES {
             assert!(name.starts_with("sekai_"), "{name} lacks the sekai_ prefix");
             assert!(
                 name.chars()
