@@ -482,21 +482,20 @@ mod tests {
         // tenant-b secret not present
         assert!(!format!("{export_a:?}").contains("sk-b"));
 
+        // The in-memory controller closes every store in one pass.
         let progress = ctl.close_tenant(&alice, "tenant-a", 1_000).unwrap();
-        assert!(progress.closed || !progress.incomplete_stores.is_empty());
-        // Retry is safe
+        assert!(progress.closed, "{progress:?}");
+        assert!(progress.incomplete_stores.is_empty(), "{progress:?}");
+        assert!(ctl.is_closed("tenant-a"));
+        // A retry is a no-op that reports the tenant already closed.
         let again = ctl.close_tenant(&alice, "tenant-a", 1_001).unwrap();
-        assert!(
-            again.closed
-                || again.message.contains("already")
-                || !again.incomplete_stores.is_empty()
-        );
+        assert!(again.closed, "{again:?}");
+        assert_eq!(again.message, "already closed");
+        assert!(again.incomplete_stores.is_empty(), "{again:?}");
 
-        // Closed tenant cannot resolve secrets / admit
-        if ctl.is_closed("tenant-a") {
-            assert!(ctl.assert_can_resolve_secrets("tenant-a").is_err());
-            assert!(ctl.assert_can_admit_work("tenant-a").is_err());
-        }
+        // A closed tenant cannot resolve secrets or admit work.
+        assert!(ctl.assert_can_resolve_secrets("tenant-a").is_err());
+        assert!(ctl.assert_can_admit_work("tenant-a").is_err());
         // Other tenant unaffected
         assert!(ctl.assert_can_resolve_secrets("tenant-b").is_ok());
         let bob = tenant_context("tenant-b", "bob");
