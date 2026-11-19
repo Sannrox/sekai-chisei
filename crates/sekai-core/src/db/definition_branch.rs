@@ -555,6 +555,7 @@ impl SekaiDb {
             "ALTER TABLE sekai_agent_definition_certifications ADD COLUMN mean_score_milli INTEGER",
             "ALTER TABLE sekai_definition_branches ADD COLUMN archived_at_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sekai_definition_branches ADD COLUMN archive_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sekai_fact_migration_snapshots ADD COLUMN migrated_properties_json TEXT",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}

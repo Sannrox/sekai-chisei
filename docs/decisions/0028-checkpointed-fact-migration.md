@@ -40,12 +40,24 @@ an ancestor revision to the current published head.
    properties are not stripped, and audit plus object lineage share that
    transaction. Get of a migration does not distinguish missing from
    unauthorized revisions.
+6. Rollback never loses an edit made after the migration (#2730). Execute
+   stores each migrated object's post-migration properties next to its
+   snapshot. Rollback compares per property: a property still at its
+   post-migration value returns to the snapshot, and an edited one keeps its
+   value and is listed in the result's `kept_edits`, which the rollback audit
+   row binds through its result digest. A later edit never blocks the
+   rollback. Snapshots recorded before post-migration values were stored
+   restore whole, and the result sets `edit_detection_unavailable`.
 
 ## Alternatives considered
 
 In-place rewrite of the published parent was rejected because history would
 no longer be independently verifiable. Automatic breaking migration without
 a merged proposal was rejected because live approval would not be rechecked.
+Refusing the whole rollback on any later edit was rejected because one edit
+would block recovery of every other object. A whole-object digest was rejected
+because it cannot tell which property changed, so it can only refuse or
+overwrite.
 
 ## Consequences
 
@@ -58,6 +70,7 @@ stay out of this contract.
 Domain tests cover strip, missing-required, mixed-revision, unknown, and
 ancestor checks. SQLite/PostgreSQL conformance covers dry-run, execute,
 idempotent replay, rollback identity, object-security omission, ungranted
-property preservation, audit-in-transaction, and blocked transforms without
-mutating objects. Get does not distinguish missing from unauthorized
+property preservation, audit-in-transaction, blocked transforms without
+mutating objects, rollback keeping a later edit while restoring the other
+properties, and whole restore of a pre-upgrade snapshot. Get does not distinguish missing from unauthorized
 revisions.

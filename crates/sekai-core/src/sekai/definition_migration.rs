@@ -56,6 +56,13 @@ pub struct FactMigrationObjectPlan {
     pub stripped_properties: Vec<String>,
 }
 
+/// One property a rollback kept because it was edited after the migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactMigrationKeptEdit {
+    pub object_id: String,
+    pub property: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FactMigrationResult {
     pub contract_version: String,
@@ -77,6 +84,13 @@ pub struct FactMigrationResult {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub result_digest: String,
+    /// Properties a rollback left at a value edited after the migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kept_edits: Vec<FactMigrationKeptEdit>,
+    /// The rollback restored snapshots recorded before post-migration values
+    /// were stored, so later edits could not be detected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edit_detection_unavailable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +292,8 @@ pub fn finish_migration_result(
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         result_digest: String::new(),
+        kept_edits: Vec::new(),
+        edit_detection_unavailable: false,
     };
     result.result_digest = canonical_digest("fact_migration_result", &result)?;
     Ok(result)

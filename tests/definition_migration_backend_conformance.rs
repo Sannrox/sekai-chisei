@@ -10,8 +10,8 @@ use sekai_chisei::sekai::definition_branch::{
     DefinitionRevisionMember, DefinitionWriteResult, prepare_revision,
 };
 use sekai_chisei::sekai::definition_migration::{
-    ExecuteFactMigration, MODE_DRY_RUN, MODE_EXECUTE, MODE_ROLLBACK, STATUS_BLOCKED,
-    STATUS_COMMITTED, STATUS_DRY_RUN_COMPLETE, STATUS_ROLLED_BACK,
+    ExecuteFactMigration, FactMigrationKeptEdit, MODE_DRY_RUN, MODE_EXECUTE, MODE_ROLLBACK,
+    STATUS_BLOCKED, STATUS_COMMITTED, STATUS_DRY_RUN_COMPLETE, STATUS_ROLLED_BACK,
 };
 use sekai_chisei::sekai::definition_proposal::{
     ApproveDefinitionProposal, CreateDefinitionProposal, MergeDefinitionProposal,
@@ -244,6 +244,8 @@ fn exercise(db: RuntimeDb, namespace: &str) {
         .execute_definition_fact_migration(&rollback, "author", &ctx("author"), 11)
         .unwrap();
     assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    assert!(rolled.kept_edits.is_empty());
+    assert!(!rolled.edit_detection_unavailable);
     let restored = db
         .get_object(&format!("{namespace}:open"))
         .unwrap()
@@ -453,7 +455,134 @@ fn postgres_definition_fact_migration_conformance() {
     exercise_migration_id_reuse(db.clone(), &format!("{prefix}-reuse"));
     exercise_object_security_and_property_grants(db.clone(), &format!("{prefix}-auth"));
     exercise_rollback_denied_when_snapshot_hidden(db.clone(), &format!("{prefix}-hidden-rb"));
-    exercise_rollback_denied_when_ungranted_property_differs(db, &format!("{prefix}-grant-rb"));
+    exercise_rollback_denied_when_ungranted_property_differs(
+        db.clone(),
+        &format!("{prefix}-grant-rb"),
+    );
+    exercise_rollback_keeps_later_edits(db, &format!("{prefix}-edit-rb"));
+}
+
+/// Executes the breaking migration on one object, edits `title` afterwards,
+/// and rolls back. Returns the rollback result and the object after it.
+fn migrate_edit_and_roll_back(
+    db: &RuntimeDb,
+    namespace: &str,
+    before_rollback: impl FnOnce(&RuntimeDb),
+) -> (
+    sekai_chisei::sekai::definition_migration::FactMigrationResult,
+    Object,
+) {
+    let (from, to) = publish_breaking(db, namespace);
+    let id = format!("{namespace}:open");
+    db.create_object(&object(namespace, "open", "hello", Some("classified")))
+        .unwrap();
+    let request = |mode: &str, key: &str| ExecuteFactMigration {
+        namespace: namespace.into(),
+        migration_id: "m1".into(),
+        from_revision_digest: from.clone(),
+        to_revision_digest: to.clone(),
+        mode: mode.into(),
+        idempotency_key: key.into(),
+    };
+    db.execute_definition_fact_migration(
+        &request(MODE_EXECUTE, "run"),
+        "author",
+        &ctx("author"),
+        9,
+    )
+    .unwrap();
+    let mut edited = db.get_object(&id).unwrap().unwrap();
+    edited.properties.insert("title".into(), "edited".into());
+    edited.updated = 10;
+    db.update_object_with_audit(&edited, "author").unwrap();
+    before_rollback(db);
+    let rolled = db
+        .execute_definition_fact_migration(
+            &request(MODE_ROLLBACK, "undo"),
+            "author",
+            &ctx("author"),
+            11,
+        )
+        .unwrap();
+    (rolled, db.get_object(&id).unwrap().unwrap())
+}
+
+/// #2730: a property edited after the migration keeps its value and is
+/// listed; the other migrated properties return to the snapshot.
+fn exercise_rollback_keeps_later_edits(db: RuntimeDb, namespace: &str) {
+    let (rolled, restored) = migrate_edit_and_roll_back(&db, namespace, |_| {});
+
+    assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    assert_eq!(restored.properties.get("title").unwrap(), "edited");
+    assert_eq!(restored.properties.get("secret").unwrap(), "classified");
+    assert_eq!(
+        rolled.kept_edits,
+        vec![FactMigrationKeptEdit {
+            object_id: format!("{namespace}:open"),
+            property: "title".into(),
+        }]
+    );
+    assert!(!rolled.edit_detection_unavailable);
+    assert_eq!(
+        db.get_definition_fact_migration(namespace, "m1")
+            .unwrap()
+            .unwrap(),
+        rolled
+    );
+}
+
+#[test]
+fn sqlite_rollback_keeps_later_edits() {
+    exercise_rollback_keeps_later_edits(sqlite_db(), "fact-mig-edit-rb");
+}
+
+/// A snapshot recorded before post-migration values were stored restores
+/// whole, and the result says edit detection was unavailable.
+#[test]
+fn sqlite_rollback_of_a_pre_upgrade_migration_restores_snapshots() {
+    let (rolled, restored) = migrate_edit_and_roll_back(&sqlite_db(), "fact-mig-legacy-rb", |db| {
+        db.as_sqlite()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE sekai_fact_migration_snapshots SET migrated_properties_json = NULL",
+                [],
+            )
+            .unwrap();
+    });
+
+    assert_eq!(restored.properties.get("title").unwrap(), "hello");
+    assert_eq!(restored.properties.get("secret").unwrap(), "classified");
+    assert!(rolled.kept_edits.is_empty());
+    assert!(rolled.edit_detection_unavailable);
+}
+
+/// A database whose snapshot table predates the post-migration column gains
+/// it on open.
+#[test]
+fn sqlite_open_adds_the_post_migration_column_to_an_older_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sekai.db");
+    let path = path.to_str().unwrap();
+    let has_column = |db: &SekaiDb| {
+        db.conn()
+            .prepare("SELECT 1 FROM pragma_table_info('sekai_fact_migration_snapshots') WHERE name = 'migrated_properties_json'")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    };
+    let db = SekaiDb::new(path).unwrap();
+    assert!(has_column(&db));
+    db.conn()
+        .execute(
+            "ALTER TABLE sekai_fact_migration_snapshots DROP COLUMN migrated_properties_json",
+            [],
+        )
+        .unwrap();
+    assert!(!has_column(&db));
+    drop(db);
+
+    assert!(has_column(&SekaiDb::new(path).unwrap()));
 }
 
 /// A request that reuses a committed migration id is refused and leaves the

@@ -987,6 +987,15 @@ pub(super) fn to_proto_definition_fact_migration(
         created_at_ms: result.created_at_ms,
         updated_at_ms: result.updated_at_ms,
         result_digest: result.result_digest.clone(),
+        kept_edits: result
+            .kept_edits
+            .iter()
+            .map(|edit| DefinitionFactMigrationKeptEdit {
+                object_id: edit.object_id.clone(),
+                property: edit.property.clone(),
+            })
+            .collect(),
+        edit_detection_unavailable: result.edit_detection_unavailable,
     }
 }
 pub(super) fn to_proto_definition_compatibility_reason(
