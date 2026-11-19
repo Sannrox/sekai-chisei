@@ -1,8 +1,10 @@
 use sekai_chisei::db::coordination::CoordinationBackend;
-use sekai_chisei::db::{postgres::PostgresDb, sekai::SekaiDb};
+use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::sekai::coordination::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
+
+use crate::postgres_scratch::ScratchDatabase;
 
 fn scope(prefix: &str) -> ContentionScope {
     ContentionScope {
@@ -58,10 +60,14 @@ fn exercise(db: &dyn CoordinationBackend, prefix: &str) {
             .id,
         first.id
     );
-    assert_eq!(
-        db.list_work_units(&WorkUnitFilter::default()).unwrap()[0].id,
-        first.id
-    );
+    // Each backend starts empty, so the list is exactly these two, oldest first.
+    let listed: Vec<String> = db
+        .list_work_units(&WorkUnitFilter::default())
+        .unwrap()
+        .into_iter()
+        .map(|unit| unit.id)
+        .collect();
+    assert_eq!(listed, vec![first.id.clone(), second.id.clone()]);
 
     let admitted = db.try_admit_work_unit(&first.id, "worker-a", 100).unwrap();
     assert!(admitted.admitted);
@@ -124,12 +130,18 @@ fn exercise(db: &dyn CoordinationBackend, prefix: &str) {
         .reconcile_work_units(
             2402,
             &ReconcileFilter {
+                scope_id: Some(second.scope_id.clone()),
                 limit: 1,
                 ..Default::default()
             },
         )
         .unwrap();
+    // The second unit's heartbeat expired at 2301, so it is the one marked stale.
     assert_eq!(summary.work_units_reconciled, 1);
+    assert_eq!(
+        db.get_work_unit(&second.id).unwrap().unwrap().status,
+        WORK_UNIT_STATUS_STALE
+    );
 }
 
 #[test]
@@ -137,30 +149,19 @@ fn sqlite_coordination_conformance() {
     exercise(&SekaiDb::new(":memory:").unwrap(), "sqlite");
 }
 
-fn postgres() -> PostgresDb {
-    let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
-        .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
-    if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
-        PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
-    } else {
-        PostgresDb::connect(&url, 8).unwrap()
-    }
-}
-
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_coordination_conformance() {
-    exercise(
-        &postgres(),
-        &format!("pg-{}", uuid::Uuid::new_v4().simple()),
-    );
+    let scratch = ScratchDatabase::create();
+    exercise(&scratch.connect(8), "pg");
 }
 
 #[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
 fn postgres_admission_race_has_one_winner() {
-    let db = Arc::new(postgres());
-    let prefix = format!("race-{}", uuid::Uuid::new_v4().simple());
+    let scratch = ScratchDatabase::create();
+    let db = Arc::new(scratch.connect(8));
+    let prefix = "race".to_string();
     db.create_contention_scope(&scope(&prefix)).unwrap();
     let first = work(&prefix, "first", 10);
     let second = work(&prefix, "second", 10);
