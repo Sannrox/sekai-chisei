@@ -12,7 +12,7 @@ use crate::db::sekai::{SekaiDb, sqlite_object_security_filter};
 use crate::domain::{Object, storage_properties_json};
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
 use crate::sekai::definition_migration::{
-    ExecuteFactMigration, FactMigrationResult, MODE_EXECUTE, MODE_ROLLBACK,
+    ExecuteFactMigration, FactMigrationKeptEdit, FactMigrationResult, MODE_EXECUTE, MODE_ROLLBACK,
     PreparedObjectMigration, STATUS_COMMITTED, finish_migration_result, plan_fact_migration,
     require_ancestor, require_published_candidate,
 };
@@ -148,14 +148,16 @@ impl SekaiDb {
                     .unwrap_or_else(|| from.revision_digest.clone());
                 tx.execute(
                     "INSERT OR REPLACE INTO sekai_fact_migration_snapshots
-                     (namespace, migration_id, object_id, properties_json, revision_digest)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (namespace, migration_id, object_id, properties_json, revision_digest,
+                      migrated_properties_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         request.namespace,
                         request.migration_id,
                         item.object.id,
                         storage_properties_json(&item.object.properties)?,
-                        previous_binding
+                        previous_binding,
+                        storage_properties_json(&updated.properties)?
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -428,6 +430,49 @@ fn restore_snapshot_properties(
     Ok(snapshot)
 }
 
+/// The properties a rollback writes for one object (ADR 0028). A property
+/// still at its post-migration value returns to the snapshot; a property
+/// edited since the migration keeps its value and is appended to
+/// `kept_edits`. A snapshot recorded before post-migration values were stored
+/// restores whole, and the returned flag is false: edits cannot be detected.
+fn rollback_target(
+    current: &Object,
+    snapshot: HashMap<String, String>,
+    migrated_json: Option<&str>,
+    kept_edits: &mut Vec<FactMigrationKeptEdit>,
+) -> Result<(HashMap<String, String>, bool), String> {
+    let Some(migrated_json) = migrated_json else {
+        return Ok((snapshot, false));
+    };
+    let migrated: HashMap<String, String> =
+        serde_json::from_str(migrated_json).map_err(|error| error.to_string())?;
+    let mut keys = current
+        .properties
+        .keys()
+        .chain(snapshot.keys())
+        .chain(migrated.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    let mut target = HashMap::new();
+    for key in keys {
+        let value = if current.properties.get(&key) == migrated.get(&key) {
+            snapshot.get(&key)
+        } else {
+            kept_edits.push(FactMigrationKeptEdit {
+                object_id: current.id.clone(),
+                property: key.clone(),
+            });
+            current.properties.get(&key)
+        };
+        if let Some(value) = value {
+            target.insert(key, value.clone());
+        }
+    }
+    Ok((target, true))
+}
+
 fn insert_migration_audit_sqlite(
     tx: &rusqlite::Transaction<'_>,
     request: &ExecuteFactMigration,
@@ -486,7 +531,8 @@ fn rollback_sqlite(
     require_rollback_identity(request, &stored)?;
     let mut statement = tx
         .prepare(
-            "SELECT object_id, properties_json, revision_digest FROM sekai_fact_migration_snapshots
+            "SELECT object_id, properties_json, revision_digest, migrated_properties_json
+             FROM sekai_fact_migration_snapshots
              WHERE namespace=?1 AND migration_id=?2 ORDER BY object_id",
         )
         .map_err(|error| error.to_string())?;
@@ -496,13 +542,16 @@ fn rollback_sqlite(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     drop(statement);
-    for (object_id, properties_json, revision_digest) in rows {
+    let mut kept_edits = Vec::new();
+    let mut edit_detection_unavailable = false;
+    for (object_id, properties_json, revision_digest, migrated_json) in rows {
         let Some(current) = load_visible_object_sqlite(tx, &object_id, policy_context)? else {
             return Err(
                 "fact_migration_rollback_denied: snapshot cannot be restored under live grants"
@@ -511,14 +560,17 @@ fn rollback_sqlite(
         };
         let snapshot_properties: HashMap<String, String> =
             serde_json::from_str(&properties_json).map_err(|error| error.to_string())?;
-        let policy = load_active_policy_sqlite(tx, &current.namespace, &current.kind)?;
-        let mut restored = current.clone();
-        restored.properties = restore_snapshot_properties(
-            policy.as_ref(),
-            policy_context,
+        let (target, detected) = rollback_target(
             &current,
             snapshot_properties,
+            migrated_json.as_deref(),
+            &mut kept_edits,
         )?;
+        edit_detection_unavailable |= !detected;
+        let policy = load_active_policy_sqlite(tx, &current.namespace, &current.kind)?;
+        let mut restored = current.clone();
+        restored.properties =
+            restore_snapshot_properties(policy.as_ref(), policy_context, &current, target)?;
         restored.updated = now_ms;
         tx.execute(
             "UPDATE sekai_objects SET properties=?2, updated=?3 WHERE id=?1",
@@ -543,6 +595,8 @@ fn rollback_sqlite(
     }
     stored.mode = MODE_ROLLBACK.into();
     stored.status = crate::sekai::definition_migration::STATUS_ROLLED_BACK.into();
+    stored.kept_edits = kept_edits;
+    stored.edit_detection_unavailable = edit_detection_unavailable;
     stored.actor = actor.into();
     stored.updated_at_ms = now_ms;
     stored.result_digest = String::new();
@@ -895,19 +949,23 @@ impl PostgresDb {
                     .cloned()
                     .unwrap_or_else(|| from.revision_digest.clone());
                 let snapshot = storage_properties_json(&item.object.properties)?;
+                let migrated = storage_properties_json(&updated.properties)?;
                 tx.execute(
                     "INSERT INTO sekai_fact_migration_snapshots
-                     (namespace, migration_id, object_id, properties_json, revision_digest)
-                     VALUES ($1, $2, $3, $4, $5)
+                     (namespace, migration_id, object_id, properties_json, revision_digest,
+                      migrated_properties_json)
+                     VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT (namespace, migration_id, object_id) DO UPDATE SET
                         properties_json = EXCLUDED.properties_json,
-                        revision_digest = EXCLUDED.revision_digest",
+                        revision_digest = EXCLUDED.revision_digest,
+                        migrated_properties_json = EXCLUDED.migrated_properties_json",
                     &[
                         &request.namespace,
                         &request.migration_id,
                         &item.object.id,
                         &snapshot,
                         &previous_binding,
+                        &migrated,
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -1129,15 +1187,19 @@ fn rollback_postgres(
     require_rollback_identity(request, &stored)?;
     let rows = tx
         .query(
-            "SELECT object_id, properties_json, revision_digest FROM sekai_fact_migration_snapshots
+            "SELECT object_id, properties_json, revision_digest, migrated_properties_json
+             FROM sekai_fact_migration_snapshots
              WHERE namespace=$1 AND migration_id=$2 ORDER BY object_id",
             &[&request.namespace, &request.migration_id],
         )
         .map_err(|error| error.to_string())?;
+    let mut kept_edits = Vec::new();
+    let mut edit_detection_unavailable = false;
     for row in rows {
         let object_id: String = row.get(0);
         let properties_json: String = row.get(1);
         let revision_digest: String = row.get(2);
+        let migrated_json: Option<String> = row.get(3);
         let Some(current) = load_visible_object_postgres(tx, &object_id, policy_context)? else {
             return Err(
                 "fact_migration_rollback_denied: snapshot cannot be restored under live grants"
@@ -1146,14 +1208,17 @@ fn rollback_postgres(
         };
         let snapshot_properties: HashMap<String, String> =
             serde_json::from_str(&properties_json).map_err(|error| error.to_string())?;
-        let policy = load_active_policy_postgres(tx, &current.namespace, &current.kind)?;
-        let mut restored = current.clone();
-        restored.properties = restore_snapshot_properties(
-            policy.as_ref(),
-            policy_context,
+        let (target, detected) = rollback_target(
             &current,
             snapshot_properties,
+            migrated_json.as_deref(),
+            &mut kept_edits,
         )?;
+        edit_detection_unavailable |= !detected;
+        let policy = load_active_policy_postgres(tx, &current.namespace, &current.kind)?;
+        let mut restored = current.clone();
+        restored.properties =
+            restore_snapshot_properties(policy.as_ref(), policy_context, &current, target)?;
         restored.updated = now_ms;
         let properties = storage_properties_json(&restored.properties)?;
         tx.execute(
@@ -1175,6 +1240,8 @@ fn rollback_postgres(
     }
     stored.mode = MODE_ROLLBACK.into();
     stored.status = crate::sekai::definition_migration::STATUS_ROLLED_BACK.into();
+    stored.kept_edits = kept_edits;
+    stored.edit_detection_unavailable = edit_detection_unavailable;
     stored.actor = actor.into();
     stored.updated_at_ms = now_ms;
     stored.result_digest = String::new();

@@ -5830,6 +5830,16 @@ message DefinitionFactMigration {
   int64 created_at_ms = 17;
   int64 updated_at_ms = 18;
   string result_digest = 19;
+  // Properties a rollback kept because they were edited after the migration.
+  repeated DefinitionFactMigrationKeptEdit kept_edits = 20;
+  // The rollback restored snapshots recorded before post-migration values were
+  // stored, so later edits could not be detected.
+  bool edit_detection_unavailable = 21;
+}
+
+message DefinitionFactMigrationKeptEdit {
+  string object_id = 1;
+  string property = 2;
 }
 
 message ExecuteDefinitionFactMigrationRequest {

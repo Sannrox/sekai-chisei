@@ -234,6 +234,8 @@ const GATEWAY_LOG_CURSORS_SCHEMA: &str = include_str!("postgres/0163_gateway_log
 const MODEL_STAGES_SCHEMA: &str = include_str!("postgres/0164_model_stages.sql");
 const DEFINITION_BRANCH_ARCHIVE_SCHEMA: &str =
     include_str!("postgres/0165_definition_branch_archive.sql");
+const FACT_MIGRATION_POST_VALUES_SCHEMA: &str =
+    include_str!("postgres/0166_fact_migration_post_values.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1194,6 +1196,12 @@ const MIGRATIONS: &[Migration] = &[
         165,
         "definition_branch_archive",
         DEFINITION_BRANCH_ARCHIVE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        166,
+        "fact_migration_post_values",
+        FACT_MIGRATION_POST_VALUES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

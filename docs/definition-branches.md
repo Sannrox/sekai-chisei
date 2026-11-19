@@ -336,7 +336,11 @@ its immutable revision and audit evidence.
   execute, resume-by-replay, and rollback. Unknown compatibility, stale
   parents, and unapproved breaking or conditional changes fail closed. Blocked
   transforms do not mutate objects. Published definition rows are never
-  rewritten. Rollback names the stored parent and candidate. Live object and
+  rewritten. Rollback names the stored parent and candidate. It restores
+  only properties still at their post-migration value; a property edited
+  after the migration keeps its value and is listed in `kept_edits`. A
+  migration executed before this check restores whole and sets
+  `edit_detection_unavailable`. Live object and
   property grants are rechecked at effect; hidden objects are omitted and
   ungranted properties are not stripped. Mutation, audit, and object lineage
   share one transaction. `GetDefinitionFactMigration` does not distinguish
