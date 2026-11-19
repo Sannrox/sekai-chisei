@@ -351,6 +351,7 @@ fn grant_for_admit(
     }
 }
 
+/// Decides whether `actor` may auto-apply an admission of `type_id`.
 pub fn evaluate_admission(
     db: &RuntimeDb,
     actor: &str,
@@ -367,6 +368,29 @@ pub fn evaluate_admission(
     let Some(grant) = grant_for_admit(db.get_agent_autonomy(namespace, actor, type_id))? else {
         return Ok(AdmissionAutonomy::ProposeOnly);
     };
+    admit_on_grant(
+        db,
+        actor,
+        namespace,
+        type_id,
+        grant,
+        submitted_envelope_id,
+        now_ms,
+    )
+}
+
+/// Checks the grant [`evaluate_admission`] read. The store may hold a
+/// replacement by the time a check fails, so a revocation here targets
+/// only grants issued at or before this one (#2720).
+fn admit_on_grant(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    type_id: &str,
+    grant: AgentAutonomyGrant,
+    submitted_envelope_id: &str,
+    now_ms: i64,
+) -> Result<AdmissionAutonomy, String> {
     if grant.status != STATUS_LIVE_GRANT {
         return Ok(AdmissionAutonomy::ProposeOnly);
     }
@@ -378,13 +402,14 @@ pub fn evaluate_admission(
     ) {
         Ok(envelope) => envelope,
         Err(_) => {
-            revoke_auto_apply(
+            revoke_granted_by(
                 db,
                 actor,
                 namespace,
                 actor,
                 type_id,
                 REASON_ENVELOPE,
+                grant.granted_at_ms,
                 now_ms,
             )?;
             return Ok(AdmissionAutonomy::ProposeOnly);
@@ -393,25 +418,27 @@ pub fn evaluate_admission(
     // The grant binds the envelope model pin. Function model_route is a
     // different identity and stays outside this slice.
     if envelope.status != STATUS_LIVE || envelope.pins.model_digest != grant.model_digest {
-        revoke_auto_apply(
+        revoke_granted_by(
             db,
             actor,
             namespace,
             actor,
             type_id,
             REASON_MODEL_CHANGE,
+            grant.granted_at_ms,
             now_ms,
         )?;
         return Ok(AdmissionAutonomy::ProposeOnly);
     }
     if has_denial_since(db, namespace, actor, type_id, grant.granted_at_ms)? {
-        revoke_auto_apply(
+        revoke_granted_by(
             db,
             actor,
             namespace,
             actor,
             type_id,
             REASON_REJECTED,
+            grant.granted_at_ms,
             now_ms,
         )?;
         return Ok(AdmissionAutonomy::ProposeOnly);
@@ -1025,6 +1052,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(receipts.len(), 1);
+    }
+
+    #[test]
+    fn an_admission_revoke_spares_a_grant_issued_after_the_evaluated_one() {
+        let db = setup();
+        parked(&db, "agent:fixture", "dispatch", "a", DECISION_GRANT, 10);
+        parked(&db, "agent:fixture", "dispatch", "b", DECISION_GRANT, 20);
+        envelope(&db, "auto:dispatch", 3);
+        envelope(&db, "auto:other", 9);
+        let evaluated = grant_auto_apply(
+            &db,
+            grant_req("agent:fixture", "dispatch", "auto:dispatch", 30),
+        )
+        .unwrap();
+        // An admin replaces the grant while admission still holds the old one.
+        revoke_auto_apply(
+            &db,
+            "ops-admin",
+            "acme",
+            "agent:fixture",
+            "dispatch",
+            REASON_ADMIN,
+            35,
+        )
+        .unwrap();
+        grant_auto_apply(
+            &db,
+            grant_req("agent:fixture", "dispatch", "auto:other", 40),
+        )
+        .unwrap();
+        stop_envelope(&db, "agent:fixture", "acme", "auto:dispatch", 45).unwrap();
+        assert!(matches!(
+            admit_on_grant(&db, "agent:fixture", "acme", "dispatch", evaluated, "", 50).unwrap(),
+            AdmissionAutonomy::ProposeOnly
+        ));
+        let kept = db
+            .get_agent_autonomy("acme", "agent:fixture", "dispatch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, STATUS_LIVE_GRANT);
+        assert_eq!(kept.envelope_id, "auto:other");
     }
 
     #[test]
