@@ -741,11 +741,38 @@ struct LoginForm {
     token: String,
 }
 
+/// Login CSRF guard. A browser names the page that sent a form in `Origin`,
+/// or failing that `Referer`; a login sent by another site, or by an opaque
+/// `null` origin, must not plant that site's session in this browser. A
+/// request with neither header did not come from a cross-site page, so
+/// non-browser clients still log in.
+fn login_sender_is_same_origin(headers: &HeaderMap) -> bool {
+    let header_text = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    let Some(sender) = header_text(header::ORIGIN).or_else(|| header_text(header::REFERER)) else {
+        return true;
+    };
+    let Some(host) = header_text(header::HOST) else {
+        return false;
+    };
+    let authority = sender
+        .strip_prefix("https://")
+        .or_else(|| sender.strip_prefix("http://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+    authority.is_some_and(|authority| authority.eq_ignore_ascii_case(host.trim()))
+}
+
 async fn login_post(
     State(state): State<ConsoleState>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    if !login_sender_is_same_origin(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            login_page(Some("Sign in from this console's own login page.")),
+        )
+            .into_response();
+    }
     let token = form.token.trim();
     if token.is_empty() {
         return login_failure(&headers, "Token is required.");
@@ -761,6 +788,10 @@ async fn login_post(
         token_hash: credential.token_hash,
         expires_unix: now_unix().saturating_add(ttl),
     };
+    // A fresh login replaces whatever session the browser presented.
+    if let Some(presented) = parse_cookie_value(&headers, SESSION_COOKIE) {
+        state.sessions.remove(&presented);
+    }
     state.sessions.insert(sid.clone(), session);
     let mut response = Redirect::to("/console/").into_response();
     response
@@ -2307,5 +2338,80 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Sign in"));
         assert!(!text.contains("Signed in as"));
+    }
+
+    async fn login_with(
+        app: &Router,
+        token: &str,
+        headers: &[(header::HeaderName, &str)],
+    ) -> Response {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/console/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (name, value) in headers {
+            request = request.header(name, *value);
+        }
+        app.clone()
+            .oneshot(
+                request
+                    .body(Body::from(format!("token={}", urlencoding_token(token))))
+                    .unwrap(),
+            )
+            .await
+            .expect("login")
+    }
+
+    #[tokio::test]
+    async fn login_refuses_cross_site_senders_and_sets_no_cookie() {
+        let db = test_db();
+        let token = "alice-console-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .expect("credential");
+        let state = test_state(db);
+        let app = router(state.clone());
+        let host = (header::HOST, "console.test:8080");
+        for sender in [
+            (header::ORIGIN, "https://attacker.test"),
+            (header::ORIGIN, "http://console.test:9090"),
+            (header::ORIGIN, "null"),
+            (header::REFERER, "https://attacker.test/console/login"),
+        ] {
+            let refused = login_with(&app, token, &[host.clone(), sender.clone()]).await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{sender:?}");
+            assert!(refused.headers().get(header::SET_COOKIE).is_none());
+        }
+        assert!(state.sessions.by_id.read().unwrap().is_empty());
+
+        for sender in [
+            (header::ORIGIN, "http://console.test:8080"),
+            (header::ORIGIN, "https://CONSOLE.test:8080"),
+            (
+                header::REFERER,
+                "http://console.test:8080/console/login?next=1",
+            ),
+        ] {
+            let accepted = login_with(&app, token, &[host.clone(), sender.clone()]).await;
+            assert_eq!(accepted.status(), StatusCode::SEE_OTHER, "{sender:?}");
+            assert!(accepted.headers().get(header::SET_COOKIE).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn login_replaces_the_presented_session() {
+        let db = test_db();
+        let token = "alice-console-token";
+        db.create_principal_credential("alice", &hash_gateway_key(token), 1)
+            .expect("credential");
+        let state = test_state(db);
+        let app = router(state.clone());
+        let (_, first) = login(&app, token).await;
+        let first = first.expect("first sid");
+        let cookie = format!("{SESSION_COOKIE}={first}");
+
+        let second = login_with(&app, token, &[(header::COOKIE, &cookie)]).await;
+        assert_eq!(second.status(), StatusCode::SEE_OTHER);
+        assert!(state.sessions.get(&first).is_none());
+        assert_eq!(state.sessions.by_id.read().unwrap().len(), 1);
     }
 }
