@@ -115,16 +115,30 @@ pub(crate) fn export(
     namespace: &str,
     out: &Path,
 ) -> BTreeMap<String, Vec<u8>> {
-    server.sekaictl_ok(&[
-        "ontology",
-        "export",
-        "--namespace",
-        namespace,
-        "--out",
-        out.to_str().unwrap(),
-        "--target",
-        &server.socket_str(),
-    ]);
+    export_as(server, None, namespace, out)
+}
+
+/// Exports `namespace` into `out`, presenting `credential` when given, and
+/// returns the tree as relative path to file bytes.
+fn export_as(
+    server: &LoopServer,
+    credential: Option<&str>,
+    namespace: &str,
+    out: &Path,
+) -> BTreeMap<String, Vec<u8>> {
+    server.sekaictl_ok_as(
+        credential,
+        &[
+            "ontology",
+            "export",
+            "--namespace",
+            namespace,
+            "--out",
+            out.to_str().unwrap(),
+            "--target",
+            &server.socket_str(),
+        ],
+    );
     let mut tree = BTreeMap::new();
     read_tree(out, out, &mut tree);
     tree
@@ -255,8 +269,19 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
     )
     .await;
 
-    let first = export(&server, "export-a", &dir.path().join("first"));
-    let again = export(&server, "export-a", &dir.path().join("again"));
+    // Both exports present the credential, so a leak of it would show in the tree.
+    let first = export_as(
+        &server,
+        Some(&credential),
+        "export-a",
+        &dir.path().join("first"),
+    );
+    let again = export_as(
+        &server,
+        Some(&credential),
+        "export-a",
+        &dir.path().join("again"),
+    );
     assert_eq!(first, again, "exporting twice gives identical trees");
     assert!(first.contains_key("function/sync%2Ffeed.json"));
     assert!(first.contains_key("link_type/incident%2Eaffects.json"));

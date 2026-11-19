@@ -151,18 +151,27 @@ impl LoopServer {
         self.socket.to_str().expect("utf8 socket").to_string()
     }
 
-    fn sekaictl(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    fn sekaictl(&self, credential: Option<&str>, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sekaictl"));
+        command
             .args(args)
             .env("SEKAI_SOCKET", &self.socket)
             .env_remove("CHISEI_GRPC_URL")
-            .env_remove("SEKAI_CREDENTIAL")
-            .output()
-            .expect("run sekaictl")
+            .env_remove("SEKAI_CREDENTIAL");
+        if let Some(credential) = credential {
+            command.env("SEKAI_CREDENTIAL", credential);
+        }
+        command.output().expect("run sekaictl")
     }
 
     pub(crate) fn sekaictl_ok(&self, args: &[&str]) -> String {
-        let output = self.sekaictl(args);
+        self.sekaictl_ok_as(None, args)
+    }
+
+    /// Runs `sekaictl` with `credential` as its `SEKAI_CREDENTIAL` bearer, or
+    /// with none, and returns stdout; panics with the server logs on failure.
+    pub(crate) fn sekaictl_ok_as(&self, credential: Option<&str>, args: &[&str]) -> String {
+        let output = self.sekaictl(credential, args);
         assert!(
             output.status.success(),
             "sekaictl {args:?} failed\nstdout: {}\nstderr: {}\n{}",
