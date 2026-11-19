@@ -19,5 +19,7 @@ sekaictl admin quality restart --result-id sha256:...
 
 Built-in evaluators are `digest_pin`, `completeness`, and `row_count_bound`.
 Replay of a closed identity returns the prior receipt. Restart completes a
-cancelled run and keeps the cancelled receipt digest. SQLite is the reference
+cancelled run and keeps the cancelled receipt digest. A run whose rule or
+dataset changed since it started closes `unknown` and still names the start
+revision. SQLite is the reference
 store. PostgreSQL stays unavailable.
