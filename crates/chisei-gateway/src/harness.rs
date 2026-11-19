@@ -365,13 +365,24 @@ fn normalized_terminal_usage(event: &HarnessEvent) -> Result<Option<NormalizedUs
 #[derive(Debug, Clone, Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    /// Offset from which the next boundary scan resumes; bytes before it
+    /// hold no frame boundary, so a frame arriving in chunks is scanned once.
+    scanned: usize,
 }
 
 impl SseDecoder {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<HarnessEvent>, String> {
         self.buffer.extend_from_slice(bytes);
         let mut events = Vec::new();
-        while let Some((frame_end, separator_end)) = find_frame_boundary(&self.buffer) {
+        loop {
+            let (frame_end, separator_end) =
+                match find_frame_boundary_from(&self.buffer, self.scanned) {
+                    Ok(boundary) => boundary,
+                    Err(resume) => {
+                        self.scanned = resume;
+                        break;
+                    }
+                };
             if frame_end > 1024 * 1024 {
                 return Err("responses SSE frame exceeds 1 MiB".into());
             }
@@ -379,6 +390,7 @@ impl SseDecoder {
                 .map_err(|_| "responses stream is not valid UTF-8")?
                 .to_owned();
             self.buffer.drain(..separator_end);
+            self.scanned = 0;
             if let Some(event) = parse_frame(&frame)? {
                 events.push(event);
             }
@@ -398,7 +410,15 @@ impl SseDecoder {
 }
 
 pub(crate) fn find_frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let mut index = 0;
+    find_frame_boundary_from(bytes, 0).ok()
+}
+
+/// Scan `bytes` from `start` for the first blank-line frame boundary. With
+/// none, returns the offset where a later scan must resume: the start of the
+/// trailing CR/LF run, since only that run can still grow into a boundary
+/// and the full scan reaches its start at the same position.
+fn find_frame_boundary_from(bytes: &[u8], start: usize) -> Result<(usize, usize), usize> {
+    let mut index = start;
     while index < bytes.len() {
         let Some(first_end) = line_ending_len(bytes, index) else {
             index += 1;
@@ -406,11 +426,16 @@ pub(crate) fn find_frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
         };
         let next = index + first_end;
         if let Some(second_end) = line_ending_len(bytes, next) {
-            return Some((index, next + second_end));
+            return Ok((index, next + second_end));
         }
         index = next;
     }
-    None
+    let trailing = bytes
+        .iter()
+        .rev()
+        .take_while(|byte| matches!(byte, b'\r' | b'\n'))
+        .count();
+    Err(bytes.len() - trailing)
 }
 
 fn line_ending_len(bytes: &[u8], index: usize) -> Option<usize> {
@@ -864,6 +889,34 @@ mod tests {
         assert!(decoder.push(&frame.as_bytes()[..split]).unwrap().is_empty());
         let events = decoder.push(&frame.as_bytes()[split..]).unwrap();
         assert_eq!(events[0].data["delta"], "世");
+    }
+
+    #[test]
+    fn byte_at_a_time_decoding_matches_whole_and_scans_each_byte_once() {
+        let stream: &[u8] = b"event: response.output_text.delta\r\ndata: {\"delta\":\"a\"}\r\n\r\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let whole = SseDecoder::default().push(stream).unwrap();
+        assert_eq!(whole.len(), 2);
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        for byte in stream {
+            events.extend(decoder.push(std::slice::from_ref(byte)).unwrap());
+        }
+        events.extend(decoder.finish().unwrap());
+        assert_eq!(
+            events.iter().map(|event| &event.event).collect::<Vec<_>>(),
+            whole.iter().map(|event| &event.event).collect::<Vec<_>>()
+        );
+        assert_eq!(events[0].data, whole[0].data);
+
+        // A partial frame resumes after the bytes it has already scanned,
+        // backing up only to a trailing line-ending run.
+        let mut decoder = SseDecoder::default();
+        decoder.push(b"data: {}").unwrap();
+        assert_eq!(decoder.scanned, 8);
+        decoder.push(b"\r").unwrap();
+        assert_eq!(decoder.scanned, 8);
+        assert_eq!(decoder.push(b"\n\r\n").unwrap().len(), 1);
+        assert_eq!(decoder.scanned, 0);
     }
 
     #[test]
