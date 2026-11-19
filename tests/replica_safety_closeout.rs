@@ -116,6 +116,24 @@ fn lease_and_admission_converge_and_stale_work_recovers() {
             .unwrap()
             .admitted
     );
+    // Queued work in the same scope waits while replica b's worker holds the
+    // only slot.
+    pair.a
+        .create_work_unit(&WorkUnit {
+            id: "wu-closeout-next".into(),
+            idempotency_key: "closeout-next-key".into(),
+            created_at: 20,
+            updated_at: 20,
+            ..unit.clone()
+        })
+        .unwrap();
+    assert!(
+        !pair
+            .a
+            .try_admit_work_unit("wu-closeout-next", "worker-b", 200)
+            .unwrap()
+            .admitted
+    );
 
     let summary = pair
         .a
@@ -132,6 +150,14 @@ fn lease_and_admission_converge_and_stale_work_recovers() {
     assert_eq!(
         pair.b.get_work_unit("wu-closeout").unwrap().unwrap().status,
         WORK_UNIT_STATUS_STALE
+    );
+    // Replica b is lost; the other replica admits the queued work, so the
+    // scope is not stranded behind the stale unit.
+    assert!(
+        pair.a
+            .try_admit_work_unit("wu-closeout-next", "worker-b", 100 + 5_001)
+            .unwrap()
+            .admitted
     );
 }
 
