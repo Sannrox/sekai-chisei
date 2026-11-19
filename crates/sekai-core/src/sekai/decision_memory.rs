@@ -388,6 +388,38 @@ mod tests {
     }
 
     #[test]
+    fn writer_memory_object_lookups_use_the_guarded_indexes() {
+        use crate::sekai::action_instance::{
+            SQLITE_REDACT_DECISION_MEMORY_BY_FACTS, SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS,
+        };
+        let db = SekaiDb::new(":memory:").unwrap();
+        for (lookup, index) in [
+            (
+                SQLITE_REDACT_DECISION_MEMORY_BY_PARAMETERS,
+                "idx_decision_memory_writer_parameters_object",
+            ),
+            (
+                SQLITE_REDACT_DECISION_MEMORY_BY_FACTS,
+                "idx_decision_memory_writer_facts_object",
+            ),
+        ] {
+            let conn = db.conn();
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {lookup}"))
+                .unwrap();
+            let plan = stmt
+                .query_map(rusqlite::params!["acme", "x"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(plan.contains(index), "{index} not used: {plan}");
+        }
+    }
+
+    #[test]
     fn sqlite_round_trip_and_supersede() {
         let db = SekaiDb::new(":memory:").unwrap();
         let row = memory("m1", "ai-1", r#"{"object_id":"rec-1"}"#, false);
