@@ -207,11 +207,24 @@ pub fn postgres_fail_closed_methods(runtime_db_src: &str) -> BTreeSet<String> {
     methods
 }
 
+/// Method name of an impl item at four-space indent, after any visibility
+/// (`pub`, `pub(...)`) and qualifiers (`const`, `async`, `unsafe`).
 fn parse_method_name(header: &str) -> Option<String> {
-    let rest = header
-        .strip_prefix("\n    pub fn ")
-        .or_else(|| header.strip_prefix("\n    pub(crate) fn "))
-        .or_else(|| header.strip_prefix("\n    fn "))?;
+    let mut rest = header.strip_prefix("\n    ")?;
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = match after.strip_prefix('(') {
+            Some(scope) => &scope[scope.find(')')? + 1..],
+            None => after,
+        };
+        rest = rest.strip_prefix(' ')?;
+    }
+    while let Some(after) = ["const ", "async ", "unsafe "]
+        .iter()
+        .find_map(|qualifier| rest.strip_prefix(qualifier))
+    {
+        rest = after;
+    }
+    let rest = rest.strip_prefix("fn ")?;
     let name: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -528,6 +541,40 @@ mod tests {
         assert!(
             error.contains("grew") || error.contains("only shrink"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn fail_closed_scanner_reads_every_method_form() {
+        let src = "impl RuntimeDb {
+    pub async fn async_closed(&self) {
+        match self { Self::Postgres(_) => {} }
+    }
+    pub(super) fn scoped_closed(&self) {
+        match self { Self::Postgres(_) => {} }
+    }
+    pub(in crate::db) const unsafe fn qualified_closed(&self) {
+        match self { Self::Postgres(_) => {} }
+    }
+    fn private_closed(&self) {
+        match self { Self::Postgres(_) => {} }
+    }
+    pub async fn dual(&self) {
+        match self { Self::Postgres(_) => off_runtime(|| ()) }
+    }
+}
+";
+        assert_eq!(
+            postgres_fail_closed_methods(src),
+            BTreeSet::from(
+                [
+                    "async_closed",
+                    "private_closed",
+                    "qualified_closed",
+                    "scoped_closed"
+                ]
+                .map(String::from)
+            )
         );
     }
 
