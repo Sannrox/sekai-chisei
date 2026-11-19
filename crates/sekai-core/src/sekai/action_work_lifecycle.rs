@@ -11,9 +11,11 @@ use crate::sekai::action_effect::{
     ACK_OUTCOME_COMPLETED, ACK_OUTCOME_FAILED, ACK_OUTCOME_PARKED, ActionEffect,
     EFFECT_STATUS_COMPLETED, EFFECT_STATUS_FAILED,
 };
+use crate::sekai::action_instance::ActionInstance;
 use crate::sekai::audit;
 use crate::sekai::delegating_principal::{
-    DelegatorApplyError, current_delegating_principal_state, revalidate_delegator_at_apply,
+    DelegatorApplyError, agent_has_ceiling, current_delegating_principal_state,
+    revalidate_delegator_at_apply,
 };
 use crate::sekai::governed_action_type::GovernedActionType;
 use crate::sekai::parked_work::{ActionWorkContinuation, ActionWorkPark};
@@ -110,22 +112,19 @@ pub struct AckedActionWork {
     pub replay: bool,
 }
 
+/// Receipt `actor_scope` of delegated work whose agent has no ceiling: it
+/// runs with the delegating user's rights (#2435).
+pub const ACTOR_SCOPE_USER: &str = "user";
+/// Receipt `actor_scope` of delegated work bounded by the agent's ceiling.
+pub const ACTOR_SCOPE_AGENT_CEILING: &str = "agent_ceiling";
+
 pub struct ActionWorkLifecycle<'a> {
     db: &'a RuntimeDb,
-    enforce_agent_ceiling: bool,
 }
 
 impl<'a> ActionWorkLifecycle<'a> {
     pub fn new(db: &'a RuntimeDb) -> Self {
-        Self {
-            db,
-            enforce_agent_ceiling: false,
-        }
-    }
-
-    pub fn with_agent_ceiling(mut self, enforce: bool) -> Self {
-        self.enforce_agent_ceiling = enforce;
-        self
+        Self { db }
     }
 
     pub fn claim(
@@ -537,19 +536,12 @@ impl<'a> ActionWorkLifecycle<'a> {
                 return Err(ActionWorkLifecycleError::Internal(error));
             }
         }
-        if !self.enforce_agent_ceiling {
-            return Ok(None);
-        }
-        let agent = instance.principal.trim();
-        let Some(user) = instance
-            .delegating_actor
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+        let Some(agent) = delegated_agent(&instance) else {
             return Ok(None);
         };
-        if agent.is_empty() || agent == user {
+        // A defined ceiling is always enforced; an agent without one acts
+        // with the user's rights, which its receipt records.
+        if !agent_has_ceiling(self.db, agent).map_err(ActionWorkLifecycleError::Internal)? {
             return Ok(None);
         }
         // Grant ceiling only. Human credential liveness is already checked
@@ -568,6 +560,31 @@ impl<'a> ActionWorkLifecycle<'a> {
         }
     }
 
+    /// The agent of a delegated effect and the receipt `actor_scope` it runs
+    /// under; `None` for work without a distinct delegating user.
+    fn delegated_scope(
+        &self,
+        effect: &ActionEffect,
+    ) -> Result<Option<(String, &'static str)>, ActionWorkLifecycleError> {
+        let Some(instance) = self
+            .db
+            .get_action_instance(&effect.instance_id)
+            .map_err(ActionWorkLifecycleError::Internal)?
+        else {
+            return Ok(None);
+        };
+        let Some(agent) = delegated_agent(&instance) else {
+            return Ok(None);
+        };
+        let scope =
+            if agent_has_ceiling(self.db, agent).map_err(ActionWorkLifecycleError::Internal)? {
+                ACTOR_SCOPE_AGENT_CEILING
+            } else {
+                ACTOR_SCOPE_USER
+            };
+        Ok(Some((agent.to_string(), scope)))
+    }
+
     fn record_delegator_refusal_receipt(
         &self,
         effect: &ActionEffect,
@@ -575,6 +592,17 @@ impl<'a> ActionWorkLifecycle<'a> {
         reason: DelegatorApplyRefusal,
         now_ms: i64,
     ) -> Result<(), ActionWorkLifecycleError> {
+        let mut attributes = BTreeMap::from([
+            ("outcome".to_string(), "denied".to_string()),
+            ("reason".into(), reason.as_str().into()),
+            ("effect_id".into(), effect.effect_id.clone()),
+            ("instance_id".into(), effect.instance_id.clone()),
+        ]);
+        if reason == DelegatorApplyRefusal::AgentCeiling
+            && let Some((agent, _)) = self.delegated_scope(effect)?
+        {
+            attributes.insert("agent_ceiling".into(), agent);
+        }
         match self
             .db
             .update_operation_receipt(&effect.operation_id, |receipt| {
@@ -599,12 +627,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                     surface: ReceiptEventKind::OutcomeRecorded.surface(),
                     actor: runtime_id.to_string(),
                     references: Vec::new(),
-                    attributes: BTreeMap::from([
-                        ("outcome".into(), "denied".into()),
-                        ("reason".into(), reason.as_str().into()),
-                        ("effect_id".into(), effect.effect_id.clone()),
-                        ("instance_id".into(), effect.instance_id.clone()),
-                    ]),
+                    attributes: attributes.clone(),
                 });
                 receipt.completed_at_ms = Some(now_ms);
                 receipt.uncovered_surfaces.clear();
@@ -632,6 +655,7 @@ impl<'a> ActionWorkLifecycle<'a> {
         ) {
             return Ok(());
         }
+        let actor_scope = self.delegated_scope(effect)?.map(|(_, scope)| scope);
         // Hold the reporter lock across read-modify-write so a late artifact
         // attach cannot clobber concurrently appended harvest events.
         match self
@@ -641,6 +665,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                     receipt,
                     effect,
                     runtime_id,
+                    actor_scope,
                     artifact.as_ref(),
                     allow_artifact_bind,
                     now_ms,
@@ -727,10 +752,19 @@ impl<'a> ActionWorkLifecycle<'a> {
     }
 }
 
+/// The agent of a delegated instance: its principal, when a distinct
+/// delegating user is named.
+fn delegated_agent(instance: &ActionInstance) -> Option<&str> {
+    let agent = instance.principal.trim();
+    let user = instance.delegating_actor.as_deref().map(str::trim)?;
+    (!user.is_empty() && !agent.is_empty() && agent != user).then_some(agent)
+}
+
 fn apply_ack_harvest(
     receipt: &mut OperationReceipt,
     effect: &ActionEffect,
     runtime_id: &str,
+    actor_scope: Option<&str>,
     artifact: Option<&ReceiptArtifact>,
     allow_artifact_bind: bool,
     now_ms: i64,
@@ -778,11 +812,16 @@ fn apply_ack_harvest(
             surface: ReceiptEventKind::ActionPerformed.surface(),
             actor: runtime_id.to_string(),
             references: Vec::new(),
-            attributes: BTreeMap::from([
-                ("effect_id".into(), effect.effect_id.clone()),
-                ("instance_id".into(), effect.instance_id.clone()),
-                ("source".into(), "ack_action_work".into()),
-            ]),
+            attributes: BTreeMap::from_iter(
+                [
+                    ("effect_id", effect.effect_id.as_str()),
+                    ("instance_id", effect.instance_id.as_str()),
+                    ("source", "ack_action_work"),
+                ]
+                .into_iter()
+                .chain(actor_scope.map(|scope| ("actor_scope", scope)))
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+            ),
         });
         let mut outcome_parent = format!("{}:action-ack", effect.operation_id);
         if receipt.artifact.is_some() && !has_artifact_event {
@@ -2356,6 +2395,7 @@ mod tests {
                 &mut receipt,
                 &completed,
                 "shikigami",
+                None,
                 Some(&artifact),
                 true,
                 300,
@@ -2460,13 +2500,8 @@ mod tests {
         assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
     }
 
-    fn claim_refused_with(
-        db: &RuntimeDb,
-        effect: &ActionEffect,
-        enforce_agent_ceiling: bool,
-    ) -> ActionWorkLifecycleError {
+    fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
         ActionWorkLifecycle::new(db)
-            .with_agent_ceiling(enforce_agent_ceiling)
             .claim(
                 ClaimActionWork {
                     effect_id: &effect.effect_id,
@@ -2478,10 +2513,6 @@ mod tests {
                 100,
             )
             .expect_err("delegator refusal must fail closed at claim")
-    }
-
-    fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
-        claim_refused_with(db, effect, false)
     }
 
     #[test]
@@ -2536,10 +2567,50 @@ mod tests {
         assert_eq!(stored.status, EFFECT_STATUS_FAILED);
     }
 
+    /// Defines the agent's ceiling with a role in another namespace only.
+    fn define_agent_ceiling_elsewhere(db: &RuntimeDb) {
+        db.ensure_team_namespace("other", "runtime", Role::Editor, "local")
+            .unwrap();
+    }
+
+    fn ack_attribute(db: &RuntimeDb, operation_id: &str, key: &str) -> Option<String> {
+        db.get_operation_receipt(operation_id)
+            .unwrap()
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| event.attributes.get(key).cloned())
+    }
+
+    #[test]
+    fn ceilingless_agent_acts_with_user_rights_and_its_receipt_says_so() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        apply_completed(&db, &effect, &claimed).unwrap();
+        assert_eq!(
+            ack_attribute(&db, &effect.operation_id, "actor_scope").as_deref(),
+            Some(ACTOR_SCOPE_USER)
+        );
+    }
+
+    #[test]
+    fn work_without_a_delegating_user_records_no_actor_scope() {
+        let db = RuntimeDb::memory();
+        let effect = seed_effect(&db);
+        seed_open_receipt(&db, &effect);
+        let claimed = claim_effect(&db, &effect);
+        apply_completed(&db, &effect, &claimed).unwrap();
+        assert_eq!(
+            ack_attribute(&db, &effect.operation_id, "actor_scope"),
+            None
+        );
+    }
+
     #[test]
     fn claim_is_refused_when_agent_ceiling_lacks_the_grant() {
         let (db, effect, _) = seed_delegated_apply_path();
-        let error = claim_refused_with(&db, &effect, true);
+        define_agent_ceiling_elsewhere(&db);
+        let error = claim_refused(&db, &effect);
         assert_eq!(
             error,
             ActionWorkLifecycleError::FailedPrecondition(AGENT_CEILING_GRANT_MISSING.into())
@@ -2550,6 +2621,10 @@ mod tests {
         assert_eq!(
             receipt_reason(&db, &effect.operation_id).as_deref(),
             Some(AGENT_CEILING_GRANT_MISSING)
+        );
+        assert_eq!(
+            ack_attribute(&db, &effect.operation_id, "agent_ceiling").as_deref(),
+            Some("runtime")
         );
     }
 
@@ -2564,27 +2639,20 @@ mod tests {
         .unwrap();
         db.ensure_team_namespace("acme", "runtime", Role::Editor, "local")
             .unwrap();
-        ActionWorkLifecycle::new(&db)
-            .with_agent_ceiling(true)
-            .claim(
-                ClaimActionWork {
-                    effect_id: &effect.effect_id,
-                    runtime_id: "shikigami",
-                    request_id: "claim-ok",
-                    ttl_ms: 60_000,
-                },
-                "operator",
-                100,
-            )
-            .unwrap();
+        let claimed = claim_effect(&db, &effect);
+        apply_completed(&db, &effect, &claimed).unwrap();
+        assert_eq!(
+            ack_attribute(&db, &effect.operation_id, "actor_scope").as_deref(),
+            Some(ACTOR_SCOPE_AGENT_CEILING)
+        );
     }
 
     #[test]
     fn apply_is_refused_when_agent_ceiling_lacks_the_grant() {
         let (db, effect, _) = seed_delegated_apply_path();
         let claimed = claim_effect(&db, &effect);
+        define_agent_ceiling_elsewhere(&db);
         let error = ActionWorkLifecycle::new(&db)
-            .with_agent_ceiling(true)
             .ack(
                 ack_completed(&effect.effect_id, &claimed, ""),
                 "operator",

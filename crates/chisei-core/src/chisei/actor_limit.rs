@@ -3,6 +3,8 @@
 //! Tenant quotas (#119) bound a tenant. This gate bounds the identities on
 //! an actor chain so one user or one agent cannot exhaust shared RPC/MCP
 //! capacity. Enforcement stays off until `SEKAI_ACTOR_CHAIN_ENFORCEMENT=1`.
+//! The agent grant ceiling is enforced separately, at Action work claim and
+//! apply (#2435).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

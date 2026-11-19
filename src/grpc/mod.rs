@@ -1854,8 +1854,7 @@ pub fn build_services_for_plane(
             .assertion_authority()?
             .filter(crate::identity_assertion::AssertionAuthority::can_seal)
             .map(Arc::new),
-    )
-    .with_agent_ceiling(config.actor_chain_enforcement);
+    );
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
             crate::composition::cross_store_admission::CrossStoreAdmission::new(
