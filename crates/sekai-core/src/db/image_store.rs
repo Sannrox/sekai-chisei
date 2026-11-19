@@ -3,14 +3,25 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::sekai::SekaiDb;
-use crate::sekai::image::{GovernedImage, IMAGE_UNAVAILABLE, ImageAnnotation, ImageRendition};
+use crate::sekai::image::{
+    GovernedImage, IMAGE_UNAVAILABLE, ImageAnnotation, ImageRendition, require_attachable,
+};
 
 impl SekaiDb {
     pub fn put_governed_image(&self, image: &GovernedImage) -> Result<(), String> {
         let json = serde_json::to_string(image)
             .map_err(|error| format!("encode governed image: {error}"))?;
-        let changed = self
-            .conn()
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        // A tombstone is final: re-putting the image does not revive it.
+        if load_image(&tx, &image.namespace, &image.image_id)?
+            .is_some_and(|stored| stored.deleted_at_ms != 0)
+        {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_images
                     (namespace, image_id, owner, record_json)
@@ -24,6 +35,7 @@ impl SekaiDb {
         if changed == 0 {
             return Err(IMAGE_UNAVAILABLE.into());
         }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -152,19 +164,12 @@ impl SekaiDb {
         let json = serde_json::to_string(rendition)
             .map_err(|error| format!("encode governed image rendition: {error}"))?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let parent = tx
-            .query_row(
-                "SELECT record_json FROM sekai_governed_images
-                 WHERE namespace = ?1 AND image_id = ?2",
-                params![rendition.namespace, rendition.image_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        if parent.is_none() {
-            return Err(IMAGE_UNAVAILABLE.into());
-        }
+        let parent =
+            load_image(&tx, &rendition.namespace, &rendition.image_id)?.ok_or(IMAGE_UNAVAILABLE)?;
+        require_attachable(&parent, &rendition.parent_content_digest)?;
         let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_image_renditions
@@ -258,19 +263,12 @@ impl SekaiDb {
         let json = serde_json::to_string(annotation)
             .map_err(|error| format!("encode governed image annotation: {error}"))?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let parent = tx
-            .query_row(
-                "SELECT record_json FROM sekai_governed_images
-                 WHERE namespace = ?1 AND image_id = ?2",
-                params![annotation.namespace, annotation.image_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        if parent.is_none() {
-            return Err(IMAGE_UNAVAILABLE.into());
-        }
+        let parent = load_image(&tx, &annotation.namespace, &annotation.image_id)?
+            .ok_or(IMAGE_UNAVAILABLE)?;
+        require_attachable(&parent, &annotation.parent_content_digest)?;
         let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_image_annotations
@@ -321,4 +319,24 @@ impl SekaiDb {
         }
         Ok(annotations)
     }
+}
+
+/// The stored image `namespace`/`image_id`, if any.
+fn load_image(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    image_id: &str,
+) -> Result<Option<GovernedImage>, String> {
+    conn.query_row(
+        "SELECT record_json FROM sekai_governed_images
+         WHERE namespace = ?1 AND image_id = ?2",
+        params![namespace, image_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .map(|json| {
+        serde_json::from_str(&json).map_err(|error| format!("decode governed image: {error}"))
+    })
+    .transpose()
 }

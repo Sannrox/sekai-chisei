@@ -187,6 +187,20 @@ pub fn content_digest_for(reference: &ContentReference) -> Result<String, String
     ))
 }
 
+/// The store-side rule for attaching a rendition or annotation: the parent is
+/// live and the attachment was derived from its current content. Stores check
+/// it under their write lock so a tombstone between read and write cannot slip
+/// an attachment onto a deleted image.
+pub(crate) fn require_attachable(
+    parent: &GovernedImage,
+    parent_content_digest: &str,
+) -> Result<(), String> {
+    if parent.deleted_at_ms != 0 || parent.content_digest != parent_content_digest {
+        return Err(IMAGE_UNAVAILABLE.into());
+    }
+    Ok(())
+}
+
 pub fn admit_image(
     db: &RuntimeDb,
     actor: &str,

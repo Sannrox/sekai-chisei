@@ -109,6 +109,20 @@ fn exercise(db: &RuntimeDb) {
         "site"
     );
 
+    // A rendition derived from other content than the image's is refused.
+    assert_eq!(
+        db.put_governed_image_rendition(&ImageRendition {
+            parent_content_digest: digest(9),
+            ..rendition()
+        })
+        .unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert!(
+        db.list_governed_image_renditions("records", "img:site")
+            .unwrap()
+            .is_empty()
+    );
     db.put_governed_image_rendition(&rendition()).unwrap();
     assert_eq!(
         db.list_governed_image_renditions("records", "img:site")
@@ -142,6 +156,34 @@ fn exercise(db: &RuntimeDb) {
     assert_eq!(
         db.tombstone_governed_image(&taken).unwrap_err(),
         IMAGE_UNAVAILABLE
+    );
+
+    // The tombstoned image takes no attachments and is not revived by a put.
+    assert_eq!(
+        db.put_governed_image_rendition(&rendition()).unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert_eq!(
+        db.put_governed_image_annotation(&annotation()).unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert_eq!(
+        db.put_governed_image(&first).unwrap_err(),
+        IMAGE_UNAVAILABLE
+    );
+    assert_eq!(
+        db.get_governed_image("records", "img:site").unwrap(),
+        Some(tombstoned.clone())
+    );
+    assert!(
+        db.list_governed_image_renditions("records", "img:site")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        db.list_governed_image_annotations("records", "img:site")
+            .unwrap()
+            .is_empty()
     );
 
     assert_eq!(
