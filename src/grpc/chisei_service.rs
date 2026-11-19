@@ -316,8 +316,6 @@ impl ChiseiServiceImpl {
         }
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
-        let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.fact_runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
             db.list_evolve_task_records()
@@ -397,8 +395,6 @@ impl ChiseiServiceImpl {
         }
         let provider_registry_state_path = (config.db_path != ":memory:")
             .then(|| crate::provider_profile::provider_registry_state_path(&config.db_path));
-        let policy = Arc::new(PolicyResolver::new());
-        load_namespace_policies(db.fact_runtime(), &policy);
         let eval = Arc::new(EvalStore::with_db(db.clone()));
         let evolve_history = Arc::new(Mutex::new(
             db.list_evolve_task_records()
