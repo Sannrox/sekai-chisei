@@ -196,19 +196,20 @@ pub fn admit_image(
     required("actor", actor)?;
     require_positive_timestamp("admit", now_ms)?;
     let validated = validate_image(image, actor, now_ms)?;
-    if let Some(existing) = db.get_governed_image(&validated.namespace, &validated.image_id)? {
-        if existing.deleted_at_ms != 0 || existing.owner != actor || is_expired(&existing, now_ms) {
-            return Err(IMAGE_UNAVAILABLE.into());
-        }
-        if existing.content_digest == validated.content_digest
-            && definition_digest(&existing)? == definition_digest(&validated)?
-        {
-            return Ok(existing);
-        }
+    // Insert-or-read in one step: under concurrency the first definition wins
+    // and every other admission is compared against it (#2717).
+    let Some(existing) = db.insert_governed_image(&validated)? else {
+        return Ok(validated);
+    };
+    if existing.deleted_at_ms != 0 || existing.owner != actor || is_expired(&existing, now_ms) {
         return Err(IMAGE_UNAVAILABLE.into());
     }
-    db.put_governed_image(&validated)?;
-    Ok(validated)
+    if existing.content_digest == validated.content_digest
+        && definition_digest(&existing)? == definition_digest(&validated)?
+    {
+        return Ok(existing);
+    }
+    Err(IMAGE_UNAVAILABLE.into())
 }
 
 pub fn attach_rendition(
@@ -353,14 +354,15 @@ pub fn place_hold(
     required("hold id", hold_id)?;
     required("hold reason", reason)?;
     require_positive_timestamp("hold", now_ms)?;
-    let mut image = live_image(db, namespace, image_id, actor, now_ms)?;
-    if !image.hold_id.is_empty() && image.hold_id != hold_id {
-        return Err(IMAGE_HELD.into());
-    }
-    image.hold_id = hold_id.into();
-    image.hold_reason = reason.into();
-    db.put_governed_image(&image)?;
-    Ok(image)
+    update_owned(db, namespace, image_id, actor, |mut image| {
+        check_live(&image, now_ms)?;
+        if !image.hold_id.is_empty() && image.hold_id != hold_id {
+            return Err(IMAGE_HELD.into());
+        }
+        image.hold_id = hold_id.into();
+        image.hold_reason = reason.into();
+        Ok(image)
+    })
 }
 
 pub fn release_hold(
@@ -374,14 +376,15 @@ pub fn release_hold(
     required("actor", actor)?;
     required("hold id", hold_id)?;
     require_positive_timestamp("release", now_ms)?;
-    let mut image = live_image(db, namespace, image_id, actor, now_ms)?;
-    if image.hold_id != hold_id {
-        return Err(IMAGE_UNAVAILABLE.into());
-    }
-    image.hold_id.clear();
-    image.hold_reason.clear();
-    db.put_governed_image(&image)?;
-    Ok(image)
+    update_owned(db, namespace, image_id, actor, |mut image| {
+        check_live(&image, now_ms)?;
+        if image.hold_id != hold_id {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        image.hold_id.clear();
+        image.hold_reason.clear();
+        Ok(image)
+    })
 }
 
 pub fn expire_image(
@@ -393,18 +396,18 @@ pub fn expire_image(
 ) -> Result<GovernedImage, String> {
     required("actor", actor)?;
     require_positive_timestamp("expire", now_ms)?;
-    let mut image = owned_image(db, namespace, image_id, actor)?;
-    if image.deleted_at_ms != 0 {
-        return Err(IMAGE_UNAVAILABLE.into());
-    }
-    if !image.hold_id.is_empty() {
-        return Err(IMAGE_HELD.into());
-    }
-    if image.expires_at_ms == 0 || image.expires_at_ms > now_ms {
-        image.expires_at_ms = now_ms;
-    }
-    db.put_governed_image(&image)?;
-    Ok(image)
+    update_owned(db, namespace, image_id, actor, |mut image| {
+        if image.deleted_at_ms != 0 {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        if !image.hold_id.is_empty() {
+            return Err(IMAGE_HELD.into());
+        }
+        if image.expires_at_ms == 0 || image.expires_at_ms > now_ms {
+            image.expires_at_ms = now_ms;
+        }
+        Ok(image)
+    })
 }
 
 pub fn delete_image(
@@ -416,19 +419,19 @@ pub fn delete_image(
 ) -> Result<GovernedImage, String> {
     required("actor", actor)?;
     require_positive_timestamp("delete", now_ms)?;
-    let mut image = owned_image(db, namespace, image_id, actor)?;
-    if image.deleted_at_ms != 0 {
-        return Ok(image);
-    }
-    if !image.hold_id.is_empty() {
-        return Err(IMAGE_HELD.into());
-    }
-    if is_expired(&image, now_ms) {
-        return Err(IMAGE_UNAVAILABLE.into());
-    }
-    image.deleted_at_ms = now_ms;
-    db.tombstone_governed_image(&image)?;
-    Ok(image)
+    update_owned(db, namespace, image_id, actor, |mut image| {
+        if image.deleted_at_ms != 0 {
+            return Ok(image);
+        }
+        if !image.hold_id.is_empty() {
+            return Err(IMAGE_HELD.into());
+        }
+        if is_expired(&image, now_ms) {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        image.deleted_at_ms = now_ms;
+        Ok(image)
+    })
 }
 
 fn live_image(
@@ -439,7 +442,12 @@ fn live_image(
     now_ms: i64,
 ) -> Result<GovernedImage, String> {
     let image = owned_image(db, namespace, image_id, actor)?;
-    if image.deleted_at_ms != 0 || is_expired(&image, now_ms) {
+    check_live(&image, now_ms)?;
+    Ok(image)
+}
+
+fn check_live(image: &GovernedImage, now_ms: i64) -> Result<(), String> {
+    if image.deleted_at_ms != 0 || is_expired(image, now_ms) {
         return Err(IMAGE_UNAVAILABLE.into());
     }
     if image.contract_version != IMAGE_CONTRACT || image.type_revision != TYPE_REVISION_V1 {
@@ -448,7 +456,26 @@ fn live_image(
     if content_digest_for(&image.content_ref)? != image.content_digest {
         return Err(IMAGE_UNAVAILABLE.into());
     }
-    Ok(image)
+    Ok(())
+}
+
+/// Applies a lifecycle change to the actor's image atomically: the checks in `change`
+/// run against the stored record inside the same transaction that writes the result.
+fn update_owned(
+    db: &RuntimeDb,
+    namespace: &str,
+    image_id: &str,
+    actor: &str,
+    change: impl FnOnce(GovernedImage) -> Result<GovernedImage, String>,
+) -> Result<GovernedImage, String> {
+    required("namespace", namespace)?;
+    required("image id", image_id)?;
+    db.update_governed_image(namespace, image_id, |image| {
+        if image.owner != actor {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        change(image)
+    })
 }
 
 fn owned_image(
@@ -1259,6 +1286,81 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn file_runtime(dir: &tempfile::TempDir) -> RuntimeDb {
+        RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(dir.path().join("images.db").to_str().unwrap()).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn hold_racing_an_in_flight_delete_cannot_be_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = file_runtime(&dir);
+        admit(&runtime);
+        let (read, read_seen) = std::sync::mpsc::channel();
+        let (deleted, hold) = std::thread::scope(|scope| {
+            // Request A has read the record and passed its hold check when B arrives.
+            let deleter = scope.spawn(|| {
+                update_owned(&runtime, "records", "img:site", "analyst", |mut image| {
+                    read.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    image.deleted_at_ms = 3_000;
+                    Ok(image)
+                })
+            });
+            read_seen.recv().unwrap();
+            let hold = place_hold(
+                &runtime,
+                "analyst",
+                "records",
+                "img:site",
+                "hold:1",
+                "litigation",
+                3_000,
+            );
+            (deleter.join().unwrap(), hold)
+        });
+        assert_eq!(deleted.unwrap().deleted_at_ms, 3_000);
+        assert_eq!(hold.unwrap_err(), IMAGE_UNAVAILABLE);
+        let stored = runtime
+            .get_governed_image("records", "img:site")
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.deleted_at_ms, stored.hold_id.as_str()), (3_000, ""));
+    }
+
+    #[test]
+    fn concurrent_identical_admissions_return_the_stored_image() {
+        const ADMISSIONS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = file_runtime(&dir);
+        pin_ceiling(&runtime, "analyst", "internal");
+        let barrier = std::sync::Barrier::new(ADMISSIONS);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..ADMISSIONS)
+                .map(|n| {
+                    let (barrier, runtime) = (&barrier, &runtime);
+                    // Distinct admission times: only the first stored record may be returned.
+                    scope.spawn(move || {
+                        barrier.wait();
+                        admit_image(runtime, "analyst", &image(), 1_000 + n as i64)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let stored = runtime
+            .get_governed_image("records", "img:site")
+            .unwrap()
+            .unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), stored);
+        }
     }
 
     #[test]

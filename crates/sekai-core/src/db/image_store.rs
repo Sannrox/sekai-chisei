@@ -1,6 +1,6 @@
 //! SQLite persistence for governed images, renditions, and annotations (#696).
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::sekai::SekaiDb;
 use crate::sekai::image::{GovernedImage, IMAGE_UNAVAILABLE, ImageAnnotation, ImageRendition};
@@ -25,6 +25,106 @@ impl SekaiDb {
             return Err(IMAGE_UNAVAILABLE.into());
         }
         Ok(())
+    }
+
+    /// Insert `image` unless its id is taken, in one write transaction.
+    /// Returns `None` when this call stored it, or the record that already
+    /// holds the id, untouched, so concurrent admissions cannot overwrite
+    /// each other (#2717).
+    pub fn insert_governed_image(
+        &self,
+        image: &GovernedImage,
+    ) -> Result<Option<GovernedImage>, String> {
+        let json = serde_json::to_string(image)
+            .map_err(|error| format!("encode governed image: {error}"))?;
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let inserted = tx
+            .execute(
+                "INSERT INTO sekai_governed_images
+                    (namespace, image_id, owner, record_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(namespace, image_id) DO NOTHING",
+                params![image.namespace, image.image_id, image.owner, json],
+            )
+            .map_err(|error| error.to_string())?;
+        let existing = if inserted == 0 {
+            let current: String = tx
+                .query_row(
+                    "SELECT record_json FROM sekai_governed_images
+                     WHERE namespace = ?1 AND image_id = ?2",
+                    params![image.namespace, image.image_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            Some(
+                serde_json::from_str(&current)
+                    .map_err(|error| format!("decode governed image: {error}"))?,
+            )
+        } else {
+            None
+        };
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(existing)
+    }
+
+    /// Read-modify-write of one image in a single write transaction, so a check made
+    /// by `update` (hold, deletion, expiry) still holds when its result is stored.
+    /// Writing a deleted image also drops its renditions and annotations in the same
+    /// transaction (#2717).
+    pub fn update_governed_image(
+        &self,
+        namespace: &str,
+        image_id: &str,
+        update: impl FnOnce(GovernedImage) -> Result<GovernedImage, String>,
+    ) -> Result<GovernedImage, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current: String = tx
+            .query_row(
+                "SELECT record_json FROM sekai_governed_images
+                 WHERE namespace = ?1 AND image_id = ?2",
+                params![namespace, image_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or(IMAGE_UNAVAILABLE)?;
+        let current: GovernedImage = serde_json::from_str(&current)
+            .map_err(|error| format!("decode governed image: {error}"))?;
+        let owner = current.owner.clone();
+        let next = update(current)?;
+        if next.namespace != namespace || next.image_id != image_id || next.owner != owner {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
+        let json = serde_json::to_string(&next)
+            .map_err(|error| format!("encode governed image: {error}"))?;
+        tx.execute(
+            "UPDATE sekai_governed_images SET record_json = ?3
+             WHERE namespace = ?1 AND image_id = ?2",
+            params![namespace, image_id, json],
+        )
+        .map_err(|error| error.to_string())?;
+        if next.deleted_at_ms != 0 {
+            tx.execute(
+                "DELETE FROM sekai_governed_image_renditions
+                 WHERE namespace = ?1 AND image_id = ?2",
+                params![namespace, image_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM sekai_governed_image_annotations
+                 WHERE namespace = ?1 AND image_id = ?2",
+                params![namespace, image_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(next)
     }
 
     pub fn get_governed_image(
