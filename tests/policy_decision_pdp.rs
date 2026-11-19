@@ -202,14 +202,18 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
     let policy = db
         .put_object_security_policy(&owner_read(), "root", "put-owner", 1)
         .unwrap();
-    db.activate_object_security_policies(
-        "acme",
-        &BTreeMap::from([("document".into(), policy.revision_digest)]),
-        "root",
-        "act-owner",
-        2,
-    )
-    .unwrap();
+    let activation = db
+        .activate_object_security_policies(
+            "acme",
+            &BTreeMap::from([("document".into(), policy.revision_digest.clone())]),
+            "root",
+            "act-owner",
+            2,
+        )
+        .unwrap();
+    let activation_digest =
+        sekai_chisei::sekai::object_security::object_security_activation_digest(&activation)
+            .unwrap();
     let live = db
         .active_object_policy("acme", "document")
         .unwrap()
@@ -239,7 +243,7 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
             authority: &authority,
             lattice: None,
             policy: Some(&live),
-            activation_digest: "act",
+            activation_digest: &activation_digest,
             purpose: None,
             purpose_authorization: None,
             now_ms: 10,
@@ -266,7 +270,11 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
     assert_eq!(alice.len(), 1);
     assert_eq!(alice[0].decision.outcome, PolicyOutcome::Allow);
     assert_eq!(alice[0].decision.object_id, "doc-a");
-    assert!(!alice[0].decision.policy_revision_digest.is_empty());
+    assert_eq!(alice[0].decision.activation_digest, activation_digest);
+    assert_eq!(
+        alice[0].decision.policy_revision_digest,
+        policy.revision_digest
+    );
     let export = serde_json::to_vec(&alice).unwrap();
     assert!(!audit_export_contains_hidden_value(&export, "hidden-doc-a"));
 
@@ -279,4 +287,11 @@ fn audit_query_returns_allow_and_deny_without_hidden_values() {
         .unwrap();
     assert_eq!(bob.len(), 1);
     assert_eq!(bob[0].decision.outcome, PolicyOutcome::Deny);
+    assert_eq!(bob[0].decision.activation_digest, activation_digest);
+    assert_eq!(
+        bob[0].decision.policy_revision_digest,
+        policy.revision_digest
+    );
+    let export = serde_json::to_vec(&bob).unwrap();
+    assert!(!audit_export_contains_hidden_value(&export, "hidden-doc-a"));
 }
