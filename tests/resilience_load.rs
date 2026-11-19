@@ -80,20 +80,19 @@ fn oversubscribed_writers_all_complete_without_deadlock() {
     );
 
     // Saturation is a ratio, and must remain one under contention.
-    if let Some(line) = rendered
+    let line = rendered
         .lines()
         .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
-    {
-        let value: f64 = line
-            .rsplit(' ')
-            .next()
-            .and_then(|v| v.parse().ok())
-            .expect("numeric saturation");
-        assert!(
-            (0.0..=1.0).contains(&value),
-            "saturation left the unit range under load: {line}"
-        );
-    }
+        .unwrap_or_else(|| panic!("contention produced no persistence saturation:\n{rendered}"));
+    let value: f64 = line
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("numeric saturation");
+    assert!(
+        (0.0..=1.0).contains(&value),
+        "saturation left the unit range under load: {line}"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
