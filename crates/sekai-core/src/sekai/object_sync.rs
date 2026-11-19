@@ -78,10 +78,92 @@ pub fn schema_quarantine_record_reason(
     }
 }
 
+/// True when an identity field (an id, namespace, source instance, or
+/// producer) carries a credential shape: the source SDK's secret patterns, an
+/// `sk-` key that starts a token, a cloud access key id (`AKIA` or `ASIA` plus
+/// 16 uppercase alphanumerics), a bearer value, a PEM block, a chat or forge
+/// token prefix, or a JWT. Shapes, not words: `task-1` and `asia-east` pass.
+pub(crate) fn identity_looks_secret(value: &str) -> bool {
+    if contains_secret_like_text(value) {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    starts_a_token(&lower, "sk-")
+        || ["glpat-", "xoxb-", "xoxp-"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+        || lower.contains("bearer ")
+        || lower.contains("-----begin")
+        || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
+        || contains_access_key_id(value)
+}
+
+/// `needle` occurs with no letter right before it (`sk-` in `ops sk-1`, not in `risk-ops`).
+fn starts_a_token(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(at, _)| {
+        text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|before| !before.is_ascii_alphabetic())
+    })
+}
+
+/// A standalone `AKIA`/`ASIA` access key id: the prefix, 16 uppercase
+/// alphanumerics, and no alphanumeric on either side.
+fn contains_access_key_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(20).enumerate().any(|(at, window)| {
+        (window.starts_with(b"AKIA") || window.starts_with(b"ASIA"))
+            && window[4..]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            && (at == 0 || !bytes[at - 1].is_ascii_alphanumeric())
+            && bytes
+                .get(at + 20)
+                .is_none_or(|byte| !byte.is_ascii_alphanumeric())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    #[test]
+    fn identity_secret_check_matches_credential_shapes_not_words() {
+        for accepted in [
+            "task-1",
+            "risk-ops",
+            "asia-east",
+            "akia-lab",
+            "Akiapolaau",
+            "acme/ops",
+        ] {
+            assert!(
+                !identity_looks_secret(accepted),
+                "{accepted} is an ordinary id"
+            );
+        }
+        for refused in [
+            "sk-proj-abc123",
+            "ops sk-live-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAY34FZKBOKMUTVV7A",
+            "key=AKIAIOSFODNN7EXAMPLE",
+            "Authorization: Bearer abc",
+            "bearer abc",
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "ghp_abcdef",
+            "glpat-abc",
+            "eyJhbGciOi.eyJzdWIi.sig",
+        ] {
+            assert!(
+                identity_looks_secret(refused),
+                "{refused} has a credential shape"
+            );
+        }
+    }
+
     use std::collections::BTreeMap;
 
     const TYPE_DIGEST: &str = GITHUB_OBJECT_SYNC_TYPE_DIGEST;

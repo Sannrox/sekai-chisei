@@ -14,7 +14,7 @@ use crate::sekai::namespace_access::{is_safe_namespace, principal_can_access_nam
 use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_V3_VERSION, SOURCE_BATCH_VERSION,
     SourceBatchStatus, SourceBinding, SourceCheckpoint, SourceSyncGenerationStatus,
-    SourceSyncState, contains_secret_like_text,
+    SourceSyncState, contains_secret_like_text, identity_looks_secret,
 };
 
 pub const HEALTH_CONTRACT: &str = "sekai.source-health/v1";
@@ -504,17 +504,6 @@ fn health_audit_identity_digest(report: &SourceHealth) -> String {
     hasher.update(b"\n");
     hasher.update(report.type_digest.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn identity_looks_secret(value: &str) -> bool {
-    if contains_secret_like_text(value) {
-        return true;
-    }
-    let lower = value.to_ascii_lowercase();
-    ["sk-", "glpat-", "xoxb-", "xoxp-", "bearer ", "akia", "asia"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-        || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
 }
 
 fn required(label: &str, value: &str) -> Result<(), String> {

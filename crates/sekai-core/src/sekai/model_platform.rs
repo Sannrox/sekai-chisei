@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::object_sync::contains_secret_like_text;
+use crate::sekai::object_sync::identity_looks_secret;
 use crate::shomei;
 
 pub const MODEL_PLATFORM_CONTRACT: &str = "sekai.model-platform-certification/v1";
@@ -462,21 +462,7 @@ fn replay_existing(
 }
 
 fn reject_secret(value: &str) -> Result<(), String> {
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("token")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower.contains("bearer ")
-        || lower.contains("sk-")
-        || lower.contains("ghp_")
-        || lower.contains("gho_")
-        || lower.contains("ghu_")
-        || lower.contains("ghs_")
-        || lower.contains("ghr_")
-        || lower.contains("github_pat_")
-        || lower.contains("-----begin")
-        || contains_secret_like_text(value)
-    {
+    if identity_looks_secret(value) {
         return Err(MODEL_UNAVAILABLE.into());
     }
     Ok(())
@@ -505,6 +491,20 @@ fn required(label: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_ids_pass_and_credential_shapes_stay_refused() {
+        for id in ["task-1", "risk-ops", "password-policy-review"] {
+            assert_eq!(reject_secret(id), Ok(()), "{id}");
+        }
+        for secret in ["sk-proj-abc123", "AKIAIOSFODNN7EXAMPLE", "Bearer abc"] {
+            assert_eq!(
+                reject_secret(secret),
+                Err(MODEL_UNAVAILABLE.into()),
+                "{secret}"
+            );
+        }
+    }
 
     fn protocol(adapter: &str, certification_id: &str) -> ModelProtocolFixtures {
         let events = if adapter == PROFILE_RESPONSES {
