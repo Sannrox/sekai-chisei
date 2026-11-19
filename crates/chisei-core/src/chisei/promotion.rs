@@ -133,6 +133,36 @@ impl CandidateStore {
         Some(updated)
     }
 
+    /// Inserts `candidate` unless a `proposed` candidate matches `duplicate`,
+    /// and first marks each `proposed` candidate matching `stale` superseded.
+    /// One lock covers the check, the supersede, and the insert, so a
+    /// candidate the gate moved on meanwhile keeps its status and two
+    /// concurrent proposals for one key insert once (#2726). Returns whether
+    /// it inserted.
+    pub fn propose(
+        &self,
+        candidate: Candidate,
+        duplicate: impl Fn(&Candidate) -> bool,
+        stale: impl Fn(&Candidate) -> bool,
+    ) -> bool {
+        let mut candidates = self.candidates.lock().expect("candidate store poisoned");
+        let pending = |c: &&mut Candidate| c.status == STATUS_PROPOSED;
+        if candidates
+            .values_mut()
+            .filter(pending)
+            .any(|c| duplicate(c))
+        {
+            return false;
+        }
+        for c in candidates.values_mut().filter(pending) {
+            if stale(c) {
+                c.status = STATUS_SUPERSEDED.to_string();
+            }
+        }
+        candidates.insert(candidate.id.clone(), candidate);
+        true
+    }
+
     pub fn list(&self) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = self
             .candidates
@@ -255,45 +285,13 @@ pub fn propose_routing_bias_candidate(
         return None;
     };
 
-    // Pending proposals for this same (kind, namespace, task_class) key, regardless of bias.
-    let pending_same_key: Vec<Candidate> = store
-        .list_by_status(STATUS_PROPOSED)
-        .into_iter()
-        .filter(|c| {
-            c.kind == KIND_ROUTING_BIAS
-                && c.namespace == namespace
-                && c.task_class == normalized_class
-        })
-        .collect();
-
-    // Skip if an equivalent proposal (same bias) is already pending — otherwise a periodic caller
-    // (Phase D) would accrue one new candidate per tick for the same unchanged signal.
-    let already_proposed = pending_same_key.iter().any(|c| {
-        serde_json::from_str::<RoutingBiasPayload>(&c.payload)
-            .map(|p| p.bias == bias)
-            .unwrap_or(false)
-    });
-    if already_proposed {
-        return None;
-    }
-
-    // Any pending proposal for this key with a *different* bias is now stale (the signal moved):
-    // supersede it so a consumer scanning `STATUS_PROPOSED` never finds two contradictory pending
-    // proposals (e.g. a "cheap" bias still pending after the namespace regressed and this call
-    // proposes reverting to "capable").
-    for stale in pending_same_key {
-        let mut superseded = stale;
-        superseded.status = STATUS_SUPERSEDED.to_string();
-        store.upsert(superseded);
-    }
-
     let now = chrono::Utc::now().timestamp_millis();
     let seq = eval.next_sequence();
     let candidate = Candidate {
         id: format!("candidate-routing-{namespace}-{normalized_class}-{now}-{seq}"),
         kind: KIND_ROUTING_BIAS.to_string(),
         namespace: namespace.to_string(),
-        task_class: normalized_class,
+        task_class: normalized_class.clone(),
         payload: serde_json::to_string(&RoutingBiasPayload {
             bias: bias.to_string(),
         })
@@ -303,10 +301,26 @@ pub fn propose_routing_bias_candidate(
         source_ref: format!("chisei.scoring:{namespace}"),
         created: now,
     };
-    // Persist the replacement in the same call that superseded the stale one, so the two writes
-    // can't be split by a caller that drops the return value (error path, filtering, crash).
-    store.upsert(candidate.clone());
-    Some(candidate)
+    // A pending proposal for this same (kind, namespace, task_class) key.
+    let same_key = |c: &Candidate| {
+        c.kind == KIND_ROUTING_BIAS && c.namespace == namespace && c.task_class == normalized_class
+    };
+    let same_bias = |c: &Candidate| {
+        serde_json::from_str::<RoutingBiasPayload>(&c.payload).is_ok_and(|p| p.bias == bias)
+    };
+    // Skip if an equivalent proposal (same bias) is already pending, otherwise a periodic caller
+    // (Phase D) would accrue one new candidate per tick for the same unchanged signal. A pending
+    // proposal for this key with a *different* bias is stale (the signal moved): superseding it
+    // in the same store call means a consumer scanning `STATUS_PROPOSED` never finds two
+    // contradictory pending proposals, and the two writes can't be split by a caller that drops
+    // the return value.
+    store
+        .propose(
+            candidate.clone(),
+            |c| same_key(c) && same_bias(c),
+            |c| same_key(c) && !same_bias(c),
+        )
+        .then_some(candidate)
 }
 
 /// Turn `evolve::generate_templates`'s output into candidates. Namespace-scoped, not
@@ -320,17 +334,10 @@ pub fn propose_template_candidates(
     tasks: &[TaskRecord],
 ) -> Vec<Candidate> {
     let now = chrono::Utc::now().timestamp_millis();
-    let already_proposed = store.list_by_status(STATUS_PROPOSED);
     evolve::generate_templates(tasks)
         .into_iter()
         .filter_map(|template| {
             let payload = serde_json::to_string(&template).unwrap_or_default();
-            let duplicate = already_proposed.iter().any(|c| {
-                c.kind == KIND_TEMPLATE && c.namespace == template.namespace && c.payload == payload
-            });
-            if duplicate {
-                return None;
-            }
             let seq = eval.next_sequence();
             let candidate = Candidate {
                 id: format!("candidate-template-{}-{now}-{seq}", template.namespace),
@@ -350,11 +357,16 @@ pub fn propose_template_candidates(
                 source_ref: format!("evolve-templates-{}", template.namespace),
                 created: now,
             };
-            // Self-persisting, mirroring `propose_routing_bias_candidate`: a caller that forgets to
-            // upsert would otherwise also bypass the dedup guard above (which reads the store) on
-            // the next call, silently accruing duplicates.
-            store.upsert(candidate.clone());
-            Some(candidate)
+            // Self-persisting, mirroring `propose_routing_bias_candidate`: the store skips a
+            // template whose exact content is already pending for that namespace.
+            let duplicate = |c: &Candidate| {
+                c.kind == KIND_TEMPLATE
+                    && c.namespace == candidate.namespace
+                    && c.payload == candidate.payload
+            };
+            store
+                .propose(candidate.clone(), duplicate, |_| false)
+                .then_some(candidate)
         })
         .collect()
 }
@@ -634,6 +646,72 @@ mod tests {
         let candidate = propose_routing_bias_candidate(&store, &db, &eval, "acme", "BACKGROUND")
             .expect("normalization should match the stored class");
         assert_eq!(candidate.task_class, "background");
+    }
+
+    fn bias_candidate(id: &str, bias: &str) -> Candidate {
+        Candidate {
+            id: id.into(),
+            kind: KIND_ROUTING_BIAS.into(),
+            namespace: "acme".into(),
+            task_class: "triage".into(),
+            payload: serde_json::to_string(&RoutingBiasPayload { bias: bias.into() }).unwrap(),
+            rationale: String::new(),
+            status: STATUS_PROPOSED.into(),
+            source_ref: String::new(),
+            created: 1,
+        }
+    }
+
+    fn is_bias(bias: &'static str) -> impl Fn(&Candidate) -> bool {
+        move |c| c.payload.contains(bias)
+    }
+
+    #[test]
+    fn a_supersede_leaves_a_candidate_the_gate_already_passed() {
+        let store = CandidateStore::new();
+        store.upsert(bias_candidate("stale", "cheap"));
+        store.upsert(bias_candidate("still-pending", "cheap"));
+        // The gate moves one stale candidate on before the proposal lands.
+        store
+            .transition("stale", STATUS_PROPOSED, STATUS_GATE_PASSED)
+            .unwrap();
+        assert!(store.propose(
+            bias_candidate("new", "capable"),
+            is_bias("capable"),
+            is_bias("cheap")
+        ));
+        assert_eq!(store.get("stale").unwrap().status, STATUS_GATE_PASSED);
+        assert_eq!(
+            store.get("still-pending").unwrap().status,
+            STATUS_SUPERSEDED
+        );
+        assert_eq!(store.get("new").unwrap().status, STATUS_PROPOSED);
+    }
+
+    #[test]
+    fn concurrent_proposals_for_one_key_insert_once() {
+        let store = CandidateStore::new();
+        let inserted: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let store = &store;
+                    scope.spawn(move || {
+                        store.propose(
+                            bias_candidate(&format!("c{i}"), "cheap"),
+                            is_bias("cheap"),
+                            |_| false,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|inserted| *inserted)
+                .count()
+        });
+        assert_eq!(inserted, 1);
+        assert_eq!(store.list_by_status(STATUS_PROPOSED).len(), 1);
     }
 
     #[test]
