@@ -228,4 +228,67 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn sample_bundle() -> ReceiptChainBundle {
+        let keys = SigningKeySet::from_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            1,
+        )
+        .unwrap();
+        ReceiptChain::genesis("ns", keys, 10).unwrap().bundle()
+    }
+
+    #[test]
+    fn an_existing_output_is_left_intact_and_no_partial_file_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.json");
+        std::fs::write(&path, b"published").unwrap();
+        let error = write_bundle(&path, &sample_bundle()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("destination must not already exist"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"published");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["bundle.json"]);
+    }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn verify_requires_a_trusted_key() {
+        let error = parse_verify(&args(&["bundle.json"])).err().unwrap();
+        assert_eq!(error.to_string(), "verify requires --trusted-key <hex>");
+        let parsed = parse_verify(&args(&["bundle.json", "--trusted-key", "ab"])).unwrap();
+        assert_eq!(parsed.bundle, PathBuf::from("bundle.json"));
+        assert_eq!(parsed.trusted_keys, ["ab"]);
+    }
+
+    #[test]
+    fn export_refuses_unknown_flags_and_flags_without_values() {
+        let refused = |raw: &[&str]| parse_export(&args(raw)).err().unwrap().to_string();
+        assert_eq!(
+            refused(&["--namespace", "ns", "--output", "o.json", "--force"]),
+            "unknown flag --force"
+        );
+        assert_eq!(
+            refused(&["--namespace", "ns", "--output"]),
+            "--output requires a value"
+        );
+        assert_eq!(
+            refused(&["--namespace", "--output", "o.json"]),
+            "--namespace requires a value"
+        );
+        assert_eq!(refused(&["--namespace", "ns"]), usage());
+        let parsed = parse_export(&args(&["--namespace", "ns", "--output", "o.json"])).unwrap();
+        assert_eq!(parsed.namespace, "ns");
+        assert_eq!(parsed.output, PathBuf::from("o.json"));
+    }
 }
