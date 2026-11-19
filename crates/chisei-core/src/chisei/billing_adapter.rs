@@ -119,12 +119,19 @@ pub trait BillingAdapter: Send + Sync {
 }
 
 /// Deterministic fake for conformance tests (no provider SDK).
+///
+/// Subscription events apply in `occurred_at_ms` order per tenant: an event
+/// older than the last applied one is recorded as processed but changes
+/// nothing; ties apply in arrival order. Activation and replacement store
+/// the event's entitlement set; expiry and removal clear it.
 #[derive(Default)]
 pub struct FakeBillingAdapter {
     customers: RwLock<BTreeMap<String, ExternalCustomerRef>>,
     published_periods: RwLock<BTreeSet<String>>,
     events: RwLock<BTreeSet<String>>,
-    entitlement_by_tenant: RwLock<BTreeMap<String, EntitlementSet>>,
+    /// Per tenant: the last applied subscription event time and the
+    /// entitlement set it left (`None` after expiry or removal).
+    entitlement_by_tenant: RwLock<BTreeMap<String, (i64, Option<EntitlementSet>)>>,
     last_publish: RwLock<BTreeMap<String, ClosedUsagePeriod>>,
 }
 
@@ -142,7 +149,7 @@ impl FakeBillingAdapter {
             .read()
             .unwrap()
             .get(tenant_id)
-            .cloned()
+            .and_then(|(_, set)| set.clone())
     }
 
     pub fn was_published(&self, idempotency_key: &str) -> bool {
@@ -218,13 +225,24 @@ impl BillingAdapter for FakeBillingAdapter {
                 .find(|(_, c)| c == &customer)
                 .map(|(t, _)| t.clone());
             drop(customers);
+            let next = match event.kind {
+                BillingEventKind::SubscriptionActivated
+                | BillingEventKind::SubscriptionReplaced => event.entitlement_set.clone().map(Some),
+                BillingEventKind::SubscriptionExpired | BillingEventKind::SubscriptionRemoved => {
+                    Some(None)
+                }
+                _ => None,
+            };
             if let Some(tenant_id) = tenant_id
-                && let Some(set) = &event.entitlement_set
+                && let Some(next) = next
             {
-                self.entitlement_by_tenant
-                    .write()
-                    .unwrap()
-                    .insert(tenant_id, set.clone());
+                let mut entitlements = self.entitlement_by_tenant.write().unwrap();
+                let stale = entitlements
+                    .get(&tenant_id)
+                    .is_some_and(|(applied_at_ms, _)| event.occurred_at_ms < *applied_at_ms);
+                if !stale {
+                    entitlements.insert(tenant_id, (event.occurred_at_ms, next));
+                }
             }
         }
         Ok(())
@@ -263,24 +281,34 @@ impl BillingAdapter for FakeBillingAdapter {
     }
 }
 
-/// Verify a toy HMAC-like signature for fake webhooks (no real provider SDK).
+/// Verify a fake webhook signature: lowercase or uppercase hex of
+/// HMAC-SHA256(secret, body), compared in constant time. Malformed hex is
+/// refused.
 pub fn verify_fake_webhook_signature(secret: &str, body: &str, signature: &str) -> bool {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    hasher.update(body.as_bytes());
-    let expected: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    expected == signature
+    use hmac::{Hmac, Mac};
+    let Some(signature) = decode_hex(signature) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(body.as_bytes());
+    mac.verify_slice(&signature).is_ok()
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chisei::budget::PeriodType;
     use crate::chisei::entitlements::EntitlementSet;
     use crate::chisei::usage_ledger::UsageAggregate;
     use std::collections::BTreeSet;
@@ -353,8 +381,34 @@ mod tests {
         // Entitlement authority remains local; adapter only stores observed set.
     }
 
-    #[test]
-    fn reordered_events_do_not_widen_entitlement_without_replace() {
+    fn subscription_event(
+        id: &str,
+        kind: BillingEventKind,
+        occurred_at_ms: i64,
+        set_id: Option<&str>,
+    ) -> NormalizedBillingEvent {
+        NormalizedBillingEvent {
+            event_id: id.into(),
+            provider: "fake".into(),
+            kind,
+            occurred_at_ms,
+            external_customer: Some(ExternalCustomerRef {
+                provider: "fake".into(),
+                customer_id: "cus_a".into(),
+            }),
+            entitlement_set: set_id.map(|set_id| EntitlementSet {
+                version: 1,
+                set_id: set_id.into(),
+                features: BTreeSet::from(["core.chat".into()]),
+                quota_ceiling: None,
+                expires_at_ms: None,
+            }),
+            period_id: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn linked_adapter() -> FakeBillingAdapter {
         let adapter = FakeBillingAdapter::new();
         adapter
             .link_customer(
@@ -365,35 +419,72 @@ mod tests {
                 },
             )
             .unwrap();
-        let activate = NormalizedBillingEvent {
-            event_id: "e-activate".into(),
-            provider: "fake".into(),
-            kind: BillingEventKind::SubscriptionActivated,
-            occurred_at_ms: 10,
-            external_customer: Some(ExternalCustomerRef {
-                provider: "fake".into(),
-                customer_id: "cus_a".into(),
-            }),
-            entitlement_set: Some(EntitlementSet {
-                version: 1,
-                set_id: "basic".into(),
-                features: BTreeSet::from(["core.chat".into()]),
-                quota_ceiling: Some(crate::chisei::tenant_quota::TenantQuotaLimits {
-                    version: 1,
-                    max_requests_per_period: Some(10),
-                    max_tokens_per_period: Some(100),
-                    max_concurrency: Some(1),
-                    max_storage_bytes: Some(1000),
-                    period: PeriodType::Daily,
-                }),
-                expires_at_ms: None,
-            }),
-            period_id: None,
-            attributes: BTreeMap::new(),
-        };
-        // Delayed "premium" with lower event order applied after still replaces by arrival.
-        adapter.apply_normalized_event(&activate).unwrap();
+        adapter
+    }
+
+    #[test]
+    fn a_late_older_event_does_not_overwrite_a_newer_one() {
+        let adapter = linked_adapter();
+        adapter
+            .apply_normalized_event(&subscription_event(
+                "e-replace",
+                BillingEventKind::SubscriptionReplaced,
+                20,
+                Some("basic"),
+            ))
+            .unwrap();
+        // The older premium activation arrives late: processed, not applied.
+        adapter
+            .apply_normalized_event(&subscription_event(
+                "e-activate",
+                BillingEventKind::SubscriptionActivated,
+                10,
+                Some("premium"),
+            ))
+            .unwrap();
         assert_eq!(adapter.entitlement_for("tenant-a").unwrap().set_id, "basic");
+        // A late older expiry does not clear it either.
+        adapter
+            .apply_normalized_event(&subscription_event(
+                "e-old-expiry",
+                BillingEventKind::SubscriptionExpired,
+                15,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(adapter.entitlement_for("tenant-a").unwrap().set_id, "basic");
+    }
+
+    #[test]
+    fn expiry_and_removal_clear_the_entitlement() {
+        for kind in [
+            BillingEventKind::SubscriptionExpired,
+            BillingEventKind::SubscriptionRemoved,
+        ] {
+            let adapter = linked_adapter();
+            adapter
+                .apply_normalized_event(&subscription_event(
+                    "e-activate",
+                    BillingEventKind::SubscriptionActivated,
+                    10,
+                    Some("basic"),
+                ))
+                .unwrap();
+            adapter
+                .apply_normalized_event(&subscription_event("e-end", kind, 20, None))
+                .unwrap();
+            assert_eq!(adapter.entitlement_for("tenant-a"), None, "{kind:?}");
+            // An older activation cannot revive it.
+            adapter
+                .apply_normalized_event(&subscription_event(
+                    "e-late",
+                    BillingEventKind::SubscriptionActivated,
+                    15,
+                    Some("basic"),
+                ))
+                .unwrap();
+            assert_eq!(adapter.entitlement_for("tenant-a"), None, "{kind:?}");
+        }
     }
 
     #[test]
@@ -407,18 +498,40 @@ mod tests {
 
     #[test]
     fn webhook_signature_gate() {
+        use hmac::{Hmac, Mac};
         let body = r#"{"event_id":"e1"}"#;
         let secret = "test-secret";
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(secret.as_bytes());
-        hasher.update(body.as_bytes());
-        let sig: String = hasher
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        let sig: String = mac
             .finalize()
+            .into_bytes()
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
         assert!(verify_fake_webhook_signature(secret, body, &sig));
+        assert!(verify_fake_webhook_signature(
+            secret,
+            body,
+            &sig.to_uppercase()
+        ));
+        assert!(!verify_fake_webhook_signature(
+            secret,
+            r#"{"event_id":"e2"}"#,
+            &sig
+        ));
+        assert!(!verify_fake_webhook_signature("wrong-secret", body, &sig));
         assert!(!verify_fake_webhook_signature(secret, body, "deadbeef"));
+        assert!(!verify_fake_webhook_signature(secret, body, "zz"));
+        // A sign prefix is not hex, even where the radix parser would take it.
+        let signed = format!("+{}", &sig[1..]);
+        assert!(!verify_fake_webhook_signature(secret, body, &signed));
+        // The keyless digest the fake used to accept is refused.
+        use sha2::{Digest, Sha256};
+        let unkeyed: String = Sha256::digest(format!("{secret}{body}"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(!verify_fake_webhook_signature(secret, body, &unkeyed));
     }
 }
