@@ -191,10 +191,20 @@ fn a_second_combined_process_on_the_same_log_fails_closed() {
     let output = second.output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "second writer booted: {stderr}");
+    // Only the object log's lock contention counts: the boot message names
+    // the lock error and that a local log cannot be shared.
     assert!(
-        stderr.contains("log in use") || stderr.contains("HOST"),
-        "second writer must fail closed: {stderr}"
+        stderr.contains(mikura::LOG_IN_USE)
+            && stderr.contains("a second process cannot share a local log"),
+        "second writer must fail on the object log lock: {stderr}"
     );
+    // The refusal leaves the first writer serving.
+    assert!(
+        first.0.try_wait().unwrap().is_none(),
+        "first combined process exited after the refused second writer"
+    );
+    TcpStream::connect(("127.0.0.1", port))
+        .expect("first combined process stopped accepting connections");
     drop(first);
 }
 
