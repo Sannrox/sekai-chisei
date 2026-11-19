@@ -320,12 +320,15 @@ tight budgets, `mixed_persistence_reconciliation` (1.6x) and
 gateable workloads are exactly those whose budgets are loose.
 
 `.github/workflows/performance.yml` runs the matrix three times on a schedule
-and evaluates in **reporting** mode. It does not enforce: budgets and baseline
-describe Apple M2 Pro while CI runs `ubuntu-latest`, and enforcing
-hardware-specific absolute latencies on different hardware fails for reasons
-unrelated to any code change. Recording a baseline on the CI runner is the
-prerequisite for enforcement there, and the scheduled runs collect that data.
-`workflow_dispatch` accepts an `enforce` input for once it exists.
+and evaluates in **reporting** mode. Its baseline comparison uses
+`benchmarks/baseline-github-ubuntu-latest.json`, which describes the CI runner
+class, never `benchmarks/baseline-apple-m2-pro.json`: a median compared
+across hardware measures the machine, not the code. The runner-class file
+starts with empty `results`; `MissingFromBaseline` is not a regression. Check
+in three scheduled runner-class reports to give it a measured reference. The
+absolute budgets still describe Apple M2 Pro, so `workflow_dispatch` keeps
+`enforce` off by default. The Apple M2 Pro baseline stays for local runs on
+that hardware.
 
 ### Status against Issue #98
 
