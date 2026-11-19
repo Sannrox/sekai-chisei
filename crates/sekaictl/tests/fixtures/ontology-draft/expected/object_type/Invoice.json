@@ -1,0 +1,29 @@
+{
+  "key": [
+    "id"
+  ],
+  "lint_suppressions": [
+    {
+      "reason": "drafted from source discovery; not yet consumed",
+      "rule": "orphan_object_type"
+    }
+  ],
+  "name": "Invoice",
+  "properties": [
+    "id",
+    "account_id"
+  ],
+  "property_types": {
+    "account_id": "string",
+    "id": "string"
+  },
+  "required": [
+    "id",
+    "account_id"
+  ],
+  "source": {
+    "record_kind": "Invoice",
+    "schema_revision": "v1",
+    "source": "fake.crm"
+  }
+}

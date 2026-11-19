@@ -3097,6 +3097,7 @@ dependencies = [
  "sekai-obs",
  "sekai-ontology",
  "sekai-proto",
+ "sekai-source-sdk",
  "sekai-types",
  "serde",
  "serde_json",

@@ -356,8 +356,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok(())
             }
             Some(
-                "apply" | "export" | "import" | "seed" | "run" | "first-run" | "context" | "expand"
-                | "explain" | "lint",
+                "apply" | "export" | "import" | "draft" | "seed" | "run" | "first-run" | "context"
+                | "expand" | "explain" | "lint",
             ) => {
                 sekaictl::launch::load_local_env();
                 sekaictl::ontology_product_cli::run_ontology_product_command(

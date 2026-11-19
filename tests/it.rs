@@ -137,6 +137,7 @@ mod object_path_benchmark;
 mod object_security_backend_conformance;
 mod object_sync_backend_conformance;
 mod ollama_e2e;
+mod ontology_draft;
 mod ontology_export;
 mod ontology_import;
 mod open_table_backend_conformance;

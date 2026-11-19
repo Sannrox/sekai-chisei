@@ -315,6 +315,32 @@ refused, because their files would collide on a case-insensitive file system.
 The tree is written beside the target and renamed into place, so a failed export
 leaves nothing behind.
 
+## Draft a definition tree from a source discovery
+
+```sh
+sekaictl ontology draft --discovery <file> --out <dir> [--overwrite] [--namespace <ns>] [--target <url-or-socket>]
+```
+
+Writes a definition tree in the export layout from one
+`sekai.source-discovery/v1` JSON file. Draft never writes to the plane. Edit
+the files, then import them as a proposal.
+
+- one object type per record kind, keyed by the first key candidate, with a
+  property per column and the declared type
+- one link type per declared reference, and per inferred reference whose
+  present-row match is at least 8000 basis points; weaker candidates are listed
+  as dropped in the report
+- `draft-report.json`: every key choice, kept and dropped reference, and
+  value-shape finding
+- columns flagged `possibly_sensitive` take the namespace's most restrictive
+  marking (`--namespace` is required then; the only plane read is the lattice)
+- `--overwrite` rewrites only members listed in a previous
+  `draft-report.json`, plus `layout.json` and the report
+
+Record kind and column names are the discovery's own tokens. Import skips
+`draft-report.json` and `draft-decisions.json`. Each drafted object type
+carries an `orphan_object_type` suppression until something consumes it.
+
 ## Import a file tree as a proposal
 
 ```sh

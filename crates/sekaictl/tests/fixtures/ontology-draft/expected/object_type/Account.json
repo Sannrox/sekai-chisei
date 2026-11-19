@@ -1,0 +1,26 @@
+{
+  "key": [
+    "id"
+  ],
+  "lint_suppressions": [
+    {
+      "reason": "drafted from source discovery; not yet consumed",
+      "rule": "orphan_object_type"
+    }
+  ],
+  "name": "Account",
+  "properties": [
+    "id"
+  ],
+  "property_types": {
+    "id": "string"
+  },
+  "required": [
+    "id"
+  ],
+  "source": {
+    "record_kind": "Account",
+    "schema_revision": "v1",
+    "source": "fake.crm"
+  }
+}
