@@ -359,8 +359,11 @@ impl TableStore {
                     .iter()
                     .any(|column| column.name == name && !column.hidden)
         };
-        if change.is_empty() || !change.keys().all(|name| writable(name)) {
-            return Err("the change names a column that cannot be written".into());
+        if change.is_empty() {
+            return Err("the change names no column".into());
+        }
+        if let Some(name) = change.keys().find(|name| !writable(name)) {
+            return Err(format!("column {name:?} cannot be written"));
         }
         let key_column = snapshot.key_column.clone();
         let version_column = snapshot.version_column.clone();
