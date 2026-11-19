@@ -367,9 +367,11 @@ fn descriptor_has_unknown_dimension(descriptor: &EpistemicDescriptor) -> bool {
         || descriptor.confidence_basis.is_none()
 }
 
+/// A selector is compared as given when rules match, so a padded one would
+/// validate and then never match; it is refused instead.
 fn valid_selector_string(value: &str) -> bool {
-    let value = value.trim();
-    !value.is_empty()
+    value == value.trim()
+        && !value.is_empty()
         && value.len() <= MAX_CONTEXT_ADMISSION_SELECTOR_BYTES
         && !value.bytes().any(|byte| byte.is_ascii_control())
 }
@@ -443,8 +445,13 @@ impl PolicyResolver {
         }
     }
 
+    /// Every namespace-keyed map here trims its key, so route and context
+    /// admission policies resolve for the same namespace spelling.
     pub fn set_namespace_policy(&self, ns: &str, p: Policy) {
-        self.namespace_policies.lock().unwrap().insert(ns.into(), p);
+        self.namespace_policies
+            .lock()
+            .unwrap()
+            .insert(ns.trim().into(), p);
     }
 
     pub fn set_context_admission_policy(
@@ -554,7 +561,7 @@ impl PolicyResolver {
         self.namespace_policies
             .lock()
             .unwrap()
-            .get(namespace)
+            .get(namespace.trim())
             .cloned()
     }
 
@@ -562,7 +569,7 @@ impl PolicyResolver {
         let policies = self.namespace_policies.lock().unwrap();
         scopes.iter().find_map(|scope| {
             policies
-                .get(scope)
+                .get(scope.trim())
                 .cloned()
                 .map(|policy| (scope.clone(), policy))
         })
@@ -578,7 +585,7 @@ impl PolicyResolver {
         let preferred_model = if automatic { "" } else { preferred_model };
         // Then namespace
         let nss = self.namespace_policies.lock().unwrap();
-        if let Some(p) = nss.get(namespace) {
+        if let Some(p) = nss.get(namespace.trim()) {
             return self.apply_policy(p, preferred_runtime, preferred_model);
         }
         if automatic {
@@ -942,6 +949,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unknown.action, ContextAdmissionAction::HoldOut);
+    }
+
+    #[test]
+    fn padded_selectors_are_refused_and_padded_namespaces_resolve_both_policies() {
+        let rule =
+            |applicability: Option<&str>, confidence_basis: Option<&str>| ContextAdmissionPolicy {
+                contract_version: CONTEXT_ADMISSION_POLICY_VERSION.into(),
+                default_action: ContextAdmissionAction::Include,
+                unknown_action: ContextAdmissionAction::HoldOut,
+                rules: vec![ContextAdmissionRule {
+                    action: ContextAdmissionAction::HoldOut,
+                    origin_classes: vec![],
+                    evidence_statuses: vec![],
+                    lifecycle_statuses: vec![],
+                    applicability: applicability.map(Into::into),
+                    confidence_basis: confidence_basis.map(Into::into),
+                    min_confidence_bps: None,
+                    max_confidence_bps: None,
+                    operation_risk: None,
+                }],
+            };
+        assert!(rule(Some("general"), Some("measured")).validate().is_ok());
+        assert!(rule(Some(" general"), None).validate().is_err());
+        assert!(rule(None, Some("measured\t")).validate().is_err());
+
+        let resolver = PolicyResolver::new();
+        resolver.set_namespace_policy(
+            " prod ",
+            Policy {
+                allowed_runtimes: vec![],
+                allowed_models: vec!["claude".into()],
+                default_runtime: "anthropic".into(),
+                default_model: "claude".into(),
+                data_class: String::new(),
+            },
+        );
+        resolver
+            .set_context_admission_policy("prod", rule(None, None))
+            .unwrap();
+        for namespace in ["prod", " prod", "prod\n"] {
+            assert_eq!(
+                resolver.resolve(namespace, "", "").unwrap(),
+                ("anthropic".to_string(), "claude".to_string()),
+                "{namespace:?}"
+            );
+            assert!(resolver.effective_policy(namespace).is_some());
+            assert!(
+                resolver
+                    .context_admission_policy(namespace)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[test]
