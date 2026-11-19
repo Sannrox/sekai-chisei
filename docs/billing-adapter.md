@@ -19,7 +19,15 @@ Version: `chisei.billing-adapter/v1`.
 
 `FakeBillingAdapter` covers retries (duplicate publish), duplicate events,
 customer link refusal, and reconciliation without any provider SDK or secrets
-in normal tests. Signature verification is demonstrated with a toy HMAC.
+in normal tests.
+
+Subscription events apply per tenant in `occurred_at_ms` order. An event older
+than the last applied one is recorded as processed but changes nothing; ties
+apply in arrival order. Activation and replacement store the event's
+entitlement set; expiry and removal clear it.
+
+`verify_fake_webhook_signature` checks a hex HMAC-SHA256 of the body under the
+shared secret and compares it in constant time.
 
 ## Non-goals
 
