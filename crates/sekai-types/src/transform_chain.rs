@@ -150,6 +150,22 @@ impl TransformChain {
         self.steps.iter().find(|step| step.name == name)
     }
 
+    /// Steps no edge feeds: the chain's inputs, in name order.
+    pub fn root_steps(&self) -> Vec<&ChainStep> {
+        self.steps_by_name(|step| self.edges.iter().all(|edge| edge.to_step != step.name))
+    }
+
+    /// Steps that feed no edge: the chain's outputs, in name order.
+    pub fn sink_steps(&self) -> Vec<&ChainStep> {
+        self.steps_by_name(|step| self.edges.iter().all(|edge| edge.from_step != step.name))
+    }
+
+    fn steps_by_name(&self, keep: impl Fn(&ChainStep) -> bool) -> Vec<&ChainStep> {
+        let mut steps: Vec<&ChainStep> = self.steps.iter().filter(|step| keep(step)).collect();
+        steps.sort_by(|left, right| left.name.cmp(&right.name));
+        steps
+    }
+
     pub fn topo_order(&self) -> Vec<&ChainStep> {
         let mut remaining: BTreeMap<&str, u32> = self
             .steps
@@ -460,6 +476,33 @@ fn resolve_named_input(
     }
 }
 
+/// Domain tag for a chain receipt digest that covers several endpoint steps.
+const CHAIN_ENDPOINTS_DIGEST: &str = "sekai.transform-chain.endpoints/v1";
+
+/// The chain receipt's input or output digest from `(step name, step digest)`
+/// pairs for its root or sink steps. One endpoint keeps that step's digest
+/// unchanged, so a single-root or single-sink chain's receipt is as before.
+/// Several are hashed in step-name order with each name and digest
+/// length-prefixed, so no endpoint is left out and the order is stable.
+pub fn chain_endpoint_digest(endpoints: &[(&str, &str)]) -> String {
+    if let [(_, digest)] = endpoints {
+        return (*digest).to_string();
+    }
+    if endpoints.is_empty() {
+        return String::new();
+    }
+    let mut sorted = endpoints.to_vec();
+    sorted.sort_unstable();
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, CHAIN_ENDPOINTS_DIGEST);
+    hasher.update((sorted.len() as u64).to_le_bytes());
+    for (step, digest) in sorted {
+        hash_field(&mut hasher, step);
+        hash_field(&mut hasher, digest);
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn chain_has_cycle(chain: &TransformChain) -> bool {
     chain.topo_order().len() != chain.steps.len()
 }
@@ -545,6 +588,56 @@ mod tests {
         }
         .prepare()
         .unwrap()
+    }
+
+    fn names(steps: Vec<&ChainStep>) -> Vec<&str> {
+        steps.into_iter().map(|step| step.name.as_str()).collect()
+    }
+
+    #[test]
+    fn root_and_sink_steps_name_every_endpoint() {
+        let line = chain();
+        assert_eq!(names(line.root_steps()), vec!["a"]);
+        assert_eq!(names(line.sink_steps()), vec!["c"]);
+
+        // b and a both feed c, and a also feeds d: two roots, two sinks.
+        let mut fan = line.clone();
+        fan.steps.push(ChainStep {
+            name: "d".into(),
+            ..fan.steps[0].clone()
+        });
+        fan.edges = vec![("a", "c"), ("b", "c"), ("a", "d")]
+            .into_iter()
+            .map(|(from, to)| ChainEdge {
+                from_step: from.into(),
+                output: "out".into(),
+                to_step: to.into(),
+                input: "in".into(),
+            })
+            .collect();
+        assert_eq!(names(fan.root_steps()), vec!["a", "b"]);
+        assert_eq!(names(fan.sink_steps()), vec!["c", "d"]);
+    }
+
+    #[test]
+    fn endpoint_digest_keeps_one_endpoint_and_binds_several() {
+        assert_eq!(chain_endpoint_digest(&[]), "");
+        assert_eq!(chain_endpoint_digest(&[("a", "sha256:1")]), "sha256:1");
+
+        let both = chain_endpoint_digest(&[("a", "sha256:1"), ("b", "sha256:2")]);
+        assert!(both.starts_with("sha256:"));
+        assert_eq!(
+            both,
+            chain_endpoint_digest(&[("b", "sha256:2"), ("a", "sha256:1")]),
+            "endpoint order does not change the digest"
+        );
+        for changed in [
+            [("a", "sha256:1"), ("b", "sha256:3")],
+            [("a", "sha256:1"), ("c", "sha256:2")],
+            [("a", "sha256:2"), ("b", "sha256:1")],
+        ] {
+            assert_ne!(both, chain_endpoint_digest(&changed), "{changed:?}");
+        }
     }
 
     #[test]

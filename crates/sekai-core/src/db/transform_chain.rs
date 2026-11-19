@@ -13,8 +13,8 @@ use crate::sekai::governed_transform::{
 };
 use crate::sekai::transform_chain::{
     CHAIN_WORK_CANCELLED, CHAIN_WORK_COMPLETED, CHAIN_WORK_FAILED, CHAIN_WORK_RUNNING, ChainStep,
-    TransformChain, TransformChainRun, chain_receipt, chain_run_identity, compile_named_edges,
-    evaluate_assertions,
+    TransformChain, TransformChainRun, chain_endpoint_digest, chain_receipt, chain_run_identity,
+    compile_named_edges, evaluate_assertions,
 };
 
 pub(crate) trait ChainStore {
@@ -567,24 +567,42 @@ fn endpoint_digests<S: ChainStore>(
     chain: &TransformChain,
     run: &TransformChainRun,
 ) -> Result<(String, String), String> {
-    let order = chain.topo_order();
-    let first = order.first().and_then(|step| run.step_run_id(&step.name));
-    let last = order.last().and_then(|step| run.step_run_id(&step.name));
-    let input = match first {
-        Some(run_id) if !run_id.is_empty() => store
-            .get_transform_run(run_id)?
+    // Every root step's input and every sink step's output, not only the
+    // first and last in topological order (#2881).
+    let mut inputs = Vec::new();
+    for step in chain.root_steps() {
+        let digest = step_transform_run(store, run, &step.name)?
             .map(|run| run.input_digest)
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
-    let output = match last {
-        Some(run_id) if !run_id.is_empty() => store
-            .get_transform_run(run_id)?
+            .unwrap_or_default();
+        inputs.push((step.name.as_str(), digest));
+    }
+    let mut outputs = Vec::new();
+    for step in chain.sink_steps() {
+        let digest = step_transform_run(store, run, &step.name)?
             .map(|run| run.output_digest)
-            .unwrap_or_default(),
-        _ => String::new(),
+            .unwrap_or_default();
+        outputs.push((step.name.as_str(), digest));
+    }
+    let pairs = |endpoints: &[(&str, String)]| {
+        let pairs: Vec<(&str, &str)> = endpoints
+            .iter()
+            .map(|(step, digest)| (*step, digest.as_str()))
+            .collect();
+        chain_endpoint_digest(&pairs)
     };
-    Ok((input, output))
+    Ok((pairs(&inputs), pairs(&outputs)))
+}
+
+/// The step's recorded transform run, if it ran.
+fn step_transform_run<S: ChainStore>(
+    store: &S,
+    run: &TransformChainRun,
+    step: &str,
+) -> Result<Option<TransformRun>, String> {
+    match run.step_run_id(step) {
+        Some(run_id) if !run_id.is_empty() => store.get_transform_run(run_id),
+        _ => Ok(None),
+    }
 }
 
 fn upstream_complete(chain: &TransformChain, run: &TransformChainRun, step: &ChainStep) -> bool {
@@ -1260,6 +1278,55 @@ mod tests {
             now_ms + 10,
         )
         .unwrap()
+    }
+
+    /// Two independent steps are both roots and both sinks; the chain run's
+    /// digests cover each of them, not only the first and last (#2881).
+    #[test]
+    fn several_root_and_sink_steps_all_enter_the_chain_digests() {
+        let db = db();
+        for id in ["in", "in2", "mid1", "mid2"] {
+            db.create_dataset(&dataset(id)).unwrap();
+        }
+        for input in ["in", "in2"] {
+            db.append_rows(
+                input,
+                &[HashMap::from([
+                    ("id".into(), input.into()),
+                    ("keep".into(), "yes".into()),
+                ])],
+            )
+            .unwrap();
+        }
+        db.put_governed_transform(&projection("t1", "in", "mid1"), 10)
+            .unwrap();
+        db.put_governed_transform(&projection("t2", "in2", "mid2"), 11)
+            .unwrap();
+        let mut chain = three_step_chain();
+        chain.steps.truncate(2);
+        chain.steps[0].assertions.clear();
+        chain.edges.clear();
+        let chain = db.put_transform_chain(&chain, 20).unwrap();
+        assert_eq!(chain.root_steps().len(), 2);
+        assert_eq!(chain.sink_steps().len(), 2);
+
+        let (run, _) = db.run_transform_chain("ops", "pipe", "k1", "", 30).unwrap();
+        assert_eq!(run.status, CHAIN_WORK_COMPLETED);
+        let step = |name: &str| {
+            db.get_transform_run(run.step_run_id(name).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let (a, b) = (step("a"), step("b"));
+        assert_ne!(a.input_digest, b.input_digest);
+        assert_eq!(
+            run.input_digest,
+            chain_endpoint_digest(&[("a", &a.input_digest), ("b", &b.input_digest)])
+        );
+        assert_eq!(
+            run.output_digest,
+            chain_endpoint_digest(&[("a", &a.output_digest), ("b", &b.output_digest)])
+        );
     }
 
     #[test]
