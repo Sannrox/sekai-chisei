@@ -49,37 +49,48 @@ pub fn normalize_identity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Submit decisions read per page while correlating objects to operations.
+const SUBMIT_PAGE: i32 = 512;
+
 /// Plane-stamped operation identities for objects mutated by governed actions.
+///
+/// Pages through submit decisions newest first and stops once every requested
+/// object has an identity or the ledger runs out. A decision inserted while
+/// paging shifts older rows to a later page, which can only repeat a row,
+/// never skip one.
 pub fn operation_ids_for_objects(
     db: &RuntimeDb,
     object_ids: &BTreeSet<String>,
 ) -> Result<HashMap<String, String>, String> {
     let mut found = HashMap::new();
-    if object_ids.is_empty() {
-        return Ok(found);
-    }
-    let decisions = db.list_decisions(&DecisionFilter {
-        action: Some(ACTION_SUBMIT.into()),
-        limit: 512,
-        ..DecisionFilter::default()
-    })?;
-    for decision in decisions {
-        if found.len() == object_ids.len() {
+    let mut offset = 0;
+    while found.len() < object_ids.len() {
+        let decisions = db.list_decisions(&DecisionFilter {
+            action: Some(ACTION_SUBMIT.into()),
+            limit: SUBMIT_PAGE,
+            offset,
+            ..DecisionFilter::default()
+        })?;
+        let page_len = decisions.len();
+        for decision in decisions {
+            let Some(object_id) = decision.evidence.get("object_id") else {
+                continue;
+            };
+            if !object_ids.contains(object_id) || found.contains_key(object_id) {
+                continue;
+            }
+            let Some(operation_id) = decision.evidence.get("operation_id") else {
+                continue;
+            };
+            if operation_id.trim().is_empty() {
+                continue;
+            }
+            found.insert(object_id.clone(), operation_id.clone());
+        }
+        if page_len < SUBMIT_PAGE as usize {
             break;
         }
-        let Some(object_id) = decision.evidence.get("object_id") else {
-            continue;
-        };
-        if !object_ids.contains(object_id) || found.contains_key(object_id) {
-            continue;
-        }
-        let Some(operation_id) = decision.evidence.get("operation_id") else {
-            continue;
-        };
-        if operation_id.trim().is_empty() {
-            continue;
-        }
-        found.insert(object_id.clone(), operation_id.clone());
+        offset = offset.saturating_add(SUBMIT_PAGE);
     }
     Ok(found)
 }
@@ -113,6 +124,40 @@ impl OperationCarriers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_submit(db: &RuntimeDb, seq: usize, object_id: &str, operation_id: &str) {
+        db.record_decision(&crate::sekai::audit::Decision {
+            id: format!("decision-{seq}"),
+            timestamp: 1_000 + seq as i64,
+            actor: "agent".into(),
+            action: ACTION_SUBMIT.into(),
+            reason: String::new(),
+            evidence: HashMap::from([
+                ("object_id".to_string(), object_id.to_string()),
+                ("operation_id".to_string(), operation_id.to_string()),
+            ]),
+            target_id: String::new(),
+            outcome: "allowed".into(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn operation_ids_reach_submits_older_than_one_page() {
+        let db = RuntimeDb::memory();
+        record_submit(&db, 0, "old-object", "op-old");
+        for seq in 1..=(SUBMIT_PAGE as usize + 10) {
+            record_submit(&db, seq, &format!("noise-{seq}"), &format!("op-{seq}"));
+        }
+        let wanted = BTreeSet::from(["old-object".to_string(), "never-submitted".to_string()]);
+
+        let found = operation_ids_for_objects(&db, &wanted).unwrap();
+
+        assert_eq!(
+            found,
+            HashMap::from([("old-object".to_string(), "op-old".to_string())])
+        );
+    }
 
     #[test]
     fn header_fills_empty_request_id() {
