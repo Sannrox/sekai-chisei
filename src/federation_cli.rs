@@ -1383,3 +1383,151 @@ mod reserved_output_tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// `base` with the `flag` and its value removed.
+    fn without<'a>(base: &[&'a str], flag: &str) -> Vec<&'a str> {
+        let at = base.iter().position(|arg| *arg == flag).unwrap();
+        [&base[..at], &base[at + 2..]].concat()
+    }
+
+    const PIN: &[&str] = &[
+        "--site-identity",
+        "site-b",
+        "--key-id",
+        "key-1",
+        "--public-key-hex",
+        "abcd",
+    ];
+
+    #[test]
+    fn pin_trust_root_defaults_the_namespace_and_refuses_bad_input() {
+        let parsed = parse_pin_trust_root(&args(PIN)).unwrap();
+        assert_eq!(parsed.namespace, TRUST_ROOT_NAMESPACE);
+        assert_eq!(parsed.site_identity, "site-b");
+        assert_eq!(parsed.actor, "operator");
+        let parsed =
+            parse_pin_trust_root(&args(&[PIN, &["--namespace", "trust"]].concat())).unwrap();
+        assert_eq!(parsed.namespace, "trust");
+
+        for flag in ["--site-identity", "--key-id", "--public-key-hex"] {
+            assert_eq!(
+                parse_pin_trust_root(&args(&without(PIN, flag))).unwrap_err(),
+                format!("{flag} is required")
+            );
+        }
+        assert_eq!(
+            parse_pin_trust_root(&args(&[PIN, &["--force"]].concat())).unwrap_err(),
+            "unknown pin-trust-root option --force"
+        );
+        // A flag never takes the next flag as its value.
+        assert_eq!(
+            parse_pin_trust_root(&args(&["--namespace", "--site-identity", "site-b"])).unwrap_err(),
+            "--namespace requires a value"
+        );
+    }
+
+    const JOIN: &[&str] = &[
+        "--peer-site-id",
+        "site-b",
+        "--peer-key-id",
+        "key-1",
+        "--peer-public-key-hex",
+        "abcd",
+        "--pack-id",
+        "pack",
+        "--pack-version",
+        "1",
+        "--pack-digest",
+        "sha256:pack",
+    ];
+
+    #[test]
+    fn join_defaults_the_trust_namespace_and_refuses_bad_input() {
+        let parsed = parse_join(&args(JOIN)).unwrap();
+        assert_eq!(parsed.trust_namespace, TRUST_ROOT_NAMESPACE);
+        assert_eq!(parsed.actor, "operator");
+        assert_eq!(parsed.region, None);
+        assert!(parsed.data_classes.is_empty());
+        let parsed = parse_join(&args(
+            &[
+                JOIN,
+                &[
+                    "--trust-namespace",
+                    "trust",
+                    "--data-class",
+                    "pii",
+                    "--data-class",
+                    "logs",
+                ],
+            ]
+            .concat(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.trust_namespace, "trust");
+        assert_eq!(parsed.data_classes, ["pii", "logs"]);
+
+        for flag in [
+            "--peer-site-id",
+            "--peer-key-id",
+            "--peer-public-key-hex",
+            "--pack-id",
+            "--pack-version",
+            "--pack-digest",
+        ] {
+            assert_eq!(
+                parse_join(&args(&without(JOIN, flag))).unwrap_err(),
+                format!("{flag} is required")
+            );
+        }
+        assert_eq!(
+            parse_join(&args(&[JOIN, &["--namespace", "x"]].concat())).unwrap_err(),
+            "unknown join option --namespace"
+        );
+        assert_eq!(
+            parse_join(&args(&[JOIN, &["--trust-namespace"]].concat())).unwrap_err(),
+            "--trust-namespace requires a value"
+        );
+    }
+
+    const PACK_PIN: &[&str] = &[
+        "--peer-site-id",
+        "site-b",
+        "--pack-id",
+        "pack",
+        "--pack-version",
+        "2",
+        "--pack-digest",
+        "sha256:pack",
+    ];
+
+    // set-pack-pin takes no namespace or actor, so there is no default to pin.
+    #[test]
+    fn set_pack_pin_requires_every_flag_and_refuses_unknown_options() {
+        let parsed = parse_set_pack_pin(&args(PACK_PIN)).unwrap();
+        assert_eq!(parsed.peer_site_id, "site-b");
+        assert_eq!(parsed.pack.version, "2");
+        for flag in [
+            "--peer-site-id",
+            "--pack-id",
+            "--pack-version",
+            "--pack-digest",
+        ] {
+            assert_eq!(
+                parse_set_pack_pin(&args(&without(PACK_PIN, flag))).unwrap_err(),
+                format!("{flag} is required")
+            );
+        }
+        assert_eq!(
+            parse_set_pack_pin(&args(&[PACK_PIN, &["--actor", "x"]].concat())).unwrap_err(),
+            "unknown set-pack-pin option --actor"
+        );
+    }
+}
