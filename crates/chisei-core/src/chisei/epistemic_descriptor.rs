@@ -263,52 +263,44 @@ impl EpistemicDescriptor {
         } else {
             EvidenceStatus::Supported
         };
+        let memory_status = match memory.state.as_str() {
+            "active" => LifecycleStatus::Current,
+            "superseded" => LifecycleStatus::Superseded,
+            "rejected" => LifecycleStatus::Retracted,
+            // Candidate is not an admitted planning reference. Keep this
+            // branch conservative if a future caller projects one anyway.
+            _ => LifecycleStatus::Unknown,
+        };
         let lifecycle_status = if has_authoritative_basis {
             // A reassessment snapshot can invalidate an otherwise active
-            // memory. Preserve the strongest inactive state so context policy
-            // cannot admit a projection backed only by stale or retracted
+            // memory, and an inactive memory stays inactive whatever its
+            // basis says. Both are computed and the stronger wins, so context
+            // policy never admits a projection backed by stale or retracted
             // evidence. Mixed available/inactive bases remain conservative.
-            if memory
-                .evidence_basis
-                .iter()
-                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Retracted)
-            {
+            let basis_has = |state| {
+                memory
+                    .evidence_basis
+                    .iter()
+                    .any(|basis| basis.lifecycle_state == state)
+            };
+            let basis_status = if basis_has(EvidenceLifecycleState::Retracted) {
                 LifecycleStatus::Retracted
-            } else if memory
-                .evidence_basis
-                .iter()
-                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Stale)
-            {
+            } else if basis_has(EvidenceLifecycleState::Stale) {
                 LifecycleStatus::Stale
-            } else if memory
-                .evidence_basis
-                .iter()
-                .any(|basis| basis.lifecycle_state == EvidenceLifecycleState::Superseded)
-            {
+            } else if basis_has(EvidenceLifecycleState::Superseded) {
                 LifecycleStatus::Superseded
             } else if memory
                 .evidence_basis
                 .iter()
                 .all(|basis| basis.lifecycle_state == EvidenceLifecycleState::Available)
             {
-                match memory.state.as_str() {
-                    "active" => LifecycleStatus::Current,
-                    "superseded" => LifecycleStatus::Superseded,
-                    "rejected" => LifecycleStatus::Retracted,
-                    _ => LifecycleStatus::Unknown,
-                }
+                LifecycleStatus::Current
             } else {
                 LifecycleStatus::Unknown
-            }
+            };
+            stronger_lifecycle(memory_status, basis_status)
         } else {
-            match memory.state.as_str() {
-                "active" => LifecycleStatus::Current,
-                "superseded" => LifecycleStatus::Superseded,
-                "rejected" => LifecycleStatus::Retracted,
-                // Candidate is not an admitted planning reference. Keep this
-                // branch conservative if a future caller projects one anyway.
-                _ => LifecycleStatus::Unknown,
-            }
+            memory_status
         };
         let origin_class = match memory.derivation_method.as_str() {
             // This is the only derivation contract currently authoritative in
@@ -512,6 +504,24 @@ impl EpistemicDescriptor {
     }
 }
 
+/// The stronger of two lifecycle states in the order Retracted, Stale,
+/// Superseded, Unknown, Current. Unknown outranks Current so an unknown side
+/// never projects as admissible.
+fn stronger_lifecycle(left: LifecycleStatus, right: LifecycleStatus) -> LifecycleStatus {
+    let rank = |status| match status {
+        LifecycleStatus::Retracted => 4,
+        LifecycleStatus::Stale => 3,
+        LifecycleStatus::Superseded => 2,
+        LifecycleStatus::Unknown => 1,
+        LifecycleStatus::Current => 0,
+    };
+    if rank(left) >= rank(right) {
+        left
+    } else {
+        right
+    }
+}
+
 fn bounded_optional_string(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()
@@ -703,12 +713,32 @@ mod tests {
         let stale_descriptor = EpistemicDescriptor::from_kioku(&stale_memory, &[]);
         assert_eq!(stale_descriptor.lifecycle_status, LifecycleStatus::Stale);
 
-        let mut retracted_memory = memory;
+        let mut retracted_memory = memory.clone();
         retracted_memory.evidence_basis[0].lifecycle_state = EvidenceLifecycleState::Retracted;
         let retracted_descriptor = EpistemicDescriptor::from_kioku(&retracted_memory, &[]);
         assert_eq!(
             retracted_descriptor.lifecycle_status,
             LifecycleStatus::Retracted
+        );
+
+        // The memory's own inactive state outranks a weaker basis state.
+        let mut rejected_stale = stale_memory.clone();
+        rejected_stale.state = MemoryLifecycleState::Rejected;
+        assert_eq!(
+            EpistemicDescriptor::from_kioku(&rejected_stale, &[]).lifecycle_status,
+            LifecycleStatus::Retracted
+        );
+        let mut superseded_stale = stale_memory;
+        superseded_stale.state = MemoryLifecycleState::Superseded;
+        assert_eq!(
+            EpistemicDescriptor::from_kioku(&superseded_stale, &[]).lifecycle_status,
+            LifecycleStatus::Stale
+        );
+        let mut superseded_available = memory;
+        superseded_available.state = MemoryLifecycleState::Superseded;
+        assert_eq!(
+            EpistemicDescriptor::from_kioku(&superseded_available, &[]).lifecycle_status,
+            LifecycleStatus::Superseded
         );
     }
 
