@@ -420,6 +420,11 @@ fn run_setup(arguments: &Arguments) -> Result<ExitCode, Error> {
                 .into(),
         ));
     }
+    if arguments.no_skill && (arguments.skill_path.is_some() || arguments.force) {
+        return Err(Error::Input(
+            "--path and --force install the skill; omit --no-skill".into(),
+        ));
+    }
     let cwd = env::current_dir()
         .map_err(|error| Error::Input(format!("cannot resolve the current directory: {error}")))?;
     let root_operand = arguments.operands.first().map(PathBuf::from);
@@ -564,7 +569,7 @@ fn resolve_setup_skill_directory(arguments: &Arguments) -> Result<Option<PathBuf
     arguments
         .skill_path
         .clone()
-        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
+        .or_else(skill_path_from_env)
         .or_else(default_skill_path)
         .map(Some)
         .ok_or_else(|| {
@@ -1065,7 +1070,7 @@ fn run_skill(arguments: &Arguments) -> Result<ExitCode, Error> {
     let directory = arguments
         .skill_path
         .clone()
-        .or_else(|| env::var_os("SEKAI_SKILL_PATH").map(PathBuf::from))
+        .or_else(skill_path_from_env)
         .or_else(default_skill_path);
     match verb {
         "path" => {
@@ -1098,6 +1103,14 @@ fn run_skill(arguments: &Arguments) -> Result<ExitCode, Error> {
             "usage: sekai skill <path|install> [--path <dir>] [--force|--uninstall]".into(),
         )),
     }
+}
+
+/// `SEKAI_SKILL_PATH`, with an empty value treated as unset so it never
+/// resolves to the current directory.
+fn skill_path_from_env() -> Option<PathBuf> {
+    env::var_os("SEKAI_SKILL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn default_skill_path() -> Option<PathBuf> {

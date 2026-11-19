@@ -1460,6 +1460,57 @@ fn setup_that_cannot_resolve_the_skill_directory_changes_nothing() {
 }
 
 #[test]
+fn setup_refuses_skill_flags_under_no_skill_before_touching_the_database() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+    for flags in [&["--path", "skill"][..], &["--force"][..]] {
+        let mut arguments = vec!["setup", "--no-skill"];
+        arguments.extend_from_slice(flags);
+        let output = sekai_isolated(&home, &project, &arguments);
+        assert_eq!(output.status.code(), Some(2), "{flags:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("omit --no-skill"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!project.join(".sekai").exists(), "{flags:?}");
+    }
+}
+
+#[test]
+fn empty_skill_path_variable_resolves_the_default_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let project = temporary.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+    let default = home.join(".agents/skills/sekai-ontology/SKILL.md");
+    for arguments in [&["skill", "install"][..], &["setup", "--no-index"][..]] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sekai"));
+        command
+            .args(arguments)
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env_remove("SEKAI_DB")
+            .env("SEKAI_SKILL_PATH", "");
+        #[cfg(not(target_os = "macos"))]
+        command.env("XDG_DATA_HOME", home.join("share"));
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(default.is_file(), "{arguments:?}");
+        assert!(!project.join("SKILL.md").exists(), "{arguments:?}");
+        fs::remove_file(&default).unwrap();
+    }
+}
+
+#[test]
 fn setup_rejects_index_flags_without_indexing_and_keeps_json_stdout_clean() {
     let temporary = tempfile::tempdir().unwrap();
     let home = temporary.path().join("home");
