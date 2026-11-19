@@ -17,7 +17,7 @@ use crate::sekai::namespace_access::{
 };
 use crate::sekai::object_sync::{
     OperationOutcome, SourceBatch, SourceBatchResult, SourceBatchStatus, SourceRecordResult,
-    SourceSyncState, SyncDecision, contains_secret_like_text,
+    SourceSyncState, SyncDecision, identity_looks_secret,
 };
 
 pub const INSPECT_CONTRACT: &str = "sekai.source-quarantine-inspect/v1";
@@ -733,17 +733,6 @@ fn identity_digest(namespace: &str, source_instance: &str, type_digest: &str) ->
     hasher.update(b"\n");
     hasher.update(type_digest.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn identity_looks_secret(value: &str) -> bool {
-    if contains_secret_like_text(value) {
-        return true;
-    }
-    let lower = value.to_ascii_lowercase();
-    ["sk-", "glpat-", "xoxb-", "xoxp-", "bearer ", "akia", "asia"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
-        || (lower.starts_with("eyj") && lower.matches('.').count() == 2)
 }
 
 fn required(label: &str, value: &str) -> Result<(), String> {
