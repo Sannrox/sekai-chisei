@@ -34276,6 +34276,96 @@ async fn ontology_health_drops_with_a_stale_dataset_and_a_broken_contract_and_re
 }
 
 #[tokio::test]
+async fn ontology_health_scores_each_namespace_alike_alone_or_together() {
+    let svc = service();
+    let db = svc.db.runtime();
+    for namespace in ["health-a", "health-b"] {
+        seed_definition_parent(&svc, namespace);
+        grant_source_namespace(&svc, namespace, "root", security::Role::Admin);
+        db.create_object(&domain::Object {
+            id: format!("{namespace}-object"),
+            kind: "Ticket".into(),
+            name: namespace.into(),
+            namespace: namespace.into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.create_dataset(&dataset::Dataset {
+            id: format!("{namespace}-orders"),
+            name: "orders".into(),
+            columns: vec![dataset::ColumnDef {
+                name: "total".into(),
+                col_type: "string".into(),
+                classification: "public".into(),
+            }],
+            object_id: format!("{namespace}-object"),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.put_dataset_health_check(&crate::sekai::dataset_health::DatasetHealthCheck {
+            dataset_id: format!("{namespace}-orders"),
+            check_id: "fresh".into(),
+            kind: "freshness".into(),
+            max_age_ms: i64::MAX / 2,
+            min_rows: 0,
+            max_rows: 0,
+            columns: Vec::new(),
+            predicate: Vec::new(),
+            blocking: false,
+            every_ms: 1_000,
+            tenant: String::new(),
+            space: String::new(),
+            last_run_ms: 0,
+        })
+        .unwrap();
+    }
+    // Only `health-a` misses its schedule, so only its dataset is stale.
+    db.append_rows(
+        "health-a-orders",
+        &[HashMap::from([("total".to_string(), "9".to_string())])],
+    )
+    .unwrap();
+    for now_ms in [5_000, 7_000] {
+        db.run_dataset_health_checks("health-a-orders", now_ms)
+            .unwrap();
+    }
+    let health = |namespace: &str| {
+        svc.get_ontology_health(with_named_principal(
+            GetOntologyHealthRequest {
+                namespace: namespace.into(),
+            },
+            "root",
+        ))
+    };
+    let freshness = |namespace: &NamespaceHealth| {
+        namespace
+            .parts
+            .iter()
+            .find(|part| part.part == "freshness")
+            .unwrap()
+            .score
+    };
+
+    let together = health("").await.unwrap().into_inner();
+    let names: Vec<&str> = together
+        .namespaces
+        .iter()
+        .map(|namespace| namespace.namespace.as_str())
+        .collect();
+    assert_eq!(names, ["health-a", "health-b"]);
+    for scored in &together.namespaces {
+        let alone = health(&scored.namespace).await.unwrap().into_inner();
+        assert_eq!(alone.namespaces, std::slice::from_ref(scored));
+    }
+    assert_eq!(freshness(&together.namespaces[0]), 0);
+    assert_eq!(freshness(&together.namespaces[1]), 100);
+}
+
+#[tokio::test]
 async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_sees() {
     let svc = service();
     let parent = seed_definition_parent(&svc, "lint-a");
