@@ -633,6 +633,20 @@ async fn sqlite_runtime_claim_refuses_disabled_delegator() {
     exercise_delegator_claim_refusal(RuntimeDb::memory(), "sqlite-delegator").await;
 }
 
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_runtime_claim_refuses_disabled_delegator() {
+    let scratch = ScratchDatabase::create();
+    let db = RuntimeDb::Postgres(Arc::new(scratch.connect(4)));
+    let prefix = format!("pg-d-{}", uuid::Uuid::new_v4().simple());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(exercise_delegator_claim_refusal(db.clone(), &prefix));
+    drop(db);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlite_runtime_claim_transform_conformance() {
     exercise_transform(RuntimeDb::memory(), "sqlite-transform").await;
