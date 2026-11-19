@@ -135,6 +135,8 @@ mod team_namespace_backend_conformance;
 mod tenant_isolation_conformance;
 mod two_plane_processes;
 
+#[path = "support/bound_port.rs"]
+mod bound_port;
 #[path = "support/postgres_scratch.rs"]
 mod postgres_scratch;
 

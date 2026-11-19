@@ -13,24 +13,18 @@ use std::time::{Duration, Instant};
 
 const WAIT_BUDGET: Duration = Duration::from_secs(20);
 
-fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-fn split_server(dir: &Path, ops_port: u16, sekai: &str, chisei: &str) -> Command {
+/// A Split server on port 0 for both gRPC and ops; the ops listener logs the
+/// port it bound.
+fn split_server(dir: &Path, sekai: &str, chisei: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
     command
         .env("SEKAI_SOCKET", dir.join("sekai.sock"))
         .env("SEKAI_DB_PATH", dir.join("sekai.db"))
         .env("CHISEI_DB_PATH", dir.join("chisei.db"))
-        .env("GRPC_PORT", free_tcp_port().to_string())
-        .env("OPS_PORT", ops_port.to_string())
+        .env("GRPC_PORT", "0")
+        .env("OPS_PORT", "0")
         .env("OPS_BIND", "127.0.0.1")
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", "error,sekai_chisei::obs::ops=info")
         .env("SEKAI_POSTGRES_MAX_CONNECTIONS", "16")
         .env("SEKAI_POSTGRES_SEKAI_CONNECTIONS", sekai)
         .env("SEKAI_POSTGRES_CHISEI_CONNECTIONS", chisei)
@@ -75,17 +69,22 @@ impl Drop for Running {
 #[test]
 fn split_pools_take_per_plane_sizes_and_report_checkouts_per_plane() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let ops_port = free_tcp_port();
     let log_path = dir.path().join("server.log");
     let log = std::fs::File::create(&log_path).expect("server log");
     let mut running = Running(
-        split_server(dir.path(), ops_port, "12", "4")
+        split_server(dir.path(), "12", "4")
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log))
             .spawn()
             .expect("spawn sekai-chisei"),
     );
     let logs = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let ops_port = crate::bound_port::wait_for_logged_port(
+        &mut running.0,
+        &log_path,
+        crate::bound_port::OPS_LISTENING,
+        WAIT_BUDGET,
+    );
 
     let deadline = Instant::now() + WAIT_BUDGET;
     let metrics = loop {
@@ -137,7 +136,7 @@ fn split_pools_take_per_plane_sizes_and_report_checkouts_per_plane() {
 #[test]
 fn split_pool_sizes_over_the_process_ceiling_refuse_to_start() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let output = split_server(dir.path(), free_tcp_port(), "12", "8")
+    let output = split_server(dir.path(), "12", "8")
         .output()
         .expect("run sekai-chisei");
     assert!(

@@ -89,15 +89,8 @@ impl Server {
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", &sekai_db)
             .env("CHISEI_DB_PATH", &chisei_db)
-            .env(
-                "GRPC_PORT",
-                std::net::TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
-                    .port()
-                    .to_string(),
-            )
+            // UDS-only; port 0 keeps an unused TCP bind from colliding.
+            .env("GRPC_PORT", "0")
             .env("OPS_PORT", "")
             .env("RUST_LOG", "error")
             .env_remove("SEKAI_EXPERIMENTAL_RPCS")
