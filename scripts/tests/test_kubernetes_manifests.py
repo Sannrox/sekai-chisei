@@ -1,7 +1,7 @@
 """Kubernetes manifest invariants, asserted on the parsed YAML (#3002).
 
 Each fact is checked on the field that carries it, so a value in the wrong
-place fails. Image tag and environment variables stay in
+place fails. Image tag and literal environment values stay in
 tests/deploy_kubernetes_manifest.rs.
 """
 
@@ -35,6 +35,29 @@ class StatefulSet(unittest.TestCase):
             for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz")):
                 with self.subTest(container=container["name"], probe=probe):
                     self.assertEqual(container[probe]["httpGet"], {"path": path, "port": "ops"})
+
+    def test_gateway_settings_come_only_from_the_optional_secret(self):
+        # #3173: without the Secret the pod starts as before, and the gateway
+        # key is never a literal in the manifest.
+        for container in self.containers:
+            env = {entry["name"]: entry for entry in container.get("env", [])}
+            for name in (
+                "CHISEI_GATEWAY_KEY",
+                "CHISEI_GATEWAY_URL",
+                "CHISEI_GATEWAY_PROVIDED_PROVIDERS",
+            ):
+                with self.subTest(container=container["name"], variable=name):
+                    self.assertNotIn("value", env[name])
+                    self.assertEqual(
+                        env[name]["valueFrom"],
+                        {
+                            "secretKeyRef": {
+                                "name": "sekai-chisei-gateway",
+                                "key": name,
+                                "optional": True,
+                            }
+                        },
+                    )
 
     def test_pod_meets_restricted_pod_security(self):
         context = self.pod["securityContext"]
