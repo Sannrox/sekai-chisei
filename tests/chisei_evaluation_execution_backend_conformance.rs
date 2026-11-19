@@ -113,7 +113,7 @@ fn execution(
     )
 }
 
-fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
+fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> EvaluationExecutionIndex {
     let manifest = manifest(namespace, suffix);
     db.put_evaluation_manifest(&manifest, "resolve", "request-digest")
         .unwrap();
@@ -153,7 +153,26 @@ fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
             .len(),
         2
     );
-    (manifest.manifest_digest, index.operation_id)
+    index
+}
+
+/// Restart checks shared by both backends: a reopened store returns the same
+/// index and the receipt with its intent and step events.
+fn assert_reloaded(db: &RuntimeDb, index: &EvaluationExecutionIndex) {
+    assert_eq!(
+        db.get_evaluation_execution_index(&index.manifest_digest)
+            .unwrap()
+            .as_ref(),
+        Some(index)
+    );
+    assert_eq!(
+        db.get_operation_receipt(&index.operation_id)
+            .unwrap()
+            .unwrap()
+            .events
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -204,22 +223,7 @@ fn sqlite_evaluation_execution_conformance_restart_and_concurrency() {
     let restarted = RuntimeDb::Sqlite(Arc::new(
         sekai_chisei::chisei_store::open_sekai_with_chisei_schema(&path),
     ));
-    assert_eq!(
-        restarted
-            .get_evaluation_execution_index(&manifest.manifest_digest)
-            .unwrap()
-            .unwrap(),
-        index
-    );
-    assert_eq!(
-        restarted
-            .get_operation_receipt(&index.operation_id)
-            .unwrap()
-            .unwrap()
-            .events
-            .len(),
-        2
-    );
+    assert_reloaded(&restarted, &index);
     std::fs::remove_file(path).ok();
 }
 
@@ -241,18 +245,6 @@ fn postgres() -> RuntimeDb {
 fn postgres_evaluation_execution_conformance_and_restart() {
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let namespace = format!("pg-execution-{suffix}");
-    let (manifest_digest, operation_id) = exercise(&postgres(), &namespace, &suffix);
-    let restarted = postgres();
-    assert!(
-        restarted
-            .get_evaluation_execution_index(&manifest_digest)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        restarted
-            .get_operation_receipt(&operation_id)
-            .unwrap()
-            .is_some()
-    );
+    let index = exercise(&postgres(), &namespace, &suffix);
+    assert_reloaded(&postgres(), &index);
 }
