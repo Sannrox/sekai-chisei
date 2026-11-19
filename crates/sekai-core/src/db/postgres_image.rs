@@ -3,7 +3,9 @@
 use postgres::GenericClient;
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key};
-use crate::sekai::image::{GovernedImage, IMAGE_UNAVAILABLE, ImageAnnotation, ImageRendition};
+use crate::sekai::image::{
+    GovernedImage, IMAGE_UNAVAILABLE, ImageAnnotation, ImageRendition, require_attachable,
+};
 
 impl PostgresDb {
     pub fn put_governed_image(&self, image: &GovernedImage) -> Result<(), String> {
@@ -14,6 +16,12 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_image(&mut tx, &image.namespace, &image.image_id)?;
+        // A tombstone is final: re-putting the image does not revive it.
+        if load_image(&mut tx, &image.namespace, &image.image_id)?
+            .is_some_and(|stored| stored.deleted_at_ms != 0)
+        {
+            return Err(IMAGE_UNAVAILABLE.into());
+        }
         let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_images
@@ -150,7 +158,12 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_image(&mut tx, &rendition.namespace, &rendition.image_id)?;
-        require_parent(&mut tx, &rendition.namespace, &rendition.image_id)?;
+        require_parent(
+            &mut tx,
+            &rendition.namespace,
+            &rendition.image_id,
+            &rendition.parent_content_digest,
+        )?;
         let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_image_renditions
@@ -242,7 +255,12 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_image(&mut tx, &annotation.namespace, &annotation.image_id)?;
-        require_parent(&mut tx, &annotation.namespace, &annotation.image_id)?;
+        require_parent(
+            &mut tx,
+            &annotation.namespace,
+            &annotation.image_id,
+            &annotation.parent_content_digest,
+        )?;
         let changed = tx
             .execute(
                 "INSERT INTO sekai_governed_image_annotations
@@ -301,22 +319,32 @@ fn lock_image(
     Ok(())
 }
 
-fn require_parent(
+fn load_image(
     client: &mut impl GenericClient,
     namespace: &str,
     image_id: &str,
-) -> Result<(), String> {
-    let parent = client
+) -> Result<Option<GovernedImage>, String> {
+    client
         .query_opt(
             "SELECT record_json FROM sekai_governed_images
              WHERE namespace = $1 AND image_id = $2",
             &[&namespace, &image_id],
         )
-        .map_err(|error| error.to_string())?;
-    if parent.is_none() {
-        return Err(IMAGE_UNAVAILABLE.into());
-    }
-    Ok(())
+        .map_err(|error| error.to_string())?
+        .map(|row| decode_image(&row.get::<_, String>(0)))
+        .transpose()
+}
+
+/// Refuses an attachment unless its parent image exists, is live, and has
+/// the content the attachment was derived from. Call under `lock_image`.
+fn require_parent(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    image_id: &str,
+    parent_content_digest: &str,
+) -> Result<(), String> {
+    let parent = load_image(client, namespace, image_id)?.ok_or(IMAGE_UNAVAILABLE)?;
+    require_attachable(&parent, parent_content_digest)
 }
 
 fn decode_image(json: &str) -> Result<GovernedImage, String> {
