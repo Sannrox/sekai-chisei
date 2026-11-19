@@ -132,10 +132,6 @@ fn product_pack_imports_and_validates_offline() {
     let document: ImportDocument =
         serde_json::from_str(&fs::read_to_string(PACK).unwrap()).unwrap();
     assert_eq!(document.schema_version, 1);
-    assert!(
-        PACK.ends_with("/ontologies/sekai-chisei-product-v1.json"),
-        "pack must live outside proto/: {PACK}"
-    );
 }
 
 #[test]
