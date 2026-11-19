@@ -300,24 +300,75 @@ fn runner_reports_semantic_leaks_and_foreign_state_changes_by_kind() {
     assert_eq!(report.failures.len(), cases.len() + 1);
 }
 
-#[test]
-fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
-    fn rpc_methods(protocol: &str) -> Vec<String> {
-        let mut service = None;
-        let mut methods = Vec::new();
-        for line in protocol.lines().map(str::trim) {
-            if let Some(name) = line.strip_prefix("service ") {
+/// Every `Service/Method` declared in a proto file. Brace depth is tracked
+/// inside a service so an RPC option body (`rpc X(..) returns (..) { .. }`)
+/// does not end the service; `//` comments are ignored.
+fn rpc_methods(protocol: &str) -> Vec<String> {
+    let mut service = None;
+    let mut depth = 0usize;
+    let mut methods = Vec::new();
+    for line in protocol.lines() {
+        let line = line.split_once("//").map_or(line, |(code, _)| code).trim();
+        match service {
+            None => {
+                let Some(name) = line.strip_prefix("service ") else {
+                    continue;
+                };
                 service = name.split_whitespace().next();
-            } else if line == "}" {
-                service = None;
-            } else if let (Some(service), Some(method)) = (service, line.strip_prefix("rpc "))
-                && let Some((method, _)) = method.split_once('(')
-            {
-                methods.push(format!("{service}/{method}"));
+                depth = 0;
+            }
+            Some(service) if depth == 1 => {
+                if let Some(method) = line.strip_prefix("rpc ")
+                    && let Some((method, _)) = method.split_once('(')
+                {
+                    methods.push(format!("{service}/{}", method.trim()));
+                }
+            }
+            Some(_) => {}
+        }
+        for brace in line.chars() {
+            match brace {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
             }
         }
-        methods
+        if depth == 0 && !line.starts_with("service ") {
+            service = None;
+        }
     }
+    methods
+}
+
+#[test]
+fn rpc_scan_reads_every_method_after_an_option_body() {
+    let protocol = "service One {\n  rpc A(Req) returns (Res) {\n    option deprecated = true;\n  }\n  // rpc Commented(Req) returns (Res);\n  rpc B(Req) returns (Res) {}\n  rpc C(Req) returns (stream Res);\n}\nmessage Req {}\nservice Two { \n  rpc D(Req) returns (Res);\n}\n";
+    assert_eq!(rpc_methods(protocol), ["One/A", "One/B", "One/C", "Two/D"]);
+    for (protocol, service) in [
+        (include_str!("../proto/sekai.proto"), "SekaiService"),
+        (include_str!("../proto/chisei.proto"), "ChiseiService"),
+    ] {
+        let declared = protocol
+            .lines()
+            .filter(|line| line.trim_start().starts_with("rpc "))
+            .count();
+        let methods = rpc_methods(protocol);
+        assert_eq!(methods.len(), declared, "{service}");
+        assert!(
+            methods
+                .iter()
+                .all(|method| method.starts_with(&format!("{service}/")))
+        );
+    }
+    // Declared right after AcknowledgeExportDelivery's option body.
+    assert!(
+        rpc_methods(include_str!("../proto/sekai.proto"))
+            .contains(&"SekaiService/ExportDatasetVersion".to_string())
+    );
+}
+
+#[test]
+fn community_profile_exposes_no_tenant_or_identity_runtime_surface() {
     let protocols = [
         include_str!("../proto/sekai.proto"),
         include_str!("../proto/chisei.proto"),
