@@ -377,11 +377,28 @@ async fn a_governed_action_writes_back_to_the_warehouse_and_the_next_snapshot_sh
     );
     assert_eq!(store.row_version("1002").unwrap(), "1");
 
-    // Identity and restricted columns cannot be written through the adapter.
-    let forbidden = store.apply(
-        "1002",
-        "1",
-        &BTreeMap::from([("customer_email".into(), "x@example.com".into())]),
-    );
-    assert!(forbidden.is_err());
+    // Identity and restricted columns cannot be written through the adapter,
+    // and the refused write leaves the row as it was.
+    let email_before = row_value(&store, "1002", "customer_email");
+    let forbidden = store
+        .apply(
+            "1002",
+            "1",
+            &BTreeMap::from([("customer_email".into(), "x@example.com".into())]),
+        )
+        .unwrap_err();
+    assert!(forbidden.contains("\"customer_email\""), "{forbidden}");
+    assert_eq!(store.row_version("1002").unwrap(), "1");
+    assert_eq!(row_value(&store, "1002", "customer_email"), email_before);
+    assert_ne!(email_before.as_deref(), Some("x@example.com"));
+}
+
+/// One column of one row in the store's current snapshot.
+fn row_value(store: &TableStore, key: &str, column: &str) -> Option<String> {
+    let snapshot = store.snapshot();
+    snapshot
+        .rows
+        .iter()
+        .find(|row| row.get(&snapshot.key_column).map(String::as_str) == Some(key))
+        .and_then(|row| row.get(column).cloned())
 }
