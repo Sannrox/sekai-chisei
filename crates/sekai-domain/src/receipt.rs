@@ -510,6 +510,133 @@ mod tests {
         );
     }
 
+    /// The errors of a receipt that must be reported partial.
+    fn partial_errors(receipt: &OperationReceipt) -> Vec<String> {
+        let result = receipt.completeness();
+        assert!(!result.complete, "{result:?}");
+        result.errors
+    }
+
+    #[test]
+    fn zero_intent_events_are_rejected() {
+        let mut receipt = complete_receipt();
+        receipt
+            .events
+            .retain(|event| event.kind != ReceiptEventKind::IntentRecorded);
+        assert_eq!(
+            partial_errors(&receipt),
+            [
+                "receipt requires exactly one intent event, found 0",
+                "event policy references missing causal parent intent",
+                "event route references missing causal parent intent",
+                "event budget references missing causal parent intent",
+                "event outcome references missing causal parent intent",
+            ]
+        );
+    }
+
+    #[test]
+    fn two_intent_events_are_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events.push(event(
+            "intent-2",
+            None,
+            ReceiptEventKind::IntentRecorded,
+            ReceiptSurface::Intent,
+        ));
+        assert_eq!(
+            partial_errors(&receipt),
+            [
+                "receipt requires exactly one intent event, found 2",
+                "event intent-2 has no causal path to intent",
+            ]
+        );
+    }
+
+    #[test]
+    fn intent_with_a_parent_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events[0].parent_event_id = Some("outcome".into());
+        assert_eq!(
+            partial_errors(&receipt),
+            ["intent event must not have a causal parent"]
+        );
+    }
+
+    #[test]
+    fn missing_causal_parent_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events[4].parent_event_id = Some("ghost".into());
+        assert_eq!(
+            partial_errors(&receipt),
+            ["event outcome references missing causal parent ghost"]
+        );
+    }
+
+    #[test]
+    fn two_event_causal_cycle_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events.extend([
+            event(
+                "loop-a",
+                Some("loop-b"),
+                ReceiptEventKind::RouteSelected,
+                ReceiptSurface::Routing,
+            ),
+            event(
+                "loop-b",
+                Some("loop-a"),
+                ReceiptEventKind::BudgetDecided,
+                ReceiptSurface::Budget,
+            ),
+        ]);
+        assert_eq!(
+            partial_errors(&receipt),
+            [
+                "causal cycle at event loop-a",
+                "causal cycle at event loop-b"
+            ]
+        );
+    }
+
+    #[test]
+    fn self_parented_event_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events.push(event(
+            "self",
+            Some("self"),
+            ReceiptEventKind::PolicyDecided,
+            ReceiptSurface::Policy,
+        ));
+        assert_eq!(partial_errors(&receipt), ["causal cycle at event self"]);
+    }
+
+    #[test]
+    fn chain_ending_at_a_non_intent_root_is_rejected() {
+        let mut receipt = complete_receipt();
+        receipt.events.extend([
+            event(
+                "orphan-root",
+                None,
+                ReceiptEventKind::RouteSelected,
+                ReceiptSurface::Routing,
+            ),
+            event(
+                "orphan-child",
+                Some("orphan-root"),
+                ReceiptEventKind::BudgetDecided,
+                ReceiptSurface::Budget,
+            ),
+        ]);
+        assert_eq!(
+            partial_errors(&receipt),
+            [
+                "event orphan-root has no causal path to intent",
+                "event orphan-child has no causal path to intent",
+            ]
+        );
+    }
+
     #[test]
     fn missing_artifact_field_deserializes_as_none() {
         let mut value = serde_json::to_value(complete_receipt()).unwrap();
