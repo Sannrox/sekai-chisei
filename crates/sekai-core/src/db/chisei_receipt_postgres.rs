@@ -123,15 +123,6 @@ impl PostgresDb {
             &[&instance_id],
         )
         .map_err(|error| error.to_string())?;
-        // The marker a takeover checks (#1931); updating the row also makes
-        // a waiting takeover recheck its condition against this commit.
-        tx.execute(
-            "UPDATE sekai_action_instances
-             SET body_json = jsonb_set(body_json::jsonb, '{admission_lease,receipt_recorded}', 'true')::text
-             WHERE instance_id = $1",
-            &[&instance_id],
-        )
-        .map_err(|error| error.to_string())?;
         if ingest {
             crate::db::object_log_ingest::postgres_mark_ready(&mut tx, instance_id)?;
         }
