@@ -11638,7 +11638,7 @@ async fn submit_action_instance_admit_replay_conflict_policy_budget() {
             type_id: "review.intake".into(),
             status: STATUS_ADMITTED.into(),
             limit: 10,
-            decidable_by_caller: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -20894,6 +20894,52 @@ fn action_read_fixture(namespace: &str) -> crate::sekai::action_instance::Action
     }
 }
 
+/// A created window pages with opaque tokens; every instance in the window
+/// is listed once and none outside it (#2122).
+#[tokio::test]
+async fn action_instance_list_pages_through_a_created_window() {
+    let svc = service();
+    for (id, created_at_ms) in [("a", 10), ("b", 20), ("c", 20), ("d", 30), ("e", 40)] {
+        let mut instance = action_read_fixture("acme");
+        instance.instance_id = id.into();
+        instance.idempotency_key = format!("key-{id}");
+        instance.operation_id = format!("op-{id}");
+        instance.created_at_ms = created_at_ms;
+        svc.db.runtime().put_action_instance(&instance).unwrap();
+    }
+    let page = |page_token: String| {
+        svc.list_action_instances(with_named_principal(
+            ListActionInstancesRequest {
+                namespace: "acme".into(),
+                limit: 2,
+                created_from_ms: Some(20),
+                created_before_ms: Some(40),
+                page_token,
+                ..Default::default()
+            },
+            "owner",
+        ))
+    };
+    let first = page(String::new()).await.unwrap().into_inner();
+    let second = page(first.next_page_token.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    let ids = |page: &ListActionInstancesResponse| {
+        page.instances
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&first), ["d", "c"]);
+    assert_eq!(ids(&second), ["b"]);
+    assert!(second.next_page_token.is_empty());
+    assert_eq!(
+        page("not-a-token".into()).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+}
+
 #[tokio::test]
 async fn action_instance_reads_require_entitlement_and_target_visibility() {
     let svc = service();
@@ -20933,6 +20979,7 @@ async fn action_instance_reads_require_entitlement_and_target_visibility() {
         } else {
             assert_eq!(get.unwrap_err().code(), tonic::Code::PermissionDenied);
             assert!(list.instances.is_empty());
+            assert_eq!(list.withheld_count, 1);
         }
     }
     // Entitlement alone cannot disclose a target whose grant was revoked.

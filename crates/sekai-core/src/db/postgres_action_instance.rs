@@ -184,6 +184,44 @@ impl PostgresDb {
             .collect()
     }
 
+    /// See `SekaiDb::list_action_instances_between`.
+    pub fn list_action_instances_between(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        created_from_ms: i64,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_instances
+                 WHERE namespace = $1
+                   AND ($2::TEXT IS NULL OR type_id = $2)
+                   AND ($3::TEXT IS NULL OR status = $3)
+                   AND created_at_ms >= $4 AND created_at_ms <= $5
+                   AND (created_at_ms, instance_id) < ($5, $6)
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $7",
+                &[
+                    &namespace,
+                    &type_id.filter(|t| !t.trim().is_empty()),
+                    &status.filter(|s| !s.trim().is_empty()),
+                    &created_from_ms,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit.clamp(1, 500) as i64),
+                ],
+            )
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| {
+                serde_json::from_str(row.get(0))
+                    .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     pub fn put_action_instance(&self, instance: &ActionInstance) -> Result<ActionInstance, String> {
         instance.validate_fields()?;
         if let Some(existing) =
@@ -1534,6 +1572,65 @@ mod tests {
             created: updated,
             updated,
         }
+    }
+
+    /// `ListActionInstances` reads a created window page by page: the lower
+    /// bound is inclusive, the keyset position exclusive, and type and status
+    /// filter when given (#2122).
+    fn assert_lists_between(db: &RuntimeDb) {
+        use crate::db::OlderThan;
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let namespace = format!("window-{run}");
+        for (id, created_at_ms, status, type_id) in [
+            ("a", 10, STATUS_ADMITTED, "t"),
+            ("b", 20, STATUS_ADMITTED, "t"),
+            ("c", 20, STATUS_DENIED, "t"),
+            ("d", 30, STATUS_ADMITTED, "u"),
+            ("e", 40, STATUS_ADMITTED, "t"),
+        ] {
+            let mut instance = sample_for_test(status);
+            instance.namespace = namespace.clone();
+            instance.instance_id = id.into();
+            instance.idempotency_key = format!("key-{id}-{run}");
+            instance.operation_id = format!("op-{id}-{run}");
+            instance.type_id = type_id.into();
+            instance.created_at_ms = created_at_ms;
+            db.put_action_instance(&instance).unwrap();
+        }
+        let ids = |type_id, status, from, at_ms, id, limit| {
+            db.list_action_instances_between(
+                &namespace,
+                type_id,
+                status,
+                from,
+                OlderThan { at_ms, id },
+                limit,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|instance| instance.instance_id)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(None, None, 20, 40, "", 2), ["d", "c"]);
+        assert_eq!(ids(None, None, 20, 20, "c", 10), ["b"]);
+        assert_eq!(
+            ids(Some("t"), Some(STATUS_ADMITTED), i64::MIN, i64::MAX, "", 10),
+            ["e", "b", "a"]
+        );
+    }
+
+    #[test]
+    fn sqlite_lists_action_instances_between() {
+        assert_lists_between(&RuntimeDb::Sqlite(Arc::new(
+            crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
+        )));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_lists_action_instances_between() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        assert_lists_between(&RuntimeDb::Postgres(Arc::new(scratch.connect())));
     }
 
     /// Admission, parked grant, plan-step close and forget on overlapping

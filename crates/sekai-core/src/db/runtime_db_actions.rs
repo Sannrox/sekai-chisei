@@ -584,6 +584,40 @@ impl RuntimeDb {
         }
     }
 
+    /// Instances of `namespace` (of `type_id` and `status` when given)
+    /// created at or after `created_from_ms` and older than `before`, newest
+    /// first.
+    pub fn list_action_instances_between(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        created_from_ms: i64,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_action_instances_between(
+                namespace,
+                type_id,
+                status,
+                created_from_ms,
+                before,
+                limit,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_action_instances_between(
+                    namespace,
+                    type_id,
+                    status,
+                    created_from_ms,
+                    before,
+                    limit,
+                )
+            }),
+        }
+    }
+
     pub fn put_action_effects(
         &self,
         effects: &[crate::sekai::action_effect::ActionEffect],
