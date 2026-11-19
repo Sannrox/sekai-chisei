@@ -199,24 +199,24 @@ impl PrivacyScanCache {
     }
 }
 
+/// Everything [`compile_leak_rules`] reads from each rule object, so any
+/// change to a compiled rule, its label included, misses the cache. Each
+/// entry is a quoted tuple, so no field value can blur into the next.
 fn leak_fingerprint(objects: &[Object]) -> String {
     let mut parts: Vec<String> = objects
         .iter()
         .map(|object| {
+            let property = |key: &str| object.properties.get(key).map(String::as_str);
             format!(
-                "{}|{}|{}|{}",
-                object.namespace,
-                object.id,
-                object
-                    .properties
-                    .get("pattern")
-                    .map(String::as_str)
-                    .unwrap_or(""),
-                object
-                    .properties
-                    .get("action")
-                    .map(String::as_str)
-                    .unwrap_or("block"),
+                "{:?}",
+                (
+                    &object.namespace,
+                    &object.id,
+                    &object.name,
+                    property("pattern").unwrap_or(""),
+                    property("action").unwrap_or("block"),
+                    property("label"),
+                )
             )
         })
         .collect();
@@ -682,6 +682,46 @@ mod tests {
         assert_eq!(second.entities.as_slice(), first.entities.as_slice());
         assert!(Arc::ptr_eq(&first.entities, &second.entities));
         assert!(!first.truncated);
+    }
+
+    #[test]
+    fn privacy_scan_cache_refreshes_a_renamed_leak_rule() {
+        let cache = PrivacyScanCache::default();
+        let rule = |name: &str, label: Option<&str>| {
+            let mut properties = HashMap::from([("pattern".to_string(), "SecretCo".to_string())]);
+            if let Some(label) = label {
+                properties.insert("label".into(), label.into());
+            }
+            Object {
+                id: "leak-1".into(),
+                kind: "leak_rule".into(),
+                name: name.into(),
+                namespace: "alpha".into(),
+                external_id: "leak_rule:company".into(),
+                properties,
+                created: 0,
+                updated: 0,
+            }
+        };
+        let label = |object: Object| {
+            cache
+                .load(
+                    "alpha",
+                    false,
+                    || Ok::<_, ()>(vec![object]),
+                    1,
+                    || Ok(Vec::new()),
+                )
+                .unwrap()
+                .rules[0]
+                .label
+                .clone()
+        };
+
+        assert_eq!(label(rule("company", Some("first"))), "first");
+        assert_eq!(label(rule("company", Some("second"))), "second");
+        assert_eq!(label(rule("company", None)), "company");
+        assert_eq!(label(rule("renamed", None)), "renamed");
     }
 
     fn fill_scan_objects(count: usize) -> Vec<Object> {
