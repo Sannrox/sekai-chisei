@@ -533,7 +533,10 @@ impl SourceOutbox {
         fs::create_dir_all(&directory)
             .map_err(|_| "failed to create source outbox quarantine".to_string())?;
         restrict_directory(&directory)?;
-        if pending_paths(&directory)?.len() >= self.limits.max_pending_files {
+        let destination = directory.join(format!("{}.json", batch.idempotency_key));
+        if !destination.exists()
+            && pending_paths(&directory)?.len() >= self.limits.max_pending_files
+        {
             return Err("source outbox quarantine reached its file limit".into());
         }
         let quarantined = QuarantinedBatch {
@@ -544,10 +547,14 @@ impl SourceOutbox {
         let bytes = serde_json::to_vec(&quarantined)
             .map_err(|_| "source quarantine entry cannot be serialized".to_string())?;
         self.check_entry_size(bytes.len())?;
-        let destination = directory.join(format!("{}.json", batch.idempotency_key));
+        // A crash after this write but before `remove_pending` leaves the
+        // entry in place; a retry may be rejected with another reason code.
+        // The existing entry stands when it holds the same batch.
         if atomic_write(&directory, &destination, &bytes)? == PublishDisposition::Existing {
             let existing = read_bounded_regular_file(&destination, self.limits.max_entry_bytes)?;
-            if existing != bytes {
+            let same_batch = serde_json::from_slice::<QuarantinedBatch>(&existing)
+                .is_ok_and(|existing| existing.batch.batch_digest == batch.batch_digest);
+            if !same_batch {
                 return Err("source quarantine identity is bound to another entry".into());
             }
         }

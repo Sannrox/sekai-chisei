@@ -1237,6 +1237,47 @@ fn outbox_restarts_retains_ambiguous_progress_and_removes_exact_commit() {
 }
 
 #[test]
+fn requarantine_after_a_crash_clears_pending_and_a_foreign_entry_still_fails() {
+    let root = temporary_root("requarantine");
+    let batch = batch(vec![issue()]);
+    let outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
+    let rejected = |reason: &str| ScriptedTransport {
+        replies: VecDeque::from([Ok(ApplySourceBatchReply::Rejected {
+            reason_code: reason.into(),
+        })]),
+        ..Default::default()
+    };
+    outbox.enqueue(&batch).unwrap();
+    outbox.flush(&mut rejected("first_reason"), true).unwrap();
+
+    // Re-enqueueing reproduces a crash between the quarantine write and the
+    // pending removal: the entry holds the first reason and B is pending.
+    outbox.enqueue(&batch).unwrap();
+    let report = outbox.flush(&mut rejected("second_reason"), true).unwrap();
+    assert_eq!(
+        report.entries[0].disposition,
+        object_sync_sdk::FlushDisposition::Quarantined
+    );
+    assert!(outbox.pending().unwrap().is_empty());
+    assert_eq!(outbox.quarantine_count().unwrap(), 1);
+
+    let entry = root
+        .join("quarantine")
+        .join(format!("{}.json", batch.idempotency_key));
+    let mut foreign: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
+    foreign["batch"]["batch_digest"] = format!("sha256:{}", "0".repeat(64)).into();
+    std::fs::write(&entry, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    outbox.enqueue(&batch).unwrap();
+    assert_eq!(
+        outbox.flush(&mut rejected("second_reason"), true),
+        Err("source quarantine identity is bound to another entry".into())
+    );
+    assert_eq!(outbox.pending().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn mismatched_commit_stays_pending_and_rejection_is_safely_quarantined() {
     let root = temporary_root("quarantine");
     let batch = batch(vec![issue()]);
