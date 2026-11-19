@@ -138,10 +138,28 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
     assert_eq!(current.revision, 2);
     assert_eq!(kept, ActionBindingCursor::default());
 
-    // An invalid binding is refused before any write.
+    // An invalid binding is refused before any write: the stored revision,
+    // its ops, and a non-default cursor all survive, and no binding is added.
+    let advanced = ActionBindingCursor {
+        snapshot_revision: "snap-2".into(),
+        last_page_digest: "sha256:page-2".into(),
+        ..ActionBindingCursor::default()
+    };
+    db.advance_action_binding_cursor(&second, &advanced, 14)
+        .unwrap();
     let mut invalid = binding(namespace);
     invalid.ops = vec!["invalidate".into()];
-    assert!(db.put_action_binding(&invalid, "admin", 14).is_err());
+    assert!(db.put_action_binding(&invalid, "admin", 15).is_err());
+    let (after, cursor) = db
+        .get_action_binding(namespace, "escalate-on-update")
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.revision, 2);
+    assert_eq!(after.ops, vec![OP_UPDATE.to_string()]);
+    assert_eq!(cursor, advanced);
+    let listed = db.list_action_bindings(namespace).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].revision, 2);
 }
 
 #[test]
