@@ -313,6 +313,7 @@ fn seed_transform(
                 .iter()
                 .map(|(name, version)| (name.to_string(), version.to_string()))
                 .collect(),
+            model_outputs: Default::default(),
         }),
         schedule: None,
         trigger: None,
@@ -479,6 +480,7 @@ async fn exercise_transform(db: RuntimeDb, prefix: &str) {
         quarantined: false,
         quality_rule: String::new(),
         partitions: Vec::new(),
+        model_outputs: Vec::new(),
     };
     let refused = claim
         .write_transform_result(&stale, write.clone())
@@ -730,6 +732,7 @@ async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
                     requires: Default::default(),
                     code: TRANSFORM_CODE.into(),
                     model_inputs: Default::default(),
+                    model_outputs: Default::default(),
                 }),
                 schedule: None,
                 trigger: None,
@@ -801,6 +804,7 @@ async fn exercise_adhoc_isolated(db: RuntimeDb, prefix: &str) {
                         quarantined: false,
                         quality_rule: String::new(),
                         partitions: Vec::new(),
+                        model_outputs: Vec::new(),
                     },
                 )
                 .await
@@ -1084,6 +1088,7 @@ async fn exercise_model_scoring(db: RuntimeDb, prefix: &str) {
         quarantined: false,
         quality_rule: String::new(),
         partitions: Vec::new(),
+        model_outputs: Vec::new(),
     };
     let run = claim
         .write_transform_result(&fence, write)

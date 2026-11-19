@@ -1056,6 +1056,12 @@ message GovernedTransform {
   // resolves it to the stage's version, and ClaimTransformWork returns the
   // definition with the resolved version id.
   repeated TransformModelInput model_inputs = 21;
+  // Experimental (#3021). Models the code trains, by model name.
+  // Isolated-process profile only; names must not repeat. A successful run's
+  // WriteTransformRunResult publishes exactly one new version of each, in
+  // the transaction that commits its output; a quarantined or failed run
+  // publishes none. Part of definition_digest when non-empty.
+  repeated string model_outputs = 22;
 }
 // A model version a transform scores with (#3074).
 message TransformModelInput {
@@ -1845,6 +1851,21 @@ message WriteTransformRunResultRequest {
   bool quarantined = 7;
   string quality_rule = 8;
   repeated TransformPartitionWrite partitions = 9;
+  // Experimental (#3021). One trained model per name the definition
+  // declares in model_outputs, no other; the runner stores the bytes in the
+  // registry first. Published with the output unless the run is
+  // quarantined; ignored by a quarantined write.
+  repeated TransformModelOutput model_outputs = 10;
+}
+// Experimental (#3021). A model a transform run trained. The plane fills
+// the namespace, run, marking and training inputs from the run.
+message TransformModelOutput {
+  string model_name = 1;
+  string digest = 2;
+  string adapter_id = 3;
+  string adapter_version = 4;
+  string registry_locator = 5;
+  ModelAdapterContract contract = 6;
 }
 message WriteTransformRunResultResponse {
   TransformRun run = 1;

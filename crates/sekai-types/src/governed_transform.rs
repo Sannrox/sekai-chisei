@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::classification_lattice::ClassificationLattice;
@@ -203,6 +203,12 @@ pub struct IsolatedProcessSpec {
     /// keeps the digest of definitions written before it existed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_inputs: BTreeMap<String, String>,
+    /// Models the code trains, by model name (#3021). A successful run
+    /// publishes exactly one new version of each through its write-back;
+    /// a quarantined or failed run publishes none. Empty keeps the digest of
+    /// definitions written before it existed.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub model_outputs: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +425,9 @@ pub struct WriteTransformRunCommand {
     pub replaced_partitions: Vec<TransformPartitionWrite>,
     pub partition_key: Option<String>,
     pub max_bytes: i64,
+    /// One new version per model the definition declares in
+    /// `model_outputs` (#3021), published in the write-back transaction.
+    pub model_outputs: Vec<crate::model_version::ModelOutputWrite>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -464,6 +473,7 @@ impl GovernedTransform {
                 }
             }
             prepare_model_inputs(spec)?;
+            prepare_model_outputs(spec)?;
             validate_placement_labels("requires", &spec.requires)?;
         } else if let Some(spec) = self.analytical.as_mut() {
             prepare_analytical(&mut self.input_dataset_id, spec, &self.steps)?;
@@ -877,6 +887,22 @@ fn prepare_analytical(
 /// Trims model input names and version ids, refuses blanks and dataset ids
 /// that collide with the model pin prefix, and requires the model placement
 /// label so only a runtime that can run a model claims the work.
+/// Trims model output names and refuses blanks and names that collapse
+/// into one after trimming.
+fn prepare_model_outputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
+    let mut trimmed = BTreeSet::new();
+    for name in &spec.model_outputs {
+        require_token("model output name", name)?;
+        if !trimmed.insert(name.trim().to_string()) {
+            return Err(TransformError::InvalidArgument(
+                "model output names must be unique".into(),
+            ));
+        }
+    }
+    spec.model_outputs = trimmed;
+    Ok(())
+}
+
 fn prepare_model_inputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformError> {
     if spec.model_inputs.is_empty() {
         return Ok(());

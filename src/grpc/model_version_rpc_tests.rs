@@ -156,6 +156,7 @@ async fn model_inputs_refuse_a_hidden_or_missing_version() {
         analytical: None,
         isolated_process: Some(IsolatedProcessSpec {
             model_inputs: std::collections::BTreeMap::from([("scorer".into(), version_id.into())]),
+            model_outputs: Default::default(),
             ..Default::default()
         }),
         schedule: None,

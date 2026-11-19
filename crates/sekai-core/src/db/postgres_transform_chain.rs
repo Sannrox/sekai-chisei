@@ -555,6 +555,7 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
                 requires: Default::default(),
                 code: String::new(),
                 model_inputs: Default::default(),
+                model_outputs: Default::default(),
             }),
             schedule: None,
             trigger: None,

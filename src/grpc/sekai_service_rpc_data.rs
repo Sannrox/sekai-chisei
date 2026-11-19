@@ -4098,6 +4098,11 @@ pub(super) async fn write_transform_run_result(
                 },
             )
             .collect(),
+        model_outputs: input
+            .model_outputs
+            .into_iter()
+            .map(super::model_version_rpc::model_output_from_proto)
+            .collect::<Result<_, _>>()?,
         ..crate::sekai::governed_transform::WriteTransformRunCommand::default()
     };
     if let Some(context) = tenant_context.as_ref() {
@@ -5100,6 +5105,11 @@ fn to_proto_transform(
                 version_id: version_id.clone(),
             })
             .collect(),
+        model_outputs: transform
+            .isolated_process
+            .iter()
+            .flat_map(|spec| spec.model_outputs.iter().cloned())
+            .collect(),
     }
 }
 
@@ -5163,6 +5173,11 @@ fn from_proto_isolated(
                 "model_inputs apply only to the isolated_process profile",
             ));
         }
+        if !proto.model_outputs.is_empty() {
+            return Err(Status::invalid_argument(
+                "model_outputs apply only to the isolated_process profile",
+            ));
+        }
         return Ok(None);
     }
     // The engine needs something to run (#1605).
@@ -5190,8 +5205,24 @@ fn from_proto_isolated(
             )?,
             code: proto.code.clone(),
             model_inputs: model_inputs_from_proto(&proto.model_inputs)?,
+            model_outputs: model_outputs_from_proto(&proto.model_outputs)?,
         },
     ))
+}
+
+/// Model output names; a repeated name is refused rather than collapsed.
+fn model_outputs_from_proto(
+    names: &[String],
+) -> Result<std::collections::BTreeSet<String>, Status> {
+    let mut outputs = std::collections::BTreeSet::new();
+    for name in names {
+        if !outputs.insert(name.trim().to_string()) {
+            return Err(Status::invalid_argument(
+                "model output names must be unique",
+            ));
+        }
+    }
+    Ok(outputs)
 }
 
 /// Model inputs by name; a repeated name is refused rather than collapsed.

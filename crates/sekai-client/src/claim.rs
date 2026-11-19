@@ -431,6 +431,9 @@ pub struct TransformWrite {
     pub quarantined: bool,
     pub quality_rule: String,
     pub partitions: Vec<crate::protocol::sekai::TransformPartitionWrite>,
+    /// One trained model per name the definition declares in
+    /// `model_outputs` (#3021); empty for a transform that trains none.
+    pub model_outputs: Vec<crate::protocol::sekai::TransformModelOutput>,
 }
 
 /// Stream of transform input rows whose item errors use the claim taxonomy.
@@ -1427,6 +1430,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 quarantined: write.quarantined,
                 quality_rule: write.quality_rule,
                 partitions: write.partitions,
+                model_outputs: write.model_outputs,
             },
             false,
             true,

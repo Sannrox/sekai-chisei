@@ -1167,8 +1167,8 @@ fn ephemeral_lineage_node(resource_id: &str, kind: &str, namespace: &str) -> dom
 /// The non-object nodes `node` came from: the dataset behind a
 /// dataset-backed object type, the source binding that lands a source-owned
 /// dataset, the transforms that write a dataset, every dataset input and
-/// model version a transform reads, and the training datasets of a model
-/// version.
+/// model version a transform reads, and the training datasets and training
+/// transform of a model version.
 fn lineage_upstream(
     db: &RuntimeDb,
     node: &domain::Object,
@@ -1242,25 +1242,32 @@ fn lineage_upstream(
                     .collect()
             })
             .unwrap_or_default()),
-        // A model version came from the dataset versions it was trained on.
-        LINEAGE_MODEL_VERSION => Ok(db
-            .get_model_version(&node.namespace, resource_id)
-            .map_err(Status::internal)?
-            .map(|version| {
-                version
-                    .training_inputs
-                    .iter()
-                    .filter(|input| !crate::sekai::object_set_input::is_pin_key(&input.dataset_id))
-                    .map(|input| {
-                        ephemeral_lineage_node(
-                            &input.dataset_id,
-                            LINEAGE_DATASET,
-                            &version.namespace,
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()),
+        // A model version came from the dataset versions it was trained on,
+        // and from the transform whose run trained it (#3021).
+        LINEAGE_MODEL_VERSION => {
+            let Some(version) = db
+                .get_model_version(&node.namespace, resource_id)
+                .map_err(Status::internal)?
+            else {
+                return Ok(Vec::new());
+            };
+            let trainer = db
+                .get_governed_transform_run(&version.run_id)
+                .map_err(Status::internal)?
+                .filter(|run| run.namespace == version.namespace)
+                .map(|run| {
+                    ephemeral_lineage_node(&run.transform_id, LINEAGE_TRANSFORM, &version.namespace)
+                });
+            Ok(version
+                .training_inputs
+                .iter()
+                .filter(|input| !crate::sekai::object_set_input::is_pin_key(&input.dataset_id))
+                .map(|input| {
+                    ephemeral_lineage_node(&input.dataset_id, LINEAGE_DATASET, &version.namespace)
+                })
+                .chain(trainer)
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }

@@ -331,6 +331,30 @@ resolves the version with `GetModelVersion` and loads the bytes from the
 registry itself; the claim does not carry them. A dataset input id may not
 start with `model:` beside model inputs.
 
+### Model outputs
+
+An isolated-process definition may declare the models its code trains in
+`model_outputs`, a list of model names (#3021). The runner stores each
+trained model's bytes in the registry first, then reports one
+`TransformModelOutput` per declared name with `WriteTransformRunResult`:
+digest, adapter id and version, registry locator, and adapter contract.
+
+- The plane publishes each as a model version in the same transaction that
+  commits the run's output. The version names the run, takes the run's
+  output marking, and records the run's pinned inputs (except the model
+  versions it scored with) as its training inputs.
+- A write-back must report exactly the declared models, each once.
+  Anything else refuses the whole write, and nothing is published.
+- A quarantined run publishes nothing, nor does a run that fails or is
+  cancelled before its write-back. A killed host's stale claim cannot write,
+  and the retried run publishes exactly one version of each model. A
+  repeated write-back of a committed run adds nothing.
+- An ad-hoc run publishes no models.
+
+Lineage reaches from a model version to the transform that trained it, as
+well as to its training datasets. A newly published version moves the
+model's gateless stages to it, as registration does.
+
 ### Model stages
 
 A stage such as `staging` or `production` names the version of one model

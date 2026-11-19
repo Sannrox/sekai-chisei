@@ -229,6 +229,7 @@ impl Subject<'_> {
                             replaced_partitions: Vec::new(),
                             partition_key: None,
                             max_bytes: 0,
+                            model_outputs: Vec::new(),
                         },
                         now_ms,
                     )
@@ -421,6 +422,7 @@ fn admit_transform(db: &RuntimeDb, namespace: &str) -> String {
             requires: Default::default(),
             code: String::new(),
             model_inputs: Default::default(),
+            model_outputs: Default::default(),
         }),
         schedule: None,
         trigger: None,
