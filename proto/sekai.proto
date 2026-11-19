@@ -1700,7 +1700,11 @@ message AckWorkRequest {
   // auth_failed, permission_missing, invalid or unsupported. A failed sync
   // waits for the next interval. An external effect takes completed,
   // failed (the change did not apply) or outcome_unknown (the executor
-  // cannot tell); each is final, and reason is at most 1 KiB.
+  // cannot tell); each is final, and reason is at most 1 KiB. Transform
+  // work completes by WriteTransformRunResult; here it takes only failed,
+  // with a reason code of lowercase letters, digits and _, which ends the
+  // run as refused with that code and no output (#3075). The response then
+  // carries no payload.
   string outcome = 6;
   string reason = 7;
   // Source sync and external effects: the work's namespace.

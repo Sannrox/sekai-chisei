@@ -126,6 +126,7 @@ futures = "0.3"
 [dev-dependencies]
 chisei-core = { version = "3.0.0", path = "crates/chisei-core", features = ["gateway-test-support"] }
 sekai-core = { version = "4.0.0", path = "crates/sekai-core", features = ["gateway-test-support"] }
+sekai-adapters = { path = "crates/sekai-adapters" }
 sekai-client = { path = "crates/sekai-client" }
 sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
