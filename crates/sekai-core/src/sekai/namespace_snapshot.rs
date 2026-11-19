@@ -238,7 +238,9 @@ pub fn grant_namespace(
     }
 
     let grant = PeerNamespaceGrant {
-        grant_id: grant_id_for(&request.peer_site_id, &request.namespace, now_ms),
+        // Random, so a second grant in the same millisecond never replaces the
+        // first through the store's upsert on grant_id.
+        grant_id: format!("grant-{}", uuid::Uuid::new_v4().simple()),
         peer_site_id: request.peer_site_id.clone(),
         namespace: request.namespace.clone(),
         object_kinds: request.object_kinds.clone(),
@@ -1393,11 +1395,6 @@ fn validate_policy_pack(pin: &PolicyPackPin) -> Result<(), String> {
     Ok(())
 }
 
-fn grant_id_for(peer_site_id: &str, namespace: &str, now_ms: i64) -> String {
-    let digest = Sha256::digest(format!("{peer_site_id}\0{namespace}\0{now_ms}").as_bytes());
-    format!("grant-{}", encode_hex(&digest[..16]))
-}
-
 fn snapshot_id_for(site_id: &str, namespace: &str, digest: &str) -> String {
     let hashed = Sha256::digest(format!("{site_id}\0{namespace}\0{digest}").as_bytes());
     format!("snapshot-{}", encode_hex(&hashed[..16]))
@@ -1695,6 +1692,53 @@ mod tests {
         register_site(&exporter, "site-a", 1);
         federate_importer(&importer, 1);
         (exporter, importer)
+    }
+
+    fn exercise_same_millisecond_grants_stay_distinct(db: &RuntimeDb) {
+        register_site(db, "site-b", 2);
+        pin_peer_root(db, "site-a", 1);
+        join(db, "site-a", 1);
+        let request = |kind: &str| GrantNamespaceRequest {
+            peer_site_id: "site-a".into(),
+            namespace: "ops".into(),
+            object_kinds: vec![kind.into()],
+            max_classification: Some("internal".into()),
+            not_before_ms: 0,
+            not_after_ms: None,
+        };
+        let first = grant_namespace(db, "admin", &request("asset"), 3_000).unwrap();
+        revoke_namespace_grant(db, "admin", &first.grant_id, 3_000).unwrap();
+        let second = grant_namespace(db, "admin", &request("ticket"), 3_000).unwrap();
+
+        assert_ne!(first.grant_id, second.grant_id);
+        let stored_first = db
+            .get_federation_namespace_grant(&first.grant_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored_first.revoked);
+        assert_eq!(stored_first.object_kinds, vec!["asset".to_string()]);
+        let stored_second = db
+            .get_federation_namespace_grant(&second.grant_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_second, second);
+        let listed = db
+            .list_federation_namespace_grants(Some("ops"), Some("site-a"))
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn same_millisecond_grants_stay_distinct() {
+        exercise_same_millisecond_grants_stay_distinct(&db());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_same_millisecond_grants_stay_distinct() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        exercise_same_millisecond_grants_stay_distinct(&db);
     }
 
     #[test]
