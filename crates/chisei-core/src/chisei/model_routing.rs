@@ -678,6 +678,8 @@ mod tests {
             default_data_class: "unclassified".into(),
             safe_egress_providers: vec![],
             gateway_provided_providers: vec![],
+            gateway_key: None,
+            gateway_url: crate::config::DEFAULT_GATEWAY_URL.into(),
             routing_endpoint_allowlist: vec![],
             routing_credential_refs: vec![],
             gateway_receipt_principals: vec![],

@@ -163,6 +163,8 @@ Operator runbook and data model: [budget-topology.md](budget-topology.md). Desig
 | `CHISEI_DEFAULT_DATA_CLASS` | `unclassified` | Default classification for egress decisions |
 | `CHISEI_SAFE_EGRESS_PROVIDERS` | empty | Comma-separated providers allowed by egress policy |
 | `CHISEI_GATEWAY_PROVIDED_PROVIDERS` | empty | Providers whose upstream auth is supplied by the gateway; model routing treats them as available without a local key |
+| `CHISEI_GATEWAY_KEY` | unset | Gateway client key native execution presents. When set, native calls for `openai` and `anthropic` listed in `CHISEI_GATEWAY_PROVIDED_PROVIDERS` go to `CHISEI_GATEWAY_URL`, and this process needs no key for them |
+| `CHISEI_GATEWAY_URL` | `http://127.0.0.1:8788` | Gateway origin native execution sends through with `CHISEI_GATEWAY_KEY`; also the gateway that `chisei-gateway refresh` and `sekaictl` gateway setup address |
 | `SEKAI_ROUTING_ENDPOINT_ALLOWLIST` | empty | Comma-separated `https://host[:port]` origins that customer-hosted routing profiles may use; loopback `http` origins only when listed. Empty admits none. Read at startup |
 | `SEKAI_ROUTING_CREDENTIAL_<REF>` | unset | Secret for a customer-hosted profile whose `credential_ref` is `<REF>` (`[A-Z0-9_]`). Only the reference name is stored. Read at startup |
 | `CHISEI_GATEWAY_RECEIPT_PRINCIPALS` | empty | Token-authenticated service principals allowed to write gateway receipts |

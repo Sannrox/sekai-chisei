@@ -30,6 +30,14 @@ pub struct Config {
     /// control-plane server (e.g. Codex ChatGPT-plan passthrough). Model routing
     /// treats them as available even when the server holds no API key for them.
     pub gateway_provided_providers: Vec<String>,
+    /// Gateway client key native execution presents as an ordinary principal
+    /// (`CHISEI_GATEWAY_KEY`, ADR 0152, #2700). When set, native calls for the
+    /// `gateway_provided_providers` the gateway serves go to `gateway_url`
+    /// instead of the provider, and this process needs no key for them.
+    pub gateway_key: Option<String>,
+    /// Gateway origin native execution egresses through (`CHISEI_GATEWAY_URL`,
+    /// default `http://127.0.0.1:8788`). Used only with `gateway_key`.
+    pub gateway_url: String,
     /// Operator-owned origins customer-hosted routing profiles may use
     /// (`SEKAI_ROUTING_ENDPOINT_ALLOWLIST`, #1171), as canonical origins.
     pub routing_endpoint_allowlist: Vec<String>,
@@ -106,6 +114,8 @@ impl Config {
             default_data_class: env("CHISEI_DEFAULT_DATA_CLASS", "unclassified"),
             safe_egress_providers: csv_env("CHISEI_SAFE_EGRESS_PROVIDERS"),
             gateway_provided_providers: csv_env("CHISEI_GATEWAY_PROVIDED_PROVIDERS"),
+            gateway_key: optional_env("CHISEI_GATEWAY_KEY"),
+            gateway_url: env("CHISEI_GATEWAY_URL", DEFAULT_GATEWAY_URL),
             routing_endpoint_allowlist: crate::chisei::routing_profiles::endpoint_allowlist(),
             routing_credential_refs: crate::chisei::routing_profiles::resolvable_credential_refs(),
             gateway_receipt_principals: identity_csv_env("CHISEI_GATEWAY_RECEIPT_PRINCIPALS"),
@@ -305,6 +315,9 @@ fn security_i64_env(name: &str, default: i64, invalid: i64) -> i64 {
         }
     }
 }
+
+/// Gateway origin when `CHISEI_GATEWAY_URL` is unset; the gateway's own default bind.
+pub const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8788";
 
 fn env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
