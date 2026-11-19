@@ -30,11 +30,15 @@ use sekai_chisei::sekai::definition_proposal::{
     STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, merge_receipt_id,
 };
 
-fn member(namespace: &str, member_id: &str, definition_json: &str) -> DefinitionMemberInput {
+pub(crate) fn member(
+    namespace: &str,
+    member_id: &str,
+    definition_json: &str,
+) -> DefinitionMemberInput {
     typed_member(namespace, "object_type", member_id, definition_json)
 }
 
-fn typed_member(
+pub(crate) fn typed_member(
     namespace: &str,
     member_kind: &str,
     member_id: &str,
@@ -54,7 +58,10 @@ fn digest(byte: char) -> String {
     format!("sha256:{}", byte.to_string().repeat(64))
 }
 
-fn seed(db: &dyn DefinitionBranchBackend, namespace: &str) -> (String, CreateDefinitionBranch) {
+pub(crate) fn seed(
+    db: &dyn DefinitionBranchBackend,
+    namespace: &str,
+) -> (String, CreateDefinitionBranch) {
     let input = member(namespace, "Ticket", r#"{"name":"Ticket"}"#);
     let prepared = input.prepare(namespace).unwrap();
     let revision = prepare_revision(
@@ -1732,7 +1739,7 @@ fn exercise_rollback_live_values(
     );
 }
 
-fn publish_revision(
+pub(crate) fn publish_revision(
     db: &dyn DefinitionBranchBackend,
     namespace: &str,
     parent_digest: &str,
@@ -2770,7 +2777,7 @@ fn sqlite_definition_branch_backend_conformance() {
     );
 }
 
-fn postgres() -> PostgresDb {
+pub(crate) fn postgres() -> PostgresDb {
     let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
         .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
     if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
