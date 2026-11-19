@@ -113,14 +113,25 @@ fn template_connector_commits_fake_pages_through_the_plane() {
         Ok(RunOutcome::Quarantined)
     );
     assert!(quarantine_outbox.pending().unwrap().is_empty());
+    // The refused batch is kept in quarantine, and the plane recorded nothing.
+    assert_eq!(quarantine_outbox.quarantine_count().unwrap(), 1);
+    let sync_state_input = GetSourceSyncStateInput {
+        namespace: config.namespace.clone(),
+        source_instance: config.source_instance.clone(),
+        type_digest: config.type_digest.clone(),
+    };
+    let refused_state = connect().get_source_sync_state(&sync_state_input).unwrap();
+    assert_eq!(refused_state.current_cursor, None, "{refused_state:?}");
+    assert!(!refused_state.open_transaction, "{refused_state:?}");
 
     let outbox_root = tempfile::tempdir().unwrap();
     let outbox = SourceOutbox::open(outbox_root.path(), OutboxLimits::default()).unwrap();
     let mut source = FakeSource::new(&config.source, &config.source_instance);
     let mut transport = connect();
 
+    // Bounded, so a stuck cursor fails the test instead of hanging `it`.
     let mut outcomes = Vec::new();
-    loop {
+    for _ in 0..10 {
         let outcome = run_once(&config, &outbox, &mut source, &mut transport).unwrap();
         outcomes.push(outcome.clone());
         if !matches!(
@@ -133,6 +144,7 @@ fn template_connector_commits_fake_pages_through_the_plane() {
             break;
         }
     }
+    // A loop that hit the cap fails here, listing the collected outcomes.
     assert_eq!(
         outcomes,
         [
@@ -146,13 +158,7 @@ fn template_connector_commits_fake_pages_through_the_plane() {
             },
         ]
     );
-    let state = transport
-        .get_source_sync_state(&GetSourceSyncStateInput {
-            namespace: config.namespace.clone(),
-            source_instance: config.source_instance.clone(),
-            type_digest: config.type_digest.clone(),
-        })
-        .unwrap();
+    let state = transport.get_source_sync_state(&sync_state_input).unwrap();
     assert!(state.found);
     assert_eq!(state.current_cursor.as_deref(), Some("page-2"));
     assert!(!state.open_transaction);
