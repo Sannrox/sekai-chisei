@@ -36,7 +36,15 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn delivery(namespace: &str, id: &str, seed: u8, key_id: &str) -> SourceWebhookDelivery {
+/// A webhook delivery `id` from `current` to `push:{id}`, signed by
+/// `signing_key(seed)` under `key_id`.
+fn delivery(
+    namespace: &str,
+    id: &str,
+    current: &str,
+    seed: u8,
+    key_id: &str,
+) -> SourceWebhookDelivery {
     let mut delivery = SourceWebhookDelivery {
         contract_version: WEBHOOK_DELIVERY_CONTRACT.into(),
         delivery_id: id.into(),
@@ -45,7 +53,7 @@ fn delivery(namespace: &str, id: &str, seed: u8, key_id: &str) -> SourceWebhookD
         source: SOURCE_GITHUB.into(),
         source_instance: REPOSITORY.into(),
         type_digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
-        current_cursor: String::new(),
+        current_cursor: current.into(),
         proposed_next_cursor: format!("push:{id}"),
         signed_at_ms: 5_000,
         not_after_ms: 65_000,
@@ -108,7 +116,12 @@ fn pager_batch(namespace: &str, digest: &str, current: &str, next: &str) -> Sour
 
 fn exercise_webhook_pins(db: &RuntimeDb, namespace: &str) {
     let producer = format!("connector/{namespace}");
-    let unpinned = admit_source_webhook(db, &producer, &delivery(namespace, "d0", 1, "k1"), 5_100);
+    let unpinned = admit_source_webhook(
+        db,
+        &producer,
+        &delivery(namespace, "d0", "", 1, "k1"),
+        5_100,
+    );
     assert_eq!(unpinned.unwrap_err(), ADMIT_UNAVAILABLE);
 
     let public_key = hex(signing_key(1).verifying_key().as_bytes());
@@ -124,14 +137,31 @@ fn exercise_webhook_pins(db: &RuntimeDb, namespace: &str) {
             .is_empty()
     );
 
-    let admitted =
-        admit_source_webhook(db, &producer, &delivery(namespace, "d1", 1, "k1"), 5_100).unwrap();
+    let admitted = admit_source_webhook(
+        db,
+        &producer,
+        &delivery(namespace, "d1", "", 1, "k1"),
+        5_100,
+    )
+    .unwrap();
     assert_eq!(admitted.outcome, "accepted");
     assert!(admitted.batch.checkpoint_advanced);
 
-    let foreign_key =
-        admit_source_webhook(db, &producer, &delivery(namespace, "d2", 2, "k2"), 5_100);
-    assert_eq!(foreign_key.unwrap_err(), ADMIT_UNAVAILABLE);
+    // Both refusals carry the current cursor, so only the key can refuse them.
+    let foreign_key = delivery(namespace, "d2", "push:d1", 2, "k2");
+    assert_eq!(
+        admit_source_webhook(db, &producer, &foreign_key, 5_100).unwrap_err(),
+        ADMIT_UNAVAILABLE
+    );
+    let wrong_signer = delivery(namespace, "d2", "push:d1", 2, "k1");
+    assert_eq!(
+        admit_source_webhook(db, &producer, &wrong_signer, 5_100).unwrap_err(),
+        ADMIT_UNAVAILABLE
+    );
+    let pinned = delivery(namespace, "d2", "push:d1", 1, "k1");
+    let admitted = admit_source_webhook(db, &producer, &pinned, 5_100).unwrap();
+    assert_eq!(admitted.outcome, "accepted");
+    assert!(admitted.batch.checkpoint_advanced);
 }
 
 fn exercise_registered_descriptor(db: &RuntimeDb, namespace: &str) {
