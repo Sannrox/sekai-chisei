@@ -228,12 +228,33 @@ async fn a_reused_commit_and_a_stale_tree_are_refused() {
             .unwrap_or_else(|error| panic!("{attempt}: {error}\n{}", server.logs()));
     }
 
+    // Merging the first import moves the head past `head`; a tree planned
+    // against that real older head would revert the merge.
+    sekai
+        .approve_definition_proposal(ApproveDefinitionProposalRequest {
+            namespace: "import-a".into(),
+            proposal_id: "import-eeeeeee".into(),
+            idempotency_key: "approve-eeeeeee".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("approve: {error}\n{}", server.logs()));
+    sekai
+        .merge_definition_proposal(MergeDefinitionProposalRequest {
+            namespace: "import-a".into(),
+            proposal_id: "import-eeeeeee".into(),
+            idempotency_key: "merge-eeeeeee".into(),
+            expected_published_digest: head.clone(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("merge: {error}\n{}", server.logs()));
+    assert_ne!(
+        published_head(&server).await,
+        head,
+        "the merge moved the head"
+    );
+
     let stale = sekai
-        .import_definition_tree(incident_import(
-            "fffffff",
-            &other,
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-        ))
+        .import_definition_tree(incident_import("fffffff", &other, &head))
         .await
         .unwrap_err();
     assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
