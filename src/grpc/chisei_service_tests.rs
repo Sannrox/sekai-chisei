@@ -7164,10 +7164,8 @@ async fn record_usage_is_idempotent_for_replayed_keys() {
     assert_eq!(mismatch.code(), tonic::Code::Internal);
 }
 
-#[tokio::test]
-async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
-    let svc = memory_service();
-    let operation_id = "gateway-receipt-1";
+/// A complete gateway receipt for `operation_id`; `status` is its outcome.
+fn gateway_receipt(operation_id: &str, status: &str) -> OperationReceipt {
     let events = vec![
         receipt_event(
             operation_id,
@@ -7212,10 +7210,10 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
             5,
             ReceiptEventKind::OutcomeRecorded,
             "chisei-gateway",
-            BTreeMap::from([("status".into(), "completed".into())]),
+            BTreeMap::from([("status".into(), status.into())]),
         ),
     ];
-    let receipt = OperationReceipt {
+    OperationReceipt {
         version: OPERATION_RECEIPT_VERSION.into(),
         operation_id: operation_id.into(),
         parent_operation_id: None,
@@ -7231,7 +7229,14 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
         reporter_grants: Vec::new(),
         ontology_digest: None,
         artifact: None,
-    };
+    }
+}
+
+#[tokio::test]
+async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
+    let svc = memory_service();
+    let operation_id = "gateway-receipt-1";
+    let receipt = gateway_receipt(operation_id, "completed");
     assert!(receipt.completeness().complete);
     let usage = RecordUsageRequest {
         user_id: "agent:caller".into(),
@@ -7261,6 +7266,29 @@ async fn trusted_usage_accounting_persists_the_canonical_gateway_receipt() {
     assert_eq!(
         svc.record_usage(untrusted).await.unwrap_err().code(),
         tonic::Code::PermissionDenied
+    );
+}
+
+#[tokio::test]
+async fn a_report_that_loses_the_receipt_insert_race_does_not_overwrite_or_attribute() {
+    let svc = memory_service();
+    let operation_id = "gateway-receipt-race";
+    let winner = gateway_receipt(operation_id, "completed");
+    svc.db.insert_operation_receipt(&winner).unwrap();
+    // Both reports read no receipt; this one inserts after the winner did.
+    let loser = gateway_receipt(operation_id, "failed");
+    let refused = svc
+        .insert_gateway_receipt(&loser, false, "agent:caller", 10)
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::AlreadyExists);
+    assert_eq!(
+        svc.db.get_operation_receipt(operation_id).unwrap(),
+        Some(winner.clone())
+    );
+    // An identical racing report replays, and only the winner attributes.
+    assert!(
+        !svc.insert_gateway_receipt(&winner, false, "agent:caller", 10)
+            .unwrap()
     );
 }
 

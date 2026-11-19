@@ -116,32 +116,19 @@ impl ChiseiServiceImpl {
             .db
             .get_operation_receipt(&receipt.operation_id)
             .map_err(Status::internal)?;
-        if existing
-            .as_ref()
-            .is_some_and(|existing| existing != &receipt)
-        {
-            return Err(Status::already_exists(
-                "operation receipt already exists with different evidence",
-            ));
-        }
-        if existing.is_none() && has_kioku_context {
-            reported_operation_event_lifecycle::record_reported_memory_outcomes(
-                &self.db,
+        let inserted = match existing {
+            Some(existing) => {
+                require_same_receipt(&existing, &receipt)?;
+                false
+            }
+            None => self.insert_gateway_receipt(
                 &receipt,
+                has_kioku_context,
                 authenticated_principal,
                 now,
-                false,
-                None,
-                true,
-            )
-            .map_err(|error| {
-                Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
-            })?;
-        }
-        self.db
-            .put_operation_receipt(&receipt)
-            .map_err(Status::internal)?;
-        if existing.is_none()
+            )?,
+        };
+        if inserted
             && has_kioku_context
             && let Err(error) = reported_operation_event_lifecycle::record_reported_memory_outcomes(
                 &self.db,
@@ -177,4 +164,56 @@ impl ChiseiServiceImpl {
             }])
             .map_err(Status::internal)
     }
+
+    /// Stores a first receipt for its operation with an insert-only write.
+    /// Returns whether this call stored it; a concurrent report that won the
+    /// insert makes this an identical replay or AlreadyExists (#2721), so
+    /// Kioku attribution runs once per operation.
+    pub(super) fn insert_gateway_receipt(
+        &self,
+        receipt: &OperationReceipt,
+        has_kioku_context: bool,
+        authenticated_principal: &str,
+        now: i64,
+    ) -> Result<bool, Status> {
+        if has_kioku_context {
+            reported_operation_event_lifecycle::record_reported_memory_outcomes(
+                &self.db,
+                receipt,
+                authenticated_principal,
+                now,
+                false,
+                None,
+                true,
+            )
+            .map_err(|error| {
+                Status::invalid_argument(format!("Kioku outcome attribution invalid: {error}"))
+            })?;
+        }
+        let Err(error) = self.db.insert_operation_receipt(receipt) else {
+            return Ok(true);
+        };
+        match self
+            .db
+            .get_operation_receipt(&receipt.operation_id)
+            .map_err(Status::internal)?
+        {
+            Some(existing) => require_same_receipt(&existing, receipt).map(|()| false),
+            None => Err(Status::internal(error)),
+        }
+    }
+}
+
+/// An operation keeps its first receipt: a report with different evidence is
+/// refused, an identical one replays.
+fn require_same_receipt(
+    existing: &OperationReceipt,
+    receipt: &OperationReceipt,
+) -> Result<(), Status> {
+    if existing != receipt {
+        return Err(Status::already_exists(
+            "operation receipt already exists with different evidence",
+        ));
+    }
+    Ok(())
 }
