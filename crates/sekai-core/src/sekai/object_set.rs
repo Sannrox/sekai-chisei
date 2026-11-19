@@ -10,6 +10,7 @@ use crate::sekai::geospatial::{
     parse_geospatial_query,
 };
 use crate::sekai::object_security::object_query_digest;
+use sekai_types::governed_transform::hash_field;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -471,16 +472,21 @@ pub fn descriptor_query_digest(
     hasher.update(CONTRACT_VERSION.as_bytes());
     hasher.update(descriptor.definition_digest.as_bytes());
     hasher.update(list_digest.as_bytes());
+    // Hop and aggregation fields are length-prefixed so text cannot move
+    // between adjacent fields without changing the digest. A descriptor with
+    // neither hashes as before, so export source versions stay stable.
     for hop in resolved_hops(descriptor) {
-        hasher.update(hop.relation.as_bytes());
-        hasher.update(hop.direction.as_bytes());
-        hasher.update(hop.far_kind.as_bytes());
-        hasher.update(hop.join_property.as_bytes());
+        hasher.update(b"hop");
+        hash_field(&mut hasher, &hop.relation);
+        hash_field(&mut hasher, &hop.direction);
+        hash_field(&mut hasher, &hop.far_kind);
+        hash_field(&mut hasher, &hop.join_property);
     }
     if let Some(aggregation) = &descriptor.aggregation {
-        hasher.update(aggregation.function.as_bytes());
-        hasher.update(aggregation.property.as_bytes());
-        hasher.update(aggregation.group_by.as_bytes());
+        hasher.update(b"aggregation");
+        hash_field(&mut hasher, &aggregation.function);
+        hash_field(&mut hasher, &aggregation.property);
+        hash_field(&mut hasher, &aggregation.group_by);
     }
     // Hashed only when present, so v1 and v2 digests (and the cursors that
     // carry them) are unchanged.
@@ -1230,6 +1236,55 @@ mod tests {
             traversed.prepare(&digest, &members),
             Err(ObjectSetError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn query_digest_separates_adjacent_hop_and_aggregation_fields() {
+        let filter = ListFilter::default();
+        let hop = |far_kind: &str, join_property: &str| ObjectSetTraversal {
+            relation: "owns".into(),
+            direction: "outgoing".into(),
+            far_kind: far_kind.into(),
+            join_property: join_property.into(),
+        };
+        let with_hops = |hops| ObjectSetDescriptor {
+            hops,
+            ..Default::default()
+        };
+        let digest = |descriptor: &ObjectSetDescriptor| {
+            descriptor_query_digest(descriptor, &filter).unwrap()
+        };
+        assert_ne!(
+            digest(&with_hops(vec![hop("asset", "owner")])),
+            digest(&with_hops(vec![hop("asse", "towner")])),
+        );
+        assert_ne!(
+            digest(&with_hops(vec![hop("asset", "ownerowns"), hop("x", "y")])),
+            digest(&with_hops(vec![hop("asset", "owner"), hop("x", "y")])),
+        );
+        let aggregate = |property: &str, group_by: &str| ObjectSetDescriptor {
+            aggregation: Some(ObjectSetAggregation {
+                function: "sum".into(),
+                property: property.into(),
+                group_by: group_by.into(),
+            }),
+            ..Default::default()
+        };
+        assert_ne!(
+            digest(&aggregate("cost", "region")),
+            digest(&aggregate("costr", "egion")),
+        );
+
+        // A descriptor without hops or aggregation keeps its earlier digest.
+        let plain = ObjectSetDescriptor {
+            definition_digest: "sha256:definition".into(),
+            ..Default::default()
+        };
+        let mut unchanged = Sha256::new();
+        unchanged.update(CONTRACT_VERSION.as_bytes());
+        unchanged.update(plain.definition_digest.as_bytes());
+        unchanged.update(object_query_digest(&filter).unwrap().as_bytes());
+        assert_eq!(digest(&plain), format!("{:x}", unchanged.finalize()));
     }
 
     #[test]
