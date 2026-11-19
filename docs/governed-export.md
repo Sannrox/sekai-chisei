@@ -34,8 +34,11 @@ is a stream:
 Rows are the objects a read returns, in the descriptor's order. A property
 the reader may not see is an empty cell, an absent key, or a null Parquet
 cell. CSV fields with a
-comma, quote, line break or surrounding whitespace are quoted. Values are
-written as stored, without spreadsheet formula escaping.
+comma, quote, line break or surrounding whitespace are quoted. A CSV value
+that starts with `=`, `+`, `-`, `@`, a tab, a carriage return or `'` is
+written quoted with one leading apostrophe so a spreadsheet does not run it
+as a formula; strip exactly one leading apostrophe to recover the stored
+value. JSON Lines and Parquet values are written as stored.
 
 The receipt (`operation_class` `governed_export`) is a Sekai record, written
 before the first byte. It is closed with outcome `completed` (with the row

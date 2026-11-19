@@ -573,6 +573,8 @@ fn parse_csv(text: &str) -> Result<Vec<SampleRow>, String> {
         let mut id = String::new();
         for (index, name) in header.iter().enumerate() {
             let field = fields.get(index).cloned().unwrap_or_default();
+            // The encoder prefixes formula-leading cells with one apostrophe.
+            let field = field.strip_prefix('\'').map(str::to_owned).unwrap_or(field);
             if Some(index) == id_at {
                 id = field.clone();
             }
