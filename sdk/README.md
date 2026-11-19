@@ -47,8 +47,11 @@ canonical checkout's `proto/` directory; the SDK intentionally does not bundle
 a second protocol snapshot. Publication records from
 `sekaictl admin sdk-packages` pin protocol, source, and package digests; they
 are not registry downloads. Isolated consumer proof lives in
-`tests/sdk_external_consumer.rs` (#840, #843, #844, #1093). It fails closed
-without `python3`, `node`, `npm`, and `rustc`, pins `sekai-proto` beside the
+`tests/sdk_external_consumer.rs` (#840, #843, #844, #1093). Its tests are
+ignored by default because they need `python3`, `node`, `npm`, `rustc`, and
+registry network access; run them with
+`cargo test --test it -- --ignored sdk_external_consumer` (CI does). They fail
+closed without those tools, pin `sekai-proto` beside the
 staged Rust client, re-hashes protocol, source, and package bytes from disk,
 and installs packed TypeScript/Python artifacts into a consumer that does not
 import an in-repo path.
