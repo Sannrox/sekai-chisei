@@ -278,7 +278,7 @@ fn verify_rejects_bad_signature() {
         1_500,
     )
     .unwrap_err();
-    assert!(!err.is_empty());
+    assert_eq!(err, "permit signature verification failed");
 }
 
 #[test]
@@ -554,6 +554,18 @@ fn redeem_after_revoke_fails() {
     ));
     let record = authorization(10_000, 2);
     let (permit, key) = persist_and_issue(&db, &record);
+    let context = host_context(&permit, permit.required_host_capabilities.clone());
+    // The permit redeems before revocation, so the later refusal is the revocation.
+    db.redeem_permit(
+        &permit,
+        &context,
+        &key.verifying_key(),
+        "idem-before-revoke",
+        "execution-before-revoke",
+        "local",
+        3_000,
+    )
+    .unwrap();
     db.revoke_permit(
         &permit.revocation_handle,
         "operator:test",
@@ -564,7 +576,7 @@ fn redeem_after_revoke_fails() {
     let err = db
         .redeem_permit(
             &permit,
-            &host_context(&permit, permit.required_host_capabilities.clone()),
+            &context,
             &key.verifying_key(),
             "idem-revoked",
             "execution-revoked",
@@ -572,7 +584,7 @@ fn redeem_after_revoke_fails() {
             4_000,
         )
         .unwrap_err();
-    assert!(!err.is_empty());
+    assert_eq!(err, "permit revoked: operator revoked");
 }
 
 #[test]
