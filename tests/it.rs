@@ -122,6 +122,7 @@ mod sekaictl_evaluation_compare;
 mod sekaictl_evaluation_plan;
 mod sekaictl_learning_pin;
 mod sekaictl_semantic_reads;
+mod sekaictl_unmarked_fence;
 mod service_file_ceilings;
 mod service_principal_backend_conformance;
 mod source_ingestion_benchmark;

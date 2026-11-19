@@ -75,7 +75,7 @@ pub fn run_unmarked_command(args: Vec<String>) -> Result<(), BoxErr> {
             Ok(())
         }
         UnmarkedCommand::Apply { namespace, marking } => {
-            let store = open_sekai_store()?;
+            let store = open_fenced_sekai_store()?;
             let report = apply_unmarked(&store, &namespace, &marking)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
@@ -120,9 +120,24 @@ pub fn apply_unmarked(
     })
 }
 
+/// Read-only `list` opens the configured store as is.
 fn open_sekai_store() -> Result<SekaiStore, BoxErr> {
     let cfg = Config::from_env();
     let layout = CombinedStoreLayout::from_env(&cfg.db_path).map_err(std::io::Error::other)?;
+    Ok(layout.handles().0)
+}
+
+/// `apply` writes, so it opens through the relocate writer fence like the
+/// other admin writers and, like the mutating RPCs, refuses a split pair whose
+/// generations disagree after a one-sided restore.
+fn open_fenced_sekai_store() -> Result<SekaiStore, BoxErr> {
+    let cfg = Config::from_env();
+    let layout = crate::db::postgres::off_runtime(|| {
+        let layout = crate::store_relocate::open_layout_or_fence(&cfg.db_path)?;
+        crate::store_relocate::refuse_mutating_if_generation_mismatch(&layout)?;
+        Ok::<_, String>(layout)
+    })
+    .map_err(std::io::Error::other)?;
     Ok(layout.handles().0)
 }
 
