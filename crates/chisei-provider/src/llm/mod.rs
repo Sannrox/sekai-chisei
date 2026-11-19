@@ -95,10 +95,17 @@ pub(super) fn ensure_declared_response_size(
     content_length: Option<u64>,
     context: &str,
 ) -> Result<(), String> {
-    if content_length.is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64) {
+    ensure_declared_size_within(content_length, context, MAX_PROVIDER_RESPONSE_BYTES)
+}
+
+fn ensure_declared_size_within(
+    content_length: Option<u64>,
+    context: &str,
+    limit: usize,
+) -> Result<(), String> {
+    if content_length.is_some_and(|length| length > limit as u64) {
         Err(format!(
-            "{context} exceeded the {} byte response limit",
-            MAX_PROVIDER_RESPONSE_BYTES
+            "{context} exceeded the {limit} byte response limit"
         ))
     } else {
         Ok(())
@@ -109,15 +116,23 @@ pub(super) async fn read_bounded_response(
     response: reqwest::Response,
     context: &str,
 ) -> Result<Vec<u8>, String> {
-    ensure_declared_response_size(response.content_length(), context)?;
+    read_response_within(response, context, MAX_PROVIDER_RESPONSE_BYTES).await
+}
+
+/// Read the whole body, failing as soon as it would exceed `limit` bytes.
+pub(super) async fn read_response_within(
+    response: reqwest::Response,
+    context: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
+    ensure_declared_size_within(response.content_length(), context, limit)?;
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| classify_reqwest_error(context, error))?;
-        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESPONSE_BYTES {
+        if body.len().saturating_add(chunk.len()) > limit {
             return Err(format!(
-                "{context} exceeded the {} byte response limit",
-                MAX_PROVIDER_RESPONSE_BYTES
+                "{context} exceeded the {limit} byte response limit"
             ));
         }
         body.extend_from_slice(&chunk);
