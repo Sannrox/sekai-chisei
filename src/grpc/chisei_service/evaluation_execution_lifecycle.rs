@@ -122,8 +122,6 @@ impl EvaluationExecutionLifecycle {
         actor: &str,
         facts: Arc<RuntimeDb>,
     ) -> Result<evaluation_execution_domain::EvaluationExecutionProjection, Status> {
-        let cancelled = self.cancellation_for(&manifest.manifest_digest)?;
-        cancelled.store(true, Ordering::Release);
         let receipt = self
             .db
             .get_operation_receipt(&index.operation_id)
@@ -133,6 +131,10 @@ impl EvaluationExecutionLifecycle {
         if receipt.completed_at_ms.is_none() && !evaluation_cancellation_requested(&receipt) {
             self.request_cancellation(index, &receipt, actor)?;
         }
+        // Raise the in-process flag only once the cancellation is durable, so a
+        // failed request never cancels a later execute of the same manifest.
+        let cancelled = self.cancellation_for(&manifest.manifest_digest)?;
+        cancelled.store(true, Ordering::Release);
         let execution_lock = self.execution_lock_for(&manifest.manifest_digest)?;
         let _guard = execution_lock.lock().await;
         let projection = self

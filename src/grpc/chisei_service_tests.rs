@@ -4531,6 +4531,68 @@ async fn concurrent_cancellation_reconciles_to_the_first_durable_actor() {
     assert_eq!(quality.totals.allow, 0);
 }
 
+#[tokio::test]
+async fn a_cancel_whose_append_fails_does_not_cancel_the_next_execute() {
+    let svc = evaluation_execution_service(0);
+    let manifest = resolved_execution_fixture(&svc, "cancel-append-fails-resolve").await;
+    let stored = svc
+        .db
+        .get_evaluation_manifest(&manifest.manifest_digest)
+        .unwrap()
+        .unwrap();
+    svc.evaluation_execution_lifecycle
+        .ensure_execution_for_test(&stored, "starter", 2_000)
+        .unwrap();
+    svc.db
+        .runtime()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER receipt_down BEFORE UPDATE ON chisei_operation_receipts
+             BEGIN SELECT RAISE(ABORT, 'receipt store down'); END;",
+        )
+        .unwrap();
+    svc.cancel_evaluation_execution(Request::new(CancelEvaluationExecutionRequest {
+        namespace: "acme".into(),
+        manifest_digest: manifest.manifest_digest.clone(),
+    }))
+    .await
+    .unwrap_err();
+    svc.db
+        .runtime()
+        .conn()
+        .execute_batch("DROP TRIGGER receipt_down;")
+        .unwrap();
+
+    let executed = svc
+        .execute_evaluation_manifest(Request::new(ExecuteEvaluationManifestRequest {
+            execution: Some(EvaluationExecutionRequest {
+                contract_version: evaluation_execution_domain::EXECUTION_REQUEST_CONTRACT.into(),
+                executor_version: evaluation_execution_domain::EXECUTOR_VERSION.into(),
+                namespace: "acme".into(),
+                manifest_digest: manifest.manifest_digest,
+                max_total_duration_ms: 2_000,
+            }),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .execution
+        .unwrap();
+    assert!(
+        executed
+            .steps
+            .iter()
+            .all(|step| step.reason_code != evaluation_execution_domain::REASON_EXECUTION_CANCELLED),
+        "{executed:?}"
+    );
+    let receipt = svc
+        .db
+        .get_operation_receipt(&executed.operation_id)
+        .unwrap()
+        .unwrap();
+    assert!(!evaluation_cancellation_requested(&receipt));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cancellation_is_durable_and_reduces_fail_closed() {
     let svc = Arc::new(evaluation_execution_service(250));
