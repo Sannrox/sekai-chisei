@@ -76,12 +76,27 @@ fn exercise(db: &dyn ChiseiRoutingProfileBackend, prefix: &str) {
     );
     assert_eq!(db.list_hosted_routing_profiles(&foreign).unwrap().len(), 1);
 
-    // Registering again after revocation restores it.
-    db.put_hosted_routing_profile(&replaced).unwrap();
+    // Registering again after revocation restores it in full. The new
+    // registration changes fields, so a backend that revives the revoked row
+    // without writing them fails. The profile exposes no revocation field, so
+    // a listed profile equal to it is live.
+    let reregistered = HostedRoutingProfile {
+        endpoint_origin: "https://a2.example.com".into(),
+        model_patterns: vec!["acme-3-*".into()],
+        artifact_digest: None,
+        registered_at_ms: 5,
+        ..replaced.clone()
+    };
+    db.put_hosted_routing_profile(&reregistered).unwrap();
+    let restored = db.list_hosted_routing_profiles(&namespace).unwrap();
     assert_eq!(
-        db.list_hosted_routing_profiles(&namespace).unwrap().len(),
-        2
+        restored
+            .iter()
+            .map(|profile| profile.profile_id.as_str())
+            .collect::<Vec<_>>(),
+        ["hosted:acme", "hosted:beta"]
     );
+    assert_eq!(restored[0], reregistered);
 }
 
 #[test]
