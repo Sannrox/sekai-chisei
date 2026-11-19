@@ -335,6 +335,11 @@ fn object_properties(structured: &serde_json::Value) -> Result<HashMap<String, S
     Ok(properties)
 }
 
+/// Writes a directly allowed extraction: the document lineage stub, the
+/// object, and its `derived_from` link. A re-run after a write that stopped
+/// part-way finds the object with the same content, skips the create, and
+/// finishes the link, like [`complete_lineage_write`] (#2723). An object id
+/// held with other content still fails the create.
 fn persist_extracted_object(
     db: &RuntimeDb,
     actor: &str,
@@ -353,8 +358,22 @@ fn persist_extracted_object(
         classification,
         now_ms,
     )?;
-    db.create_object_with_audit(object, actor)?;
+    let already_written = db
+        .get_object(&object.id)?
+        .is_some_and(|existing| same_content(&existing, object));
+    if !already_written {
+        db.create_object_with_audit(object, actor)?;
+    }
     link_derived_from(db, object, lineage_id, now_ms)
+}
+
+/// Whether `existing` holds what `object` would write, ignoring timestamps.
+fn same_content(existing: &Object, object: &Object) -> bool {
+    existing.kind == object.kind
+        && existing.name == object.name
+        && existing.namespace == object.namespace
+        && existing.external_id == object.external_id
+        && existing.properties == object.properties
 }
 
 fn link_derived_from(
@@ -996,6 +1015,49 @@ mod tests {
                     .contains_key(LINEAGE_PARENT_CONTENT_DIGEST)
         }));
         assert_eq!(runtime.get_object("inv-1").unwrap().unwrap().id, "inv-1");
+    }
+
+    #[test]
+    fn a_rerun_finishes_an_extraction_whose_link_write_failed() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        set_policy(&runtime, ActionDecision::Allow);
+        let function = extract_function(800_000);
+        let output =
+            || serde_json::json!({"id": "inv-1", "vendor": "ACME", "confidence_micros": 900_000});
+        let sqlite = runtime.as_sqlite().unwrap();
+        sqlite
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_link BEFORE INSERT ON sekai_links
+                 BEGIN SELECT RAISE(ABORT, 'simulated crash'); END;",
+            )
+            .unwrap();
+        extract(&runtime, &function, EXTRACTED, output()).unwrap_err();
+        assert!(runtime.get_object("inv-1").unwrap().is_some());
+        sqlite
+            .conn()
+            .execute_batch("DROP TRIGGER fail_link")
+            .unwrap();
+
+        extract(&runtime, &function, EXTRACTED, output()).unwrap();
+        let lineage_id = document_lineage_object_id("records", "doc:invoice");
+        let lineage = runtime.get_lineage("inv-1", 8).unwrap();
+        assert!(
+            lineage
+                .nodes
+                .iter()
+                .any(|item| item.object.id == lineage_id)
+        );
+
+        let changed =
+            serde_json::json!({"id": "inv-1", "vendor": "Other", "confidence_micros": 900_000});
+        extract(&runtime, &function, EXTRACTED, changed).unwrap_err();
+        assert_eq!(
+            runtime.get_object("inv-1").unwrap().unwrap().properties["vendor"],
+            "ACME"
+        );
     }
 
     #[test]
