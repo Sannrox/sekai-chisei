@@ -205,7 +205,7 @@ impl SekaiRpcInventory {
             ));
         }
 
-        let mut complete = self
+        let complete = self
             .complete_sekai_surfaces
             .iter()
             .map(String::as_str)
@@ -239,10 +239,6 @@ impl SekaiRpcInventory {
             }
         }
         for internal in &self.internal_surfaces {
-            if !complete.contains(internal.surface.as_str()) {
-                // Internal surfaces may extend the complete set.
-                complete.insert(internal.surface.as_str());
-            }
             if internal.evidence.is_empty() {
                 return Err(format!(
                     "internal surface {} is missing evidence",
@@ -251,13 +247,22 @@ impl SekaiRpcInventory {
             }
         }
 
-        // Tenant / identity surfaces must stay absent from the complete set.
-        for surface in &self.complete_sekai_surfaces {
+        // Tenant / identity surfaces stay out of the complete and internal sets.
+        let named = self
+            .complete_sekai_surfaces
+            .iter()
+            .map(|surface| ("complete_sekai_surfaces", surface))
+            .chain(
+                self.internal_surfaces
+                    .iter()
+                    .map(|internal| ("internal_surfaces", &internal.surface)),
+            );
+        for (list, surface) in named {
             let lower = surface.to_ascii_lowercase();
             for banned in ["tenant", "oidc", "oauth"] {
                 if lower.contains(banned) {
                     return Err(format!(
-                        "complete_sekai_surfaces must not include {banned} surface {surface}"
+                        "{list} must not include {banned} surface {surface}"
                     ));
                 }
             }
@@ -530,6 +535,27 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(complete, fixture);
+    }
+
+    #[test]
+    fn internal_surfaces_with_identity_names_are_refused() {
+        for name in [
+            "sekai.tenant-audit",
+            "sekai.OIDC-sessions",
+            "sekai.oauth-grants",
+        ] {
+            let mut inventory = SekaiRpcInventory::load().unwrap();
+            inventory.internal_surfaces.push(InternalSurfaceEvidence {
+                surface: name.into(),
+                evidence: vec!["src/lib.rs".into()],
+                note: String::new(),
+            });
+            let refused = inventory.validate().unwrap_err();
+            assert!(
+                refused.starts_with("internal_surfaces must not include"),
+                "{name}: {refused}"
+            );
+        }
     }
 
     #[test]
