@@ -3,7 +3,7 @@
 
 use super::*;
 
-fn store_version(svc: &SekaiServiceImpl, digest: &str, marking: &str) -> String {
+pub(super) fn store_version(svc: &SekaiServiceImpl, digest: &str, marking: &str) -> String {
     let column = |name: &str| crate::sekai::model_version::ModelColumn {
         name: name.into(),
         col_type: "float".into(),

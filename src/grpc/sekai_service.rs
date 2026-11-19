@@ -43,6 +43,8 @@ mod explain_value_rpc;
 mod graph_explore_rpc;
 #[path = "media_upload_rpc.rs"]
 mod media_upload_rpc;
+#[path = "model_stage_rpc.rs"]
+mod model_stage_rpc;
 #[path = "model_version_rpc.rs"]
 mod model_version_rpc;
 #[path = "object_change_subscription.rs"]
@@ -271,6 +273,11 @@ impl SekaiService for SekaiServiceImpl {
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
         heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
+        get_model_version => get_model_version_rpc(GetModelVersionRequest) -> GetModelVersionResponse;
+        list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
+        put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
+        list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;
+        promote_model_version => promote_model_version_rpc(PromoteModelVersionRequest) -> PromoteModelVersionResponse;
         ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;
         list_site_agent_working_memory => list_site_agent_working_memory_rpc(ListSiteAgentWorkingMemoryRequest) -> ListSiteAgentWorkingMemoryResponse;
         grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;
@@ -1613,18 +1620,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetTransformChainRunRequest>,
     ) -> Result<Response<GetTransformChainRunResponse>, Status> {
         rpc_data::get_transform_chain_run(self, req).await
-    }
-    async fn get_model_version(
-        &self,
-        req: Request<GetModelVersionRequest>,
-    ) -> Result<Response<GetModelVersionResponse>, Status> {
-        model_version_rpc::get_model_version(self, req).await
-    }
-    async fn list_model_versions(
-        &self,
-        req: Request<ListModelVersionsRequest>,
-    ) -> Result<Response<ListModelVersionsResponse>, Status> {
-        model_version_rpc::list_model_versions(self, req).await
     }
     async fn cancel_governed_transform_run(
         &self,

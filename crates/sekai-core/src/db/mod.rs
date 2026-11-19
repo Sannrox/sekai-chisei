@@ -41,6 +41,7 @@ pub mod lakehouse_snapshot_store;
 pub mod lease;
 pub mod media_upload;
 pub mod model_platform_store;
+pub mod model_stage_store;
 pub mod model_version_store;
 pub mod namespace_snapshot_store;
 pub mod object_log_ingest;

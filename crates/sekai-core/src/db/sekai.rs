@@ -527,6 +527,7 @@ impl SekaiDb {
         self.migrate_catalog_criticality_outbox()?;
         self.migrate_model_versions()?;
         self.migrate_gateway_log_cursors()?;
+        self.migrate_model_stages()?;
         Ok(())
     }
 

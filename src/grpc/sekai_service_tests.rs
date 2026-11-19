@@ -38664,6 +38664,8 @@ mod export_delivery_source_tests;
 
 #[path = "governed_document_rpc_tests.rs"]
 mod governed_document_rpc_tests;
+#[path = "model_stage_rpc_tests.rs"]
+mod model_stage_rpc_tests;
 #[path = "model_version_rpc_tests.rs"]
 mod model_version_rpc_tests;
 

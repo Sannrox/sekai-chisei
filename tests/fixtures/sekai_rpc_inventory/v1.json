@@ -1728,6 +1728,48 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "PutModelStage",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/model_stage_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListModelStages",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/model_stage_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "PromoteModelVersion",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/model_stage_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ClaimTransformWork",
       "kind": "persistent",
       "surfaces": [

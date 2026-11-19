@@ -3558,6 +3558,44 @@ pub(super) async fn list_claimable_transform_work(
         .collect();
     Ok(Response::new(ListClaimableTransformWorkResponse { work }))
 }
+/// The claimed definition with each stage-pinned model input replaced by the
+/// version its run admitted (#3023), so the runner scores with exactly the
+/// version the run receipt names, even after the stage moves on.
+fn with_resolved_model_inputs(
+    service: &SekaiServiceImpl,
+    run_id: &str,
+    mut transform: crate::sekai::governed_transform::GovernedTransform,
+) -> Result<crate::sekai::governed_transform::GovernedTransform, Status> {
+    let Some(spec) = transform.isolated_process.as_mut() else {
+        return Ok(transform);
+    };
+    if !spec
+        .model_inputs
+        .values()
+        .any(|pinned| crate::sekai::model_stage::parse_stage_pin(pinned).is_some())
+    {
+        return Ok(transform);
+    }
+    let run = service
+        .db
+        .runtime()
+        .get_governed_transform_run(run_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::internal("claimed run vanished"))?;
+    for (name, pinned) in &mut spec.model_inputs {
+        let key = format!(
+            "{}{name}",
+            crate::sekai::governed_transform::MODEL_PIN_PREFIX
+        );
+        *pinned = run
+            .input_versions
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| Status::internal("claimed run has no model pin"))?;
+    }
+    Ok(transform)
+}
+
 pub(super) async fn claim_transform_work(
     service: &SekaiServiceImpl,
     req: Request<ClaimTransformWorkRequest>,
@@ -3888,6 +3926,7 @@ pub(super) async fn claim_transform_work(
                         return Err(status);
                     }
                 }
+                let transform = with_resolved_model_inputs(service, &work.run_id, transform)?;
                 return Ok(Response::new(ClaimTransformWorkResponse {
                     work: Some(to_proto_transform_work(&work)),
                     transform: Some(to_proto_transform(&transform)),

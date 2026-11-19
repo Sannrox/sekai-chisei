@@ -1051,7 +1051,10 @@ message GovernedTransform {
   // `model:<name>` in its input versions, and its output carries the
   // version's marking. Adds the `sekai.input.model=v1` placement label, so
   // only a runtime that can run a model claims the work. The claiming
-  // runner resolves each version with GetModelVersion.
+  // runner resolves each version with GetModelVersion. A version_id of
+  // `stage:<model>/<stage>` (#3023) pins a stage instead: run admission
+  // resolves it to the stage's version, and ClaimTransformWork returns the
+  // definition with the resolved version id.
   repeated TransformModelInput model_inputs = 21;
 }
 // A model version a transform scores with (#3074).
@@ -1243,6 +1246,56 @@ message ListModelVersionsRequest {
 message ListModelVersionsResponse {
   repeated ModelVersion versions = 1;
   string next_page_token = 2;
+}
+// Experimental (#3023). The version one model's consumers use at a stage.
+message ModelStage {
+  string namespace = 1;
+  string model_name = 2;
+  string stage = 3;
+  // Suite a promotion must pass; empty for a gateless stage, which follows
+  // each newly registered version.
+  string evaluation_suite_id = 4;
+  // Empty until the first promotion or registration.
+  string version_id = 5;
+  int64 updated_at_ms = 6;
+}
+// Creates a stage or changes its gate. The stage keeps its current version.
+message PutModelStageRequest {
+  string namespace = 1;
+  string model_name = 2;
+  // 1-64 of [a-z0-9_-].
+  string stage = 3;
+  string evaluation_suite_id = 4;
+}
+message PutModelStageResponse {
+  ModelStage stage = 1;
+}
+message ListModelStagesRequest {
+  string namespace = 1;
+  // Empty lists every model's stages.
+  string model_name = 2;
+}
+message ListModelStagesResponse {
+  repeated ModelStage stages = 1;
+}
+// Promotes a version to a stage. A gated stage needs an evaluation run of its
+// suite against this version (config_ref = version_id) in which every case
+// passed. Admitted and refused promotions each record an operation receipt.
+message PromoteModelVersionRequest {
+  string namespace = 1;
+  string model_name = 2;
+  string stage = 3;
+  string version_id = 4;
+  string evaluation_run_id = 5;
+}
+message PromoteModelVersionResponse {
+  bool promoted = 1;
+  // The stage after the request; a refusal leaves its previous version.
+  ModelStage stage = 2;
+  // Receipt of the promotion or the refusal (GetOperationReceipt).
+  string operation_id = 3;
+  // Empty when promoted; otherwise a `model_stage.*` refusal code.
+  string refusal = 4;
 }
 message TransformChainAssertion {
   string kind = 1;
@@ -5927,6 +5980,10 @@ service SekaiService {
   // only with the marking it inherits from its training inputs.
   rpc GetModelVersion(GetModelVersionRequest) returns (GetModelVersionResponse);
   rpc ListModelVersions(ListModelVersionsRequest) returns (ListModelVersionsResponse);
+  // Experimental (#3023): model stages and gated, receipted promotion.
+  rpc PutModelStage(PutModelStageRequest) returns (PutModelStageResponse);
+  rpc ListModelStages(ListModelStagesRequest) returns (ListModelStagesResponse);
+  rpc PromoteModelVersion(PromoteModelVersionRequest) returns (PromoteModelVersionResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);

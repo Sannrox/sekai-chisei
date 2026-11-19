@@ -66,3 +66,59 @@ impl RuntimeDb {
         }
     }
 }
+
+/// Dual-backend dispatch for model stages (#3023).
+impl RuntimeDb {
+    pub fn put_model_stage(
+        &self,
+        stage: &crate::sekai::model_stage::ModelStage,
+    ) -> Result<crate::sekai::model_stage::ModelStage, String> {
+        match self {
+            Self::Sqlite(db) => db.put_model_stage(stage),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.put_model_stage(stage)),
+        }
+    }
+
+    pub fn get_model_stage(
+        &self,
+        namespace: &str,
+        model_name: &str,
+        stage: &str,
+    ) -> Result<Option<crate::sekai::model_stage::ModelStage>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_model_stage(namespace, model_name, stage),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_model_stage(namespace, model_name, stage)
+            }),
+        }
+    }
+
+    pub fn list_model_stages(
+        &self,
+        namespace: &str,
+        model_name: &str,
+    ) -> Result<Vec<crate::sekai::model_stage::ModelStage>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_model_stages(namespace, model_name),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_model_stages(namespace, model_name))
+            }
+        }
+    }
+
+    /// Moves `stage` to its `version_id` only while it still holds
+    /// `expected_version_id`, recording `receipt` in the same transaction.
+    pub fn promote_model_stage(
+        &self,
+        stage: &crate::sekai::model_stage::ModelStage,
+        expected_version_id: &str,
+        receipt: &sekai_domain::receipt::OperationReceipt,
+    ) -> Result<bool, String> {
+        match self {
+            Self::Sqlite(db) => db.promote_model_stage(stage, expected_version_id, receipt),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.promote_model_stage(stage, expected_version_id, receipt)
+            }),
+        }
+    }
+}

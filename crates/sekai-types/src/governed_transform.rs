@@ -196,8 +196,10 @@ pub struct IsolatedProcessSpec {
     /// their digest.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub code: String,
-    /// Model versions the code scores with, by input name (#3074). A run
-    /// pins each under [`MODEL_PIN_PREFIX`] in its `input_versions`. Empty
+    /// Model versions the code scores with, by input name (#3074): a version
+    /// id, or a stage pin `stage:<model>/<stage>` (#3023) that resolves to the
+    /// stage's version when a run is admitted. A run pins each resolved
+    /// version under [`MODEL_PIN_PREFIX`] in its `input_versions`. Empty
     /// keeps the digest of definitions written before it existed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_inputs: BTreeMap<String, String>,
@@ -914,8 +916,9 @@ fn prepare_model_inputs(spec: &mut IsolatedProcessSpec) -> Result<(), TransformE
     }
 }
 
-/// The receipt pins of a definition's model inputs: `model:<name>` to the
-/// version id.
+/// A definition's model inputs as written: `model:<name>` to the pinned value.
+/// A stage pin (`stage:<model>/<stage>`, #3023) is kept as written; run
+/// admission resolves it to a version id before recording `input_versions`.
 pub fn model_input_pins(transform: &GovernedTransform) -> BTreeMap<String, String> {
     transform
         .isolated_process
