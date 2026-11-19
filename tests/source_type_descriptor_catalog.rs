@@ -11,8 +11,7 @@ use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::sekai::security::Role;
 use sekai_chisei::sekai::source_type_descriptor::{
     DESCRIPTOR_UNAVAILABLE, ProposedSourceTypeDescriptor, SOURCE_TYPE_DESCRIPTOR_CONTRACT,
-    inspect_source_type_descriptor, register_source_type_descriptor, retire_source_type_descriptor,
-    synthetic_pager_alert_v1,
+    inspect_source_type_descriptor, register_source_type_descriptor, synthetic_pager_alert_v1,
 };
 use std::sync::Arc;
 use tonic::metadata::MetadataValue;
@@ -129,11 +128,36 @@ async fn grpc_register_inspect_and_retire_one_descriptor() {
         .descriptor
         .unwrap();
     assert_eq!(retired.status, "retired");
-    assert_eq!(
-        retire_source_type_descriptor(&RuntimeDb::memory(), "local", "ops", &pager.digest, 11)
-            .unwrap_err(),
-        DESCRIPTOR_UNAVAILABLE
-    );
+
+    // Retiring the same descriptor again on the same database is refused, and
+    // the descriptor stays retired.
+    let again = svc
+        .retire_source_type_descriptor(with_principal(
+            RetireSourceTypeDescriptorRequest {
+                namespace: "ops".into(),
+                digest: registered.digest.clone(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(again.code(), Code::Unavailable);
+    assert_eq!(again.message(), DESCRIPTOR_UNAVAILABLE);
+    let after = svc
+        .inspect_source_type_descriptor(with_principal(
+            InspectSourceTypeDescriptorRequest {
+                namespace: "ops".into(),
+                digest: registered.digest.clone(),
+            },
+            "local",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .descriptor
+        .unwrap();
+    assert_eq!(after.digest, pager.digest);
+    assert_eq!(after.status, "retired");
 }
 
 #[tokio::test]
