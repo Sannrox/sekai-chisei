@@ -94,6 +94,15 @@ pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// suite source. Connector certifications record this next to the test-suite
 /// digest so a suite-behavior change cannot keep the previous pin.
 pub fn conformance_suite_digest() -> String {
+    suite_digest(
+        include_str!("conformance.rs"),
+        include_str!("change_capture.rs"),
+    )
+}
+
+/// Hashes the version pins with the given suite source texts. Tests pass
+/// edited texts to prove each source is bound into the digest.
+fn suite_digest(conformance_source: &str, change_capture_source: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(SDK_VERSION.as_bytes());
@@ -108,11 +117,11 @@ pub fn conformance_suite_digest() -> String {
     hasher.update(b"\n");
     hasher.update(SOURCE_DISCOVERY_VERSION.as_bytes());
     hasher.update(b"\n");
-    hasher.update(include_str!("conformance.rs").as_bytes());
+    hasher.update(conformance_source.as_bytes());
     hasher.update(b"\n");
     hasher.update(CHANGE_CAPTURE_CONFORMANCE_VERSION.as_bytes());
     hasher.update(b"\n");
-    hasher.update(include_str!("change_capture.rs").as_bytes());
+    hasher.update(change_capture_source.as_bytes());
     format!("sha256:{:x}", hasher.finalize())
 }
 
@@ -131,26 +140,20 @@ mod tests {
     #[test]
     fn conformance_digest_is_stable_for_this_version() {
         let first = conformance_suite_digest();
-        let second = conformance_suite_digest();
-        assert_eq!(first, second);
+        assert_eq!(first, conformance_suite_digest());
         assert!(first.starts_with("sha256:"));
         assert_eq!(first.len(), "sha256:".len() + 64);
-        use sha2::{Digest, Sha256};
-        let mut versions_only = Sha256::new();
-        versions_only.update(SDK_VERSION.as_bytes());
-        versions_only.update(b"\n");
-        versions_only.update(OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION.as_bytes());
-        versions_only.update(b"\n");
-        versions_only.update(SOURCE_BATCH_VERSION.as_bytes());
-        versions_only.update(b"\n");
-        versions_only.update(SOURCE_BATCH_V2_VERSION.as_bytes());
-        versions_only.update(b"\n");
-        versions_only.update(SOURCE_BATCH_V3_VERSION.as_bytes());
-        versions_only.update(b"\n");
-        let versions_only = format!("sha256:{:x}", versions_only.finalize());
-        assert_ne!(
-            first, versions_only,
-            "digest must bind conformance.rs, not only version strings"
-        );
+    }
+
+    #[test]
+    fn conformance_digest_binds_each_suite_source() {
+        let conformance = include_str!("conformance.rs");
+        let change_capture = include_str!("change_capture.rs");
+        let pinned = suite_digest(conformance, change_capture);
+        assert_eq!(pinned, conformance_suite_digest());
+        let edited_conformance = format!("{conformance} ");
+        assert_ne!(suite_digest(&edited_conformance, change_capture), pinned);
+        let edited_change_capture = format!("{change_capture} ");
+        assert_ne!(suite_digest(conformance, &edited_change_capture), pinned);
     }
 }
