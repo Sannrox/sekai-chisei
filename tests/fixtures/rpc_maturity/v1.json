@@ -2391,6 +2391,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "DryRunActionPolicy",
+      "storage_path": "sekai.action-definitions, sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetLineage",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",

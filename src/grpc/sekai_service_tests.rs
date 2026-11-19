@@ -38758,3 +38758,177 @@ async fn object_change_subscription_refuses_restricted_property_filters() {
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
     subscribe("name").await.unwrap();
 }
+
+/// A governed action admission receipt as #3016 records it, decided by
+/// `(decision, scope, version)`, or with no policy attributes when `None`.
+fn action_admission_receipt(
+    id: &str,
+    namespace: &str,
+    policy: Option<(&str, &str, &str)>,
+) -> crate::chisei::receipt::OperationReceipt {
+    use crate::chisei::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+        ReceiptSurface,
+    };
+    use std::collections::BTreeMap;
+    let event =
+        |kind: ReceiptEventKind, attributes: BTreeMap<String, String>| OperationReceiptEvent {
+            event_id: format!("{id}:{kind:?}"),
+            operation_id: id.into(),
+            parent_event_id: None,
+            timestamp_ms: 150,
+            kind,
+            surface: ReceiptSurface::Policy,
+            actor: "submitter".into(),
+            references: Vec::new(),
+            attributes,
+        };
+    let mut attributes = BTreeMap::from([("action".into(), "submit_action_instance".into())]);
+    if let Some((decision, scope, version)) = policy {
+        attributes.extend([
+            ("action_policy_decision".into(), decision.into()),
+            ("action_policy_scope".into(), scope.into()),
+            ("action_policy_version".into(), version.into()),
+            ("risk_class".into(), "write".into()),
+        ]);
+    }
+    OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id: id.into(),
+        parent_operation_id: None,
+        namespace: namespace.into(),
+        operation_class: "governed_action_instance".into(),
+        initiating_actor: "submitter".into(),
+        schema_version: "action-instance/v1".into(),
+        policy_version: namespace.into(),
+        started_at_ms: 150,
+        completed_at_ms: Some(150),
+        events: vec![
+            event(
+                ReceiptEventKind::IntentRecorded,
+                BTreeMap::from([("instance_id".into(), format!("gai-{id}"))]),
+            ),
+            event(ReceiptEventKind::PolicyDecided, attributes),
+        ],
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+        ontology_digest: None,
+        artifact: None,
+    }
+}
+
+#[tokio::test]
+async fn action_policy_dry_run_rpc_reports_like_the_console_and_mutates_nothing() {
+    let svc = service();
+    let namespace = "dry-run-ns";
+    grant_source_namespace(&svc, namespace, "tester", security::Role::Viewer);
+    let db = svc.db.runtime();
+    db.put_operation_receipt(&action_admission_receipt(
+        "op-allowed",
+        namespace,
+        Some(("allow", namespace, "v1")),
+    ))
+    .unwrap();
+    db.put_operation_receipt(&action_admission_receipt("op-legacy", namespace, None))
+        .unwrap();
+    let deny = ActionPolicy {
+        scope: namespace.into(),
+        default_decision: "deny".into(),
+        ..Default::default()
+    };
+    let request = |candidate: ActionPolicy| DryRunActionPolicyRequest {
+        namespace: namespace.into(),
+        candidate: Some(candidate),
+        start_timestamp_ms: 100,
+        end_timestamp_ms: 200,
+    };
+
+    let response = svc
+        .dry_run_action_policy(with_principal(request(deny.clone())))
+        .await
+        .unwrap()
+        .into_inner();
+    let counts = response.counts.unwrap();
+    assert_eq!(
+        (
+            counts.evaluated,
+            counts.would_deny,
+            counts.insufficient_history
+        ),
+        (2, 1, 1)
+    );
+    let denied = response
+        .samples
+        .iter()
+        .find(|sample| sample.delta == "would_deny")
+        .unwrap();
+    assert_eq!(
+        (
+            denied.instance_id.as_str(),
+            denied.historical_decision.as_str(),
+            denied.historical_policy_version.as_str(),
+            denied.candidate_decision.as_str(),
+            denied.candidate_rule.as_str(),
+        ),
+        ("gai-op-allowed", "allow", "v1", "deny", "default_decision")
+    );
+
+    // The console form runs the same engine and gets the same report.
+    let console = crate::composition::action_policy_dry_run::run_action_policy_dry_run(
+        db,
+        "tester",
+        namespace,
+        100,
+        200,
+        &from_proto_action_policy(&deny).unwrap(),
+        "console",
+    )
+    .unwrap();
+    assert_eq!(
+        console.candidate_policy_version,
+        response.candidate_policy_version
+    );
+    assert_eq!(console.counts.evaluated, counts.evaluated);
+    assert_eq!(
+        console.samples.values().map(Vec::len).sum::<usize>(),
+        response.samples.len()
+    );
+
+    // One decision per run; the candidate is never stored.
+    let decisions = db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("action_policy.dry_run".into()),
+            target_id: Some(namespace.into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut surfaces: Vec<_> = decisions
+        .iter()
+        .map(|decision| decision.evidence["surface"].as_str())
+        .collect();
+    surfaces.sort_unstable();
+    assert_eq!(surfaces, ["console", "grpc"]);
+    assert!(db.get_action_policy(namespace).unwrap().is_none());
+
+    let invalid = svc
+        .dry_run_action_policy(with_principal(request(ActionPolicy {
+            default_decision: "maybe".into(),
+            ..deny.clone()
+        })))
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+    let backwards = svc
+        .dry_run_action_policy(with_principal(DryRunActionPolicyRequest {
+            end_timestamp_ms: 100,
+            ..request(deny.clone())
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(backwards.code(), tonic::Code::InvalidArgument);
+    let ungranted = svc
+        .dry_run_action_policy(with_named_principal(request(deny), "outsider"))
+        .await
+        .unwrap_err();
+    assert_eq!(ungranted.code(), tonic::Code::PermissionDenied);
+}

@@ -3659,6 +3659,22 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "DryRunActionPolicy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "src/composition/action_policy_dry_run.rs",
+        "src/grpc/sekai_service_tests.rs",
+        "tests/action_policy_dry_run_backend_conformance.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.action-definitions"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GetLineage",
       "kind": "computed",
       "surfaces": [],

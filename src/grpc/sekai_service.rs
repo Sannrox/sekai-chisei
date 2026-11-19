@@ -279,6 +279,7 @@ impl SekaiService for SekaiServiceImpl {
         rebase_definition_branch => rebase_definition_branch_rpc(RebaseDefinitionBranchRequest) -> RebaseDefinitionBranchResponse;
         set_definition_branch_archived => set_definition_branch_archived_rpc(SetDefinitionBranchArchivedRequest) -> SetDefinitionBranchArchivedResponse;
         export_namespace_audit => export_namespace_audit_rpc(ExportNamespaceAuditRequest) -> ExportNamespaceAuditResponse;
+        dry_run_action_policy => dry_run_action_policy_rpc(DryRunActionPolicyRequest) -> DryRunActionPolicyResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;

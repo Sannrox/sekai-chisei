@@ -3,11 +3,11 @@
 //! candidate replays them without writing anything but its audit decision.
 
 use sekai_chisei::chisei::action_policy_dry_run::ActionDryRunDelta;
+use sekai_chisei::composition::action_policy_dry_run::run_action_policy_dry_run;
 use sekai_chisei::db::postgres::PostgresDb;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{ListFilter, Object};
-use sekai_chisei::obs::console_policy::run_console_action_dry_run;
 use sekai_chisei::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionRequest,
 };
@@ -127,7 +127,8 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
         .insert(RiskClass::Write, ActionDecision::RequireApproval);
     let before = state(db, namespace);
     let report =
-        run_console_action_dry_run(db, "auditor", namespace, 0, 10_000, &candidate).unwrap();
+        run_action_policy_dry_run(db, "auditor", namespace, 0, 10_000, &candidate, "console")
+            .unwrap();
     assert_eq!(report.counts.evaluated, 3);
     assert_eq!(report.counts.unchanged, 1);
     assert_eq!(report.counts.would_require_approval, 2);
@@ -157,7 +158,10 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
     assert_eq!(audited[0].evidence["would_require_approval"], "2");
 
     // No grant on the namespace: refused.
-    assert!(run_console_action_dry_run(db, "mallory", namespace, 0, 10_000, &candidate).is_err());
+    assert!(
+        run_action_policy_dry_run(db, "mallory", namespace, 0, 10_000, &candidate, "console")
+            .is_err()
+    );
 }
 
 #[test]

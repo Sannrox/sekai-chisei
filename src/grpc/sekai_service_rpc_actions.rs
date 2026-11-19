@@ -1784,6 +1784,87 @@ pub(super) async fn list_action_policies(
         policies: policies.iter().map(to_proto_action_policy).collect(),
     }))
 }
+/// Trait route for the facade's `delegate_rpcs!` list.
+impl SekaiServiceImpl {
+    pub(super) async fn dry_run_action_policy_rpc(
+        &self,
+        req: Request<DryRunActionPolicyRequest>,
+    ) -> Result<Response<DryRunActionPolicyResponse>, Status> {
+        dry_run_action_policy(self, req)
+    }
+}
+
+/// Dry-run a candidate action policy over the namespace's past governed
+/// action submits (#3059): the same engine as the console form. The candidate
+/// is read like a `SetActionPolicy` policy, so a malformed one is refused the
+/// same way.
+fn dry_run_action_policy(
+    service: &SekaiServiceImpl,
+    req: Request<DryRunActionPolicyRequest>,
+) -> Result<Response<DryRunActionPolicyResponse>, Status> {
+    use crate::composition::action_policy_dry_run::{
+        ActionPolicyDryRunError, run_action_policy_dry_run,
+    };
+    let principals = caller_principals(&req);
+    require_authenticated(&principals)?;
+    let principal = principals
+        .first()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    let request = req.into_inner();
+    let candidate = request
+        .candidate
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("candidate required"))
+        .and_then(from_proto_action_policy)?;
+    let report = run_action_policy_dry_run(
+        service.db.runtime(),
+        &principal,
+        &request.namespace,
+        request.start_timestamp_ms,
+        request.end_timestamp_ms,
+        &candidate,
+        "grpc",
+    )
+    .map_err(|error| match error {
+        ActionPolicyDryRunError::AccessDenied => Status::permission_denied(error.to_string()),
+        ActionPolicyDryRunError::Invalid(message) => Status::invalid_argument(message),
+        ActionPolicyDryRunError::Store(message) => Status::internal(message),
+    })?;
+    let counts = &report.counts;
+    Ok(Response::new(DryRunActionPolicyResponse {
+        counts: Some(ActionPolicyDryRunCounts {
+            evaluated: counts.evaluated,
+            unchanged: counts.unchanged,
+            would_deny: counts.would_deny,
+            would_allow: counts.would_allow,
+            would_require_approval: counts.would_require_approval,
+            would_skip_approval: counts.would_skip_approval,
+            insufficient_history: counts.insufficient_history,
+        }),
+        samples: report
+            .samples
+            .iter()
+            .flat_map(|(delta, samples)| {
+                samples.iter().map(|sample| ActionPolicyDryRunSample {
+                    delta: delta.as_str().into(),
+                    operation_id: sample.operation_id.clone(),
+                    instance_id: sample.instance_id.clone(),
+                    historical_decision: sample.historical_decision.clone(),
+                    historical_policy_version: sample.historical_policy_version.clone(),
+                    candidate_decision: sample.candidate_decision.clone(),
+                    candidate_rule: sample.candidate_rule.clone(),
+                    detail: sample.detail.clone(),
+                })
+            })
+            .collect(),
+        namespace: report.namespace,
+        start_timestamp_ms: report.start_timestamp_ms,
+        end_timestamp_ms: report.end_timestamp_ms,
+        candidate_scope: report.candidate_scope,
+        candidate_policy_version: report.candidate_policy_version,
+    }))
+}
 pub(super) async fn get_lineage(
     service: &SekaiServiceImpl,
     req: Request<GetLineageRequest>,
