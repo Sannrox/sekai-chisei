@@ -4777,6 +4777,10 @@ message DefinitionBranch {
   int64 created_at_ms = 7;
   int64 updated_at_ms = 8;
   string pin_digest = 9;
+  // When the branch was archived; 0 while it is open work. An archived
+  // branch refuses edits, proposals and rebase until it is restored.
+  int64 archived_at_ms = 10;
+  string archive_reason = 11;
 }
 
 message CreateDefinitionBranchRequest {
@@ -5195,6 +5199,72 @@ message ProposeDefinitionRollbackRequest {
 message ProposeDefinitionRollbackResponse {
   DefinitionProposal proposal = 1;
   DefinitionRevisionDiff preview = 2;
+}
+
+// Resolves one member changed on both sides during a rebase (#2434).
+message DefinitionRebaseResolution {
+  string member_kind = 1;
+  string member_id = 2;
+  // keep_branch | take_published
+  string choice = 3;
+}
+
+// A member changed on both the branch and the published side to different
+// content. An empty digest means that side does not have the member.
+message DefinitionRebaseConflict {
+  string member_kind = 1;
+  string member_id = 2;
+  string base_member_digest = 3;
+  string branch_member_digest = 4;
+  string published_member_digest = 5;
+}
+
+// Moves a branch that fell behind onto the published head. Each member is
+// merged three ways (branch base, branch head, published); a member changed
+// on both sides is a conflict until a resolution names it. With an
+// unresolved conflict nothing is written and the conflicts are returned.
+// A written rebase closes the branch's open proposals as `superseded`.
+message RebaseDefinitionBranchRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  string expected_head_digest = 3;
+  // Must be the published head when the rebase runs.
+  string onto_published_digest = 4;
+  repeated DefinitionRebaseResolution resolutions = 5;
+  // Compute the outcome and write nothing: the preview of a stale branch.
+  bool dry_run = 6;
+  // Required unless dry_run.
+  string idempotency_key = 7;
+}
+
+message RebaseDefinitionBranchResponse {
+  // The branch after the rebase, or as it is when nothing was applied.
+  DefinitionBranch branch = 1;
+  string previous_head_digest = 2;
+  // The rebased head; empty while a conflict is unresolved.
+  string revision_digest = 3;
+  // Published head against the rebased head: what a merge would publish.
+  DefinitionRevisionDiff preview = 4;
+  repeated DefinitionRebaseConflict conflicts = 5;
+  repeated string superseded_proposal_ids = 6;
+  // False for a dry run and while a conflict is unresolved.
+  bool applied = 7;
+}
+
+// Archives or restores a branch. Archiving closes its open proposals as
+// `operator_abort`; restoring leaves them closed. A merged branch is
+// terminal and refused.
+message SetDefinitionBranchArchivedRequest {
+  string namespace = 1;
+  string branch_id = 2;
+  bool archived = 3;
+  string reason = 4;
+  string idempotency_key = 5;
+}
+
+message SetDefinitionBranchArchivedResponse {
+  DefinitionBranch branch = 1;
+  repeated string closed_proposal_ids = 2;
 }
 
 
@@ -5881,6 +5951,9 @@ service SekaiService {
   rpc GetPublishedDefinitionRevision(GetPublishedDefinitionRevisionRequest) returns (GetPublishedDefinitionRevisionResponse);
   rpc ListPublishedDefinitionRevisions(ListPublishedDefinitionRevisionsRequest) returns (ListPublishedDefinitionRevisionsResponse);
   rpc ProposeDefinitionRollback(ProposeDefinitionRollbackRequest) returns (ProposeDefinitionRollbackResponse);
+  // Rebase and archive of definition branches (#2434).
+  rpc RebaseDefinitionBranch(RebaseDefinitionBranchRequest) returns (RebaseDefinitionBranchResponse);
+  rpc SetDefinitionBranchArchived(SetDefinitionBranchArchivedRequest) returns (SetDefinitionBranchArchivedResponse);
   // Signed, namespace-independent definition packages (#1700). Export signs
   // a published revision with this plane's package key; import verifies the
   // envelope against this plane's trusted package keys and opens a proposal.

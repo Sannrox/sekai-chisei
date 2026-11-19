@@ -232,6 +232,8 @@ const ACTION_INSTANCE_DENIAL_INDEX_SCHEMA: &str =
 const MODEL_VERSIONS_SCHEMA: &str = include_str!("postgres/0162_model_versions.sql");
 const GATEWAY_LOG_CURSORS_SCHEMA: &str = include_str!("postgres/0163_gateway_log_cursors.sql");
 const MODEL_STAGES_SCHEMA: &str = include_str!("postgres/0164_model_stages.sql");
+const DEFINITION_BRANCH_ARCHIVE_SCHEMA: &str =
+    include_str!("postgres/0165_definition_branch_archive.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1187,6 +1189,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_evaluation_rationales",
         "",
         MigrationOwner::Chisei,
+    ),
+    mig(
+        165,
+        "definition_branch_archive",
+        DEFINITION_BRANCH_ARCHIVE_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

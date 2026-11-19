@@ -258,6 +258,24 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "RebaseDefinitionBranch",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "SetDefinitionBranchArchived",
+      "storage_path": "sekai.definition-branch",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ExportDefinitionPackage",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",

@@ -10,18 +10,22 @@ use crate::sekai::definition_branch::{
     DefinitionBranchEditResult, DefinitionMember, DefinitionRevision, DefinitionWriteResult,
     apply_member_changes, changed_member_digests, validate_revision_members,
 };
+use crate::sekai::definition_branch_rebase::{
+    DefinitionBranchArchiveResult, RebaseDefinitionBranch, SetDefinitionBranchArchived, close_open,
+    rebase_branch,
+};
 use crate::sekai::definition_proposal::{
-    ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    DATASET_PROPOSAL_NOT_FOUND, DatasetProposalAttachment, DefinitionMergePath, DefinitionProposal,
-    DefinitionProposalApproval, DefinitionProposalMergeResult, MergeDefinitionProposal,
-    PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput, ProposeDefinitionImport,
-    ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
-    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
-    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
-    list_published_definition_history, merge_receipt_id, object_property_keys,
-    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
-    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
-    rollback_member_edits,
+    ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
+    CreateDefinitionProposal, DATASET_PROPOSAL_NOT_FOUND, DatasetProposalAttachment,
+    DefinitionMergePath, DefinitionProposal, DefinitionProposalApproval,
+    DefinitionProposalMergeResult, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
+    PreparedProposalDigestInput, ProposeDefinitionImport, ProposeDefinitionRollback,
+    PublishedDefinitionHistoryStore, PublishedDefinitionRevisionHistoryEntry, ReplacementProposal,
+    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, dataset_column_names,
+    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
+    object_property_keys, proposal_content_digest, reject_foreign_member_grants,
+    require_descendant_candidate, require_rollback_migration_plan,
+    rollback_may_drop_live_object_type_properties, rollback_member_edits,
 };
 
 pub const POSTGRES_DEFINITION_BRANCH_SURFACE: &str = "sekai.definition-branch";
@@ -138,6 +142,20 @@ pub trait DefinitionBranchBackend: Send + Sync {
     fn close_definition_proposal(
         &self,
         request: &CloseDefinitionProposal,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn rebase_definition_branch(
+        &self,
+        request: &RebaseDefinitionBranch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String>;
+
+    fn set_definition_branch_archived(
+        &self,
+        request: &SetDefinitionBranchArchived,
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String>;
@@ -307,6 +325,24 @@ macro_rules! forward {
             now_ms: i64,
         ) -> Result<DefinitionWriteResult, String> {
             <$target>::close_definition_proposal(self, request, actor, now_ms)
+        }
+
+        fn rebase_definition_branch(
+            &self,
+            request: &RebaseDefinitionBranch,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::rebase_definition_branch(self, request, actor, now_ms)
+        }
+
+        fn set_definition_branch_archived(
+            &self,
+            request: &SetDefinitionBranchArchived,
+            actor: &str,
+            now_ms: i64,
+        ) -> Result<DefinitionWriteResult, String> {
+            <$target>::set_definition_branch_archived(self, request, actor, now_ms)
         }
 
         fn put_agent_definition_certification(
@@ -517,6 +553,8 @@ impl SekaiDb {
             "ALTER TABLE sekai_definition_proposals ADD COLUMN receipt_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_definition_proposals ADD COLUMN close_reason_code TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_agent_definition_certifications ADD COLUMN mean_score_milli INTEGER",
+            "ALTER TABLE sekai_definition_branches ADD COLUMN archived_at_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sekai_definition_branches ADD COLUMN archive_reason TEXT NOT NULL DEFAULT ''",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}
@@ -645,6 +683,8 @@ impl SekaiDb {
             created_by: actor.into(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            archived_at_ms: 0,
+            archive_reason: String::new(),
         };
         transaction
             .execute(
@@ -705,6 +745,7 @@ impl SekaiDb {
         }
         let mut branch = load_branch_sqlite(&transaction, &request.namespace, &request.branch_id)?
             .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        branch.require_active()?;
         if branch.head_revision_digest != request.expected_head_digest {
             return Err("stale_definition_branch_head: expected head is no longer current".into());
         }
@@ -1054,6 +1095,7 @@ impl SekaiDb {
         }
         let branch = load_branch_sqlite(&transaction, &request.namespace, &request.branch_id)?
             .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        branch.require_active()?;
         if branch.head_revision_digest != request.candidate_digest {
             return Err(
                 "stale_definition_proposal_candidate: branch head does not match candidate".into(),
@@ -1578,6 +1620,217 @@ impl SekaiDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+
+    /// Rebases a branch onto the published head (#2434); a dry run writes
+    /// nothing. An unresolved conflict also writes nothing and is returned
+    /// in the result, not as an error.
+    pub fn rebase_definition_branch(
+        &self,
+        request: &RebaseDefinitionBranch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.prepare()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if !request.idempotency_key.is_empty()
+            && let Some(replayed) = replay_sqlite(
+                &transaction,
+                &request.namespace,
+                actor,
+                &request.idempotency_key,
+                &request_digest,
+            )?
+        {
+            return Ok(replayed);
+        }
+        let branch = load_branch_sqlite(&transaction, &request.namespace, &request.branch_id)?
+            .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        let published =
+            load_published_head_sqlite(&transaction, &request.namespace)?.ok_or_else(|| {
+                "definition_revision_not_found: published head is unavailable".to_string()
+            })?;
+        request.check(&branch, &published)?;
+        let load = |digest: &str| {
+            load_revision_sqlite(&transaction, &request.namespace, digest)?.ok_or_else(|| {
+                "definition_revision_not_found: rebase revision is unavailable".to_string()
+            })
+        };
+        let mut result = rebase_branch(
+            &branch,
+            &load(&branch.base_revision_digest)?,
+            &load(&branch.head_revision_digest)?,
+            &load(&published)?,
+            &request.resolutions,
+            actor,
+            now_ms,
+        )?;
+        let Some(revision) = result.revision.clone() else {
+            return Ok(DefinitionWriteResult::Rebase {
+                result: Box::new(result),
+            });
+        };
+        if request.dry_run {
+            return Ok(DefinitionWriteResult::Rebase {
+                result: Box::new(result),
+            });
+        }
+        let revision = if revision.revision_digest == published {
+            revision
+        } else {
+            insert_revision_sqlite(&transaction, &revision)?
+        };
+        result.revision = Some(revision.clone());
+        let superseded = close_open(
+            load_branch_proposals_sqlite(&transaction, &request.namespace, &request.branch_id)?,
+            CLOSE_REASON_SUPERSEDED,
+            now_ms,
+        );
+        for proposal in &superseded {
+            update_proposal_sqlite(&transaction, proposal)?;
+        }
+        result.apply(
+            &published,
+            superseded
+                .into_iter()
+                .map(|proposal| proposal.proposal_id)
+                .collect(),
+            now_ms,
+        )?;
+        let updated = transaction
+            .execute(
+                "UPDATE sekai_definition_branches
+                 SET base_revision_digest=?1, head_revision_digest=?2, updated_at_ms=?3
+                 WHERE namespace=?4 AND branch_id=?5 AND head_revision_digest=?6",
+                params![
+                    published,
+                    revision.revision_digest,
+                    now_ms,
+                    request.namespace,
+                    request.branch_id,
+                    request.expected_head_digest,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("stale_definition_branch_head: expected head is no longer current".into());
+        }
+        let result = DefinitionWriteResult::Rebase {
+            result: Box::new(result),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &request.expected_head_digest,
+            &revision.revision_digest,
+            "rebase",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    /// Archives or restores a branch (#2434).
+    pub fn set_definition_branch_archived(
+        &self,
+        request: &SetDefinitionBranchArchived,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.request_digest()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.conn();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if let Some(replayed) = replay_sqlite(
+            &transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let mut branch = load_branch_sqlite(&transaction, &request.namespace, &request.branch_id)?
+            .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        let proposals =
+            load_branch_proposals_sqlite(&transaction, &request.namespace, &request.branch_id)?;
+        let closed = request.apply(&mut branch, proposals, now_ms)?;
+        for proposal in &closed {
+            update_proposal_sqlite(&transaction, proposal)?;
+        }
+        transaction
+            .execute(
+                "UPDATE sekai_definition_branches
+                 SET archived_at_ms=?1, archive_reason=?2, updated_at_ms=?3
+                 WHERE namespace=?4 AND branch_id=?5",
+                params![
+                    branch.archived_at_ms,
+                    branch.archive_reason,
+                    now_ms,
+                    request.namespace,
+                    request.branch_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let action = if request.archived {
+            "archive"
+        } else {
+            "restore"
+        };
+        let head = branch.head_revision_digest.clone();
+        let result = DefinitionWriteResult::SetArchived {
+            result: Box::new(DefinitionBranchArchiveResult {
+                branch,
+                closed_proposal_ids: closed
+                    .into_iter()
+                    .map(|proposal| proposal.proposal_id)
+                    .collect(),
+            }),
+        };
+        persist_result_sqlite(
+            &transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &head,
+            &head,
+            action,
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+/// Every proposal of one branch, oldest first.
+fn load_branch_proposals_sqlite(
+    connection: &rusqlite::Connection,
+    namespace: &str,
+    branch_id: &str,
+) -> Result<Vec<DefinitionProposal>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE namespace = ?1 AND branch_id = ?2
+             ORDER BY created_at_ms, proposal_id",
+        )
+        .map_err(|error| error.to_string())?;
+    let bodies = statement
+        .query_map(params![namespace, branch_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    bodies.iter().map(|body| decode_proposal(body)).collect()
 }
 
 /// A missing dataset proposal reads like one in another tenant.
@@ -1895,7 +2148,7 @@ fn load_branch_sqlite(
     connection
         .query_row(
             "SELECT base_revision_digest, head_revision_digest, created_by,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, archived_at_ms, archive_reason
              FROM sekai_definition_branches WHERE namespace=?1 AND branch_id=?2",
             params![namespace, branch_id],
             |row| {
@@ -1909,6 +2162,8 @@ fn load_branch_sqlite(
                     created_by: row.get(2)?,
                     created_at_ms: row.get(3)?,
                     updated_at_ms: row.get(4)?,
+                    archived_at_ms: row.get(5)?,
+                    archive_reason: row.get(6)?,
                 })
             },
         )
@@ -2025,6 +2280,8 @@ fn open_replacement_proposal_sqlite(
         created_by: actor.into(),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
+        archived_at_ms: 0,
+        archive_reason: String::new(),
     };
     transaction
         .execute(
@@ -3228,5 +3485,177 @@ mod tests {
                 || error.contains("content binding is invalid"),
             "{error}"
         );
+    }
+
+    fn count(db: &SekaiDb, sql: &str) -> i64 {
+        db.conn().query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn interrupted_rebase_writes_nothing_and_archive_is_audited() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let (parent, ticket, create) = parent_fixture(&db);
+        db.create_definition_branch(&create, "author", 2).unwrap();
+        let edit = ApplyDefinitionBranchEdit {
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            expected_head_digest: parent.revision_digest.clone(),
+            upserts: vec![DefinitionMemberInput {
+                member_kind: "control".into(),
+                member_id: "retention".into(),
+                definition_json: r#"{"mode":"strict"}"#.into(),
+                member_digest: String::new(),
+            }],
+            removals: Vec::new(),
+            idempotency_key: "edit-1".into(),
+        };
+        let DefinitionWriteResult::ApplyEdit { result } =
+            db.apply_definition_branch_edit(&edit, "author", 3).unwrap()
+        else {
+            panic!("expected branch edit");
+        };
+        let head = result.revision.revision_digest;
+        db.create_definition_proposal(
+            &CreateDefinitionProposal {
+                namespace: "team-a".into(),
+                branch_id: "feature".into(),
+                proposal_id: "p1".into(),
+                base_digest: parent.revision_digest.clone(),
+                candidate_digest: head.clone(),
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: "propose-1".into(),
+                major_revision: false,
+                migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
+                tenant: String::new(),
+            },
+            "author",
+            4,
+        )
+        .unwrap();
+        // The published head moves on with a member the branch did not touch.
+        let class = DefinitionMemberInput {
+            member_kind: "ontology_class".into(),
+            member_id: "TicketClass".into(),
+            definition_json: r#"{"name":"TicketClass"}"#.into(),
+            member_digest: String::new(),
+        }
+        .prepare("team-a")
+        .unwrap();
+        let published = prepare_revision(
+            "team-a",
+            &parent.revision_digest,
+            [&ticket, &class].map(|member| DefinitionRevisionMember {
+                member_kind: member.member_kind.clone(),
+                member_id: member.member_id.clone(),
+                member_digest: member.member_digest.clone(),
+            }),
+            true,
+            "root",
+            5,
+        )
+        .unwrap();
+        {
+            let mut connection = db.conn();
+            let transaction = connection.transaction().unwrap();
+            insert_members_sqlite(&transaction, &[class]).unwrap();
+            insert_revision_sqlite(&transaction, &published).unwrap();
+            write_published_head_sqlite(
+                &transaction,
+                "team-a",
+                &published.revision_digest,
+                5,
+                Some(&parent.revision_digest),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_definition_rebase
+                 BEFORE UPDATE ON sekai_definition_branches
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected rebase failure');
+                 END;",
+            )
+            .unwrap();
+        let rebase = RebaseDefinitionBranch {
+            namespace: "team-a".into(),
+            branch_id: "feature".into(),
+            expected_head_digest: head.clone(),
+            onto_published_digest: published.revision_digest.clone(),
+            resolutions: Vec::new(),
+            dry_run: false,
+            idempotency_key: "rebase-1".into(),
+        };
+        let error = db
+            .rebase_definition_branch(&rebase, "author", 6)
+            .unwrap_err();
+        assert!(error.contains("injected rebase failure"), "{error}");
+        let branch = db
+            .get_definition_branch("team-a", "feature")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (branch.base_revision_digest, branch.head_revision_digest),
+            (parent.revision_digest.clone(), head)
+        );
+        let proposal = db.get_definition_proposal("team-a", "p1").unwrap().unwrap();
+        assert_eq!(proposal.status, STATUS_OPEN);
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM sekai_definition_requests WHERE idempotency_key='rebase-1'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &db,
+                &format!(
+                    "SELECT COUNT(*) FROM sekai_definition_revisions
+                     WHERE parent_revision_digest='{}'",
+                    published.revision_digest
+                )
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM sekai_definition_branch_audit WHERE action='rebase'"
+            ),
+            0
+        );
+
+        // Archive and restore each leave one audit row with the transition.
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_definition_rebase;")
+            .unwrap();
+        for (archived, key, now) in [(true, "archive-1", 7), (false, "restore-1", 8)] {
+            db.set_definition_branch_archived(
+                &SetDefinitionBranchArchived {
+                    namespace: "team-a".into(),
+                    branch_id: "feature".into(),
+                    archived,
+                    reason: "paused".into(),
+                    idempotency_key: key.into(),
+                },
+                "operator",
+                now,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM sekai_definition_branch_audit
+                 WHERE action IN ('archive','restore') AND actor='operator'"
+            ),
+            2
+        );
+        let proposal = db.get_definition_proposal("team-a", "p1").unwrap().unwrap();
+        assert_eq!(proposal.status, STATUS_CLOSED);
     }
 }

@@ -10,17 +10,22 @@ use crate::sekai::definition_branch::{
     DefinitionBranchEditResult, DefinitionMember, DefinitionRevision, DefinitionWriteResult,
     apply_member_changes, changed_member_digests, validate_revision_members,
 };
+use crate::sekai::definition_branch_rebase::{
+    DefinitionBranchArchiveResult, RebaseDefinitionBranch, SetDefinitionBranchArchived, close_open,
+    rebase_branch,
+};
 use crate::sekai::definition_proposal::{
-    ApproveDefinitionProposal, CloseDefinitionProposal, CreateDefinitionProposal,
-    DatasetProposalAttachment, DefinitionMergePath, DefinitionProposal, DefinitionProposalApproval,
-    DefinitionProposalMergeResult, MergeDefinitionProposal, PROPOSAL_CONTRACT_VERSION,
-    PreparedProposalDigestInput, ProposeDefinitionImport, ProposeDefinitionRollback,
-    PublishedDefinitionHistoryStore, PublishedDefinitionRevisionHistoryEntry, ReplacementProposal,
-    STATUS_CLOSED, STATUS_MERGED, STATUS_OPEN, dataset_column_names,
-    history_entry_from_merged_proposal, list_published_definition_history, merge_receipt_id,
-    object_property_keys, proposal_content_digest, reject_foreign_member_grants,
-    require_descendant_candidate, require_rollback_migration_plan,
-    rollback_may_drop_live_object_type_properties, rollback_member_edits,
+    ApproveDefinitionProposal, CLOSE_REASON_SUPERSEDED, CloseDefinitionProposal,
+    CreateDefinitionProposal, DatasetProposalAttachment, DefinitionMergePath, DefinitionProposal,
+    DefinitionProposalApproval, DefinitionProposalMergeResult, MergeDefinitionProposal,
+    PROPOSAL_CONTRACT_VERSION, PreparedProposalDigestInput, ProposeDefinitionImport,
+    ProposeDefinitionRollback, PublishedDefinitionHistoryStore,
+    PublishedDefinitionRevisionHistoryEntry, ReplacementProposal, STATUS_CLOSED, STATUS_MERGED,
+    STATUS_OPEN, dataset_column_names, history_entry_from_merged_proposal,
+    list_published_definition_history, merge_receipt_id, object_property_keys,
+    proposal_content_digest, reject_foreign_member_grants, require_descendant_candidate,
+    require_rollback_migration_plan, rollback_may_drop_live_object_type_properties,
+    rollback_member_edits,
 };
 
 impl PostgresDb {
@@ -154,6 +159,8 @@ impl PostgresDb {
             created_by: actor.into(),
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            archived_at_ms: 0,
+            archive_reason: String::new(),
         };
         transaction
             .execute(
@@ -220,6 +227,7 @@ impl PostgresDb {
             true,
         )?
         .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        branch.require_active()?;
         if branch.head_revision_digest != request.expected_head_digest {
             return Err("stale_definition_branch_head: expected head is no longer current".into());
         }
@@ -600,6 +608,7 @@ impl PostgresDb {
             true,
         )?
         .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        branch.require_active()?;
         if branch.head_revision_digest != request.candidate_digest {
             return Err(
                 "stale_definition_proposal_candidate: branch head does not match candidate".into(),
@@ -1128,6 +1137,271 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+
+    /// PostgreSQL twin of `SekaiDb::rebase_definition_branch`.
+    pub fn rebase_definition_branch(
+        &self,
+        request: &RebaseDefinitionBranch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.prepare()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if !request.dry_run {
+            lock_write(&mut transaction, request, actor)?;
+            // Proposal locks come before the branch row lock, the order merge
+            // takes them in, so a concurrent merge and rebase cannot deadlock.
+            for proposal in load_branch_proposals_postgres(
+                &mut transaction,
+                &request.namespace,
+                &request.branch_id,
+            )? {
+                lock_proposal(&mut transaction, &request.namespace, &proposal.proposal_id)?;
+            }
+        }
+        if !request.idempotency_key.is_empty()
+            && let Some(replayed) = replay_postgres(
+                &mut transaction,
+                &request.namespace,
+                actor,
+                &request.idempotency_key,
+                &request_digest,
+            )?
+        {
+            return Ok(replayed);
+        }
+        let branch = load_branch_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            !request.dry_run,
+        )?
+        .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        let published = load_published_head_postgres(&mut transaction, &request.namespace)?
+            .ok_or_else(|| {
+                "definition_revision_not_found: published head is unavailable".to_string()
+            })?;
+        request.check(&branch, &published)?;
+        let mut load = |digest: &str| {
+            load_revision_postgres(&mut transaction, &request.namespace, digest)?.ok_or_else(|| {
+                "definition_revision_not_found: rebase revision is unavailable".to_string()
+            })
+        };
+        let (base, head, onto) = (
+            load(&branch.base_revision_digest)?,
+            load(&branch.head_revision_digest)?,
+            load(&published)?,
+        );
+        let mut result = rebase_branch(
+            &branch,
+            &base,
+            &head,
+            &onto,
+            &request.resolutions,
+            actor,
+            now_ms,
+        )?;
+        let Some(revision) = result.revision.clone() else {
+            return Ok(DefinitionWriteResult::Rebase {
+                result: Box::new(result),
+            });
+        };
+        if request.dry_run {
+            return Ok(DefinitionWriteResult::Rebase {
+                result: Box::new(result),
+            });
+        }
+        let revision = if revision.revision_digest == published {
+            revision
+        } else {
+            insert_revision_postgres(&mut transaction, &revision)?
+        };
+        result.revision = Some(revision.clone());
+        let superseded = close_open(
+            load_branch_proposals_postgres(
+                &mut transaction,
+                &request.namespace,
+                &request.branch_id,
+            )?,
+            CLOSE_REASON_SUPERSEDED,
+            now_ms,
+        );
+        for proposal in &superseded {
+            update_proposal_postgres(&mut transaction, proposal)?;
+        }
+        result.apply(
+            &published,
+            superseded
+                .into_iter()
+                .map(|proposal| proposal.proposal_id)
+                .collect(),
+            now_ms,
+        )?;
+        let updated = transaction
+            .execute(
+                "UPDATE sekai_definition_branches
+                 SET base_revision_digest=$1, head_revision_digest=$2, updated_at_ms=$3
+                 WHERE namespace=$4 AND branch_id=$5 AND head_revision_digest=$6",
+                &[
+                    &published,
+                    &revision.revision_digest,
+                    &now_ms,
+                    &request.namespace,
+                    &request.branch_id,
+                    &request.expected_head_digest,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if updated != 1 {
+            return Err("stale_definition_branch_head: expected head is no longer current".into());
+        }
+        let result = DefinitionWriteResult::Rebase {
+            result: Box::new(result),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &request.expected_head_digest,
+            &revision.revision_digest,
+            "rebase",
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+
+    /// PostgreSQL twin of `SekaiDb::set_definition_branch_archived`.
+    pub fn set_definition_branch_archived(
+        &self,
+        request: &SetDefinitionBranchArchived,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        let request_digest = request.request_digest()?;
+        validate_write_context(actor, now_ms)?;
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_write(&mut transaction, request, actor)?;
+        for proposal in load_branch_proposals_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+        )? {
+            lock_proposal(&mut transaction, &request.namespace, &proposal.proposal_id)?;
+        }
+        if let Some(replayed) = replay_postgres(
+            &mut transaction,
+            &request.namespace,
+            actor,
+            &request.idempotency_key,
+            &request_digest,
+        )? {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(replayed);
+        }
+        let mut branch = load_branch_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+            true,
+        )?
+        .ok_or_else(|| "definition_branch_not_found: branch is unavailable".to_string())?;
+        let proposals = load_branch_proposals_postgres(
+            &mut transaction,
+            &request.namespace,
+            &request.branch_id,
+        )?;
+        let closed = request.apply(&mut branch, proposals, now_ms)?;
+        for proposal in &closed {
+            update_proposal_postgres(&mut transaction, proposal)?;
+        }
+        transaction
+            .execute(
+                "UPDATE sekai_definition_branches
+                 SET archived_at_ms=$1, archive_reason=$2, updated_at_ms=$3
+                 WHERE namespace=$4 AND branch_id=$5",
+                &[
+                    &branch.archived_at_ms,
+                    &branch.archive_reason,
+                    &now_ms,
+                    &request.namespace,
+                    &request.branch_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let action = if request.archived {
+            "archive"
+        } else {
+            "restore"
+        };
+        let head = branch.head_revision_digest.clone();
+        let result = DefinitionWriteResult::SetArchived {
+            result: Box::new(DefinitionBranchArchiveResult {
+                branch,
+                closed_proposal_ids: closed
+                    .into_iter()
+                    .map(|proposal| proposal.proposal_id)
+                    .collect(),
+            }),
+        };
+        persist_result_postgres(
+            &mut transaction,
+            request,
+            actor,
+            &request_digest,
+            &result,
+            &head,
+            &head,
+            action,
+            now_ms,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+/// Every proposal of one branch, oldest first.
+fn load_branch_proposals_postgres(
+    client: &mut impl GenericClient,
+    namespace: &str,
+    branch_id: &str,
+) -> Result<Vec<DefinitionProposal>, String> {
+    client
+        .query(
+            "SELECT body_json FROM sekai_definition_proposals
+             WHERE namespace = $1 AND branch_id = $2
+             ORDER BY created_at_ms, proposal_id",
+            &[&namespace, &branch_id],
+        )
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|row| crate::db::definition_branch::decode_proposal(row.get(0)))
+        .collect()
+}
+
+/// The advisory lock `lock_write` takes for a request naming `proposal_id`.
+fn lock_proposal(
+    transaction: &mut Transaction<'_>,
+    namespace: &str,
+    proposal_id: &str,
+) -> Result<(), String> {
+    let key = advisory_lock_key(&[namespace, "proposal", proposal_id]);
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 666))",
+            &[&key],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn list_live_kind_properties_postgres(
@@ -1403,6 +1677,8 @@ fn open_replacement_proposal_postgres(
         created_by: actor.into(),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
+        archived_at_ms: 0,
+        archive_reason: String::new(),
     };
     transaction
         .execute(
@@ -1737,7 +2013,7 @@ fn load_branch_postgres(
     let suffix = if for_update { " FOR UPDATE" } else { "" };
     let statement = format!(
         "SELECT base_revision_digest, head_revision_digest, created_by,
-                created_at_ms, updated_at_ms
+                created_at_ms, updated_at_ms, archived_at_ms, archive_reason
          FROM sekai_definition_branches WHERE namespace=$1 AND branch_id=$2{suffix}"
     );
     let branch = client
@@ -1752,6 +2028,8 @@ fn load_branch_postgres(
             created_by: row.get(2),
             created_at_ms: row.get(3),
             updated_at_ms: row.get(4),
+            archived_at_ms: row.get(5),
+            archive_reason: row.get(6),
         });
     Ok(branch)
 }

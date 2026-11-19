@@ -4,6 +4,54 @@
 use super::*;
 
 impl RuntimeDb {
+    pub fn rebase_definition_branch(
+        &self,
+        request: &crate::sekai::definition_branch_rebase::RebaseDefinitionBranch,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::rebase_definition_branch(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::rebase_definition_branch(
+                    db.as_ref(),
+                    request,
+                    actor,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
+    pub fn set_definition_branch_archived(
+        &self,
+        request: &crate::sekai::definition_branch_rebase::SetDefinitionBranchArchived,
+        actor: &str,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
+        match self {
+            Self::Sqlite(db) => DefinitionBranchBackend::set_definition_branch_archived(
+                db.as_ref(),
+                request,
+                actor,
+                now_ms,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                DefinitionBranchBackend::set_definition_branch_archived(
+                    db.as_ref(),
+                    request,
+                    actor,
+                    now_ms,
+                )
+            }),
+        }
+    }
+
     pub fn get_definition_revision(
         &self,
         namespace: &str,

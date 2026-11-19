@@ -891,6 +891,8 @@ pub(super) fn to_proto_definition_branch(
         created_at_ms: branch.created_at_ms,
         updated_at_ms: branch.updated_at_ms,
         pin_digest: definition_branch_domain::branch_pin_digest(branch),
+        archived_at_ms: branch.archived_at_ms,
+        archive_reason: branch.archive_reason.clone(),
     }
 }
 pub(super) fn to_proto_definition_revision_diff(
@@ -1082,6 +1084,16 @@ pub(super) fn map_definition_write_error(error: String) -> Status {
         Status::already_exists("definition write conflicts with durable state")
     } else if error.starts_with("definition_proposal_invalid_close_reason") {
         Status::invalid_argument("definition close reason is invalid")
+    } else if error.starts_with("definition_branch_archived")
+        || error.starts_with("definition_branch_not_archived")
+        || error.starts_with("definition_branch_merged")
+        || error.starts_with("definition_rebase_no_change")
+    {
+        // Branch lifecycle states (#2434); they name no member.
+        Status::failed_precondition(error)
+    } else if error.starts_with("definition_rebase_resolution_unused") {
+        // Names only a member the caller put in its own request.
+        Status::invalid_argument(error)
     } else {
         Status::internal("definition write unavailable")
     }

@@ -117,6 +117,8 @@ mod rpc_coordination;
 mod rpc_data;
 #[path = "sekai_service_rpc_definition_package.rs"]
 mod rpc_definition_package;
+#[path = "sekai_service_rpc_definition_rebase.rs"]
+mod rpc_definition_rebase;
 #[path = "sekai_service_rpc_definitions.rs"]
 mod rpc_definitions;
 #[path = "sekai_service_rpc_leases.rs"]
@@ -274,6 +276,8 @@ impl SekaiService for SekaiServiceImpl {
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
         heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
         get_model_version => get_model_version_rpc(GetModelVersionRequest) -> GetModelVersionResponse;
+        rebase_definition_branch => rebase_definition_branch_rpc(RebaseDefinitionBranchRequest) -> RebaseDefinitionBranchResponse;
+        set_definition_branch_archived => set_definition_branch_archived_rpc(SetDefinitionBranchArchivedRequest) -> SetDefinitionBranchArchivedResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;

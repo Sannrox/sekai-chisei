@@ -55,6 +55,7 @@ mod dataset_health_backend_conformance;
 mod dataset_rows_backend_conformance;
 mod decision_backend_conformance;
 mod definition_branch_backend_conformance;
+mod definition_branch_rebase_conformance;
 mod definition_lifecycle_backend_conformance;
 mod definition_migration_backend_conformance;
 mod deploy_tenkai_manifest;

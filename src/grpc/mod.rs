@@ -991,6 +991,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // Rollback and package import open proposals under the same
             // namespace and member grants; export reads like a member read.
             | "ProposeDefinitionRollback"
+            // Rebase and archive (#2434) check namespace write and member
+            // grants like a branch edit.
+            | "RebaseDefinitionBranch"
+            | "SetDefinitionBranchArchived"
             | "ExportDefinitionPackage"
             | "ImportDefinitionPackage"
             | "ImportDefinitionTree"
@@ -3619,6 +3623,8 @@ mod tests {
             "CreateDefinitionBranch",
             "ApplyDefinitionBranchEdit",
             "ProposeDefinitionRollback",
+            "RebaseDefinitionBranch",
+            "SetDefinitionBranchArchived",
             "ExportDefinitionPackage",
             "ImportDefinitionPackage",
             "ImportDefinitionTree",

@@ -140,6 +140,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
 | `SekaiService.ListPublishedDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ProposeDefinitionRollback` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.RebaseDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.SetDefinitionBranchArchived` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionTree` | `sekai.definition-branch` | yes | cli | `experimental` |

@@ -94,6 +94,23 @@ pub struct DefinitionBranch {
     pub created_by: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// When the branch was archived; 0 while it is open work. An archived
+    /// branch refuses edits, proposals and rebase until it is restored.
+    #[serde(default)]
+    pub archived_at_ms: i64,
+    /// Why it was archived; empty while it is open work.
+    #[serde(default)]
+    pub archive_reason: String,
+}
+
+impl DefinitionBranch {
+    /// Refuses a write to an archived branch.
+    pub fn require_active(&self) -> Result<(), String> {
+        if self.archived_at_ms != 0 {
+            return Err("definition_branch_archived: restore the branch before changing it".into());
+        }
+        Ok(())
+    }
 }
 
 pub fn branch_pin_digest(branch: &DefinitionBranch) -> String {
@@ -154,6 +171,12 @@ pub enum DefinitionWriteResult {
     },
     CloseProposal {
         proposal: DefinitionProposal,
+    },
+    Rebase {
+        result: Box<crate::sekai::definition_branch_rebase::DefinitionBranchRebaseResult>,
+    },
+    SetArchived {
+        result: Box<crate::sekai::definition_branch_rebase::DefinitionBranchArchiveResult>,
     },
 }
 
@@ -637,7 +660,7 @@ fn member_digest(namespace: &str, member_kind: &str, member_id: &str, body: &[u8
     format!("sha256:{:x}", hasher.finalize())
 }
 
-fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
+pub(crate) fn canonical_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
     let canonical = crate::shomei::canonical_json_with_finite_numbers(value)?;
     let mut hasher = Sha256::new();
     hasher.update(BRANCH_CONTRACT_VERSION.as_bytes());
@@ -858,6 +881,8 @@ mod tests {
             created_by: "author".into(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            archived_at_ms: 0,
+            archive_reason: String::new(),
         };
         let pin = branch_pin_digest(&branch);
         assert!(pin.starts_with("sha256:"));

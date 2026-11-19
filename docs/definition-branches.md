@@ -146,6 +146,33 @@ or datasets still carry, merge without a pinned `migration_plan_digest` fails
 executed fact migration; `ExecuteDefinitionFactMigration` still requires the
 TO revision to already be the published head.
 
+### Rebase and archive (#2434)
+
+`RebaseDefinitionBranch` moves a branch onto the live published head with a
+three-way merge per member: base, branch head, and published head. A member
+changed on one side only takes that side. A member changed on both sides is a
+conflict, reported with the three member digests (empty means absent), and the
+rebase writes nothing until each conflict has a resolution of `keep_branch` or
+`take_published`. A resolution for a member that is not in conflict fails as
+invalid. `expected_head_digest` and `onto_published_digest` must match the
+stored branch head and published head, or the call fails stale. `dry_run`
+returns the same outcome and a preview diff of the published head against the
+rebased head, and writes nothing. A written rebase stores the new head
+revision, sets base and head, closes the branch's open proposals as
+`superseded`, and records a `rebase` audit row in one transaction; a retry with
+the same key, dry or not, replays it. Auth: namespace write, read on the branch
+head and the published head, and write on every member the rebase changes.
+
+`SetDefinitionBranchArchived` archives or restores a branch. Archiving records
+the reason (at most 1024 bytes) and closes the branch's open proposals as
+`operator_abort`. An archived branch refuses edits, new proposals, and rebase
+with `definition_branch_archived`. Restore reopens the branch for edits; the
+closed proposals stay closed. A branch whose head was merged cannot be
+archived. Both transitions write an `archive` or `restore` audit row. Auth:
+namespace write and read on the branch head.
+
+Both RPCs are experimental.
+
 ### Definition file trees (#1618)
 
 `ImportDefinitionTree` (experimental) opens a branch and proposal whose
@@ -298,8 +325,7 @@ its immutable revision and audit evidence.
 
 - Branch creation starts from a published parent or from genesis. There is no
   implicit snapshot of legacy mutable schema or ontology rows.
-- A branch cannot yet be rebased, previewed, archived, or used to migrate
-  runtime facts.
+- A branch cannot be used to migrate runtime facts.
 - `CompareDefinitionRevisions` reports deterministic added, removed, and
   changed members and property keys between two authorized revisions without
   returning definition bodies.
