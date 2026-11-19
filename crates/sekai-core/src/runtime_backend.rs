@@ -67,9 +67,11 @@ pub enum BackendIdentity {
 }
 
 impl BackendIdentity {
+    /// Parses a `SEKAI_DB_BACKEND` value. Blank means unset, so SQLite, the
+    /// way the other store variables treat a blank value.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "sqlite" => Ok(Self::Sqlite),
+            "" | "sqlite" => Ok(Self::Sqlite),
             "postgres" | "postgresql" => Ok(Self::Postgres),
             other => Err(format!(
                 "unsupported SEKAI_DB_BACKEND {other:?}; expected sqlite or postgres"
@@ -450,6 +452,17 @@ fn reject_tenant_surfaces(capabilities: &BackendCapabilities) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_backend_selects_sqlite_and_unknown_is_refused() {
+        assert_eq!(BackendIdentity::parse(""), Ok(BackendIdentity::Sqlite));
+        assert_eq!(BackendIdentity::parse("  "), Ok(BackendIdentity::Sqlite));
+        assert_eq!(
+            BackendIdentity::parse(" Postgres "),
+            Ok(BackendIdentity::Postgres)
+        );
+        assert!(BackendIdentity::parse("mysql").is_err());
+    }
 
     #[test]
     fn sqlite_default_exposes_complete_versioned_capabilities() {
