@@ -256,7 +256,7 @@ impl SekaiDb {
         let Some((namespace, definition_id)) = conn
             .query_row(
                 "SELECT namespace, definition_id FROM sekai_export_artifacts
-                 WHERE receipt_id = ?1 AND expires_at_ms >= ?2 AND acked_at_ms IS NULL",
+                 WHERE receipt_id = ?1 AND expires_at_ms > ?2 AND acked_at_ms IS NULL",
                 rusqlite::params![receipt_id, now_ms],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -296,7 +296,7 @@ impl SekaiDb {
         let mut statement = conn
             .prepare(&format!(
                 "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
-                 WHERE namespace = ?1 AND acked_at_ms IS NULL AND expires_at_ms >= ?2
+                 WHERE namespace = ?1 AND acked_at_ms IS NULL AND expires_at_ms > ?2
                  ORDER BY created_at_ms"
             ))
             .map_err(|error| error.to_string())?;
@@ -641,7 +641,7 @@ impl PostgresDb {
         let Some(row) = connection
             .query_opt(
                 "SELECT namespace, definition_id FROM sekai_export_artifacts
-                 WHERE receipt_id = $1 AND expires_at_ms >= $2 AND acked_at_ms IS NULL",
+                 WHERE receipt_id = $1 AND expires_at_ms > $2 AND acked_at_ms IS NULL",
                 &[&receipt_id, &now_ms],
             )
             .map_err(|error| error.to_string())?
@@ -676,7 +676,7 @@ impl PostgresDb {
             .query(
                 &format!(
                     "SELECT {ARTIFACT_COLUMNS} FROM sekai_export_artifacts
-                     WHERE namespace = $1 AND acked_at_ms IS NULL AND expires_at_ms >= $2
+                     WHERE namespace = $1 AND acked_at_ms IS NULL AND expires_at_ms > $2
                      ORDER BY created_at_ms"
                 ),
                 &[&namespace, &now_ms],
