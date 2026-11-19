@@ -60,7 +60,8 @@ it, outside a tenant assertion, and snapshots record as that administrator.
 `DeleteOntologyHealthSchedule` stops it and keeps the trend.
 `ListOntologyHealthTrend` returns the schedule to the namespace's
 administrator. The schedule is a member of the transform schedule graph:
-`TickGovernedTransforms` records each due window, scored and authorized as
+the schedule tick every plane runs (and `TickGovernedTransforms` on demand)
+records each due window, scored and authorized as
 the recorder at that moment (see [governed-transforms.md](governed-transforms.md)).
 If the recorder is refused, for example because their administration was
 revoked, the tick fails with `FAILED_PRECONDITION`. The schedule then halts

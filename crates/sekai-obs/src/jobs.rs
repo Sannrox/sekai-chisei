@@ -30,6 +30,7 @@ pub enum JobKind {
     ObjectLogIngest,
     SecurityReopen,
     CatalogReconcile,
+    ScheduleTick,
 }
 
 impl JobKind {
@@ -44,6 +45,7 @@ impl JobKind {
         JobKind::ObjectLogIngest,
         JobKind::SecurityReopen,
         JobKind::CatalogReconcile,
+        JobKind::ScheduleTick,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -58,6 +60,7 @@ impl JobKind {
             JobKind::ObjectLogIngest => "object_log_ingest",
             JobKind::SecurityReopen => "security_reopen",
             JobKind::CatalogReconcile => "catalog_reconcile",
+            JobKind::ScheduleTick => "schedule_tick",
         }
     }
 }

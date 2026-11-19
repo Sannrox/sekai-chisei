@@ -377,7 +377,9 @@ impl SekaiDb {
 
     /// Claims at most one due bucket. The cursor write is the admission
     /// (ADR 0103): a crash after this commit loses that interval and never
-    /// double-runs it; remaining due definitions stay unclaimed.
+    /// double-runs it; remaining due definitions stay unclaimed. The write
+    /// lock is taken up front: a deferred read upgraded to a write fails at
+    /// once, without the busy wait, when another replica claims meanwhile.
     pub fn claim_due_export_schedules(
         &self,
         now_ms: i64,
@@ -385,7 +387,9 @@ impl SekaiDb {
         use rusqlite::OptionalExtension;
         use sekai_types::governed_transform::schedule_due_bucket;
         let mut conn = self.conn();
-        let transaction = conn.transaction().map_err(|error| error.to_string())?;
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let definitions: Vec<(String, String, String, String)> = {
             let mut statement = transaction
                 .prepare(

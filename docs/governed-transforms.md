@@ -79,14 +79,32 @@ still require credential administration. `RunGovernedTransform` stays
 unadmitted for scoped sessions.
 
 A definition may carry a `schedule` interval and an `on_input_commit` trigger.
-The plane admits due work on an idempotent replica tick. An upstream commit
+The plane admits due work on an idempotent replica tick (#3092). Every Sekai
+plane instance runs the schedule tick in the background once a minute, as
+`system:transform-scheduler`, with no leader and no caller outside the plane.
+The tick admits due transform runs (schedule buckets and debounced change
+triggers), dataset and ontology health checks, Source sync buckets, export
+schedules, site agent schedule and change wakes, the ad-hoc scratch sweep,
+retryable quota releases and pending transform usage. Each member claims its
+due bucket in the store: SQLite admits transform runs in one `IMMEDIATE`
+transaction with the bucket cursor, and PostgreSQL behind a
+transaction-scoped advisory lock. So instances ticking at once admit a bucket
+once, and an instance that dies before its claim commits leaves the bucket
+to the next tick on any instance. A schedule that missed several buckets while
+the plane was down admits one run for the current bucket, not one per missed
+bucket. A saved export runs after its claim commits, so an instance that dies
+between the two loses that one interval rather than running it twice (ADR
+0103). Each pass is a `schedule_tick` background job span; a pass that
+admitted no transform run is idle and exports none. `TickGovernedTransforms`
+runs the same pass on demand; an outside caller still works, and a call
+between background passes finds nothing more due. An upstream commit
 or `ApplySourceBatch` coalesces into one downstream run inside the debounce
 window. Cycles are refused at Put. Failed upstream runs mark downstream
 outputs `blocked`; a later success unblocks them. Cancelling a run skips
 not-yet-started downstream work and records that on the receipts.
 
 A dataset health check with `every_ms` greater than zero is also a member of
-this schedule graph (#2187). `TickGovernedTransforms` runs it once per due
+this schedule graph (#2187). The schedule tick runs it once per due
 bucket (`now / every_ms`), with no caller outside the plane. The check's
 stored `last_run_ms` is the schedule cursor: a run claims the bucket by a
 conditional update of `last_run_ms`, and that claim commits together with the
