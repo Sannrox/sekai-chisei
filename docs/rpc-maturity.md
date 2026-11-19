@@ -413,6 +413,7 @@ Edit the fixture, then regenerate with
 | `ChiseiService.ListEvalDatasetDefinitions` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.ListEvalDatasetCases` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.CancelEvaluationExecution` | `chisei.evaluation` | yes | none | `experimental` |
+| `ChiseiService.GetEvaluationRationale` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.AuthorizeExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.TransitionExternalAction` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | yes | example | `stable` |

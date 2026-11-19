@@ -34,6 +34,18 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "GetEvaluationRationale",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.evaluation"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei_store/evaluation_rationale.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ClaimGatewayDispatch",
       "kind": "persistent",
       "surfaces": [

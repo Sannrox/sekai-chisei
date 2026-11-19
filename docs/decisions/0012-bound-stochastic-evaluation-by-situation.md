@@ -68,10 +68,30 @@ provider policy. There is no provider or model fallback.
 
 V1 persists no raw prompt, evidence payload, provider response, model
 reasoning, or normalized result object. Only bounded reason codes, numeric
-statistics, token counts, and digests enter the receipt. The policy value is
-therefore currently restricted to `none/v1`. Encrypted raw retention remains
-disabled until a dedicated governed encrypted store, authorization model,
-redaction contract, and retention lifecycle exist.
+statistics, token counts, and digests enter the receipt. `none/v1` stays the
+default retention policy.
+
+A plan may opt a stochastic node into `rationale/v1` (#2630). Under it, an
+evaluator using the `chisei.bounded-rubric-rationale/v1` prompt profile
+returns a bounded judge rationale (at most 1024 characters) with each trial.
+Chisei keeps only that rationale, never the prompt, evidence payload, or full
+provider response, in a dedicated store keyed by execution operation, node,
+and trial slot. The receipt records only the rationale digest.
+
+- The rationale carries the markings of the admitted evidence the step read.
+  `GetEvaluationRationale` returns it only to a principal with namespace read
+  access and clearance for every one of those evidence objects; any refusal
+  reads as not found, and each disclosure is audited before it is returned.
+- The TTL is frozen by the policy version: `rationale/v1` keeps a rationale
+  for 30 days.
+- A rationale goes away when its TTL passes or when any source evidence is
+  removed or withdrawn (retracted, rejected, or quarantined). Reads enforce
+  both, and a periodic sweep deletes rows nobody reads.
+- Protection at rest comes from markings, the TTL, and volume encryption.
+  There is no application-level encryption, so an operator who can read the
+  database files can read retained rationale.
+
+Full raw prompt and response retention stays unavailable.
 
 The existing request-level executor version remains
 `chisei.deterministic-evaluation-executor/v1` for persistence and client
@@ -93,6 +113,10 @@ does not allow stochastic execution through the deterministic boundary.
 - **Persist raw responses by default.** Rejected because model output and
   prompts can reproduce sensitive evidence and require a separate governed
   retention boundary.
+- **Encrypt retained rationale at the application level.** Rejected for v1:
+  key custody, rotation, and recovery add an operational surface larger than
+  the bounded rationale it protects. Markings, the TTL, removal with the
+  source, and volume encryption bound the exposure instead.
 
 ## Consequences
 
@@ -110,6 +134,8 @@ bounded retry.
 Stochastic execution costs more and provides statistical rather than
 bit-identical comparability. Its bounded trials, no-fallback routing,
 fail-closed states, and no-raw-retention default are accepted constraints.
+Opting into `rationale/v1` accepts that a bounded, marked, expiring judge
+rationale is stored without application-level encryption.
 Deterministic evaluator semantics and existing immutable receipt digests remain
 unchanged when no stochastic policy is present.
 
@@ -126,6 +152,9 @@ The implementation must prove:
 - provider adapters bind supported sampling controls without provider-specific
   types in plan contracts;
 - persisted receipts contain no raw prompt, evidence, or provider response;
+- under `rationale/v1`, only a principal cleared for every source evidence
+  object reads a retained rationale, `none/v1` retains nothing, and a
+  rationale is removed at its TTL and with its source;
 - SQLite and PostgreSQL apply the same immutable-definition and plan checks;
 - an ignored Ollama integration test exercises a live provider without making
   default CI depend on a model; and

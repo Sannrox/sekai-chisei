@@ -1966,6 +1966,44 @@ fn spawn_service_background_tasks(
     if plane == ProcessPlane::Combined {
         spawn_embedding_catch_up(db.clone(), chisei_svc.clone());
     }
+    if plane.serves_chisei() {
+        spawn_evaluation_rationale_sweeper(chisei_svc.clone());
+    }
+}
+
+/// Removes retained judge rationale (#2630) whose TTL passed or whose source
+/// evidence is gone or withdrawn. Reads also enforce both, so the sweep only
+/// bounds how long an unread row lingers. Safe on every instance at once:
+/// each delete is keyed and idempotent.
+fn spawn_evaluation_rationale_sweeper(chisei: Arc<chisei_service::ChiseiServiceImpl>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let chisei = chisei.clone();
+            let pass = JobPass::start(JobKind::Retention);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::chisei::evaluation_rationale::sweep_evaluation_rationales(
+                    chisei.db.runtime(),
+                    chisei.sekai_facts.reader(),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(removed)) => pass.finish(JobOutcome::Ok, removed),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "evaluation rationale sweep failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "evaluation rationale sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+            }
+        }
+    });
 }
 
 /// What a pass over several namespaces or specs saw, for its job span:

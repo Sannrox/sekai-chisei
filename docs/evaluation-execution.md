@@ -148,6 +148,29 @@ The production evaluator maps output to a closed reason vocabulary
 (`criteria_met`, `criteria_not_met`, or `insufficient_evidence`); arbitrary
 model-generated strings cannot enter a receipt.
 
+### Retained judge rationale
+
+A node whose stochastic policy declares `rationale/v1` retention, and whose
+evaluator uses the `chisei.bounded-rubric-rationale/v1` prompt profile, keeps
+the judge's rationale (at most 1024 characters) for each completed trial.
+Nothing else from the prompt or provider response is kept. The step receipt
+records only `rationale_digest` per trial.
+
+Read a rationale with the experimental `ChiseiService.GetEvaluationRationale`
+RPC (enable it with `SEKAI_EXPERIMENTAL_RPCS`), passing the namespace,
+manifest digest, node id, and trial index:
+
+- the caller needs namespace read access and clearance for the markings of
+  every evidence object the step read; any refusal reads as not found;
+- each disclosure records an `evaluation_rationale/read` audit decision first,
+  and the read fails if the audit write fails;
+- a rationale expires 30 days after it is recorded, and is removed when any
+  source evidence is deleted, retracted, rejected, or quarantined. Reads
+  enforce both, and a sweep every 10 minutes deletes unread rows.
+
+Retained rationale relies on markings, the TTL, and volume encryption; it is
+not encrypted by the application. See ADR 0012.
+
 ## Closed execution and reduction
 
 Ready nodes run sequentially in deterministic topological order with

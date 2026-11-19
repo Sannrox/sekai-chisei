@@ -1158,6 +1158,7 @@ mod tests {
                 output_tokens: 2,
                 retry_accounted_tokens: 0,
                 result_digest: digest('x'),
+                rationale_digest: String::new(),
             }],
             aggregate_digest: digest('z'),
         });

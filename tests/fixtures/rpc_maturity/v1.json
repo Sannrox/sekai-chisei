@@ -2715,6 +2715,15 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "GetEvaluationRationale",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "AuthorizeExternalAction",
       "storage_path": "chisei.approvals",
       "real_backend": "yes",

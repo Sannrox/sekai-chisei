@@ -1680,6 +1680,7 @@ pub(super) fn to_proto_evaluation_step(
                         output_tokens: trial.output_tokens,
                         retry_accounted_tokens: trial.retry_accounted_tokens,
                         result_digest: trial.result_digest.clone(),
+                        rationale_digest: trial.rationale_digest.clone(),
                     })
                     .collect(),
                 aggregate_digest: evidence.aggregate_digest.clone(),

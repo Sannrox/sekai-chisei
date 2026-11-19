@@ -723,6 +723,13 @@ fn run_evaluation_execution(
                 &durable_step.status,
                 execution.elapsed,
             );
+            retain_rationales(
+                db,
+                manifest,
+                node,
+                &index.operation_id,
+                &execution.rationales,
+            );
         }
         prior_steps = projection
             .steps
@@ -773,6 +780,54 @@ fn run_evaluation_execution(
         }
     };
     evaluation_projection_from_receipt(manifest, index, &receipt).map_err(Status::data_loss)
+}
+
+/// Stores the rationales a `rationale/v1` step kept (#2630), once its step is
+/// durable. They carry the step's admitted evidence and expire at the policy's
+/// TTL. A failed write is logged and leaves the step as recorded: the receipt
+/// names the digest, and a read of the missing rationale finds nothing.
+fn retain_rationales(
+    db: &RuntimeDb,
+    manifest: &evaluation_manifest_domain::ResolvedEvaluationManifest,
+    node: &evaluation_manifest_domain::ResolvedEvaluationNode,
+    operation_id: &str,
+    rationales: &[evaluation_execution_domain::TrialRationale],
+) {
+    use crate::chisei::evaluation_rationale::{
+        EvaluationRationale, EvaluationRationaleStore, most_restrictive_classification,
+    };
+    if rationales.is_empty() {
+        return;
+    }
+    let classification = most_restrictive_classification(
+        manifest
+            .evidence
+            .iter()
+            .filter(|binding| {
+                node.evidence_object_ids
+                    .contains(&binding.evidence_object_id)
+            })
+            .map(|binding| binding.classification.as_str()),
+    );
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let rows: Vec<_> = rationales
+        .iter()
+        .map(|kept| EvaluationRationale {
+            operation_id: operation_id.into(),
+            node_id: node.node_id.clone(),
+            trial_index: kept.trial_index,
+            namespace: manifest.namespace.clone(),
+            rationale: kept.rationale.clone(),
+            rationale_digest: kept.rationale_digest.clone(),
+            evidence_object_ids: node.evidence_object_ids.clone(),
+            classification: classification.clone(),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(evaluation_plan_domain::RATIONALE_TTL_MS),
+        })
+        .collect();
+    if let Err(error) = db.put_evaluation_rationales(&rows) {
+        tracing::error!(%error, node_id = %node.node_id, "evaluation rationale was not retained");
+    }
 }
 
 #[cfg(test)]

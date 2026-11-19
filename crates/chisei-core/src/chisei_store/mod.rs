@@ -22,6 +22,7 @@ pub mod eval_run;
 mod evaluation_execution;
 mod evaluation_manifest;
 mod evaluation_plan;
+pub mod evaluation_rationale;
 pub mod ext;
 pub mod governed_subject_provenance;
 mod handle;
