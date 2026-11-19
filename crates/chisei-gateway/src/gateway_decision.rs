@@ -172,10 +172,7 @@ pub(super) async fn apply_gateway_decision(
     requested_provider: ProviderKind,
     client_provider: ProviderKind,
     capability_surface: Option<CapabilityRequestSurface>,
-    context_request: Option<&GatewayContextRequest>,
     requested_model: Option<&str>,
-    request_id: &str,
-    work_unit_id: Option<&str>,
 ) -> Result<
     (
         PolicyPreflight,
@@ -334,20 +331,9 @@ pub(super) async fn apply_gateway_decision(
     preflight_context.policy_scope = resolved.policy_scope.clone();
     preflight_context.policy_version = resolved.policy_version.clone();
     preflight_context.egress_applied = true;
-    let egress = apply_context_egress(
-        config,
-        runtime,
-        identity,
-        client_provider,
-        resolved.resolved_provider,
-        &resolved.body,
-        context_request,
-        requested_model,
-        resolved.resolved_model.as_deref(),
-        request_id,
-        work_unit_id,
-    )
-    .await?;
+    let egress = ContextEgressPreflight {
+        body: resolved.body.clone(),
+    };
     Ok((resolved, egress, Some(budget)))
 }
 /// Request the canonical gateway governance decision.

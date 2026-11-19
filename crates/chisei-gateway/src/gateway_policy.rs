@@ -633,7 +633,6 @@ pub(super) fn policy_preflight(
     provider: ProviderKind,
     canonical_model: Option<&str>,
     model_metadata_request: bool,
-    has_context_request: bool,
     data_class: &str,
 ) -> Result<
     (
@@ -643,13 +642,6 @@ pub(super) fn policy_preflight(
     ),
     GatewayRejection,
 > {
-    if has_context_request {
-        return Err(GatewayRejection::json(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "chisei_context is not available in gateway policy mode",
-        ));
-    }
     let model = if model_metadata_request {
         None
     } else {

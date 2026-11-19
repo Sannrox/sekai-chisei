@@ -50,10 +50,10 @@ use sekai_proto::chisei::{
 };
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_proto::sekai::{
-    AppendRowsRequest, ColumnDef, ContextRoot as SekaiContextRoot, CreateDatasetRequest,
-    CreateLinkRequest, CreateObjectRequest, Dataset, Decision, FindByExternalIdRequest,
-    FindByPropertyRequest, Link, ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest,
-    RecordDecisionRequest, RetrieveContextRequest, Row, RowFilter, RowQuery, UpdateDatasetRequest,
+    AppendRowsRequest, ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest,
+    Dataset, Decision, FindByExternalIdRequest, FindByPropertyRequest, Link,
+    ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest, RecordDecisionRequest, Row,
+    RowFilter, RowQuery, UpdateDatasetRequest,
 };
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
@@ -1032,91 +1032,6 @@ struct ContextEgressPreflight {
     body: Vec<u8>,
 }
 
-const MAX_CONTEXT_OBJECT_SELECTORS: usize = 32;
-const MAX_CONTEXT_FIELDS_PER_OBJECT: usize = 32;
-const MAX_CONTEXT_RETRIEVAL_RELATIONS: usize = 8;
-const MAX_CONTEXT_RETRIEVAL_KINDS: usize = 8;
-const MAX_CONTEXT_RETRIEVAL_DEPTH: i32 = 3;
-const MAX_CONTEXT_RETRIEVAL_OBJECTS: i32 = 32;
-const MAX_CONTEXT_RETRIEVAL_LINKS: i32 = 64;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewayContextRequest {
-    objects: Vec<GatewayContextObject>,
-    retrieval: Option<GatewayContextRetrieval>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewayContextObject {
-    root: GatewayContextRoot,
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum GatewayContextRoot {
-    External(String),
-    Object(String),
-    Link(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GatewayContextRetrieval {
-    relations: Vec<String>,
-    direction: String,
-    max_depth: i32,
-    max_objects: i32,
-    max_links: i32,
-    kinds: Vec<String>,
-    fields: Vec<String>,
-}
-
-struct ResolvedGatewayContextObject {
-    object: crate::domain::Object,
-    fields: Vec<String>,
-    expanded: bool,
-}
-
-#[derive(Default)]
-struct GatewayContextResolution {
-    objects: Vec<ResolvedGatewayContextObject>,
-    unresolved_roots: u32,
-    denied_objects: u32,
-    truncated_objects: u32,
-    truncated_links: u32,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGatewayContextRequest {
-    objects: Vec<RawGatewayContextObject>,
-    #[serde(default)]
-    retrieval: Option<RawGatewayContextRetrieval>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGatewayContextObject {
-    #[serde(rename = "ref", default)]
-    external_id: Option<String>,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    link_id: Option<String>,
-    fields: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawGatewayContextRetrieval {
-    relations: Vec<String>,
-    direction: String,
-    max_depth: i32,
-    max_objects: i32,
-    max_links: i32,
-    kinds: Vec<String>,
-    fields: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResponseAdapter {
     Passthrough,
@@ -1947,15 +1862,6 @@ impl SseUsageTap {
             self.observation.stop_reason = observation.stop_reason;
         }
     }
-}
-
-/// An object's governed context prepared for injection, with the audit
-/// metadata needed to reconcile the egress record with what was actually
-/// forwarded.
-struct InjectableObject {
-    line: String,
-    included_fields: usize,
-    object_ref: String,
 }
 
 enum BoundedResponseError {

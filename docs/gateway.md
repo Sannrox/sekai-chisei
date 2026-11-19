@@ -375,36 +375,19 @@ lag while a gateway is unreachable. The reader stops, and reports why, when
 the gateway's log ends before the cursor (a replaced log) or has dropped
 records the cursor does not cover.
 
-Not yet in policy mode: `x-chisei-request-id` dispatch deduplication,
-`chisei_context` (refused), and cost or token quotas.
+Not yet in policy mode: `x-chisei-request-id` dispatch deduplication and
+cost or token quotas.
 
-## Context selection and egress
+## No graph context
 
-Compatible clients can request exact graph fields with a top-level
-`chisei_context` control field. The gateway removes it before forwarding and
-injects only selected fields permitted by access and egress policy:
-
-```json
-{
-  "model": "gpt-5.5",
-  "input": "Analyze the selected evidence.",
-  "chisei_context": {
-    "objects": [
-      { "ref": "ticker:AAPL", "fields": ["score", "confidence"] }
-    ]
-  }
-}
-```
-
-Each selector uses one of `ref`, `id`, or `link_id`. An optional bounded
-`retrieval` block selects eligible relations, direction, depth, object/link
-counts, kinds, and fields. Access checks apply at every traversal step. The
-gateway records requested, omitted, denied, and injected context without
-turning graph values into trusted instructions.
-
-Context expansion is evaluation-gated. A direct root selection can remain
-available while related-object expansion is denied because it lacks a passing
-candidate comparison or has regressed against its baseline.
+The gateway injects no graph data (ADR 0152, #2696). A request with a
+top-level `chisei_context` field is refused with `400 invalid_request_error`
+before any decision or provider contact, in policy mode and on the
+`gateway.decide/v2` path alike. Object references in the request text are
+forwarded as written; the gateway no longer looks them up. Select context
+through native planning (`PlanExecution`), or read it with the MCP read tools
+(`Search`, `GetObject`, and `ExpandNeighborhood`, which is
+experimental and needs `SEKAI_EXPERIMENTAL_RPCS`).
 
 ## Usage and smoke tests
 

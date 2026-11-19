@@ -279,16 +279,16 @@ pub(super) async fn proxy_gateway_inner_scoped(
             );
         }
     };
-    let (body, context_request) = match extract_gateway_context_request(&body) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("invalid chisei_context: {err}"),
-            );
-        }
-    };
+    // ADR 0152: the gateway injects no graph data. Refuse the retired field
+    // before any decision or provider contact so a caller never believes
+    // context was added.
+    if carries_chisei_context(&body) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            CHISEI_CONTEXT_REMOVED,
+        );
+    }
     let request_bytes = body.len();
     let request_hash = format!("{:x}", Sha256::digest(&body));
     let requested_model = extract_request_model(&body);
@@ -527,7 +527,6 @@ pub(super) async fn proxy_gateway_inner_scoped(
                 .as_ref()
                 .map(|model| model.canonical_model.as_str()),
             model_metadata_request,
-            context_request.is_some(),
             &caller_data_class,
         ),
         None => match gateway_decision_preflight(
@@ -559,10 +558,7 @@ pub(super) async fn proxy_gateway_inner_scoped(
                     requested_provider,
                     client_provider,
                     capability_surface,
-                    context_request.as_ref(),
                     requested_model.as_deref(),
-                    &request_id,
-                    work_unit_id.as_deref(),
                 )
                 .await
             }

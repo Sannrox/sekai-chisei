@@ -483,52 +483,6 @@ pub(super) fn truncate_gateway_spec(value: &str) -> String {
     const MAX_GATEWAY_SPEC_CHARS: usize = 4000;
     value.chars().take(MAX_GATEWAY_SPEC_CHARS).collect()
 }
-/// Maximum characters of governed object context the gateway will inject into a
-/// request, read from `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` (default 4000).
-/// Bounds precision-injection so it never balloons the prompt (which would
-/// defeat the cost goal) or drown the model in low-signal context.
-pub(super) fn max_object_context_chars() -> usize {
-    const DEFAULT_MAX_OBJECT_CONTEXT_CHARS: usize = 4000;
-    std::env::var("CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_MAX_OBJECT_CONTEXT_CHARS)
-}
-/// Keep whole object contexts in order until the character budget is reached;
-/// drop the rest. Returns the kept objects and the number dropped, so injection
-/// stays bounded and the drop is auditable. Whole lines are preserved where
-/// possible; a single first object whose line is larger than the budget is
-/// truncated so the total never exceeds `max_chars`.
-pub(super) fn cap_injectable_objects(
-    objects: Vec<InjectableObject>,
-    max_chars: usize,
-) -> (Vec<InjectableObject>, usize) {
-    let mut kept: Vec<InjectableObject> = Vec::new();
-    let mut used = 0usize;
-    let mut dropped = 0usize;
-    for mut object in objects {
-        if kept.is_empty() {
-            // Always inject at least one object's context, hard-truncating it
-            // to the budget in the rare case it exceeds the cap on its own.
-            if object.line.chars().count() > max_chars {
-                object.line = object.line.chars().take(max_chars).collect();
-            }
-            used = object.line.chars().count();
-            kept.push(object);
-            continue;
-        }
-        // Account for the "\n" separator between kept lines.
-        let projected = used + 1 + object.line.chars().count();
-        if projected <= max_chars {
-            used = projected;
-            kept.push(object);
-        } else {
-            dropped += 1;
-        }
-    }
-    (kept, dropped)
-}
 pub(super) fn clamp_i64_to_i32(value: i64) -> i32 {
     value.clamp(0, i32::MAX as i64) as i32
 }
