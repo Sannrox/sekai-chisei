@@ -231,3 +231,120 @@ fn postgres_definition_lifecycle_conformance_and_restart() {
             .all(|item| item.name != format!("{prefix}-Trackable"))
     );
 }
+
+/// Runs `op` on a thread while `blocker` holds an open transaction, waits until
+/// `op` waits on a lock or returns, then commits `blocker` and returns `op`'s result.
+fn race_against_open_transaction<T: Send + 'static>(
+    db: &PostgresDb,
+    blocker: postgres::Transaction<'_>,
+    op: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let handle = std::thread::spawn(op);
+    let mut probe = db.connection().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !handle.is_finished() {
+        let waiting: i64 = probe
+            .query_one(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "racing operation neither waited nor returned"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    blocker.commit().unwrap();
+    handle.join().unwrap()
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+fn postgres_schema_deletes_never_commit_alongside_a_racing_dependent_write() {
+    let prefix = format!("pg-{}", uuid::Uuid::new_v4().simple());
+    let db = std::sync::Arc::new(postgres());
+    let kind = format!("{prefix}-raced");
+    let interface_name = format!("{prefix}-Raced");
+    db.upsert_interface(&InterfaceDef {
+        name: interface_name.clone(),
+        description: "raced".into(),
+        properties: vec![],
+        is_builtin: false,
+    })
+    .unwrap();
+    let object_type = |kind: &str, implements: Vec<String>| ObjectType {
+        kind: kind.into(),
+        description: "raced".into(),
+        properties: vec![],
+        is_builtin: false,
+        implements,
+    };
+    db.upsert_object_type(&object_type(&kind, vec![])).unwrap();
+
+    // An uncommitted object insert of the kind: the delete waits, then refuses.
+    let mut conn = db.connection().unwrap();
+    let mut tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated)
+         VALUES ($1, $2, 'raced', 'default', '', '{}', 1, 1)",
+        &[&format!("{prefix}-object"), &kind],
+    )
+    .unwrap();
+    let (racer, raced) = (db.clone(), kind.clone());
+    let deleted = race_against_open_transaction(&db, tx, move || racer.delete_object_type(&raced));
+    assert!(
+        deleted.unwrap_err().contains("objects of that kind exist"),
+        "a type delete never commits beside a racing object insert"
+    );
+
+    // An uncommitted type upsert implementing the interface: the delete waits, then refuses.
+    let mut tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO sekai_object_types (kind, description, properties_json, implements_json, created, updated)
+         VALUES ($1, 'raced', '[]', $2, 1, 1)",
+        &[&format!("{prefix}-late"), &serde_json::json!([interface_name]).to_string()],
+    )
+    .unwrap();
+    let (racer, raced) = (db.clone(), interface_name.clone());
+    let deleted = race_against_open_transaction(&db, tx, move || racer.delete_interface(&raced));
+    assert!(
+        deleted.unwrap_err().contains("implement"),
+        "an interface delete never commits beside a racing implementing upsert"
+    );
+
+    // A delete already under way: the upsert waits, then fails as an unknown interface.
+    let mut tx = conn.transaction().unwrap();
+    tx.batch_execute("LOCK TABLE sekai_object_types IN SHARE MODE")
+        .unwrap();
+    tx.execute(
+        "DELETE FROM sekai_object_types WHERE kind = $1",
+        &[&format!("{prefix}-late")],
+    )
+    .unwrap();
+    tx.execute(
+        "DELETE FROM sekai_interfaces WHERE name = $1",
+        &[&interface_name],
+    )
+    .unwrap();
+    let (racer, upserted) = (
+        db.clone(),
+        object_type(&format!("{prefix}-after"), vec![interface_name.clone()]),
+    );
+    let upsert =
+        race_against_open_transaction(&db, tx, move || racer.upsert_object_type(&upserted));
+    assert_eq!(
+        upsert.unwrap_err(),
+        format!("unknown interface: {interface_name}")
+    );
+    assert!(
+        db.get_object_type(&format!("{prefix}-after"))
+            .unwrap()
+            .is_none()
+    );
+}

@@ -4,15 +4,47 @@ use crate::sekai::schema::{
 };
 
 impl PostgresDb {
+    /// Upserts a custom object type. Custom interfaces it implements must exist
+    /// at write time: the ROW EXCLUSIVE lock orders this upsert against
+    /// `delete_interface`'s SHARE lock, so the delete either sees this type or
+    /// commits first and this upsert fails as an unknown interface.
     pub fn upsert_object_type(&self, object_type: &ObjectType) -> Result<(), String> {
         let now = chrono::Utc::now().timestamp_millis();
         let properties =
             serde_json::to_string(&object_type.properties).map_err(|error| error.to_string())?;
         let implements =
             serde_json::to_string(&object_type.implements).map_err(|error| error.to_string())?;
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_object_types
+        let custom_interfaces: Vec<&str> = object_type
+            .implements
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !is_builtin_interface_name(name))
+            .collect();
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        if !custom_interfaces.is_empty() {
+            tx.batch_execute("LOCK TABLE sekai_object_types IN ROW EXCLUSIVE MODE")
+                .map_err(|error| error.to_string())?;
+            let present: Vec<String> = tx
+                .query(
+                    "SELECT name FROM sekai_interfaces WHERE name = ANY($1)",
+                    &[&custom_interfaces],
+                )
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|row| row.get(0))
+                .collect();
+            if let Some(missing) = custom_interfaces
+                .iter()
+                .find(|name| !present.iter().any(|present| present == *name))
+            {
+                return Err(format!("unknown interface: {missing}"));
+            }
+        }
+        tx.execute(
+            "INSERT INTO sekai_object_types
                     (kind, description, properties_json, implements_json, created, updated)
                  VALUES ($1, $2, $3, $4, $5, $5)
                  ON CONFLICT (kind) DO UPDATE SET
@@ -20,16 +52,16 @@ impl PostgresDb {
                     properties_json = EXCLUDED.properties_json,
                     implements_json = EXCLUDED.implements_json,
                     updated = EXCLUDED.updated",
-                &[
-                    &object_type.kind,
-                    &object_type.description,
-                    &properties,
-                    &implements,
-                    &now,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            &[
+                &object_type.kind,
+                &object_type.description,
+                &properties,
+                &implements,
+                &now,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn get_object_type(&self, kind: &str) -> Result<Option<ObjectType>, String> {
@@ -67,6 +99,10 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
+            .map_err(|error| error.to_string())?;
+        // SHARE conflicts with every object insert: in-flight writes commit
+        // before the count runs, and new ones wait for this delete to finish.
+        tx.batch_execute("LOCK TABLE sekai_objects IN SHARE MODE")
             .map_err(|error| error.to_string())?;
         let object_count: i64 = tx
             .query_one("SELECT COUNT(*) FROM sekai_objects WHERE kind=$1", &[&kind])
@@ -124,6 +160,10 @@ impl PostgresDb {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
+            .map_err(|error| error.to_string())?;
+        // In-flight type upserts commit before the scan; new ones wait for
+        // this delete and then find the interface gone.
+        tx.batch_execute("LOCK TABLE sekai_object_types IN SHARE MODE")
             .map_err(|error| error.to_string())?;
         for row in tx
             .query("SELECT implements_json FROM sekai_object_types", &[])
