@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tonic::transport::Channel;
 
 use crate::chisei::action_impact::{ActionClaimRef, ClaimResolution};
@@ -42,11 +42,25 @@ impl SekaiHop {
         }
     }
 
-    fn run<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        if let Ok(handle) = Handle::try_current() {
-            return tokio::task::block_in_place(|| handle.block_on(future));
+    /// Drives a hop future to completion from synchronous code, inside or
+    /// outside a Tokio runtime.
+    fn run<T: Send>(
+        &self,
+        future: impl Future<Output = Result<T, String>> + Send,
+    ) -> Result<T, String> {
+        match Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            // A current-thread runtime can neither block in place nor host a
+            // nested runtime on this thread, so the hop runs on its own thread.
+            Ok(_) => {
+                let runtime = self.fallback_runtime()?;
+                std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
+                    .map_err(|_| "sekai hop thread panicked".to_string())?
+            }
+            Err(_) => self.fallback_runtime()?.block_on(future),
         }
-        self.fallback_runtime()?.block_on(future)
     }
 
     fn fallback_runtime(&self) -> Result<&Runtime, String> {
@@ -73,6 +87,16 @@ impl SekaiHop {
             SekaiServiceClient::new(self.channel()?),
             self.credential.clone(),
         ))
+    }
+}
+
+impl Drop for SekaiHop {
+    /// The fallback runtime may be built from inside a current-thread runtime,
+    /// where a plain drop panics; a background shutdown is allowed anywhere.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.fallback_runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -124,9 +148,9 @@ impl RemoteSekaiFactReader {
         Self::new(endpoint, std::env::var("SEKAI_CREDENTIAL").ok())
     }
 
-    fn call<T>(
+    fn call<T: Send, F: Future<Output = Result<T, String>> + Send>(
         &self,
-        read: impl AsyncFnOnce(SekaiServiceClient<Channel>, Option<String>) -> Result<T, String>,
+        read: impl FnOnce(SekaiServiceClient<Channel>, Option<String>) -> F,
     ) -> Result<T, SekaiFactError> {
         let (client, credential) = self.hop.client().map_err(SekaiFactError::Read)?;
         self.hop
@@ -138,14 +162,14 @@ impl RemoteSekaiFactReader {
 impl SekaiFactReader for RemoteSekaiFactReader {
     fn find_by_external_id(&self, external_id: &str) -> Result<Option<Object>, SekaiFactError> {
         let external_id = external_id.to_string();
-        self.call(async move |client, credential| {
+        self.call(move |client, credential| async move {
             find_by_external_id_on(client, credential, external_id).await
         })
     }
 
     fn find_namespace_boundary(&self, namespace: &str) -> Result<Option<Object>, SekaiFactError> {
         let external_id = format!("namespace:{}", namespace.trim());
-        let boundary = self.call(async move |client, credential| {
+        let boundary = self.call(move |client, credential| async move {
             find_by_external_id_on(client, credential, external_id).await
         })?;
         match boundary {
@@ -164,7 +188,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
 
     fn list_grants(&self, object_id: &str) -> Result<Vec<PrincipalGrant>, SekaiFactError> {
         let object_id = object_id.to_string();
-        self.call(async move |mut client, credential| {
+        self.call(move |mut client, credential| async move {
             let request = authorized(ListGrantsRequest { object_id }, credential)?;
             let grants = client
                 .list_grants(request)
@@ -185,7 +209,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
 
     fn get_object(&self, id: &str) -> Result<Option<Object>, SekaiFactError> {
         let id = id.to_string();
-        self.call(async move |mut client, credential| {
+        self.call(move |mut client, credential| async move {
             let request = authorized(GetObjectRequest { id }, credential)?;
             match client.get_object(request).await {
                 Ok(response) => Ok(response
@@ -201,7 +225,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
 
     fn list_objects(&self, filter: &ListFilter) -> Result<Vec<Object>, SekaiFactError> {
         let filter = filter.clone();
-        self.call(async move |mut client, credential| {
+        self.call(move |mut client, credential| async move {
             list_objects_pages(&mut client, credential, &filter).await
         })
     }
@@ -211,7 +235,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
         // pipeline type cache so classification and interface changes are
         // visible on the next request.
         let kind = kind.to_string();
-        self.call(async move |mut client, credential| {
+        self.call(move |mut client, credential| async move {
             let request = authorized(ListSchemaTypesRequest {}, credential)?;
             let types = client
                 .list_schema_types(request)
@@ -245,7 +269,7 @@ impl SekaiFactReader for RemoteSekaiFactReader {
             }
             .into(),
         };
-        self.call(async move |mut client, credential| {
+        self.call(move |mut client, credential| async move {
             let request = authorized(request, credential)?;
             Ok(client
                 .get_linked_objects(request)
@@ -820,6 +844,27 @@ mod tests {
         assert_eq!(agent.kind, "agent");
         assert!(reader.get_object_type("namespace").unwrap().is_some());
         assert!(reader.get_object_type("absent-kind").unwrap().is_none());
+    }
+
+    #[test]
+    fn hop_reads_from_inside_a_current_thread_runtime() {
+        // The server runs on its own runtime: the caller's current-thread
+        // runtime is blocked for the length of the synchronous hop call.
+        let server = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = server.block_on(serve_sekai(SekaiStore::memory()));
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let agent = caller.block_on(async {
+            let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
+            reader.get_object_type("agent")
+        });
+        assert_eq!(agent.unwrap().expect("builtin agent type").kind, "agent");
     }
 
     #[tokio::test(flavor = "multi_thread")]
