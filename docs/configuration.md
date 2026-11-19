@@ -176,7 +176,7 @@ references through an external secrets-manager adapter:
 
 | Variable | Purpose |
 | --- | --- |
-| `CHISEI_SECRET_COMMAND` | Executable that receives one opaque reference and prints the secret |
+| `CHISEI_SECRET_COMMAND` | Executable that receives one opaque reference and prints the secret. It is killed after 30 seconds; a failure reports its exit status and up to 512 bytes of stderr, never stdout |
 | `CHISEI_OPENAI_API_KEY_SECRET` | OpenAI secret reference |
 | `CHISEI_ANTHROPIC_API_KEY_SECRET` | Anthropic secret reference |
 
