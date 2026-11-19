@@ -36,7 +36,7 @@ template.
 | `SEKAI_ASSERTION_AUDIENCE` | unset | Audience-bound assertion audience |
 | `SEKAI_ASSERTION_HMAC_KEY` | unset | HMAC key that verifies `sia1.` assertions and seals the plane's own runtime and service tokens; treat as a secret. At least 32 bytes; a shorter key is refused at startup. Without it the plane issues no runtime or service tokens |
 | `SEKAI_ASSERTION_ED25519_KEYS` | unset | Ed25519 public keys that verify `sia2.` assertions ([ADR 0145](decisions/0145-ed25519-identity-assertions.md)): comma-separated `<kid>=<public key>`, each key 32 bytes base64url without padding. Not a secret. A kid that is not listed is refused |
-| `SEKAI_ASSERTION_ACCEPT_HMAC` | `1` | `0` refuses `sia1.` assertions; requires `SEKAI_ASSERTION_ED25519_KEYS`. Runtime and service tokens are unaffected |
+| `SEKAI_ASSERTION_ACCEPT_HMAC` | `1` | `0` refuses `sia1.` assertions; requires `SEKAI_ASSERTION_ED25519_KEYS`. An explicit `1` requires `SEKAI_ASSERTION_HMAC_KEY`. Runtime and service tokens are unaffected |
 | `SEKAI_MCP_PRINCIPAL` | unset | Authenticated principal for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_NAMESPACE` | unset | Canonical namespace for the `sekai-mcp` stdio host |
 | `SEKAI_MCP_TARGET` | `http://127.0.0.1:50051` or `SEKAI_SOCKET` | Control-plane target for the `sekai-mcp` stdio host. HTTP MCP is `POST /mcp` on `SEKAI_HTTP_PORT`. MCP Preview that may fill uses `LLM_HTTP_REQUEST_TIMEOUT_SECS` (default 120s), not a hard 5s deadline; Submit stays at 5s. |

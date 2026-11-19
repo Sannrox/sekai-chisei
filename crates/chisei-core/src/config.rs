@@ -176,7 +176,8 @@ impl Config {
     /// [`Self::assertion_authority`] with the Ed25519 public keys and the
     /// HMAC acceptance switch given instead of read from the environment.
     /// Issuer and audience are required with either key; HMAC acceptance
-    /// defaults on and may be off only when Ed25519 keys are configured.
+    /// defaults on and may be off only when Ed25519 keys are configured. An
+    /// explicit `1` requires the HMAC key, so it is never silently ignored.
     pub fn assertion_authority_with(
         &self,
         ed25519_keys: Option<&str>,
@@ -201,6 +202,7 @@ impl Config {
         {
             return Ok(None);
         }
+        let explicit_hmac = accept_hmac == Some("1");
         let accept_hmac = match accept_hmac {
             None | Some("1") => true,
             Some("0") => false,
@@ -229,6 +231,11 @@ impl Config {
                     }
                     None => authority,
                 }
+            }
+            (Some(_), Some(_), None, Some(_)) if explicit_hmac => {
+                return Err(
+                    "SEKAI_ASSERTION_ACCEPT_HMAC=1 requires SEKAI_ASSERTION_HMAC_KEY".into(),
+                );
             }
             (Some(issuer), Some(audience), None, Some(keys)) => {
                 AssertionAuthority::ed25519_only(issuer, audience, keys)
@@ -547,6 +554,11 @@ mod tests {
             .unwrap()
             .expect("installed");
         assert!(ed25519_only.seal("srt1.", b"{}").is_err());
+        // An explicit request for HMAC assertions needs the HMAC key.
+        let error = config
+            .assertion_authority_with(Some(&keys), Some("1"))
+            .unwrap_err();
+        assert!(error.contains("SEKAI_ASSERTION_HMAC_KEY"), "{error}");
 
         config.assertion_hmac_key = Some(TEST_HMAC_KEY.into());
         assert!(config.assertion_authority_with(None, Some("0")).is_err());
