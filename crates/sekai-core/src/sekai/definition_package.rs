@@ -302,16 +302,12 @@ pub fn sign_package(
     })
 }
 
+/// 128 plain hex digits, either case; anything else (a sign, a space) is malformed.
 fn decode_signature(value: &str) -> Result<[u8; 64], String> {
-    if value.len() != 128 || !value.is_ascii() {
-        return Err(format!("{REFUSAL_UNVERIFIED}: signature is malformed"));
-    }
-    let mut bytes = [0_u8; 64];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| format!("{REFUSAL_UNVERIFIED}: signature is malformed"))?;
-    }
-    Ok(bytes)
+    sekai_types::hex::decode(value)
+        .ok()
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
+        .ok_or_else(|| format!("{REFUSAL_UNVERIFIED}: signature is malformed"))
 }
 
 /// Parses and verifies an envelope: the format, every member and package
@@ -761,6 +757,21 @@ mod tests {
         let foreign = json.replace(PACKAGE_CONTRACT, "sekai.definition-package/v9");
         let refused = verify_envelope(&foreign, &keyring()).unwrap_err();
         assert!(refused.starts_with(REFUSAL_INCOMPATIBLE), "{refused}");
+    }
+
+    #[test]
+    fn signature_decodes_only_plain_hex_digits() {
+        let signed_digit = format!("+a{}", "0".repeat(126));
+        assert_eq!(
+            decode_signature(&signed_digit).unwrap_err(),
+            format!("{REFUSAL_UNVERIFIED}: signature is malformed")
+        );
+        assert!(decode_signature(&"0".repeat(126)).is_err());
+
+        let mut signed = envelope();
+        signed.signature.value = signed.signature.value.to_uppercase();
+        let json = serde_json::to_string(&signed).unwrap();
+        assert_eq!(verify_envelope(&json, &keyring()).unwrap(), signed);
     }
 
     fn projection(namespace: &str, output: &str, columns: &[&str]) -> GovernedTransform {
