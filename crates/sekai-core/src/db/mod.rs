@@ -30,6 +30,7 @@ pub mod federation_network_store;
 pub mod federation_revocation_store;
 pub mod federation_store;
 pub mod function;
+pub mod gateway_log_cursor;
 pub mod governed_facts;
 pub mod governed_transform;
 pub mod graph;
