@@ -260,4 +260,87 @@ mod tests {
             HandoffLifecycleError::NotFound("handoff not found".into())
         );
     }
+
+    /// Creates `manifest` as its own creator, with every reference available.
+    fn create(
+        lifecycle: &HandoffLifecycle<'_>,
+        manifest: HandoffManifest,
+        request_id: &str,
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
+        let principals = vec![manifest.creator_principal.clone()];
+        lifecycle.create(
+            CreateHandoff {
+                manifest,
+                request_id,
+                principals: &principals,
+                now_ms: 1_000,
+            },
+            |_| Ok(true),
+        )
+    }
+
+    fn successor_of(predecessor: &str) -> HandoffManifest {
+        let mut successor = manifest("handoff-next", 1_000);
+        successor.supersedes_manifest_id = predecessor.into();
+        successor
+    }
+
+    #[test]
+    fn create_refuses_a_request_id_bound_to_different_input() {
+        let db = RuntimeDb::memory();
+        let lifecycle = HandoffLifecycle::new(&db);
+        create(&lifecycle, manifest("handoff-1", 1_000), "request-1").unwrap();
+        let mut different = manifest("handoff-1", 1_000);
+        different.purpose = "something else".into();
+        assert_eq!(
+            create(&lifecycle, different, "request-1").unwrap_err(),
+            HandoffLifecycleError::AlreadyExists(
+                "request_id is already bound to different handoff input".into()
+            )
+        );
+    }
+
+    #[test]
+    fn create_refuses_a_missing_or_incompatible_predecessor() {
+        let db = RuntimeDb::memory();
+        let lifecycle = HandoffLifecycle::new(&db);
+        let unavailable =
+            HandoffLifecycleError::FailedPrecondition("superseded handoff is unavailable".into());
+        assert_eq!(
+            create(
+                &lifecycle,
+                successor_of("handoff-missing"),
+                "request-missing"
+            )
+            .unwrap_err(),
+            unavailable
+        );
+
+        let mut other_creator = manifest("from-carol", 1_000);
+        other_creator.creator_principal = "carol".into();
+        let mut other_intended = manifest("to-dave", 1_000);
+        other_intended.intended_principal = "dave".into();
+        let mut other_namespace = manifest("in-other", 1_000);
+        other_namespace.namespace = "other".into();
+        other_namespace.intended_scope = "other".into();
+        for predecessor in [other_creator, other_intended, other_namespace] {
+            let id = predecessor.id.clone();
+            create(&lifecycle, predecessor, &format!("request-{id}")).unwrap();
+            assert_eq!(
+                create(&lifecycle, successor_of(&id), &format!("successor-{id}")).unwrap_err(),
+                unavailable,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_accepts_a_compatible_predecessor() {
+        let db = RuntimeDb::memory();
+        let lifecycle = HandoffLifecycle::new(&db);
+        create(&lifecycle, manifest("handoff-1", 1_000), "request-1").unwrap();
+        let successor = create(&lifecycle, successor_of("handoff-1"), "request-2").unwrap();
+        assert_eq!(successor.supersedes_manifest_id, "handoff-1");
+        assert_eq!(db.get_handoff("handoff-next").unwrap(), Some(successor));
+    }
 }
