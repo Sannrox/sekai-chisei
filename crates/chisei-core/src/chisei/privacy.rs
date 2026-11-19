@@ -96,11 +96,29 @@ pub struct LeakRule {
     pub action: LeakAction,
 }
 
+/// A known-entity literal with its matcher, compiled once when a scan loads
+/// the entity set, so payload checks never recompile it.
+#[derive(Debug, Clone)]
+pub struct KnownEntity {
+    pub literal: String,
+    matcher: Regex,
+}
+
+impl KnownEntity {
+    /// The literal's matcher from [`known_entity_pattern`]; `None` only when
+    /// the escaped pattern exceeds the regex size limit.
+    pub fn new(literal: impl Into<String>) -> Option<Self> {
+        let literal = literal.into();
+        let matcher = Regex::new(&known_entity_pattern(&literal)).ok()?;
+        Some(Self { literal, matcher })
+    }
+}
+
 struct CachedPrivacyScan {
     leak_fingerprint: String,
     entity_generation: u64,
     rules: Arc<Vec<LeakRule>>,
-    entities: Option<Arc<Vec<String>>>,
+    entities: Option<Arc<Vec<KnownEntity>>>,
     truncated: bool,
 }
 
@@ -109,7 +127,7 @@ struct CachedPrivacyScan {
 /// the next invocation searches the current object set.
 pub struct PrivacyScan {
     pub rules: Arc<Vec<LeakRule>>,
-    pub entities: Arc<Vec<String>>,
+    pub entities: Arc<Vec<KnownEntity>>,
     pub truncated: bool,
 }
 
@@ -170,7 +188,12 @@ impl PrivacyScanCache {
                 objects.as_slice()
             };
             (
-                Some(Arc::new(entity_scan_literals(scanned))),
+                Some(Arc::new(
+                    entity_scan_literals(scanned)
+                        .into_iter()
+                        .filter_map(KnownEntity::new)
+                        .collect(),
+                )),
                 listed_overflow,
             )
         } else {
@@ -343,7 +366,7 @@ pub fn blocking_refusal(findings: &[LeakFinding]) -> Option<&'static str> {
 pub fn check_payload(
     payload: &str,
     rules: &[LeakRule],
-    entities: &[String],
+    entities: &[KnownEntity],
     truncated: bool,
 ) -> Vec<LeakFinding> {
     let mut findings = Vec::new();
@@ -365,15 +388,13 @@ pub fn check_payload(
         }
     }
     for entity in entities {
-        if let Ok(regex) = Regex::new(&known_entity_pattern(entity)) {
-            let count = regex.find_iter(payload).count();
-            if count > 0 {
-                findings.push(LeakFinding {
-                    rule_label: format!("known_entity:{entity}"),
-                    action: LeakAction::Block,
-                    match_count: count,
-                });
-            }
+        let count = entity.matcher.find_iter(payload).count();
+        if count > 0 {
+            findings.push(LeakFinding {
+                rule_label: format!("known_entity:{}", entity.literal),
+                action: LeakAction::Block,
+                match_count: count,
+            });
         }
     }
     findings
@@ -398,6 +419,20 @@ fn known_entity_pattern(entity: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn known(literals: &[&str]) -> Vec<KnownEntity> {
+        literals
+            .iter()
+            .map(|literal| KnownEntity::new(*literal).unwrap())
+            .collect()
+    }
+
+    fn literals(entities: &[KnownEntity]) -> Vec<&str> {
+        entities
+            .iter()
+            .map(|entity| entity.literal.as_str())
+            .collect()
+    }
 
     #[test]
     fn gate_matrix_blocks_sensitive_private_only() {
@@ -481,7 +516,7 @@ mod tests {
         let findings = check_payload(
             "Review ACCT-123 and SecretCo.",
             &rules,
-            &["SecretCo".into()],
+            &known(&["SecretCo"]),
             false,
         );
         assert_eq!(findings.len(), 2);
@@ -492,7 +527,7 @@ mod tests {
 
     #[test]
     fn known_entity_ending_in_punctuation_is_flagged() {
-        let entities = ["Acme Inc.".to_string()];
+        let entities = known(&["Acme Inc."]);
         for payload in ["Contract with Acme Inc. today", "Contract with Acme Inc."] {
             let findings = check_payload(payload, &[], &entities, false);
             assert_eq!(
@@ -505,7 +540,7 @@ mod tests {
             );
         }
         // A word character on the literal's edge still needs a word boundary.
-        let findings = check_payload("SecretCorp signed", &[], &["SecretCo".into()], false);
+        let findings = check_payload("SecretCorp signed", &[], &known(&["SecretCo"]), false);
         assert!(findings.is_empty());
     }
 
@@ -677,9 +712,9 @@ mod tests {
         assert_eq!(leak_calls.get(), 2);
         assert_eq!(entity_calls.get(), 1);
         assert_eq!(first.rules.len(), 1);
-        assert_eq!(first.entities.as_slice(), ["SecretCo", "asset:SECRET"]);
+        assert_eq!(literals(&first.entities), ["SecretCo", "asset:SECRET"]);
         assert_eq!(second.rules[0].id, first.rules[0].id);
-        assert_eq!(second.entities.as_slice(), first.entities.as_slice());
+        assert_eq!(literals(&second.entities), literals(&first.entities));
         assert!(Arc::ptr_eq(&first.entities, &second.entities));
         assert!(!first.truncated);
     }
@@ -805,7 +840,7 @@ mod tests {
                 || Ok(entities.borrow().clone()),
             )
             .unwrap();
-        assert_eq!(first.entities.as_slice(), ["SecretCo", "asset:SECRET"]);
+        assert_eq!(literals(&first.entities), ["SecretCo", "asset:SECRET"]);
         *entities.borrow_mut() = second_entities;
         let second = cache
             .load(
@@ -820,7 +855,7 @@ mod tests {
             second
                 .entities
                 .iter()
-                .any(|literal| literal == "UniqueSecretCorp"),
+                .any(|entity| entity.literal == "UniqueSecretCorp"),
             "entity created after the first scan must be in the next snapshot: {:?}",
             second.entities
         );
@@ -968,7 +1003,7 @@ mod tests {
             second
                 .entities
                 .iter()
-                .any(|literal| literal == "UniqueSecretCorp")
+                .any(|entity| entity.literal == "UniqueSecretCorp")
         );
     }
 
