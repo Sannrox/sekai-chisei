@@ -908,7 +908,7 @@ impl SekaiServiceImpl {
                 }
                 {
                     let mut writer = writer.borrow_mut();
-                    for part in sink.finish() {
+                    for part in sink.finish().map_err(Status::internal)? {
                         if !writer.write(part.bytes, part.rows) {
                             return Ok(false);
                         }

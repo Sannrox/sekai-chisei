@@ -316,33 +316,33 @@ impl FingerprintSink {
             )?;
             self.group.push((id.to_string(), values));
             if self.group.len() == FINGERPRINT_GROUP_SIZE {
-                return Ok(self.flush_group());
+                return self.flush_group();
             }
             return Ok(Vec::new());
         }
-        Ok(self.encoder.push(id, &values).into_iter().collect())
+        Ok(self.encoder.push(id, &values)?.into_iter().collect())
     }
 
     /// Encodes any buffered remainder, then the format's trailer.
-    pub fn finish(&mut self) -> Vec<crate::sekai::data_export::EncodedPart> {
+    pub fn finish(&mut self) -> Result<Vec<crate::sekai::data_export::EncodedPart>, String> {
         let mut out = if self.plan.is_none() || self.group.is_empty() {
             Vec::new()
         } else {
-            self.flush_group()
+            self.flush_group()?
         };
-        if let Some(part) = self.encoder.finish() {
-            out.push(part);
-        }
-        out
+        out.extend(self.encoder.finish()?);
+        Ok(out)
     }
 
-    fn flush_group(&mut self) -> Vec<crate::sekai::data_export::EncodedPart> {
+    fn flush_group(&mut self) -> Result<Vec<crate::sekai::data_export::EncodedPart>, String> {
         permute_group(&self.export_id, self.group_index, &mut self.group);
         self.group_index += 1;
         let rows = std::mem::take(&mut self.group);
-        rows.into_iter()
-            .filter_map(|(id, values)| self.encoder.push(&id, &values))
-            .collect()
+        let mut out = Vec::new();
+        for (id, values) in rows {
+            out.extend(self.encoder.push(&id, &values)?);
+        }
+        Ok(out)
     }
 }
 
@@ -829,7 +829,7 @@ mod tests {
         let encode = |export_id: &str| {
             let mut sink = FingerprintSink::new(export_id.into(), encoder(), Some(plan.clone()));
             let mut bytes = sink.push("t-1", "internal", row()).unwrap();
-            bytes.extend(sink.finish());
+            bytes.extend(sink.finish().unwrap());
             String::from_utf8(bytes.concat()).unwrap()
         };
         let alice_row = encode("export-alice");
@@ -843,13 +843,13 @@ mod tests {
             let mut values = row();
             values.remove(OBJECT_CLASSIFICATION_PROPERTY);
             let mut bytes = sink.push("t-1", "", values).unwrap();
-            bytes.extend(sink.finish());
+            bytes.extend(sink.finish().unwrap());
             String::from_utf8(bytes.concat()).unwrap()
         };
         let source = {
             let mut sink = FingerprintSink::new("export-alice".into(), encoder(), None);
             let mut bytes = sink.push("t-1", "internal", row()).unwrap();
-            bytes.extend(sink.finish());
+            bytes.extend(sink.finish().unwrap());
             String::from_utf8(bytes.concat()).unwrap()
         };
         assert_eq!(unmarked, source);
@@ -881,7 +881,7 @@ mod tests {
                 file.extend(part);
             }
         }
-        for part in sink.finish() {
+        for part in sink.finish().unwrap() {
             file.extend(part);
         }
         let text = String::from_utf8(file.clone()).unwrap();
@@ -923,7 +923,7 @@ mod tests {
                 id_file.extend(part);
             }
         }
-        for part in id_sink.finish() {
+        for part in id_sink.finish().unwrap() {
             id_file.extend(part);
         }
         let id_rows = parse_sample(ExportFormat::Csv, &id_file).unwrap();
@@ -951,7 +951,7 @@ mod tests {
                 missing_file.extend(part);
             }
         }
-        for part in missing.finish() {
+        for part in missing.finish().unwrap() {
             missing_file.extend(part);
         }
         let missing_rows = parse_sample(ExportFormat::Csv, &missing_file).unwrap();
@@ -974,7 +974,7 @@ mod tests {
                 only_file.extend(part);
             }
         }
-        for part in only_sink.finish() {
+        for part in only_sink.finish().unwrap() {
             only_file.extend(part);
         }
         let only_rows = parse_sample(ExportFormat::Csv, &only_file).unwrap();
@@ -994,7 +994,7 @@ mod tests {
                 repeated_file.extend(part);
             }
         }
-        for part in repeated.finish() {
+        for part in repeated.finish().unwrap() {
             repeated_file.extend(part);
         }
         let repeated_rows = parse_sample(ExportFormat::Csv, &repeated_file).unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
                 ]),
             )
             .unwrap();
-        bytes.extend(redacted.finish());
+        bytes.extend(redacted.finish().unwrap());
         let text = String::from_utf8(bytes.concat()).unwrap();
         assert!(text.contains("[redacted]"));
         assert!(text.contains("alpha"));
@@ -1099,7 +1099,7 @@ mod tests {
                     file.extend(part);
                 }
             }
-            for part in sink.finish() {
+            for part in sink.finish().unwrap() {
                 file.extend(part);
             }
             receipt.complete(11).unwrap();
@@ -1206,7 +1206,7 @@ mod tests {
                 file.extend(part);
             }
         }
-        for part in sink.finish() {
+        for part in sink.finish().unwrap() {
             file.extend(part);
         }
         let record = ExportFingerprintRecord {
@@ -1249,7 +1249,7 @@ mod tests {
                 file.extend(part);
             }
         }
-        for part in sink.finish() {
+        for part in sink.finish().unwrap() {
             file.extend(part);
         }
         let record = ExportFingerprintRecord {

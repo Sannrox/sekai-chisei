@@ -12,7 +12,7 @@ mod write;
 
 pub use read::decode;
 pub use thrift::DecodeError;
-pub use write::{Encoder, Flush};
+pub use write::{EncodeError, Encoder, Flush};
 
 pub const MAGIC: [u8; 4] = *b"PAR1";
 pub const ROW_GROUP_ROWS: usize = 256;
@@ -34,16 +34,20 @@ pub struct Table {
 }
 
 /// Writes `rows` as a complete Parquet file.
-pub fn encode(columns: &[String], id_column: bool, rows: &[ExportRow]) -> Vec<u8> {
+pub fn encode(
+    columns: &[String],
+    id_column: bool,
+    rows: &[ExportRow],
+) -> Result<Vec<u8>, EncodeError> {
     let mut encoder = Encoder::new(columns.to_vec(), id_column);
     let mut file = Encoder::header();
     for row in rows {
-        if let Some(flush) = encoder.push(&row.id, &row.values) {
+        if let Some(flush) = encoder.push(&row.id, &row.values)? {
             file.extend(flush.bytes);
         }
     }
-    file.extend(encoder.finish().bytes);
-    file
+    file.extend(encoder.finish()?.bytes);
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -69,7 +73,7 @@ mod tests {
             row("t-1", &[("title", "a, \"b\"\nc")]),
             row("t-2", &[("title", "ok"), ("secret", "hidden")]),
         ];
-        let file = encode(&columns, true, &rows);
+        let file = encode(&columns, true, &rows).unwrap();
         assert!(file.starts_with(&MAGIC));
         assert!(file.ends_with(&MAGIC));
 
@@ -127,7 +131,7 @@ mod tests {
 
     #[test]
     fn empty_export_is_still_a_parquet_file() {
-        let file = encode(&["title".into()], false, &[]);
+        let file = encode(&["title".into()], false, &[]).unwrap();
         let table = decode(&file).unwrap();
         assert!(table.rows.is_empty());
         SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();
@@ -139,7 +143,7 @@ mod tests {
         let rows: Vec<ExportRow> = (0..ROW_GROUP_ROWS)
             .map(|n| row(&format!("r-{n}"), &[]))
             .collect();
-        let file = encode(&columns, true, &rows);
+        let file = encode(&columns, true, &rows).unwrap();
         let table = decode(&file).expect("sparse optional column");
         assert_eq!(table.rows.len(), ROW_GROUP_ROWS);
         assert_eq!(table.rows[0].id, "r-0");
@@ -155,7 +159,7 @@ mod tests {
     fn a_dataset_column_named_id_stays_optional() {
         let columns = vec!["id".into(), "title".into()];
         let rows = vec![row("", &[("id", "user-1"), ("title", "a")])];
-        let file = encode(&columns, false, &rows);
+        let file = encode(&columns, false, &rows).unwrap();
         let table = decode(&file).expect("dialect reader");
         assert!(!table.id_column);
         assert_eq!(table.columns, columns);
@@ -181,7 +185,7 @@ mod tests {
         let rows: Vec<ExportRow> = (0..(ROW_GROUP_ROWS + 3))
             .map(|n| row("", &[("n", &n.to_string())]))
             .collect();
-        let file = encode(&columns, false, &rows);
+        let file = encode(&columns, false, &rows).unwrap();
         let table = decode(&file).unwrap();
         assert_eq!(table.rows.len(), ROW_GROUP_ROWS + 3);
         let reader = SerializedFileReader::new(bytes::Bytes::from(file)).unwrap();

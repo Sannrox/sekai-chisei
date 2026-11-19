@@ -14,6 +14,31 @@ const ENCODING_RLE: i32 = 3;
 const CODEC_UNCOMPRESSED: i32 = 0;
 const PAGE_DATA: i32 = 0;
 
+/// A length that does not fit the Parquet field that carries it. The file
+/// would be corrupt, so the encoder refuses it; the encoder is unusable after.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeError {
+    pub field: &'static str,
+    pub len: usize,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "parquet {} of {} does not fit its length field",
+            self.field, self.len
+        )
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// `len` as the integer type of the Parquet field named `field`.
+fn length<T: TryFrom<usize>>(field: &'static str, len: usize) -> Result<T, EncodeError> {
+    T::try_from(len).map_err(|_| EncodeError { field, len })
+}
+
 /// Bytes flushed from the encoder, with the number of rows they contain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flush {
@@ -67,28 +92,32 @@ impl Encoder {
         self.id_column
     }
 
-    pub fn push(&mut self, id: &str, values: &HashMap<String, String>) -> Option<Flush> {
+    pub fn push(
+        &mut self,
+        id: &str,
+        values: &HashMap<String, String>,
+    ) -> Result<Option<Flush>, EncodeError> {
         self.buffered.push(self.cells(id, values));
         if self.buffered.len() == ROW_GROUP_ROWS {
             let rows = self.buffered.len() as u64;
-            Some(Flush {
-                bytes: self.flush_group(),
+            Ok(Some(Flush {
+                bytes: self.flush_group()?,
                 rows,
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
-    pub fn finish(&mut self) -> Flush {
+    pub fn finish(&mut self) -> Result<Flush, EncodeError> {
         let rows = self.buffered.len() as u64;
         let mut bytes = if rows == 0 {
             Vec::new()
         } else {
-            self.flush_group()
+            self.flush_group()?
         };
-        bytes.extend(self.footer());
-        Flush { bytes, rows }
+        bytes.extend(self.footer()?);
+        Ok(Flush { bytes, rows })
     }
 
     fn cells(&self, id: &str, values: &HashMap<String, String>) -> Vec<Option<String>> {
@@ -102,7 +131,7 @@ impl Encoder {
         cells
     }
 
-    fn flush_group(&mut self) -> Vec<u8> {
+    fn flush_group(&mut self) -> Result<Vec<u8>, EncodeError> {
         let rows = std::mem::take(&mut self.buffered);
         let num_rows = rows.len() as i64;
         let mut bytes = Vec::new();
@@ -114,7 +143,7 @@ impl Encoder {
                 .iter()
                 .map(|row| row[index].as_deref().map(str::as_bytes))
                 .collect();
-            let chunk = encode_column(&values, required);
+            let chunk = encode_column(&values, required)?;
             let file_offset = (self.offset + bytes.len() as u64) as i64;
             columns.push(ColumnMeta {
                 file_offset,
@@ -131,16 +160,17 @@ impl Encoder {
             total_byte_size: bytes.len() as i64,
             columns,
         });
-        bytes
+        Ok(bytes)
     }
 
-    fn footer(&self) -> Vec<u8> {
+    fn footer(&self) -> Result<Vec<u8>, EncodeError> {
         let names = self.schema_names();
-        let metadata = write_file_metadata(&names, self.id_column, self.total_rows, &self.groups);
-        let mut footer = metadata;
-        footer.extend((footer.len() as u32).to_le_bytes());
+        let mut footer =
+            write_file_metadata(&names, self.id_column, self.total_rows, &self.groups)?;
+        let len: u32 = length("footer", footer.len())?;
+        footer.extend(len.to_le_bytes());
         footer.extend(MAGIC);
-        footer
+        Ok(footer)
     }
 
     fn schema_names(&self) -> Vec<String> {
@@ -158,7 +188,7 @@ fn write_file_metadata(
     id_column: bool,
     total_rows: i64,
     groups: &[RowGroupMeta],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut meta = CompactWriter::new();
     meta.begin_struct();
     meta.write_i32_field(1, 1);
@@ -166,7 +196,7 @@ fn write_file_metadata(
     meta.begin_struct();
     meta.write_i32_field(3, REPETITION_REQUIRED);
     meta.write_str_field(4, "schema");
-    meta.write_i32_field(5, names.len() as i32);
+    meta.write_i32_field(5, length("schema column count", names.len())?);
     meta.end_struct();
     for (index, name) in names.iter().enumerate() {
         meta.begin_struct();
@@ -215,34 +245,38 @@ fn write_file_metadata(
     }
     meta.write_str_field(6, CREATED_BY);
     meta.end_struct();
-    meta.buf
+    Ok(meta.buf)
 }
 
 fn write_list_i32(w: &mut CompactWriter, value: i32) {
     crate::thrift::write_varint(&mut w.buf, ((value << 1) ^ (value >> 31)) as u32 as u64);
 }
 
-fn encode_column(values: &[Option<&[u8]>], required: bool) -> Vec<u8> {
+fn encode_column(values: &[Option<&[u8]>], required: bool) -> Result<Vec<u8>, EncodeError> {
     let mut body = Vec::new();
     if !required {
-        body.extend(encode_definition_levels(values));
+        body.extend(encode_definition_levels(values)?);
     }
     for value in values.iter().flatten() {
-        body.extend((value.len() as u32).to_le_bytes());
+        let len: u32 = length("value", value.len())?;
+        body.extend(len.to_le_bytes());
         body.extend_from_slice(value);
     }
-    let mut page = page_header(values.len() as i32, body.len() as i32);
+    let mut page = page_header(
+        length("page value count", values.len())?,
+        length("page body", body.len())?,
+    );
     page.extend(body);
-    page
+    Ok(page)
 }
 
-fn encode_definition_levels(values: &[Option<&[u8]>]) -> Vec<u8> {
+fn encode_definition_levels(values: &[Option<&[u8]>]) -> Result<Vec<u8>, EncodeError> {
     let levels: Vec<u8> = values
         .iter()
         .map(|value| u8::from(value.is_some()))
         .collect();
     if levels.is_empty() {
-        return (0u32).to_le_bytes().to_vec();
+        return Ok((0u32).to_le_bytes().to_vec());
     }
     if levels.iter().all(|level| *level == levels[0]) {
         return rle_run(levels.len() as u64, levels[0]);
@@ -250,17 +284,18 @@ fn encode_definition_levels(values: &[Option<&[u8]>]) -> Vec<u8> {
     bitpack_run(&levels)
 }
 
-fn rle_run(count: u64, value: u8) -> Vec<u8> {
+fn rle_run(count: u64, value: u8) -> Result<Vec<u8>, EncodeError> {
     let mut body = Vec::new();
     crate::thrift::write_varint(&mut body, count << 1);
     body.push(value);
+    let len: u32 = length("definition level run", body.len())?;
     let mut out = Vec::with_capacity(4 + body.len());
-    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(len.to_le_bytes());
     out.extend(body);
-    out
+    Ok(out)
 }
 
-fn bitpack_run(levels: &[u8]) -> Vec<u8> {
+fn bitpack_run(levels: &[u8]) -> Result<Vec<u8>, EncodeError> {
     let groups = levels.len().div_ceil(8);
     let mut body = Vec::new();
     crate::thrift::write_varint(&mut body, ((groups as u64) << 1) | 1);
@@ -274,10 +309,11 @@ fn bitpack_run(levels: &[u8]) -> Vec<u8> {
         }
         body.push(byte);
     }
+    let len: u32 = length("definition level run", body.len())?;
     let mut out = Vec::with_capacity(4 + body.len());
-    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(len.to_le_bytes());
     out.extend(body);
-    out
+    Ok(out)
 }
 
 fn page_header(num_values: i32, body_len: i32) -> Vec<u8> {
@@ -294,4 +330,25 @@ fn page_header(num_values: i32, body_len: i32) -> Vec<u8> {
     });
     header.end_struct();
     header.buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_length_past_its_field_is_refused() {
+        let page_body = i32::MAX as usize + 1;
+        assert_eq!(
+            length::<i32>("page body", page_body),
+            Err(EncodeError {
+                field: "page body",
+                len: page_body
+            })
+        );
+        assert_eq!(length::<i32>("page body", i32::MAX as usize), Ok(i32::MAX));
+        let value = u32::MAX as usize + 1;
+        assert!(length::<u32>("value", value).is_err());
+        assert_eq!(length::<u32>("value", u32::MAX as usize), Ok(u32::MAX));
+    }
 }
