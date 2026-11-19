@@ -20,12 +20,7 @@ impl ConformanceTarget for DeterministicEnterpriseFake {
         fixture: &TenantFixture,
         case: &ConformanceCase,
     ) -> Result<Observation, Self::Error> {
-        let outcome = match case.expected {
-            ExpectedOutcome::Success => ObservedOutcome::Success,
-            ExpectedOutcome::Unauthenticated => ObservedOutcome::Unauthenticated,
-            ExpectedOutcome::PermissionDenied => ObservedOutcome::PermissionDenied,
-            ExpectedOutcome::NotFound => ObservedOutcome::NotFound,
-        };
+        let outcome = expected_outcome(case);
         let values = if outcome == ObservedOutcome::Success {
             vec![
                 ObservableValue {
@@ -144,12 +139,109 @@ fn deterministic_fake_passes_identical_generated_cases() {
     assert_eq!(report.total, registry.cases().len());
 }
 
+/// Every observation channel. The exhaustive match makes a new channel a
+/// compile error here until it is listed, so it cannot skip the detection test.
+fn every_observation_channel() -> Vec<ObservationChannel> {
+    use ObservationChannel::*;
+    let all = vec![
+        Body,
+        ListItem,
+        Count,
+        Report,
+        Receipt,
+        MetricLabel,
+        CacheKey,
+        Error,
+    ];
+    for channel in &all {
+        match channel {
+            Body | ListItem | Count | Report | Receipt | MetricLabel | CacheKey | Error => {}
+        }
+    }
+    all
+}
+
+fn expected_outcome(case: &ConformanceCase) -> ObservedOutcome {
+    match case.expected {
+        ExpectedOutcome::Success => ObservedOutcome::Success,
+        ExpectedOutcome::Unauthenticated => ObservedOutcome::Unauthenticated,
+        ExpectedOutcome::PermissionDenied => ObservedOutcome::PermissionDenied,
+        ExpectedOutcome::NotFound => ObservedOutcome::NotFound,
+    }
+}
+
+fn list_registry() -> CaseRegistry {
+    CaseRegistry::new([Surface::new(
+        Transport::Grpc,
+        "enterprise.v1.Objects/List",
+        SurfaceKind::List,
+        ExpectedOutcome::Success,
+        ExpectedOutcome::Success,
+    )])
+    .unwrap()
+}
+
 #[test]
 fn runner_detects_foreign_values_in_all_observation_channels() {
-    struct LeakingFake {
+    /// Answers every case correctly except for one foreign value in `channel`.
+    struct ChannelLeak {
+        channel: ObservationChannel,
+    }
+    impl ConformanceTarget for ChannelLeak {
+        type Error = &'static str;
+        fn isolation_snapshot(
+            &mut self,
+            _fixture: &TenantFixture,
+        ) -> Result<IsolationSnapshot, Self::Error> {
+            Ok(IsolationSnapshot {
+                tenant_a_state: "tenant-a-state".into(),
+                tenant_b_state: "tenant-b-state".into(),
+            })
+        }
+        fn execute(
+            &mut self,
+            fixture: &TenantFixture,
+            case: &ConformanceCase,
+        ) -> Result<Observation, Self::Error> {
+            Ok(Observation {
+                outcome: expected_outcome(case),
+                values: vec![ObservableValue {
+                    channel: self.channel,
+                    value: fixture.tenant_b.clone(),
+                }],
+                leakage_signals: Vec::new(),
+            })
+        }
+    }
+
+    let registry = list_registry();
+    let fixture = TenantFixture::deterministic();
+    for channel in every_observation_channel() {
+        let report = run(&registry, &fixture, &mut ChannelLeak { channel });
+        let reason = format!("foreign tenant value appeared in {channel:?}");
+        let mut flagged: Vec<&str> = report
+            .failures
+            .iter()
+            .map(|failure| {
+                assert_eq!(failure.reason, reason, "{channel:?}");
+                failure.case_id.as_str()
+            })
+            .collect();
+        flagged.sort_unstable();
+        let mut cases: Vec<String> = registry.cases().into_iter().map(|case| case.id).collect();
+        cases.sort_unstable();
+        assert_eq!(flagged, cases, "{channel:?}");
+    }
+}
+
+#[test]
+fn runner_reports_semantic_leaks_and_foreign_state_changes_by_kind() {
+    /// Answers every case correctly, raises a semantic leak signal, and
+    /// changes the foreign tenant's state on its first call.
+    struct SemanticLeak {
         mutated_foreign_state: bool,
     }
-    impl ConformanceTarget for LeakingFake {
+    impl ConformanceTarget for SemanticLeak {
         type Error = &'static str;
         fn isolation_snapshot(
             &mut self,
@@ -166,46 +258,46 @@ fn runner_detects_foreign_values_in_all_observation_channels() {
         }
         fn execute(
             &mut self,
-            fixture: &TenantFixture,
+            _fixture: &TenantFixture,
             case: &ConformanceCase,
         ) -> Result<Observation, Self::Error> {
             self.mutated_foreign_state = true;
-            let outcome = match case.expected {
-                ExpectedOutcome::Success => ObservedOutcome::Success,
-                ExpectedOutcome::Unauthenticated => ObservedOutcome::Unauthenticated,
-                ExpectedOutcome::PermissionDenied => ObservedOutcome::PermissionDenied,
-                ExpectedOutcome::NotFound => ObservedOutcome::NotFound,
-            };
             Ok(Observation {
-                outcome,
-                values: vec![ObservableValue {
-                    channel: ObservationChannel::Count,
-                    value: format!("{}:1", fixture.tenant_b),
-                }],
+                outcome: expected_outcome(case),
+                values: Vec::new(),
                 leakage_signals: vec![LeakageSignal::ForeignAggregateContribution],
             })
         }
     }
 
-    let registry = CaseRegistry::new([Surface::new(
-        Transport::Grpc,
-        "enterprise.v1.Objects/List",
-        SurfaceKind::List,
-        ExpectedOutcome::Success,
-        ExpectedOutcome::Success,
-    )])
-    .unwrap();
+    let registry = list_registry();
+    let cases = registry.cases();
     let report = run(
         &registry,
         &TenantFixture::deterministic(),
-        &mut LeakingFake {
+        &mut SemanticLeak {
             mutated_foreign_state: false,
         },
     );
+    let reasons_for = |id: &str| -> Vec<&str> {
+        report
+            .failures
+            .iter()
+            .filter(|failure| failure.case_id == id)
+            .map(|failure| failure.reason.as_str())
+            .collect()
+    };
+    let signal = "semantic tenant leak observed: ForeignAggregateContribution";
+    // Only the first case sees the foreign state change; later cases start
+    // from the already-mutated state.
     assert_eq!(
-        report.failures.len(),
-        2 * (CallerProfile::ALL.len() - 1) + 1
+        reasons_for(&cases[0].id),
+        [signal, "foreign tenant state changed"]
     );
+    for case in &cases[1..] {
+        assert_eq!(reasons_for(&case.id), [signal], "{}", case.id);
+    }
+    assert_eq!(report.failures.len(), cases.len() + 1);
 }
 
 #[test]
