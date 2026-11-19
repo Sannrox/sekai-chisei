@@ -562,10 +562,33 @@ fn postgres_concurrent_redeem_and_delegate_cannot_split_authority() {
     let delegated = thread::spawn(move || delegate_db.put_delegated_permit(&child, &child_actor));
     let redeemed = redeem.join().expect("redeem thread");
     let transferred = delegated.join().expect("delegate thread");
-    assert!(
-        redeemed.is_ok() ^ transferred.is_ok(),
-        "parent must be consumed or delegated, not both: redeem={redeemed:?} delegate={transferred:?}"
-    );
+    // The loser is refused because the winner took the authority, never for an
+    // unrelated reason, and the parent's stored state names the winner.
+    let parent_state = db.validate_permit_for_delegation(&root).unwrap_err();
+    match (&redeemed, &transferred) {
+        (Ok(_), Err(refused)) => {
+            // The delegation sees the parent's redemption under its lock, and
+            // the parent's single invocation is now spent.
+            assert_eq!(
+                refused,
+                "partially consumed permit authority cannot be delegated"
+            );
+            assert_eq!(parent_state, "permit invocation count exhausted");
+        }
+        (Err(refused), Ok(_)) => {
+            assert_eq!(
+                refused,
+                "permit authority was transferred to a delegated child"
+            );
+            assert_eq!(
+                parent_state,
+                "permit authority was transferred to a delegated child"
+            );
+        }
+        _ => panic!(
+            "parent must be consumed or delegated, not both: redeem={redeemed:?} delegate={transferred:?}"
+        ),
+    }
 }
 
 /// A delegation waits for the parent's permit lock and validates the chain after it, in
