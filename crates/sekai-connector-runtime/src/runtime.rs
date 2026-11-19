@@ -201,7 +201,7 @@ impl Runtime {
             return None;
         }
         let mut work = std::pin::pin!(work);
-        let mut beat = tokio::time::interval(self.options.lease / 3);
+        let mut beat = tokio::time::interval(heartbeat_period(self.options.lease));
         beat.tick().await;
         loop {
             tokio::select! {
@@ -239,7 +239,8 @@ impl Runtime {
     /// retried on the next poll; the plane keeps the work.
     pub async fn serve(&self, poll: Duration, shutdown: impl Future<Output = ()>) {
         let mut shutdown = std::pin::pin!(shutdown);
-        let mut ticks = tokio::time::interval(poll);
+        // `interval` panics on a zero period.
+        let mut ticks = tokio::time::interval(poll.max(MIN_PERIOD));
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
@@ -250,5 +251,28 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+/// The shortest timer period; `tokio::time::interval` panics on zero.
+const MIN_PERIOD: Duration = Duration::from_millis(1);
+
+/// Heartbeats run three times per lease, never with a zero period.
+fn heartbeat_period(lease: Duration) -> Duration {
+    (lease / 3).max(MIN_PERIOD)
+}
+
+#[cfg(test)]
+mod period_tests {
+    use super::*;
+
+    #[test]
+    fn a_tiny_lease_still_gets_a_nonzero_heartbeat_period() {
+        assert_eq!(heartbeat_period(Duration::from_millis(2)), MIN_PERIOD);
+        assert_eq!(heartbeat_period(Duration::ZERO), MIN_PERIOD);
+        assert_eq!(
+            heartbeat_period(Duration::from_millis(60_000)),
+            Duration::from_millis(20_000)
+        );
     }
 }
