@@ -96,6 +96,15 @@ fn exercise(db: &RuntimeDb) {
 
     let revoked = revoke_package(db, "reviewer", "ops", "cert:2", "signer rotated", 4_000).unwrap();
     assert_eq!(revoked.revocation, REVOCATION_REVOKED);
+    // The revocation is stored: the package no longer verifies, and a fresh
+    // read carries the revoked state and time.
+    assert_eq!(
+        verify_package(db, "reviewer", "ops", "cert:2", &recertified).unwrap_err(),
+        PACKAGE_UNAVAILABLE
+    );
+    let stored = get_package(db, "reviewer", "ops", "cert:2").unwrap();
+    assert_eq!(stored.revocation, REVOCATION_REVOKED);
+    assert_eq!(stored.revoked_at_ms, 4_000);
     assert_eq!(db.list_capability_packages("ops").unwrap().len(), 2);
 }
 
