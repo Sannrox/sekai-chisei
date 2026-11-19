@@ -187,15 +187,17 @@ lease with every write. Other instances leave the namespace alone while
 the lease holds and take the rebuild over once it lapses, so a rebuild that
 died part-way is redone instead of reported current.
 
-This index lives in its own `sekai_search_*_v2` tables. Planes from before
-the scheduled worker keep reading and writing the unsuffixed
-`sekai_search_*` tables, so during a rolling upgrade or after a rollback the
-two versions never write each other's index; both follow the object-change
-feed and the dataset catalog, which stay the source of truth. The upgrade
-creates the new tables once and seeds them from the old ones, so search
-starts warm; a namespace whose old index was stale or mid-rebuild is caught
-up or rebuilt by the worker. The unsuffixed tables are retired and are
-dropped in a later release.
+This index lives in the `sekai_search_*_v2` tables. Release 3.0.0 created
+them beside the unsuffixed `sekai_search_*` tables of earlier planes and
+seeded them once from those. The unsuffixed tables are now dropped, on
+SQLite when the store opens and on PostgreSQL in migration 0167, so the
+index is stored once.
+
+Upgrade from 3.0.0 or later keeps the index as it is. Rollback to a release
+before 3.0.0 is unsupported: those planes read only the dropped tables. A
+SQLite store upgraded directly from a release before 3.0.0 starts with an
+empty index, which the worker rebuilds from the object-change feed and the
+dataset catalog.
 
 ## Status
 
