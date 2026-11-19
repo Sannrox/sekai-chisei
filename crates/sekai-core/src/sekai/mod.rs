@@ -21,6 +21,7 @@ pub mod agent_turn;
 pub mod agent_wake;
 pub mod attestation;
 pub mod audit;
+pub mod audit_export;
 pub mod autonomous_envelope;
 pub mod capability;
 pub mod capability_package;

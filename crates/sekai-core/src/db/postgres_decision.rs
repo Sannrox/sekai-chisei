@@ -1,6 +1,6 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::audit::{Decision, DecisionFilter, validate_decision};
-use crate::sekai::ledger;
+use crate::sekai::{audit_export, ledger};
 
 impl PostgresDb {
     /// [`verify_ledger_in`] in one read-only repeatable-read snapshot.
@@ -15,6 +15,65 @@ impl PostgresDb {
         let verification = verify_ledger_in(&mut tx)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(verification)
+    }
+
+    /// One repeatable-read snapshot for [`audit_export::walk`]: the latest
+    /// purge anchor and up to `limit` chain entries after the cursor.
+    pub fn audit_chain_snapshot(
+        &self,
+        cursor: Option<&audit_export::AuditCursor>,
+        limit: usize,
+    ) -> Result<audit_export::ChainSnapshot, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .build_transaction()
+            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| error.to_string())?;
+        let anchor = tx
+            .query_opt(
+                "SELECT seq,entry_hash FROM sekai_ledger_anchors ORDER BY seq DESC LIMIT 1",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .map_or_else(audit_export::AuditCursor::genesis, |row| {
+                audit_export::AuditCursor {
+                    seq: row.get(0),
+                    entry_hash: row.get(1),
+                }
+            });
+        let rows = tx
+            .query(
+                "SELECT id,timestamp,actor,action,reason,evidence,target_id,outcome,
+                        seq,COALESCE(prev_hash,''),COALESCE(entry_hash,'')
+                 FROM sekai_decisions WHERE seq > $1 ORDER BY seq LIMIT $2",
+                &[
+                    &audit_export::read_after(cursor, anchor.seq),
+                    &(limit as i64),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let entries = rows
+            .into_iter()
+            .map(|row| {
+                let (evidence_json, seq, prev_hash, entry_hash) =
+                    (row.get(5), row.get(8), row.get(9), row.get(10));
+                Ok(audit_export::ChainEntry {
+                    decision: row_to_decision(row)?,
+                    evidence_json,
+                    seq,
+                    prev_hash,
+                    entry_hash,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        Ok(audit_export::ChainSnapshot {
+            anchor,
+            entries,
+            limit,
+        })
     }
 
     pub fn record_decision(&self, decision: &Decision) -> Result<(), String> {

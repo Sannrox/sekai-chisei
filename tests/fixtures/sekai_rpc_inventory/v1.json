@@ -2076,6 +2076,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ExportNamespaceAudit",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/audit_export.rs",
+        "src/grpc/sekai_service_rpc_audit_export.rs",
+        "docs/operations.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "FindByExternalId",
       "kind": "persistent",
       "surfaces": [

@@ -247,6 +247,43 @@ ticks with nothing expired skip the walk. `RuntimeDb::verify_ledger` still
 reports the full chain on either backend. See
 [postgres-sekai-parity.md](postgres-sekai-parity.md).
 
+### Audit export
+
+`SekaiService.ExportNamespaceAudit` (experimental, #2638) pages one
+namespace's audit decisions in chain order on SQLite and PostgreSQL. It is
+served only when the plane runs with `SEKAI_EXPERIMENTAL_RPCS=1` or is built
+with the `experimental-rpcs` Cargo feature. A record belongs to a namespace
+when its hashed evidence names it (`namespace`, else `project`).
+
+- Authorization: the caller needs the admin role on that namespace; root and
+  the local operator pass. Every page read is recorded as an `audit.export`
+  decision in the namespace, so the next page returns it.
+- Cursor: opaque, holding the last walked chain position. Pass
+  `next_cursor` back to continue. Records are never repeated or skipped,
+  including while new decisions are written. The response sets `caught_up`
+  once it reaches the ledger head.
+- Verification: each record carries `seq`, `prev_hash`, `entry_hash` and the
+  exact hashed `evidence_json`, so a reader can recompute its hash. The plane
+  checks every chain entry from `verified_from_seq` through
+  `verified_through_seq`, including other namespaces' entries, and refuses
+  the page with `DATA_LOSS` naming the first seq that does not verify.
+- Disclosure: the seq numbers between a namespace's records are other
+  namespaces' decisions. A namespace admin learns how many audit decisions
+  the whole plane wrote in that span, not their content.
+- Archived records: when retention archived decisions past the cursor, or
+  before a fresh export, the page sets `archived_through_seq` to the latest
+  purge anchor and continues after it. Archived decisions are not served by
+  this call.
+- Page size: 100 by default, at most 1000. One page walks at most 2000 chain
+  entries, so a namespace with few records can get an empty page that is not
+  `caught_up`.
+
+`sekaictl admin assurance audit export --namespace <ns> --output <file.jsonl>`
+pages until caught up. For each page it appends one `record` line per decision
+and then a `checkpoint` line with the cursor and the verified range, and syncs
+them together. Rerunning the same command resumes after the last checkpoint
+and drops any partial page written after it.
+
 ## Gateway safeguards
 
 - Use virtual keys or authenticated passthrough only on a trusted gateway.
