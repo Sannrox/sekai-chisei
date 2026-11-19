@@ -152,7 +152,7 @@ impl Server {
 
     fn sekaictl(&self, args: &[&str]) -> Output {
         let run = || {
-            Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+            Command::new(crate::sekaictl_bin())
                 .args(args)
                 .env("SEKAI_SOCKET", &self.socket)
                 .env("SEKAI_DB_PATH", Self::db_path(self.dir.path()))

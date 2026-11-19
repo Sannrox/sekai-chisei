@@ -7,7 +7,7 @@ fn repository_file(path: &str) -> PathBuf {
 
 #[test]
 fn offline_validation_json_matches_the_v1_golden_contract() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    let output = Command::new(crate::sekaictl_bin())
         .args([
             "admin",
             "evaluation",
@@ -31,7 +31,7 @@ fn offline_validation_json_matches_the_v1_golden_contract() {
 
 #[test]
 fn execution_requires_explicit_confirmation_before_any_connection() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    let output = Command::new(crate::sekaictl_bin())
         .args([
             "admin",
             "evaluation",

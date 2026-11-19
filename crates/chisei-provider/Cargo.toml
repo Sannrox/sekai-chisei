@@ -28,7 +28,11 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "registry",
     "std",

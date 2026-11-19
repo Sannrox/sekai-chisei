@@ -39,7 +39,7 @@ and defaults the server bind to `127.0.0.1`, but an explicit `SEKAI_BIND`
 overrides that default. Never expose insecure mode on a non-loopback address.
 
 For network-accessible deployments, issue principal-scoped credentials with
-`cargo run --bin sekaictl -- admin access credential create <principal>` and send gRPC metadata using
+`cargo run -p sekaictl -- admin access credential create <principal>` and send gRPC metadata using
 `authorization: Bearer <token>`. Client processes may read that value from
 `SEKAI_CREDENTIAL`; the server does not accept an environment bootstrap token.
 `0.0.0.0` requires TLS (`SEKAI_TLS_CERT` + `SEKAI_TLS_KEY`) unless

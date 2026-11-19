@@ -9,7 +9,7 @@ use std::path::Path;
 const DOC: &str = include_str!("../docs/integration-contract.md");
 const SEKAI_PROTO: &str = include_str!("../proto/sekai.proto");
 const CHISEI_PROTO: &str = include_str!("../proto/chisei.proto");
-const ONTOLOGY_CLI: &str = include_str!("../src/ontology_product_cli.rs");
+const ONTOLOGY_CLI: &str = include_str!("../crates/sekaictl/src/ontology_product_cli.rs");
 const SDK_TS: &str = include_str!("../sdk/typescript/client.ts");
 const SDK_PY: &str = include_str!("../sdk/python/sekai_client.py");
 const RUNTIME_DB: &str = concat!(

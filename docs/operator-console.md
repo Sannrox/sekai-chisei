@@ -24,7 +24,7 @@ The read-only shell is an operator convenience surface. Console mutations
 2. Create a principal credential for authenticated access:
 
    ```bash
-   cargo run --bin sekaictl -- admin access credential create alice
+   cargo run -p sekaictl -- admin access credential create alice
    # note the printed token; store it like any other API secret
    ```
 

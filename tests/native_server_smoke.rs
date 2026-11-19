@@ -277,7 +277,7 @@ impl NativeServer {
     }
 
     fn sekaictl(&mut self, args: &[&str]) -> Output {
-        let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        let output = Command::new(crate::sekaictl_bin())
             .args(args)
             .env("SEKAI_SOCKET", &self.socket)
             .env_remove("CHISEI_GRPC_URL")

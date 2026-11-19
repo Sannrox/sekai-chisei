@@ -204,6 +204,7 @@ fn claim_label(state: &ClaimState) -> &'static str {
         ClaimState::NotVerified => "not_verified",
         ClaimState::Verified => "verified",
         ClaimState::Failed => "failed",
+        _ => "unknown",
     }
 }
 

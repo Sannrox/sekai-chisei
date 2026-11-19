@@ -5,6 +5,46 @@
 //! Prometheus recorder tests and `crate::`-coupled adapter, example, and
 //! ratchet tests stay separate `[[test]]` targets.
 
+fn sekaictl_bin() -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let mut bin = PathBuf::from(env!("CARGO_BIN_EXE_sekai-chisei"));
+            bin.set_file_name("sekaictl");
+            if bin.is_file() {
+                return bin;
+            }
+            let target_dir = bin
+                .parent()
+                .and_then(Path::parent)
+                .expect("cargo target dir");
+            let mut cmd = Command::new(env!("CARGO"));
+            cmd.args([
+                "build",
+                "-p",
+                "sekaictl",
+                "--bin",
+                "sekaictl",
+                "--target-dir",
+            ])
+            .arg(target_dir)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stderr(Stdio::inherit());
+            if !cfg!(debug_assertions) {
+                cmd.arg("--release");
+            }
+            let status = cmd.status().expect("build sekaictl");
+            assert!(status.success(), "failed to build sekaictl");
+            assert!(bin.is_file(), "sekaictl missing at {}", bin.display());
+            bin
+        })
+        .clone()
+}
+
 /// Combined/Sekai default the object log under `SEKAI_DATA_DIR`. Spawned
 /// processes must not share `./data/objects.mikura` under the test CWD.
 fn isolate_object_log(command: &mut std::process::Command, dir: &std::path::Path) {
@@ -104,6 +144,7 @@ mod perf_gate_cli;
 mod performance_manifest;
 mod policy_decision_pdp;
 mod postgres_bind_hygiene;
+mod probe_runner;
 mod product_loop_backend_conformance;
 mod reference_workload_sharing;
 mod replica_safety_budget;

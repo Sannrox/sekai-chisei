@@ -5,14 +5,8 @@
 //! credentials, stamp that ownership, and refuse the other plane's
 //! destination variables or a store already stamped for the other plane.
 
-use crate::combined_stores::{
-    CHISEI_STORE_FILE, CombinedStoreLayout, CombinedStoreSources, SEKAI_STORE_FILE, StoreIdentity,
-    data_dir_file, optional_trimmed_env,
-};
+use crate::combined_stores::{CombinedStoreLayout, CombinedStoreSources, StoreIdentity};
 use crate::db::store_plane::{StorePlaneRole, ensure_store_plane};
-use crate::runtime_backend::{
-    BackendIdentity, COMMUNITY_REQUIRED_SURFACES, RuntimeBackend, RuntimeBackendConfig,
-};
 use crate::store_relocate::open_layout_or_fence;
 
 /// Which gRPC plane this process serves.
@@ -76,7 +70,10 @@ impl ProcessPlane {
             }
             Self::Sekai | Self::Chisei => {
                 let sources = CombinedStoreSources::from_env(default_sqlite_path)?;
-                open_owned_layout(self.store_role().expect("owned plane"), sources)
+                crate::combined_stores::open_owned_layout(
+                    self.store_role().expect("owned plane"),
+                    sources,
+                )
             }
         }
     }
@@ -91,167 +88,13 @@ fn stamp_combined(layout: &CombinedStoreLayout) -> Result<(), String> {
     Ok(())
 }
 
-fn open_owned_layout(
-    role: StorePlaneRole,
-    sources: CombinedStoreSources,
-) -> Result<CombinedStoreLayout, String> {
-    refuse_foreign_destinations(role, &sources)?;
-    let backend = sources.backend.unwrap_or(BackendIdentity::Sqlite);
-    let default_sqlite_path = sources.default_sqlite_path.as_str();
-    // No store variable: this plane derives only its own file in the data dir.
-    let derived = sources.data_dir.as_deref().map(|dir| {
-        data_dir_file(
-            dir,
-            match role {
-                StorePlaneRole::Sekai => SEKAI_STORE_FILE,
-                StorePlaneRole::Chisei => CHISEI_STORE_FILE,
-            },
-        )
-    });
-    let (path, url) = match role {
-        StorePlaneRole::Sekai => (
-            sources
-                .sekai_sqlite_path
-                .as_deref()
-                .or(derived.as_deref())
-                .unwrap_or(default_sqlite_path),
-            sources.sekai_postgres_url.as_deref(),
-        ),
-        StorePlaneRole::Chisei => match (
-            sources.chisei_sqlite_path.as_deref().or(derived.as_deref()),
-            sources.chisei_postgres_url.as_deref(),
-            backend,
-        ) {
-            (None, None, BackendIdentity::Sqlite) => {
-                return Err(
-                    "chisei process requires CHISEI_DB_PATH; it does not open SEKAI_DB_PATH".into(),
-                );
-            }
-            (None, None, BackendIdentity::Postgres) => {
-                return Err(
-                    "chisei process requires CHISEI_DATABASE_URL; it does not open SEKAI_DATABASE_URL"
-                        .into(),
-                );
-            }
-            (Some(path), _, BackendIdentity::Sqlite) => (path, None),
-            (_, Some(url), BackendIdentity::Postgres) => (default_sqlite_path, Some(url)),
-            (Some(_), _, BackendIdentity::Postgres) => {
-                return Err(
-                    "chisei process with SEKAI_DB_BACKEND=postgres requires CHISEI_DATABASE_URL"
-                        .into(),
-                );
-            }
-            (_, Some(_), BackendIdentity::Sqlite) => {
-                return Err(
-                    "chisei process with SEKAI_DB_BACKEND=sqlite requires CHISEI_DB_PATH".into(),
-                );
-            }
-        },
-    };
-
-    let pool_size = crate::combined_stores::owned_plane_pool_size(
-        sources.postgres_max_connections,
-        match role {
-            StorePlaneRole::Sekai => sources.sekai_pool_connections,
-            StorePlaneRole::Chisei => sources.chisei_pool_connections,
-        },
-    )?;
-    let layout = match (backend, url) {
-        (BackendIdentity::Postgres, Some(url)) => {
-            let identity = crate::combined_stores::postgres_identity(url)?;
-            let backend = RuntimeBackend::initialize(
-                RuntimeBackendConfig::from_sources(
-                    BackendIdentity::Postgres,
-                    None,
-                    "unused.db",
-                    Some(url),
-                    pool_size,
-                    sources.postgres_ca_cert_path.as_deref(),
-                )?
-                .with_schema_plane(match role {
-                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
-                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
-                }),
-            )?;
-            backend
-                .capabilities()
-                .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
-            CombinedStoreLayout::owned(backend, identity)
-        }
-        (BackendIdentity::Postgres, None) => {
-            return Err(match role {
-                StorePlaneRole::Sekai => {
-                    "sekai process with SEKAI_DB_BACKEND=postgres requires SEKAI_DATABASE_URL"
-                        .into()
-                }
-                StorePlaneRole::Chisei => {
-                    "chisei process with SEKAI_DB_BACKEND=postgres requires CHISEI_DATABASE_URL"
-                        .into()
-                }
-            });
-        }
-        (BackendIdentity::Sqlite, _) => {
-            let identity = crate::combined_stores::sqlite_identity(path)?;
-            let backend = RuntimeBackend::initialize(
-                RuntimeBackendConfig::from_sources(
-                    BackendIdentity::Sqlite,
-                    Some(path),
-                    path,
-                    None,
-                    pool_size,
-                    sources.postgres_ca_cert_path.as_deref(),
-                )?
-                .with_schema_plane(match role {
-                    StorePlaneRole::Sekai => crate::db::schema_plane::SchemaPlane::Sekai,
-                    StorePlaneRole::Chisei => crate::db::schema_plane::SchemaPlane::Chisei,
-                }),
-            )?;
-            backend
-                .capabilities()
-                .validate_required(COMMUNITY_REQUIRED_SURFACES)?;
-            CombinedStoreLayout::owned(backend, identity)
-        }
-    };
-    ensure_store_plane(&layout.sekai_runtime(), role)?;
-    layout.sekai_runtime().set_pool_plane(match role {
-        StorePlaneRole::Sekai => crate::obs::labels::PoolPlane::Sekai,
-        StorePlaneRole::Chisei => crate::obs::labels::PoolPlane::Chisei,
-    });
-    Ok(layout)
-}
-
-fn refuse_foreign_destinations(
-    role: StorePlaneRole,
-    sources: &CombinedStoreSources,
-) -> Result<(), String> {
-    match role {
-        StorePlaneRole::Sekai
-            if sources.chisei_sqlite_path.is_some() || sources.chisei_postgres_url.is_some() =>
-        {
-            Err(
-                "sekai process refuses Chisei destination variables; set only SEKAI_DB_PATH or SEKAI_DATABASE_URL"
-                    .into(),
-            )
-        }
-        StorePlaneRole::Chisei
-            if sources.sekai_sqlite_path.is_some() || sources.sekai_postgres_url.is_some() =>
-        {
-            Err(
-                "chisei process refuses Sekai destination variables; set only CHISEI_DB_PATH or CHISEI_DATABASE_URL"
-                    .into(),
-            )
-        }
-        _ => Ok(()),
-    }
-}
-
 pub fn wrong_plane_message(plane: ProcessPlane) -> String {
     format!("wrong-plane: this process serves {}", plane.as_str())
 }
 
 pub fn plane_registry_anchor(plane: ProcessPlane, default_sqlite_path: &str) -> String {
     match plane {
-        ProcessPlane::Chisei => optional_trimmed_env("CHISEI_DB_PATH")
+        ProcessPlane::Chisei => crate::combined_stores::optional_trimmed_env("CHISEI_DB_PATH")
             .unwrap_or_else(|| default_sqlite_path.to_string()),
         ProcessPlane::Combined | ProcessPlane::Sekai => {
             crate::combined_stores::registry_db_anchor(default_sqlite_path)
@@ -269,6 +112,7 @@ pub fn plane_store_identity(plane: ProcessPlane, layout: &CombinedStoreLayout) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::combined_stores::open_owned_layout;
     use crate::runtime_backend::BackendIdentity;
 
     fn sqlite_owned(path: &str) -> CombinedStoreSources {

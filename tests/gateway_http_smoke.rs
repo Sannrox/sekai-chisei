@@ -444,7 +444,7 @@ fn chisei_gateway_bin() -> PathBuf {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT
         .get_or_init(|| {
-            let sekaictl = PathBuf::from(env!("CARGO_BIN_EXE_sekaictl"));
+            let sekaictl = crate::sekaictl_bin();
             let target_dir = sekaictl
                 .parent()
                 .and_then(Path::parent)
@@ -572,7 +572,7 @@ fn sekaictl(
     args: &[&str],
 ) -> Output {
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        Command::new(crate::sekaictl_bin())
             .args(args)
             .env("SEKAI_SOCKET", socket)
             .env("SEKAI_DB_PATH", sekai_db)

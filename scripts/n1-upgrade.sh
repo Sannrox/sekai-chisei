@@ -102,9 +102,9 @@ resolve_n1_tag() {
     | head -n 1 || true
 }
 
-# The combined server is the package's default binary (src/main.rs); sekaictl
-# is auto-discovered from src/bin/sekaictl.rs. Neither has a [[bin]] entry, so
-# check that at the given revision instead of assuming it.
+# The combined server is the package's default binary (src/main.rs). sekaictl
+# lived at src/bin/sekaictl.rs, then at crates/sekaictl/src/main.rs. Check that
+# the revision has the server and one of those sekaictl paths.
 server_bin_name() {
   local rev="$1" manifest
   manifest="$(git show "$rev:Cargo.toml")"
@@ -112,13 +112,17 @@ server_bin_name() {
     echo "autobins is off at $rev; name the server binary explicitly" >&2
     return 1
   fi
-  git cat-file -e "$rev:src/main.rs" && git cat-file -e "$rev:src/bin/sekaictl.rs"
+  git cat-file -e "$rev:src/main.rs" || return 1
+  git cat-file -e "$rev:src/bin/sekaictl.rs" \
+    || git cat-file -e "$rev:crates/sekaictl/src/main.rs" \
+    || return 1
   awk '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^name *=/{gsub(/[" ]/,""); sub(/^name=/,""); print; exit}' <<<"$manifest"
 }
 
 build_bins() {
   local dir="$1" target="$2" server="$3"
-  (cd "$dir" && CARGO_TARGET_DIR="$target" cargo build --locked --bin "$server" --bin sekaictl)
+  # --workspace finds sekaictl on the root package (N-1) or crates/sekaictl (HEAD).
+  (cd "$dir" && CARGO_TARGET_DIR="$target" cargo build --locked --workspace --bin "$server" --bin sekaictl)
 }
 
 N1_TAG="$(resolve_n1_tag)"

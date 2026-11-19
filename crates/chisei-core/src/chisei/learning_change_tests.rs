@@ -2,9 +2,10 @@
 //! in-process Sekai store (ADR 0096: Chisei depends on Sekai code).
 
 use super::*;
-use crate::domain::Object;
-use crate::sekai::learning::record_learning;
-use crate::sekai::schema::SchemaRegistry;
+use sekai_core::db::store::SekaiStore;
+use sekai_core::domain::Object;
+use sekai_core::sekai::learning::record_learning;
+use sekai_core::sekai::schema::SchemaRegistry;
 use std::collections::HashMap;
 
 fn db() -> ChiseiStore {
@@ -12,9 +13,9 @@ fn db() -> ChiseiStore {
 }
 
 fn facts(db: &ChiseiStore) -> crate::chisei::sekai_facts::SekaiFacts {
-    crate::chisei::sekai_facts::SekaiFacts::in_process(
-        crate::db::store::SekaiStore::from_shared_runtime(db.runtime_arc()),
-    )
+    crate::chisei::sekai_facts::SekaiFacts::in_process(SekaiStore::from_shared_runtime(
+        db.runtime_arc(),
+    ))
 }
 
 fn propose_change(

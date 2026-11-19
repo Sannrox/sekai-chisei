@@ -15,7 +15,7 @@ fn removed_top_level_aliases_fail_with_their_canonical_replacement() {
         ("replay", "admin assurance replay"),
         ("federation", "admin federation"),
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        let output = Command::new(crate::sekaictl_bin())
             .args([alias, "--help"])
             .output()
             .expect("sekaictl should run");
@@ -36,7 +36,7 @@ fn gateway_key_help_reaches_the_key_usage() {
         &["admin", "gateway", "key", "--help"][..],
         &["admin", "gateway", "key", "create", "--help"][..],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        let output = Command::new(crate::sekaictl_bin())
             .args(args)
             .output()
             .expect("sekaictl should run");
@@ -49,7 +49,7 @@ fn gateway_key_help_reaches_the_key_usage() {
         );
     }
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    let output = Command::new(crate::sekaictl_bin())
         .args(["admin", "gateway", "--help"])
         .output()
         .expect("sekaictl should run");
@@ -63,7 +63,7 @@ fn gateway_key_help_reaches_the_key_usage() {
 
 #[test]
 fn canonical_admin_paths_still_render_command_specific_help() {
-    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    let output = Command::new(crate::sekaictl_bin())
         .args(["admin", "access", "credential", "--help"])
         .output()
         .expect("sekaictl should run");

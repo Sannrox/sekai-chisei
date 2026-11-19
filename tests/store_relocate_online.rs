@@ -94,7 +94,7 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
         })
     };
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    let output = Command::new(crate::sekaictl_bin())
         .args([
             "admin", "store", "relocate", "--source", &source_s, "--sekai", &source_s, "--chisei",
             &chisei_s,

@@ -12,10 +12,10 @@ pub mod embedding_catch_up;
 pub mod function_revision_gate;
 pub mod gateway_log_reader;
 pub mod invoice_extraction_eval;
-pub mod lookup_first;
+pub use chisei_core::lookup_first;
 pub mod sekai_facts;
 pub mod sekai_principal;
-pub(crate) mod transform_run_admission;
+pub use chisei_core::transform_run_admission;
 
 #[cfg(test)]
 mod system_one_fill_tests;

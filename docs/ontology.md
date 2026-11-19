@@ -54,33 +54,33 @@ receipt**. The CLI implements that loop without raw gRPC:
 SEKAI_INSECURE=1 SEKAI_DB_PATH=./data/sekai.db CHISEI_DB_PATH=./data/chisei.db cargo run
 
 # Optional: create a principal credential when not using insecure mode.
-# cargo run --bin sekaictl -- admin access credential create operator
+# cargo run -p sekaictl -- admin access credential create operator
 
 # Apply a domain document (classes + relations). Non-builtin mapped_kind values
 # are ensured as ObjectTypes before the ontology class is created.
 export SEKAI_CREDENTIAL='<token-if-required>'
-cargo run --bin sekaictl -- ontology apply \
+cargo run -p sekaictl -- ontology apply \
   --file tests/fixtures/product_loop/domain-v1.json
 
 # Seed objects and links (kinds must already exist: builtin or ensure_kind).
-cargo run --bin sekaictl -- ontology seed \
+cargo run -p sekaictl -- ontology seed \
   --file tests/fixtures/product_loop/seed-v1.json
 
 # One governed operation (lookup-first resolve_ref — no external model required
 # when the object is visible to the principal).
-cargo run --bin sekaictl -- ontology run \
+cargo run -p sekaictl -- ontology run \
   --namespace demo \
   --task-type sekai.semantic.resolve_ref \
   --spec '{"object_id":"svc-api"}'
 
 # Or chain apply → seed → lookup-first resolve → receipt hint:
-cargo run --bin sekaictl -- ontology first-run \
+cargo run -p sekaictl -- ontology first-run \
   --domain tests/fixtures/product_loop/domain-v1.json \
   --seed tests/fixtures/product_loop/seed-v1.json \
   --resolve-object svc-api
 
 # Inspect receipt (after a run that recorded one):
-cargo run --bin sekaictl -- receipt <request-id> --request-id
+cargo run -p sekaictl -- receipt <request-id> --request-id
 ```
 
 **Kind materialization (#387):** creating an ontology class with a non-empty
@@ -109,22 +109,22 @@ through the same CLI path as any user-owned domain document:
 
 ```bash
 PACK=tests/fixtures/lookup_first/reference_domain
-cargo run --bin sekaictl -- ontology apply --file "$PACK/domain-v1.json"
-cargo run --bin sekaictl -- ontology seed --file "$PACK/seed-v1.json"
+cargo run -p sekaictl -- ontology apply --file "$PACK/domain-v1.json"
+cargo run -p sekaictl -- ontology seed --file "$PACK/seed-v1.json"
 
-cargo run --bin sekaictl -- ontology run \
+cargo run -p sekaictl -- ontology run \
   --namespace reliability-demo \
   --task-type sekai.semantic.resolve_ref \
   --spec '{"external_id":"service:checkout-api"}'
-cargo run --bin sekaictl -- ontology run \
+cargo run -p sekaictl -- ontology run \
   --namespace reliability-demo \
   --task-type sekai.semantic.expand_relations \
   --spec '{"root":{"object_id":"svc-checkout-api"},"relations":["service_depends_on","service_owned_by"],"direction":"outgoing","max_depth":2}'
-cargo run --bin sekaictl -- ontology run \
+cargo run -p sekaictl -- ontology run \
   --namespace reliability-demo \
   --task-type sekai.context.retrieve \
   --spec '{"roots":[{"object_id":"svc-checkout-api"}],"direction":"both","max_depth":2}'
-cargo run --bin sekaictl -- ontology run \
+cargo run -p sekaictl -- ontology run \
   --namespace reliability-demo \
   --task-type sekai.semantic.explain_derivation \
   --spec '{"from":{"object_id":"svc-checkout-api"},"to":{"object_id":"svc-ledger"},"relations":["service_depends_on"],"direction":"outgoing","max_depth":2}'
@@ -239,7 +239,7 @@ Generate a browser-readable snapshot through the same authenticated gRPC path:
 # Inspect calls experimental list/get/retrieve RPCs. Start the server with
 # SEKAI_EXPERIMENTAL_RPCS=1 (or --features experimental-rpcs).
 export SEKAI_CREDENTIAL='<operator token>'
-cargo run --bin sekaictl -- ontology inspect \
+cargo run -p sekaictl -- ontology inspect \
   --root <object-id> \
   --authorization-context '<non-secret access-scope label>' \
   --output ontology-inspection.html

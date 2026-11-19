@@ -14,7 +14,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 fn unmarked(sekai: &Path, chisei: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+    Command::new(crate::sekaictl_bin())
         .args(["admin", "access", "unmarked"])
         .args(args)
         .env("SEKAI_DB_PATH", sekai)

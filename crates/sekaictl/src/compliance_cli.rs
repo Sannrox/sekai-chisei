@@ -1,0 +1,883 @@
+//! sekaictl admin assurance compliance export/verify/report commands (#297, #1468).
+
+use crate::cli_args::require_value;
+use crate::compliance_pack::{
+    PackReportBundle, build_pack_report, builtin_pack_ids, load_builtin_pack, pack_report_bytes,
+    parse_pack, sign_pack_report, verify_pack_report,
+};
+use chisei_core::config::Config;
+use chrono::Utc;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use sekai_core::compliance_export::{
+    ComplianceExportBundle, ComplianceExportRequest, RedactionMode, compliance_bundle_bytes,
+    export_compliance_from_db, record_compliance_export_success, sign_compliance_export,
+    verify_compliance_export,
+};
+use sekai_core::runtime_backend::{RuntimeBackend, RuntimeBackendConfig};
+use std::path::{Path, PathBuf};
+
+type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+pub fn usage() -> &'static str {
+    "sekaictl admin assurance compliance export --namespace <ns> --from-ms <ts> --to-ms <ts> --output <file> [--redact] [--request-id <id>] [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance verify <bundle> [--trusted-key <file>]\n  sekaictl admin assurance compliance report --bundle <export.json> --output <file> (--pack <id> | --pack-file <pack.json>) [--actor <principal>] [--signing-key <file> --identity <id> --key-id <id>]\n  sekaictl admin assurance compliance report-verify <report.json> --bundle <export.json> [--trusted-key <file>]\n  sekaictl admin assurance compliance packs\n  sekaictl admin assurance compliance trust-root --namespace <ns> --site-identity <id> --key-id <id> --public-key-hex <hex> [--actor <principal>]\n  sekaictl admin assurance compliance import-peer --namespace <ns> --bundle <file> [--actor <principal>]\n  sekaictl admin assurance compliance list-trust-roots --namespace <ns>"
+}
+
+pub async fn run_compliance_command(args: Vec<String>) -> Result<(), BoxErr> {
+    match args.first().map(String::as_str) {
+        Some("export") => export(parse_export(&args[1..])?).await,
+        Some("verify") => verify(parse_verify(&args[1..])?),
+        Some("report") => report(parse_report(&args[1..])?),
+        Some("report-verify") => report_verify(parse_report_verify(&args[1..])?),
+        Some("packs") => list_packs(),
+        Some("trust-root") => trust_root(parse_trust_root(&args[1..])?).await,
+        Some("import-peer") => import_peer(parse_import_peer(&args[1..])?).await,
+        Some("list-trust-roots") => list_trust_roots(parse_list_trust_roots(&args[1..])?).await,
+        _ => Err(std::io::Error::other(usage()).into()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExportConfig {
+    namespace: String,
+    from_ms: i64,
+    to_ms: i64,
+    output: PathBuf,
+    redact: bool,
+    request_id: String,
+    actor: String,
+    signing_key: Option<PathBuf>,
+    identity: Option<String>,
+    key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyConfig {
+    bundle: PathBuf,
+    trusted_key: Option<PathBuf>,
+}
+
+async fn export(config: ExportConfig) -> Result<(), BoxErr> {
+    // Local sekaictl export uses the host database configuration as the trust
+    // boundary, matching receipt/report CLIs. Callers who can open the runtime
+    // store can already read the underlying tables. Networked multi-tenant
+    // export must go through an authorized gRPC surface (follow-up).
+    chisei_core::combined_stores::refuse_split_single_store_cli(
+        "ChiseiService.GetOperationReceipt",
+    )
+    .map_err(std::io::Error::other)?;
+    let cfg = Config::from_env();
+    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
+    let db = backend.database();
+    let request = ComplianceExportRequest {
+        namespace: config.namespace,
+        start_timestamp_ms: config.from_ms,
+        end_timestamp_ms: config.to_ms,
+        redaction: if config.redact {
+            RedactionMode::Redacted
+        } else {
+            RedactionMode::Full
+        },
+        actor: config.actor,
+        request_id: config.request_id,
+    };
+    if config.output.exists() {
+        return Err(std::io::Error::other(format!(
+            "output already exists: {} (refusing to overwrite a compliance artifact)",
+            config.output.display()
+        ))
+        .into());
+    }
+    let signing_parts = [
+        config.signing_key.is_some(),
+        config.identity.is_some(),
+        config.key_id.is_some(),
+    ];
+    if signing_parts.iter().any(|present| *present) && !signing_parts.iter().all(|present| *present)
+    {
+        return Err(std::io::Error::other(
+            "signing requires all of --signing-key, --identity, and --key-id (or none)",
+        )
+        .into());
+    }
+
+    let exported_at = Utc::now().timestamp_millis();
+    let mut bundle = export_compliance_from_db(db.as_ref(), &request, exported_at)?;
+    if let (Some(key_path), Some(identity), Some(key_id)) =
+        (&config.signing_key, &config.identity, &config.key_id)
+    {
+        let signing = load_signing_key(key_path)?;
+        sign_compliance_export(
+            &mut bundle,
+            &signing,
+            identity,
+            key_id,
+            Utc::now().timestamp_millis(),
+        )?;
+    }
+
+    // Unique create-new staging file (no symlink follow), publish, then audit.
+    let parent = config
+        .output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged = parent.join(format!(
+        ".compliance-export-{}-{}.partial",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| {
+            let mut file = options.open(&staged)?;
+            file.write_all(&compliance_bundle_bytes(&bundle)?)?;
+            file.sync_all()?;
+            Ok::<(), BoxErr>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    // hard_link fails if the destination already exists (no silent overwrite).
+    if let Err(error) = std::fs::hard_link(&staged, &config.output) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to publish {}: {error} (destination must not already exist)",
+                config.output.display()
+            ),
+        )
+        .into());
+    }
+    let _ = std::fs::remove_file(&staged);
+    // Make the published directory entry durable before recording success.
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(error) = dir.sync_all() {
+                let _ = std::fs::remove_file(&config.output);
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            // On platforms where the parent cannot be opened as a file, fail
+            // closed rather than claiming durable publication without evidence.
+            let _ = std::fs::remove_file(&config.output);
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = record_compliance_export_success(
+        db.as_ref(),
+        &request,
+        &bundle,
+        Utc::now().timestamp_millis(),
+    ) {
+        // Best-effort compensation: remove only the file this invocation
+        // published if audit fails so we do not leave an unaudited artifact.
+        let _ = std::fs::remove_file(&config.output);
+        return Err(error.into());
+    }
+    println!(
+        "exported {} receipts={} decisions={} digest={}",
+        config.output.display(),
+        bundle.manifest.receipt_count,
+        bundle.manifest.decision_count,
+        bundle.manifest.content_digest
+    );
+    Ok(())
+}
+
+/// An ok verdict without a trusted signer proves self-consistency only; say so.
+fn warn_untrusted_signer(signer_trusted: bool) {
+    if !signer_trusted {
+        eprintln!(
+            "warning: signer not trusted (no signature verified against --trusted-key); \
+             a re-signed bundle also passes this check"
+        );
+    }
+}
+
+fn verify(config: VerifyConfig) -> Result<(), BoxErr> {
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let trusted = match &config.trusted_key {
+        Some(path) => Some(encode_hex(load_verifying_key(path)?.as_bytes())),
+        None => None,
+    };
+    let report = verify_compliance_export(&bundle, trusted.as_deref());
+    if report.ok {
+        println!(
+            "ok content_digest_ok={} signature_ok={} signer_trusted={} receipts={} decisions={}",
+            report.content_digest_ok,
+            report.signature_ok,
+            report.signer_trusted,
+            bundle.manifest.receipt_count,
+            bundle.manifest.decision_count
+        );
+        warn_untrusted_signer(report.signer_trusted);
+        Ok(())
+    } else {
+        for error in &report.errors {
+            eprintln!("error: {error}");
+        }
+        Err(std::io::Error::other("compliance bundle verification failed").into())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReportConfig {
+    bundle: PathBuf,
+    output: PathBuf,
+    pack: Option<String>,
+    pack_file: Option<PathBuf>,
+    actor: String,
+    signing_key: Option<PathBuf>,
+    identity: Option<String>,
+    key_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReportVerifyConfig {
+    report: PathBuf,
+    bundle: PathBuf,
+    trusted_key: Option<PathBuf>,
+}
+
+fn report(config: ReportConfig) -> Result<(), BoxErr> {
+    let pack = match (&config.pack, &config.pack_file) {
+        (Some(id), None) => load_builtin_pack(id)?,
+        (None, Some(path)) => parse_pack(&std::fs::read_to_string(path)?)?,
+        _ => {
+            return Err(
+                std::io::Error::other("exactly one of --pack or --pack-file is required").into(),
+            );
+        }
+    };
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let generated_at = Utc::now().timestamp_millis();
+    let mut report = build_pack_report(&pack, &bundle, &config.actor, generated_at)?;
+    let signing_parts = [
+        config.signing_key.is_some(),
+        config.identity.is_some(),
+        config.key_id.is_some(),
+    ];
+    if signing_parts.iter().any(|present| *present) && !signing_parts.iter().all(|present| *present)
+    {
+        return Err(std::io::Error::other(
+            "signing requires all of --signing-key, --identity, and --key-id (or none)",
+        )
+        .into());
+    }
+    if let (Some(key_path), Some(identity), Some(key_id)) =
+        (&config.signing_key, &config.identity, &config.key_id)
+    {
+        let signing = load_signing_key(key_path)?;
+        sign_pack_report(
+            &mut report,
+            &signing,
+            identity,
+            key_id,
+            Utc::now().timestamp_millis(),
+        )?;
+    }
+    publish_new_file(&config.output, &pack_report_bytes(&report)?)?;
+    let met = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::Met)
+        .count();
+    let partly = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::PartlyMet)
+        .count();
+    let none = report
+        .controls
+        .iter()
+        .filter(|control| control.status == crate::compliance_pack::ControlStatus::NoEvidence)
+        .count();
+    println!(
+        "wrote {} pack={} controls={} met={} partly_met={} no_evidence={} digest={}",
+        config.output.display(),
+        report.manifest.pack_id,
+        report.controls.len(),
+        met,
+        partly,
+        none,
+        report.manifest.content_digest
+    );
+    Ok(())
+}
+
+fn report_verify(config: ReportVerifyConfig) -> Result<(), BoxErr> {
+    let report: PackReportBundle = serde_json::from_slice(&std::fs::read(&config.report)?)?;
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let trusted = match &config.trusted_key {
+        Some(path) => Some(encode_hex(load_verifying_key(path)?.as_bytes())),
+        None => None,
+    };
+    let result = verify_pack_report(&report, &bundle, trusted.as_deref());
+    if result.ok {
+        println!(
+            "ok content_digest_ok={} signature_ok={} signer_trusted={} pack={} controls={}",
+            result.content_digest_ok,
+            result.signature_ok,
+            result.signer_trusted,
+            report.manifest.pack_id,
+            report.controls.len()
+        );
+        warn_untrusted_signer(result.signer_trusted);
+        Ok(())
+    } else {
+        for error in &result.errors {
+            eprintln!("error: {error}");
+        }
+        Err(std::io::Error::other("compliance pack report verification failed").into())
+    }
+}
+
+fn list_packs() -> Result<(), BoxErr> {
+    for id in builtin_pack_ids() {
+        let pack = load_builtin_pack(id)?;
+        println!(
+            "{id} framework={} version={} controls={}",
+            pack.framework,
+            pack.version,
+            pack.controls.len()
+        );
+    }
+    Ok(())
+}
+
+fn publish_new_file(output: &Path, bytes: &[u8]) -> Result<(), BoxErr> {
+    if output.exists() {
+        return Err(std::io::Error::other(format!(
+            "output already exists: {} (refusing to overwrite a compliance artifact)",
+            output.display()
+        ))
+        .into());
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staged = parent.join(format!(
+        ".compliance-artifact-{}-{}.partial",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    {
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write_result = (|| {
+            let mut file = options.open(&staged)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok::<(), BoxErr>(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+    }
+    if let Err(error) = std::fs::hard_link(&staged, output) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to publish {}: {error} (destination must not already exist)",
+                output.display()
+            ),
+        )
+        .into());
+    }
+    let _ = std::fs::remove_file(&staged);
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(error) = dir.sync_all() {
+                let _ = std::fs::remove_file(output);
+                return Err(error.into());
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(output);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct TrustRootConfig {
+    namespace: String,
+    site_identity: String,
+    key_id: String,
+    public_key_hex: String,
+    actor: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImportPeerConfig {
+    namespace: String,
+    bundle: PathBuf,
+    actor: String,
+}
+
+#[derive(Debug, Clone)]
+struct ListTrustRootsConfig {
+    namespace: String,
+}
+
+async fn open_local_db() -> Result<std::sync::Arc<sekai_core::db::runtime_db::RuntimeDb>, BoxErr> {
+    let cfg = Config::from_env();
+    let backend = RuntimeBackend::initialize(RuntimeBackendConfig::from_env(&cfg.db_path)?)?;
+    Ok(backend.database())
+}
+
+async fn trust_root(config: TrustRootConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let root = sekai_core::sekai::peer_import::PeerTrustRoot {
+        namespace: config.namespace,
+        site_identity: config.site_identity,
+        key_id: config.key_id,
+        public_key_hex: config.public_key_hex,
+        enabled: true,
+        created_by: config.actor,
+        created_at_ms: Utc::now().timestamp_millis(),
+    };
+    sekai_core::sekai::peer_import::put_trust_root(db.as_ref(), &root)
+        .map_err(std::io::Error::other)?;
+    println!(
+        "trusted peer site={} key_id={} namespace={}",
+        root.site_identity, root.key_id, root.namespace
+    );
+    Ok(())
+}
+
+async fn import_peer(config: ImportPeerConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let bundle: ComplianceExportBundle = serde_json::from_slice(&std::fs::read(&config.bundle)?)?;
+    let result = sekai_core::sekai::peer_import::import_compliance_bundle(
+        db.as_ref(),
+        &config.actor,
+        &config.namespace,
+        &bundle,
+        Utc::now().timestamp_millis(),
+    )
+    .map_err(std::io::Error::other)?;
+    println!(
+        "imported id={} digest={} receipts={} decisions={} permit_authority={}",
+        result.record.import_id,
+        result.record.bundle_content_digest,
+        result.record.receipt_count,
+        result.record.decision_count,
+        result.record.permit_authority
+    );
+    Ok(())
+}
+
+async fn list_trust_roots(config: ListTrustRootsConfig) -> Result<(), BoxErr> {
+    let db = open_local_db().await?;
+    let roots = sekai_core::sekai::peer_import::list_trust_roots(db.as_ref(), &config.namespace)
+        .map_err(std::io::Error::other)?;
+    println!("{}", serde_json::to_string_pretty(&roots)?);
+    Ok(())
+}
+
+fn parse_trust_root(args: &[String]) -> Result<TrustRootConfig, String> {
+    let mut namespace = None;
+    let mut site_identity = None;
+    let mut key_id = None;
+    let mut public_key_hex = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            "--site-identity" => {
+                site_identity = Some(require_value(args, index, "--site-identity")?);
+                index += 2;
+            }
+            "--key-id" => {
+                key_id = Some(require_value(args, index, "--key-id")?);
+                index += 2;
+            }
+            "--public-key-hex" => {
+                public_key_hex = Some(require_value(args, index, "--public-key-hex")?);
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            other => return Err(format!("unknown trust-root option {other}")),
+        }
+    }
+    Ok(TrustRootConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        site_identity: site_identity.ok_or("--site-identity is required")?,
+        key_id: key_id.ok_or("--key-id is required")?,
+        public_key_hex: public_key_hex.ok_or("--public-key-hex is required")?,
+        actor,
+    })
+}
+
+fn parse_import_peer(args: &[String]) -> Result<ImportPeerConfig, String> {
+    let mut namespace = None;
+    let mut bundle = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            other => return Err(format!("unknown import-peer option {other}")),
+        }
+    }
+    Ok(ImportPeerConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+        bundle: bundle.ok_or("--bundle is required")?,
+        actor,
+    })
+}
+
+fn parse_list_trust_roots(args: &[String]) -> Result<ListTrustRootsConfig, String> {
+    let mut namespace = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown list-trust-roots option {other}")),
+        }
+    }
+    Ok(ListTrustRootsConfig {
+        namespace: namespace.ok_or("--namespace is required")?,
+    })
+}
+
+fn parse_export(args: &[String]) -> Result<ExportConfig, String> {
+    let mut namespace = None;
+    let mut from_ms = None;
+    let mut to_ms = None;
+    let mut output = None;
+    let mut redact = false;
+    let mut request_id = format!("compliance-export-{}", Utc::now().timestamp_millis());
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut signing_key = None;
+    let mut identity = None;
+    let mut key_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--namespace" => {
+                namespace = Some(require_value(args, index, "--namespace")?);
+                index += 2;
+            }
+            "--from-ms" => {
+                from_ms = Some(parse_i64(&require_value(args, index, "--from-ms")?)?);
+                index += 2;
+            }
+            "--to-ms" => {
+                to_ms = Some(parse_i64(&require_value(args, index, "--to-ms")?)?);
+                index += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(require_value(args, index, "--output")?));
+                index += 2;
+            }
+            "--redact" => {
+                redact = true;
+                index += 1;
+            }
+            "--request-id" => {
+                request_id = require_value(args, index, "--request-id")?;
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            "--signing-key" => {
+                signing_key = Some(PathBuf::from(require_value(args, index, "--signing-key")?));
+                index += 2;
+            }
+            "--identity" => {
+                identity = Some(require_value(args, index, "--identity")?);
+                index += 2;
+            }
+            "--key-id" => {
+                key_id = Some(require_value(args, index, "--key-id")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown export flag: {other}")),
+        }
+    }
+    Ok(ExportConfig {
+        namespace: namespace.ok_or("--namespace required")?,
+        from_ms: from_ms.ok_or("--from-ms required")?,
+        to_ms: to_ms.ok_or("--to-ms required")?,
+        output: output.ok_or("--output required")?,
+        redact,
+        request_id,
+        actor,
+        signing_key,
+        identity,
+        key_id,
+    })
+}
+
+fn parse_verify(args: &[String]) -> Result<VerifyConfig, String> {
+    let mut bundle = None;
+    let mut trusted_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--trusted-key" => {
+                trusted_key = Some(PathBuf::from(require_value(args, index, "--trusted-key")?));
+                index += 2;
+            }
+            other if !other.starts_with('-') && bundle.is_none() => {
+                bundle = Some(PathBuf::from(other));
+                index += 1;
+            }
+            other => return Err(format!("unknown verify flag: {other}")),
+        }
+    }
+    Ok(VerifyConfig {
+        bundle: bundle.ok_or("bundle path required")?,
+        trusted_key,
+    })
+}
+
+fn parse_report(args: &[String]) -> Result<ReportConfig, String> {
+    let mut bundle = None;
+    let mut output = None;
+    let mut pack = None;
+    let mut pack_file = None;
+    let mut actor = std::env::var("SEKAI_ACTOR").unwrap_or_else(|_| "local-operator".into());
+    let mut signing_key = None;
+    let mut identity = None;
+    let mut key_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(require_value(args, index, "--output")?));
+                index += 2;
+            }
+            "--pack" => {
+                pack = Some(require_value(args, index, "--pack")?);
+                index += 2;
+            }
+            "--pack-file" => {
+                pack_file = Some(PathBuf::from(require_value(args, index, "--pack-file")?));
+                index += 2;
+            }
+            "--actor" => {
+                actor = require_value(args, index, "--actor")?;
+                index += 2;
+            }
+            "--signing-key" => {
+                signing_key = Some(PathBuf::from(require_value(args, index, "--signing-key")?));
+                index += 2;
+            }
+            "--identity" => {
+                identity = Some(require_value(args, index, "--identity")?);
+                index += 2;
+            }
+            "--key-id" => {
+                key_id = Some(require_value(args, index, "--key-id")?);
+                index += 2;
+            }
+            other => return Err(format!("unknown report flag: {other}")),
+        }
+    }
+    if pack.is_some() == pack_file.is_some() {
+        return Err("exactly one of --pack or --pack-file is required".into());
+    }
+    Ok(ReportConfig {
+        bundle: bundle.ok_or("--bundle required")?,
+        output: output.ok_or("--output required")?,
+        pack,
+        pack_file,
+        actor,
+        signing_key,
+        identity,
+        key_id,
+    })
+}
+
+fn parse_report_verify(args: &[String]) -> Result<ReportVerifyConfig, String> {
+    let mut report = None;
+    let mut bundle = None;
+    let mut trusted_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--bundle" => {
+                bundle = Some(PathBuf::from(require_value(args, index, "--bundle")?));
+                index += 2;
+            }
+            "--trusted-key" => {
+                trusted_key = Some(PathBuf::from(require_value(args, index, "--trusted-key")?));
+                index += 2;
+            }
+            other if !other.starts_with('-') && report.is_none() => {
+                report = Some(PathBuf::from(other));
+                index += 1;
+            }
+            other => return Err(format!("unknown report-verify flag: {other}")),
+        }
+    }
+    Ok(ReportVerifyConfig {
+        report: report.ok_or("report path required")?,
+        bundle: bundle.ok_or("--bundle required")?,
+        trusted_key,
+    })
+}
+
+fn parse_i64(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid integer {value}: {error}"))
+}
+
+fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let seed = if bytes.len() == 32 {
+        bytes
+    } else {
+        sekai_types::hex::decode(String::from_utf8_lossy(&bytes).trim())?
+    };
+    let array: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .map_err(|_| "signing key must be 32 bytes".to_string())?;
+    Ok(SigningKey::from_bytes(&array))
+}
+
+fn load_verifying_key(path: &Path) -> Result<VerifyingKey, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let key = if bytes.len() == 32 {
+        bytes
+    } else {
+        sekai_types::hex::decode(String::from_utf8_lossy(&bytes).trim())?
+    };
+    let array: [u8; 32] = key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "public key must be 32 bytes".to_string())?;
+    VerifyingKey::from_bytes(&array).map_err(|error| format!("invalid public key: {error}"))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_report_requires_pack_xor_pack_file() {
+        let error = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+        ]))
+        .unwrap_err();
+        assert!(
+            error.contains("exactly one of --pack or --pack-file"),
+            "{error}"
+        );
+        let both = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+            "--pack",
+            "gdpr",
+            "--pack-file",
+            "custom.json",
+        ]))
+        .unwrap_err();
+        assert!(
+            both.contains("exactly one of --pack or --pack-file"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn parse_report_accepts_builtin_pack() {
+        let config = parse_report(&args(&[
+            "--bundle",
+            "export.json",
+            "--output",
+            "report.json",
+            "--pack",
+            "fixture",
+            "--actor",
+            "auditor",
+        ]))
+        .unwrap();
+        assert_eq!(config.pack.as_deref(), Some("fixture"));
+        assert!(config.pack_file.is_none());
+        assert_eq!(config.actor, "auditor");
+    }
+
+    #[test]
+    fn parse_report_verify_requires_bundle_and_report() {
+        let error = parse_report_verify(&args(&["report.json"])).unwrap_err();
+        assert!(error.contains("--bundle required"), "{error}");
+        let config =
+            parse_report_verify(&args(&["report.json", "--bundle", "export.json"])).unwrap();
+        assert_eq!(config.report, PathBuf::from("report.json"));
+        assert_eq!(config.bundle, PathBuf::from("export.json"));
+    }
+
+    #[test]
+    fn usage_names_report_commands() {
+        let text = usage();
+        assert!(text.contains("compliance report "));
+        assert!(text.contains("compliance report-verify "));
+        assert!(text.contains("compliance packs"));
+    }
+}

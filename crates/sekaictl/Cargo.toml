@@ -1,0 +1,62 @@
+[package]
+name = "sekaictl"
+version = "3.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Operator CLI for the Sekai Chisei control plane."
+repository = "https://github.com/Sannrox/sekai-chisei"
+
+[[bin]]
+name = "sekaictl"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+chisei-core = { version = "3.0.0", path = "../chisei-core" }
+chisei-provider = { version = "1.0.0", path = "../chisei-provider" }
+ed25519-dalek = "2"
+http = "1"
+prost = "0.14"
+regex = "1"
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
+same-file = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+sekai-admin-client = { version = "1.0.0", path = "../sekai-admin-client" }
+sekai-core = { version = "4.0.0", path = "../sekai-core" }
+sekai-domain = { version = "1.1.0", path = "../sekai-domain" }
+sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
+sekai-ontology = { version = "1.0.0", path = "../sekai-ontology" }
+sekai-proto = { version = "3.0.0", path = "../sekai-proto" }
+sekai-types = { version = "2.0.0", path = "../sekai-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tonic = { version = "0.14", default-features = false, features = [
+    "codegen",
+    "channel",
+    "router",
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["net"] }
