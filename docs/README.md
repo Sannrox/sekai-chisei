@@ -225,7 +225,7 @@ If you want to deploy or operate the control plane:
 ## Documentation conventions
 
 - Commands are written from the repository root unless a guide says otherwise.
-- `cargo run --bin sekaictl -- ...` works without installing the CLI. Examples
+- `cargo run -p sekaictl -- ...` works without installing the CLI. Examples
   may use the shorter `sekaictl ...` form after installation.
 - `.env.example` is the primary local template. The configuration guide
   explains stable operator-facing settings; experimental settings may remain

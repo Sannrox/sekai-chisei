@@ -31,15 +31,15 @@ a non-loopback bind; use it only for trusted local development.
 Create a principal-scoped credential:
 
 ```bash
-cargo run --bin sekaictl -- admin access credential create <principal>
+cargo run -p sekaictl -- admin access credential create <principal>
 ```
 
 Clients send the returned value as `authorization: Bearer <token>`. Rotate or
 revoke it with:
 
 ```bash
-cargo run --bin sekaictl -- admin access credential rotate <principal>
-cargo run --bin sekaictl -- admin access credential revoke <principal>
+cargo run -p sekaictl -- admin access credential rotate <principal>
+cargo run -p sekaictl -- admin access credential revoke <principal>
 ```
 
 Authenticated TCP infers a `0.0.0.0` bind when `SEKAI_BIND` is unset. Public

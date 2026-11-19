@@ -20,7 +20,7 @@ env:
   # Pull request paths that need the optional lanes; a change elsewhere is
   # still checked by the run on main.
   IMAGE_PATHS: '^(build/|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
-  TEMPLATE_PATHS: '^(crates/(sekai-connector-template|sekai-source-sdk|sekai-types|sekai-proto)/|src/connector_template\.rs$|scripts/check-connector-template\.sh$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
+  TEMPLATE_PATHS: '^(crates/(sekai-connector-template|sekai-source-sdk|sekai-types|sekai-proto)/|crates/sekaictl/src/connector_template\.rs$|scripts/check-connector-template\.sh$|Cargo\.toml$|Cargo\.lock$|rust-toolchain\.toml$|\.github/workflows/ci\.yml$)'
 
 jobs:
   # Whether a pull request needs the image lane. Pushes to main and scheduled

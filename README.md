@@ -82,8 +82,8 @@ as separate processes, see
 In another terminal, define a small service domain and seed facts:
 
 ```bash
-cargo run --bin sekaictl -- ontology apply --file tests/fixtures/product_loop/domain-v1.json
-cargo run --bin sekaictl -- ontology seed --file tests/fixtures/product_loop/seed-v1.json
+cargo run -p sekaictl -- ontology apply --file tests/fixtures/product_loop/domain-v1.json
+cargo run -p sekaictl -- ontology seed --file tests/fixtures/product_loop/seed-v1.json
 ```
 
 ```text
@@ -102,7 +102,7 @@ Then read the graph back through the structured semantic reads. These answer
 from Sekai facts and require no external model:
 
 ```bash
-cargo run --bin sekaictl -- ontology context --object inc-1 --depth 1
+cargo run -p sekaictl -- ontology context --object inc-1 --depth 1
 ```
 
 ```text

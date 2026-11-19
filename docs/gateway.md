@@ -52,15 +52,15 @@ fields at the gateway.
 Check local prerequisites, then launch a supported client:
 
 ```bash
-cargo run --bin sekaictl -- doctor codex-app
-cargo run --bin sekaictl -- launch codex-app
+cargo run -p sekaictl -- doctor codex-app
+cargo run -p sekaictl -- launch codex-app
 ```
 
 or:
 
 ```bash
-cargo run --bin sekaictl -- doctor claude-code
-cargo run --bin sekaictl -- launch claude-code
+cargo run -p sekaictl -- doctor claude-code
+cargo run -p sekaictl -- launch claude-code
 ```
 
 The launcher reads unset values from `./.env`, starts the control plane and
@@ -78,7 +78,7 @@ Useful launch options include:
 --gateway-bind    change the local gateway address
 ```
 
-Run `cargo run --bin sekaictl -- --help` and see its **Launch commands** section
+Run `cargo run -p sekaictl -- --help` and see its **Launch commands** section
 for the current option set.
 
 ## Upstream authentication modes
@@ -133,9 +133,9 @@ One gateway can serve Codex and Claude Code at the same time. Bring up the
 shared stack without opening an application, then launch either client:
 
 ```bash
-cargo run --bin sekaictl -- launch codex-app --no-app
-cargo run --bin sekaictl -- launch claude-code
-cargo run --bin sekaictl -- launch codex-app
+cargo run -p sekaictl -- launch codex-app --no-app
+cargo run -p sekaictl -- launch claude-code
+cargo run -p sekaictl -- launch codex-app
 ```
 
 The launcher merges each client's allowed runtimes and models into the shared
@@ -207,17 +207,17 @@ gateway availability mode.
 Manage hashed gateway keys through the CLI:
 
 ```bash
-cargo run --bin sekaictl -- admin gateway key create codex-app \
+cargo run -p sekaictl -- admin gateway key create codex-app \
   --agent codex-app \
   --project sekai-chisei \
   --gateway-key <generated-secret> \
   --budget 500000 \
   --allowed-model gpt-5.5
-cargo run --bin sekaictl -- admin gateway key list
-cargo run --bin sekaictl -- admin gateway key rotate \
+cargo run -p sekaictl -- admin gateway key list
+cargo run -p sekaictl -- admin gateway key rotate \
   --gateway-key-name codex-app \
   --gateway-key <new-generated-secret>
-cargo run --bin sekaictl -- admin gateway key revoke \
+cargo run -p sekaictl -- admin gateway key revoke \
   --gateway-key-name codex-app
 ```
 

@@ -8,7 +8,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 out="$(mktemp -d)"
 trap 'rm -rf "$out"' EXIT
-cargo run --locked --quiet --bin sekaictl -- admin connectors new demo-connector \
+cargo run --locked --quiet -p sekaictl -- admin connectors new demo-connector \
   --out "$out/demo-connector" --sdk-path "$root"
 cp Cargo.lock "$out/demo-connector/"
 CARGO_TARGET_DIR="$root/target" cargo test \
