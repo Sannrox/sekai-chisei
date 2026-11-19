@@ -24,15 +24,22 @@ fn connection_acquisition_emits_wait_and_pool_saturation() {
         !before.contains(signals::DB_WAIT),
         "db wait family present before any database use:\n{before}"
     );
+    assert!(
+        persistence_saturation(&before).is_none(),
+        "persistence saturation present before any database use:\n{before}"
+    );
 
     // Constructing the database runs migrations, each acquiring a pooled
     // connection through the instrumented chokepoint.
     let db = RuntimeDb::Sqlite(std::sync::Arc::new(
         SekaiDb::new(":memory:").expect("open in-memory database"),
     ));
-    drop(db);
-
+    // Saturation is sampled at checkout, so the sample taken for this held
+    // connection counts it as in use. Scrape before releasing it.
+    let held = db.conn();
     let after = scrape();
+    drop(held);
+    drop(db);
 
     let waits = after
         .lines()
@@ -44,18 +51,23 @@ fn connection_acquisition_emits_wait_and_pool_saturation() {
         "connection acquisition recorded no db wait samples:\n{after}"
     );
 
-    let saturation = after
-        .lines()
-        .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
+    let value = persistence_saturation(&after)
         .unwrap_or_else(|| panic!("no persistence saturation series:\n{after}"));
-    let value: f64 = saturation
-        .rsplit(' ')
-        .next()
-        .expect("value field")
-        .parse()
-        .expect("numeric gauge value");
     assert!(
-        (0.0..=1.0).contains(&value),
-        "pool saturation outside unit range: {saturation}"
+        value > 0.0 && value <= 1.0,
+        "a checked-out connection must count toward saturation, got {value}:\n{after}"
     );
+}
+
+/// The persistence saturation gauge value, if the series exists.
+fn persistence_saturation(rendered: &str) -> Option<f64> {
+    let line = rendered.lines().find(|line| {
+        line.starts_with(signals::SATURATION_RATIO) && line.contains(r#"subsystem="persistence""#)
+    })?;
+    Some(
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("non-numeric saturation: {line}")),
+    )
 }
