@@ -270,11 +270,17 @@ pub fn provider_registry_state_path(db_path: &str) -> PathBuf {
         .join("provider-registry-state.json")
 }
 
+/// Loads the registry state at `path` and publishes it as the process snapshot.
+/// The file locks are released before publishing, so a lifecycle update may
+/// publish a newer state in between; an older load never replaces it.
 pub fn refresh_provider_registry(path: &Path) -> Result<(), String> {
     let registry = load_provider_registry_snapshot(path)?;
-    *AUTHORITATIVE_PROVIDER_REGISTRY
+    let mut authoritative = AUTHORITATIVE_PROVIDER_REGISTRY
         .write()
-        .map_err(|_| "provider registry lock is poisoned".to_string())? = registry;
+        .map_err(|_| "provider registry lock is poisoned".to_string())?;
+    if registry.state_version >= authoritative.state_version {
+        *authoritative = registry;
+    }
     Ok(())
 }
 
