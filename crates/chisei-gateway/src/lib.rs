@@ -7,7 +7,6 @@ mod client;
 #[cfg(test)]
 pub use chisei_core::config;
 pub use sekai_domain::domain;
-mod egress;
 pub use sekai_domain::enterprise;
 mod gateway_support;
 #[allow(dead_code)]

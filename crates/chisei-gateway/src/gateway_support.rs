@@ -22,7 +22,3 @@ pub fn llm_call_column_classification(name: &str) -> &'static str {
         "public"
     }
 }
-
-pub fn is_restricted_property_classification(value: &str) -> bool {
-    matches!(value.trim(), "internal" | "sensitive")
-}

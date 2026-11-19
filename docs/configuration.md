@@ -200,7 +200,6 @@ value to stdout.
 | `CHISEI_GATEWAY_RATE_LIMIT_REQUESTS` | `120` | Requests per identity and window |
 | `CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS` | `1200` | Gateway-wide requests per window |
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed rate-limit window |
-| `CHISEI_GATEWAY_MAX_OBJECT_CONTEXT_CHARS` | `4000` | Maximum injected graph-context characters |
 | `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS` | `30` | Virtual-key lookup cache lifetime |
 | `CHISEI_GATEWAY_USAGE_RECOVERY_PATH` | `data/chisei-gateway-usage-recovery.json` | Durable journal for post-call usage records that could not yet reach the control plane |
 | `CHISEI_GATEWAY_RECOVERY_SPOOL_PATH` | `data/chisei-gateway-recovery.jsonl` | Durable receipt, usage, and refusal recovery file (process CWD-relative unless absolute) |

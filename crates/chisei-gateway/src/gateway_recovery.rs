@@ -279,17 +279,6 @@ pub(super) fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     inject_trace_context(request.metadata_mut());
     request
 }
-pub(super) fn principal_request<T>(
-    message: T,
-    principal: &str,
-) -> Result<GrpcRequest<T>, tonic::Status> {
-    let mut request = GrpcRequest::new(message);
-    let principal = tonic::metadata::MetadataValue::try_from(principal)
-        .map_err(|_| tonic::Status::internal("invalid authenticated gateway principal"))?;
-    request.metadata_mut().insert("x-principal", principal);
-    inject_trace_context(request.metadata_mut());
-    Ok(request)
-}
 
 fn inject_trace_context(metadata: &mut tonic::metadata::MetadataMap) {
     use crate::obs::otel::Injector;
