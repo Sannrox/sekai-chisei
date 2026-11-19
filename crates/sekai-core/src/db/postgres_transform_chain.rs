@@ -259,7 +259,10 @@ impl ChainStore for PostgresDb {
         }
         tx.execute(
             "DELETE FROM sekai_transform_chain_step_run
-             WHERE chain_run_id = $1 AND status != 'completed'",
+             WHERE chain_run_id = $1 AND status != 'completed'
+               AND NOT (status = 'running' AND transform_run_id IN (
+                   SELECT run_id FROM sekai_governed_transform_run
+                   WHERE dispatch_status IN ('pending', 'claimed')))",
             &[&run_id],
         )
         .map_err(|error| error.to_string())?;
@@ -437,7 +440,8 @@ mod tests {
     };
     use crate::sekai::transform_chain::{
         CHAIN_ASSERT_NOT_NULL, CHAIN_CONTRACT, CHAIN_PROFILE, CHAIN_WORK_CANCELLED,
-        CHAIN_WORK_COMPLETED, CHAIN_WORK_RUNNING, ChainAssertion, ChainEdge, ChainStep,
+        CHAIN_WORK_COMPLETED, CHAIN_WORK_FAILED, CHAIN_WORK_RUNNING, ChainAssertion, ChainEdge,
+        ChainStep,
     };
     use sekai_types::receipt_chain::{SigningKeySet, verify_bundle};
     use std::collections::HashMap;
@@ -753,5 +757,48 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
                 .len(),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_retry_keeps_a_step_whose_isolated_run_is_still_pending() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        seed_isolated(&db);
+        db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        let (run, _) = db
+            .run_transform_chain("ops", "pipe", "k-pending", "", 30)
+            .unwrap();
+        let a_run = run.step_run_id("a").unwrap().to_string();
+        // Break the b -> c edge so the chain fails while step a is pending.
+        db.put_governed_transform(&isolated("t3", "in", "out"), 40)
+            .unwrap();
+        let failed = db
+            .get_transform_chain_run(&run.run_id, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, CHAIN_WORK_FAILED);
+        db.put_governed_transform(&isolated("t3", "mid2", "out"), 60)
+            .unwrap();
+        let (rerun, _) = db
+            .run_transform_chain("ops", "pipe", "k-pending", "", 70)
+            .unwrap();
+        assert_eq!(rerun.status, CHAIN_WORK_RUNNING);
+        assert_eq!(rerun.step_run_id("a"), Some(a_run.as_str()));
+        let t1_runs = db
+            .list_governed_transform_runs("ops", 100)
+            .unwrap()
+            .into_iter()
+            .filter(|transform_run| transform_run.transform_id == "t1")
+            .count();
+        assert_eq!(t1_runs, 1);
+        for now_ms in [80, 100, 120] {
+            write_claimed(&db, now_ms);
+        }
+        let done = db
+            .get_transform_chain_run(&run.run_id, 140)
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, CHAIN_WORK_COMPLETED);
     }
 }

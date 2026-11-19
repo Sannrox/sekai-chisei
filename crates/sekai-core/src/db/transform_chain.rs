@@ -43,6 +43,9 @@ pub(crate) trait ChainStore {
     /// after transform commit and before bind can re-dispatch past the lease;
     /// bind still requires an empty `transform_run_id`.
     fn reclaim_stale_step(&self, run_id: &str, step: &str, now_ms: i64) -> Result<bool, String>;
+    /// Reopen a failed or cancelled run. Keeps completed steps and running
+    /// steps whose bound transform run is still pending or claimed, and
+    /// drops every other step so it dispatches again.
     fn begin_retry(&self, run_id: &str) -> Result<bool, String>;
     fn dataset_partition_keys(&self, dataset_id: &str) -> Result<Vec<String>, String>;
     fn get_transform(
@@ -282,18 +285,11 @@ fn advance_transform_chain<S: ChainStore>(
         if !store.begin_retry(&run.run_id)? {
             return advance_transform_chain(store, run_id, now_ms, false, dispatch);
         }
-        run.status = CHAIN_WORK_RUNNING.into();
-        run.failed_step.clear();
-        run.error.clear();
-        run.completed_at_ms = 0;
-        for step in &mut run.steps {
-            if step.status != CHAIN_WORK_COMPLETED {
-                step.status.clear();
-                step.transform_run_id.clear();
-            }
-        }
-        run.steps.retain(|step| !step.status.is_empty());
-        store.persist_run(&run)?;
+        // begin_retry kept completed steps and running steps whose transform
+        // run is still pending or claimed; reconcile_running_step resumes those.
+        run = store
+            .load_run(run_id)?
+            .ok_or_else(|| "transform chain run not found".to_string())?;
     }
     if run.status != CHAIN_WORK_RUNNING {
         return Ok(run);
@@ -886,7 +882,10 @@ impl ChainStore for SekaiDb {
         }
         tx.execute(
             "DELETE FROM sekai_transform_chain_step_run
-             WHERE chain_run_id = ?1 AND status != 'completed'",
+             WHERE chain_run_id = ?1 AND status != 'completed'
+               AND NOT (status = 'running' AND transform_run_id IN (
+                   SELECT run_id FROM sekai_governed_transform_run
+                   WHERE dispatch_status IN ('pending', 'claimed')))",
             params![run_id],
         )
         .map_err(|error| error.to_string())?;
@@ -1392,6 +1391,52 @@ mod tests {
         assert_eq!(done.status, CHAIN_WORK_COMPLETED);
         assert_eq!(done.steps.len(), 3);
         assert_eq!(db.query_rows("out", &RowQuery::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_keeps_a_step_whose_isolated_run_is_still_pending() {
+        let db = db();
+        seed_isolated(&db);
+        db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        let (run, _) = db
+            .run_transform_chain("ops", "pipe", "k-pending", "", 30)
+            .unwrap();
+        assert_eq!(run.step_status("a"), Some(CHAIN_WORK_RUNNING));
+        let a_run = run.step_run_id("a").unwrap().to_string();
+        // Break the b -> c edge so the chain fails while step a is pending.
+        db.put_governed_transform(&isolated("t3", "in", "out"), 40)
+            .unwrap();
+        let failed = db
+            .get_transform_chain_run(&run.run_id, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, CHAIN_WORK_FAILED);
+        assert_eq!(failed.failed_step, "chain");
+        db.put_governed_transform(&isolated("t3", "mid2", "out"), 60)
+            .unwrap();
+        let (rerun, replayed) = db
+            .run_transform_chain("ops", "pipe", "k-pending", "", 70)
+            .unwrap();
+        assert!(!replayed);
+        assert_eq!(rerun.status, CHAIN_WORK_RUNNING);
+        assert_eq!(rerun.step_status("a"), Some(CHAIN_WORK_RUNNING));
+        assert_eq!(rerun.step_run_id("a"), Some(a_run.as_str()));
+        assert!(rerun.step_status("chain").is_none());
+        let t1_runs = db
+            .list_governed_transform_runs("ops", 100)
+            .unwrap()
+            .into_iter()
+            .filter(|transform_run| transform_run.transform_id == "t1")
+            .count();
+        assert_eq!(t1_runs, 1);
+        for now_ms in [80, 100, 120] {
+            write_claimed(&db, now_ms);
+        }
+        let done = db
+            .get_transform_chain_run(&run.run_id, 140)
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, CHAIN_WORK_COMPLETED);
     }
 
     #[test]
