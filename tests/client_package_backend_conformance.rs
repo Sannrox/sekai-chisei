@@ -62,12 +62,35 @@ fn exercise(db: &RuntimeDb) {
     .unwrap();
     assert_eq!(first, replay);
 
-    let mut colliding = package("pkg:rust-dup", "0.1.0", LANG_RUST, &first_artifacts);
-    colliding.package_digest = first_artifacts.package.clone();
+    // Only reads by the owner of an existing package succeed.
+    for (actor, id) in [
+        ("someone-else", "pkg:rust-0.1.0"),
+        ("integrator", "pkg:missing"),
+    ] {
+        assert_eq!(
+            get_client_package(db, actor, "sdk", id).unwrap_err(),
+            PACKAGE_UNAVAILABLE,
+            "{actor} reading {id}"
+        );
+    }
+
+    // Same name, language and version under another id is refused for its
+    // identity, not a shared digest: its artifacts share none with the first.
+    // (Both the live-identity and the later-version rule refuse it.)
+    let colliding_artifacts = artifacts_from("proto-dup", "source-dup", b"pkg-dup").unwrap();
+    assert_ne!(colliding_artifacts.package, first_artifacts.package);
     assert_eq!(
-        publish_client_package(db, "integrator", &colliding, &first_artifacts, 2_500).unwrap_err(),
+        publish_client_package(
+            db,
+            "integrator",
+            &package("pkg:rust-dup", "0.1.0", LANG_RUST, &colliding_artifacts),
+            &colliding_artifacts,
+            2_500,
+        )
+        .unwrap_err(),
         PACKAGE_UNAVAILABLE
     );
+    assert_eq!(db.get_client_package("sdk", "pkg:rust-dup").unwrap(), None);
 
     for language in [LANG_TYPESCRIPT, LANG_PYTHON] {
         publish_client_package(
@@ -87,12 +110,14 @@ fn exercise(db: &RuntimeDb) {
     let listed = db.list_client_packages("sdk").unwrap();
     assert_eq!(listed.len(), 3);
 
-    let next_artifacts = artifacts_from("proto-v1", "source-v2", b"pkg-v2").unwrap();
-    let mut successor = package("pkg:rust-0.2.0", "0.2.0", LANG_RUST, &next_artifacts);
+    // The package digest is not an identity key: a later version reusing the
+    // first version's digest is admitted as its successor.
+    let mut successor = package("pkg:rust-0.2.0", "0.2.0", LANG_RUST, &first_artifacts);
     successor.predecessor_id = first.package_id.clone();
     let published =
-        publish_client_package(db, "integrator", &successor, &next_artifacts, 4_000).unwrap();
+        publish_client_package(db, "integrator", &successor, &first_artifacts, 4_000).unwrap();
     assert_eq!(published.predecessor_id, "pkg:rust-0.1.0");
+    assert_eq!(published.package_digest, first.package_digest);
     let superseded = db
         .get_client_package("sdk", "pkg:rust-0.1.0")
         .unwrap()
