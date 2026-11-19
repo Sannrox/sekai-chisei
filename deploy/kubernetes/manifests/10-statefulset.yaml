@@ -48,6 +48,28 @@ spec:
               value: /data/sekai.db
             - name: CHISEI_DB_PATH
               value: /data/chisei.db
+            # Native execution through the gateway (#3173). Each key of the
+            # optional Secret sekai-chisei-gateway is read when present;
+            # without the Secret these stay unset and native calls go to the
+            # providers directly.
+            - name: CHISEI_GATEWAY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-gateway
+                  key: CHISEI_GATEWAY_KEY
+                  optional: true
+            - name: CHISEI_GATEWAY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-gateway
+                  key: CHISEI_GATEWAY_URL
+                  optional: true
+            - name: CHISEI_GATEWAY_PROVIDED_PROVIDERS
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-gateway
+                  key: CHISEI_GATEWAY_PROVIDED_PROVIDERS
+                  optional: true
           volumeMounts:
             - name: data
               mountPath: /data

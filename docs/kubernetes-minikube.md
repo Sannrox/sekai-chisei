@@ -42,6 +42,24 @@ kubectl -n local create secret tls sekai-chisei-tls \
 rm tls.key
 ```
 
+## Gateway secret (optional)
+
+Native execution can send `openai` and `anthropic` calls through the gateway
+([Native execution through the gateway](gateway.md#native-execution-through-the-gateway)).
+The StatefulSet reads `CHISEI_GATEWAY_KEY`, `CHISEI_GATEWAY_URL`, and
+`CHISEI_GATEWAY_PROVIDED_PROVIDERS` from the optional Secret
+`sekai-chisei-gateway`, one key per variable. Without the Secret, or without a
+key, that variable stays unset and the server starts as before.
+
+```bash
+kubectl -n local create secret generic sekai-chisei-gateway \
+  --from-literal=CHISEI_GATEWAY_URL=http://chisei-gateway.local.svc:8788 \
+  --from-literal=CHISEI_GATEWAY_PROVIDED_PROVIDERS=openai,anthropic \
+  --from-file=CHISEI_GATEWAY_KEY=gateway.key
+# Environment variables are read at start: restart the pod after changing it.
+kubectl -n local rollout restart statefulset/sekai-chisei
+```
+
 ## Publish and apply
 
 Point Tenkai at a kubeconfig file, then publish the Kubernetes product. Unsigned
@@ -120,4 +138,5 @@ revision is restored.
 tenkaictl env unsubscribe local sekai-chisei
 # or remove the environment workload through the usual Tenkai uninstall path
 kubectl -n local delete secret sekai-chisei-tls --ignore-not-found
+kubectl -n local delete secret sekai-chisei-gateway --ignore-not-found
 ```
