@@ -32,7 +32,11 @@ impl OpenAI {
     ) -> Self {
         Self {
             api_key: api_key.to_string(),
-            base_url: base_url.unwrap_or(OPENAI_BASE_URL).to_string(),
+            // A trailing slash would build `//v1/...`, which some endpoints refuse.
+            base_url: base_url
+                .unwrap_or(OPENAI_BASE_URL)
+                .trim_end_matches('/')
+                .to_string(),
             client: timeouts.client(),
             timeouts,
         }
@@ -919,6 +923,28 @@ mod tests {
         let provider = OpenAI::with_timeouts("", Some(&base_url), HttpTimeouts::default());
         let response = provider.chat(&test_chat_request("acme-1")).await.unwrap();
         assert_eq!(response.stop_reason, "length");
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_base_url_posts_to_a_single_slash_path() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::Json(json!({
+                    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAI::with_timeouts("", Some(&base_url), HttpTimeouts::default());
+        let response = provider.chat(&test_chat_request("acme-1")).await.unwrap();
+        assert_eq!(response.content, "ok");
     }
 
     async fn spawn_delayed_openai() -> String {
