@@ -15,8 +15,8 @@ pub(crate) enum VisiblePageError<E> {
 ///
 /// `fetch` receives a raw storage limit and offset. The scan budget bounds the
 /// work performed when most rows are invisible and never exceeds
-/// [`MAX_SCAN_ROWS`]; exhausting it before filling the requested page fails
-/// closed.
+/// [`MAX_SCAN_ROWS`] plus one probe row; exhausting it before filling the
+/// requested page fails closed unless storage ends exactly at the budget.
 pub(crate) fn scan_visible_page<T, E>(
     visible_limit: usize,
     visible_offset: usize,
@@ -35,10 +35,13 @@ pub(crate) fn scan_visible_page<T, E>(
     let mut scanned = 0usize;
     let mut skipped = 0usize;
     let mut scan_offset = 0i32;
+    let mut reached_end = false;
 
     while visible.len() < visible_limit && scanned < max_scan {
         let take = batch_size.min(max_scan - scanned);
         let batch = fetch(take as i32, scan_offset).map_err(VisiblePageError::Fetch)?;
+        // A batch shorter than requested means storage has no more rows.
+        reached_end = batch.len() < take;
         if batch.is_empty() {
             break;
         }
@@ -59,7 +62,15 @@ pub(crate) fn scan_visible_page<T, E>(
         }
     }
 
-    if visible.len() < visible_limit && scanned >= max_scan {
+    // The budget ran out on a full batch: one probe row decides whether
+    // storage ended exactly at the budget or the short page hides more rows.
+    if visible.len() < visible_limit
+        && scanned >= max_scan
+        && !reached_end
+        && !fetch(1, scan_offset)
+            .map_err(VisiblePageError::Fetch)?
+            .is_empty()
+    {
         Err(VisiblePageError::ScanBudgetExhausted)
     } else {
         Ok(visible)
@@ -181,6 +192,33 @@ mod tests {
     }
 
     #[test]
+    fn storage_ending_exactly_at_the_budget_returns_a_short_page() {
+        // One visible row in 200 raw rows: the budget (200) is spent on a
+        // full last batch, and the probe finds no further rows.
+        for count in [200, 150] {
+            let source = rows(count);
+            let page = scan_visible_page(
+                5,
+                0,
+                |limit, offset| {
+                    Ok::<_, ()>(
+                        source
+                            .iter()
+                            .skip(offset as usize)
+                            .take(limit as usize)
+                            .copied()
+                            .collect(),
+                    )
+                },
+                |row| *row == 7,
+            )
+            .unwrap();
+
+            assert_eq!(page, vec![7], "{count} rows");
+        }
+    }
+
+    #[test]
     fn caller_limit_and_offset_cannot_raise_the_scan_ceiling() {
         for (limit, offset) in [(i32::MAX as usize, 0), (1, i32::MAX as usize)] {
             let mut scanned = 0usize;
@@ -189,8 +227,9 @@ mod tests {
                 offset,
                 |limit, offset| {
                     scanned += limit as usize;
-                    // Stop a runaway scan so a missing ceiling fails fast.
-                    if scanned > MAX_SCAN_ROWS {
+                    // Stop a runaway scan so a missing ceiling fails fast. The
+                    // ceiling allows one probe row past the budget.
+                    if scanned > MAX_SCAN_ROWS + 1 {
                         return Err(());
                     }
                     Ok((offset..offset.saturating_add(limit)).collect::<Vec<i32>>())
@@ -200,7 +239,7 @@ mod tests {
             .unwrap_err();
 
             assert_eq!(error, VisiblePageError::ScanBudgetExhausted);
-            assert!(scanned <= MAX_SCAN_ROWS, "scanned {scanned} rows");
+            assert!(scanned <= MAX_SCAN_ROWS + 1, "scanned {scanned} rows");
         }
     }
 }
