@@ -782,6 +782,36 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "ListClaimableWork") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_claimable_work(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ClaimWork") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::claim_work(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "HeartbeatWorkClaim") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::heartbeat_work_claim(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "AckWork") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::ack_work(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RecordDecision") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::record_decision(&*svc, req).await
+            })
+            .await
+        }
         _ => status_response(Status::unimplemented("rpc is not hosted on HTTP/JSON")),
     }
 }
@@ -1269,114 +1299,37 @@ mod tests {
         );
     }
 
+    /// Every RPC the generated HTTP clients call has a `dispatch` arm: an
+    /// unauthenticated call is refused, and an authenticated one reaches a
+    /// handler instead of the `unimplemented` fallback or the experimental gate.
     #[tokio::test]
-    async fn promoted_semantic_rpcs_are_hosted_and_stay_authorized() {
+    async fn every_generated_http_client_method_is_hosted_and_stays_authorized() {
         let (sekai, chisei, interceptor, token) = token_world();
         let app = router_for(sekai, chisei, interceptor);
-        for rpc in ["RetrieveContext", "ExpandRelations", "ExplainDerivation"] {
-            let path = format!("/sekai.SekaiService/{rpc}");
+        let methods = crate::http_codegen::http_unary_methods();
+        assert!(!methods.is_empty(), "no generated HTTP client methods");
+        let mut unhosted = Vec::new();
+        for method in methods {
+            let path = format!("/{}/{}", method.service, method.rpc);
             let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(payload["code"], "unauthenticated", "{path}");
 
             let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
             let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
+            if payload["code"] == "unimplemented" {
+                unhosted.push(path);
+                continue;
+            }
             assert!(
                 !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
+                "{path} is stable and must not hit the experimental gate: {message}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn promoted_action_approval_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in ["DecideActionInstance", "ListActionInstances"] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn promoted_evaluation_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in [
-            "PutEvaluationPlan",
-            "ResolveEvaluationPlan",
-            "ExecuteEvaluationManifest",
-        ] {
-            let path = format!("/chisei.ChiseiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn promoted_definition_change_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in [
-            "CreateDefinitionBranch",
-            "ApplyDefinitionBranchEdit",
-            "CompareDefinitionRevisions",
-            "ReportDefinitionConsumerImpact",
-            "CreateDefinitionProposal",
-        ] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn promoted_search_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in ["Search", "GetSearchIndexStatus"] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
+        assert!(
+            unhosted.is_empty(),
+            "generated HTTP clients call RPCs with no dispatch arm: {unhosted:#?}"
+        );
     }
 
     #[tokio::test]
@@ -1396,89 +1349,6 @@ mod tests {
         )
         .await;
         assert_eq!(payload["code"], "not_found", "{payload}");
-    }
-
-    #[tokio::test]
-    async fn promoted_dataset_version_and_health_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in [
-            "ListDatasets",
-            "ListDatasetVersions",
-            "GetDatasetVersion",
-            "RollbackDataset",
-            "PutDatasetHealthCheck",
-            "ListDatasetHealthChecks",
-            "ListDatasetHealthResults",
-            "RunDatasetHealthChecks",
-            "ListDatasetAlerts",
-        ] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn promoted_datasource_index_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in [
-            "RegisterObjectTypeDatasource",
-            "ReindexObjectType",
-            "GetObjectTypeIndexStatus",
-            "PutObjectTypeIndexEdit",
-        ] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn promoted_document_rpcs_are_hosted_and_stay_authorized() {
-        let (sekai, chisei, interceptor, token) = token_world();
-        let app = router_for(sekai, chisei, interceptor);
-        for rpc in [
-            "AdmitGovernedDocument",
-            "AttachGovernedDocumentRendition",
-            "GetGovernedDocument",
-            "HoldGovernedDocument",
-            "ReleaseGovernedDocumentHold",
-            "ExpireGovernedDocument",
-            "DeleteGovernedDocument",
-        ] {
-            let path = format!("/sekai.SekaiService/{rpc}");
-            let (status, payload) = http_json(app.clone(), &path, None, json!({})).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{rpc}");
-            assert_eq!(payload["code"], "unauthenticated", "{rpc}");
-
-            let (_, payload) = http_json(app.clone(), &path, Some(&token), json!({})).await;
-            let message = payload["message"].as_str().unwrap_or_default();
-            assert_ne!(payload["code"], "unimplemented", "{rpc} must be hosted");
-            assert!(
-                !message.contains("experimental"),
-                "{rpc} is stable and must not hit the experimental gate: {message}"
-            );
-        }
     }
 
     /// Proto3 JSON may omit default-valued fields of a nested input message;
