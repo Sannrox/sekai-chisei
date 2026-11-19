@@ -89,6 +89,25 @@ fn require_tool(name: &str) {
         .unwrap_or_else(|error| panic!("{name} is required for isolated consumer proof: {error}"));
 }
 
+/// The tarball name from `npm pack --json` output. Lifecycle scripts print
+/// banner lines before the JSON array, so parsing starts at the array.
+fn packed_filename(pack_out: &str) -> String {
+    let start = if pack_out.starts_with('[') {
+        0
+    } else {
+        pack_out
+            .find("\n[")
+            .map(|at| at + 1)
+            .unwrap_or_else(|| panic!("npm pack printed no JSON array: {pack_out}"))
+    };
+    let rows: serde_json::Value = serde_json::from_str(&pack_out[start..])
+        .unwrap_or_else(|error| panic!("npm pack JSON did not parse ({error}): {pack_out}"));
+    rows[0]["filename"]
+        .as_str()
+        .unwrap_or_else(|| panic!("npm pack JSON names no filename: {pack_out}"))
+        .to_string()
+}
+
 fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {
     let output = Command::new(program)
         .current_dir(dir)
@@ -160,6 +179,7 @@ fn tree_text(root: &Path) -> String {
 }
 
 #[test]
+#[ignore = "requires python3, node, and rustc on PATH; CI runs it with --ignored"]
 fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
     let (_root, rust, typescript, python, proto, proto_crate) = stage_consumers();
     rewrite_python_fixture(&python);
@@ -341,6 +361,7 @@ fn main() {
 /// Pack TypeScript and Python SDKs and install them into a directory that
 /// has no in-repo path. Clerk publication records are not the install source.
 #[test]
+#[ignore = "requires network access to the public package registries plus python3, node, and npm; CI runs it with --ignored"]
 fn isolated_registry_packs_install_without_an_in_repo_path() {
     let (root, _rust, typescript, python, _proto, _proto_crate) = stage_consumers();
     require_tool("python3");
@@ -350,26 +371,7 @@ fn isolated_registry_packs_install_without_an_in_repo_path() {
     run_in(&typescript, "npm", &["install", "--ignore-scripts"]);
     run_in(&typescript, "npm", &["run", "build"]);
     let pack_out = run_in(&typescript, "npm", &["pack", "--json"]);
-    let tarball = pack_out
-        .lines()
-        .rev()
-        .find_map(|line| {
-            serde_json::from_str::<serde_json::Value>(line)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .as_array()
-                        .and_then(|rows| rows.first().cloned())
-                        .or(Some(value))
-                })
-                .and_then(|value| {
-                    value
-                        .get("filename")
-                        .and_then(|name| name.as_str())
-                        .map(str::to_string)
-                })
-        })
-        .unwrap_or_else(|| "sannrox-sekai-chisei-sdk-0.1.0.tgz".into());
+    let tarball = packed_filename(&pack_out);
     let tarball_path = typescript.join(&tarball);
     assert!(
         tarball_path.is_file(),
@@ -410,11 +412,18 @@ fn isolated_registry_packs_install_without_an_in_repo_path() {
         ts_import.contains("sekai.http-projection/v1"),
         "typescript pack install missing HTTP client: {ts_import}"
     );
-    let ts_lock = fs::read_to_string(ts_consumer.join("package-lock.json"))
-        .unwrap_or_else(|_| fs::read_to_string(ts_consumer.join("package.json")).unwrap());
+    // The lockfile must resolve the SDK to the packed tarball, never to a
+    // linked source directory.
+    let ts_lock: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(ts_consumer.join("package-lock.json"))
+            .expect("npm install writes package-lock.json"),
+    )
+    .expect("package-lock.json is JSON");
+    let sdk_entry = &ts_lock["packages"]["node_modules/@sannrox/sekai-chisei-sdk"];
+    let resolved = sdk_entry["resolved"].as_str().unwrap_or_default();
     assert!(
-        !ts_lock.contains("sdk/typescript"),
-        "typescript consumer still names the in-repo tree: {ts_lock}"
+        resolved.ends_with(&format!("/{tarball}")) && sdk_entry.get("link").is_none(),
+        "typescript consumer does not resolve the SDK to {tarball}: {sdk_entry}"
     );
 
     let py_wheel = root.path().join("py-wheels");

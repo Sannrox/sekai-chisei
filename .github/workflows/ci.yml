@@ -144,6 +144,9 @@ jobs:
       # Main writes this cache from reviewed code, and the job publishes nothing.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2 # zizmor: ignore[cache-poisoning]
       - run: cargo test-all
+      # The SDK consumer tests need python3, node, npm, rustc, and registry
+      # network access, so they are ignored by default and run here.
+      - run: cargo test --locked --test it -- --ignored sdk_external_consumer
       - run: cargo run -p sekai-source-sdk --example out_of_tree_adapter --locked
       - run: bash scripts/check-source-sdk-api.sh
       # Reuses this job's target directory, so it stays here.
