@@ -306,20 +306,19 @@ fn validate_envelope(
 // budget, or lease stores. A later admit with different pins for the same
 // envelope identity is stale and fails closed.
 fn validate_pins(pins: &AutonomousPins) -> Result<(), String> {
-    for (label, value) in [
-        ("state", pins.state_digest.as_str()),
-        ("policy", pins.policy_digest.as_str()),
-        ("model", pins.model_digest.as_str()),
-        ("prompt", pins.prompt_digest.as_str()),
-        ("evidence", pins.evidence_digest.as_str()),
-        ("simulation", pins.simulation_digest.as_str()),
-        ("budget", pins.budget_digest.as_str()),
-        ("lease", pins.lease_digest.as_str()),
+    for value in [
+        &pins.state_digest,
+        &pins.policy_digest,
+        &pins.model_digest,
+        &pins.prompt_digest,
+        &pins.evidence_digest,
+        &pins.simulation_digest,
+        &pins.budget_digest,
+        &pins.lease_digest,
     ] {
         if !digest_token(value) {
             return Err(AUTONOMY_UNAVAILABLE.into());
         }
-        reject_secret(label)?;
     }
     Ok(())
 }
