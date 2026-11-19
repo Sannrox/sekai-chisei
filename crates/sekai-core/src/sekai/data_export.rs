@@ -358,8 +358,18 @@ pub struct RowEncoder {
     parquet: Option<sekai_parquet_export::Encoder>,
 }
 
+/// Leading characters a spreadsheet runs as a formula, plus the apostrophe
+/// itself so the neutralizing prefix stays reversible.
+const CSV_FORMULA_LEADS: [char; 7] = ['=', '+', '-', '@', '\t', '\r', '\''];
+
+/// One CSV cell. A value that starts with a formula lead is written quoted
+/// with a leading apostrophe; a reader strips exactly one leading apostrophe
+/// to recover it. Fields with a separator, quote, line break or surrounding
+/// whitespace are quoted.
 fn csv_field(value: &str) -> String {
-    if value.contains([',', '"', '\n', '\r']) || value.trim() != value {
+    if value.starts_with(CSV_FORMULA_LEADS) {
+        format!("\"'{}\"", value.replace('"', "\"\""))
+    } else if value.contains([',', '"', '\n', '\r']) || value.trim() != value {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
@@ -854,6 +864,26 @@ mod tests {
             created: 0,
             updated: 0,
         }
+    }
+
+    #[test]
+    fn csv_neutralizes_cells_that_start_a_formula() {
+        for (value, encoded) in [
+            ("=SUM(A1)", "\"'=SUM(A1)\""),
+            ("+1", "\"'+1\""),
+            ("-20.5", "\"'-20.5\""),
+            ("@cmd", "\"'@cmd\""),
+            ("\tx", "\"'\tx\""),
+            ("\rx", "\"'\rx\""),
+            ("'kept", "\"''kept\""),
+            ("=\"q\",x", "\"'=\"\"q\"\",x\""),
+        ] {
+            assert_eq!(csv_field(value), encoded, "{value:?}");
+        }
+        for plain in ["a=b", "20.5", "", "plain text"] {
+            assert_eq!(csv_field(plain), plain);
+        }
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
     }
 
     #[test]
