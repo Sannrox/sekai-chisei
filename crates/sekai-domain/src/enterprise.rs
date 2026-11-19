@@ -304,10 +304,8 @@ impl AuthenticatedContext {
                     .tenant
                     .as_ref()
                     .is_none_or(|tenant| tenant.tenant_id.trim().is_empty()))
-            || self
-                .act
-                .as_ref()
-                .is_some_and(|actor| actor.trim().is_empty() || actor == &self.principal.subject)
+            || (self.act.is_some()
+                && delegating_user(&self.principal.subject, self.act.as_deref()).is_none())
         {
             return Err(ExtensionError::PermissionDenied);
         }
@@ -443,6 +441,14 @@ impl ActorKind {
     }
 }
 
+/// The user `act` delegates from for `subject`, both compared trimmed. `None`
+/// when `act` is absent, blank, or names the subject itself. Authorization and
+/// [`ActorChain`] both decide delegation here so they key on one identity.
+pub fn delegating_user<'a>(subject: &str, act: Option<&'a str>) -> Option<&'a str> {
+    act.map(str::trim)
+        .filter(|user| !user.is_empty() && *user != subject.trim())
+}
+
 /// Delegating user plus optional agent taken from `sub` and `act`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorChain {
@@ -457,13 +463,12 @@ impl ActorChain {
         if subject.is_empty() {
             return None;
         }
-        let act = act.map(str::trim).filter(|value| !value.is_empty());
-        match act {
-            Some(user) if user != subject => Some(Self {
+        match delegating_user(subject, act) {
+            Some(user) => Some(Self {
                 principal: user.to_string(),
                 agent: Some(subject.to_string()),
             }),
-            _ => Some(Self {
+            None => Some(Self {
                 principal: subject.to_string(),
                 agent: None,
             }),
@@ -1446,6 +1451,32 @@ mod tests {
         context.space = None;
         context.space_role = Some(SpaceRole::Viewer);
         assert!(context.authorize_space(NamespaceAction::Read).is_err());
+    }
+
+    #[test]
+    fn authorization_and_actor_chain_agree_on_delegation() {
+        let mut context = FakeExtension.authenticate_context("test-token").unwrap();
+        context.principal.subject = "alice".into();
+        for (act, delegates) in [
+            ("bob", true),
+            (" bob ", true),
+            ("alice", false),
+            ("alice ", false),
+            (" alice", false),
+            ("  ", false),
+        ] {
+            context.act = Some(act.into());
+            let chain = context.actor_chain().unwrap();
+            assert_eq!(chain.agent.is_some(), delegates, "chain for {act:?}");
+            assert_eq!(
+                context.authorize_space(NamespaceAction::Write).is_ok(),
+                delegates,
+                "authorization for {act:?}"
+            );
+        }
+        context.act = None;
+        assert!(context.actor_chain().unwrap().agent.is_none());
+        assert!(context.authorize_space(NamespaceAction::Write).is_ok());
     }
 
     #[test]
