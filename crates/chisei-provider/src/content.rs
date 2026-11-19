@@ -337,8 +337,9 @@ pub fn validate_media_type(kind: ContentKind, value: &str) -> Result<(), String>
     }
 }
 
+/// Checks the raw reference, untrimmed: callers keep and hash it as given,
+/// so a padded spelling of one handle must be refused, not normalized.
 pub fn validate_opaque_reference(value: &str) -> Result<(), String> {
-    let value = value.trim();
     let lower = value.to_ascii_lowercase();
     if value.is_empty()
         || value.len() > MAX_REFERENCE_BYTES
@@ -456,6 +457,18 @@ mod tests {
         let debug = format!("{part:?}");
         assert!(!debug.contains("secret text"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_refused_and_a_plain_handle_passes() {
+        assert!(validate_opaque_reference("blob:abc").is_ok());
+        for padded in [" blob:abc", "blob:abc ", "\tblob:abc", "blob:abc\n"] {
+            assert_eq!(
+                validate_opaque_reference(padded),
+                Err("content reference must be a credential-free opaque handle".into()),
+                "{padded:?}"
+            );
+        }
     }
 
     #[test]
