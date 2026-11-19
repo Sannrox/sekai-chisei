@@ -79,7 +79,7 @@ impl Running {
         let socket = self.socket.to_str().expect("utf8 socket").to_string();
         let mut full: Vec<&str> = args.to_vec();
         full.extend(["--target", socket.as_str()]);
-        Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        Command::new(crate::sekaictl_bin())
             .args(&full)
             .env("SEKAI_SOCKET", &self.socket)
             .env_remove("CHISEI_GRPC_URL")

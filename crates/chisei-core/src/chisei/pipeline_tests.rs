@@ -22,12 +22,13 @@ use crate::chisei::kioku::{
 };
 use crate::chisei::object_schema::{ObjectType, PropertyDef, PropertyType};
 use crate::chisei::principal::{PrincipalGrant, PrincipalRole};
-use crate::domain::{Link, Object};
-use crate::sekai::evidence::{
+use sekai_core::db::store::SekaiStore;
+use sekai_core::domain::{Link, Object};
+use sekai_core::sekai::evidence::{
     EVIDENCE_ENVELOPE_VERSION, EvidenceEnvelope, EvidenceIntent, EvidenceSignal, EvidenceTarget,
     SchemaCompatibility,
 };
-use crate::sekai::evidence_store::{
+use sekai_core::sekai::evidence_store::{
     EvidenceProducerCapability, EvidenceSchemaDefinition, canonical_content_digest,
 };
 use serde_json::json;
@@ -279,9 +280,7 @@ fn routing_and_policy_steps_never_read_a_pinned_learning() {
 
 /// Shared-compatibility layout: Sekai facts live in the same physical store.
 fn shared_facts(db: &ChiseiStore) -> SekaiFacts {
-    SekaiFacts::in_process(crate::db::store::SekaiStore::from_shared_runtime(
-        db.runtime_arc(),
-    ))
+    SekaiFacts::in_process(SekaiStore::from_shared_runtime(db.runtime_arc()))
 }
 
 fn make_req(db: &ChiseiStore) -> PipelineRequest {
@@ -1826,7 +1825,7 @@ fn authenticated_context_never_crosses_namespace_or_object_acl() {
 
 #[test]
 fn split_stores_resolve_context_objects_from_the_sekai_store() {
-    let sekai = crate::db::store::SekaiStore::memory();
+    let sekai = SekaiStore::memory();
     let chisei = ChiseiStore::memory();
     sekai
         .runtime()
@@ -1932,7 +1931,10 @@ impl SekaiFactReader for CountingTypes {
         Ok(None)
     }
 
-    fn list_objects(&self, _: &crate::domain::ListFilter) -> Result<Vec<Object>, SekaiFactError> {
+    fn list_objects(
+        &self,
+        _: &sekai_core::domain::ListFilter,
+    ) -> Result<Vec<Object>, SekaiFactError> {
         Ok(Vec::new())
     }
 
@@ -1945,7 +1947,7 @@ impl SekaiFactReader for CountingTypes {
         Ok(Vec::new())
     }
 
-    fn in_process_store(&self) -> Result<&crate::db::store::SekaiStore, SekaiFactError> {
+    fn in_process_store(&self) -> Result<&SekaiStore, SekaiFactError> {
         Err(SekaiFactError::Unsupported("counting fixture"))
     }
 }

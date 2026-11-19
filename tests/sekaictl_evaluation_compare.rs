@@ -163,7 +163,7 @@ impl Running {
     }
 
     fn sekaictl(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_sekaictl"))
+        Command::new(crate::sekaictl_bin())
             .args(args)
             .env("SEKAI_SOCKET", &self.socket)
             .env_remove("CHISEI_GRPC_URL")

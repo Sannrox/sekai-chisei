@@ -28,7 +28,14 @@ postgres = { version = "0.19", default-features = false, features = [
 postgres-native-tls = "0.5"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
-rusqlite = { version = "0.41", features = ["backup", "bundled", "functions", "hooks", "limits"] }
+rusqlite = { version = "0.41", default-features = false, features = [
+    "backup",
+    "bundled",
+    "cache",
+    "functions",
+    "hooks",
+    "limits",
+] }
 same-file = "1"
 sekai-domain = { version = "1.1.0", path = "../sekai-domain" }
 sekai-obs = { version = "1.1.0", path = "../sekai-obs" }
@@ -48,7 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
-rusqlite = { version = "0.41", features = ["trace"] }
+rusqlite = { version = "0.41", default-features = false, features = ["trace"] }
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",

@@ -109,7 +109,7 @@ The shared procedure is agent-kit's `prepare-release` reference
 ## Contract versions
 
 Tenkai dependents require Chisei's RPC contracts, not its release version.
-`PROVIDED_CONTRACTS` in `src/compatibility_matrix.rs` is the only source of
+`PROVIDED_CONTRACTS` in `crates/sekaictl/src/compatibility_matrix.rs` is the only source of
 their versions. Each release lists them under `contracts` in
 `compatibility.json`, and its Tenkai products provide them.
 

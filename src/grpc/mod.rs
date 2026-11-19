@@ -2196,25 +2196,9 @@ fn spawn_admission_reconciler(
     });
 }
 
-/// Archive only when the restore fence admits the mutation. `dry_run` skips
-/// the fence because it writes nothing. `sekaictl admin retention run` uses
-/// it and waits on the retention lock; the tick uses [`archive_tick`].
-pub(crate) fn archive_admitted(
-    db: &RuntimeDb,
-    stores: &CombinedStoreLayout,
-    now: i64,
-    dry_run: bool,
-) -> Result<crate::sekai::retention::ArchiveRun, String> {
-    crate::db::postgres::off_runtime(|| {
-        if !dry_run {
-            crate::store_relocate::refuse_mutating_if_generation_mismatch(stores)?;
-        }
-        db.archive_retained_records(now, dry_run)
-    })
-}
-
 /// One scheduled retention run behind the same fence: `None` when another
-/// replica holds the retention lock.
+/// replica holds the retention lock. `sekaictl admin retention run` calls
+/// `chisei_core::store_relocate::archive_admitted` and waits on the lock.
 fn archive_tick(
     db: &RuntimeDb,
     stores: &CombinedStoreLayout,

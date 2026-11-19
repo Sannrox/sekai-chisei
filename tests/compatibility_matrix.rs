@@ -1,6 +1,6 @@
 //! Compatibility matrix projection and consumer pin check (#873).
 
-use sekai_chisei::compatibility_matrix::{
+use sekaictl::compatibility_matrix::{
     self, CompatibilityMatrix, MATRIX_CONTRACT, check_consumer, check_tenkai_products,
     protocol_revision,
 };

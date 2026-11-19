@@ -1102,11 +1102,9 @@ pub(super) fn evaluate_execute_lookup_first(
                 lookup_refusal: Some(reason),
             }
         }
-        Ok(crate::composition::lookup_first::LookupDecision::NotEligible) => {
-            ExecuteLookupFirst::ModelPath {
-                lookup_refusal: None,
-            }
-        }
+        Ok(_) => ExecuteLookupFirst::ModelPath {
+            lookup_refusal: None,
+        },
         Err(error) => {
             crate::composition::lookup_first::record_model_path(true);
             ExecuteLookupFirst::ModelPath {

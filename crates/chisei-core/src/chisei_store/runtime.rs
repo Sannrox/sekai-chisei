@@ -2192,7 +2192,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 host_site_id,
                 timing,
             ),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.redeem_or_reconcile_permit(
                     permit,
                     context,
@@ -2828,7 +2828,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
         match self {
             Self::Sqlite(db) => db.put_delegated_permit(permit, issued_by),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_delegated_permit(permit, issued_by))
+                sekai_core::db::postgres::off_runtime(|| db.put_delegated_permit(permit, issued_by))
             }
         }
     }
@@ -2940,7 +2940,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
     ) -> Result<Option<Redemption>, String> {
         match self {
             Self::Sqlite(db) => db.replay_redemption(permit, idempotency_key, execution_id),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.replay_redemption(permit, idempotency_key, execution_id)
             }),
         }
@@ -3006,7 +3006,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
         match self {
             Self::Sqlite(db) => db.validate_delegation_chain(permit),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.validate_delegation_chain(permit))
+                sekai_core::db::postgres::off_runtime(|| db.validate_delegation_chain(permit))
             }
         }
     }
@@ -3015,7 +3015,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
         match self {
             Self::Sqlite(db) => db.validate_permit_for_delegation(permit),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.validate_permit_for_delegation(permit))
+                sekai_core::db::postgres::off_runtime(|| db.validate_permit_for_delegation(permit))
             }
         }
     }
@@ -3024,7 +3024,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
         match self {
             Self::Sqlite(db) => db.validate_permit_state(permit),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.validate_permit_state(permit))
+                sekai_core::db::postgres::off_runtime(|| db.validate_permit_state(permit))
             }
         }
     }
@@ -3065,7 +3065,7 @@ impl ChiseiRuntimeDb for RuntimeDb {
                 host_site_id,
                 now_ms,
             ),
-            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.redeem_permit(
                     permit,
                     context,

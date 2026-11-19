@@ -31,6 +31,7 @@ members = [
     "crates/sekai-proto",
     "crates/chisei-provider",
     "crates/sekai-source-sdk",
+    "crates/sekaictl",
 ]
 resolver = "2"
 
@@ -45,7 +46,13 @@ experimental-rpcs = []
 
 [dependencies]
 # gRPC
-tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic = { version = "0.14", default-features = false, features = [
+    "codegen",
+    "router",
+    "transport",
+    "tls-ring",
+    "tls-native-roots",
+] }
 tonic-prost = "0.14"
 tonic-health = "0.14"
 prost = "0.14"
@@ -68,13 +75,29 @@ tokio = { version = "1", default-features = false, features = [
     "time",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
-axum = "0.8"
+axum = { version = "0.8", default-features = false, features = [
+    "form",
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
 async-stream = "0.3"
 
 # Database
-rusqlite = { version = "0.41", features = ["bundled", "functions", "hooks", "limits"] }
+rusqlite = { version = "0.41", default-features = false, features = [
+    "bundled",
+    "cache",
+    "functions",
+    "hooks",
+    "limits",
+] }
 r2d2 = "0.8"
-postgres = "0.19"
+postgres = { version = "0.19", default-features = false, features = [
+    "with-chrono-0_4",
+    "with-serde_json-1",
+    "with-uuid-1",
+] }
 postgres-native-tls = "0.5"
 r2d2_postgres = "0.18"
 native-tls = "0.2"
@@ -130,11 +153,12 @@ sekai-adapters = { path = "crates/sekai-adapters" }
 sekai-client = { path = "crates/sekai-client" }
 sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }
 sekai-connector-template = { path = "crates/sekai-connector-template" }
-rusqlite = { version = "0.41", features = ["trace"] }
+rusqlite = { version = "0.41", default-features = false, features = ["trace"] }
 chisei-gateway = { version = "1.0.0", path = "crates/chisei-gateway", features = ["test-support"] }
 # The object-log host the clerk adapter talks to (ADR 0088), same pinned tag.
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 sekai-parquet-export = { version = "1.0.0", path = "crates/sekai-parquet-export" }
+sekaictl = { version = "3.1.0", path = "crates/sekaictl" }
 tempfile = "3"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
