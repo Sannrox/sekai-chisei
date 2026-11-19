@@ -106,7 +106,7 @@ fn lattice_value(lattice: &ClassificationLattice) -> Value {
 }
 
 /// Pretty JSON with sorted object keys at every depth and a trailing newline.
-fn render(value: &Value) -> Result<String, String> {
+pub(crate) fn render(value: &Value) -> Result<String, String> {
     let mut text =
         serde_json::to_string_pretty(&sorted(value.clone())).map_err(|error| error.to_string())?;
     text.push('\n');

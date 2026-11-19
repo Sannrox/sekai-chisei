@@ -1,0 +1,143 @@
+{
+  "contract_version": "sekai.ontology-draft-report/v1",
+  "inferred_link_confidence_bp": 8000,
+  "layout_version": "sekai.ontology-export/v1",
+  "members": [
+    {
+      "id": "Contact_account_id_Account",
+      "kind": "link_type",
+      "path": "link_type/Contact_account_id_Account.json"
+    },
+    {
+      "id": "Order_account_id_Account",
+      "kind": "link_type",
+      "path": "link_type/Order_account_id_Account.json"
+    },
+    {
+      "id": "Order_contact_id_Contact",
+      "kind": "link_type",
+      "path": "link_type/Order_contact_id_Contact.json"
+    },
+    {
+      "id": "Account",
+      "kind": "object_type",
+      "path": "object_type/Account.json"
+    },
+    {
+      "id": "Contact",
+      "kind": "object_type",
+      "path": "object_type/Contact.json"
+    },
+    {
+      "id": "Invoice",
+      "kind": "object_type",
+      "path": "object_type/Invoice.json"
+    },
+    {
+      "id": "Order",
+      "kind": "object_type",
+      "path": "object_type/Order.json"
+    }
+  ],
+  "object_types": [
+    {
+      "dropped_key_candidates": [],
+      "findings": [],
+      "id": "Account",
+      "key": [
+        "id"
+      ],
+      "key_choice": "first_key_candidate",
+      "record_kind": "Account"
+    },
+    {
+      "dropped_key_candidates": [],
+      "findings": [],
+      "id": "Contact",
+      "key": [
+        "id"
+      ],
+      "key_choice": "first_key_candidate",
+      "record_kind": "Contact"
+    },
+    {
+      "dropped_key_candidates": [],
+      "findings": [],
+      "id": "Invoice",
+      "key": [
+        "id"
+      ],
+      "key_choice": "first_key_candidate",
+      "record_kind": "Invoice"
+    },
+    {
+      "dropped_key_candidates": [],
+      "findings": [
+        {
+          "code": "nullable_reference",
+          "column": "contact_id",
+          "formats": [],
+          "matched": 2,
+          "sampled": 4
+        }
+      ],
+      "id": "Order",
+      "key": [
+        "id"
+      ],
+      "key_choice": "first_key_candidate",
+      "record_kind": "Order"
+    }
+  ],
+  "references": {
+    "dropped": [],
+    "kept": [
+      {
+        "basis": "declared",
+        "cardinality": "many_to_one",
+        "columns": [
+          "account_id"
+        ],
+        "from": "Contact",
+        "link_id": "Contact_account_id_Account",
+        "match_bp": 10000,
+        "required": true,
+        "target_key": [
+          "id"
+        ],
+        "to": "Account"
+      },
+      {
+        "basis": "inferred",
+        "cardinality": "many_to_one",
+        "columns": [
+          "account_id"
+        ],
+        "from": "Order",
+        "link_id": "Order_account_id_Account",
+        "match_bp": 10000,
+        "required": true,
+        "target_key": [
+          "id"
+        ],
+        "to": "Account"
+      },
+      {
+        "basis": "inferred",
+        "cardinality": "many_to_one",
+        "columns": [
+          "contact_id"
+        ],
+        "from": "Order",
+        "link_id": "Order_contact_id_Contact",
+        "match_bp": 10000,
+        "required": false,
+        "target_key": [
+          "id"
+        ],
+        "to": "Contact"
+      }
+    ]
+  },
+  "source": "fake.crm"
+}

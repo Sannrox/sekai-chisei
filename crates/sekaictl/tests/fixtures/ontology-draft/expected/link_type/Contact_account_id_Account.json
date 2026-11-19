@@ -1,0 +1,13 @@
+{
+  "cardinality": "many_to_one",
+  "columns": [
+    "account_id"
+  ],
+  "from": "Contact",
+  "name": "Contact_account_id_Account",
+  "required": true,
+  "target_key": [
+    "id"
+  ],
+  "to": "Account"
+}

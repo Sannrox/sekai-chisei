@@ -1,0 +1,13 @@
+{
+  "cardinality": "many_to_one",
+  "columns": [
+    "contact_id"
+  ],
+  "from": "Order",
+  "name": "Order_contact_id_Contact",
+  "required": false,
+  "target_key": [
+    "id"
+  ],
+  "to": "Contact"
+}

@@ -38,6 +38,7 @@ pub mod model_release_evidence_cli;
 pub mod model_review_cli;
 pub mod models_cli;
 pub mod onboarding;
+pub mod ontology_draft;
 pub mod ontology_export;
 pub mod ontology_import;
 pub mod ontology_inspect;

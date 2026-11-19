@@ -1,0 +1,164 @@
+{
+  "contract_version": "sekai.source-discovery/v1",
+  "source": "fake.crm",
+  "record_kinds": [
+    {
+      "record_kind": "Account",
+      "schema_revision": "v1",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        }
+      ],
+      "key_candidates": [
+        [
+          "id"
+        ]
+      ],
+      "references": [],
+      "value_findings": []
+    },
+    {
+      "record_kind": "Contact",
+      "schema_revision": "v1",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        },
+        {
+          "name": "account_id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        }
+      ],
+      "key_candidates": [
+        [
+          "id"
+        ]
+      ],
+      "references": [
+        {
+          "columns": [
+            "account_id"
+          ],
+          "target_record_kind": "Account",
+          "target_key": [
+            "id"
+          ],
+          "basis": "declared",
+          "evidence": {
+            "sampled": 2,
+            "matched": 2,
+            "null_ratio_bp": 0,
+            "nullable": false
+          }
+        }
+      ],
+      "value_findings": []
+    },
+    {
+      "record_kind": "Invoice",
+      "schema_revision": "v1",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        },
+        {
+          "name": "account_id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        }
+      ],
+      "key_candidates": [
+        [
+          "id"
+        ]
+      ],
+      "references": [],
+      "value_findings": []
+    },
+    {
+      "record_kind": "Order",
+      "schema_revision": "v1",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        },
+        {
+          "name": "account_id",
+          "data_type": "string",
+          "nullable": false,
+          "profile": null
+        },
+        {
+          "name": "contact_id",
+          "data_type": "string",
+          "nullable": true,
+          "profile": null
+        }
+      ],
+      "key_candidates": [
+        [
+          "id"
+        ]
+      ],
+      "references": [
+        {
+          "columns": [
+            "account_id"
+          ],
+          "target_record_kind": "Account",
+          "target_key": [
+            "id"
+          ],
+          "basis": "inferred",
+          "evidence": {
+            "sampled": 4,
+            "matched": 4,
+            "null_ratio_bp": 0,
+            "nullable": false
+          }
+        },
+        {
+          "columns": [
+            "contact_id"
+          ],
+          "target_record_kind": "Contact",
+          "target_key": [
+            "id"
+          ],
+          "basis": "inferred",
+          "evidence": {
+            "sampled": 4,
+            "matched": 2,
+            "null_ratio_bp": 5000,
+            "nullable": true
+          }
+        }
+      ],
+      "value_findings": [
+        {
+          "column": "contact_id",
+          "code": "nullable_reference",
+          "sampled": 4,
+          "matched": 2,
+          "formats": []
+        }
+      ]
+    }
+  ]
+}

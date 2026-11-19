@@ -310,10 +310,8 @@ fn classify_member_change(
 ) -> Result<(), String> {
     let from_value = parse_definition(&from.definition_json)?;
     let to_value = parse_definition(&to.definition_json)?;
-    inspect_value_constructs(&from_value)?;
-    inspect_value_constructs(&to_value)?;
-    let from_required = named_string_set(&from_value, "required")?;
-    let to_required = named_string_set(&to_value, "required")?;
+    inspect_value_constructs(&from_value, &change.member_kind)?;
+    inspect_value_constructs(&to_value, &change.member_kind)?;
     let from_marking = optional_string_field(&from_value, "access_marking")?;
     let to_marking = optional_string_field(&to_value, "access_marking")?;
     let mut classified = false;
@@ -326,44 +324,81 @@ fn classify_member_change(
         ));
         classified = true;
     }
-    for property in &change.added_properties {
-        if to_required.contains(property) {
-            reasons.push(reason(
-                DefinitionCompatibilityClass::Breaking,
-                change,
-                "added_required_property",
-                property,
-            ));
-        } else {
+    if change.member_kind == "link_type" {
+        let from_required = optional_bool(&from_value, "required")?.unwrap_or(false);
+        let to_required = optional_bool(&to_value, "required")?.unwrap_or(false);
+        match (from_required, to_required) {
+            (false, true) => {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Breaking,
+                    change,
+                    "added_required_property",
+                    "required",
+                ));
+                classified = true;
+            }
+            (true, false) => {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    "removed_required_constraint",
+                    "required",
+                ));
+                classified = true;
+            }
+            _ => {}
+        }
+        for property in &change.added_properties {
             reasons.push(reason(
                 DefinitionCompatibilityClass::Compatible,
                 change,
                 "added_optional_property",
                 property,
             ));
-        }
-        classified = true;
-    }
-    for property in to_required.difference(&from_required) {
-        if !change.added_properties.contains(property) {
-            reasons.push(reason(
-                DefinitionCompatibilityClass::Breaking,
-                change,
-                "added_required_property",
-                property,
-            ));
             classified = true;
         }
-    }
-    for property in from_required.difference(&to_required) {
-        if !change.removed_properties.contains(property) {
-            reasons.push(reason(
-                DefinitionCompatibilityClass::Compatible,
-                change,
-                "removed_required_constraint",
-                property,
-            ));
+    } else {
+        let from_required = named_string_set(&from_value, "required")?;
+        let to_required = named_string_set(&to_value, "required")?;
+        for property in &change.added_properties {
+            if to_required.contains(property) {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Breaking,
+                    change,
+                    "added_required_property",
+                    property,
+                ));
+            } else {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    "added_optional_property",
+                    property,
+                ));
+            }
             classified = true;
+        }
+        for property in to_required.difference(&from_required) {
+            if !change.added_properties.contains(property) {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Breaking,
+                    change,
+                    "added_required_property",
+                    property,
+                ));
+                classified = true;
+            }
+        }
+        for property in from_required.difference(&to_required) {
+            if !change.removed_properties.contains(property) {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    "removed_required_constraint",
+                    property,
+                ));
+                classified = true;
+            }
         }
     }
     if from_marking != to_marking {
@@ -409,7 +444,8 @@ fn classify_member_change(
                 ));
                 classified = true;
             }
-            "name" | "mode" => {
+            "name" | "mode" | "key" | "property_types" | "property_markings" | "source"
+            | "from" | "to" | "columns" | "target_key" | "cardinality" => {
                 reasons.push(reason(
                     DefinitionCompatibilityClass::Conditional,
                     change,
@@ -445,7 +481,10 @@ fn inspect_member_constructs(member: &DefinitionMember) -> Result<(), String> {
     if governed_transform_member(member) {
         return Ok(());
     }
-    inspect_value_constructs(&parse_definition(&member.definition_json)?)
+    inspect_value_constructs(
+        &parse_definition(&member.definition_json)?,
+        &member.member_kind,
+    )
 }
 
 fn governed_transform_member(member: &DefinitionMember) -> bool {
@@ -465,15 +504,28 @@ fn governed_transform_member(member: &DefinitionMember) -> bool {
 /// `lint_suppressions` waives its lint findings with a reason (#1684), and
 /// `source_turn` names the conversation turn a drafted member came from
 /// (#1461); changing any of them is compatible and shows in the diff.
+/// `key`, `property_types`, `property_markings` and `source` are the
+/// object-type fields a source draft writes (#2296). `from`, `to`,
+/// `columns`, `target_key` and `cardinality` are the matching link-type
+/// fields. Changing any of them is conditional.
 const KNOWN_DEFINITION_FIELDS: &[&str] = &[
     "access_marking",
+    "cardinality",
+    "columns",
+    "from",
+    "key",
     "lint_suppressions",
     "mode",
     "name",
     "owner",
     "properties",
+    "property_markings",
+    "property_types",
     "required",
+    "source",
     "source_turn",
+    "target_key",
+    "to",
 ];
 
 fn push_unknown_fields(
@@ -504,9 +556,24 @@ fn unknown_definition_fields(value: &Value) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn inspect_value_constructs(value: &Value) -> Result<(), String> {
+fn inspect_value_constructs(value: &Value, member_kind: &str) -> Result<(), String> {
     named_string_set(value, "properties")?;
-    named_string_set(value, "required")?;
+    if member_kind == "link_type" {
+        optional_bool(value, "required")?;
+        optional_string_field(value, "from")?;
+        optional_string_field(value, "to")?;
+        named_string_list(value, "columns")?;
+        named_string_list(value, "target_key")?;
+        optional_enum(value, "cardinality", &["many_to_one", "one_to_one"])?;
+    } else {
+        named_string_set(value, "required")?;
+    }
+    if member_kind == "object_type" {
+        named_string_list(value, "key")?;
+        optional_string_map(value, "property_types")?;
+        optional_string_map(value, "property_markings")?;
+        optional_source_block(value)?;
+    }
     optional_string_field(value, "access_marking")?;
     optional_string_field(value, "owner")?;
     optional_string_field(value, "source_turn")?;
@@ -666,6 +733,106 @@ fn optional_string_field(value: &Value, key: &str) -> Result<Option<String>, Str
             "unknown_definition_construct: {key} must be a string"
         )),
     }
+}
+
+fn optional_bool(value: &Value, key: &str) -> Result<Option<bool>, String> {
+    match value.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(_) => Err(format!(
+            "unknown_definition_construct: {key} must be a boolean"
+        )),
+    }
+}
+
+fn optional_enum(value: &Value, key: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+    let Some(text) = optional_string_field(value, key)? else {
+        return Ok(None);
+    };
+    if allowed.contains(&text.as_str()) {
+        Ok(Some(text))
+    } else {
+        Err(format!(
+            "unknown_definition_construct: {key} must be one of {}",
+            allowed.join(", ")
+        ))
+    }
+}
+
+fn named_string_list(value: &Value, key: &str) -> Result<Vec<String>, String> {
+    let Some(items) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(array) = items.as_array() else {
+        return Err(format!(
+            "unknown_definition_construct: {key} must be an array of strings"
+        ));
+    };
+    let mut names = Vec::with_capacity(array.len());
+    let mut seen = BTreeSet::new();
+    for item in array {
+        let Some(name) = item.as_str() else {
+            return Err(format!(
+                "unknown_definition_construct: {key} must be an array of strings"
+            ));
+        };
+        if !seen.insert(name) {
+            return Err(format!(
+                "unknown_definition_construct: {key} list contains duplicates"
+            ));
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
+fn optional_string_map(value: &Value, key: &str) -> Result<BTreeMap<String, String>, String> {
+    let Some(items) = value.get(key) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(object) = items.as_object() else {
+        return Err(format!(
+            "unknown_definition_construct: {key} must be an object of strings"
+        ));
+    };
+    let mut map = BTreeMap::new();
+    for (name, typed) in object {
+        let Some(text) = typed.as_str() else {
+            return Err(format!(
+                "unknown_definition_construct: {key} must be an object of strings"
+            ));
+        };
+        map.insert(name.clone(), text.to_string());
+    }
+    Ok(map)
+}
+
+fn optional_source_block(value: &Value) -> Result<(), String> {
+    let Some(source) = value.get("source") else {
+        return Ok(());
+    };
+    let Some(object) = source.as_object() else {
+        return Err("unknown_definition_construct: source must be an object".into());
+    };
+    for key in ["source", "record_kind", "schema_revision"] {
+        match object.get(key) {
+            Some(Value::String(_)) => {}
+            _ => {
+                return Err(format!(
+                    "unknown_definition_construct: source.{key} must be a string"
+                ));
+            }
+        }
+    }
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "source" | "record_kind" | "schema_revision"))
+    {
+        return Err(format!(
+            "unknown_definition_construct: source has unknown field {unknown}"
+        ));
+    }
+    Ok(())
 }
 
 fn diff_digest(diff: &DefinitionRevisionDiff) -> Result<String, String> {
@@ -1111,6 +1278,80 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unknown_definition_construct"));
+    }
+
+    #[test]
+    fn a_drafted_object_type_key_change_is_conditional_not_unknown() {
+        let from_ticket = prepared(
+            "object_type",
+            "Account",
+            r#"{"name":"Account","properties":["id"],"key":["id"],"property_types":{"id":"string"},"source":{"source":"fake.crm","record_kind":"Account","schema_revision":"v1"}}"#,
+        );
+        let to_ticket = prepared(
+            "object_type",
+            "Account",
+            r#"{"name":"Account","properties":["id","code"],"key":["code"],"property_types":{"id":"string","code":"text"},"source":{"source":"fake.crm","record_kind":"Account","schema_revision":"v2"}}"#,
+        );
+        let from = revision(std::slice::from_ref(&from_ticket), "");
+        let to = revision(std::slice::from_ref(&to_ticket), "");
+        let report = classify_definition_revision_compatibility(
+            &from,
+            std::slice::from_ref(&from_ticket),
+            &to,
+            std::slice::from_ref(&to_ticket),
+        )
+        .unwrap();
+        assert_eq!(report.class, "conditional");
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "changed_field" && reason.property == "key")
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .all(|reason| reason.class != "unknown"),
+            "{:?}",
+            report.reasons
+        );
+    }
+
+    #[test]
+    fn a_link_type_required_flag_is_boolean_and_raising_it_breaks() {
+        let from_link = prepared(
+            "link_type",
+            "Order_account_id_Account",
+            r#"{"name":"Order_account_id_Account","from":"Order","to":"Account","columns":["account_id"],"target_key":["id"],"cardinality":"many_to_one","required":false}"#,
+        );
+        let to_link = prepared(
+            "link_type",
+            "Order_account_id_Account",
+            r#"{"name":"Order_account_id_Account","from":"Order","to":"Account","columns":["account_id"],"target_key":["id"],"cardinality":"one_to_one","required":true}"#,
+        );
+        let from = revision(std::slice::from_ref(&from_link), "");
+        let to = revision(std::slice::from_ref(&to_link), "");
+        let report = classify_definition_revision_compatibility(
+            &from,
+            std::slice::from_ref(&from_link),
+            &to,
+            std::slice::from_ref(&to_link),
+        )
+        .unwrap();
+        assert_eq!(report.class, "breaking");
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "added_required_property")
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "changed_field" && reason.property == "cardinality")
+        );
     }
 
     #[test]

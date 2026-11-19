@@ -26,6 +26,7 @@
 //! absence of a finding says nothing about the rest of the column.
 
 use crate::contract::{MAX_SOURCE_IDENTIFIER_BYTES, contains_secret_like_text};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SOURCE_DISCOVERY_VERSION: &str = "sekai.source-discovery/v1";
@@ -123,22 +124,23 @@ pub fn cap_discovery_sample(sample: DiscoverySample) -> DiscoverySample {
 }
 
 /// Optional per-column hints computed by the connector, never by the plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnProfileHint {
     pub distinct_ratio_bp: u16,
     pub null_ratio_bp: u16,
     pub possibly_sensitive: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredColumn {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
+    #[serde(default)]
     pub profile: Option<ColumnProfileHint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredRecordKind {
     pub record_kind: String,
     /// The source's own schema revision; a change is declared drift.
@@ -150,15 +152,18 @@ pub struct DiscoveredRecordKind {
     pub key_candidates: Vec<Vec<String>>,
     /// Reference candidates, ordered by columns then target. Empty until
     /// [`attach_references`] runs; older consumers ignore it.
+    #[serde(default)]
     pub references: Vec<ReferenceCandidate>,
     /// Value-shape findings, ordered by column then code. Empty until
     /// [`attach_value_findings`] runs; older consumers ignore it.
+    #[serde(default)]
     pub value_findings: Vec<ValueShapeFinding>,
 }
 
 /// What a sampled column looks like. The strings from [`Self::as_str`] are
 /// stable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ValueShapeCode {
     MixedTemporalFormat,
@@ -184,7 +189,7 @@ impl ValueShapeCode {
 
 /// One hint about a column, from the bounded sample. Counts and format names
 /// only; `sampled` says how many rows it saw.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValueShapeFinding {
     pub column: String,
     pub code: ValueShapeCode,
@@ -194,11 +199,13 @@ pub struct ValueShapeFinding {
     /// that collapse, or rows with a missing value.
     pub matched: u32,
     /// Temporal format names, in ascending order; empty for other codes.
+    #[serde(with = "formats_serde")]
     pub formats: Vec<&'static str>,
 }
 
 /// Why a reference candidate is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ReferenceBasis {
     /// The source declares the reference.
@@ -208,7 +215,7 @@ pub enum ReferenceBasis {
 }
 
 /// Counts from the bounded sample behind a candidate. No values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceEvidence {
     /// Sampled rows of the referencing record kind.
     pub sampled: u32,
@@ -222,7 +229,7 @@ pub struct ReferenceEvidence {
 
 /// Columns of one record kind that point at a key candidate of another (or
 /// the same) record kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReferenceCandidate {
     pub columns: Vec<String>,
     pub target_record_kind: String,
@@ -232,7 +239,7 @@ pub struct ReferenceCandidate {
     pub evidence: Option<ReferenceEvidence>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceDiscovery {
     pub contract_version: String,
     pub source: String,
@@ -578,6 +585,48 @@ fn column_findings(
             missing,
             Vec::new(),
         ));
+    }
+}
+
+const TEMPORAL_FORMAT_NAMES: &[&str] = &[
+    "iso_date",
+    "dotted_date",
+    "slash_date",
+    "time",
+    "iso_datetime",
+];
+
+/// Wire form of [`ValueShapeFinding::formats`]: [`TEMPORAL_FORMAT_NAMES`].
+/// Unknown names fail closed so a stored discovery cannot invent a format
+/// the drafter would not understand.
+mod formats_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const KNOWN: &[&str] = super::TEMPORAL_FORMAT_NAMES;
+
+    pub(super) fn serialize<S: Serializer>(
+        formats: &[&'static str],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(formats.iter().copied())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<&'static str>, D::Error> {
+        let names = Vec::<String>::deserialize(deserializer)?;
+        names
+            .into_iter()
+            .map(|name| {
+                KNOWN
+                    .iter()
+                    .copied()
+                    .find(|known| *known == name)
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(format!("unknown value-shape format {name}"))
+                    })
+            })
+            .collect()
     }
 }
 
@@ -1250,6 +1299,23 @@ mod tests {
         ] {
             assert!(!output.contains(value), "{value} leaked into the discovery");
         }
+    }
+
+    #[test]
+    fn a_discovery_round_trips_through_the_v1_json_contract() {
+        let mut source = Crm {
+            declares: true,
+            samples: true,
+        };
+        let mut discovery = source.discover().unwrap();
+        attach_references(&mut source, &mut discovery).unwrap();
+        attach_value_findings(&mut source, &mut discovery).unwrap();
+        let json = serde_json::to_string(&discovery).unwrap();
+        let loaded: SourceDiscovery = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, discovery);
+        assert!(json.contains("\"contract_version\":\"sekai.source-discovery/v1\""));
+        assert!(json.contains("\"basis\":\"declared\""));
+        assert!(json.contains("\"code\":\"nullable_reference\""));
     }
 
     #[test]

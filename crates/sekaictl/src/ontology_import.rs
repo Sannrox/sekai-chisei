@@ -89,7 +89,11 @@ pub fn read_tree(dir: &Path) -> Result<Vec<TreeMember>, String> {
     let mut members = Vec::new();
     for kind_entry in read_dir_sorted(dir)? {
         let kind_segment = file_name(&kind_entry)?;
-        if kind_segment == "layout.json" || kind_segment == "markings" {
+        if kind_segment == "layout.json"
+            || kind_segment == "markings"
+            || kind_segment == "draft-report.json"
+            || kind_segment == "draft-decisions.json"
+        {
             continue;
         }
         // Links are refused, so a tree never makes import read a file
@@ -363,6 +367,18 @@ mod tests {
                 .unwrap_err()
                 .contains("not a definition kind")
         );
+    }
+
+    #[test]
+    fn draft_sidecar_files_are_not_definition_members() {
+        let members = [published("object_type", "a", r#"{"name":"a"}"#)];
+        let dir = written(&members);
+        std::fs::write(dir.path().join("draft-report.json"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("draft-decisions.json"), "{}\n").unwrap();
+        let tree = read_tree(dir.path()).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, "a");
+        assert_eq!(plan_members(&tree, &members).unwrap(), None);
     }
 
     #[test]
