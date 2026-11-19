@@ -110,6 +110,18 @@ fn exercise(db: &RuntimeDb, namespace: &str, subject_identity: &str) -> String {
     first.manifest_digest
 }
 
+/// Restart checks shared by both backends: a reopened store returns the
+/// manifest and replays the first request with its original digest.
+fn assert_reloaded(db: &RuntimeDb, namespace: &str, digest: &str) {
+    let manifest = db.get_evaluation_manifest(digest).unwrap().unwrap();
+    let replay = db
+        .get_evaluation_manifest_for_request(namespace, "operator", "resolve-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay.request_digest, "request-digest-1");
+    assert_eq!(replay.manifest, manifest);
+}
+
 #[test]
 fn sqlite_evaluation_manifest_conformance_and_restart() {
     let path = std::env::temp_dir().join(format!(
@@ -126,18 +138,7 @@ fn sqlite_evaluation_manifest_conformance_and_restart() {
     let restarted = RuntimeDb::Sqlite(Arc::new(
         sekai_chisei::chisei_store::open_sekai_with_chisei_schema(&path),
     ));
-    assert!(
-        restarted
-            .get_evaluation_manifest(&digest)
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        restarted
-            .get_evaluation_manifest_for_request("sqlite-manifest", "operator", "resolve-1",)
-            .unwrap()
-            .is_some()
-    );
+    assert_reloaded(&restarted, "sqlite-manifest", &digest);
     std::fs::remove_file(path).ok();
 }
 
@@ -161,10 +162,5 @@ fn postgres_evaluation_manifest_conformance_and_restart() {
     let namespace = format!("pg-manifest-{suffix}");
     let subject_identity = format!("document:{suffix}");
     let digest = exercise(&postgres(), &namespace, &subject_identity);
-    assert!(
-        postgres()
-            .get_evaluation_manifest(&digest)
-            .unwrap()
-            .is_some()
-    );
+    assert_reloaded(&postgres(), &namespace, &digest);
 }
