@@ -549,6 +549,7 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
             definition_digest: String::new(),
             analytical: None,
             isolated_process: Some(IsolatedProcessSpec {
+                llm_step: None,
                 engine: "python".into(),
                 runtime_image: "runner:1".into(),
                 inputs: Vec::new(),

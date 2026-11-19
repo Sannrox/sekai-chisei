@@ -404,6 +404,44 @@ model under that name and writes the rows it returns. The transform is
 scheduled like any other with `--every-ms`. Binding refuses a missing version
 and a model with more than one input table.
 
+## Model steps
+
+An isolated-process definition with engine `llm-rows` runs one model call
+per input row (#3025). Its `code` is a prompt template: `{column}` takes the
+row's value, and `{{` and `}}` are literal braces. `llm_step` names the
+`model`, the `output_column` each output row carries the reply in, and the
+`output_type` the reply must parse as: `string`, `integer`, `number` or
+`boolean`. Parsing is strict. The reply, trimmed of surrounding whitespace,
+must be exactly a value of the type. The definition takes one input. Put
+refuses a step on any other engine, an `llm-rows` definition without one, and
+a template that does not parse. The plane adds the placement label
+`sekai.step.llm=v1` to `requires`.
+
+- **Egress.** The connector runtime runs the step when it is given a gateway
+  route: `gateway_url` in its configuration and the gateway key in
+  `CHISEI_GATEWAY_KEY`. It then registers the label. Every call goes to the
+  gateway's compatible chat surface as that gateway principal, with the run
+  id as `x-chisei-operation-id`. The gateway's own policy (routes, quotas,
+  egress) decides each call, and its admission record names the run
+  (ADR 0152). The runtime holds no provider key.
+- **Refusals before any call.** Every prompt is rendered before the first
+  call. A row missing a column fails the run `llm_step_invalid`. A runtime
+  offered the work with no route fails it `no_gateway_route`.
+- **Typed output.** A reply that does not parse quarantines the run with
+  `llm_output_type: row <row id>: <column> is not <type>`. The plane checks
+  the rows a runtime writes the same way and quarantines a run whose output
+  column is not the type's canonical form, naming the output row.
+- **Gateway failures.** A refused call (4xx) fails the run
+  `gateway_refused`. An unreachable gateway or a failed call fails it
+  `gateway_unavailable`. A plane read error writes nothing, so the lease
+  lapses and the run is claimed again.
+- **Preview.** `PreviewGovernedTransform` runs the step on the sampled rows
+  through the same claim queue (ADR 0110). The calls go through the gateway
+  like a run's.
+
+Output datasets are unpartitioned: the runtime digests its output rows as
+one set.
+
 ## Operator path
 
 ```bash

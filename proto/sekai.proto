@@ -1062,6 +1062,24 @@ message GovernedTransform {
   // the transaction that commits its output; a quarantined or failed run
   // publishes none. Part of definition_digest when non-empty.
   repeated string model_outputs = 22;
+  // Experimental (#3025). The row-wise model step of an `llm-rows` engine;
+  // `code` is its prompt template, `{column}` taking each row's value and
+  // `{{`/`}}` literal braces. Required for that engine and refused for any
+  // other. Adds the `sekai.step.llm=v1` placement label, so only a runtime
+  // holding a gateway route claims the work. Part of definition_digest when
+  // set.
+  TransformLlmStep llm_step = 23;
+}
+// A row-wise model step (#3025). The runtime makes one call per input row
+// through the model egress gateway and writes the row with the reply in
+// output_column. A reply that is not a canonical value of output_type
+// (`string`, `integer`, `number` or `boolean`) quarantines the run with an
+// `llm_output_type` reason naming the row; the plane checks written rows
+// the same way.
+message TransformLlmStep {
+  string model = 1;
+  string output_column = 2;
+  string output_type = 3;
 }
 // A model version a transform scores with (#3074).
 message TransformModelInput {

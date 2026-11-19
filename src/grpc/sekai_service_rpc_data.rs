@@ -5110,6 +5110,15 @@ fn to_proto_transform(
             .iter()
             .flat_map(|spec| spec.model_outputs.iter().cloned())
             .collect(),
+        llm_step: transform
+            .isolated_process
+            .as_ref()
+            .and_then(|spec| spec.llm_step.as_ref())
+            .map(|step| TransformLlmStep {
+                model: step.model.clone(),
+                output_column: step.output_column.clone(),
+                output_type: step.output_type.as_str().into(),
+            }),
     }
 }
 
@@ -5178,6 +5187,11 @@ fn from_proto_isolated(
                 "model_outputs apply only to the isolated_process profile",
             ));
         }
+        if proto.llm_step.is_some() {
+            return Err(Status::invalid_argument(
+                "llm_step applies only to the isolated_process profile",
+            ));
+        }
         return Ok(None);
     }
     // The engine needs something to run (#1605).
@@ -5206,8 +5220,29 @@ fn from_proto_isolated(
             code: proto.code.clone(),
             model_inputs: model_inputs_from_proto(&proto.model_inputs)?,
             model_outputs: model_outputs_from_proto(&proto.model_outputs)?,
+            llm_step: proto
+                .llm_step
+                .as_ref()
+                .map(llm_step_from_proto)
+                .transpose()?,
         },
     ))
+}
+
+/// A model step with a known output type; an unknown type is refused.
+fn llm_step_from_proto(
+    step: &TransformLlmStep,
+) -> Result<sekai_types::transform_llm_step::LlmRowStep, Status> {
+    use sekai_types::transform_llm_step::{LlmOutputType, LlmRowStep};
+    Ok(LlmRowStep {
+        model: step.model.clone(),
+        output_column: step.output_column.clone(),
+        output_type: LlmOutputType::parse_name(&step.output_type).ok_or_else(|| {
+            Status::invalid_argument(
+                "llm_step.output_type must be string, integer, number or boolean",
+            )
+        })?,
+    })
 }
 
 /// Model output names; a repeated name is refused rather than collapsed.

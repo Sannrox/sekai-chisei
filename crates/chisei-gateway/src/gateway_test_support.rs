@@ -16,6 +16,7 @@ use axum::http::HeaderName;
 use super::{GatewayConfig, GatewayRuntime, ResilienceConfig};
 use crate::llm::HttpTimeouts;
 
+pub const POLICY_FORMAT: &str = super::POLICY_FORMAT;
 pub const DEFAULT_GATEWAY_TIER: &str = super::DEFAULT_GATEWAY_TIER;
 pub const DEFAULT_KEY_CACHE_TTL: Duration = Duration::from_secs(super::DEFAULT_KEY_CACHE_TTL_SECS);
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = super::DEFAULT_MAX_REQUEST_BYTES;
@@ -58,6 +59,18 @@ impl TestRuntime {
 
     pub fn with_recovery_spool_path(self, path: PathBuf) -> Self {
         Self(self.0.with_recovery_spool_path(Some(path)))
+    }
+
+    /// Serve in policy mode from the policy file at `policy_path`, with the
+    /// egress log in `log_dir`.
+    pub fn with_policy(
+        mut self,
+        policy_path: PathBuf,
+        log_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        self.0.policy = Some(super::PolicyStore::open(policy_path));
+        self.0.egress_log = Some(super::EgressLog::open(log_dir)?);
+        Ok(self)
     }
 
     /// Accept `token` on the admin refresh route.

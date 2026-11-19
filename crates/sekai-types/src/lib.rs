@@ -39,6 +39,7 @@ pub mod sekai_principal;
 pub mod service_principal;
 pub mod system_one_bind;
 pub mod transform_chain;
+pub mod transform_llm_step;
 pub mod transform_replay;
 pub mod transform_shadow;
 pub mod transform_sql;

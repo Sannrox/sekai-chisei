@@ -64,6 +64,14 @@ pub enum Ran {
     /// redeem; nothing was acknowledged. The next holder cannot redeem a
     /// permit this one redeemed, so it records `outcome_unknown`.
     EffectLost { effect_id: String },
+    /// A model step run ([`crate::llm_rows`]) written back, or ended with
+    /// `Err` naming why: a failure reason code or a quarantine reason.
+    Transformed {
+        run_id: String,
+        outcome: Result<(), String>,
+    },
+    /// The model step's claim was lost; nothing was written.
+    TransformLost { run_id: String },
 }
 
 /// One connector runtime, serving a fixed set of namespaces.
@@ -72,6 +80,7 @@ pub struct Runtime {
     pub(crate) options: RuntimeOptions,
     pub(crate) bindings: CredentialBindings,
     pub(crate) connectors: Connectors,
+    pub(crate) gateway: Option<crate::llm_rows::GatewayRoute>,
 }
 
 impl Runtime {
@@ -93,6 +102,7 @@ impl Runtime {
             options,
             bindings,
             connectors,
+            gateway: None,
         })
     }
 
@@ -218,7 +228,8 @@ impl Runtime {
 
     /// One pass: claims and runs every due Source sync, then every
     /// deliverable artifact and every pending external effect of a Source
-    /// this runtime can run, in each namespace in turn.
+    /// this runtime can run, then every model step run it may claim, in each
+    /// namespace in turn.
     pub async fn pass(&self) -> Result<Vec<Ran>, RuntimeClaimError> {
         let mut ran = Vec::new();
         for index in 0..self.clients.len() {
@@ -230,6 +241,9 @@ impl Runtime {
             }
             while let Some(work) = self.claim_effect(index).await? {
                 ran.push(self.apply(index, work).await?);
+            }
+            while let Some(work) = self.claim_llm_rows(index).await? {
+                ran.push(self.run_llm_rows(index, work).await?);
             }
         }
         Ok(ran)

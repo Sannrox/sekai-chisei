@@ -2932,6 +2932,7 @@ dependencies = [
  "reqwest 0.12.28",
  "sekai-client",
  "sekai-source-sdk",
+ "sekai-types",
  "serde",
  "serde_json",
  "sha2 0.10.9",
