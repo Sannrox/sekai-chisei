@@ -123,10 +123,12 @@ pub fn append_rows_tx(
     if rows.is_empty() {
         return Ok((0, 0));
     }
+    // Row ids come from one table-wide sequence, so the range starts after the
+    // table's highest id. SQLite has one writer, so every id above it is ours.
     let before: i64 = tx
         .query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows WHERE dataset_id = ?1",
-            params![dataset_id],
+            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows",
+            [],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
@@ -1471,6 +1473,51 @@ mod tests {
 
     fn setup() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
+    }
+
+    #[test]
+    fn interleaved_appends_return_only_their_own_row_ids() {
+        let db = setup();
+        for id in ["a", "b"] {
+            db.create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: Vec::new(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        let rows = |n: usize| vec![HashMap::from([("v".to_string(), "1".to_string())]); n];
+        let append = |dataset: &str, n: usize| {
+            let mut conn = db.conn();
+            let tx = conn.transaction().unwrap();
+            let range = append_rows_tx(&tx, dataset, &rows(n)).unwrap();
+            tx.commit().unwrap();
+            range
+        };
+        let ids_in = |dataset: &str, (from, to): (i64, i64)| -> Vec<String> {
+            db.conn()
+                .prepare("SELECT dataset_id FROM sekai_dataset_rows WHERE id BETWEEN ?1 AND ?2")
+                .unwrap()
+                .query_map(params![from, to], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|owner: &String| owner != dataset)
+                .collect()
+        };
+
+        let first_a = append("a", 2);
+        let first_b = append("b", 3);
+        let second_a = append("a", 2);
+
+        assert_eq!(first_a, (1, 2));
+        assert_eq!(first_b, (3, 5));
+        assert_eq!(second_a, (6, 7));
+        for (dataset, range) in [("a", first_a), ("b", first_b), ("a", second_a)] {
+            assert!(ids_in(dataset, range).is_empty(), "{dataset} {range:?}");
+        }
     }
 
     #[test]

@@ -751,13 +751,6 @@ pub(crate) fn append_dataset_rows_tx(
         return Ok((0, 0));
     }
     lock_dataset_rows(tx, dataset_id)?;
-    let before: i64 = tx
-        .query_one(
-            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows WHERE dataset_id=$1",
-            &[&dataset_id],
-        )
-        .map_err(|error| error.to_string())?
-        .get(0);
     let keys_json: Option<String> = tx
         .query_opt(
             "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
@@ -769,24 +762,27 @@ pub(crate) fn append_dataset_rows_tx(
         return Err("dataset not found".into());
     };
     let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
+    // The range is the first and last id these inserts took from the
+    // table-wide identity, not this dataset's previous maximum, which other
+    // datasets' rows may have passed since. The lock is per dataset, so an
+    // append to another dataset running at the same moment can still take ids
+    // inside this range.
+    let (mut first, mut last) = (i64::MAX, 0i64);
     for row in rows {
         let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
         let partition_key = crate::sekai::governed_transform::partition_value(&keys, row);
-        tx.execute(
-            "INSERT INTO sekai_dataset_rows (dataset_id,data,partition_key) VALUES ($1,$2,$3)",
-            &[&dataset_id, &data, &partition_key],
-        )
-        .map_err(|error| error.to_string())?;
+        let id: i64 = tx
+            .query_one(
+                "INSERT INTO sekai_dataset_rows (dataset_id,data,partition_key) VALUES ($1,$2,$3) RETURNING id",
+                &[&dataset_id, &data, &partition_key],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        first = first.min(id);
+        last = last.max(id);
     }
     snapshot_dataset_version_pg(tx, dataset_id, "", "", "", "", dataset_version::now_ms())?;
-    let after: i64 = tx
-        .query_one(
-            "SELECT COALESCE(MAX(id), 0) FROM sekai_dataset_rows WHERE dataset_id=$1",
-            &[&dataset_id],
-        )
-        .map_err(|error| error.to_string())?
-        .get(0);
-    Ok((before + 1, after))
+    Ok((first, last))
 }
 
 fn encode_columns(columns: &[ColumnDef]) -> Result<String, String> {
@@ -1144,4 +1140,61 @@ fn redact_dataset_version_rows_pg(
         .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::postgres::ScratchDatabase;
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_interleaved_appends_return_only_their_own_row_ids() {
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        for id in ["a", "b"] {
+            db.create_dataset(&Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: Vec::new(),
+                object_id: String::new(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        let rows = |n: usize| vec![HashMap::from([("v".to_string(), "1".to_string())]); n];
+        let append = |dataset: &str, n: usize| {
+            let mut connection = db.connection().unwrap();
+            let mut tx = connection.transaction().unwrap();
+            let range = append_dataset_rows_tx(&mut tx, dataset, &rows(n)).unwrap();
+            tx.commit().unwrap();
+            range
+        };
+        let owners_in = |(from, to): (i64, i64)| -> Vec<String> {
+            db.connection()
+                .unwrap()
+                .query(
+                    "SELECT DISTINCT dataset_id FROM sekai_dataset_rows WHERE id BETWEEN $1 AND $2",
+                    &[&from, &to],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+
+        let first_a = append("a", 2);
+        let first_b = append("b", 3);
+        let second_a = append("a", 2);
+
+        for (dataset, range, len) in [("a", first_a, 2), ("b", first_b, 3), ("a", second_a, 2)] {
+            assert_eq!(range.1 - range.0 + 1, len, "{dataset} {range:?}");
+            assert_eq!(
+                owners_in(range),
+                vec![dataset.to_string()],
+                "{dataset} {range:?}"
+            );
+        }
+    }
 }
