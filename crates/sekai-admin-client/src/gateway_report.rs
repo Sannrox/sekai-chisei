@@ -235,45 +235,44 @@ pub fn render_egress_html(rows: &[Row]) -> String {
     render_dashboard(rows, since)
 }
 
+/// Renders egress rows as CSV with one column per value key, sorted by name.
+/// Header names and values both go through [`csv_cell`].
 pub fn render_egress_csv(rows: &[Row]) -> String {
-    let mut columns = std::collections::BTreeSet::new();
-    for row in rows {
-        for key in row.values.keys() {
-            columns.insert(key.clone());
-        }
-    }
-    let ordered: Vec<_> = columns
-        .into_iter()
+    let columns: BTreeSet<&str> = rows
+        .iter()
+        .flat_map(|row| row.values.keys().map(String::as_str))
         .filter(|name| !name.is_empty())
         .collect();
 
     let mut out = String::new();
-    out.push_str(&ordered.join(","));
-    if !ordered.is_empty() {
+    if !columns.is_empty() {
+        let header: Vec<_> = columns.iter().map(|name| csv_cell(name)).collect();
+        out.push_str(&header.join(","));
         out.push('\n');
     }
 
     for row in rows {
-        for (index, column) in ordered.iter().enumerate() {
-            if index > 0 {
-                out.push(',');
-            }
-            let value = row
-                .values
-                .get(column)
-                .map(|value| value.as_str())
-                .unwrap_or("");
-            /*
-            let escaped = value.replace('"', "\\"\"");
-            */
-            let escaped = value.replace('"', "\"\"");
-            out.push('"');
-            out.push_str(&escaped);
-            out.push('"');
-        }
+        let cells: Vec<_> = columns
+            .iter()
+            .map(|column| csv_cell(row.values.get(*column).map_or("", String::as_str)))
+            .collect();
+        out.push_str(&cells.join(","));
         out.push('\n');
     }
     out
+}
+
+/// Quotes one CSV cell. A cell that a spreadsheet would read as a formula
+/// (leading `=`, `+`, `-`, `@`, tab or carriage return) gets a leading
+/// apostrophe so it opens as text. A value that already starts with an
+/// apostrophe gets one too, so a reader strips exactly one to recover it.
+fn csv_cell(value: &str) -> String {
+    let guard = if value.starts_with(['=', '+', '-', '@', '\t', '\r', '\'']) {
+        "'"
+    } else {
+        ""
+    };
+    format!("\"{guard}{}\"", value.replace('"', "\"\""))
 }
 
 pub fn summarize_rows(rows: Vec<Row>, group_by: ReportGroupBy) -> Vec<GatewayReportRow> {
@@ -981,6 +980,16 @@ mod tests {
                     .into_iter()
                     .map(|(key, value)| (key.to_string(), value.to_string())),
             ),
+        }
+    }
+
+    #[test]
+    fn egress_csv_quotes_hostile_headers_and_neutralizes_formula_cells() {
+        let csv = render_egress_csv(&[row([("a,\"b\"\nc", "=SUM(A1)"), ("plain", "ok")])]);
+        assert_eq!(csv, "\"a,\"\"b\"\"\nc\",\"plain\"\n\"'=SUM(A1)\",\"ok\"\n");
+        for lead in ["+", "-", "@", "\t", "\r", "'"] {
+            let value = format!("{lead}x");
+            assert_eq!(csv_cell(&value), format!("\"'{value}\""));
         }
     }
 
