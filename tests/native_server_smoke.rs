@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -178,7 +177,6 @@ struct NativeServer {
     #[allow(dead_code)]
     dir: tempfile::TempDir,
     socket: PathBuf,
-    grpc_port: u16,
     log_path: PathBuf,
 }
 
@@ -197,17 +195,18 @@ impl NativeServer {
         let socket = dir.path().join("sekai.sock");
         let db_path = dir.path().join("sekai.db");
         let log_path = dir.path().join("sekai.log");
-        let grpc_port = free_tcp_port();
         let log = std::fs::File::create(&log_path).expect("server log");
         let mut command = Command::new(env!("CARGO_BIN_EXE_sekai-chisei"));
         command
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", &db_path)
             .env("CHISEI_DB_PATH", dir.path().join("chisei.db"))
-            .env("GRPC_PORT", grpc_port.to_string())
+            // These tests talk over the Unix socket. Port 0 means a TCP bind,
+            // if one ever happened, could not collide with another process.
+            .env("GRPC_PORT", "0")
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
-            .env("RUST_LOG", "error")
+            .env("RUST_LOG", "error,sekai_chisei::grpc=info")
             .env("LLM_HTTP_CONNECT_TIMEOUT_SECS", "2")
             .env("LLM_HTTP_READ_TIMEOUT_SECS", "5")
             .env("LLM_HTTP_REQUEST_TIMEOUT_SECS", "5")
@@ -240,7 +239,6 @@ impl NativeServer {
             child,
             dir,
             socket,
-            grpc_port,
             log_path,
         };
         server.wait_until_ready();
@@ -457,22 +455,6 @@ impl Drop for NativeServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_tcp_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .expect("ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
-fn tcp_open(port: u16) -> bool {
-    TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(200),
-    )
-    .is_ok()
 }
 
 fn assert_success(output: &Output, label: &str, logs: &str) {
@@ -1814,12 +1796,17 @@ async fn spawned_binary_rotates_and_revokes_credential() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn spawned_binary_keeps_tcp_closed_without_insecure() {
-    let server = NativeServer::spawn();
-    assert!(
-        !tcp_open(server.grpc_port),
-        "TCP 127.0.0.1:{} should stay closed without SEKAI_INSECURE or a durable credential\n{}",
-        server.grpc_port,
-        server.logs()
+    let mut server = NativeServer::spawn();
+    // The UDS and TCP listeners share one `select!`, and a TCP listener binds
+    // and logs on its first poll. Serving an RPC over UDS takes later polls,
+    // so after it returns a TCP listener would have logged its address.
+    let listed = server.sekaictl(&["admin", "access", "credential", "list"]);
+    assert_success(&listed, "credential list", &server.logs());
+    let logs = crate::bound_port::read_log(&server.log_path);
+    assert_eq!(
+        crate::bound_port::logged_port(&logs, crate::bound_port::GRPC_LISTENING),
+        None,
+        "TCP should stay closed without SEKAI_INSECURE or a durable credential\n{logs}"
     );
 }
 

@@ -1687,7 +1687,7 @@ where
     H::Future: Send + 'static,
 {
     let maybe_tls = tls_policy(bind_addr, config).map_err(std::io::Error::other)?;
-    let addr = format!("{}:{}", bind_addr, port).parse()?;
+    let addr: std::net::SocketAddr = format!("{}:{}", bind_addr, port).parse()?;
 
     let mut server = Server::builder().layer(MetricsLayer);
     if let Some((cert, key)) = maybe_tls {
@@ -1699,7 +1699,12 @@ where
             nonempty_tls_path(client_ca.as_deref()),
         )?)?;
     }
-    tracing::info!(addr = %addr, "gRPC server listening");
+    // Bind after TLS loads, so bad TLS material exits before any listener
+    // exists, and before serving, so the log carries the bound address; with
+    // port 0 that is the only way a caller learns which port the kernel picked.
+    let incoming = tonic::transport::server::TcpIncoming::bind(addr)?.with_nodelay(Some(true));
+    let bound = incoming.local_addr()?;
+    tracing::info!(addr = %bound, "gRPC server listening");
 
     server
         .add_service(health_service)
@@ -1726,7 +1731,7 @@ where
                 with_restore_fence(stores, with_plane(plane, ProcessPlane::Chisei, interceptor)),
             ),
         ))
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await
         .map_err(Into::into)
 }

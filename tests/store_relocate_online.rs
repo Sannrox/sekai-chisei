@@ -151,7 +151,8 @@ fn boot_split_server(dir: &Path, sekai: &Path, chisei: &Path) {
         .env("SEKAI_SOCKET", &socket)
         .env("SEKAI_DB_PATH", sekai)
         .env("CHISEI_DB_PATH", chisei)
-        .env("GRPC_PORT", free_tcp_port().to_string())
+        // UDS-only; port 0 keeps an unused TCP bind from colliding.
+        .env("GRPC_PORT", "0")
         .env("OPS_PORT", "")
         .env("OPS_BIND", "127.0.0.1")
         .env("RUST_LOG", "error")
@@ -192,12 +193,4 @@ fn boot_split_server(dir: &Path, sekai: &Path, chisei: &Path) {
             std::fs::read_to_string(&log_path).unwrap_or_default()
         );
     }
-}
-
-fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }

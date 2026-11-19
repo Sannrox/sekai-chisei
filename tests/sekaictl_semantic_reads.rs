@@ -29,7 +29,8 @@ impl Running {
             .env("SEKAI_SOCKET", &socket)
             .env("SEKAI_DB_PATH", dir.path().join("sekai.db"))
             .env("CHISEI_DB_PATH", dir.path().join("chisei.db"))
-            .env("GRPC_PORT", free_tcp_port().to_string())
+            // UDS-only; port 0 keeps an unused TCP bind from colliding.
+            .env("GRPC_PORT", "0")
             .env("OPS_PORT", "")
             .env("OPS_BIND", "127.0.0.1")
             .env("RUST_LOG", "error")
@@ -105,14 +106,6 @@ impl Drop for Running {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn free_tcp_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
 }
 
 fn fixture(relative: &str) -> String {
