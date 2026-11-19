@@ -86,9 +86,10 @@ impl DeliverableExportArtifact {
 }
 
 impl ArtifactMeta {
-    /// What the artifact's state means for its claim.
+    /// What the artifact's state means for its claim. The artifact closes at
+    /// its expiry instant, where a capped lease would already be zero.
     pub fn hold(&self, now_ms: i64) -> Hold {
-        if self.acked_at_ms.is_some() || self.expires_at_ms < now_ms {
+        if self.acked_at_ms.is_some() || self.expires_at_ms <= now_ms {
             Hold::Closed
         } else if self.claim.owner.is_empty() {
             Hold::Open
@@ -447,6 +448,17 @@ pub(crate) mod tests {
         assert_eq!(
             claim_next(db, &ns, "runtime-b", 1_000, expires_at_ms + 1, |_, _| true),
             Err(DeliveryError::Unavailable)
+        );
+
+        // One millisecond before expiry grants a one-millisecond lease; at
+        // the expiry instant the artifact is closed and grants nothing.
+        let edge = completed_artifact_at(db, &ns, OPENED_AT_MS + 1);
+        let edge_expiry = OPENED_AT_MS + 1 + ARTIFACT_RETENTION_MS;
+        let last = claim(db, &edge, "runtime-c", 1_000, edge_expiry - 1).unwrap();
+        assert_eq!(last.claim.expires_at_ms, edge_expiry);
+        assert_eq!(
+            claim(db, &edge, "runtime-d", 1_000, edge_expiry).unwrap_err(),
+            DeliveryError::Claim(ClaimError::Closed)
         );
     }
 
