@@ -1371,10 +1371,12 @@ pub fn run_for_plane(
         credential_store,
         assertion_authority,
         (sekai_svc, chisei_svc),
+        gateway_logs,
     ) = (|| -> Result<_, std::io::Error> {
         stores
             .validate_required_surfaces()
             .map_err(std::io::Error::other)?;
+        let gateway_logs = gateway_log_sources(plane).map_err(std::io::Error::other)?;
         let db = match plane {
             ProcessPlane::Chisei => stores.chisei_runtime(),
             ProcessPlane::Combined | ProcessPlane::Sekai => stores.sekai_runtime(),
@@ -1406,6 +1408,7 @@ pub fn run_for_plane(
             credential_store,
             assertion_authority,
             services,
+            gateway_logs,
         ))
     })()?;
 
@@ -1477,6 +1480,12 @@ pub fn run_for_plane(
         }
 
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
+        crate::composition::gateway_log_reader::spawn(
+            gateway_logs,
+            stores.handles().1,
+            stores.sekai_runtime(),
+            health_reporter.clone(),
+        );
         spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
 
         if let Some(socket_path) = config.sekai_socket.clone() {
@@ -1893,6 +1902,23 @@ fn hosted_embedding_route(
             .map_err(|status| EmbeddingError::Refused(status.message().to_string()));
         Box::pin(async move { admitted })
     })
+}
+
+/// The gateways whose egress logs this process reads. The receipt, row and
+/// decision writes need both stores, so only a combined process reads them.
+fn gateway_log_sources(
+    plane: ProcessPlane,
+) -> Result<Vec<crate::composition::gateway_log_reader::GatewayLogSource>, String> {
+    let sources = crate::composition::gateway_log_reader::sources_from_env()?;
+    if !sources.is_empty() && plane != ProcessPlane::Combined {
+        return Err(format!(
+            "{} is set, but reading gateway logs needs both stores; run the combined server \
+             (sekai-chisei) instead of the {} plane",
+            crate::composition::gateway_log_reader::GATEWAY_LOGS_ENV,
+            plane.as_str()
+        ));
+    }
+    Ok(sources)
 }
 
 fn spawn_service_background_tasks(

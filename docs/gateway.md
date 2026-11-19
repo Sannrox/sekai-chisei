@@ -341,9 +341,42 @@ A `log_reader` principal reads records in order:
 
 Back up the log directory with the policy file.
 
-Not yet in policy mode: Chisei reading the log into receipts (#3096),
-`x-chisei-request-id` dispatch deduplication, `chisei_context` (refused), and
-cost or token quotas.
+### Chisei reads the log
+
+The combined server reads each gateway named in `CHISEI_GATEWAY_LOGS`
+(`name=base_url`, comma-separated) with the `log_reader` key given for it in
+`CHISEI_GATEWAY_LOG_KEYS` (`name=key`). A `sekai-plane` or `chisei-plane`
+process refuses to start with either set, because the writes need both
+stores (#3096).
+
+For each gateway Chisei keeps a cursor, the highest committed sequence, in
+the Sekai store. It reads the records after the cursor and:
+
+- writes each usage record's Operation Receipt to the Chisei store. Writing
+  the same receipt again changes nothing;
+- writes each usage record's `llm_calls` row and one decision entry per
+  record (`gateway.admission` for an admission, `operation.receipt.upsert` for
+  a usage record with a receipt) in the Sekai transaction that moves the
+  cursor;
+- acknowledges the new cursor to the gateway after that transaction commits.
+
+The cursor moves only from the value the batch was read at. When several
+Chisei instances read one gateway, one commits each batch and the others
+write nothing and read again. A restart resumes from the cursor; a crash
+between the commit and the acknowledgement rereads records the cursor already
+covers, skips them, and acknowledges. An admission without a usage record (the
+call was never forwarded) leaves its decision entry and no `llm_calls` row.
+Decision entries are named `gateway-log:<gateway>:<seq>`.
+
+Each gateway is a gRPC health service, `chisei.gateway_log.<name>`. It is
+`NOT_SERVING` while reads fail and the reader retries with backoff up to 30
+seconds; other gateways and the server's own health are unaffected. Receipts
+lag while a gateway is unreachable. The reader stops, and reports why, when
+the gateway's log ends before the cursor (a replaced log) or has dropped
+records the cursor does not cover.
+
+Not yet in policy mode: `x-chisei-request-id` dispatch deduplication,
+`chisei_context` (refused), and cost or token quotas.
 
 ## Context selection and egress
 

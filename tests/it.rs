@@ -74,6 +74,7 @@ mod game_soak;
 mod gateway_admin_setup;
 mod gateway_control_plane;
 mod gateway_http_smoke;
+mod gateway_log_reader;
 mod governed_fact_backend_conformance;
 mod governed_image_backend_conformance;
 mod graph_backend_conformance;
