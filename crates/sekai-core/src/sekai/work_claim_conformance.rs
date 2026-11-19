@@ -67,22 +67,28 @@ impl Subject<'_> {
                     generation: work.claim_generation,
                     token: work.fencing_token,
                 }),
-            WorkKind::Action => self
-                .db
-                .claim_action_work(
-                    &self.id,
-                    owner,
-                    &format!("{owner}-{now_ms}"),
-                    "op",
-                    TTL_MS,
-                    now_ms,
-                )
-                .ok()
-                .map(|effect| Held {
+            WorkKind::Action => match self.db.claim_action_work(
+                &self.id,
+                owner,
+                &format!("{owner}-{now_ms}"),
+                "op",
+                TTL_MS,
+                now_ms,
+            ) {
+                Ok(effect) => Some(Held {
                     owner: effect.claim_owner,
                     generation: i64::try_from(effect.claim_generation).unwrap(),
                     token: effect.claim_fencing_token,
                 }),
+                // Held, or dead-lettered at the lease-expiry limit.
+                Err(error)
+                    if error.starts_with("effect already claimed by ")
+                        || error == "lease expiry retry limit exceeded; effect dead-lettered" =>
+                {
+                    None
+                }
+                Err(error) => panic!("action claim failed: {error}"),
+            },
             WorkKind::AgentTurn => {
                 match agent_turn::claim(self.db, &self.namespace, owner, &self.id, TTL_MS, now_ms) {
                     Ok(turn) => Some(Held {
@@ -161,17 +167,24 @@ impl Subject<'_> {
                     now_ms,
                 )
                 .is_ok(),
-            WorkKind::Action => self
-                .db
-                .heartbeat_action_claim(
-                    &self.id,
-                    &held.owner,
-                    u64::try_from(held.generation).unwrap(),
-                    &held.token,
-                    TTL_MS,
-                    now_ms,
-                )
-                .is_ok(),
+            WorkKind::Action => match self.db.heartbeat_action_claim(
+                &self.id,
+                &held.owner,
+                u64::try_from(held.generation).unwrap(),
+                &held.token,
+                TTL_MS,
+                now_ms,
+            ) {
+                Ok(_) => true,
+                // The lease lapsed, or a reclaim fenced this holder out.
+                Err(error)
+                    if error == "claim lease expired"
+                        || error == "fencing token or generation mismatch" =>
+                {
+                    false
+                }
+                Err(error) => panic!("action heartbeat failed: {error}"),
+            },
             WorkKind::AgentTurn => agent_turn::heartbeat(
                 self.db,
                 &self.id,
