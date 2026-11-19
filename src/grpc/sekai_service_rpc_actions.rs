@@ -769,6 +769,15 @@ pub(super) async fn list_action_instances(
     req: Request<ListActionInstancesRequest>,
 ) -> Result<Response<ListActionInstancesResponse>, Status> {
     if req.get_ref().decidable_by_caller {
+        let inner = req.get_ref();
+        if inner.created_from_ms.is_some()
+            || inner.created_before_ms.is_some()
+            || !inner.page_token.is_empty()
+        {
+            return Err(Status::invalid_argument(
+                "decidable_by_caller does not take a created window or page_token",
+            ));
+        }
         return list_decidable_action_instances(service, req);
     }
     let principals = caller_principals(&req);
@@ -811,17 +820,39 @@ pub(super) async fn list_action_instances(
         inner.limit as usize
     };
     let limit = limit.clamp(1, 500);
-    let mut offset = 0;
+    let created_from_ms = inner.created_from_ms.unwrap_or(i64::MIN);
+    let mut position = parse_action_instance_page_token(&inner.page_token)?;
+    if let Some(before) = inner.created_before_ms {
+        if created_from_ms >= before {
+            return Err(Status::invalid_argument(
+                "created_from_ms must be before created_before_ms",
+            ));
+        }
+        // (before, "") sorts below every instance created at `before`.
+        position = position.min((before, String::new()));
+    }
     let mut instances = Vec::new();
-    loop {
+    let mut withheld_count = 0u32;
+    let mut next_page_token = String::new();
+    'pages: loop {
         let stored = service
             .db
             .runtime()
-            .list_action_instances_page(&inner.namespace, type_id, status, 100, offset)
+            .list_action_instances_between(
+                &inner.namespace,
+                type_id,
+                status,
+                created_from_ms,
+                crate::db::OlderThan {
+                    at_ms: position.0,
+                    id: &position.1,
+                },
+                100,
+            )
             .map_err(Status::internal)?;
         let exhausted = stored.len() < 100;
-        offset += stored.len();
-        for instance in &stored {
+        for (index, instance) in stored.iter().enumerate() {
+            position = (instance.created_at_ms, instance.instance_id.clone());
             match authorize_action_instance_visibility(
                 service,
                 &principals,
@@ -834,18 +865,42 @@ pub(super) async fn list_action_instances(
                     if matches!(
                         status.code(),
                         tonic::Code::PermissionDenied | tonic::Code::NotFound
-                    ) => {}
+                    ) =>
+                {
+                    withheld_count += 1;
+                }
                 Err(status) => return Err(status),
             }
             if instances.len() == limit {
-                break;
+                if !exhausted || index + 1 < stored.len() {
+                    next_page_token = format!("{}|{}", position.0, position.1);
+                }
+                break 'pages;
             }
         }
-        if exhausted || instances.len() == limit {
+        if exhausted {
             break;
         }
     }
-    Ok(Response::new(ListActionInstancesResponse { instances }))
+    Ok(Response::new(ListActionInstancesResponse {
+        instances,
+        next_page_token,
+        withheld_count,
+    }))
+}
+
+/// Keyset position `(created_at_ms, instance_id)` of a `ListActionInstances`
+/// page token; the first page starts above every instance.
+fn parse_action_instance_page_token(token: &str) -> Result<(i64, String), Status> {
+    if token.is_empty() {
+        return Ok((i64::MAX, String::new()));
+    }
+    token
+        .split_once('|')
+        .and_then(|(at_ms, id)| Some((at_ms.parse().ok()?, id)))
+        .filter(|(_, id)| !id.is_empty())
+        .map(|(at_ms, id)| (at_ms, id.to_string()))
+        .ok_or_else(|| Status::invalid_argument("page_token is invalid"))
 }
 
 /// The parked instances the caller may decide (#1771), by the checks
@@ -891,7 +946,10 @@ fn list_decidable_action_instances(
             instances.len() < limit
         },
     )?;
-    Ok(Response::new(ListActionInstancesResponse { instances }))
+    Ok(Response::new(ListActionInstancesResponse {
+        instances,
+        ..Default::default()
+    }))
 }
 
 /// The one subject that may decide in `namespace` under the request gates

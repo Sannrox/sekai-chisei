@@ -27,6 +27,44 @@ incomparable. See
 [Evaluation quality trends](evaluation-quality-trends.md) for denominator,
 freshness, redaction, recovery, retention, and rollback semantics.
 
+## Governed decision trend report
+
+Compare how governed Action decisions behave in a window and in the baseline
+window of the same length just before it:
+
+```sh
+sekaictl report decisions \
+  --namespace acme \
+  --window 7d \
+  --until-ms 1784505600000 \
+  --fail-on-drift \
+  --json \
+  --output reports/acme-decisions.json
+```
+
+The command reads `ListActionInstances` from the plane at `CHISEI_GRPC_URL`
+or `SEKAI_SOCKET`, as the caller's credential allows. `--window` takes
+`ms`, `s`, `m`, `h` or `d`; `--until-ms` defaults to now. Per action type it
+reports, for both windows: policy outcomes (`allow`, which includes
+`auto_apply`, `deny`, `require_approval`, other), approver outcomes of parked
+instances (grant, deny, pending), median and p95 time to decision, decided
+instances that missed their review deadline or escalated, and decisions made
+by agents. Each share is a series in basis points. A series is `drifted` when
+both windows hold at least `--min-count` instances in its denominator
+(default 30) and the share moved by more than `--max-share-shift-bps`
+(default 1500); otherwise it is `stable` or `low_count`. `--fail-on-drift`
+exits non-zero after printing a report with a drifted series, so any
+scheduler can alert on it. An unknown or misspelled option fails instead of
+being ignored.
+
+Instances the caller may not read are excluded and counted as `withheld`.
+A window holding more than 4,096 instances, withheld ones included, fails
+with "narrow the window". A plane that predates the created window fails
+with "server does not support windowed listing". The report lists the
+instance ids of each window, and `digest` is a SHA-256 over the report with
+the digest empty, so the same instances give the same digest and a verifier
+who fetches the listed instances recomputes it.
+
 ## Lookup-first substitution report
 
 Inspect realized lookup-first and model-path evidence from the configured local

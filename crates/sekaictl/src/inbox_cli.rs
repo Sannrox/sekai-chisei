@@ -172,6 +172,7 @@ mod tests {
                     review_queue_id: "risk".into(),
                     ..Default::default()
                 }],
+                ..Default::default()
             }))
         }
     }

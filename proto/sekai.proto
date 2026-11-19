@@ -3925,8 +3925,22 @@ message ListActionInstancesRequest {
   // DecideActionInstance applies (#1771); `status` is ignored. Those checks
   // replace the namespace read check: a named approver decides without one.
   bool decidable_by_caller = 5;
+  // Only instances created in [created_from_ms, created_before_ms) (#2122).
+  // Either bound may be unset. Not combined with `decidable_by_caller`.
+  optional int64 created_from_ms = 6;
+  optional int64 created_before_ms = 7;
+  // Opaque; resumes after the last instance the previous page examined.
+  // Empty is the first page. Not combined with `decidable_by_caller`.
+  string page_token = 8;
 }
-message ListActionInstancesResponse { repeated ActionInstance instances = 1; }
+message ListActionInstancesResponse {
+  repeated ActionInstance instances = 1;
+  // Set when more instances may match; pass it as `page_token`.
+  string next_page_token = 2;
+  // Instances on this page that matched the filter but the caller may not
+  // read (namespace tenant or marking). A count only.
+  uint32 withheld_count = 3;
+}
 
 // Experimental (#2203): what waits on the caller's decision, across the four
 // review kinds. Rows stay in each kind's own store, and deciding still goes

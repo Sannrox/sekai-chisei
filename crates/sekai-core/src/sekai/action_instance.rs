@@ -830,6 +830,47 @@ impl SekaiDb {
             .collect()
     }
 
+    /// Instances of `namespace` (of `type_id` and `status` when given)
+    /// created at or after `created_from_ms` and older than `before`, newest
+    /// first, read as an index range. `ListActionInstances` pages with it.
+    pub fn list_action_instances_between(
+        &self,
+        namespace: &str,
+        type_id: Option<&str>,
+        status: Option<&str>,
+        created_from_ms: i64,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
+        self.migrate_action_instances()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(SQLITE_ACTION_INSTANCES_BETWEEN)
+            .map_err(|e| e.to_string())?;
+        let bodies = stmt
+            .query_map(
+                params![
+                    namespace,
+                    type_id.filter(|t| !t.trim().is_empty()),
+                    status.filter(|s| !s.trim().is_empty()),
+                    created_from_ms,
+                    before.at_ms,
+                    before.id,
+                    limit.clamp(1, 500) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        bodies
+            .iter()
+            .map(|body| {
+                serde_json::from_str(body).map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     /// Insert a newly decided instance. Caller must already have checked
     /// idempotency. Returns conflict if the unique key races.
     pub fn put_action_instance(&self, instance: &ActionInstance) -> Result<ActionInstance, String> {
@@ -1663,6 +1704,16 @@ pub(crate) const SQLITE_ACTION_INSTANCES_OLDER_THAN: &str =
      WHERE namespace = ?1 AND status = ?2 AND (?3 IS NULL OR type_id = ?3)
        AND (created_at_ms, instance_id) < (?4, ?5)
      ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?6";
+
+/// Instances of a namespace, of a type when `?2` and in a status when `?3`
+/// is not NULL, created at or after `?4` and past a keyset position, newest
+/// first. `created_at_ms <= ?5` bounds the namespace index range.
+pub(crate) const SQLITE_ACTION_INSTANCES_BETWEEN: &str =
+    "SELECT body_json FROM sekai_action_instances
+     WHERE namespace = ?1 AND (?2 IS NULL OR type_id = ?2) AND (?3 IS NULL OR status = ?3)
+       AND created_at_ms >= ?4 AND created_at_ms <= ?5
+       AND (created_at_ms, instance_id) < (?5, ?6)
+     ORDER BY created_at_ms DESC, instance_id DESC LIMIT ?7";
 
 pub(crate) const SQLITE_REDACT_WRITER_ACTIONS: &str =
     "SELECT instance_id, parameters_json, body_json

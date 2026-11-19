@@ -10,12 +10,15 @@ use std::path::PathBuf;
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> &'static str {
-    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report quality --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report substitution --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
+    "sekaictl report <operation-id> [--attempt <number>] [--output <file>] [--json]\n  sekaictl report quality --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report decisions --namespace <name> --window <duration> [--until-ms <time>] [--min-count <n>] [--max-share-shift-bps <bps>] [--fail-on-drift] [--output <file>] [--json]\n  sekaictl report substitution --namespace <name> --since-ms <time> --until-ms <time> [--principal <name>] [--output <file>] [--json]\n  sekaictl report summary <report.json>... --since-ms <time> --until-ms <time> [--namespace <name>] [--output <file>]\n  sekaictl report bundle <operation-id> --output <bundle> [attest export options]\n  sekaictl report verify <bundle> [attest verify options]"
 }
 
 pub async fn run_report_command(args: Vec<String>) -> Result<(), BoxErr> {
     if args.first().is_some_and(|arg| arg == "quality") {
         return quality_report(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "decisions") {
+        return crate::decision_trend_cli::run(&args[1..]).await;
     }
     if args.first().is_some_and(|arg| arg == "substitution") {
         return substitution_report(&args[1..]);

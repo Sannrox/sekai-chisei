@@ -318,6 +318,16 @@ replace the namespace read check, as they do for a decision. An instance
 the caller may not decide is absent, and a caller who may decide nothing
 gets an empty list.
 
+`ListActionInstances` lists newest first. `created_from_ms` and
+`created_before_ms` select instances created in `[from, before)` (#2122);
+either bound may be unset. A response whose page filled carries
+`next_page_token`, which resumes after the last instance that page examined;
+the 500-per-page cap stays. `withheld_count` counts the instances on the page
+that matched the filter but the caller may not read (namespace tenant or
+marking); it is a count only. A server that predates these fields ignores
+them, so a client that sends a window checks each `created_at_ms` against it.
+`decidable_by_caller` takes neither a window nor a page token.
+
 `ListPendingDecisions` (#2203, experimental) is the inbox across review
 kinds: parked Action instances, plan reviews, open definition proposals and
 open dataset branch merge proposals in one namespace. Each kind is filtered

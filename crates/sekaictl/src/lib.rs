@@ -19,6 +19,7 @@ pub mod compliance_pack;
 pub mod connector_certification_cli;
 pub mod connector_template;
 pub mod credential_cli;
+pub mod decision_trend_cli;
 pub mod document_cli;
 pub mod evaluation_plan_cli;
 pub mod event_stream_cli;
