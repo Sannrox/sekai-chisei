@@ -1,5 +1,6 @@
 use sekai_ontology::{EMBEDDED_SKILL, ImportDocument, Ontology, SqliteOntology};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::process::{Command, Output};
 
@@ -330,7 +331,10 @@ fn export_handles_empty_and_invalid_databases_without_partial_output() {
 #[test]
 fn embedded_skill_only_documents_shipping_commands() {
     let help = sekai(&["--help"]);
+    assert!(help.status.success(), "sekai --help failed: {help:?}");
     let help = String::from_utf8(help.stdout).unwrap();
+    let shipped = help_commands(&help);
+    let skill_words: BTreeSet<&str> = words(EMBEDDED_SKILL).collect();
     for command in [
         "setup",
         "export",
@@ -345,12 +349,60 @@ fn embedded_skill_only_documents_shipping_commands() {
         "relation",
         "directory",
     ] {
-        assert!(help.contains(command), "help is missing {command}");
+        assert!(shipped.contains(command), "help is missing {command}");
+        assert!(skill_words.contains(command), "skill is missing {command}");
+    }
+    let documented = skill_invocations(EMBEDDED_SKILL);
+    assert!(
+        !documented.is_empty(),
+        "skill documents no sekai invocations"
+    );
+    for command in documented {
         assert!(
-            EMBEDDED_SKILL.contains(command),
-            "skill is missing {command}"
+            shipped.contains(command),
+            "skill documents `sekai {command}`, which help does not list"
         );
     }
+}
+
+/// First word of each line in the `Commands:` block of `sekai --help`.
+fn help_commands(help: &str) -> BTreeSet<&str> {
+    help.lines()
+        .skip_while(|line| line.trim() != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
+}
+
+/// The command word of every `sekai ...` invocation in `text`, skipping the
+/// global `--json` flag and `--db <path>` option.
+fn skill_invocations(text: &str) -> Vec<&str> {
+    text.match_indices("sekai ")
+        .filter(|(index, _)| {
+            text[..*index]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !before.is_alphanumeric() && before != '-')
+        })
+        .filter_map(|(index, matched)| {
+            let mut tokens = text[index + matched.len()..].split_whitespace();
+            loop {
+                match tokens.next()? {
+                    "--json" => {}
+                    "--db" => {
+                        tokens.next()?;
+                    }
+                    token => return Some(token.trim_end_matches(['`', '"', ',', '.'])),
+                }
+            }
+        })
+        .collect()
+}
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+        .filter(|word| !word.is_empty())
 }
 
 #[test]
