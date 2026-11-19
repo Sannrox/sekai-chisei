@@ -3,7 +3,7 @@ use r2d2::{CustomizeConnection, Pool, PooledConnection};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -12,15 +12,17 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-static NEXT_MEMORY_POOL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static MEMORY_CONN_HELD: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
+    /// Connections this thread holds, per pool. `SqliteConn` is not `Send`,
+    /// so a checkout is always returned on the thread that took it.
+    static CONN_HELD: RefCell<BTreeMap<u64, u32>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 pub struct SqliteConn {
     inner: PooledConnection<SqliteConnectionManager>,
-    memory_pool_id: Option<u64>,
+    pool_id: u64,
     /// `persistence` stage span from checkout until the connection returns
     /// to the pool, opened only inside a request span, so a trace shows each store transaction. Its outcome
     /// reports the checkout; work on the connection does not mark it failed.
@@ -30,11 +32,15 @@ pub struct SqliteConn {
 
 impl Drop for SqliteConn {
     fn drop(&mut self) {
-        if let Some(pool_id) = self.memory_pool_id {
-            MEMORY_CONN_HELD.with(|held| {
-                held.borrow_mut().remove(&pool_id);
-            });
-        }
+        CONN_HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(count) = held.get_mut(&self.pool_id) {
+                *count -= 1;
+                if *count == 0 {
+                    held.remove(&self.pool_id);
+                }
+            }
+        });
     }
 }
 
@@ -66,7 +72,7 @@ pub struct SekaiDb {
     pool: Pool<SqliteConnectionManager>,
     enterprise_extension: Option<Arc<dyn crate::enterprise::EnterpriseExtension>>,
     persistent: bool,
-    memory_pool_id: u64,
+    pool_id: u64,
     plane: std::sync::OnceLock<crate::obs::labels::PoolPlane>,
     schema_plane: crate::db::schema_plane::SchemaPlane,
     chisei_schema: std::sync::OnceLock<()>,
@@ -262,18 +268,14 @@ impl SekaiDb {
             .connection_customizer(Box::new(SqliteConnectionSetup))
             .build(manager)
             .map_err(|e| e.to_string())?;
-        let memory_pool_id = if persistent {
-            0
-        } else {
-            NEXT_MEMORY_POOL_ID.fetch_add(1, Ordering::Relaxed)
-        };
+        let pool_id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
         let (source_index_derive, source_index_derive_lock_path) =
             sqlite_source_index_derive_lock(path, persistent);
         let db = Self {
             pool,
             enterprise_extension,
             persistent,
-            memory_pool_id,
+            pool_id,
             plane: std::sync::OnceLock::new(),
             schema_plane,
             chisei_schema: std::sync::OnceLock::new(),
@@ -376,16 +378,18 @@ impl SekaiDb {
         let stage = crate::obs::correlation::StageGuard::open_nested(
             crate::obs::correlation::Stage::Persistence,
         );
-        // In-memory pools are single-connection. A nested checkout from the
-        // same thread waits forever on the default 30s timeout loop. Fail
-        // immediately so a missed `drop` cannot hang a test for tens of minutes.
-        // Other threads may legitimately wait for the connection.
-        if !self.persistent
-            && MEMORY_CONN_HELD.with(|held| held.borrow().contains(&self.memory_pool_id))
-        {
+        // A thread that already holds every connection the pool allows would
+        // wait forever on the 30s retry loop below, because only it can return
+        // one. Fail immediately instead: the in-memory pool has one connection,
+        // a persistent pool has `pool_max`. Other threads may legitimately
+        // wait for a busy pool.
+        let held = CONN_HELD.with(|held| held.borrow().get(&self.pool_id).copied().unwrap_or(0));
+        if held >= self.pool.max_size() {
             panic!(
-                "nested SQLite checkout on the single-connection in-memory pool; \
-                 drop the outer connection before calling another store method"
+                "nested SQLite checkout would exhaust the pool ({held} of {} connections \
+                 held on this thread); drop the outer connection before calling another \
+                 store method",
+                self.pool.max_size()
             );
         }
         loop {
@@ -397,17 +401,12 @@ impl SekaiDb {
                         started.elapsed(),
                     );
                     self.observe_pool_saturation(started.elapsed());
-                    let memory_pool_id = if self.persistent {
-                        None
-                    } else {
-                        MEMORY_CONN_HELD.with(|held| {
-                            held.borrow_mut().insert(self.memory_pool_id);
-                        });
-                        Some(self.memory_pool_id)
-                    };
+                    CONN_HELD.with(|held| {
+                        *held.borrow_mut().entry(self.pool_id).or_insert(0) += 1;
+                    });
                     return SqliteConn {
                         inner: conn,
-                        memory_pool_id,
+                        pool_id: self.pool_id,
                         _stage: stage,
                         _not_send: PhantomData,
                     };
@@ -2803,6 +2802,61 @@ mod tests {
         let db = test_db();
         let _outer = db.conn();
         let _inner = db.conn();
+    }
+
+    /// #2737: a thread that already holds every connection of a persistent
+    /// pool fails at once on another checkout instead of retrying forever.
+    #[test]
+    fn nested_checkout_that_would_exhaust_a_persistent_pool_fails_at_once() {
+        let path = temp_db_path("pool-exhaust");
+        let db = Arc::new(SekaiDb::new_with_pool_max(path.to_str().unwrap(), 1).unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let nested = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _outer = db.conn();
+                    db.list_datasets().map(|_| ())
+                }));
+                let _ =
+                    sender.send(outcome.map_err(|panic| {
+                        panic.downcast_ref::<String>().cloned().unwrap_or_default()
+                    }));
+            })
+        };
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("nested checkout must fail instead of waiting on the exhausted pool");
+        nested.join().unwrap();
+        let message = outcome.expect_err("nested checkout must not succeed");
+        assert!(message.contains("nested SQLite checkout"), "{message}");
+        drop(db);
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Another thread still waits on a busy persistent pool and gets the
+    /// connection once it is returned.
+    #[test]
+    fn another_thread_waits_for_a_busy_persistent_pool() {
+        let path = temp_db_path("pool-wait");
+        let db = SekaiDb::new_with_pool_max(path.to_str().unwrap(), 1).unwrap();
+        let held = db.conn();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| db.list_datasets().map(|datasets| datasets.len()));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !waiter.is_finished(),
+                "the waiter must block on the busy pool"
+            );
+            drop(held);
+            assert_eq!(waiter.join().unwrap(), Ok(0));
+        });
+        drop(db);
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// Opening an in-memory store runs every migration family, dataset
