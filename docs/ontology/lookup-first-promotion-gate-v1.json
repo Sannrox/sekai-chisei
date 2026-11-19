@@ -65,31 +65,31 @@
     {
       "subject": "ChiseiPublicApiV1",
       "source": "sekai-chisei",
-      "locator": "src/composition/lookup_first.rs;run_lookup_promotion_gate",
+      "locator": "crates/chisei-core/src/lookup_first.rs;run_lookup_promotion_gate",
       "confidence": 1.0
     },
     {
       "subject": "LookupFirstPromotionGate",
       "source": "sekai-chisei",
-      "locator": "src/composition/lookup_first.rs;run_lookup_promotion_gate;record_lookup_promotion_gate",
+      "locator": "crates/chisei-core/src/lookup_first.rs;run_lookup_promotion_gate;record_lookup_promotion_gate",
       "confidence": 1.0
     },
     {
       "subject": "LookupFirstPromotionGateSuite",
       "source": "sekai-chisei",
-      "locator": "src/composition/lookup_first.rs;LookupPromotionGateSuite;parse_lookup_promotion_gate_suite",
+      "locator": "crates/chisei-core/src/lookup_first.rs;LookupPromotionGateSuite;parse_lookup_promotion_gate_suite",
       "confidence": 1.0
     },
     {
       "subject": "exposes_lookup_first_promotion_gate",
       "source": "sekai-chisei",
-      "locator": "src/composition/lookup_first.rs;run_lookup_promotion_gate",
+      "locator": "crates/chisei-core/src/lookup_first.rs;run_lookup_promotion_gate",
       "confidence": 1.0
     },
     {
       "subject": "evaluates_lookup_promotion_suite",
       "source": "sekai-chisei",
-      "locator": "src/composition/lookup_first.rs;record_lookup_promotion_gate",
+      "locator": "crates/chisei-core/src/lookup_first.rs;record_lookup_promotion_gate",
       "confidence": 1.0
     }
   ]

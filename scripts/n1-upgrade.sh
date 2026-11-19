@@ -121,7 +121,8 @@ server_bin_name() {
 
 build_bins() {
   local dir="$1" target="$2" server="$3"
-  (cd "$dir" && CARGO_TARGET_DIR="$target" cargo build --locked --bin "$server" --bin sekaictl)
+  # --workspace finds sekaictl on the root package (N-1) or crates/sekaictl (HEAD).
+  (cd "$dir" && CARGO_TARGET_DIR="$target" cargo build --locked --workspace --bin "$server" --bin sekaictl)
 }
 
 N1_TAG="$(resolve_n1_tag)"

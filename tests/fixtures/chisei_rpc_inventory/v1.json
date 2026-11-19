@@ -324,7 +324,7 @@
       "kind": "query",
       "surfaces": [],
       "evidence": [
-        "src/quality_trend.rs",
+        "crates/chisei-core/src/quality_trend.rs",
         "src/grpc/chisei_service.rs",
         "docs/evaluation-quality-trends.md"
       ],
