@@ -75,17 +75,10 @@ pub const TRANSFORM_DEFINITION_CHANGED: &str = "transform definition changed";
 /// Order-independent 256-bit sum of per-row SHA-256 hashes.
 /// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
 /// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
-/// Order-independent 256-bit sum of per-row SHA-256 hashes.
-/// Reference-platform analog: governed incremental `semantic_version` / `v2_semantics`
-/// force a SNAPSHOT rebuild; old encodings are not folded as the new sum.
 pub const OUTPUT_DIGEST_PREFIX: &str = "sha256-sum-v1:";
 /// Sorted map of partition identity to `sha256-sum-v1:` member digest.
 /// Does not fold into `OUTPUT_DIGEST_PREFIX` (#1358 / ADR 0103).
-/// Sorted map of partition identity to `sha256-sum-v1:` member digest.
-/// Does not fold into `OUTPUT_DIGEST_PREFIX` (#1358 / ADR 0103).
 pub const PARTITIONED_DIGEST_PREFIX: &str = "sha256-partitions-v1:";
-/// Receipt identity when the caller cannot read the bound datasets.
-/// Not derived from the partition value, so it is not dictionary-attackable.
 /// Receipt identity when the caller cannot read the bound datasets.
 /// Not derived from the partition value, so it is not dictionary-attackable.
 pub const REDACTED_PARTITION_IDENTITY: &str = "redacted";
@@ -382,8 +375,6 @@ pub struct ClaimTransformWorkOutcome {
 
 /// In-process scheduled or triggered work that has a Put quota owner.
 /// Tick skips these so the RPC can admit tenant quota before the run.
-/// In-process scheduled or triggered work that has a Put quota owner.
-/// Tick skips these so the RPC can admit tenant quota before the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueOwnedInProcessTransform {
     pub namespace: String,
@@ -570,9 +561,6 @@ impl GovernedTransform {
         }
     }
 
-    /// Alias + dataset_id pairs the run path must load.
-    /// The dataset inputs as `(alias, dataset_id)`; object-set inputs are
-    /// [`Self::object_set_inputs`].
     /// The object-set inputs as `(alias, descriptor JSON)` (ADR 0140).
     pub fn object_set_inputs(&self) -> Vec<(String, String)> {
         self.analytical
@@ -588,6 +576,9 @@ impl GovernedTransform {
             .collect()
     }
 
+    /// Alias + dataset_id pairs the run path must load.
+    /// The dataset inputs as `(alias, dataset_id)`; object-set inputs are
+    /// [`Self::object_set_inputs`].
     pub fn input_bindings(&self) -> Vec<(String, String)> {
         if let Some(spec) = &self.isolated_process
             && !spec.inputs.is_empty()
@@ -1371,9 +1362,6 @@ pub type TransformCheckpoint = (i64, String, String);
 /// Incremental selection requires the current JobSpec and a live output
 /// digest in the current encoding. An old or malformed digest forces a
 /// full rebuild (reference-platform snapshot) instead of folding.
-/// Incremental selection requires the current JobSpec and a live output
-/// digest in the current encoding. An old or malformed digest forces a
-/// full rebuild (reference-platform snapshot) instead of folding.
 pub fn bind_checkpoint(
     incremental: bool,
     checkpoint: Option<(TransformCheckpoint, String)>,
@@ -1520,9 +1508,6 @@ impl TransformWork {
     }
 }
 
-/// Claim-time puts stay on CLAIMED so a delayed insert cannot land after
-/// cancel. Restore after a taken hold may rewrite the row on the completing
-/// fence, including terminal work.
 /// Claim-time puts stay on CLAIMED so a delayed insert cannot land after
 /// cancel. Restore after a taken hold may rewrite the row on the completing
 /// fence, including terminal work.
@@ -1727,9 +1712,6 @@ impl InputLoadBudget {
 /// Union input dataset/object/row markings for a transform receipt.
 /// Unknown or incomparable tokens fail closed. The live output marking is
 /// always folded into markings_out so a rebuild cannot strip a stricter stamp.
-/// Union input dataset/object/row markings for a transform receipt.
-/// Unknown or incomparable tokens fail closed. The live output marking is
-/// always folded into markings_out so a rebuild cannot strip a stricter stamp.
 pub fn derive_transform_markings<'a>(
     lattice: Option<&ClassificationLattice>,
     input_object_tokens: impl IntoIterator<Item = Option<&'a str>>,
@@ -1769,11 +1751,6 @@ pub fn derive_transform_markings<'a>(
 /// Isolated write-back may not replace a newer committed result. A strictly
 /// older live receipt becomes this run's lineage parent. Same-millisecond
 /// admissions use run_id as a deterministic tie-break, not a sequence number.
-/// Fold a live output stamp into the admitted token so write-back cannot
-/// strip a stricter classification applied after admission.
-/// Isolated write-back may not replace a newer committed result. A strictly
-/// older live receipt becomes this run's lineage parent. Same-millisecond
-/// admissions use run_id as a deterministic tie-break, not a sequence number.
 pub fn bind_isolated_write_lineage(
     run: &mut TransformRun,
     live: Option<&TransformRun>,
@@ -1807,8 +1784,6 @@ pub fn fold_live_output_marking(
 
 /// Marked derived output must stamp a bound dataset object. Unbound datasets
 /// are readable without marking clearance.
-/// Marked derived output must stamp a bound dataset object. Unbound datasets
-/// are readable without marking clearance.
 pub fn require_bound_output_for_markings(
     output_object_id: &str,
     markings_out: &str,
@@ -1823,10 +1798,6 @@ pub fn rows_digest(rows: &[HashMap<String, String>]) -> String {
     encode_digest(fold_row_hashes([0u8; 32], rows))
 }
 
-/// Fold newly appended output rows into a stored digest. The digest is an
-/// order-independent 256-bit sum of per-row SHA-256 hashes, so this equals
-/// `rows_digest` of the combined live set. Returns `None` when `previous` is
-/// not the current encoding, so callers force a full rebuild.
 /// Fold newly appended output rows into a stored digest. The digest is an
 /// order-independent 256-bit sum of per-row SHA-256 hashes, so this equals
 /// `rows_digest` of the combined live set. Returns `None` when `previous` is
@@ -2016,8 +1987,6 @@ pub fn partition_records(
 
 /// Receipts for each input using that dataset's own `partition_keys`.
 /// Unpartitioned inputs are omitted; they must not borrow another input's keys.
-/// Receipts for each input using that dataset's own `partition_keys`.
-/// Unpartitioned inputs are omitted; they must not borrow another input's keys.
 pub fn input_partition_receipts<I>(inputs: I) -> Vec<TransformPartition>
 where
     I: IntoIterator<Item = (String, Vec<String>, Vec<HashMap<String, String>>)>,
@@ -2032,8 +2001,6 @@ where
     receipts
 }
 
-/// Group snapshot rows by `(alias, partition_key)` so two inputs that share an
-/// identity stay separate receipts. Callers omit unpartitioned datasets.
 /// Group snapshot rows by `(alias, partition_key)` so two inputs that share an
 /// identity stay separate receipts. Callers omit unpartitioned datasets.
 pub fn receipts_from_snapshot_rows<I>(rows: I) -> Vec<TransformPartition>
@@ -2140,8 +2107,6 @@ pub fn prepare_partition_commit(
 
 /// Whole-dataset digest: `sha256-sum-v1:` when unpartitioned, otherwise the
 /// `sha256-partitions-v1:` envelope over member `sha256-sum-v1:` digests.
-/// Whole-dataset digest: `sha256-sum-v1:` when unpartitioned, otherwise the
-/// `sha256-partitions-v1:` envelope over member `sha256-sum-v1:` digests.
 pub fn dataset_digest(keys: &[String], rows: &[HashMap<String, String>]) -> String {
     if keys.is_empty() {
         return rows_digest(rows);
@@ -2154,8 +2119,6 @@ pub fn dataset_digest(keys: &[String], rows: &[HashMap<String, String>]) -> Stri
     )
 }
 
-/// Incremental projection rewrites only partitions that received new output
-/// rows. Untouched live partitions stay on disk.
 /// Incremental projection rewrites only partitions that received new output
 /// rows. Untouched live partitions stay on disk.
 pub fn rewritten_partitions(
