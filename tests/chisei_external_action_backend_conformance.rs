@@ -103,12 +103,24 @@ fn exercise(db: &dyn ExternalHarness, prefix: &str) {
         "allow"
     );
 
-    db.reserve_external_action_blast_radius(&authorization_id, &request, Some(10), Some(10))
+    // Each reservation counts one mutation against the operation; the cap is
+    // one, so a second authorization fits only after the first is released.
+    let second_id = format!("{prefix}-auth-2");
+    db.reserve_external_action_blast_radius(&authorization_id, &request, Some(1), Some(1))
         .unwrap();
     // Idempotent reserve for same identity.
-    db.reserve_external_action_blast_radius(&authorization_id, &request, Some(10), Some(10))
+    db.reserve_external_action_blast_radius(&authorization_id, &request, Some(1), Some(1))
         .unwrap();
+    assert_eq!(
+        db.reserve_external_action_blast_radius(&second_id, &request, Some(1), Some(1))
+            .unwrap_err(),
+        "external-action blast-radius cap exceeded"
+    );
     db.release_external_action_blast_radius(&authorization_id, &request)
+        .unwrap();
+    db.reserve_external_action_blast_radius(&second_id, &request, Some(1), Some(1))
+        .unwrap();
+    db.release_external_action_blast_radius(&second_id, &request)
         .unwrap();
 
     let mut next = record.clone();
@@ -120,6 +132,13 @@ fn exercise(db: &dyn ExternalHarness, prefix: &str) {
     assert!(
         !db.compare_and_swap_external_action_authorization(&record, &next)
             .unwrap()
+    );
+    // The swap is stored, not only reported.
+    assert_eq!(
+        db.get_external_action_authorization_by_id(&authorization_id)
+            .unwrap()
+            .unwrap(),
+        next
     );
 
     let listed = db.list_external_action_authorizations().unwrap();
