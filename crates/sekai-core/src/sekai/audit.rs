@@ -456,11 +456,31 @@ impl SekaiDb {
         })
         .collect::<Vec<_>>();
         for grant in &grants {
+            let before: Option<crate::db::team_namespace::TeamGrantAttributes> = tx
+                .query_row(
+                    "SELECT role, purpose, not_after_ms, exception_reason FROM sekai_grants
+                     WHERE object_id = ?1 AND principal = ?2",
+                    params![grant.object_id, grant.principal],
+                    |row| {
+                        Ok([
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get::<_, i64>(2)?.to_string(),
+                            row.get(3)?,
+                        ])
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            // The bootstrap is the source of truth for team grants: an existing grant takes
+            // its expiry, purpose, and exception reason too, not only its role (#2718).
             tx.execute(
                 "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(object_id, principal) DO UPDATE SET
-                    id=excluded.id, role=excluded.role, created=excluded.created",
+                    id=excluded.id, role=excluded.role, created=excluded.created,
+                    purpose=excluded.purpose, not_after_ms=excluded.not_after_ms,
+                    exception_reason=excluded.exception_reason",
                 params![
                     grant.id,
                     grant.object_id,
@@ -473,6 +493,10 @@ impl SekaiDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+            insert_object_changes(
+                &tx,
+                &crate::db::team_namespace::team_grant_changes(actor, grant, before.as_ref(), now),
+            )?;
         }
         tx.commit().map_err(|error| error.to_string())?;
         drop(conn);

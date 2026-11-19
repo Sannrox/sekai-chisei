@@ -1,5 +1,7 @@
 use crate::db::postgres::PostgresDb;
-use crate::db::team_namespace::validate_team_namespace_bootstrap;
+use crate::db::team_namespace::{
+    TeamGrantAttributes, team_grant_changes, validate_team_namespace_bootstrap,
+};
 use crate::domain::Object;
 use crate::sekai::audit::{ObjectChange, object_diff_changes};
 use crate::sekai::security::{Grant, Role};
@@ -189,11 +191,30 @@ impl PostgresDb {
         })
         .collect::<Vec<_>>();
         for grant in &grants {
+            let before: Option<TeamGrantAttributes> = tx
+                .query_opt(
+                    "SELECT role, purpose, not_after_ms, exception_reason FROM sekai_grants
+                     WHERE object_id = $1 AND principal = $2",
+                    &[&grant.object_id.as_str(), &grant.principal.as_str()],
+                )
+                .map_err(|error| error.to_string())?
+                .map(|row| {
+                    [
+                        row.get(0),
+                        row.get(1),
+                        row.get::<_, i64>(2).to_string(),
+                        row.get(3),
+                    ]
+                });
+            // The bootstrap is the source of truth for team grants: an existing grant takes
+            // its expiry, purpose, and exception reason too, not only its role (#2718).
             tx.execute(
                 "INSERT INTO sekai_grants (id, object_id, principal, role, created, purpose, not_after_ms, exception_reason)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT (object_id, principal) DO UPDATE SET
-                    id=EXCLUDED.id, role=EXCLUDED.role, created=EXCLUDED.created",
+                    id=EXCLUDED.id, role=EXCLUDED.role, created=EXCLUDED.created,
+                    purpose=EXCLUDED.purpose, not_after_ms=EXCLUDED.not_after_ms,
+                    exception_reason=EXCLUDED.exception_reason",
                 &[
                     &grant.id.as_str(),
                     &grant.object_id.as_str(),
@@ -206,6 +227,10 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
+            insert_changes(
+                &mut tx,
+                &team_grant_changes(actor, grant, before.as_ref(), now),
+            )?;
         }
         tx.commit().map_err(|error| error.to_string())?;
         drop(connection);
