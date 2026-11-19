@@ -462,33 +462,44 @@ impl RowEncoder {
     }
 
     /// Encodes `id` and `values`. CSV and JSON Lines yield one row; Parquet
-    /// yields a row group when the group fills.
-    pub fn push(&mut self, id: &str, values: &HashMap<String, String>) -> Option<EncodedPart> {
+    /// yields a row group when the group fills, and fails when a length does
+    /// not fit its Parquet field.
+    pub fn push(
+        &mut self,
+        id: &str,
+        values: &HashMap<String, String>,
+    ) -> Result<Option<EncodedPart>, String> {
         match self.format {
-            ExportFormat::Csv | ExportFormat::JsonLines => Some(EncodedPart {
+            ExportFormat::Csv | ExportFormat::JsonLines => Ok(Some(EncodedPart {
                 bytes: self.row(id, values),
                 rows: 1,
-            }),
+            })),
             ExportFormat::Parquet => {
-                self.parquet
-                    .as_mut()?
+                let Some(parquet) = self.parquet.as_mut() else {
+                    return Ok(None);
+                };
+                let flush = parquet
                     .push(id, values)
-                    .map(|flush| EncodedPart {
-                        bytes: flush.bytes,
-                        rows: flush.rows,
-                    })
+                    .map_err(|error| error.to_string())?;
+                Ok(flush.map(|flush| EncodedPart {
+                    bytes: flush.bytes,
+                    rows: flush.rows,
+                }))
             }
         }
     }
 
     /// Remaining Parquet bytes (last group and footer). Empty for CSV and
     /// JSON Lines.
-    pub fn finish(&mut self) -> Option<EncodedPart> {
-        let flush = self.parquet.as_mut()?.finish();
-        (!flush.bytes.is_empty()).then_some(EncodedPart {
+    pub fn finish(&mut self) -> Result<Option<EncodedPart>, String> {
+        let Some(parquet) = self.parquet.as_mut() else {
+            return Ok(None);
+        };
+        let flush = parquet.finish().map_err(|error| error.to_string())?;
+        Ok((!flush.bytes.is_empty()).then_some(EncodedPart {
             bytes: flush.bytes,
             rows: flush.rows,
-        })
+        }))
     }
 }
 
@@ -891,11 +902,14 @@ mod tests {
         .unwrap();
         let mut file = encoder.header();
         let mut rows = 0u64;
-        if let Some(part) = encoder.push("t-1", &object("t-1", &[("title", "hello")]).properties) {
+        if let Some(part) = encoder
+            .push("t-1", &object("t-1", &[("title", "hello")]).properties)
+            .unwrap()
+        {
             rows += part.rows;
             file.extend(part.bytes);
         }
-        if let Some(part) = encoder.finish() {
+        if let Some(part) = encoder.finish().unwrap() {
             rows += part.rows;
             file.extend(part.bytes);
         }
