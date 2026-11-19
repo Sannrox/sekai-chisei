@@ -30,7 +30,6 @@ impl SekaiServiceImpl {
             runtime_token_authority: None,
             dry_run_host: None,
             embedding_route: None,
-            enforce_agent_ceiling: false,
         }
     }
 

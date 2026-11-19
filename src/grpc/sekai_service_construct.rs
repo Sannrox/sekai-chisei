@@ -46,7 +46,6 @@ impl SekaiServiceImpl {
             runtime_token_authority: None,
             dry_run_host: None,
             embedding_route: None,
-            enforce_agent_ceiling: false,
         }
     }
 
@@ -57,11 +56,6 @@ impl SekaiServiceImpl {
         authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     ) -> Self {
         self.runtime_token_authority = authority;
-        self
-    }
-
-    pub fn with_agent_ceiling(mut self, enforce: bool) -> Self {
-        self.enforce_agent_ceiling = enforce;
         self
     }
 

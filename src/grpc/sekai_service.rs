@@ -230,8 +230,6 @@ pub struct SekaiServiceImpl {
     /// Signs runtime tokens for granted Action work claims; none issues none.
     pub(super) runtime_token_authority: Option<Arc<crate::identity_assertion::AssertionAuthority>>,
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
-    /// User grants intersect the agent ceiling at claim and apply (#1563).
-    pub(super) enforce_agent_ceiling: bool,
     /// Embeds hybrid Search queries (#1582); none refuses hybrid mode.
     pub(super) embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
 }

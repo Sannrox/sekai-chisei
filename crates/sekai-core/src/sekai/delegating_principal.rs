@@ -21,6 +21,17 @@ pub enum DelegatorApplyError {
     Internal(String),
 }
 
+/// Whether `agent` has a grant ceiling (#2435). In community mode a ceiling
+/// is defined once the agent holds any namespace role; an agent with none
+/// acts with its delegating user's rights. The enterprise extension owns
+/// agent grants, so under it every agent has a ceiling.
+pub fn agent_has_ceiling(db: &RuntimeDb, agent: &str) -> Result<bool, String> {
+    if db.enterprise_extension().is_some() {
+        return Ok(true);
+    }
+    Ok(!db.list_namespace_roles_for_principal(agent)?.is_empty())
+}
+
 pub fn current_delegating_principal_state(
     db: &RuntimeDb,
     principal: &str,
