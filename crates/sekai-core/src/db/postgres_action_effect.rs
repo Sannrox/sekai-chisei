@@ -326,6 +326,16 @@ impl PostgresDb {
         let generation_i64 = park_generation as i64;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
+        // Lock the effect before the resolution action, the order reserve and
+        // submit use, so concurrent calls on one resolution cannot deadlock.
+        // A resolution action cannot exist without its effect.
+        let effect_row = tx
+            .query_opt(
+                "SELECT body_json FROM sekai_action_effects WHERE effect_id=$1 FOR UPDATE",
+                &[&effect_id],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "resolution action not found".to_string())?;
         let row = tx
             .query_one(
                 "SELECT body_json FROM sekai_parked_resolution_actions
@@ -347,7 +357,7 @@ impl PostgresDb {
         ) {
             return Err("resolution action is not invokable".into());
         }
-        let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
+        let mut effect = parse_pg_json::<ActionEffect>(effect_row.get(0), "action effect")?;
         if effect.effective_lifecycle_state() != EFFECT_LIFECYCLE_AWAITING_CONTINUATION
             || effect.park_generation != park_generation
         {
@@ -1282,4 +1292,110 @@ fn pg_insert_continuation(
         }
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::runtime_db::RuntimeDb;
+    use crate::sekai::action_effect::plan_effects_for_admit;
+    use std::sync::{Arc, Barrier};
+
+    /// Invoke and reserve on one parked resolution lock the effect before the
+    /// resolution action, so racing them never deadlocks (#2986).
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_concurrent_invoke_and_reserve_do_not_deadlock() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = Arc::new(RuntimeDb::Postgres(Arc::new(scratch.connect())));
+        for round in 0..40 {
+            let mut effect = plan_effects_for_admit(
+                &format!("ai-{round}"),
+                "acme",
+                &format!("op-{round}"),
+                &["runtime_dispatch".into()],
+                "{}",
+                10,
+                false,
+            )
+            .unwrap()
+            .remove(0);
+            effect.effect_id = format!("effect-{round}-{}", uuid::Uuid::new_v4().simple());
+            db.put_action_effects(std::slice::from_ref(&effect))
+                .unwrap();
+            let claimed = db
+                .claim_action_work(&effect.effect_id, "runtime", "claim", "operator", 1_000, 10)
+                .unwrap();
+            db.park_action_work(
+                &effect.effect_id,
+                "runtime",
+                1,
+                &claimed.claim_fencing_token,
+                "",
+                "park",
+                "",
+                "",
+                "",
+                "runtime",
+                20,
+            )
+            .unwrap();
+            let action = db
+                .submit_parked_resolution(
+                    &effect.effect_id,
+                    1,
+                    r#"{"answer":"yes"}"#,
+                    "",
+                    "resolve",
+                    "operator",
+                    "namespace:acme",
+                    "pending_execution",
+                    "",
+                    30,
+                )
+                .unwrap()
+                .action;
+            let barrier = Arc::new(Barrier::new(2));
+            let invoke = {
+                let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+                let (action_id, effect_id) = (
+                    action.resolution_action_id.clone(),
+                    effect.effect_id.clone(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.invoke_parked_resolution(&action_id, &effect_id, 1, "operator", 40)
+                        .map(|_| ())
+                })
+            };
+            barrier.wait();
+            let reserved = db.reserve_parked_resolution_execution(
+                &action.resolution_action_id,
+                &effect.effect_id,
+                1,
+            );
+            let invoked = invoke.join().unwrap();
+            // A deadlock abort surfaces as a bare driver error, so the loser
+            // must report one of the domain refusals instead.
+            for outcome in [&reserved, &invoked] {
+                if let Err(error) = outcome {
+                    assert!(
+                        [
+                            "resolution action is stale",
+                            "resolution action is not invokable",
+                            "resolution action is not pending execution",
+                        ]
+                        .contains(&error.as_str()),
+                        "round {round}: {error}"
+                    );
+                }
+            }
+            // Whichever call takes the effect first wins; the other sees the
+            // action already moved on.
+            assert_ne!(
+                reserved.is_ok(),
+                invoked.is_ok(),
+                "round {round}: {reserved:?} {invoked:?}"
+            );
+        }
+    }
 }
