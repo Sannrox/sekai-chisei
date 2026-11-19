@@ -333,10 +333,10 @@ impl GatewayStack {
 
         let mut gateway = None;
         let mut base = String::new();
-        for attempt in 1..=10 {
+        for _ in 1..=10 {
             let gateway_port = free_tcp_port();
-            let attempt_log = dir.path().join(format!("gateway-{attempt}.log"));
-            let log_file = std::fs::File::create(&attempt_log).expect("gateway log");
+            // Truncated per attempt, so it always holds the latest attempt's output.
+            let log_file = std::fs::File::create(&gateway_log_path).expect("gateway log");
             let child = Command::new(chisei_gateway_bin())
                 .env("SEKAI_SOCKET", &socket)
                 .env("SEKAI_DB_PATH", &sekai_db)
@@ -370,14 +370,7 @@ impl GatewayStack {
                 .spawn()
                 .expect("spawn chisei-gateway");
             let candidate = format!("http://127.0.0.1:{gateway_port}");
-            if wait_for_http(
-                &format!("{candidate}/healthz"),
-                &attempt_log,
-                Duration::from_secs(2),
-            )
-            .await
-            {
-                let _ = std::fs::copy(&attempt_log, &gateway_log_path);
+            if wait_for_http(&format!("{candidate}/healthz"), Duration::from_secs(2)).await {
                 gateway = Some(child);
                 base = candidate;
                 break;
@@ -555,7 +548,7 @@ fn wait_for_socket(socket: &Path, log_path: &Path) {
     }
 }
 
-async fn wait_for_http(url: &str, log_path: &Path, budget: Duration) -> bool {
+async fn wait_for_http(url: &str, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     let client = http_client();
     loop {
@@ -565,7 +558,6 @@ async fn wait_for_http(url: &str, log_path: &Path, budget: Duration) -> bool {
             return true;
         }
         if Instant::now() >= deadline {
-            let _ = log_path;
             return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
