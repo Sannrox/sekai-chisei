@@ -58,12 +58,22 @@ fn exercise(db: &RuntimeDb) {
         db.put_open_table_source(&taken).unwrap_err(),
         QUERY_UNAVAILABLE
     );
+    assert_eq!(
+        db.get_open_table_source("ot:orders").unwrap(),
+        Some(first.clone())
+    );
 
     assert_eq!(
         db.put_open_table_snapshot(&snapshot(9)).unwrap_err(),
         SNAPSHOT_UNAVAILABLE
     );
     db.put_open_table_snapshot(&snapshot(2)).unwrap();
+    assert_eq!(
+        db.get_open_table_snapshot("ot:orders").unwrap(),
+        Some(snapshot(2))
+    );
+    // An unchanged re-register keeps the stored snapshot.
+    db.put_open_table_source(&first).unwrap();
     assert_eq!(
         db.get_open_table_snapshot("ot:orders").unwrap(),
         Some(snapshot(2))
