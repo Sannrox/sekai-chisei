@@ -92,15 +92,33 @@ fn two_adapters_pass_deterministic_protocol_fixtures() {
     adapter_lifecycle(PROFILE_MESSAGES);
 }
 
+/// Injects an unknown `token` key into the object at `pointer` of a fixture
+/// and asserts the adapter refuses it as an unknown field.
+fn rejects_unknown_field<T>(parse: fn(&[u8]) -> Result<T, String>, fixture: &[u8], pointer: &str) {
+    let mut document: serde_json::Value = serde_json::from_slice(fixture).unwrap();
+    document
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| panic!("no object at {pointer:?}"))
+        .insert("token".into(), serde_json::json!("sk-live"));
+    match parse(&serde_json::to_vec(&document).unwrap()) {
+        Ok(_) => panic!("unknown field at {pointer:?} was accepted"),
+        Err(error) => assert!(error.contains("unknown field `token`"), "{error}"),
+    }
+}
+
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut responses: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../adapters/fixtures/model_responses.json"
-    ))
-    .unwrap();
-    responses
-        .as_object_mut()
-        .unwrap()
-        .insert("token".into(), serde_json::json!("sk-live"));
-    assert!(model_responses::parse(&serde_json::to_vec(&responses).unwrap()).is_err());
+    // Both documents are flat: fields are scalars or string lists, so the
+    // top level is the only place an unknown field can hide.
+    rejects_unknown_field(
+        model_responses::parse,
+        include_bytes!("../../../adapters/fixtures/model_responses.json"),
+        "",
+    );
+    rejects_unknown_field(
+        model_messages::parse,
+        include_bytes!("../../../adapters/fixtures/model_messages.json"),
+        "",
+    );
 }

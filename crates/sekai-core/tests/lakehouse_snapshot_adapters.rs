@@ -95,15 +95,33 @@ fn two_adapter_fixtures_pass_partitions_upgrade_redaction_deletion_reimport_and_
     adapter_lifecycle(PROFILE_METRICS);
 }
 
+/// Injects an unknown `token` key into the object at `pointer` of a fixture
+/// and asserts the adapter refuses it as an unknown field.
+fn rejects_unknown_field<T>(parse: fn(&[u8]) -> Result<T, String>, fixture: &[u8], pointer: &str) {
+    let mut document: serde_json::Value = serde_json::from_slice(fixture).unwrap();
+    document
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| panic!("no object at {pointer:?}"))
+        .insert("token".into(), serde_json::json!("sk-live"));
+    match parse(&serde_json::to_vec(&document).unwrap()) {
+        Ok(_) => panic!("unknown field at {pointer:?} was accepted"),
+        Err(error) => assert!(error.contains("unknown field `token`"), "{error}"),
+    }
+}
+
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut events: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../adapters/fixtures/lakehouse_events.json"
-    ))
-    .unwrap();
-    events
-        .as_object_mut()
-        .unwrap()
-        .insert("token".into(), serde_json::json!("ghp_nope"));
-    assert!(lakehouse_events::parse(&serde_json::to_vec(&events).unwrap()).is_err());
+    for pointer in ["", "/partitions/0", "/partitions/0/rows/0"] {
+        rejects_unknown_field(
+            lakehouse_events::parse,
+            include_bytes!("../../../adapters/fixtures/lakehouse_events.json"),
+            pointer,
+        );
+        rejects_unknown_field(
+            lakehouse_metrics::parse,
+            include_bytes!("../../../adapters/fixtures/lakehouse_metrics.json"),
+            pointer,
+        );
+    }
 }

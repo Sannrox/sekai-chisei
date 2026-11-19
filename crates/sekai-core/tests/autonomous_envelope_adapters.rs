@@ -112,15 +112,33 @@ fn lease_loss_and_receipt_invalidation_fail_closed() {
     );
 }
 
+/// Injects an unknown `token` key into the object at `pointer` of a fixture
+/// and asserts the adapter refuses it as an unknown field.
+fn rejects_unknown_field<T>(parse: fn(&[u8]) -> Result<T, String>, fixture: &[u8], pointer: &str) {
+    let mut document: serde_json::Value = serde_json::from_slice(fixture).unwrap();
+    document
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+        .unwrap_or_else(|| panic!("no object at {pointer:?}"))
+        .insert("token".into(), serde_json::json!("sk-live"));
+    match parse(&serde_json::to_vec(&document).unwrap()) {
+        Ok(_) => panic!("unknown field at {pointer:?} was accepted"),
+        Err(error) => assert!(error.contains("unknown field `token`"), "{error}"),
+    }
+}
+
 #[test]
 fn hidden_fields_fail_closed() {
-    let mut document: serde_json::Value = serde_json::from_slice(include_bytes!(
-        "../../../adapters/fixtures/autonomy_simulate.json"
-    ))
-    .unwrap();
-    document
-        .as_object_mut()
-        .unwrap()
-        .insert("token".into(), serde_json::json!("sk-live"));
-    assert!(autonomy_simulate::parse(&serde_json::to_vec(&document).unwrap()).is_err());
+    // Both documents are flat: every field is a string, so the top level is
+    // the only place an unknown field can hide.
+    rejects_unknown_field(
+        autonomy_simulate::parse,
+        include_bytes!("../../../adapters/fixtures/autonomy_simulate.json"),
+        "",
+    );
+    rejects_unknown_field(
+        autonomy_evaluate::parse,
+        include_bytes!("../../../adapters/fixtures/autonomy_evaluate.json"),
+        "",
+    );
 }
