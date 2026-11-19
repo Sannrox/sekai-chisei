@@ -100,6 +100,12 @@ impl SekaiPrincipalStoreExt for SekaiStore {
             .create_principal_grant(grant_id, object_id, grant, created)
     }
 
+    /// Raw `classification_ceiling` of `principal`'s trusted profile, the
+    /// marking ceiling of a service principal; `None` when unset.
+    fn principal_classification_ceiling(&self, principal: &str) -> Result<Option<String>, String> {
+        Ok(trusted_principal_authority(self.runtime(), principal)?.classification_token)
+    }
+
     /// Classification-marking clearance of `principal` for `object`.
     ///
     /// Unmarked objects never consult the principal profile. Marked objects
@@ -107,12 +113,6 @@ impl SekaiPrincipalStoreExt for SekaiStore {
     /// default evidence lattice when none is configured); anything but an
     /// explicit lattice deny clears. Storage errors and an ambiguous trusted
     /// principal profile are errors, which callers treat as a deny.
-    /// Raw `classification_ceiling` of `principal`'s trusted profile, the
-    /// marking ceiling of a service principal; `None` when unset.
-    fn principal_classification_ceiling(&self, principal: &str) -> Result<Option<String>, String> {
-        Ok(trusted_principal_authority(self.runtime(), principal)?.classification_token)
-    }
-
     fn principal_marking_clearance(
         &self,
         operation_id: &str,
