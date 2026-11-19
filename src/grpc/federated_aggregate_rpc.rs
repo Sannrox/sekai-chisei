@@ -300,12 +300,27 @@ fn rows_from_members(
 }
 
 impl SekaiServiceImpl {
+    /// Every store read and write of the query, receipts included, runs in
+    /// one blocking task: it finishes even when the caller goes away, so a
+    /// receipt it opened is always closed or aborted, and none of the work
+    /// holds an async executor thread.
     pub(super) async fn federated_aggregate_rpc(
         &self,
         req: Request<FederatedAggregateRequest>,
     ) -> Result<Response<FederatedAggregateResponse>, Status> {
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
+        let svc = self.clone();
+        self.spawn_db(move || svc.federated_aggregate_blocking(principals, req))
+            .await
+            .map(Response::new)
+    }
+
+    fn federated_aggregate_blocking(
+        &self,
+        principals: Vec<String>,
+        req: Request<FederatedAggregateRequest>,
+    ) -> Result<FederatedAggregateResponse, Status> {
         let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
         let parsed = parse_request(req.into_inner())?;
         let requester = parsed.query.requester.clone();
@@ -386,13 +401,7 @@ impl SekaiServiceImpl {
             }
         }
 
-        let svc = self.clone();
-        let parsed_scan = parsed.clone();
-        let covered_scan = covered.clone();
-        let evaluated = self
-            .spawn_db(move || svc.evaluate_partials(&parsed_scan, &covered_scan))
-            .await;
-        let partials = match evaluated {
+        let partials = match self.evaluate_partials(&parsed, &covered) {
             Ok((partials, changed)) => {
                 excluded.extend(changed);
                 partials
@@ -453,7 +462,7 @@ impl SekaiServiceImpl {
             }
         }
 
-        Ok(Response::new(FederatedAggregateResponse {
+        Ok(FederatedAggregateResponse {
             query_id,
             query_digest,
             groups: combined
@@ -493,7 +502,7 @@ impl SekaiServiceImpl {
                     scale: noise.scale,
                 })
                 .collect(),
-        }))
+        })
     }
 
     /// Whether `namespace` takes part, decided from its allowance and its
@@ -1712,6 +1721,10 @@ mod tests {
     /// Global so the hook still fires when the scan runs on the blocking pool.
     static AFTER_SCAN: std::sync::Mutex<Option<ScanHook>> = std::sync::Mutex::new(None);
 
+    /// Held by each test that installs [`AFTER_SCAN`], so two hook tests in
+    /// one process do not replace each other's hook.
+    static AFTER_SCAN_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     pub(super) fn after_scan(svc: &SekaiServiceImpl, namespace: &str) {
         if let Ok(hook) = AFTER_SCAN.lock()
             && let Some(hook) = hook.as_ref()
@@ -1756,6 +1769,7 @@ mod tests {
     /// namespace is excluded as unavailable, in the result and its receipt.
     #[tokio::test]
     async fn an_index_change_during_the_scan_excludes_the_namespace() {
+        let _hook = AFTER_SCAN_TESTS.lock().await;
         let svc = federation();
         let expected = std::sync::Arc::as_ptr(&svc.db.runtime_arc()) as usize;
         *AFTER_SCAN.lock().unwrap() =
@@ -1797,6 +1811,68 @@ mod tests {
         let outcome = receipt.outcome.unwrap();
         assert_eq!(outcome.returned_groups, 0);
         assert_eq!(outcome.excluded["north"], ExclusionReason::Unavailable);
+    }
+
+    /// A caller that goes away mid-scan does not strand its receipts: the
+    /// blocking task that opened them still closes them.
+    #[tokio::test]
+    async fn a_dropped_request_still_closes_its_receipts() {
+        let _hook = AFTER_SCAN_TESTS.lock().await;
+        let svc = federation();
+        let expected = std::sync::Arc::as_ptr(&svc.db.runtime_arc()) as usize;
+        let (scanning_tx, scanning_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook_channels = std::sync::Mutex::new((scanning_tx, release_rx));
+        *AFTER_SCAN.lock().unwrap() =
+            Some(Box::new(move |svc: &SekaiServiceImpl, namespace: &str| {
+                if std::sync::Arc::as_ptr(&svc.db.runtime_arc()) as usize != expected
+                    || namespace != "north"
+                {
+                    return;
+                }
+                let channels = hook_channels.lock().unwrap();
+                let _ = channels.0.send(());
+                let _ = channels.1.recv_timeout(std::time::Duration::from_secs(10));
+            }));
+        let call = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.federated_aggregate(as_principal(
+                    request(&["north", "south"], vec![measure("count", "")]),
+                    "analyst",
+                ))
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            scanning_rx.recv_timeout(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap()
+        .expect("scan started with receipts open");
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+
+        let tenants = ["buyer", "north", "south"];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let states = loop {
+            let states: Vec<_> = tenants
+                .iter()
+                .flat_map(|tenant| {
+                    federated_receipt::list_for_tenant(svc.db.runtime(), tenant, 10).unwrap()
+                })
+                .map(|receipt| receipt.state)
+                .collect();
+            if states.len() == tenants.len() && !states.contains(&ReceiptState::Open)
+                || std::time::Instant::now() > deadline
+            {
+                break states;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        *AFTER_SCAN.lock().unwrap() = None;
+        assert_eq!(states, [ReceiptState::Completed; 3]);
     }
 
     /// A rebuild marks the kind not ready before it clears members; one
