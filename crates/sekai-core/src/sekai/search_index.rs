@@ -76,7 +76,7 @@ impl SearchIndexError {
     }
 }
 
-/// A namespace's durable index position (`sekai_search_checkpoint`). A
+/// A namespace's durable index position (`sekai_search_checkpoint_v2`). A
 /// rebuild clears `analyzer_version` until it completes; `indexed_at_ms` is
 /// the last fenced write, which is the rebuild's lease.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2852,7 +2852,7 @@ pub(crate) mod tests {
     /// Index `object` the way a plane from before #2250 did, into the
     /// legacy tables, with a current checkpoint at the namespace's feed
     /// position. Uses plain ASCII text, so search folding is the identity.
-    pub(crate) fn index_into_legacy_tables(db: &RuntimeDb, object: &Object) {
+    fn index_into_legacy_tables(db: &RuntimeDb, object: &Object) {
         let watermark = db.object_change_watermark(&object.namespace).unwrap() as i64;
         let generation = db.namespace_object_generation(&object.namespace).unwrap() as i64;
         let attributes = serde_json::to_string(&policy_attributes(object)).unwrap();
@@ -2953,86 +2953,114 @@ pub(crate) mod tests {
         }
     }
 
-    /// Clear the legacy index of `namespace` the way an older plane's
-    /// rebuild did: one unfenced transaction per document.
-    fn clear_legacy_tables(db: &RuntimeDb, namespace: &str) {
-        match db {
-            RuntimeDb::Sqlite(db) => {
-                let mut conn = db.conn();
-                let ids: Vec<String> = conn
-                    .prepare("SELECT object_id FROM sekai_search_object WHERE namespace = ?1")
-                    .unwrap()
-                    .query_map([namespace], |row| row.get(0))
-                    .unwrap()
-                    .collect::<Result<_, _>>()
-                    .unwrap();
-                for object_id in ids {
-                    let tx = conn.transaction().unwrap();
-                    let rows: Vec<(i64, String, String)> = tx
-                        .prepare(
-                            "SELECT id, property, text FROM sekai_search_object_text
-                             WHERE namespace = ?1 AND object_id = ?2",
-                        )
-                        .unwrap()
-                        .query_map([namespace, object_id.as_str()], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                        })
-                        .unwrap()
-                        .collect::<Result<_, _>>()
-                        .unwrap();
-                    for (id, property, text) in rows {
-                        tx.execute(
-                            "INSERT INTO sekai_search_object_fts(sekai_search_object_fts, rowid, property, text)
-                             VALUES('delete', ?1, ?2, ?3)",
-                            rusqlite::params![id, property, indexed_search_text(&text)],
-                        )
-                        .unwrap();
-                    }
-                    tx.execute(
-                        "DELETE FROM sekai_search_object_text WHERE namespace = ?1 AND object_id = ?2",
-                        [namespace, object_id.as_str()],
-                    )
-                    .unwrap();
-                    tx.execute(
-                        "DELETE FROM sekai_search_object WHERE namespace = ?1 AND object_id = ?2",
-                        [namespace, object_id.as_str()],
-                    )
-                    .unwrap();
-                    tx.commit().unwrap();
-                }
-            }
-            RuntimeDb::Postgres(db) => {
-                let mut conn = db.connection().unwrap();
-                let ids: Vec<String> = conn
-                    .query(
-                        "SELECT object_id FROM sekai_search_object WHERE namespace = $1",
-                        &[&namespace],
-                    )
-                    .unwrap()
-                    .iter()
-                    .map(|row| row.get(0))
-                    .collect();
-                for object_id in ids {
-                    let mut tx = conn.transaction().unwrap();
-                    tx.execute(
-                        "DELETE FROM sekai_search_object_text WHERE namespace = $1 AND object_id = $2",
-                        &[&namespace, &object_id],
-                    )
-                    .unwrap();
-                    tx.execute(
-                        "DELETE FROM sekai_search_object WHERE namespace = $1 AND object_id = $2",
-                        &[&namespace, &object_id],
-                    )
-                    .unwrap();
-                    tx.commit().unwrap();
-                }
-            }
-        }
+    /// The index tables of planes from before #2250, as SQLite stores from
+    /// the releases that shipped #2250 still hold them.
+    const LEGACY_SQLITE_SCHEMA: &str = "
+        CREATE TABLE sekai_search_checkpoint (
+            namespace TEXT PRIMARY KEY,
+            analyzer_version TEXT NOT NULL,
+            last_change_rowid INTEGER NOT NULL DEFAULT 0,
+            last_generation INTEGER NOT NULL DEFAULT 0,
+            dataset_catalog_digest TEXT NOT NULL DEFAULT '',
+            indexed_at_ms INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE sekai_search_object (
+            namespace TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            access_marking TEXT NOT NULL DEFAULT '',
+            policy_attributes TEXT NOT NULL DEFAULT '{}',
+            content_digest TEXT NOT NULL,
+            indexed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (namespace, object_id)
+        );
+        CREATE TABLE sekai_search_object_text (
+            id INTEGER PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            object_id TEXT NOT NULL,
+            property TEXT NOT NULL,
+            text TEXT NOT NULL,
+            UNIQUE (namespace, object_id, property)
+        );
+        CREATE TABLE sekai_search_dataset (
+            namespace TEXT NOT NULL,
+            dataset_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            bound_object_id TEXT NOT NULL DEFAULT '',
+            bound_access_marking TEXT NOT NULL DEFAULT '',
+            bound_policy_attributes TEXT NOT NULL DEFAULT '{}',
+            columns TEXT NOT NULL DEFAULT '[]',
+            content_digest TEXT NOT NULL,
+            indexed_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (namespace, dataset_id)
+        );
+        CREATE TABLE sekai_search_dataset_text (
+            id INTEGER PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            dataset_id TEXT NOT NULL,
+            field TEXT NOT NULL,
+            classification TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            UNIQUE (namespace, dataset_id, field)
+        );
+        CREATE VIRTUAL TABLE sekai_search_object_fts USING fts5(
+            property UNINDEXED, text,
+            content='sekai_search_object_text', content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE VIRTUAL TABLE sekai_search_dataset_fts USING fts5(
+            field UNINDEXED, text,
+            content='sekai_search_dataset_text', content_rowid='id',
+            tokenize='unicode61 remove_diacritics 2'
+        );
+    ";
+
+    /// A store as the releases that shipped #2250 leave it: `note-a`
+    /// ("join customers") indexed by the current plane, and the legacy
+    /// tables populated by an older one.
+    pub(crate) fn index_into_both_indexes(db: &RuntimeDb) {
+        let note = object("note-a", "acme", "alpha", &[("body", "join customers")]);
+        db.create_object_with_audit(&note, "editor").unwrap();
+        db.catch_up_search_namespace("acme", 10).unwrap();
+        index_into_legacy_tables(db, &note);
     }
 
-    /// After an upgrade seeded the new index from [`index_into_legacy_tables`]
-    /// for `note-a` ("join customers"), new code serves it without a rebuild.
-    pub(crate) fn assert_seeded_hit_is_served_without_a_rebuild(db: &RuntimeDb) {
+    /// After the upgrade from [`index_into_both_indexes`] the legacy tables
+    /// are gone and `note-a` is still found, without a rebuild.
+    pub(crate) fn assert_legacy_index_dropped_and_hit_kept(db: &RuntimeDb) {
+        let legacy = [
+            "sekai_search_checkpoint",
+            "sekai_search_object",
+            "sekai_search_object_text",
+            "sekai_search_object_fts",
+            "sekai_search_dataset",
+            "sekai_search_dataset_text",
+            "sekai_search_dataset_fts",
+        ];
+        let remaining: Vec<&str> = legacy
+            .into_iter()
+            .filter(|table| match db {
+                RuntimeDb::Sqlite(db) => db
+                    .conn()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+                RuntimeDb::Postgres(db) => db
+                    .connection()
+                    .unwrap()
+                    .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])
+                    .unwrap()
+                    .get(0),
+            })
+            .collect();
+        assert_eq!(remaining, Vec::<&str>::new());
+        assert_hit_is_served_without_a_rebuild(db);
+    }
+
+    fn assert_hit_is_served_without_a_rebuild(db: &RuntimeDb) {
         let query = SearchCandidateQuery {
             mode: SearchQueryMode::Text,
             text: "customers".into(),
@@ -3044,7 +3072,6 @@ pub(crate) mod tests {
             },
             limit: 10,
         };
-        // Before any catch-up: the hit comes from the seeded index.
         let hits = db.query_candidates(&query).unwrap().candidates;
         assert_eq!(hits.len(), 1);
         let status = db.status("acme", 10).unwrap();
@@ -3057,89 +3084,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_upgrade_seeds_the_new_index_from_the_legacy_one() {
+    fn an_upgrade_drops_the_legacy_index_and_keeps_search_results() {
         let db = RuntimeDb::memory();
         let RuntimeDb::Sqlite(sqlite) = &db else {
             unreachable!()
         };
-        // The store as a plane from before #2250 left it.
-        sqlite
-            .conn()
-            .execute_batch(
-                "DROP TABLE sekai_search_object_v2_fts;
-                 DROP TABLE sekai_search_dataset_v2_fts;
-                 DROP TABLE sekai_search_checkpoint_v2;
-                 DROP TABLE sekai_search_object_v2;
-                 DROP TABLE sekai_search_object_text_v2;
-                 DROP TABLE sekai_search_dataset_v2;
-                 DROP TABLE sekai_search_dataset_text_v2;",
-            )
-            .unwrap();
-        let note = object("note-a", "acme", "alpha", &[("body", "join customers")]);
-        db.create_object_with_audit(&note, "editor").unwrap();
-        index_into_legacy_tables(&db, &note);
+        sqlite.conn().execute_batch(LEGACY_SQLITE_SCHEMA).unwrap();
+        index_into_both_indexes(&db);
         sqlite.migrate_search_index().unwrap();
-        // A second open finds the index created and does not seed again.
+        // Every open migrates; a second one finds nothing left to drop.
         sqlite.migrate_search_index().unwrap();
-        assert_seeded_hit_is_served_without_a_rebuild(&db);
-    }
-
-    fn exercise_legacy_writes_leave_the_new_index_alone(db: &RuntimeDb) {
-        let store = maintenance(db);
-        let alpha = object("note-a", "acme", "alpha", &[("body", "join customers")]);
-        db.create_object_with_audit(&alpha, "editor").unwrap();
-        db.create_object_with_audit(&object("note-b", "acme", "beta", &[]), "editor")
-            .unwrap();
-        // A fenced rebuild of the new index indexes one object.
-        let mut revision = store.start_search_rebuild("acme", 0, 10).unwrap();
-        revision = store
-            .write_search_document("acme", DocumentWrite::IndexObject(&alpha), revision, 11)
-            .unwrap();
-        // Meanwhile an older plane indexes, publishes, and then clears its
-        // own index.
-        let stale = object("note-a", "acme", "alpha", &[("body", "stale words")]);
-        index_into_legacy_tables(db, &stale);
-        clear_legacy_tables(db, "acme");
-        // The fenced rebuild finishes and publishes the new index intact.
-        let beta = store.get_object("note-b").unwrap().unwrap();
-        revision = store
-            .write_search_document("acme", DocumentWrite::IndexObject(&beta), revision, 12)
-            .unwrap();
-        store
-            .advance_search_checkpoint(
-                "acme",
-                &SearchPosition {
-                    last_change_rowid: db.object_change_watermark("acme").unwrap(),
-                    last_generation: db.namespace_object_generation("acme").unwrap(),
-                    dataset_catalog_digest: dataset_catalog_digest(&[]),
-                },
-                revision,
-                13,
-            )
-            .unwrap();
-        let status = db.status("acme", 13).unwrap();
-        assert_eq!(status.analyzer_version, ANALYZER_VERSION);
-        assert_eq!(status.object_count, 2);
-        let dump = db.search_index_dump("acme").unwrap();
-        assert_eq!(
-            dump.objects["note-a"]
-                .properties
-                .get("body")
-                .map(String::as_str),
-            Some("join customers")
-        );
-    }
-
-    #[test]
-    fn legacy_writes_leave_the_new_index_alone() {
-        exercise_legacy_writes_leave_the_new_index_alone(&RuntimeDb::memory());
-    }
-
-    #[test]
-    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
-    fn postgres_legacy_writes_leave_the_new_index_alone() {
-        let (_scratch, db) = postgres_runtime();
-        exercise_legacy_writes_leave_the_new_index_alone(&db);
+        assert_legacy_index_dropped_and_hit_kept(&db);
     }
 
     fn exercise_lag_gauge_moves_with_unindexed_backlog(db: &RuntimeDb) {

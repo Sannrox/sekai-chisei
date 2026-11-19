@@ -236,6 +236,8 @@ const DEFINITION_BRANCH_ARCHIVE_SCHEMA: &str =
     include_str!("postgres/0165_definition_branch_archive.sql");
 const FACT_MIGRATION_POST_VALUES_SCHEMA: &str =
     include_str!("postgres/0166_fact_migration_post_values.sql");
+const DROP_LEGACY_SEARCH_INDEX_SCHEMA: &str =
+    include_str!("postgres/0167_drop_legacy_search_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1202,6 +1204,12 @@ const MIGRATIONS: &[Migration] = &[
         166,
         "fact_migration_post_values",
         FACT_MIGRATION_POST_VALUES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        167,
+        "drop_legacy_search_index",
+        DROP_LEGACY_SEARCH_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2584,7 +2592,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
-    fn search_index_upgrade_seeds_the_new_index_from_the_legacy_one() {
+    fn search_index_upgrade_drops_the_legacy_index_and_keeps_search_results() {
         let _guard = POSTGRES_MIGRATION_TEST
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2592,27 +2600,14 @@ mod tests {
         reset_database(&db);
         let before = MIGRATIONS
             .iter()
-            .position(|migration| migration.name == "search_index_v2")
+            .position(|migration| migration.name == "drop_legacy_search_index")
             .unwrap();
         db.migrate_with(&MIGRATIONS[..before]).unwrap();
-        let runtime = crate::db::runtime_db::RuntimeDb::Postgres(Arc::new(db));
-        let note = crate::domain::Object {
-            id: "note-a".into(),
-            kind: "note".into(),
-            name: "alpha".into(),
-            namespace: "acme".into(),
-            external_id: String::new(),
-            properties: [("body".to_string(), "join customers".to_string())].into(),
-            created: 1,
-            updated: 1,
-        };
-        runtime.create_object_with_audit(&note, "editor").unwrap();
-        crate::sekai::search_index::tests::index_into_legacy_tables(&runtime, &note);
-        let crate::db::runtime_db::RuntimeDb::Postgres(db) = &runtime else {
-            unreachable!()
-        };
+        let db = Arc::new(db);
+        let runtime = crate::db::runtime_db::RuntimeDb::Postgres(Arc::clone(&db));
+        crate::sekai::search_index::tests::index_into_both_indexes(&runtime);
         db.migrate().unwrap();
-        crate::sekai::search_index::tests::assert_seeded_hit_is_served_without_a_rebuild(&runtime);
+        crate::sekai::search_index::tests::assert_legacy_index_dropped_and_hit_kept(&runtime);
     }
 
     #[test]

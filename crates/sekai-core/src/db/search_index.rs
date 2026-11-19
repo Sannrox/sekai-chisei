@@ -23,11 +23,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-/// The search index this plane reads and writes (#2250). Planes from before
-/// the fenced catch-up keep the unsuffixed tables in [`LEGACY_SCHEMA`], so
-/// the two never write each other's index; both follow the object-change
-/// feed and the dataset catalog. The legacy tables are retired and dropped
-/// in a later release. Mirrors PostgreSQL migration 0154.
+/// The search index this plane reads and writes (#2250), in its own
+/// `*_v2` tables. Mirrors PostgreSQL migration 0154.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sekai_search_checkpoint_v2 (
     namespace TEXT PRIMARY KEY,
@@ -93,100 +90,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS sekai_search_dataset_v2_fts USING fts5(
 );
 ";
 
-/// The index of planes from before #2250, unchanged: still created so an
-/// older plane (during a rolling deploy or after a rollback) finds its
-/// tables, and read once to seed [`SCHEMA`]. Never written by this plane.
-const LEGACY_SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS sekai_search_checkpoint (
-    namespace TEXT PRIMARY KEY,
-    analyzer_version TEXT NOT NULL,
-    last_change_rowid INTEGER NOT NULL DEFAULT 0,
-    last_generation INTEGER NOT NULL DEFAULT 0,
-    dataset_catalog_digest TEXT NOT NULL DEFAULT '',
-    indexed_at_ms INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS sekai_search_object (
-    namespace TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    access_marking TEXT NOT NULL DEFAULT '',
-    policy_attributes TEXT NOT NULL DEFAULT '{}',
-    content_digest TEXT NOT NULL,
-    indexed_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, object_id)
-);
-CREATE TABLE IF NOT EXISTS sekai_search_object_text (
-    id INTEGER PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    property TEXT NOT NULL,
-    text TEXT NOT NULL,
-    UNIQUE (namespace, object_id, property)
-);
-CREATE TABLE IF NOT EXISTS sekai_search_dataset (
-    namespace TEXT NOT NULL,
-    dataset_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    bound_object_id TEXT NOT NULL DEFAULT '',
-    bound_access_marking TEXT NOT NULL DEFAULT '',
-    bound_policy_attributes TEXT NOT NULL DEFAULT '{}',
-    columns TEXT NOT NULL DEFAULT '[]',
-    content_digest TEXT NOT NULL,
-    indexed_at_ms INTEGER NOT NULL,
-    PRIMARY KEY (namespace, dataset_id)
-);
-CREATE TABLE IF NOT EXISTS sekai_search_dataset_text (
-    id INTEGER PRIMARY KEY,
-    namespace TEXT NOT NULL,
-    dataset_id TEXT NOT NULL,
-    field TEXT NOT NULL,
-    classification TEXT NOT NULL DEFAULT '',
-    text TEXT NOT NULL,
-    UNIQUE (namespace, dataset_id, field)
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS sekai_search_object_fts USING fts5(
-    property UNINDEXED,
-    text,
-    content='sekai_search_object_text',
-    content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS sekai_search_dataset_fts USING fts5(
-    field UNINDEXED,
-    text,
-    content='sekai_search_dataset_text',
-    content_rowid='id',
-    tokenize='unicode61 remove_diacritics 2'
-);
-";
-
-/// Copy the legacy index into the new tables, once, as they are created.
-/// Text rows keep their ids, so the full-text index is refilled from them.
-const SEED_FROM_LEGACY: &str = "
-INSERT INTO sekai_search_checkpoint_v2
-    (namespace, analyzer_version, last_change_rowid, last_generation,
-     dataset_catalog_digest, indexed_at_ms)
-SELECT namespace, analyzer_version, last_change_rowid, last_generation,
-       dataset_catalog_digest, indexed_at_ms
-FROM sekai_search_checkpoint;
-INSERT INTO sekai_search_object_v2
-    (namespace, object_id, kind, access_marking, policy_attributes,
-     content_digest, indexed_at_ms)
-SELECT namespace, object_id, kind, access_marking, policy_attributes,
-       content_digest, indexed_at_ms
-FROM sekai_search_object;
-INSERT INTO sekai_search_object_text_v2 (id, namespace, object_id, property, text)
-SELECT id, namespace, object_id, property, text FROM sekai_search_object_text;
-INSERT INTO sekai_search_dataset_v2
-    (namespace, dataset_id, name, bound_object_id, bound_access_marking,
-     bound_policy_attributes, columns, content_digest, indexed_at_ms)
-SELECT namespace, dataset_id, name, bound_object_id, bound_access_marking,
-       bound_policy_attributes, columns, content_digest, indexed_at_ms
-FROM sekai_search_dataset;
-INSERT INTO sekai_search_dataset_text_v2
-    (id, namespace, dataset_id, field, classification, text)
-SELECT id, namespace, dataset_id, field, classification, text
-FROM sekai_search_dataset_text;
+/// The index of planes from before #2250 (#2255). Rollback below the release
+/// that introduced [`SCHEMA`] is unsupported, so nothing reads these tables.
+/// Full-text tables go first, before the content tables they read. Mirrors
+/// PostgreSQL migration 0167.
+const DROP_LEGACY_SCHEMA: &str = "
+DROP TABLE IF EXISTS sekai_search_object_fts;
+DROP TABLE IF EXISTS sekai_search_dataset_fts;
+DROP TABLE IF EXISTS sekai_search_checkpoint;
+DROP TABLE IF EXISTS sekai_search_object;
+DROP TABLE IF EXISTS sekai_search_object_text;
+DROP TABLE IF EXISTS sekai_search_dataset;
+DROP TABLE IF EXISTS sekai_search_dataset_text;
 ";
 
 fn lattice_marking_allows(
@@ -198,69 +113,17 @@ fn lattice_marking_allows(
 }
 
 impl SekaiDb {
+    /// Create the search index and drop the legacy one. Idempotent; runs on
+    /// every open.
     pub fn migrate_search_index(&self) -> Result<(), String> {
         let mut conn = self.conn();
-        conn.execute_batch(LEGACY_SCHEMA)
-            .map_err(|error| error.to_string())?;
-        // Columns the legacy dataset table gained before it was retired.
-        for column in [
-            "bound_access_marking TEXT NOT NULL DEFAULT ''",
-            "bound_policy_attributes TEXT NOT NULL DEFAULT '{}'",
-            "bound_object_id TEXT NOT NULL DEFAULT ''",
-        ] {
-            let _ = conn.execute(
-                &format!("ALTER TABLE sekai_search_dataset ADD COLUMN {column}"),
-                [],
-            );
-        }
-        // One writer creates and seeds the new index; a second plane opening
-        // the same file waits, then finds it created.
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let created: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'sekai_search_checkpoint_v2')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
         tx.execute_batch(SCHEMA)
             .map_err(|error| error.to_string())?;
-        if !created {
-            tx.execute_batch(SEED_FROM_LEGACY)
-                .map_err(|error| error.to_string())?;
-            for (table, label) in [
-                ("sekai_search_object", "property"),
-                ("sekai_search_dataset", "field"),
-            ] {
-                let rows = {
-                    let mut stmt = tx
-                        .prepare(&format!("SELECT id, {label}, text FROM {table}_text_v2"))
-                        .map_err(|error| error.to_string())?;
-                    stmt.query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?
-                };
-                for (id, field, text) in rows {
-                    tx.execute(
-                        &format!(
-                            "INSERT INTO {table}_v2_fts(rowid, {label}, text) VALUES (?1, ?2, ?3)"
-                        ),
-                        params![id, field, indexed_search_text(&text)],
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-            }
-        }
+        tx.execute_batch(DROP_LEGACY_SCHEMA)
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())
     }
 
