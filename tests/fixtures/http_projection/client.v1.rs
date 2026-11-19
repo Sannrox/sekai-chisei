@@ -2,6 +2,11 @@
 
 pub const HTTP_PROJECTION_CONTRACT: &str = "sekai.http-projection/v1";
 pub const HTTP_UNARY_METHODS: &[(&str, &str)] = &[
+        ("sekai.SekaiService", "AcquireLease"),
+        ("sekai.SekaiService", "GetLease"),
+        ("sekai.SekaiService", "RefreshLease"),
+        ("sekai.SekaiService", "ReleaseLease"),
+        ("sekai.SekaiService", "TakeoverExpiredLease"),
         ("sekai.SekaiService", "ApplySourceBatch"),
         ("sekai.SekaiService", "GetSourceSyncState"),
         ("sekai.SekaiService", "CreateDefinitionBranch"),

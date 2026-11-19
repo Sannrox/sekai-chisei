@@ -40,11 +40,12 @@ use sekai_chisei::grpc::pb::sekai::{
     GetActionInstanceRequest, GetGovernedDocumentRequest, GetLeaseRequest, GetLinkedObjectsRequest,
     GetObjectRequest, GetObjectTypeIndexStatusRequest, GovernedActionType,
     GovernedDocumentAdmission, GraphQuery, HoldGovernedDocumentRequest, ListActionInstancesRequest,
-    ListFilter, ListObjectsRequest, Object, ObjectTypeDatasource, PropertyValue,
-    PutActionBindingRequest, PutGovernedActionTypeRequest, PutObjectTypeIndexEditRequest,
-    RegisterObjectTypeDatasourceRequest, ReindexObjectTypeRequest,
-    ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, Row, RunActionBindingRequest,
-    SubmitActionInstanceRequest, TraverseRequest, UpdateObjectRequest,
+    ListEmbeddingSpecsRequest, ListFilter, ListObjectsRequest, Object, ObjectTypeDatasource,
+    PropertyValue, PutActionBindingRequest, PutGovernedActionTypeRequest,
+    PutObjectTypeIndexEditRequest, RefreshLeaseRequest, RegisterObjectTypeDatasourceRequest,
+    ReindexObjectTypeRequest, ReleaseGovernedDocumentHoldRequest, ReleaseLeaseRequest, Row,
+    RunActionBindingRequest, SubmitActionInstanceRequest, TakeoverExpiredLeaseRequest,
+    TraverseRequest, UpdateObjectRequest,
 };
 use sekai_chisei::sekai::semantic::CAPABILITY_RESOLVE_REF;
 use serde_json::{Value, json};
@@ -186,6 +187,15 @@ impl NativeServer {
     }
 
     fn spawn_with_ollama(ollama_url: Option<&str>) -> Self {
+        Self::spawn_configured(ollama_url, true)
+    }
+
+    /// A plane as shipped: experimental RPCs stay refused.
+    fn spawn_default_plane() -> Self {
+        Self::spawn_configured(None, false)
+    }
+
+    fn spawn_configured(ollama_url: Option<&str>, experimental_rpcs: bool) -> Self {
         static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _start = START_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -210,8 +220,7 @@ impl NativeServer {
             .env("LLM_HTTP_CONNECT_TIMEOUT_SECS", "2")
             .env("LLM_HTTP_READ_TIMEOUT_SECS", "5")
             .env("LLM_HTTP_REQUEST_TIMEOUT_SECS", "5")
-            // Product-palette RPCs still classified experimental on current main.
-            .env("SEKAI_EXPERIMENTAL_RPCS", "1")
+            .env_remove("SEKAI_EXPERIMENTAL_RPCS")
             .env_remove("SEKAI_INSECURE")
             .env_remove("SEKAI_CREDENTIAL")
             .env_remove("SEKAI_BIND")
@@ -229,6 +238,10 @@ impl NativeServer {
             .stdout(Stdio::from(log.try_clone().expect("clone log")))
             .stderr(Stdio::from(log));
         crate::isolate_object_log(&mut command, dir.path());
+        if experimental_rpcs {
+            // Product-palette RPCs still classified experimental on current main.
+            command.env("SEKAI_EXPERIMENTAL_RPCS", "1");
+        }
         if let Some(url) = ollama_url {
             command.env("OLLAMA_URL", url);
         } else {
@@ -841,44 +854,104 @@ async fn spawned_binary_traverses_graph() {
     );
 }
 
+/// The lease RPCs are stable (#3266): a plane with experimental RPCs off
+/// serves acquire, refresh, get, release, and takeover after expiry.
 #[tokio::test(flavor = "multi_thread")]
-async fn spawned_binary_acquires_and_releases_lease() {
-    let (_fake, server) = seeded_server().await;
+async fn default_plane_serves_the_lease_lifecycle() {
+    let server = NativeServer::spawn_default_plane();
     let mut sekai = server.sekai().await;
+    let gated = sekai
+        .list_embedding_specs(ListEmbeddingSpecsRequest {
+            namespace: "runners".into(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("an experimental RPC stays refused on the default plane");
+    assert_eq!(gated.code(), Code::FailedPrecondition, "{gated}");
+
     let lease = sekai
         .acquire_lease(AcquireLeaseRequest {
-            namespace: "demo".into(),
-            key: "object:svc-api".into(),
-            owner: "local".into(),
+            namespace: "runners".into(),
+            key: "feed:orders".into(),
+            owner: "runner-a".into(),
             ttl_ms: 30_000,
-            request_id: "palette-lease".into(),
+            request_id: "acquire".into(),
         })
         .await
         .unwrap_or_else(|error| panic!("acquire lease: {error}\n{}", server.logs()))
         .into_inner()
         .lease
         .expect("lease");
-    assert_eq!(lease.owner, "local");
+    let refreshed = sekai
+        .refresh_lease(RefreshLeaseRequest {
+            namespace: "runners".into(),
+            key: "feed:orders".into(),
+            fencing_token: lease.fencing_token.clone(),
+            ttl_ms: 30_000,
+            request_id: "refresh".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("refresh lease: {error}\n{}", server.logs()))
+        .into_inner()
+        .lease
+        .expect("refreshed lease");
+    assert_eq!(refreshed.generation, lease.generation);
     let loaded = sekai
         .get_lease(GetLeaseRequest {
-            namespace: "demo".into(),
-            key: "object:svc-api".into(),
+            namespace: "runners".into(),
+            key: "feed:orders".into(),
         })
         .await
         .unwrap_or_else(|error| panic!("get lease: {error}\n{}", server.logs()))
         .into_inner()
         .lease
         .expect("loaded lease");
-    assert_eq!(loaded.generation, lease.generation);
-    sekai
+    assert_eq!(loaded, refreshed);
+    let released = sekai
         .release_lease(ReleaseLeaseRequest {
-            namespace: "demo".into(),
-            key: "object:svc-api".into(),
+            namespace: "runners".into(),
+            key: "feed:orders".into(),
             fencing_token: lease.fencing_token,
-            request_id: "palette-lease-release".into(),
+            request_id: "release".into(),
         })
         .await
-        .unwrap_or_else(|error| panic!("release lease: {error}\n{}", server.logs()));
+        .unwrap_or_else(|error| panic!("release lease: {error}\n{}", server.logs()))
+        .into_inner()
+        .lease
+        .expect("released lease");
+    assert_eq!(released.status, "released");
+
+    let short = sekai
+        .acquire_lease(AcquireLeaseRequest {
+            namespace: "runners".into(),
+            key: "feed:invoices".into(),
+            owner: "runner-a".into(),
+            ttl_ms: 50,
+            request_id: "acquire-short".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("acquire short lease: {error}\n{}", server.logs()))
+        .into_inner()
+        .lease
+        .expect("short lease");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let taken = sekai
+        .takeover_expired_lease(TakeoverExpiredLeaseRequest {
+            namespace: "runners".into(),
+            key: "feed:invoices".into(),
+            owner: "runner-b".into(),
+            expected_fencing_token: short.fencing_token,
+            expected_expires_at_ms: short.expires_at_ms,
+            ttl_ms: 30_000,
+            request_id: "takeover".into(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("take over lease: {error}\n{}", server.logs()))
+        .into_inner()
+        .lease
+        .expect("taken-over lease");
+    assert_eq!(taken.owner, "runner-b");
+    assert_eq!(taken.generation, short.generation + 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

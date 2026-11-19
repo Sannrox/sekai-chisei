@@ -218,6 +218,36 @@ async fn dispatch<I>(
     body: Bytes,
 ) -> Response {
     match (service, method) {
+        ("sekai.SekaiService", "AcquireLease") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::acquire_lease(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetLease") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_lease(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RefreshLease") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::refresh_lease(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ReleaseLease") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::release_lease(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "TakeoverExpiredLease") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::takeover_expired_lease(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "ApplySourceBatch") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::apply_source_batch(&*svc, req).await

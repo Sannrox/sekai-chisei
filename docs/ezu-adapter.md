@@ -64,9 +64,10 @@ A namespace administrator sets up:
    `sekaictl admin governance action type put --file <type.json>`
    defines the type the events submit, with a closed parameter schema. Pin
    its version in the adapter configuration.
-3. **Leases.** `AcquireLease` and `TakeoverExpiredLease` are experimental.
-   The plane runs with `SEKAI_EXPERIMENTAL_RPCS=1`. Subscriptions, object
-   reads and Action submits are stable.
+3. **Leases.** The lease RPCs are stable (#3266), like subscriptions, object
+   reads and Action submits. `PutServicePrincipal` and
+   `IssueServicePrincipalToken` in step 1 are still experimental and need
+   `SEKAI_EXPERIMENTAL_RPCS=1` on the plane.
 
 No Ezu setting goes into the plane.
 

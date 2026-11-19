@@ -1,8 +1,13 @@
 # Generation-fenced leases
 
-Lease RPCs (`AcquireLease`, `GetLease`, and siblings) are classified
-`experimental` and are rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature is enabled.
+The lease RPCs (`AcquireLease`, `GetLease`, `RefreshLease`, `ReleaseLease`,
+`TakeoverExpiredLease`) are `stable` (#3266): a default plane serves them over
+gRPC and the HTTP/JSON projection, and their wire is frozen.
+
+Inputs are bounded on SQLite and PostgreSQL alike. `namespace`, `key`,
+`owner`, `fencing_token`, and `request_id` are non-blank, at most 512 bytes,
+and contain no NUL. `ttl_ms` is between 1 and 86,400,000 (24 hours). Anything
+else is `INVALID_ARGUMENT`.
 
 Sekai exposes namespace-scoped leases for coordinating one active owner of a
 logical key. Acquire returns both a monotonically increasing `generation` and
