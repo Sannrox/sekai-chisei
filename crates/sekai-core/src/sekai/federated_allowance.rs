@@ -68,8 +68,7 @@ pub fn publish(
     check_reason(reason)?;
     let allowance_digest = allowance.digest().map_err(|error| error.to_string())?;
     let (namespace, object_type) = (allowance.namespace.clone(), allowance.object_type.clone());
-    mirror_history(db, &namespace, &object_type)?;
-    let latest = db.latest_federated_allowance(&namespace, &object_type)?;
+    let latest = mirror_latest(db, &namespace, &object_type)?;
     if let Some((_, current)) = &latest
         && current.active()
         && current.allowance_digest == allowance_digest
@@ -101,8 +100,7 @@ pub fn withdraw(
     now_ms: i64,
 ) -> Result<Option<AllowanceRecord>, String> {
     check_reason(reason)?;
-    mirror_history(db, namespace, object_type)?;
-    let Some((seq, current)) = db.latest_federated_allowance(namespace, object_type)? else {
+    let Some((seq, current)) = mirror_latest(db, namespace, object_type)? else {
         return Ok(None);
     };
     if !current.active() {
@@ -138,11 +136,19 @@ fn record_change(db: &RuntimeDb, seq: i64, record: &AllowanceRecord) -> Result<(
     mirror(db, seq, record)
 }
 
-fn mirror_history(db: &RuntimeDb, namespace: &str, object_type: &str) -> Result<(), String> {
-    for (seq, record) in db.federated_allowance_history(namespace, object_type)? {
-        mirror(db, seq, &record)?;
+/// The latest history entry, after re-mirroring its audit decision. Every
+/// change is mirrored right after its insert and the next change reads this
+/// entry first, so only the latest one can be missing its audit record.
+fn mirror_latest(
+    db: &RuntimeDb,
+    namespace: &str,
+    object_type: &str,
+) -> Result<Option<(i64, AllowanceRecord)>, String> {
+    let latest = db.latest_federated_allowance(namespace, object_type)?;
+    if let Some((seq, record)) = &latest {
+        mirror(db, *seq, record)?;
     }
-    Ok(())
+    Ok(latest)
 }
 
 /// A digest of the length-prefixed (namespace, object type, seq), so no two
@@ -412,6 +418,45 @@ mod tests {
         let mut outcomes: Vec<_> = decisions.iter().map(|d| d.outcome.as_str()).collect();
         outcomes.sort();
         assert_eq!(outcomes, ["published", "published", "withdrawn"]);
+    }
+
+    #[test]
+    fn a_change_whose_audit_was_lost_is_mirrored_on_the_next_call() {
+        let db = RuntimeDb::memory();
+        let audited = |db: &RuntimeDb| {
+            db.list_decisions(&DecisionFilter {
+                action: Some("federated_aggregate_allowance".into()),
+                ..Default::default()
+            })
+            .unwrap()
+            .len()
+        };
+        // Inserted without its audit decision, as if the process died
+        // between the insert and the mirror.
+        let lost = AllowanceRecord {
+            allowance_digest: allowance("acme", 3).digest().unwrap(),
+            allowance: allowance("acme", 3),
+            published_by: "admin".into(),
+            published_at_ms: 1,
+            reason: "opt in".into(),
+            withdrawn_by: String::new(),
+            withdrawn_at_ms: 0,
+            withdrawal_reason: String::new(),
+        };
+        assert!(db.insert_federated_allowance(1, &lost).unwrap());
+        assert_eq!(audited(&db), 0);
+
+        assert_eq!(
+            publish(&db, allowance("acme", 3), "retry", "admin", 2).unwrap(),
+            lost
+        );
+        assert_eq!(audited(&db), 1);
+        assert_eq!(
+            db.federated_allowance_history("acme", "shipment")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
