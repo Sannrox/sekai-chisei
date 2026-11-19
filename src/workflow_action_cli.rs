@@ -245,4 +245,98 @@ mod tests {
         assert!(usage.contains("callback"));
         assert!(usage.contains("reconcile"));
     }
+
+    fn args(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn envelope_parser_defaults_the_actor_and_refuses_bad_input() {
+        let parsed = parse_envelope(&args(&["--envelope", "step.json"])).unwrap();
+        assert_eq!(parsed.path, PathBuf::from("step.json"));
+        assert_eq!(parsed.actor, "operator");
+        let parsed =
+            parse_envelope(&args(&["--actor", "agent:ops", "--envelope", "step.json"])).unwrap();
+        assert_eq!(parsed.actor, "agent:ops");
+
+        let refused = |raw: &[&str]| parse_envelope(&args(raw)).err().unwrap();
+        assert_eq!(refused(&[]), "--envelope is required");
+        assert_eq!(refused(&["--envelope"]), "--envelope requires a value");
+        assert_eq!(
+            refused(&["--envelope", "x", "--force"]),
+            "unknown option --force"
+        );
+        // A flag never takes the next flag as its value.
+        assert_eq!(
+            refused(&["--actor", "--envelope", "x"]),
+            "--actor requires a value"
+        );
+    }
+
+    #[test]
+    fn callback_parser_defaults_the_actor_and_requires_both_flags() {
+        let parsed = parse_callback(&args(&[
+            "--envelope",
+            "step.json",
+            "--payload-digest",
+            "sha256:abc",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.path, PathBuf::from("step.json"));
+        assert_eq!(parsed.payload_digest, "sha256:abc");
+        assert_eq!(parsed.actor, "operator");
+        let parsed = parse_callback(&args(&[
+            "--envelope",
+            "step.json",
+            "--payload-digest",
+            "sha256:abc",
+            "--actor",
+            "agent:ops",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.actor, "agent:ops");
+
+        let refused = |raw: &[&str]| parse_callback(&args(raw)).err().unwrap();
+        assert_eq!(
+            refused(&["--payload-digest", "sha256:abc"]),
+            "--envelope is required"
+        );
+        assert_eq!(
+            refused(&["--envelope", "step.json"]),
+            "--payload-digest is required"
+        );
+        assert_eq!(
+            refused(&["--envelope", "step.json", "--payload-digest"]),
+            "--payload-digest requires a value"
+        );
+        assert_eq!(refused(&["--digest", "x"]), "unknown option --digest");
+    }
+
+    #[test]
+    fn binding_parser_defaults_the_actor_and_requires_both_flags() {
+        let parsed =
+            parse_binding_actor(&args(&["--namespace", "ops", "--binding-id", "b-1"])).unwrap();
+        assert_eq!(parsed.namespace, "ops");
+        assert_eq!(parsed.binding_id, "b-1");
+        assert_eq!(parsed.actor, "operator");
+        let parsed = parse_binding_actor(&args(&[
+            "--namespace",
+            "ops",
+            "--binding-id",
+            "b-1",
+            "--actor",
+            "agent:ops",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.actor, "agent:ops");
+
+        let refused = |raw: &[&str]| parse_binding_actor(&args(raw)).err().unwrap();
+        assert_eq!(refused(&["--binding-id", "b-1"]), "--namespace is required");
+        assert_eq!(refused(&["--namespace", "ops"]), "--binding-id is required");
+        assert_eq!(
+            refused(&["--namespace", "ops", "--binding-id"]),
+            "--binding-id requires a value"
+        );
+        assert_eq!(refused(&["--ns", "ops"]), "unknown option --ns");
+    }
 }
