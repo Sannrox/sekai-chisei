@@ -257,7 +257,7 @@ pub struct RunReport {
 }
 
 fn append(ledger: &Path, attempt: &Attempt) -> Result<(), String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
     if let Some(parent) = ledger.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -273,15 +273,13 @@ fn append(ledger: &Path, attempt: &Attempt) -> Result<(), String> {
         .map_err(|error| format!("probe ledger lock: {error}"))?;
     // A crash mid-append leaves a torn last line; drop it so every line
     // stays a whole record.
-    let mut text = Vec::new();
-    file.read_to_end(&mut text)
+    let len = file
+        .seek(SeekFrom::End(0))
         .map_err(|error| format!("probe ledger: {error}"))?;
-    if text.last().is_some_and(|byte| *byte != b'\n') {
-        let keep = text
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |at| at + 1);
-        file.set_len(keep as u64)
+    let keep =
+        whole_records_len(&mut file, len).map_err(|error| format!("probe ledger: {error}"))?;
+    if keep != len {
+        file.set_len(keep)
             .map_err(|error| format!("probe ledger: {error}"))?;
     }
     file.seek(SeekFrom::End(0))
@@ -291,6 +289,39 @@ fn append(ledger: &Path, attempt: &Attempt) -> Result<(), String> {
     file.write_all(line.as_bytes())
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("probe ledger: {error}"))
+}
+
+/// Length of `ledger`'s leading whole lines, given its total `len`. An intact
+/// ledger costs one byte read; a torn last line is scanned back in chunks
+/// only as far as the previous newline.
+fn whole_records_len<R: std::io::Read + std::io::Seek>(
+    ledger: &mut R,
+    len: u64,
+) -> std::io::Result<u64> {
+    use std::io::SeekFrom;
+    const CHUNK: u64 = 4096;
+    let mut last = [0u8; 1];
+    if len == 0 {
+        return Ok(0);
+    }
+    ledger.seek(SeekFrom::Start(len - 1))?;
+    ledger.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(len);
+    }
+    let mut end = len - 1;
+    let mut buf = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buf[..(end - start) as usize];
+        ledger.seek(SeekFrom::Start(start))?;
+        ledger.read_exact(chunk)?;
+        if let Some(at) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + at as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 fn now_ms() -> i64 {
@@ -716,6 +747,46 @@ pub fn weekly_summary(ledger: &Path, from_ms: i64) -> Result<WeeklySummary, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts bytes read so a test can bound the repair scan.
+    struct Counted(std::io::Cursor<Vec<u8>>, usize);
+
+    impl std::io::Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.0.read(buf)?;
+            self.1 += read;
+            Ok(read)
+        }
+    }
+
+    impl std::io::Seek for Counted {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    fn keep(bytes: &[u8]) -> (u64, usize) {
+        let mut ledger = Counted(std::io::Cursor::new(bytes.to_vec()), 0);
+        let kept = whole_records_len(&mut ledger, bytes.len() as u64).unwrap();
+        (kept, ledger.1)
+    }
+
+    #[test]
+    fn ledger_repair_reads_only_the_tail() {
+        let mut intact = b"{\"a\":1}\n".repeat(10_000);
+        assert_eq!(keep(&intact), (intact.len() as u64, 1));
+        let whole = intact.len() as u64;
+        intact.extend_from_slice(b"{\"torn\":");
+        let (kept, read) = keep(&intact);
+        assert_eq!(kept, whole);
+        assert!(read <= 1 + 4096, "{read}");
+        // A torn line longer than one chunk still finds the last newline.
+        let mut long = b"{\"a\":1}\n".to_vec();
+        long.extend(std::iter::repeat_n(b'x', 10_000));
+        assert_eq!(keep(&long).0, 8);
+        assert_eq!(keep(b"").0, 0);
+        assert_eq!(keep(b"no newline at all").0, 0);
+    }
 
     #[test]
     fn the_guard_fails_closed_without_an_allow_list() {
