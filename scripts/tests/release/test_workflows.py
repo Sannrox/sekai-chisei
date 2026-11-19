@@ -5,6 +5,7 @@ from bypassing the scripts. Assert on structure (triggers, permissions, job
 graph, step order), not on the wording of a step.
 """
 
+import json
 import shlex
 import unittest
 
@@ -240,6 +241,26 @@ class Performance(unittest.TestCase):
         self.assertTrue(
             any("scripts/object-path-with-postgres.sh" in runs(step) for step in steps)
         )
+
+    def test_gates_compare_against_a_runner_class_baseline(self):
+        """A baseline from other hardware makes the verdict about the machine (#2901)."""
+        for job in ("benchmark", "object-path"):
+            self.assertEqual(self.workflow["jobs"][job]["runs-on"], "ubuntu-latest", job)
+            gates = {
+                (option(args, "--manifest"), option(args, "--baseline"))
+                for step in self.workflow["jobs"][job]["steps"]
+                for args in perf_gate_calls(step)
+                if option(args, "--baseline")
+            }
+            self.assertTrue(gates, job)
+            for manifest, baseline in gates:
+                report = json.loads((ROOT / baseline).read_text())
+                self.assertTrue(
+                    report["hardware"]["description"].startswith("github-hosted ubuntu-latest"),
+                    f"{job}: {baseline}",
+                )
+                expected = json.loads((ROOT / manifest).read_text())["fixture_version"]
+                self.assertEqual(report["fixture_version"], expected, f"{job}: {baseline}")
 
     def test_smoke_job_runs_the_smoke_manifest(self):
         steps = self.workflow["jobs"]["object-path-smoke"]["steps"]

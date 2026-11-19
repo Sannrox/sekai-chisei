@@ -90,12 +90,15 @@ jobs:
           done
 
       - name: Evaluate regression gate
+        # The baseline describes this runner class. It starts empty, and
+        # MissingFromBaseline is not a regression; the Apple M2 Pro baseline
+        # stays for local comparison only (#2901).
         run: |
           set -euo pipefail
           if [[ "${{ inputs.enforce }}" == "true" ]]; then
-            ./target/release/perf-gate --enforce --manifest benchmarks/manifest-v1.json --baseline benchmarks/baseline-apple-m2-pro.json perf-reports/run-*.json
+            ./target/release/perf-gate --enforce --manifest benchmarks/manifest-v1.json --baseline benchmarks/baseline-github-ubuntu-latest.json perf-reports/run-*.json
           else
-            ./target/release/perf-gate --manifest benchmarks/manifest-v1.json --baseline benchmarks/baseline-apple-m2-pro.json perf-reports/run-*.json
+            ./target/release/perf-gate --manifest benchmarks/manifest-v1.json --baseline benchmarks/baseline-github-ubuntu-latest.json perf-reports/run-*.json
           fi
 
       - name: Upload reports
