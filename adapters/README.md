@@ -443,3 +443,18 @@ Offline conformance:
 ```sh
 cargo test -p sekai-core --test autonomous_envelope_adapters
 ```
+
+## Ezu adapter
+
+`ezu.rs` binds Ezu through generic RPCs as a service principal. A geo feed
+sends object geometry to Ezu from an object-change subscription. Fence
+events from Ezu become `SubmitActionInstance` calls. `nearby`, `positions`
+and `tracks` filter Ezu answers through `EvaluateObjectSet` as the reader.
+Each loop holds a lease and keeps its cursor in a plane object written
+under the lease's fencing token. Ezu sits behind the `Ezu` trait. See
+[ezu-adapter.md](../docs/ezu-adapter.md). Offline conformance against an
+in-memory plane and a fake Ezu:
+
+```sh
+cargo test --test ezu_adapter
+```
