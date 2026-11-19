@@ -182,15 +182,60 @@ impl SekaiDb {
                     head_hash: anchor.1,
                 });
             }
-            let classifications = {
+            // NULL seqs sorted first in the old single-pass scan, so incomplete
+            // metadata is still reported before any classification mismatch.
+            let incomplete: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sekai_decisions WHERE seq IS NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if incomplete {
+                return Ok(LedgerVerification {
+                    ok: false,
+                    entries_checked: 0,
+                    first_bad_seq: anchor.0 + 1,
+                    error: "audit ledger contains incomplete chain metadata".into(),
+                    anchor_seq: anchor.0,
+                    head_seq: anchor.0,
+                    head_hash: anchor.1,
+                });
+            }
+            anchor
+        };
+        if let Some(seq) = self.first_misclassified_seq()? {
+            return Ok(LedgerVerification {
+                ok: false,
+                entries_checked: 0,
+                first_bad_seq: seq,
+                error: "lifecycle classification differs from hashed evidence".into(),
+                anchor_seq,
+                head_seq: anchor_seq,
+                head_hash: anchor_hash,
+            });
+        }
+        self.verify_ledger_from(anchor_seq, anchor_hash)
+    }
+
+    /// The lowest seq whose stored lifecycle classification differs from the
+    /// one its hashed evidence implies. Reads in batches and returns the
+    /// pooled connection between them, like the chain walk.
+    fn first_misclassified_seq(&self) -> Result<Option<i64>, String> {
+        const BATCH: i64 = 1000;
+        let mut after = i64::MIN;
+        loop {
+            let batch = {
+                let conn = self.conn();
                 let mut stmt = conn
                     .prepare(
-                        "SELECT seq,evidence,namespace,data_class FROM sekai_decisions ORDER BY seq",
+                        "SELECT seq,evidence,namespace,data_class FROM sekai_decisions \
+                         WHERE seq > ?1 ORDER BY seq LIMIT ?2",
                     )
                     .map_err(|e| e.to_string())?;
-                stmt.query_map([], |row| {
+                stmt.query_map(params![after, BATCH], |row| {
                     Ok((
-                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
@@ -200,35 +245,17 @@ impl SekaiDb {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?
             };
-            for (seq, evidence, namespace, data_class) in classifications {
-                let Some(seq) = seq else {
-                    return Ok(LedgerVerification {
-                        ok: false,
-                        entries_checked: 0,
-                        first_bad_seq: anchor.0 + 1,
-                        error: "audit ledger contains incomplete chain metadata".into(),
-                        anchor_seq: anchor.0,
-                        head_seq: anchor.0,
-                        head_hash: anchor.1,
-                    });
-                };
+            let Some((last, ..)) = batch.last() else {
+                return Ok(None);
+            };
+            after = *last;
+            for (seq, evidence, namespace, data_class) in batch {
                 let evidence = serde_json::from_str(&evidence).unwrap_or_default();
-                let expected = lifecycle_scope_from_evidence(&evidence);
-                if (namespace, data_class) != expected {
-                    return Ok(LedgerVerification {
-                        ok: false,
-                        entries_checked: 0,
-                        first_bad_seq: seq,
-                        error: "lifecycle classification differs from hashed evidence".into(),
-                        anchor_seq: anchor.0,
-                        head_seq: anchor.0,
-                        head_hash: anchor.1,
-                    });
+                if (namespace, data_class) != lifecycle_scope_from_evidence(&evidence) {
+                    return Ok(Some(seq));
                 }
             }
-            anchor
-        };
-        self.verify_ledger_from(anchor_seq, anchor_hash)
+        }
     }
 
     /// Chain walk starting after `(anchor_seq, anchor_hash)`. Split out so the
@@ -497,6 +524,50 @@ mod tests {
         let report = db.verify_ledger().unwrap();
         assert!(!report.ok);
         assert!(report.error.contains("classification differs"));
+    }
+
+    #[test]
+    fn a_row_without_chain_metadata_is_reported_incomplete() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for i in 0..3 {
+            db.record_decision(&decision(&format!("d{i}"), 100 + i))
+                .unwrap();
+        }
+        db.conn()
+            .execute("UPDATE sekai_decisions SET seq=NULL WHERE id='d2'", [])
+            .unwrap();
+
+        let report = db.verify_ledger().unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.first_bad_seq, 1);
+        assert!(
+            report.error.contains("incomplete chain metadata"),
+            "{}",
+            report.error
+        );
+    }
+
+    #[test]
+    fn a_tampered_classification_past_the_first_batch_is_detected() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let decisions: Vec<Decision> = (0..1_005)
+            .map(|i| decision(&format!("d{i}"), 100 + i))
+            .collect();
+        db.record_decisions(&decisions).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_decisions SET data_class='public' WHERE id='d1002'",
+                [],
+            )
+            .unwrap();
+
+        let report = db.verify_ledger().unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.first_bad_seq, 1_003);
+        assert_eq!(
+            report.error,
+            "lifecycle classification differs from hashed evidence"
+        );
     }
 
     #[test]
