@@ -44,7 +44,7 @@ fn chisei_runtime_db_calls_only_shrink() {
     assert!(
         grown.is_empty(),
         "new RuntimeDb calls in Chisei violate ADR 0083 rule 6; use the Chisei store \
-         traits in crate::db::store or the Sekai read port instead: {grown:#?}"
+         traits in crate::chisei_store or the Sekai read port instead: {grown:#?}"
     );
 
     let shrunk: Vec<_> = allowed

@@ -1,7 +1,7 @@
 //! The game reference workload's policy pack and budget and routing config
 //! (#1854).
 //!
-//! `examples/game-ontology/policy-pack-v1.json` and `routing-v1.json` are
+//! `examples/game-ontology/policy-pack-v1.json` and `routing-v2.json` are
 //! versioned with the `game-ontology/v1` package. Each test applies them to
 //! the shipped binary through its public surfaces, the operator CLI and gRPC,
 //! and shows one allowed and one refused case for one rule. Routing decisions
