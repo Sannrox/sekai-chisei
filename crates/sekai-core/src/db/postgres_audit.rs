@@ -205,11 +205,25 @@ impl PostgresDb {
         Ok(Some(before))
     }
 
+    /// Remove an object and its change rows so an aborted create can reuse the id.
+    /// Does nothing once the object was updated after its create, so a
+    /// committed follow-on write and its history survive the abort.
     pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        lock_object_lifecycle(&mut transaction, id)?;
+        let untouched = transaction
+            .query_opt(
+                "SELECT created = updated FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, bool>(0));
+        if untouched != Some(true) {
+            return Ok(());
+        }
         transaction
             .execute("DELETE FROM sekai_objects WHERE id = $1", &[&id])
             .map_err(|error| error.to_string())?;

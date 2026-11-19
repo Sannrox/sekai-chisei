@@ -1317,4 +1317,47 @@ mod tests {
             Err(ActionObjectMutationError::FailedPrecondition(_))
         ));
     }
+
+    /// #2728: an update committed after `compensate` checked the row and
+    /// before the abort keeps the object and its history.
+    fn an_abort_keeps_an_object_updated_after_its_create(db: &RuntimeDb) {
+        let mut object = crate::domain::Object {
+            id: "rec-updated".into(),
+            kind: "customer_record".into(),
+            name: "record".into(),
+            namespace: "acme".into(),
+            external_id: "ext:rec-updated".into(),
+            properties: Default::default(),
+            created: 10,
+            updated: 10,
+        };
+        db.create_object_with_audit(&object, "alice").unwrap();
+        object.name = "renamed".into();
+        object.updated = 20;
+        db.update_object_with_audit(&object, "bob").unwrap();
+
+        db.abort_unreceipted_object_create("rec-updated").unwrap();
+
+        assert_eq!(
+            db.get_object("rec-updated").unwrap().unwrap().name,
+            "renamed"
+        );
+        assert_eq!(
+            db.list_object_changes("rec-updated", 10, 0).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn sqlite_an_abort_keeps_an_object_updated_after_its_create() {
+        an_abort_keeps_an_object_updated_after_its_create(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_an_abort_keeps_an_object_updated_after_its_create() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        an_abort_keeps_an_object_updated_after_its_create(&db);
+    }
 }

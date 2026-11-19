@@ -1253,9 +1253,24 @@ impl SekaiDb {
     }
 
     /// Remove an object and its change rows so an aborted create can reuse the id.
+    /// Does nothing once the object was updated after its create, so a
+    /// committed follow-on write and its history survive the abort.
     pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let untouched = tx
+            .query_row(
+                "SELECT created = updated FROM sekai_objects WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if untouched != Some(true) {
+            return Ok(());
+        }
         tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
         tx.execute(
