@@ -195,6 +195,7 @@ const SEPARATE_TARGETS: &[&str] = &[
     "deploy_kubernetes_manifest",
     "emit_git_version",
     "epistemic_replication_example",
+    "ezu_adapter",
     "feedback_adapters",
     "gateway_cache_signals",
     "object_log_differential",
