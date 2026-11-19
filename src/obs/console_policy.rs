@@ -152,6 +152,17 @@ pub fn load_effective_policy_view(
     })
 }
 
+/// Each console dry-run is its own request: the millisecond alone repeats when
+/// two identical runs land together, so a random suffix keeps their decision
+/// ids, which hash the request id, distinct.
+fn dry_run_request_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 pub fn run_console_dry_run(
     db: &RuntimeDb,
     principal: &str,
@@ -186,10 +197,7 @@ pub fn run_console_dry_run(
         &receipts,
     )?;
     // Audit like the gRPC path: fail closed if audit cannot persist.
-    let request_id = format!(
-        "console-policy-dry-run-{}",
-        chrono::Utc::now().timestamp_millis()
-    );
+    let request_id = dry_run_request_id("console-policy-dry-run");
     let decision_id = {
         format!(
             "policy-dry-run:{:x}",
@@ -258,10 +266,7 @@ pub fn run_console_action_dry_run(
         candidate,
         &receipts,
     )?;
-    let request_id = format!(
-        "console-action-policy-dry-run-{}",
-        chrono::Utc::now().timestamp_millis()
-    );
+    let request_id = dry_run_request_id("console-action-policy-dry-run");
     let decision_id = format!(
         "action-policy-dry-run:{:x}",
         Sha256::digest(format!(
@@ -831,6 +836,40 @@ mod tests {
         assert!(html.contains("Install allocation baseline"));
         assert!(!html.contains("Promote allocation policy"));
         assert!(!html.contains("beta"));
+    }
+
+    #[test]
+    fn identical_dry_runs_record_separate_decisions() {
+        let db = test_db();
+        crate::chisei_store::apply_chisei_schema(&db);
+        seed_ns(&db, "alpha", "alice", Role::Editor);
+        let candidate = Policy {
+            allowed_runtimes: vec!["ollama".into()],
+            allowed_models: vec!["llama".into()],
+            default_runtime: "ollama".into(),
+            default_model: "llama".into(),
+            data_class: "internal".into(),
+        };
+        let action_candidate = ActionPolicy::allow_all("alpha");
+        for _ in 0..2 {
+            run_console_dry_run(&db, "alice", "alpha", 0, 10_000, &candidate).unwrap();
+            run_console_action_dry_run(&db, "alice", "alpha", 0, 10_000, &action_candidate)
+                .unwrap();
+        }
+        for action in ["policy.dry_run", "action_policy.dry_run"] {
+            let recorded = db
+                .list_decisions(&crate::sekai::audit::DecisionFilter {
+                    action: Some(action.into()),
+                    target_id: Some("alpha".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let request_ids: std::collections::BTreeSet<_> = recorded
+                .iter()
+                .map(|decision| decision.evidence["request_id"].clone())
+                .collect();
+            assert_eq!((recorded.len(), request_ids.len()), (2, 2), "{action}");
+        }
     }
 
     #[test]
