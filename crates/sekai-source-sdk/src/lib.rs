@@ -97,12 +97,22 @@ pub fn conformance_suite_digest() -> String {
     suite_digest(
         include_str!("conformance.rs"),
         include_str!("change_capture.rs"),
+        &[
+            include_str!("contract.rs"),
+            include_str!("discover.rs"),
+            include_str!("lineage.rs"),
+            include_str!("sdk.rs"),
+        ],
     )
 }
 
 /// Hashes the version pins with the given suite source texts. Tests pass
 /// edited texts to prove each source is bound into the digest.
-fn suite_digest(conformance_source: &str, change_capture_source: &str) -> String {
+fn suite_digest(
+    conformance_source: &str,
+    change_capture_source: &str,
+    helper_sources: &[&str],
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(SDK_VERSION.as_bytes());
@@ -122,12 +132,27 @@ fn suite_digest(conformance_source: &str, change_capture_source: &str) -> String
     hasher.update(CHANGE_CAPTURE_CONFORMANCE_VERSION.as_bytes());
     hasher.update(b"\n");
     hasher.update(change_capture_source.as_bytes());
+    for source in helper_sources {
+        hasher.update(b"\n");
+        hasher.update(source.as_bytes());
+    }
     format!("sha256:{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Digest order. `conformance.rs` must not import a crate module absent
+    /// from this list.
+    const SUITE_SOURCE_FILES: &[&str] = &[
+        "conformance.rs",
+        "change_capture.rs",
+        "contract.rs",
+        "discover.rs",
+        "lineage.rs",
+        "sdk.rs",
+    ];
 
     #[test]
     fn crate_version_is_semver() {
@@ -149,11 +174,63 @@ mod tests {
     fn conformance_digest_binds_each_suite_source() {
         let conformance = include_str!("conformance.rs");
         let change_capture = include_str!("change_capture.rs");
-        let pinned = suite_digest(conformance, change_capture);
+        let helpers = [
+            include_str!("contract.rs"),
+            include_str!("discover.rs"),
+            include_str!("lineage.rs"),
+            include_str!("sdk.rs"),
+        ];
+        let pinned = suite_digest(conformance, change_capture, &helpers);
         assert_eq!(pinned, conformance_suite_digest());
         let edited_conformance = format!("{conformance} ");
-        assert_ne!(suite_digest(&edited_conformance, change_capture), pinned);
+        assert_ne!(
+            suite_digest(&edited_conformance, change_capture, &helpers),
+            pinned
+        );
         let edited_change_capture = format!("{change_capture} ");
-        assert_ne!(suite_digest(conformance, &edited_change_capture), pinned);
+        assert_ne!(
+            suite_digest(conformance, &edited_change_capture, &helpers),
+            pinned
+        );
+        for skip in 0..helpers.len() {
+            let mut edited = helpers;
+            edited[skip] = " ";
+            assert_ne!(
+                suite_digest(conformance, change_capture, &edited),
+                pinned,
+                "{}",
+                SUITE_SOURCE_FILES[skip + 2]
+            );
+        }
+    }
+
+    /// A new `use crate::module` in the suite must join the digest, or a
+    /// helper-module change would keep the previous certification pin.
+    #[test]
+    fn conformance_digest_covers_every_imported_crate_module() {
+        let mut imported = Vec::new();
+        for line in include_str!("conformance.rs").lines() {
+            let Some(rest) = line.trim().strip_prefix("use crate::") else {
+                continue;
+            };
+            let module = rest
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .next()
+                .unwrap_or("");
+            assert!(
+                !module.is_empty(),
+                "conformance.rs has an unreadable crate import: {line}"
+            );
+            let file = format!("{module}.rs");
+            assert!(
+                SUITE_SOURCE_FILES.contains(&file.as_str()),
+                "conformance.rs imports crate::{module} but {file} is not in the digest"
+            );
+            imported.push(file);
+        }
+        assert!(
+            !imported.is_empty(),
+            "conformance.rs must import the crate modules the digest covers"
+        );
     }
 }
