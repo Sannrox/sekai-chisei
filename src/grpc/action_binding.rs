@@ -356,6 +356,11 @@ impl SekaiServiceImpl {
             {
                 return Err(Status::failed_precondition(reason.to_string()));
             }
+            // Store and other internal admission failures are retryable; keep
+            // the page so the next run replays it.
+            if is_internal_skip(&submission.skipped_reason) {
+                return Err(Status::internal(submission.skipped_reason.clone()));
+            }
             response.submissions.push(submission);
         }
         cursor.pending_events.clear();
@@ -674,6 +679,10 @@ pub(super) fn load_bound_objects(
         visible.push(object);
     }
     Ok(visible)
+}
+
+fn is_internal_skip(reason: &str) -> bool {
+    reason == "internal" || reason.starts_with("internal:")
 }
 
 fn map_binding_store_error(error: String) -> Status {
@@ -998,5 +1007,223 @@ mod tests {
             .pending_events;
         assert_eq!(still_pending.len(), 1);
         assert_eq!(still_pending[0].event_id, "evt-frozen");
+    }
+
+    fn bound_escalator() -> (Arc<RuntimeDb>, SekaiServiceImpl) {
+        let db = Arc::new(RuntimeDb::memory());
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            db.clone(),
+        ));
+        let (_, grants) = db
+            .ensure_team_namespace("demo", "svc-escalator", security::Role::Editor, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                description: "Escalate a degraded component".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"component":{"type":"string"},"severity":{"type":"string"}},"required":["component","severity"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            },
+            "local",
+            1,
+        )
+        .unwrap();
+        db.upsert_action_policy(&crate::sekai::action_policy::ActionPolicy::allow_all(
+            "demo",
+        ))
+        .unwrap();
+        db.create_object_with_audit(
+            &domain::Object {
+                id: "billing-api".into(),
+                kind: "component".into(),
+                name: "billing-api".into(),
+                namespace: "demo".into(),
+                external_id: String::new(),
+                properties: HashMap::from([("severity".into(), "high".into())]),
+                created: 1,
+                updated: 1,
+            },
+            "local",
+        )
+        .unwrap();
+        let binding = db
+            .put_action_binding(
+                &ActionBinding {
+                    contract_version: ACTION_BINDING_CONTRACT.into(),
+                    binding_id: "escalate".into(),
+                    namespace: "demo".into(),
+                    kind: "component".into(),
+                    property_filters: Vec::new(),
+                    ops: vec!["update".into()],
+                    type_id: "component.escalate".into(),
+                    version: "1".into(),
+                    run_as: "svc-escalator".into(),
+                    parameters: BTreeMap::from([
+                        ("component".into(), ParameterSource::ObjectId),
+                        (
+                            "severity".into(),
+                            ParameterSource::Property("severity".into()),
+                        ),
+                    ]),
+                    markings: Vec::new(),
+                    enabled: true,
+                    revision: 0,
+                    created_by: String::new(),
+                    updated_at_ms: 0,
+                },
+                "local",
+                2,
+            )
+            .unwrap();
+        db.advance_action_binding_cursor(
+            &binding,
+            &ActionBindingCursor {
+                snapshot_revision: "pin".into(),
+                pending_events: vec![
+                    crate::sekai::object_change_subscription::ObjectChangeEvent {
+                        offset: 1,
+                        event_id: "evt-pending".into(),
+                        object_id: "billing-api".into(),
+                        kind: "component".into(),
+                        op: "update".into(),
+                        field: "severity".into(),
+                        committed_at_ms: 3,
+                        operation_id: "op-pending".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            now_millis(),
+        )
+        .unwrap();
+        (db, svc)
+    }
+
+    #[tokio::test]
+    async fn internal_admission_failure_keeps_pending_events_for_one_later_submit() {
+        let (db, svc) = bound_escalator();
+        db.conn()
+            .execute(
+                "INSERT INTO sekai_classification_lattices
+                 (namespace, contract_version, digest, lattice_json, created_by, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                ("demo", "v1", "stale", "{", "root", 1_i64),
+            )
+            .unwrap();
+        let refused = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::Internal);
+        let pending = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, "evt-pending");
+        assert!(
+            db.list_action_instances("demo", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        db.conn()
+            .execute(
+                "DELETE FROM sekai_classification_lattices WHERE namespace = ?1",
+                ["demo"],
+            )
+            .unwrap();
+        let run = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(run.submissions.len(), 1);
+        assert!(run.submissions[0].skipped_reason.is_empty());
+        assert!(!run.submissions[0].replay);
+        let remaining = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert!(remaining.is_empty());
+        assert_eq!(
+            db.list_action_instances("demo", None, None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_refusal_skips_pending_events_and_is_not_retried() {
+        let (db, svc) = bound_escalator();
+        let binding = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .0;
+        db.advance_action_binding_cursor(
+            &binding,
+            &ActionBindingCursor {
+                snapshot_revision: "pin".into(),
+                pending_events: vec![
+                    crate::sekai::object_change_subscription::ObjectChangeEvent {
+                        offset: 1,
+                        event_id: "evt-create".into(),
+                        object_id: "billing-api".into(),
+                        kind: "component".into(),
+                        op: "create".into(),
+                        field: String::new(),
+                        committed_at_ms: 3,
+                        operation_id: "op-create".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            now_millis(),
+        )
+        .unwrap();
+        let run = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(run.submissions.len(), 1);
+        assert_eq!(run.submissions[0].skipped_reason, "op_not_bound");
+        let remaining = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1
+            .pending_events;
+        assert!(remaining.is_empty());
+        assert!(
+            db.list_action_instances("demo", None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
