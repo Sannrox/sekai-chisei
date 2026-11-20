@@ -278,7 +278,7 @@ fn validate_parts(
             );
         }
         let normalized_path = normalize_absolute_path(Path::new(&entity.path));
-        if directory_id(&normalized_path) != entity.id {
+        if directory_id(&normalized_path).ok().as_deref() != Some(entity.id.as_str()) {
             directory_issue(
                 &mut issues,
                 "unstable_id",
@@ -463,7 +463,7 @@ fn validate_document(document: &DirectoryDocument) -> Result<(), Error> {
         );
     } else {
         let root_path = normalize_absolute_path(Path::new(&document.root));
-        let root_id = directory_id(&root_path);
+        let root_id = directory_id(&root_path)?;
         match entities.get(&root_id) {
             Some(entity) if normalize_absolute_path(Path::new(&entity.path)) == root_path => {}
             Some(_) => directory_issue(
@@ -494,8 +494,17 @@ fn directory_issue(issues: &mut Vec<ValidationIssue>, code: &str, path: &str, me
     });
 }
 
-fn directory_id(path: &Path) -> String {
-    format!("directory:{}", path.to_string_lossy())
+fn path_utf8(path: &Path) -> Result<&str, Error> {
+    path.to_str().ok_or_else(|| {
+        Error::Input(format!(
+            "directory path '{}' is not valid UTF-8",
+            path.display()
+        ))
+    })
+}
+
+fn directory_id(path: &Path) -> Result<String, Error> {
+    Ok(format!("directory:{}", path_utf8(path)?))
 }
 
 fn contains_link_id(from_id: &str, to_id: &str) -> String {
@@ -554,11 +563,31 @@ fn normalize_query_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(normalize_absolute_path(&absolute))
 }
 
-fn entity_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+fn entity_name(path: &Path) -> Result<String, Error> {
+    let text = path_utf8(path)?;
+    Ok(Path::new(text)
+        .file_name()
+        .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        .unwrap_or(text)
+        .to_owned())
+}
+
+fn insert_scanned_entity(
+    entities: &mut BTreeMap<String, DirectoryEntity>,
+    entity: DirectoryEntity,
+) -> Result<(), Error> {
+    if let Some(existing) = entities.get(&entity.id) {
+        if existing.path != entity.path {
+            return Err(Error::Input(format!(
+                "directory id '{}' already names '{}'",
+                entity.id, existing.path
+            )));
+        }
+        return Ok(());
+    }
+    entities.insert(entity.id.clone(), entity);
+    Ok(())
 }
 
 fn is_hidden(path: &Path) -> bool {
@@ -576,16 +605,17 @@ fn collect_directory(
     kind: &str,
 ) -> Result<(), Error> {
     let path = normalize_existing_directory(path)?;
-    let id = directory_id(&path);
-    entities.insert(
-        id.clone(),
+    let path_text = path_utf8(&path)?.to_owned();
+    let id = directory_id(&path)?;
+    insert_scanned_entity(
+        entities,
         DirectoryEntity {
             id: id.clone(),
-            path: path.to_string_lossy().into_owned(),
-            name: entity_name(&path),
+            path: path_text,
+            name: entity_name(&path)?,
             kind: kind.into(),
         },
-    );
+    )?;
     if depth >= options.max_depth {
         return Ok(());
     }
@@ -619,8 +649,9 @@ fn collect_directory(
         if file_type.is_symlink() || !file_type.is_dir() {
             continue;
         }
+        path_utf8(&child_path)?;
         let child_path = normalize_existing_directory(&child_path)?;
-        let child_id = directory_id(&child_path);
+        let child_id = directory_id(&child_path)?;
         collect_directory(
             &child_path,
             depth + 1,
@@ -666,7 +697,7 @@ fn scan(root: &Path, options: &DirectoryScanOptions) -> Result<DirectoryDocument
     )?;
     let document = DirectoryDocument {
         schema_version: DIRECTORY_SCHEMA_VERSION,
-        root: root.to_string_lossy().into_owned(),
+        root: path_utf8(&root)?.to_owned(),
         entities: entities.into_values().collect(),
         links: links.into_values().collect(),
     };
@@ -686,7 +717,7 @@ fn resolve_entity_id(
         return Ok(start.into());
     }
     let path = normalize_query_path(Path::new(start))?;
-    let id = directory_id(&path);
+    let id = directory_id(&path)?;
     if entities.contains_key(&id) {
         Ok(id)
     } else {
@@ -1150,9 +1181,9 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("workspace");
         let root_string = root.to_string_lossy().into_owned();
-        let root_id = directory_id(&root);
+        let root_id = directory_id(&root).unwrap();
         let child = root.join("child");
-        let child_id = directory_id(&child);
+        let child_id = directory_id(&child).unwrap();
         let invalid = DirectoryDocument {
             schema_version: DIRECTORY_SCHEMA_VERSION,
             root: root_string.clone(),
@@ -1180,6 +1211,88 @@ mod tests {
         assert!(matches!(
             validate_document(&invalid),
             Err(Error::Validation(issues)) if issues.iter().any(|issue| issue.code == "invalid_contains_path")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_id_refuses_a_non_utf8_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/bad-\xff"));
+        let error = directory_id(path).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Input(message) if message.contains("UTF-8") && message.contains("bad-")
+        ));
+    }
+
+    #[test]
+    fn collect_directory_refuses_an_id_collision_instead_of_merging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        let child = root.join("child");
+        fs::create_dir_all(&child).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let child = fs::canonicalize(&child).unwrap();
+        let child_id = directory_id(&child).unwrap();
+        let mut entities = BTreeMap::new();
+        let mut links = BTreeMap::new();
+        entities.insert(
+            child_id.clone(),
+            DirectoryEntity {
+                id: child_id,
+                path: "/elsewhere/child".into(),
+                name: "child".into(),
+                kind: DEFAULT_DIRECTORY_KIND.into(),
+            },
+        );
+
+        let error = collect_directory(
+            &root,
+            0,
+            &DirectoryScanOptions::default(),
+            &mut entities,
+            &mut links,
+            DEFAULT_DIRECTORY_KIND,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Input(message)
+                if message.contains("already names") && message.contains("/elsewhere/child")
+        ));
+        assert_eq!(
+            entities[&directory_id(&child).unwrap()].path,
+            "/elsewhere/child"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn indexing_a_non_utf8_directory_name_writes_nothing() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(root.join(OsStr::from_bytes(b"one-\xff"))).unwrap();
+
+        let database = temporary.path().join("knowledge.db");
+        let mut ontology = SqliteOntology::initialize(&database).unwrap();
+        ontology.initialize_directory_ontology().unwrap();
+        let error = ontology
+            .index_directory(&root, DirectoryScanOptions::default(), false)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Input(message) if message.contains("UTF-8") && message.contains("one-")
+        ));
+        assert!(matches!(
+            ontology.export_directory(&root),
+            Err(Error::NotFound(_))
         ));
     }
 }
