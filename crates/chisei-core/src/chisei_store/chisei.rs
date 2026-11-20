@@ -662,26 +662,56 @@ impl ChiseiSekaiDbExt2 for SekaiDb {
     }
 
     fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
-            "INSERT OR REPLACE INTO chisei_eval_iterations (id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                iteration.id,
-                iteration.run_id,
-                iteration.suite_id,
-                iteration.namespace,
-                iteration.changed_file,
-                iteration.diff_hash,
-                iteration.parent_iteration_id,
-                iteration.baseline_run_id,
-                iteration.candidate_run_id,
-                iteration.delta,
-                iteration.regressed,
-                iteration.created,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        let mut conn = self.conn();
+        let transaction = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO chisei_eval_iterations (id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    iteration.id,
+                    iteration.run_id,
+                    iteration.suite_id,
+                    iteration.namespace,
+                    iteration.changed_file,
+                    iteration.diff_hash,
+                    iteration.parent_iteration_id,
+                    iteration.baseline_run_id,
+                    iteration.candidate_run_id,
+                    iteration.delta,
+                    iteration.regressed,
+                    iteration.created,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        let stored = transaction
+            .query_row(
+                "SELECT id, run_id, suite_id, namespace, changed_file, diff_hash, parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created FROM chisei_eval_iterations WHERE id = ?1",
+                params![iteration.id],
+                |row| {
+                    Ok(eval::Iteration {
+                        id: row.get(0)?,
+                        run_id: row.get(1)?,
+                        suite_id: row.get(2)?,
+                        namespace: row.get(3)?,
+                        changed_file: row.get(4)?,
+                        diff_hash: row.get(5)?,
+                        parent_iteration_id: row.get(6)?,
+                        baseline_run_id: row.get(7)?,
+                        candidate_run_id: row.get(8)?,
+                        delta: row.get(9)?,
+                        regressed: row.get(10)?,
+                        created: row.get(11)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        if stored == *iteration {
+            transaction.commit().map_err(|error| error.to_string())
+        } else {
+            Err(format!("eval iteration {:?} is immutable", iteration.id))
+        }
     }
 
     fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String> {

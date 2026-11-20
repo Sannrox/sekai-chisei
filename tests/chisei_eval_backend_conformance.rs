@@ -104,8 +104,28 @@ fn exercise(db: &dyn EvalHarness, prefix: &str) {
         created: 200,
     };
     db.put_eval_iteration(&iteration).unwrap();
+    db.put_eval_iteration(&iteration).unwrap();
+    let mut mutated = iteration.clone();
+    mutated.diff_hash = "mutated".into();
+    assert!(
+        db.put_eval_iteration(&mutated)
+            .unwrap_err()
+            .contains("immutable")
+    );
+    let second = Iteration {
+        id: format!("{prefix}-iter-2"),
+        diff_hash: "def".into(),
+        created: 201,
+        ..iteration.clone()
+    };
+    db.put_eval_iteration(&second).unwrap();
     let listed = db.list_eval_iteration_records(&suite_id).unwrap();
-    assert!(listed.iter().any(|item| item.id == iteration.id));
+    let first = listed
+        .iter()
+        .find(|item| item.id == iteration.id)
+        .expect("first iteration");
+    assert_eq!(first.diff_hash, "abc");
+    assert!(listed.iter().any(|item| item.id == second.id));
 
     let request_id = format!("{prefix}-sample");
     let namespace = format!("{prefix}-ns");

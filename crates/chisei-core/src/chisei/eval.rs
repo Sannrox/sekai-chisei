@@ -336,11 +336,15 @@ impl EvalStore {
         if let Some(db) = &self.db {
             return db.put_eval_iteration(&iteration);
         }
-        self.iterations
-            .lock()
-            .unwrap()
-            .insert(iteration.id.clone(), iteration);
-        Ok(())
+        let mut iterations = self.iterations.lock().unwrap();
+        match iterations.get(&iteration.id) {
+            Some(existing) if existing == &iteration => Ok(()),
+            Some(_) => Err(format!("eval iteration {:?} is immutable", iteration.id)),
+            None => {
+                iterations.insert(iteration.id.clone(), iteration);
+                Ok(())
+            }
+        }
     }
 
     /// Drop all but the newest `keep` runs for a suite from memory (newest by timestamp). Used to
@@ -450,8 +454,10 @@ impl EvalStore {
         }
         let namespace = self.infer_iteration_namespace(suite_id, &run, changed_file)?;
         let previous = self.latest_iteration_for_suite_file(suite_id, changed_file);
+        let now = chrono::Utc::now().timestamp_millis();
+        let seq = self.next_sequence();
         let mut iteration = Iteration {
-            id: format!("iter-{}-{}", run.id, chrono::Utc::now().timestamp_millis()),
+            id: format!("iter-{}-{now}-{seq}", run.id),
             run_id: run.id.clone(),
             suite_id: suite_id.to_string(),
             namespace,
@@ -462,7 +468,7 @@ impl EvalStore {
             candidate_run_id: run.id.clone(),
             delta: 0.0,
             regressed: false,
-            created: chrono::Utc::now().timestamp_millis(),
+            created: now,
         };
         if let Some(previous) = previous {
             let baseline = self
@@ -1703,5 +1709,168 @@ mod tests {
             .expect("namespace a signal");
         assert!(signal.regressed);
         assert!(signal.reason.contains("regressed"));
+    }
+
+    fn suite_with_run(store: &EvalStore, suite_id: &str, run_id: &str) {
+        store.create_suite(Suite {
+            id: suite_id.into(),
+            name: "suite".into(),
+            description: String::new(),
+            cases: vec![Case {
+                id: "c1".into(),
+                name: "case".into(),
+                namespace: "namespace-a".into(),
+                spec: "spec".into(),
+                assertions: vec![],
+            }],
+        });
+        store.create_run(Run {
+            id: run_id.into(),
+            suite_id: suite_id.into(),
+            config_ref: "m1".into(),
+            results: vec![CaseResult {
+                case_id: "c1".into(),
+                passed: true,
+                status: "done".into(),
+                result: "ok".into(),
+                score: 80,
+                reason: String::new(),
+                elapsed: 10,
+            }],
+            timestamp: 100,
+        });
+    }
+
+    fn assert_iteration_id_uses_created(iteration: &Iteration, run_id: &str) {
+        let prefix = format!("iter-{run_id}-");
+        assert!(
+            iteration.id.starts_with(&prefix),
+            "iteration id {} should start with {prefix}",
+            iteration.id
+        );
+        let rest = iteration
+            .id
+            .strip_prefix(&prefix)
+            .expect("iteration id prefix");
+        let created = rest.split_once('-').expect("sequence suffix").0;
+        assert_eq!(created, iteration.created.to_string());
+    }
+
+    fn assert_same_millisecond_iterations_persist(store: &EvalStore, suite_id: &str, run_id: &str) {
+        let mut pair = None;
+        for attempt in 0..1_000 {
+            let first = store
+                .track_iteration(
+                    suite_id,
+                    run_id,
+                    &format!("skills/same-ms-{attempt}.md"),
+                    "hash-a",
+                )
+                .expect("first iteration");
+            let second = store
+                .track_iteration(
+                    suite_id,
+                    run_id,
+                    &format!("skills/same-ms-{attempt}.md"),
+                    "hash-b",
+                )
+                .expect("second iteration");
+            if first.created == second.created {
+                pair = Some((first, second));
+                break;
+            }
+        }
+        let (first, second) = pair.expect("two track_iteration calls shared a millisecond");
+        assert_ne!(first.id, second.id);
+        assert_iteration_id_uses_created(&first, run_id);
+        assert_iteration_id_uses_created(&second, run_id);
+        let listed = store.list_iterations(suite_id);
+        assert!(listed.iter().any(|item| item.id == first.id));
+        assert!(listed.iter().any(|item| item.id == second.id));
+    }
+
+    fn sample_iteration(id: &str, run_id: &str, suite_id: &str, diff_hash: &str) -> Iteration {
+        Iteration {
+            id: id.into(),
+            run_id: run_id.into(),
+            suite_id: suite_id.into(),
+            namespace: "namespace-a".into(),
+            changed_file: "skills/foo.md".into(),
+            diff_hash: diff_hash.into(),
+            parent_iteration_id: String::new(),
+            baseline_run_id: run_id.into(),
+            candidate_run_id: run_id.into(),
+            delta: 0.0,
+            regressed: false,
+            created: 200,
+        }
+    }
+
+    fn assert_put_iteration_refuses_mutation(store: &EvalStore, suite_id: &str, run_id: &str) {
+        let iteration = sample_iteration(
+            &format!("iter-immutable-{suite_id}"),
+            run_id,
+            suite_id,
+            "hash-a",
+        );
+        store.put_iteration(iteration.clone()).expect("first put");
+        store
+            .put_iteration(iteration.clone())
+            .expect("identical replay");
+        let mut mutated = iteration.clone();
+        mutated.diff_hash = "hash-b".into();
+        let error = store.put_iteration(mutated).expect_err("mutated replay");
+        assert!(error.contains("immutable"), "{error}");
+        let stored = store
+            .list_iterations(suite_id)
+            .into_iter()
+            .find(|item| item.id == iteration.id)
+            .expect("stored iteration");
+        assert_eq!(stored.diff_hash, "hash-a");
+    }
+
+    #[test]
+    fn same_millisecond_track_iteration_persists_both_in_memory() {
+        let store = EvalStore::new();
+        suite_with_run(&store, "s1", "r1");
+        assert_same_millisecond_iterations_persist(&store, "s1", "r1");
+    }
+
+    #[test]
+    fn same_millisecond_track_iteration_persists_both_on_sqlite() {
+        let store = EvalStore::with_db(ChiseiStore::memory());
+        suite_with_run(&store, "s1", "r1");
+        assert_same_millisecond_iterations_persist(&store, "s1", "r1");
+    }
+
+    #[test]
+    fn put_iteration_refuses_a_different_body_in_memory() {
+        let store = EvalStore::new();
+        suite_with_run(&store, "s1", "r1");
+        assert_put_iteration_refuses_mutation(&store, "s1", "r1");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn same_millisecond_track_iteration_persists_both_on_postgres() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            sekai_core::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                4,
+                &std::fs::read(path).unwrap(),
+            )
+            .unwrap()
+        } else {
+            sekai_core::db::postgres::PostgresDb::connect(&url, 4).unwrap()
+        };
+        let store = EvalStore::with_db(ChiseiStore::postgres(db));
+        let suffix = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        let suite_id = format!("s-{suffix}");
+        let run_id = format!("r-{suffix}");
+        suite_with_run(&store, &suite_id, &run_id);
+        assert_same_millisecond_iterations_persist(&store, &suite_id, &run_id);
+        assert_put_iteration_refuses_mutation(&store, &suite_id, &run_id);
     }
 }

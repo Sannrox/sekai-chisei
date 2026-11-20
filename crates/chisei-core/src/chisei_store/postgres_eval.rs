@@ -295,24 +295,17 @@ impl PostgresEvalPostgresDbExt for PostgresDb {
 
     fn put_eval_iteration(&self, iteration: &eval::Iteration) -> Result<(), String> {
         let regressed = i64::from(iteration.regressed);
-        self.connection()?
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "INSERT INTO chisei_eval_iterations
                     (id, run_id, suite_id, namespace, changed_file, diff_hash,
                      parent_iteration_id, baseline_run_id, candidate_run_id, delta, regressed, created)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                 ON CONFLICT(id) DO UPDATE SET
-                    run_id = excluded.run_id,
-                    suite_id = excluded.suite_id,
-                    namespace = excluded.namespace,
-                    changed_file = excluded.changed_file,
-                    diff_hash = excluded.diff_hash,
-                    parent_iteration_id = excluded.parent_iteration_id,
-                    baseline_run_id = excluded.baseline_run_id,
-                    candidate_run_id = excluded.candidate_run_id,
-                    delta = excluded.delta,
-                    regressed = excluded.regressed,
-                    created = excluded.created",
+                 ON CONFLICT(id) DO NOTHING",
                 &[
                     &iteration.id,
                     &iteration.run_id,
@@ -328,8 +321,15 @@ impl PostgresEvalPostgresDbExt for PostgresDb {
                     &iteration.created,
                 ],
             )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let sql = format!("SELECT {ITERATION_COLUMNS} FROM chisei_eval_iterations WHERE id = $1");
+        let stored = transaction
+            .query_one(&sql, &[&iteration.id])
+            .map_err(|error| error.to_string())?;
+        if row_to_eval_iteration(stored) != *iteration {
+            return Err(format!("eval iteration {:?} is immutable", iteration.id));
+        }
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     fn list_eval_iteration_records(&self, suite_id: &str) -> Result<Vec<eval::Iteration>, String> {
