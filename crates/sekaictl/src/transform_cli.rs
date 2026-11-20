@@ -121,14 +121,13 @@ pub fn run_named_with_quota(
                     quota, &owner, &run, "local", now_ms,
                 );
                 if let Some(admission) = held.as_ref()
-                    && chisei_core::transform_run_admission::complete_transform_run(
+                    && let Err(error) = chisei_core::transform_run_admission::complete_transform_run(
                         &gate, admission,
                     )
-                    .is_err()
-                    && admission.reserved_concurrency
                 {
-                    let _ =
-                        db.restore_transform_quota_hold(&run.run_id, &admission.tenant_id, true, 0);
+                    eprintln!(
+                        "tenant concurrency release failed; hold remains until expiry: {error}"
+                    );
                 }
                 if usage.is_ok() {
                     let _ = db.take_transform_usage_pending(&run.run_id);

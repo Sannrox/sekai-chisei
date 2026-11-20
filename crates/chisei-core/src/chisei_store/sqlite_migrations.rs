@@ -1040,6 +1040,8 @@ impl ChiseiSqliteSchema for SekaiDb {
         conn.execute_batch(EVAL_RUN_SQLITE)
             .map_err(|error| error.to_string())?;
         conn.execute_batch(crate::chisei_store::evaluation_rationale::SQLITE_SCHEMA)
+            .map_err(|error| error.to_string())?;
+        conn.execute_batch(crate::chisei_store::tenant_concurrency::SQLITE_SCHEMA)
             .map_err(|error| error.to_string())
     }
 

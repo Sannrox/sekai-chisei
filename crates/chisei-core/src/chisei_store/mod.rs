@@ -51,6 +51,7 @@ mod postgres_usage_ledger;
 pub mod receipt_chain;
 pub mod runtime;
 mod sqlite_migrations;
+mod tenant_concurrency;
 pub use handle::{apply_chisei_schema, try_apply_chisei_schema};
 pub use postgres_migrations::apply_chisei_postgres_schema;
 pub use runtime::ChiseiRuntimeDb;

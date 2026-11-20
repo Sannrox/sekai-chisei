@@ -38120,7 +38120,9 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
             properties: HashMap::from([
                 ("principal_id".to_string(), "agent:line-7".to_string()),
                 ("responsibility".to_string(), "t-1".to_string()),
-                ("wake_policies".to_string(), "change:60000".to_string()),
+                // 1d debounce so wall-clock committed_at_ms cannot split
+                // this test across two windows (#3299).
+                ("wake_policies".to_string(), "change:86400000".to_string()),
             ]),
             created: 1,
             updated: 1,
@@ -38173,13 +38175,13 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     let woken = turns();
     assert_eq!(woken.len(), 1, "one turn per window: {woken:?}");
     assert_eq!(woken[0].cause, agent_turn::Cause::ObjectChange);
-    assert!(woken[0].cause_ref.starts_with("change:60000@"));
+    assert!(woken[0].cause_ref.starts_with("change:86400000@"));
 
     // A cursor whose change id is no longer at its sequence (purged and
     // reused history) restarts from the beginning, and the replayed changes
     // admit nothing new.
     let wake = crate::sekai::agent_wake::change_cursor;
-    let at = wake(svc.db.runtime(), "line-7", "change:60000")
+    let at = wake(svc.db.runtime(), "line-7", "change:86400000")
         .unwrap()
         .unwrap();
     let mut reused = at.clone();
@@ -38187,20 +38189,20 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     crate::sekai::agent_wake::advance_change_cursor(
         svc.db.runtime(),
         "line-7",
-        "change:60000",
+        "change:86400000",
         Some(&at),
         &reused,
     )
     .unwrap();
     tick().await;
     assert_eq!(
-        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        wake(svc.db.runtime(), "line-7", "change:86400000").unwrap(),
         Some(Default::default())
     );
     tick().await;
     assert_eq!(turns().len(), 1, "a replay admits nothing new");
     assert_eq!(
-        wake(svc.db.runtime(), "line-7", "change:60000").unwrap(),
+        wake(svc.db.runtime(), "line-7", "change:86400000").unwrap(),
         Some(at)
     );
 }

@@ -3749,9 +3749,7 @@ pub(super) async fn claim_transform_work(
                                 Ok(None) => {
                                     if let Some(admission) = held.as_ref() {
                                         if prior_admission {
-                                            let _ = crate::composition::transform_run_admission::complete_transform_run(
-                                            &gate, admission,
-                                        );
+                                            report_complete_transform_run(&gate, admission);
                                             restore_request_admission_hold(
                                                 service.db.runtime(),
                                                 &work,
@@ -3784,9 +3782,7 @@ pub(super) async fn claim_transform_work(
                                 Err(error) => {
                                     if let Some(admission) = held.as_ref() {
                                         if prior_admission {
-                                            let _ = crate::composition::transform_run_admission::complete_transform_run(
-                                            &gate, admission,
-                                        );
+                                            report_complete_transform_run(&gate, admission);
                                             restore_request_admission_hold(
                                                 service.db.runtime(),
                                                 &work,
@@ -3861,10 +3857,7 @@ pub(super) async fn claim_transform_work(
                                 }
                                 Err(error) => {
                                     if prior_admission {
-                                        let _ = crate::composition::transform_run_admission::complete_transform_run(
-                                        &gate,
-                                        &admission,
-                                    );
+                                        report_complete_transform_run(&gate, &admission);
                                         restore_request_admission_hold(
                                             service.db.runtime(),
                                             &work,
@@ -4462,6 +4455,22 @@ fn check_isolated_transform_datasets(
     Ok(())
 }
 
+fn report_complete_transform_run(
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    admission: &crate::chisei::tenant_quota::TenantQuotaAdmission,
+) {
+    if let Err(error) =
+        crate::composition::transform_run_admission::complete_transform_run(gate, admission)
+    {
+        tracing::error!(
+            error = %error,
+            tenant_id = %admission.tenant_id,
+            run_key = %admission.idempotency_key,
+            "tenant concurrency release failed; hold remains until expiry"
+        );
+    }
+}
+
 fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Status {
     use crate::chisei::tenant_quota::TenantQuotaError;
     match error {
@@ -4603,7 +4612,7 @@ fn admit_tenant_transform(
 }
 
 fn release_tenant_transform(
-    db: &crate::db::runtime_db::RuntimeDb,
+    _db: &crate::db::runtime_db::RuntimeDb,
     gate: &crate::chisei::tenant_quota::TenantQuotaGate,
     run_id: &str,
     held: Option<&crate::chisei::tenant_quota::TenantQuotaAdmission>,
@@ -4613,12 +4622,15 @@ fn release_tenant_transform(
     };
     match crate::composition::transform_run_admission::complete_transform_run(gate, admission) {
         Ok(()) => Ok(()),
-        Err(_) if admission.reserved_concurrency => {
-            db.restore_transform_quota_hold(run_id, &admission.tenant_id, true, 0)
-                .map_err(Status::internal)?;
-            Ok(())
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                tenant_id = %admission.tenant_id,
+                run_id,
+                "tenant concurrency release failed; hold remains until expiry"
+            );
+            Err(map_quota_error(error))
         }
-        Err(error) => Err(map_quota_error(error)),
     }
 }
 
@@ -4718,6 +4730,7 @@ fn release_retryable_transform_quota(
             reserved_request: refund_request,
             reserved_concurrency,
             idempotency_key: run_id.to_string(),
+            concurrency_holder: String::new(),
         };
         match crate::composition::transform_run_admission::quota_gate(runtime.clone())
             .abandon(&admission)
@@ -4783,6 +4796,7 @@ fn complete_reserved_transform_quota(
         reserved_request: false,
         reserved_concurrency: true,
         idempotency_key: format!("transform-claim:{run_id}"),
+        concurrency_holder: String::new(),
     };
     crate::composition::transform_run_admission::complete_transform_run(
         &crate::composition::transform_run_admission::quota_gate(runtime),
