@@ -337,4 +337,54 @@ mod tests {
         assert_eq!(db.get_blast_radius("a/b").unwrap(), (1, 0));
         assert_eq!(db.get_blast_radius("a-b").unwrap(), (2, 1));
     }
+
+    #[test]
+    fn punctuation_variant_scopes_store_independently() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let colon = ActionPolicy::allow_all("agent:foo");
+        let dash = ActionPolicy::allow_all("agent-foo");
+        db.upsert_action_policy(&colon).unwrap();
+        db.upsert_action_policy(&dash).unwrap();
+        assert_eq!(db.get_action_policy("agent:foo").unwrap(), Some(colon));
+        assert_eq!(db.get_action_policy("agent-foo").unwrap(), Some(dash));
+    }
+
+    #[test]
+    fn old_style_action_policy_id_is_still_found_updated_and_listed() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let policy = ActionPolicy::allow_all("agent:legacy");
+        let now = chrono::Utc::now().timestamp();
+        db.create_object(&crate::domain::Object {
+            id: "action-policy-agent-legacy".to_string(),
+            kind: ACTION_POLICY_KIND.to_string(),
+            name: policy.scope.clone(),
+            namespace: String::new(),
+            external_id: action_policy_external_id(&policy.scope),
+            properties: policy.to_properties(),
+            created: now,
+            updated: now,
+        })
+        .unwrap();
+
+        assert_eq!(db.get_action_policy("agent:legacy").unwrap(), Some(policy));
+
+        let mut updated = ActionPolicy::allow_all("agent:legacy");
+        updated.default_decision = ActionDecision::Deny;
+        db.upsert_action_policy(&updated).unwrap();
+        assert_eq!(
+            db.get_action_policy("agent:legacy")
+                .unwrap()
+                .unwrap()
+                .default_decision,
+            ActionDecision::Deny
+        );
+        let stored = db
+            .find_by_external_id(&action_policy_external_id("agent:legacy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.id, "action-policy-agent-legacy");
+        let listed = db.list_action_policies().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], updated);
+    }
 }
