@@ -139,7 +139,7 @@ pub struct ReconcileFilter {
     pub limit: i32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RequestDedup {
     pub request_id: String,
     pub operation: String,
@@ -147,6 +147,11 @@ pub struct RequestDedup {
     pub scope_id: String,
     pub work_unit_id: String,
     pub created_at: i64,
+    /// Present when this row stored a `try_admit_work_unit` outcome.
+    pub admitted: Option<bool>,
+    pub queue_position: Option<i32>,
+    pub reason: String,
+    pub lease_owner: String,
 }
 
 impl SekaiDb {
@@ -233,6 +238,10 @@ impl SekaiDb {
                 scope_id TEXT NOT NULL DEFAULT '',
                 work_unit_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
+                admitted INTEGER,
+                queue_position INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
+                lease_owner TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (request_id, operation)
             );",
         )
@@ -241,6 +250,10 @@ impl SekaiDb {
             "ALTER TABLE sekai_work_units ADD COLUMN creator_principal TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_work_units ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE sekai_work_units ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sekai_coordination_requests ADD COLUMN admitted INTEGER",
+            "ALTER TABLE sekai_coordination_requests ADD COLUMN queue_position INTEGER",
+            "ALTER TABLE sekai_coordination_requests ADD COLUMN reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE sekai_coordination_requests ADD COLUMN lease_owner TEXT NOT NULL DEFAULT ''",
         ] {
             match conn.execute(migration, []) {
                 Ok(_) => {}
@@ -612,10 +625,12 @@ impl SekaiDb {
         }
         let conn = self.conn();
         conn.query_row(
-            "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at
+            "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at,
+                    admitted,queue_position,reason,lease_owner
              FROM sekai_coordination_requests WHERE request_id = ?1 AND operation = ?2",
             params![request_id, operation],
             |row| {
+                let admitted: Option<i32> = row.get(6)?;
                 Ok(RequestDedup {
                     request_id: row.get(0)?,
                     operation: row.get(1)?,
@@ -623,6 +638,10 @@ impl SekaiDb {
                     scope_id: row.get(3)?,
                     work_unit_id: row.get(4)?,
                     created_at: row.get(5)?,
+                    admitted: admitted.map(|flag| flag != 0),
+                    queue_position: row.get(7)?,
+                    reason: row.get(8)?,
+                    lease_owner: row.get(9)?,
                 })
             },
         )
@@ -637,8 +656,9 @@ impl SekaiDb {
         let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sekai_coordination_requests
-             (request_id,operation,principal,scope_id,work_unit_id,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+             (request_id,operation,principal,scope_id,work_unit_id,created_at,
+              admitted,queue_position,reason,lease_owner)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 request.request_id,
                 request.operation,
@@ -646,6 +666,10 @@ impl SekaiDb {
                 request.scope_id,
                 request.work_unit_id,
                 request.created_at,
+                request.admitted.map(i32::from),
+                request.queue_position,
+                request.reason,
+                request.lease_owner,
             ],
         )
         .map_err(|e| e.to_string())?;

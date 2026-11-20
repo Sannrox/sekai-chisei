@@ -55,6 +55,7 @@ pub(super) async fn create_contention_scope(
             scope_id: scope.id.clone(),
             work_unit_id: String::new(),
             created_at: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
         })
         .map_err(Status::internal)?;
     Ok(Response::new(CreateContentionScopeResponse {
@@ -112,6 +113,7 @@ pub(super) async fn update_contention_scope(
             scope_id: scope.id.clone(),
             work_unit_id: String::new(),
             created_at: chrono::Utc::now().timestamp_millis(),
+            ..Default::default()
         })
         .map_err(Status::internal)?;
     Ok(Response::new(UpdateContentionScopeResponse {

@@ -173,7 +173,9 @@ impl<'a> WorkUnitLifecycle<'a> {
             .get_dedup_request(command.request_id, "try_admit_work_unit")
             .map_err(WorkUnitLifecycleError::Storage)?
         {
-            if record.work_unit_id != command.work_unit_id || record.principal != command.principal
+            if record.work_unit_id != command.work_unit_id
+                || record.principal != command.principal
+                || (record.admitted.is_some() && record.lease_owner != command.lease_owner)
             {
                 return Err(WorkUnitLifecycleError::AlreadyExists(
                     "request_id already used for try_admit_work_unit with a different binding"
@@ -189,6 +191,15 @@ impl<'a> WorkUnitLifecycle<'a> {
                     ..Default::default()
                 })
                 .map_err(WorkUnitLifecycleError::Storage)?;
+            if let Some(admitted) = record.admitted {
+                return Ok(AdmissionResult {
+                    admitted,
+                    queue_position: record.queue_position.unwrap_or(0),
+                    reason: record.reason,
+                    work_unit,
+                    reservations,
+                });
+            }
             return Ok(AdmissionResult {
                 admitted: work_unit.status == WORK_UNIT_STATUS_RUNNING,
                 queue_position: 0,
@@ -202,13 +213,7 @@ impl<'a> WorkUnitLifecycle<'a> {
             .db
             .try_admit_work_unit(command.work_unit_id, command.lease_owner, command.now_ms)
             .map_err(WorkUnitLifecycleError::FailedPrecondition)?;
-        self.record(
-            command.request_id,
-            "try_admit_work_unit",
-            command.principal,
-            &result.work_unit,
-            command.now_ms,
-        )?;
+        self.record_admission(&command, &result)?;
         Ok(result)
     }
 
@@ -377,6 +382,28 @@ impl<'a> WorkUnitLifecycle<'a> {
                 scope_id: work_unit.scope_id.clone(),
                 work_unit_id: work_unit.id.clone(),
                 created_at: now_ms,
+                ..Default::default()
+            })
+            .map_err(WorkUnitLifecycleError::Storage)
+    }
+
+    fn record_admission(
+        &self,
+        command: &AdmitWorkUnit<'_>,
+        result: &AdmissionResult,
+    ) -> Result<(), WorkUnitLifecycleError> {
+        self.db
+            .record_dedup_request(&RequestDedup {
+                request_id: command.request_id.into(),
+                operation: "try_admit_work_unit".into(),
+                principal: command.principal.into(),
+                scope_id: result.work_unit.scope_id.clone(),
+                work_unit_id: result.work_unit.id.clone(),
+                created_at: command.now_ms,
+                admitted: Some(result.admitted),
+                queue_position: Some(result.queue_position),
+                reason: result.reason.clone(),
+                lease_owner: command.lease_owner.into(),
             })
             .map_err(WorkUnitLifecycleError::Storage)
     }
@@ -700,5 +727,148 @@ mod tests {
         assert!(replay.admitted);
         assert_eq!(replay.work_unit, first.work_unit);
         assert_eq!(replay.reservations, first.reservations);
+    }
+
+    #[test]
+    fn queued_admission_replay_returns_the_original_position() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        let mut queued = work_unit();
+        queued.id = "work-2".into();
+        queued.idempotency_key = "key-2".into();
+        queued.created_at = 2;
+        queued.updated_at = 2;
+        db.create_work_unit(&queued).unwrap();
+
+        let first = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 10,
+            })
+            .unwrap();
+        assert!(first.admitted);
+
+        let blocked = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-2",
+                request_id: "admit-2",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 11,
+            })
+            .unwrap();
+        assert!(!blocked.admitted);
+        assert_eq!(blocked.queue_position, 1);
+        assert!(!blocked.reason.is_empty());
+
+        let replay = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-2",
+                request_id: "admit-2",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 12,
+            })
+            .unwrap();
+        assert_eq!(replay.admitted, blocked.admitted);
+        assert_eq!(replay.queue_position, blocked.queue_position);
+        assert_eq!(replay.reason, blocked.reason);
+    }
+
+    #[test]
+    fn completed_admission_replay_returns_the_original_admit() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        let first = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 10,
+            })
+            .unwrap();
+        assert!(first.admitted);
+        db.complete_work_unit("work-1", 20).unwrap();
+
+        let replay = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 30,
+            })
+            .unwrap();
+        assert!(replay.admitted);
+        assert_eq!(replay.queue_position, first.queue_position);
+        assert_eq!(replay.reason, first.reason);
+    }
+
+    #[test]
+    fn admission_replay_refuses_a_different_lease_owner() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 10,
+            })
+            .unwrap();
+        let err = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "other",
+                now_ms: 20,
+            })
+            .unwrap_err();
+        assert!(matches!(err, WorkUnitLifecycleError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn pre_migration_dedup_rows_replay_from_current_state() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms: 10,
+            })
+            .unwrap();
+        db.as_sqlite()
+            .expect("sqlite")
+            .conn()
+            .execute(
+                "UPDATE sekai_coordination_requests
+                 SET admitted = NULL, queue_position = NULL, reason = '', lease_owner = ''
+                 WHERE request_id = ?1 AND operation = ?2",
+                ("admit-1", "try_admit_work_unit"),
+            )
+            .unwrap();
+        db.complete_work_unit("work-1", 20).unwrap();
+
+        let replay = lifecycle
+            .admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "other",
+                now_ms: 30,
+            })
+            .unwrap();
+        assert!(!replay.admitted);
+        assert_eq!(replay.queue_position, 0);
+        assert!(replay.reason.is_empty());
     }
 }
