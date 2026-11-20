@@ -90,6 +90,77 @@ async fn live_orders(svc: &SekaiServiceImpl) -> Vec<String> {
     orders
 }
 
+fn append_one(order_id: &str) -> Request<AppendRowsRequest> {
+    local(AppendRowsRequest {
+        dataset_id: DATASET.into(),
+        rows: vec![Row {
+            values: HashMap::from([("order_id".into(), order_id.into())]),
+        }],
+    })
+}
+
+/// #3183: lock contention on AppendRows is retryable, not a caller error.
+#[tokio::test]
+async fn append_rows_reports_sqlite_lock_contention_as_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join(format!("append-rows-lock-{}.db", std::process::id()));
+    let db = RuntimeDb::Sqlite(Arc::new(
+        crate::db::sekai::SekaiDb::new_with_pool_max(path.to_str().unwrap(), 1).unwrap(),
+    ));
+    let svc = service_on(db.clone());
+    svc.create_dataset(local(CreateDatasetRequest {
+        dataset: Some(Dataset {
+            id: DATASET.into(),
+            name: "orders".into(),
+            columns: ["order_id"]
+                .map(|name| ColumnDef {
+                    name: name.into(),
+                    r#type: "string".into(),
+                    classification: "public".into(),
+                })
+                .to_vec(),
+            ..Default::default()
+        }),
+    }))
+    .await
+    .unwrap();
+    {
+        let conn = db.conn();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+    }
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let error = svc.append_rows(append_one("o1")).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error}");
+    let message = error.message().to_ascii_lowercase();
+    assert!(
+        message.contains("database is locked") || message.contains("database is busy"),
+        "{error}"
+    );
+}
+
+/// #3183: a non-lock store fault on AppendRows stays a caller error.
+#[tokio::test]
+async fn append_rows_reports_non_lock_store_error_as_invalid_argument() {
+    let svc = service_on(RuntimeDb::memory());
+    seed_dataset(&svc, DATASET, "");
+    {
+        let conn = svc.db.runtime().conn();
+        conn.execute_batch("DROP TABLE sekai_dataset_rows").unwrap();
+    }
+    let error = svc.append_rows(append_one("o1")).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
+    assert!(
+        !error
+            .message()
+            .to_ascii_lowercase()
+            .contains("database is locked"),
+        "{error}"
+    );
+}
+
 /// List, page, read a version, roll back, and run health checks.
 async fn exercise_dataset_rpc_lifecycle(db: RuntimeDb) {
     let svc = service_on(db);

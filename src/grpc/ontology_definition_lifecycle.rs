@@ -242,14 +242,18 @@ impl SekaiServiceImpl {
 
 /// A storage failure as a gRPC status. SQLite lock contention that outlasted
 /// the busy timeout is `unavailable`, so callers retry it instead of reading
-/// it as a definition problem (#1851).
-fn persistence_status(error: String) -> Status {
+/// it as a definition or caller problem (#1851, #3183). Other errors keep `other`.
+pub(super) fn persistence_status_or(error: String, other: fn(String) -> Status) -> Status {
     let lower = error.to_ascii_lowercase();
     if lower.contains("database is locked") || lower.contains("database is busy") {
         Status::unavailable(error)
     } else {
-        Status::internal(error)
+        other(error)
     }
+}
+
+fn persistence_status(error: String) -> Status {
+    persistence_status_or(error, Status::internal)
 }
 
 fn actor(principals: &[String]) -> &str {

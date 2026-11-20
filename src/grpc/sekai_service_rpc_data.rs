@@ -383,7 +383,12 @@ pub(super) async fn append_rows(
         .db
         .runtime()
         .append_rows(&inner.dataset_id, &rows)
-        .map_err(Status::invalid_argument)?;
+        .map_err(|error| {
+            super::ontology_definition_lifecycle::persistence_status_or(
+                error,
+                Status::invalid_argument,
+            )
+        })?;
     Ok(Response::new(AppendRowsResponse { count }))
 }
 pub(super) async fn query_rows(
