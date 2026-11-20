@@ -319,34 +319,19 @@ where
     ) && existing.status == STATUS_ACTIVE
         && idle_past_retention(&existing, now_ms)
     {
-        return Ok(resnapshot_page(
-            &existing.subscription_id,
-            &existing.stream_id,
-            live_revision,
-        ));
+        return restart_for_resnapshot(db, &existing, now_ms, live_revision);
     }
     let subscription = ensure_subscription(db, actor, request, &stream, retention_ms, now_ms)?;
     if subscription.status != STATUS_ACTIVE {
         return Ok(revoked_page(&subscription, &request.snapshot_revision));
     }
     if idle_past_retention(&subscription, now_ms) {
-        return Ok(resnapshot_page(
-            &subscription.subscription_id,
-            &subscription.stream_id,
-            live_revision,
-        ));
+        return restart_for_resnapshot(db, &subscription, now_ms, live_revision);
     }
     let state = parse_stream_state(&stream)?;
-    if state.authorization_pin != authorization_pin
-        || state.kind != scope.kind
-        || state.object_ids != normalized_object_ids(&scope)
-        || !same_filters(&state.property_filters, &scope.property_filters)
-    {
-        return Ok(resnapshot_page(
-            &subscription.subscription_id,
-            &subscription.stream_id,
-            live_revision,
-        ));
+    if !stream_state_matches(&state, &scope, authorization_pin) {
+        bind_object_change_stream_state(db, &stream, &scope, authorization_pin)?;
+        return restart_for_resnapshot(db, &subscription, now_ms, live_revision);
     }
     if !request.last_page_digest.is_empty()
         && request.last_page_digest == subscription.cursor.last_page_digest
@@ -835,6 +820,37 @@ fn restart_for_resnapshot(
     ))
 }
 
+fn stream_state_matches(
+    state: &ObjectChangeStreamState,
+    scope: &ObjectChangeScope,
+    authorization_pin: &str,
+) -> bool {
+    state.authorization_pin == authorization_pin
+        && state.kind == scope.kind
+        && state.object_ids == normalized_object_ids(scope)
+        && same_filters(&state.property_filters, &scope.property_filters)
+}
+
+fn bind_object_change_stream_state(
+    db: &RuntimeDb,
+    stream: &EventStreamBinding,
+    scope: &ObjectChangeScope,
+    authorization_pin: &str,
+) -> Result<(), String> {
+    let state = ObjectChangeStreamState {
+        kind: scope.kind.clone(),
+        object_ids: normalized_object_ids(scope),
+        property_filters: scope.property_filters.clone(),
+        authorization_pin: authorization_pin.into(),
+    };
+    let binding = EventStreamBinding {
+        source_instance: serde_json::to_string(&state).map_err(|error| error.to_string())?,
+        type_digest: scope_digest(scope)?,
+        ..stream.clone()
+    };
+    db.put_event_stream_binding(&binding)
+}
+
 fn mutation_kind(mutation: &CommittedObjectMutation) -> String {
     if !mutation.object_kind.is_empty() {
         return mutation.object_kind.clone();
@@ -1172,6 +1188,32 @@ mod tests {
         .unwrap()
     }
 
+    fn read_with_pin(
+        runtime: &RuntimeDb,
+        snapshot: &str,
+        visible: &[&str],
+        now: i64,
+        pin: &str,
+    ) -> ObjectChangePage {
+        read_object_change_subscription(
+            runtime,
+            "alice",
+            &ObjectChangeReadRequest {
+                subscription_id: "sales-customers".into(),
+                scope: scope(),
+                snapshot_revision: snapshot.into(),
+                limit: 32,
+                retention_ms: DEFAULT_RETENTION_MS,
+                last_page_digest: String::new(),
+                revoke: false,
+            },
+            now,
+            &visible_customers(visible),
+            pin,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn snapshot_then_insert_update_delete_converges() {
         let runtime = db();
@@ -1297,6 +1339,15 @@ mod tests {
             "",
         );
         assert_eq!(expired.outcome, OUTCOME_RESNAPSHOT);
+        let idle_recovered = read(
+            &runtime,
+            &expired.snapshot_revision,
+            &["c-eu"],
+            20 + DEFAULT_RETENTION_MS + 2,
+            false,
+            "",
+        );
+        assert_eq!(idle_recovered.outcome, OUTCOME_PAGE);
 
         let runtime = db();
         runtime
@@ -1305,25 +1356,60 @@ mod tests {
         let revision =
             snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
         read(&runtime, &revision, &["c-eu"], 20, false, "");
-        let changed = read_object_change_subscription(
-            &runtime,
-            "alice",
-            &ObjectChangeReadRequest {
-                subscription_id: "sales-customers".into(),
-                scope: scope(),
-                snapshot_revision: revision,
-                limit: 32,
-                retention_ms: DEFAULT_RETENTION_MS,
-                last_page_digest: String::new(),
-                revoke: false,
-            },
-            21,
-            &[],
-            "sha256:other-auth",
-        )
-        .unwrap();
+        let changed = read_with_pin(&runtime, &revision, &[], 21, "sha256:other-auth");
         assert_eq!(changed.outcome, OUTCOME_RESNAPSHOT);
         assert!(changed.events.is_empty());
+        let pin_recovered = read_with_pin(
+            &runtime,
+            &changed.snapshot_revision,
+            &["c-eu"],
+            22,
+            "sha256:other-auth",
+        );
+        assert_eq!(pin_recovered.outcome, OUTCOME_PAGE);
+
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read_with_pin(&runtime, &revision, &["c-eu"], 20, "sha256:auth");
+        runtime
+            .create_object_with_audit(&customer("c-us", "West", "us", 21), "alice")
+            .unwrap();
+        let changed = read_with_pin(
+            &runtime,
+            &revision,
+            &["c-eu", "c-us"],
+            22,
+            "sha256:other-auth",
+        );
+        assert_eq!(changed.outcome, OUTCOME_RESNAPSHOT);
+        assert!(changed.events.is_empty());
+        let recovered = read_with_pin(
+            &runtime,
+            &changed.snapshot_revision,
+            &["c-eu", "c-us"],
+            23,
+            "sha256:other-auth",
+        );
+        assert_eq!(recovered.outcome, OUTCOME_PAGE);
+        assert!(
+            recovered
+                .events
+                .iter()
+                .all(|event| event.object_id != "c-us")
+        );
+        let retried = read_with_pin(
+            &runtime,
+            &changed.snapshot_revision,
+            &["c-eu", "c-us"],
+            24,
+            "sha256:auth",
+        );
+        assert_eq!(retried.outcome, OUTCOME_RESNAPSHOT);
+        assert!(retried.events.is_empty());
     }
 
     #[test]
@@ -1563,7 +1649,7 @@ mod tests {
             &ObjectChangeReadRequest {
                 subscription_id: format!("sales-customers-{suffix}"),
                 scope: scope(),
-                snapshot_revision: revision,
+                snapshot_revision: revision.clone(),
                 limit: 32,
                 retention_ms: DEFAULT_RETENTION_MS,
                 last_page_digest: String::new(),
@@ -1576,6 +1662,42 @@ mod tests {
         .unwrap();
         assert_eq!(page.outcome, OUTCOME_PAGE);
         assert!(!page.authority);
+        let changed = read_object_change_subscription(
+            runtime,
+            "alice",
+            &ObjectChangeReadRequest {
+                subscription_id: format!("sales-customers-{suffix}"),
+                scope: scope(),
+                snapshot_revision: revision.clone(),
+                limit: 32,
+                retention_ms: DEFAULT_RETENTION_MS,
+                last_page_digest: String::new(),
+                revoke: false,
+            },
+            22,
+            &objects,
+            "sha256:other-auth",
+        )
+        .unwrap();
+        assert_eq!(changed.outcome, OUTCOME_RESNAPSHOT);
+        let recovered = read_object_change_subscription(
+            runtime,
+            "alice",
+            &ObjectChangeReadRequest {
+                subscription_id: format!("sales-customers-{suffix}"),
+                scope: scope(),
+                snapshot_revision: changed.snapshot_revision,
+                limit: 32,
+                retention_ms: DEFAULT_RETENTION_MS,
+                last_page_digest: String::new(),
+                revoke: false,
+            },
+            23,
+            &objects,
+            "sha256:other-auth",
+        )
+        .unwrap();
+        assert_eq!(recovered.outcome, OUTCOME_PAGE);
     }
 
     #[test]
