@@ -376,10 +376,14 @@ pub fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
         "system_one": t.system_one,
         "review_queue": t.review_queue,
     });
-    // Added after types were stored: only a set offline rule or impact
-    // class enters the fingerprint, so every stored type keeps its
-    // fingerprint.
+    // Added after types were stored: only a set later field (offline
+    // rule, impact class, budget parameters, approvers) enters the
+    // fingerprint, so every stored type keeps its fingerprint.
     let mut body = body;
+    if !t.approvers.is_empty() {
+        let object = body.as_object_mut().expect("fingerprint body is an object");
+        object.insert("approvers".into(), t.approvers.clone().into());
+    }
     if !t.offline_conflict.is_empty() || !t.last_writer_wins_properties.is_empty() {
         let object = body.as_object_mut().expect("fingerprint body is an object");
         object.insert("offline_conflict".into(), t.offline_conflict.clone().into());
@@ -643,6 +647,9 @@ impl SekaiDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::postgres::PostgresDb;
+    use crate::db::runtime_db::RuntimeDb;
+    use std::sync::Arc;
 
     fn sample(enabled: bool) -> GovernedActionType {
         GovernedActionType {
@@ -768,6 +775,61 @@ mod tests {
             .list_governed_action_types("acme", Some("review.intake"), false)
             .unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    fn with_approvers(namespace: &str, approvers: &[&str]) -> GovernedActionType {
+        GovernedActionType {
+            namespace: namespace.into(),
+            type_id: "t".into(),
+            version: "v1".into(),
+            approvers: approvers
+                .iter()
+                .map(|principal| (*principal).into())
+                .collect(),
+            ..sample(true)
+        }
+    }
+
+    fn exercise_approver_immutability(db: &RuntimeDb, namespace: &str) {
+        let alice = with_approvers(namespace, &["alice"]);
+        db.put_governed_action_type(alice.clone(), "operator", 10)
+            .unwrap();
+        let stored = db.put_governed_action_type(alice, "operator", 20).unwrap();
+        assert_eq!(stored.approvers, ["alice"]);
+        let err = db
+            .put_governed_action_type(with_approvers(namespace, &["bob"]), "operator", 30)
+            .unwrap_err();
+        assert!(err.contains("immutable"), "{err}");
+    }
+
+    fn postgres_runtime() -> RuntimeDb {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must identify an isolated PostgreSQL database");
+        let db = if let Ok(path) = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            PostgresDb::connect_with_ca_certificate(&url, 8, &std::fs::read(path).unwrap()).unwrap()
+        } else {
+            PostgresDb::connect(&url, 8).unwrap()
+        };
+        RuntimeDb::Postgres(Arc::new(db))
+    }
+
+    /// Empty approvers stay out of the fingerprint so stored types keep
+    /// theirs. A re-put that changes the set is a new version.
+    #[test]
+    fn sqlite_reputting_a_version_with_different_approvers_is_refused() {
+        assert!(
+            !body_fingerprint(&sample(true))
+                .unwrap()
+                .contains("approvers")
+        );
+        exercise_approver_immutability(&RuntimeDb::memory(), "acme");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_reputting_a_version_with_different_approvers_is_refused() {
+        let namespace = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        exercise_approver_immutability(&postgres_runtime(), &namespace);
     }
 
     /// #1910: an unclassified type keeps the fingerprint it had before
