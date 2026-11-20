@@ -21,9 +21,10 @@ type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
 pub fn usage() -> String {
     [
-        "sekaictl admin governance action policy set --scope <scope> [--default allow|deny|require_approval]",
+        "sekaictl admin governance action policy set --scope <scope> --default allow|deny|require_approval",
         "                           [--action <name>=<decision>]... [--risk <class>=<decision>]...",
         "                           [--max-mutations <n>] [--max-deletes <n>]",
+        "                           set replaces the whole policy for the scope",
         "sekaictl admin governance action policy get --scope <scope>",
         "sekaictl admin governance action policy list",
         "sekaictl admin governance action type put --file <type.json|-> [--request-id <id>]",
@@ -32,6 +33,16 @@ pub fn usage() -> String {
     ]
     .join("\n")
 }
+
+const POLICY_SET_FLAGS: [&str; 6] = [
+    "--scope",
+    "--default",
+    "--action",
+    "--risk",
+    "--max-mutations",
+    "--max-deletes",
+];
+const POLICY_SET_REPEATABLE: [&str; 2] = ["--action", "--risk"];
 
 fn target() -> String {
     std::env::var("CHISEI_GRPC_URL")
@@ -318,43 +329,54 @@ fn print_policy(policy: &ActionPolicy) {
     }
 }
 
+/// Builds the replacement policy from flags. Called before any RPC so a
+/// usage error writes nothing.
+fn parse_policy_set(args: &[String]) -> Result<ActionPolicy, BoxErr> {
+    crate::value_flags::check_value_flags_allowing_repeats(
+        args,
+        &POLICY_SET_FLAGS,
+        &POLICY_SET_REPEATABLE,
+    )
+    .map_err(std::io::Error::other)?;
+    let scope =
+        flag_value(args, "--scope").ok_or_else(|| std::io::Error::other("--scope required"))?;
+    let default_decision =
+        flag_value(args, "--default").ok_or_else(|| std::io::Error::other("--default required"))?;
+    let action_overrides = parse_pairs(&multi_flag(args, "--action"))?;
+    let risk_overrides = parse_pairs(&multi_flag(args, "--risk"))?;
+    let max_mutations = flag_value(args, "--max-mutations")
+        .map(|v| v.parse::<u32>())
+        .transpose()?
+        .unwrap_or(0);
+    let max_deletes = flag_value(args, "--max-deletes")
+        .map(|v| v.parse::<u32>())
+        .transpose()?
+        .unwrap_or(0);
+    Ok(ActionPolicy {
+        scope,
+        default_decision,
+        action_overrides,
+        risk_overrides,
+        max_mutations_per_work_unit: max_mutations,
+        max_deletes_per_work_unit: max_deletes,
+    })
+}
+
 async fn run_policy(args: Vec<String>) -> Result<(), BoxErr> {
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", usage());
         return Ok(());
     }
+    let set_policy = (args[0] == "set")
+        .then(|| parse_policy_set(&args[1..]))
+        .transpose()?;
     let channel = connect_sekai(&target()).await?;
     let mut sekai = SekaiServiceClient::new(channel);
 
     match args[0].as_str() {
         "set" => {
-            let rest = &args[1..];
-            let scope = flag_value(rest, "--scope")
-                .ok_or_else(|| std::io::Error::other("--scope required"))?;
-            let default_decision =
-                flag_value(rest, "--default").unwrap_or_else(|| "allow".to_string());
-            let action_overrides = parse_pairs(&multi_flag(rest, "--action"))?;
-            let risk_overrides = parse_pairs(&multi_flag(rest, "--risk"))?;
-            let max_mutations = flag_value(rest, "--max-mutations")
-                .map(|v| v.parse::<u32>())
-                .transpose()?
-                .unwrap_or(0);
-            let max_deletes = flag_value(rest, "--max-deletes")
-                .map(|v| v.parse::<u32>())
-                .transpose()?
-                .unwrap_or(0);
-            let policy = ActionPolicy {
-                scope,
-                default_decision,
-                action_overrides,
-                risk_overrides,
-                max_mutations_per_work_unit: max_mutations,
-                max_deletes_per_work_unit: max_deletes,
-            };
             let stored = sekai
-                .set_action_policy(SetActionPolicyRequest {
-                    policy: Some(policy),
-                })
+                .set_action_policy(SetActionPolicyRequest { policy: set_policy })
                 .await?
                 .into_inner()
                 .policy
@@ -506,6 +528,83 @@ mod tests {
         let args = vec!["--scope".to_string(), "agent:x".to_string()];
         assert_eq!(flag_value(&args, "--scope"), Some("agent:x".to_string()));
         assert_eq!(flag_value(&args, "--missing"), None);
+    }
+
+    fn set_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    #[test]
+    fn policy_set_without_default_names_the_flag() {
+        let error = parse_policy_set(&set_args(&["--scope", "s", "--action", "a=deny"]))
+            .expect_err("omitting --default must fail before any write");
+        assert!(
+            error.to_string().contains("--default"),
+            "error must name --default, got {error}"
+        );
+    }
+
+    #[test]
+    fn policy_set_unknown_flag_is_refused() {
+        let error = parse_policy_set(&set_args(&[
+            "--scope",
+            "s",
+            "--default",
+            "deny",
+            "--defualt",
+            "allow",
+        ]))
+        .expect_err("a misspelled flag must fail before any write");
+        assert!(
+            error.to_string().contains("--defualt"),
+            "error must name the unknown flag, got {error}"
+        );
+    }
+
+    #[test]
+    fn policy_set_usage_states_replace_semantics() {
+        let text = usage();
+        assert!(
+            text.contains("set replaces the whole policy for the scope"),
+            "usage must say set replaces the whole policy, got {text}"
+        );
+        assert!(
+            text.contains("--default allow|deny|require_approval"),
+            "usage must require --default, got {text}"
+        );
+        assert!(
+            !text.contains("[--default"),
+            "usage must not mark --default optional, got {text}"
+        );
+    }
+
+    #[test]
+    fn policy_set_accepts_repeated_overrides_with_explicit_default() {
+        let policy = parse_policy_set(&set_args(&[
+            "--scope",
+            "s",
+            "--default",
+            "deny",
+            "--action",
+            "a=allow",
+            "--action",
+            "b=deny",
+            "--max-mutations",
+            "3",
+        ]))
+        .expect("explicit --default with repeated --action must parse");
+        assert_eq!(policy.scope, "s");
+        assert_eq!(policy.default_decision, "deny");
+        assert_eq!(
+            policy.action_overrides.get("a").map(String::as_str),
+            Some("allow")
+        );
+        assert_eq!(
+            policy.action_overrides.get("b").map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(policy.max_mutations_per_work_unit, 3);
+        assert_eq!(policy.max_deletes_per_work_unit, 0);
     }
 
     #[test]

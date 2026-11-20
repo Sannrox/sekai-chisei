@@ -6,6 +6,16 @@
 /// each of `known` at most once, with no value that itself looks like a flag.
 /// Errors name the offending argument.
 pub fn check_value_flags(args: &[String], known: &[&str]) -> Result<(), String> {
+    check_value_flags_allowing_repeats(args, known, &[])
+}
+
+/// Like [`check_value_flags`], but names in `repeatable` may appear more than
+/// once (`--action` / `--risk` on `policy set`).
+pub fn check_value_flags_allowing_repeats(
+    args: &[String],
+    known: &[&str],
+    repeatable: &[&str],
+) -> Result<(), String> {
     let mut seen: Vec<&str> = Vec::new();
     let mut pairs = args.chunks(2);
     for pair in &mut pairs {
@@ -13,7 +23,7 @@ pub fn check_value_flags(args: &[String], known: &[&str]) -> Result<(), String> 
         if !known.contains(&name) {
             return Err(format!("unknown option {name}"));
         }
-        if seen.contains(&name) {
+        if seen.contains(&name) && !repeatable.contains(&name) {
             return Err(format!("{name} was given more than once"));
         }
         match pair.get(1) {
@@ -53,6 +63,34 @@ mod tests {
         assert_eq!(
             check_value_flags(&args(&["--digest"]), &known).unwrap_err(),
             "--digest requires a value"
+        );
+    }
+
+    #[test]
+    fn allowing_repeats_keeps_unknown_and_duplicate_checks() {
+        let known = ["--scope", "--action"];
+        let repeatable = ["--action"];
+        assert!(
+            check_value_flags_allowing_repeats(
+                &args(&["--scope", "s", "--action", "a=deny", "--action", "b=allow"]),
+                &known,
+                &repeatable,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            check_value_flags_allowing_repeats(
+                &args(&["--scope", "s", "--scope", "t"]),
+                &known,
+                &repeatable,
+            )
+            .unwrap_err(),
+            "--scope was given more than once"
+        );
+        assert_eq!(
+            check_value_flags_allowing_repeats(&args(&["--defualt", "deny"]), &known, &repeatable)
+                .unwrap_err(),
+            "unknown option --defualt"
         );
     }
 }
