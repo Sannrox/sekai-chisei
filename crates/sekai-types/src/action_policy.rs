@@ -305,12 +305,16 @@ pub fn candidate_scopes(actor: &str, namespace: &str, project: &str) -> Vec<Stri
     scopes
 }
 
+/// Object id for a newly stored action policy. Distinct scopes stay distinct
+/// even when they differ only in punctuation. Existing rows keep their original
+/// ids; lookups go by `external_id`.
 pub fn action_policy_id(scope: &str) -> String {
     let sanitized: String = scope
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
-    format!("action-policy-{sanitized}")
+    let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
+    format!("action-policy-{sanitized}-{}", &digest[..12])
 }
 
 pub fn action_policy_external_id(scope: &str) -> String {
@@ -347,5 +351,10 @@ mod tests {
         };
         let read = ActionPolicy::from_properties("s", &policy.to_properties()).unwrap();
         assert_eq!(read.action_overrides, policy.action_overrides);
+    }
+
+    #[test]
+    fn action_policy_id_keeps_punctuation_variants_distinct() {
+        assert_ne!(action_policy_id("agent:foo"), action_policy_id("agent-foo"));
     }
 }
