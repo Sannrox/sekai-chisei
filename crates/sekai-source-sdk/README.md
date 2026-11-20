@@ -26,5 +26,7 @@ parses the crate source into `public-api.txt` (types, fields, variants,
 and function arity). Additive and incompatible changes both require
 updating that snapshot; incompatible changes also require a major bump.
 `conformance_suite_digest()` hashes the crate version, batch and discovery
-contract versions, and `src/conformance.rs`, so a suite-behavior change
-cannot keep the previous certification pin.
+contract versions, and the sources of `conformance.rs`, `change_capture.rs`,
+and every crate module the suite calls (`contract.rs`, `discover.rs`,
+`lineage.rs`, `sdk.rs`), so a suite-behavior change cannot keep the previous
+certification pin.
