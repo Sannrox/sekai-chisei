@@ -3,6 +3,8 @@
 //! A subscription is a consumer cursor over an admitted
 //! `sekai.event-stream-projection/v1` stream. It is not a broker client.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::db::runtime_db::RuntimeDb;
@@ -137,7 +139,13 @@ pub fn register_event_subscription(
             return Err(SUBSCRIBE_UNAVAILABLE.into());
         }
         if same_pins(&existing, &validated) && !idle_past_retention(&existing, now_ms) {
-            return Ok(existing);
+            if existing.retention_ms == validated.retention_ms {
+                return Ok(existing);
+            }
+            let mut kept = existing;
+            kept.retention_ms = validated.retention_ms;
+            db.put_event_subscription(&kept)?;
+            return Ok(kept);
         }
     }
     db.put_event_subscription(&validated)?;
@@ -395,14 +403,19 @@ fn owned_subscription(
     Ok(subscription)
 }
 
+/// Pins that reset the cursor: stream, schema, type digest, definition digest,
+/// and the column set. Retention and column order are not pins.
 fn same_pins(existing: &EventSubscription, next: &EventSubscription) -> bool {
     existing.stream_id == next.stream_id
         && existing.schema_revision == next.schema_revision
         && existing.type_digest == next.type_digest
         && existing.definition_digest == next.definition_digest
-        && existing.columns == next.columns
-        && existing.retention_ms == next.retention_ms
+        && same_column_set(&existing.columns, &next.columns)
         && existing.status == STATUS_ACTIVE
+}
+
+fn same_column_set(left: &[String], right: &[String]) -> bool {
+    left.iter().collect::<BTreeSet<_>>() == right.iter().collect::<BTreeSet<_>>()
 }
 
 fn idle_past_retention(subscription: &EventSubscription, now_ms: i64) -> bool {
@@ -700,6 +713,63 @@ mod tests {
         let next = deliver_subscription_page(&runtime, "analyst", &page(2, 2), 4_300).unwrap();
         assert_eq!(next.outcome, "accepted");
         assert_eq!(next.cursor.committed_offset, 2);
+    }
+
+    #[test]
+    fn reregister_keeps_cursor_when_retention_or_column_order_changes() {
+        let runtime = setup();
+        let first = deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_000).unwrap();
+        assert_eq!(first.outcome, "accepted");
+        assert_eq!(first.cursor.committed_offset, 1);
+
+        let mut longer = subscription();
+        longer.retention_ms = 20_000;
+        let restarted = register_event_subscription(&runtime, "analyst", &longer, 4_200).unwrap();
+        assert_eq!(restarted.cursor.committed_offset, 1);
+        assert_eq!(restarted.retention_ms, 20_000);
+        let stored = inspect_event_subscription(&runtime, "analyst", "ops", "ops-alerts").unwrap();
+        assert_eq!(stored.retention_ms, 20_000);
+        assert_eq!(stored.cursor.committed_offset, 1);
+        let replay = deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_300).unwrap();
+        assert_eq!(replay.outcome, "replayed");
+        assert_eq!(replay.cursor.committed_offset, 1);
+
+        let mut reordered = subscription();
+        reordered.columns = vec!["kind".into(), "id".into()];
+        reordered.retention_ms = 20_000;
+        let reordered_reg =
+            register_event_subscription(&runtime, "analyst", &reordered, 4_400).unwrap();
+        assert_eq!(reordered_reg.cursor.committed_offset, 1);
+        let still_replayed =
+            deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_500).unwrap();
+        assert_eq!(still_replayed.outcome, "replayed");
+    }
+
+    #[test]
+    fn reregister_resets_cursor_when_column_set_or_definition_changes() {
+        let runtime = setup();
+        deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_000).unwrap();
+        let mut narrower = subscription();
+        narrower.columns = vec!["id".into()];
+        let reset = register_event_subscription(&runtime, "analyst", &narrower, 4_200).unwrap();
+        assert_eq!(reset.cursor.committed_offset, 0);
+        assert_eq!(
+            deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_300)
+                .unwrap()
+                .outcome,
+            "accepted"
+        );
+
+        let runtime = setup();
+        deliver_subscription_page(&runtime, "analyst", &page(1, 1), 4_000).unwrap();
+        let mut next_stream = stream_binding();
+        next_stream.type_digest = "sha256:other".into();
+        register_event_stream(&runtime, "analyst", &next_stream, 5_000).unwrap();
+        project_event_batch(&runtime, "analyst", &projected_batch(1, 1), 5_100).unwrap();
+        let after_definition =
+            register_event_subscription(&runtime, "analyst", &subscription(), 5_200).unwrap();
+        assert_eq!(after_definition.cursor.committed_offset, 0);
+        assert_eq!(after_definition.type_digest, "sha256:other");
     }
 
     #[test]

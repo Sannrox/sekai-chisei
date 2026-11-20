@@ -33,8 +33,11 @@ epoch, offset, and digest.
 
 A subscription is an independent cursor over pages the stream checkpoint has
 already admitted. Each accepted event stores a content commitment. Exact replay
-of the last page digest returns `replayed`. Re-registering the same pins keeps
-the cursor unless the retention window has elapsed; then re-register resets it.
+of the last page digest returns `replayed`. Pins are stream, schema revision,
+type digest, definition digest, and the column set. Re-registering those pins
+keeps the cursor unless the retention window has elapsed; then re-register
+resets it. A new retention or the same columns in another order keeps the
+cursor and stores the new retention.
 An idle cursor older than the bound retention window cannot disclose a page,
 including exact replay. Revocation is durable; the
 same identifier cannot be reactivated. Checkpoints that predate event
