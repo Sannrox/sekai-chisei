@@ -1220,6 +1220,12 @@ const MIGRATIONS: &[Migration] = &[
         COORDINATION_REQUEST_OUTCOME_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(
+        169,
+        "chisei_tenant_concurrency_holds",
+        "",
+        MigrationOwner::Chisei,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -3211,6 +3217,21 @@ mod tests {
             .find(|migration| migration.name == "external_action_reclaim_index")
             .expect("external_action_reclaim_index");
         assert_eq!(migration.version, 143);
+        assert!(matches!(migration.owner, MigrationOwner::Chisei));
+        assert!(migration.sql.is_empty());
+        assert!(migration.statements(SchemaPlane::Sekai).is_empty());
+        assert!(migration.statements(SchemaPlane::Chisei).is_empty());
+        assert!(migration.statements(SchemaPlane::Shared).is_empty());
+    }
+
+    #[test]
+    fn tenant_concurrency_holds_migration_is_chisei_owned() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "chisei_tenant_concurrency_holds")
+            .expect("chisei_tenant_concurrency_holds");
+        assert_eq!(migration.version, 169);
         assert!(matches!(migration.owner, MigrationOwner::Chisei));
         assert!(migration.sql.is_empty());
         assert!(migration.statements(SchemaPlane::Sekai).is_empty());

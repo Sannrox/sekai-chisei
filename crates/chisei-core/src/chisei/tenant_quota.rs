@@ -18,6 +18,8 @@ use sekai_core::enterprise::AuthenticatedContext;
 
 /// In-flight concurrency units reserved while a tenant operation is active.
 pub const METRIC_CONCURRENCY: &str = "concurrency";
+/// How long an unreclaimed concurrency hold counts against the tenant.
+pub(crate) const CONCURRENCY_HOLD_MS: i64 = 120_000;
 /// Retained storage units (bytes) attributed to a tenant.
 pub const METRIC_STORAGE_BYTES: &str = "storage_bytes";
 
@@ -112,12 +114,15 @@ pub struct TenantQuotaReceiptNote {
 /// Tenant quota gate backed by shared budget state.
 pub struct TenantQuotaGate {
     tracker: BudgetTracker,
+    store: ChiseiStore,
 }
 
 impl TenantQuotaGate {
     pub fn new(db: impl Into<ChiseiStore>) -> Self {
+        let store = db.into();
         Self {
-            tracker: BudgetTracker::new(db.into()),
+            tracker: BudgetTracker::new(store.clone()),
+            store,
         }
     }
 
@@ -139,8 +144,8 @@ impl TenantQuotaGate {
                 .map_err(TenantQuotaError::Storage)?;
         }
         if let Some(max) = limits.max_concurrency {
-            // Concurrency uses a long period so units represent in-flight work;
-            // release returns capacity immediately via adjust.
+            // The monthly row is only the configured cap `configured_limits`
+            // reads. Live units are holder-keyed holds, not budget consume.
             self.tracker
                 .set_limit_with_metric(&scope, METRIC_CONCURRENCY, max, PeriodType::Monthly)
                 .map_err(TenantQuotaError::Storage)?;
@@ -167,6 +172,29 @@ impl TenantQuotaGate {
         estimated_tokens: i32,
         idempotency_key: &str,
     ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
+        let now = wall_ms();
+        self.admit_at(
+            context,
+            limits,
+            min_assignment_version,
+            estimated_tokens,
+            idempotency_key,
+            now..=now.saturating_add(CONCURRENCY_HOLD_MS),
+        )
+    }
+
+    /// Admit with an explicit hold window `[now, until]` so expiry is testable.
+    pub(crate) fn admit_at(
+        &self,
+        context: &AuthenticatedContext,
+        limits: &TenantQuotaLimits,
+        min_assignment_version: u64,
+        estimated_tokens: i32,
+        idempotency_key: &str,
+        hold: std::ops::RangeInclusive<i64>,
+    ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
+        let now_ms = *hold.start();
+        let until_ms = *hold.end();
         let tenant = context
             .tenant
             .as_ref()
@@ -186,6 +214,7 @@ impl TenantQuotaGate {
             reserved_request: false,
             reserved_concurrency: false,
             idempotency_key: idempotency_key.to_string(),
+            concurrency_holder: String::new(),
         };
 
         if limits.max_requests_per_period.is_some() {
@@ -205,18 +234,52 @@ impl TenantQuotaGate {
             }
             reserved.reserved_tokens = estimated_tokens;
         }
-        if limits.max_concurrency.is_some() {
-            if let Err(err) =
-                self.tracker
-                    .check_and_reserve_with_metric(&scope, 1, METRIC_CONCURRENCY)
-            {
-                let _ = self.rollback_partial(&reserved);
-                let _ = err;
-                return Err(exhausted(METRIC_CONCURRENCY));
+        if let Some(max) = limits.max_concurrency {
+            let holder = uuid::Uuid::new_v4().to_string();
+            match self.store.take_tenant_concurrency_hold(
+                &tenant.tenant_id,
+                idempotency_key,
+                &holder,
+                max,
+                now_ms,
+                until_ms,
+            ) {
+                Ok(true) => {
+                    reserved.reserved_concurrency = true;
+                    reserved.concurrency_holder = holder;
+                }
+                Ok(false) => {
+                    let _ = self.rollback_partial(&reserved);
+                    return Err(exhausted(METRIC_CONCURRENCY));
+                }
+                Err(err) => {
+                    let _ = self.rollback_partial(&reserved);
+                    return Err(TenantQuotaError::Storage(err));
+                }
             }
-            reserved.reserved_concurrency = true;
         }
         Ok(reserved)
+    }
+
+    /// Extends a live concurrency hold. False when another holder has it or
+    /// it has already expired.
+    pub fn renew_concurrency(
+        &self,
+        admission: &TenantQuotaAdmission,
+        now_ms: i64,
+    ) -> Result<bool, TenantQuotaError> {
+        if !admission.reserved_concurrency {
+            return Ok(true);
+        }
+        self.store
+            .renew_tenant_concurrency_hold(
+                &admission.tenant_id,
+                &admission.idempotency_key,
+                &admission.concurrency_holder,
+                now_ms,
+                now_ms.saturating_add(CONCURRENCY_HOLD_MS),
+            )
+            .map_err(TenantQuotaError::Storage)
     }
 
     /// Drop a reservation when the admitted work did not run.
@@ -253,10 +316,11 @@ impl TenantQuotaGate {
             remaining.reserved_tokens = 0;
         }
         if remaining.reserved_concurrency {
-            if let Err(error) =
-                self.tracker
-                    .try_adjust_with_metric(&remaining.scope_id, 1, 0, METRIC_CONCURRENCY)
-            {
+            if let Err(error) = self.store.release_tenant_concurrency_hold(
+                &remaining.tenant_id,
+                &remaining.idempotency_key,
+                &remaining.concurrency_holder,
+            ) {
                 return Err(Box::new(QuotaAbandonError {
                     error: TenantQuotaError::Storage(error),
                     remaining,
@@ -284,10 +348,15 @@ impl TenantQuotaGate {
                 .map_err(TenantQuotaError::Storage)?;
         }
         if admission.reserved_concurrency {
-            // Return the in-flight unit. Storage errors must surface so an
-            // isolated write can restore the taken hold and retry release.
-            self.tracker
-                .try_adjust_with_metric(&admission.scope_id, 1, 0, METRIC_CONCURRENCY)
+            // Holder-matched release. A missing row is a no-op so a second
+            // complete cannot free another unit. Storage errors surface; the
+            // row stays until expiry.
+            self.store
+                .release_tenant_concurrency_hold(
+                    &admission.tenant_id,
+                    &admission.idempotency_key,
+                    &admission.concurrency_holder,
+                )
                 .map_err(TenantQuotaError::Storage)?;
         }
         Ok(TenantQuotaReceiptNote {
@@ -344,6 +413,9 @@ pub struct TenantQuotaAdmission {
     pub reserved_request: bool,
     pub reserved_concurrency: bool,
     pub idempotency_key: String,
+    /// Process that took the concurrency hold. Empty on reconstructed
+    /// admissions so a successor can delete the key after a crash.
+    pub concurrency_holder: String,
 }
 
 impl TenantQuotaAdmission {
@@ -376,11 +448,19 @@ fn exhausted(metric: &str) -> TenantQuotaError {
         metric: metric.into(),
         // Period budgets reset at period boundary; concurrency may free sooner.
         retry_after_hint: if metric == METRIC_CONCURRENCY {
-            "when in-flight work completes".into()
+            "when in-flight work completes or its hold expires".into()
         } else {
             "next period boundary".into()
         },
     }
+}
+
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -523,6 +603,13 @@ mod tests {
             .unwrap();
     }
 
+    fn drop_concurrency_holds(path: &str) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch("DROP TABLE chisei_tenant_concurrency_holds")
+            .unwrap();
+    }
+
     #[test]
     fn complete_reports_storage_when_concurrency_release_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -540,10 +627,10 @@ mod tests {
         let admission = gate
             .admit(&tenant_context("tenant-a", "alice"), &lim, 1, 0, "run-1")
             .unwrap();
-        drop_budget_usage(path);
+        drop_concurrency_holds(path);
         let err = gate.complete(&admission, 0).unwrap_err();
         assert!(
-            matches!(err, TenantQuotaError::Storage(ref message) if message.contains("chisei_budget_usage")),
+            matches!(err, TenantQuotaError::Storage(ref message) if message.contains("chisei_tenant_concurrency_holds")),
             "{err}"
         );
     }
@@ -565,10 +652,10 @@ mod tests {
         let admission = gate
             .admit(&tenant_context("tenant-a", "alice"), &lim, 1, 0, "run-1")
             .unwrap();
-        drop_budget_usage(path);
+        drop_concurrency_holds(path);
         let err = gate.abandon(&admission).unwrap_err();
         assert!(
-            matches!(err.error, TenantQuotaError::Storage(ref message) if message.contains("chisei_budget_usage")),
+            matches!(err.error, TenantQuotaError::Storage(ref message) if message.contains("chisei_tenant_concurrency_holds")),
             "{}",
             err.error
         );
@@ -640,5 +727,123 @@ mod tests {
         // and this subsequent in-budget admit would fail as METRIC_REQUESTS.
         let admitted = gate.admit(&a, &lim, 1, 5, "tok-ok").unwrap();
         gate.complete(&admitted, 5).unwrap();
+    }
+
+    fn concurrency_only() -> TenantQuotaLimits {
+        TenantQuotaLimits {
+            max_requests_per_period: None,
+            max_tokens_per_period: None,
+            max_concurrency: Some(1),
+            max_storage_bytes: None,
+            ..limits(1)
+        }
+    }
+
+    #[test]
+    fn expired_concurrency_hold_stops_counting_without_complete() {
+        let gate = gate();
+        let lim = concurrency_only();
+        gate.configure("tenant-a", &lim).unwrap();
+        let a = tenant_context("tenant-a", "alice");
+        gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
+        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 5..=15).unwrap_err();
+        assert!(matches!(
+            blocked,
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
+        ));
+        gate.admit_at(&a, &lim, 1, 0, "run-3", 11..=21)
+            .expect("expired hold must free the slot");
+    }
+
+    #[test]
+    fn renewed_concurrency_hold_still_blocks_a_second_admit() {
+        let gate = gate();
+        let lim = concurrency_only();
+        gate.configure("tenant-a", &lim).unwrap();
+        let a = tenant_context("tenant-a", "alice");
+        let held = gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
+        assert!(
+            gate.renew_concurrency(&held, 9).unwrap(),
+            "live holder must extend the hold"
+        );
+        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 11..=21).unwrap_err();
+        assert!(matches!(
+            blocked,
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
+        ));
+    }
+
+    #[test]
+    fn restarted_process_reclaims_an_expired_hold_and_double_release_is_one_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.db");
+        let path = path.to_str().unwrap();
+        let lim = concurrency_only();
+        let a = tenant_context("tenant-a", "alice");
+        {
+            let first = gate_on_file(path);
+            first.configure("tenant-a", &lim).unwrap();
+            first
+                .admit_at(&a, &lim, 1, 0, "run-crashed", 0..=10)
+                .unwrap();
+        }
+        let second = gate_on_file(path);
+        second
+            .admit_at(&a, &lim, 1, 0, "run-next", 11..=21)
+            .expect("a new process must reclaim the expired hold");
+        let still_blocked = second
+            .admit_at(&a, &lim, 1, 0, "run-extra", 12..=22)
+            .unwrap_err();
+        assert!(matches!(
+            still_blocked,
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
+        ));
+
+        let held = TenantQuotaAdmission {
+            tenant_id: "tenant-a".into(),
+            scope_id: tenant_scope_id("tenant-a"),
+            assignment_version: 1,
+            reserved_tokens: 0,
+            reserved_request: false,
+            reserved_concurrency: true,
+            idempotency_key: "run-next".into(),
+            concurrency_holder: String::new(),
+        };
+        second.complete(&held, 0).unwrap();
+        second.complete(&held, 0).unwrap();
+        second
+            .admit_at(&a, &lim, 1, 0, "run-after-double", 13..=23)
+            .expect("one complete frees one unit");
+        let over = second
+            .admit_at(&a, &lim, 1, 0, "run-over", 14..=24)
+            .unwrap_err();
+        assert!(
+            matches!(
+                over,
+                TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
+            ),
+            "double complete must not free a second unit"
+        );
+    }
+
+    #[test]
+    fn stale_holder_complete_does_not_free_a_reclaimed_key() {
+        let gate = gate();
+        let lim = concurrency_only();
+        gate.configure("tenant-a", &lim).unwrap();
+        let a = tenant_context("tenant-a", "alice");
+        let stale = gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
+        let live = gate
+            .admit_at(&a, &lim, 1, 0, "run-1", 11..=21)
+            .expect("expired same key is reclaimable");
+        gate.complete(&stale, 0).unwrap();
+        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 12..=22).unwrap_err();
+        assert!(matches!(
+            blocked,
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
+        ));
+        gate.complete(&live, 0).unwrap();
+        gate.admit_at(&a, &lim, 1, 0, "run-2", 13..=23)
+            .expect("the live holder still owned the slot");
     }
 }

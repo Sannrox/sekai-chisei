@@ -170,6 +170,12 @@ pub const CHISEI_PLANE_SQL: &[PlaneSql] = &[
         include_str!("postgres/0165_chisei_evaluation_rationales.sql"),
         None,
     ),
+    plane(
+        169,
+        "chisei_tenant_concurrency_holds",
+        include_str!("postgres/0169_chisei_tenant_concurrency_holds.sql"),
+        None,
+    ),
 ];
 
 pub fn apply_chisei_postgres_schema(db: &PostgresDb) -> Result<(), String> {
@@ -266,5 +272,13 @@ mod tests {
         assert!(reclaim.contains("budget_reserved"));
         assert!(reclaim.contains("blast_radius_reserved"));
         assert!(reclaim.contains("expires_at_ms"));
+
+        let holds = sql("chisei_tenant_concurrency_holds");
+        assert!(
+            holds.contains("CREATE TABLE IF NOT EXISTS chisei_tenant_concurrency_holds"),
+            "missing PostgreSQL tenant concurrency hold table"
+        );
+        assert!(holds.contains("until_ms"));
+        assert!(holds.contains("holder"));
     }
 }
