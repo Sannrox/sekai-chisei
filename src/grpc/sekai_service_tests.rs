@@ -38205,6 +38205,180 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
     );
 }
 
+/// #2741: one instance's internal wake error must not starve the rest of
+/// the tick, must leave that instance's cursor unmoved, and must still
+/// surface as a tick failure.
+#[tokio::test]
+async fn a_failing_change_wake_does_not_stop_the_other_instances() {
+    use crate::sekai::agent_turn;
+    use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+    let db = Arc::new(RuntimeDb::memory());
+    let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db));
+    for (namespace, principal) in [("fail-ns", "agent:a-fail"), ("ops", "agent:b-ok")] {
+        let (_, grants) = svc
+            .db
+            .runtime()
+            .ensure_team_namespace(namespace, principal, security::Role::Viewer, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+    }
+    let ticket = |id: &str, namespace: &str, marking: Option<&str>| {
+        let mut properties = HashMap::from([("status".into(), "open".into())]);
+        if let Some(marking) = marking {
+            properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), marking.into());
+        }
+        Object {
+            id: id.into(),
+            kind: "ticket".into(),
+            name: id.into(),
+            namespace: namespace.into(),
+            external_id: format!("{namespace}:{id}"),
+            properties,
+            created: 0,
+            updated: 0,
+        }
+    };
+    svc.create_object(with_named_principal(
+        CreateObjectRequest {
+            object: Some(ticket("t-fail", "fail-ns", Some("restricted"))),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    svc.create_object(with_named_principal(
+        CreateObjectRequest {
+            object: Some(ticket("t-ok", "ops", None)),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let instance =
+        |id: &str, namespace: &str, principal: &str, responsibility: &str| crate::domain::Object {
+            id: id.into(),
+            kind: crate::sekai::site_agent_instance::KIND.into(),
+            name: id.into(),
+            namespace: namespace.into(),
+            external_id: String::new(),
+            properties: HashMap::from([
+                ("principal_id".to_string(), principal.to_string()),
+                ("responsibility".to_string(), responsibility.to_string()),
+                ("wake_policies".to_string(), "change:60000".to_string()),
+            ]),
+            created: 1,
+            updated: 1,
+        };
+    svc.db
+        .runtime()
+        .create_object(&instance("a-fail", "fail-ns", "agent:a-fail", "t-fail"))
+        .unwrap();
+    svc.db
+        .runtime()
+        .create_object(&instance("b-ok", "ops", "agent:b-ok", "t-ok"))
+        .unwrap();
+    let tick = |now_ms: i64| {
+        svc.tick_governed_transforms(with_named_principal(
+            TickGovernedTransformsRequest { now_ms },
+            "local",
+        ))
+    };
+    tick(60_000).await.unwrap();
+    let before =
+        crate::sekai::agent_wake::change_cursor(svc.db.runtime(), "a-fail", "change:60000")
+            .unwrap()
+            .unwrap();
+
+    let mut failed = ticket("t-fail", "fail-ns", Some("restricted"));
+    failed.properties.insert("status".into(), "triage".into());
+    failed.updated = svc
+        .db
+        .runtime()
+        .get_object("t-fail")
+        .unwrap()
+        .unwrap()
+        .updated;
+    svc.update_object(with_named_principal(
+        UpdateObjectRequest {
+            object: Some(failed),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    let mut ok = ticket("t-ok", "ops", None);
+    ok.properties.insert("status".into(), "triage".into());
+    ok.updated = svc
+        .db
+        .runtime()
+        .get_object("t-ok")
+        .unwrap()
+        .unwrap()
+        .updated;
+    svc.update_object(with_named_principal(
+        UpdateObjectRequest {
+            object: Some(ok),
+            lease_precondition: None,
+        },
+        "local",
+    ))
+    .await
+    .unwrap();
+    svc.db
+        .runtime()
+        .conn()
+        .execute(
+            "INSERT INTO sekai_classification_lattices
+             (namespace, contract_version, digest, lattice_json, created_by, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            ("fail-ns", "v1", "stale", "{", "root", 1_i64),
+        )
+        .unwrap();
+
+    let err = tick(60_000).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Internal);
+    let woken = agent_turn::list_claimable(svc.db.runtime(), "ops", i64::MAX / 2, 10).unwrap();
+    assert_eq!(
+        woken.len(),
+        1,
+        "the healthy instance still admits: {woken:?}"
+    );
+    assert_eq!(woken[0].instance_id, "b-ok");
+    assert!(
+        agent_turn::list_claimable(svc.db.runtime(), "fail-ns", i64::MAX / 2, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        crate::sekai::agent_wake::change_cursor(svc.db.runtime(), "a-fail", "change:60000")
+            .unwrap()
+            .unwrap(),
+        before,
+        "the failing instance's cursor does not advance"
+    );
+
+    let err = tick(120_000).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Internal);
+    assert_eq!(
+        crate::sekai::agent_wake::change_cursor(svc.db.runtime(), "a-fail", "change:60000")
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        agent_turn::list_claimable(svc.db.runtime(), "ops", i64::MAX / 2, 10)
+            .unwrap()
+            .len(),
+        1,
+        "retry does not admit a second turn for the healthy instance"
+    );
+}
+
 /// #1964: a non-admin caller runs an inline definition into a scratch
 /// output, a retry replays it, an unreadable input is refused before any
 /// run, and nothing is stored in the catalog.
