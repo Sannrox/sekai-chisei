@@ -11,6 +11,8 @@ use crate::domain::{
 };
 use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::object_security::PrincipalPolicyContext;
+use sekai_types::governed_transform::hash_field;
+use sha2::{Digest, Sha256};
 
 pub const VALUE_CONTRACT: &str = "sekai.geospatial-value/v1";
 pub const QUERY_CONTRACT: &str = "sekai.geospatial-query/v1";
@@ -398,6 +400,7 @@ fn audit_query(
     total: i32,
     now_ms: i64,
 ) -> Result<(), String> {
+    let query_digest = geospatial_query_digest(actor, query);
     db.record_decision(&Decision {
         // A query per millisecond is not unique; the UUID keeps each its own decision.
         id: format!(
@@ -414,6 +417,7 @@ fn audit_query(
             ("namespace".into(), query.namespace.clone()),
             ("property".into(), query.property.clone()),
             ("operator".into(), query.operator.as_str().to_string()),
+            ("query_digest".into(), query_digest),
             ("total".into(), total.to_string()),
             ("write_authority".into(), "false".into()),
             ("permit_authority".into(), "false".into()),
@@ -421,6 +425,49 @@ fn audit_query(
         target_id: query.namespace.clone(),
         outcome: "matched".into(),
     })
+}
+
+fn geospatial_query_digest(actor: &str, query: &GeospatialQuery) -> String {
+    let mut hasher = Sha256::new();
+    hash_field(&mut hasher, actor);
+    hash_field(&mut hasher, query.kind.as_deref().unwrap_or(""));
+    hash_field(&mut hasher, &query.property);
+    hash_field(&mut hasher, query.operator.as_str());
+    match &query.geometry.geometry {
+        GeospatialGeometry::Point(point) => {
+            hasher.update(b"point");
+            hash_point(&mut hasher, *point);
+        }
+        GeospatialGeometry::Line(points) => {
+            hasher.update(b"line");
+            hasher.update((points.len() as u64).to_le_bytes());
+            for point in points {
+                hash_point(&mut hasher, *point);
+            }
+        }
+        GeospatialGeometry::Polygon(points) => {
+            hasher.update(b"polygon");
+            hasher.update((points.len() as u64).to_le_bytes());
+            for point in points {
+                hash_point(&mut hasher, *point);
+            }
+        }
+    }
+    match query.max_distance_m {
+        Some(distance) => {
+            hasher.update(b"max_distance");
+            hasher.update(distance.to_bits().to_le_bytes());
+        }
+        None => hasher.update(b"no_max_distance"),
+    }
+    hasher.update(query.limit.to_le_bytes());
+    hasher.update(query.offset.to_le_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_point(hasher: &mut Sha256, point: GeoPoint) {
+    hasher.update(point.lon.to_bits().to_le_bytes());
+    hasher.update(point.lat.to_bits().to_le_bytes());
 }
 
 fn haversine_m(left: GeoPoint, right: GeoPoint) -> f64 {
@@ -1095,6 +1142,54 @@ mod tests {
             decisions
                 .iter()
                 .all(|decision| decision.id.starts_with(&prefix))
+        );
+        for decision in &decisions {
+            assert_eq!(decision.actor, "alice");
+            let digest = decision.evidence.get("query_digest").expect("query digest");
+            assert!(digest.starts_with("sha256:"));
+            assert_eq!(digest.len(), "sha256:".len() + 64);
+        }
+        assert_eq!(
+            decisions[0].evidence.get("query_digest"),
+            decisions[1].evidence.get("query_digest")
+        );
+
+        query_geospatial(&db, "bob", &query, 60).unwrap();
+        let mut paged = query.clone();
+        paged.offset = 1;
+        query_geospatial(&db, "alice", &paged, 60).unwrap();
+        let later = db
+            .list_decisions(&DecisionFilter {
+                action: Some("geospatial.query".into()),
+                target_id: Some(query.namespace.clone()),
+                limit: 8,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(later.len(), 4);
+        let bob = later
+            .iter()
+            .find(|decision| decision.actor == "bob")
+            .expect("bob decision");
+        let paged_alice = later
+            .iter()
+            .find(|decision| {
+                decision.actor == "alice"
+                    && decision.evidence.get("query_digest")
+                        != decisions[0].evidence.get("query_digest")
+            })
+            .expect("paged alice decision");
+        assert_ne!(
+            bob.evidence.get("query_digest"),
+            decisions[0].evidence.get("query_digest")
+        );
+        assert_ne!(
+            paged_alice.evidence.get("query_digest"),
+            decisions[0].evidence.get("query_digest")
+        );
+        assert_ne!(
+            bob.evidence.get("query_digest"),
+            paged_alice.evidence.get("query_digest")
         );
     }
 
