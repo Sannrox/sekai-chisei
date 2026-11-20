@@ -6,7 +6,7 @@ use crate::contract::{
 use crate::sdk::{
     FlushDisposition, GetSourceSyncStateInput, SourceAdapterConfig, SourceGenerationStatus,
     SourceOutbox, SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
-    TransportFailure, build_source_batch_v2,
+    TransportFailure, build_source_batch_v2, state_matches_committed_batch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +96,7 @@ pub fn run_change_feed<T: SourceSyncTransport, S: ChangeFeedSource>(
             }
             FlushDisposition::Committed => {
                 let state = read_state(config, transport)?;
-                if !state_matches_feed_batch(&state, &pending) {
+                if !state_matches_committed_batch(&state, &pending) {
                     return Ok(SourceRunReport::from_state(
                         SourceRunDisposition::RecoveryRequired,
                         0,
@@ -205,7 +205,7 @@ pub fn run_change_feed<T: SourceSyncTransport, S: ChangeFeedSource>(
         }
         FlushDisposition::Committed => {
             let verified = read_state(config, transport)?;
-            if !state_matches_feed_batch(&verified, &batch) {
+            if !state_matches_committed_batch(&verified, &batch) {
                 return Ok(SourceRunReport::from_state(
                     SourceRunDisposition::RecoveryRequired,
                     0,
@@ -285,24 +285,6 @@ fn validate_page(page: &ChangeFeedPage, max_records: usize) -> Option<u64> {
         expected = expected.checked_add(1)?;
     }
     expected.checked_sub(1)
-}
-
-fn state_matches_feed_batch(state: &SourceSyncStateView, batch: &SourceBatch) -> bool {
-    let Some(delivery) = batch.delivery.as_ref() else {
-        return false;
-    };
-    delivery.mode == SourceDeliveryMode::ChangeFeed
-        && state.found
-        && !state.open_transaction
-        && state.generation_status == Some(SourceGenerationStatus::Active)
-        && state.delivery_mode == Some(SourceDeliveryMode::ChangeFeed)
-        && state.current_cursor.as_deref() == Some(batch.proposed_next_cursor.as_str())
-        && state.last_committed_batch_digest.as_deref() == Some(batch.batch_digest.as_str())
-        && state.latest_transaction_idempotency_key.as_deref()
-            == Some(batch.idempotency_key.as_str())
-        && state.sync_generation == Some(delivery.sync_generation)
-        && state.source_feed_epoch == delivery.source_feed_epoch
-        && state.committed_offset == delivery.offset_end
 }
 
 fn rejected_disposition(state: &SourceSyncStateView) -> SourceRunDisposition {
