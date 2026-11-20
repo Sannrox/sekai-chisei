@@ -349,9 +349,6 @@ where
         after_seq,
         i32::try_from(MAX_BACKLOG.saturating_add(1)).map_err(|error| error.to_string())?,
     )?;
-    if raw.len() > MAX_BACKLOG as usize {
-        return disconnect_slow(&subscription, &request.snapshot_revision);
-    }
     let operation_ids = crate::sekai::operation_correlation::operation_ids_for_objects(
         db,
         &raw.iter()
@@ -376,9 +373,25 @@ where
     let limit = page_limit(request.limit);
     let page_events = events.into_iter().take(limit).collect::<Vec<_>>();
     if page_events.is_empty() {
-        let next = touch_subscription(&subscription, now_ms);
+        // Skip the scanned prefix so a busy out-of-scope kind cannot look like
+        // a slow consumer. CAS keeps a crash/retry from jumping past an
+        // in-scope event that was not in this empty projection.
+        let next = EventSubscription {
+            cursor: EventSubscriptionCursor {
+                committed_offset: raw
+                    .last()
+                    .map(|mutation| mutation.seq)
+                    .unwrap_or(subscription.cursor.committed_offset),
+                admitted_at_ms: now_ms,
+                ..subscription.cursor.clone()
+            },
+            ..subscription.clone()
+        };
         db.advance_event_subscription_cursor(&next, &subscription)?;
         return Ok(empty_page(&next, &request.snapshot_revision));
+    }
+    if raw.len() > MAX_BACKLOG as usize {
+        return disconnect_slow(&subscription, &request.snapshot_revision);
     }
     let digest = page_digest(
         &subscription.subscription_id,
@@ -990,16 +1003,6 @@ fn page_digest(
     ))
 }
 
-fn touch_subscription(subscription: &EventSubscription, now_ms: i64) -> EventSubscription {
-    EventSubscription {
-        cursor: EventSubscriptionCursor {
-            admitted_at_ms: now_ms,
-            ..subscription.cursor.clone()
-        },
-        ..subscription.clone()
-    }
-}
-
 fn resnapshot_page(
     subscription_id: &str,
     stream_id: &str,
@@ -1593,6 +1596,115 @@ mod tests {
         assert_eq!(page.outcome, OUTCOME_DISCONNECTED);
         assert_eq!(page.disconnect_reason, DISCONNECT_SLOW_CONSUMER);
         assert!(page.events.is_empty());
+    }
+
+    fn order(id: &str, ts: i64) -> Object {
+        Object {
+            id: id.into(),
+            kind: "Order".into(),
+            name: id.into(),
+            namespace: "sales".into(),
+            external_id: format!("sales:{id}"),
+            properties: HashMap::from([("status".into(), "open".into())]),
+            created: ts,
+            updated: ts,
+        }
+    }
+
+    fn inspect_customers(runtime: &RuntimeDb) -> EventSubscription {
+        crate::sekai::event_subscription::inspect_event_subscription(
+            runtime,
+            "alice",
+            "sales",
+            "sales-customers",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn out_of_scope_mutations_are_skipped_without_disconnecting() {
+        // #2740: a subscriber caught up on its own kind must skip a busy
+        // sibling kind instead of looking like a slow consumer.
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read(&runtime, &revision, &["c-eu"], 20, false, "");
+
+        runtime
+            .create_object_with_audit(&order("o-1", 21), "alice")
+            .unwrap();
+        for index in 0..300 {
+            let mut updated = order("o-1", 21);
+            updated
+                .properties
+                .insert("status".into(), format!("s{index}"));
+            updated.updated = 22 + i64::from(index);
+            runtime.update_object_with_audit(&updated, "alice").unwrap();
+        }
+
+        let mut now = 400i64;
+        let mut last_offset = inspect_customers(&runtime).cursor.committed_offset;
+        loop {
+            now += 1;
+            assert!(now < 420, "out-of-scope backlog should skip in a few pages");
+            let page = read(&runtime, &revision, &["c-eu"], now, false, "");
+            assert_eq!(page.outcome, OUTCOME_PAGE);
+            assert!(page.events.is_empty());
+            assert_eq!(page.disconnect_reason, "");
+            if page.committed_offset == last_offset {
+                break;
+            }
+            last_offset = page.committed_offset;
+        }
+
+        let mut seen = customer("c-eu", "North", "eu", 10);
+        seen.properties.insert("region".into(), "apac".into());
+        seen.updated = now + 1;
+        runtime.update_object_with_audit(&seen, "alice").unwrap();
+        let page = read(&runtime, &revision, &["c-eu"], now + 2, false, "");
+        assert_eq!(page.outcome, OUTCOME_PAGE);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].object_id, "c-eu");
+        assert_eq!(page.events[0].op, OP_UPDATE);
+    }
+
+    #[test]
+    fn empty_page_cursor_advance_retry_does_not_skip_in_scope_event() {
+        // #2740: CAS-advancing past an empty projection, then losing that
+        // persist and retrying, must still deliver a later in-scope event.
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read(&runtime, &revision, &["c-eu"], 20, false, "");
+        runtime
+            .create_object_with_audit(&order("o-1", 21), "alice")
+            .unwrap();
+
+        let before = inspect_customers(&runtime);
+        let skipped = read(&runtime, &revision, &["c-eu"], 40, false, "");
+        assert_eq!(skipped.outcome, OUTCOME_PAGE);
+        assert!(skipped.events.is_empty());
+        assert!(skipped.committed_offset > before.cursor.committed_offset);
+        let after = inspect_customers(&runtime);
+        runtime
+            .advance_event_subscription_cursor(&before, &after)
+            .unwrap();
+
+        let mut seen = customer("c-eu", "North", "eu", 10);
+        seen.properties.insert("region".into(), "apac".into());
+        seen.updated = 41;
+        runtime.update_object_with_audit(&seen, "alice").unwrap();
+        let page = read(&runtime, &revision, &["c-eu"], 42, false, "");
+        assert_eq!(page.outcome, OUTCOME_PAGE);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].object_id, "c-eu");
+        assert_eq!(page.events[0].op, OP_UPDATE);
     }
 
     fn postgres_runtime() -> RuntimeDb {
