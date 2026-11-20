@@ -108,6 +108,7 @@ fn exercise(db: &dyn CoordinationBackend, prefix: &str) {
         scope_id: first.scope_id.clone(),
         work_unit_id: first.id.clone(),
         created_at: 202,
+        ..Default::default()
     };
     db.record_dedup_request(&request).unwrap();
     db.record_dedup_request(&request).unwrap();

@@ -238,6 +238,8 @@ const FACT_MIGRATION_POST_VALUES_SCHEMA: &str =
     include_str!("postgres/0166_fact_migration_post_values.sql");
 const DROP_LEGACY_SEARCH_INDEX_SCHEMA: &str =
     include_str!("postgres/0167_drop_legacy_search_index.sql");
+const COORDINATION_REQUEST_OUTCOME_SCHEMA: &str =
+    include_str!("postgres/0168_coordination_request_outcome.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1210,6 +1212,12 @@ const MIGRATIONS: &[Migration] = &[
         167,
         "drop_legacy_search_index",
         DROP_LEGACY_SEARCH_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        168,
+        "coordination_request_outcome",
+        COORDINATION_REQUEST_OUTCOME_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

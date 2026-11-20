@@ -245,7 +245,8 @@ impl PostgresDb {
         }
         self.connection()?
             .query_opt(
-                "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at
+                "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at,
+                    admitted,queue_position,reason,lease_owner
              FROM sekai_coordination_requests WHERE request_id=$1 AND operation=$2",
                 &[&request_id, &operation],
             )
@@ -257,11 +258,13 @@ impl PostgresDb {
         if request.request_id.is_empty() {
             return Ok(());
         }
+        let admitted = request.admitted.map(i32::from);
         self.connection()?
             .execute(
                 "INSERT INTO sekai_coordination_requests
-             (request_id,operation,principal,scope_id,work_unit_id,created_at)
-             VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(request_id,operation) DO NOTHING",
+             (request_id,operation,principal,scope_id,work_unit_id,created_at,
+              admitted,queue_position,reason,lease_owner)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(request_id,operation) DO NOTHING",
                 &[
                     &request.request_id,
                     &request.operation,
@@ -269,6 +272,10 @@ impl PostgresDb {
                     &request.scope_id,
                     &request.work_unit_id,
                     &request.created_at,
+                    &admitted,
+                    &request.queue_position,
+                    &request.reason,
+                    &request.lease_owner,
                 ],
             )
             .map(|_| ())
@@ -964,6 +971,7 @@ fn row_to_event(row: Row) -> RunEvent {
     }
 }
 fn row_to_request(row: Row) -> RequestDedup {
+    let admitted: Option<i32> = row.get(6);
     RequestDedup {
         request_id: row.get(0),
         operation: row.get(1),
@@ -971,6 +979,10 @@ fn row_to_request(row: Row) -> RequestDedup {
         scope_id: row.get(3),
         work_unit_id: row.get(4),
         created_at: row.get(5),
+        admitted: admitted.map(|flag| flag != 0),
+        queue_position: row.get(7),
+        reason: row.get(8),
+        lease_owner: row.get(9),
     }
 }
 
