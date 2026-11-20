@@ -6,12 +6,12 @@
 //! opaque cursor.
 
 use crate::contract::{
-    MAX_SOURCE_BATCH_RECORDS, SourceBatch, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
+    MAX_SOURCE_BATCH_RECORDS, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
 };
 use crate::sdk::{
     FlushDisposition, GetSourceSyncStateInput, SourceAdapterConfig, SourceGenerationStatus,
     SourceOutbox, SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
-    TransportFailure, build_source_batch, build_source_batch_v2,
+    TransportFailure, build_source_batch, build_source_batch_v2, state_matches_committed_batch,
 };
 
 pub const DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN: usize = 32;
@@ -300,7 +300,7 @@ pub fn run_generation_snapshot_v2<T: SourceSyncTransport, S: GenerationSnapshotS
             }
             FlushDisposition::Committed => {
                 let state = read_state(config, transport)?;
-                if !state_matches_v2_batch(&state, &pending) {
+                if !state_matches_committed_batch(&state, &pending) {
                     return Ok(SourceRunReport::from_state(
                         SourceRunDisposition::RecoveryRequired,
                         batches_committed,
@@ -410,7 +410,7 @@ pub fn run_generation_snapshot_v2<T: SourceSyncTransport, S: GenerationSnapshotS
             }
             FlushDisposition::Committed => {
                 let verified = read_state(config, transport)?;
-                if !state_matches_v2_batch(&verified, &batch) {
+                if !state_matches_committed_batch(&verified, &batch) {
                     return Ok(SourceRunReport::from_state(
                         SourceRunDisposition::RecoveryRequired,
                         batches_committed,
@@ -475,37 +475,6 @@ fn snapshot_generation(state: &SourceSyncStateView) -> Option<u64> {
             .sync_generation
             .and_then(|generation| generation.checked_add(1)),
         _ => None,
-    }
-}
-
-fn state_matches_v2_batch(state: &SourceSyncStateView, batch: &SourceBatch) -> bool {
-    let Some(delivery) = batch.delivery.as_ref() else {
-        return false;
-    };
-    let common = state.found
-        && !state.open_transaction
-        && state.current_cursor.as_deref() == Some(batch.proposed_next_cursor.as_str())
-        && state.last_committed_batch_digest.as_deref() == Some(batch.batch_digest.as_str())
-        && state.latest_transaction_idempotency_key.as_deref()
-            == Some(batch.idempotency_key.as_str())
-        && state.sync_generation == Some(delivery.sync_generation);
-    if !common {
-        return false;
-    }
-    match delivery.mode {
-        SourceDeliveryMode::Snapshot if delivery.snapshot_complete => {
-            state.generation_status == Some(SourceGenerationStatus::Active)
-                && state.delivery_mode == Some(SourceDeliveryMode::ChangeFeed)
-                && state.source_feed_epoch == delivery.source_feed_epoch
-                && state.committed_offset == delivery.offset_end
-        }
-        SourceDeliveryMode::Snapshot => {
-            state.generation_status == Some(SourceGenerationStatus::Snapshotting)
-                && state.delivery_mode == Some(SourceDeliveryMode::Snapshot)
-                && state.source_feed_epoch.is_none()
-                && state.committed_offset.is_none()
-        }
-        SourceDeliveryMode::ChangeFeed => false,
     }
 }
 

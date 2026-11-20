@@ -666,6 +666,43 @@ pub struct SourceSyncStateView {
     pub latest_transaction_reason: Option<String>,
 }
 
+/// True when `state` is the committed result of `batch`, judged by that
+/// batch's own delivery mode. A complete snapshot and a change-feed page
+/// both leave Active ChangeFeed state; an incomplete snapshot stays
+/// Snapshotting.
+pub(crate) fn state_matches_committed_batch(
+    state: &SourceSyncStateView,
+    batch: &SourceBatch,
+) -> bool {
+    let Some(delivery) = batch.delivery.as_ref() else {
+        return false;
+    };
+    if !(state.found
+        && !state.open_transaction
+        && state.current_cursor.as_deref() == Some(batch.proposed_next_cursor.as_str())
+        && state.last_committed_batch_digest.as_deref() == Some(batch.batch_digest.as_str())
+        && state.latest_transaction_idempotency_key.as_deref()
+            == Some(batch.idempotency_key.as_str())
+        && state.sync_generation == Some(delivery.sync_generation))
+    {
+        return false;
+    }
+    match delivery.mode {
+        SourceDeliveryMode::Snapshot if !delivery.snapshot_complete => {
+            state.generation_status == Some(SourceGenerationStatus::Snapshotting)
+                && state.delivery_mode == Some(SourceDeliveryMode::Snapshot)
+                && state.source_feed_epoch.is_none()
+                && state.committed_offset.is_none()
+        }
+        SourceDeliveryMode::Snapshot | SourceDeliveryMode::ChangeFeed => {
+            state.generation_status == Some(SourceGenerationStatus::Active)
+                && state.delivery_mode == Some(SourceDeliveryMode::ChangeFeed)
+                && state.source_feed_epoch == delivery.source_feed_epoch
+                && state.committed_offset == delivery.offset_end
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceRunDisposition {
     CaughtUp,
