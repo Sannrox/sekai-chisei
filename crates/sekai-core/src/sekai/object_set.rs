@@ -1275,6 +1275,33 @@ mod tests {
             digest(&aggregate("costr", "egion")),
         );
 
+        let pinned = ObjectSetDescriptor {
+            definition_digest: "sha256:definition".into(),
+            hops: vec![hop("asset", "owner")],
+            aggregation: Some(ObjectSetAggregation {
+                function: "sum".into(),
+                property: "cost".into(),
+                group_by: "region".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            digest(&pinned),
+            "0b4c0b7967b2eb5db7abff94d7a8e67a8b518d0619eb66cbd4448a376c1a92df"
+        );
+        let mut concatenated = Sha256::new();
+        concatenated.update(CONTRACT_VERSION.as_bytes());
+        concatenated.update(pinned.definition_digest.as_bytes());
+        concatenated.update(object_query_digest(&filter).unwrap().as_bytes());
+        concatenated.update(b"owns");
+        concatenated.update(b"outgoing");
+        concatenated.update(b"asset");
+        concatenated.update(b"owner");
+        concatenated.update(b"sum");
+        concatenated.update(b"cost");
+        concatenated.update(b"region");
+        assert_ne!(digest(&pinned), format!("{:x}", concatenated.finalize()));
+
         // A descriptor without hops or aggregation keeps its earlier digest.
         let plain = ObjectSetDescriptor {
             definition_digest: "sha256:definition".into(),

@@ -1978,6 +1978,7 @@ mod tests {
         DefinitionMember, DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
     };
     use crate::sekai::security;
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use tonic::metadata::MetadataValue;
@@ -2575,6 +2576,95 @@ mod tests {
         assert_eq!(second.members[0].id, "o-north");
         assert!(second.next_page_token.is_empty());
         assert!(!second.members.iter().any(|object| object.id == "o-west"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_object_set_refuses_a_pre_upgrade_query_digest_cursor() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        let descriptor = descriptor(&digest, 1);
+        let first = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor.clone()),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!first.next_page_token.is_empty());
+
+        let bound = svc
+            .authorize_object_set_read(&["alice".into()], None, Some(descriptor.clone()))
+            .unwrap();
+        let list_digest =
+            crate::sekai::object_security::object_query_digest(&bound.filter).unwrap();
+        let mut concatenated = Sha256::new();
+        concatenated.update(crate::sekai::object_set::CONTRACT_VERSION.as_bytes());
+        concatenated.update(bound.descriptor.definition_digest.as_bytes());
+        concatenated.update(list_digest.as_bytes());
+        for hop in crate::sekai::object_set::resolved_hops(&bound.descriptor) {
+            concatenated.update(hop.relation.as_bytes());
+            concatenated.update(hop.direction.as_bytes());
+            concatenated.update(hop.far_kind.as_bytes());
+            concatenated.update(hop.join_property.as_bytes());
+        }
+        let old_digest = format!("{:x}", concatenated.finalize());
+        assert_ne!(old_digest, bound.query_digest);
+
+        let current = crate::sekai::object_security::ObjectQueryCursor::decode(
+            &first.next_page_token,
+            &svc.object_query_cursor_key,
+            1,
+        )
+        .unwrap();
+        let stale = crate::sekai::object_security::ObjectQueryCursor::issue(
+            current.offset,
+            current.principal_context_digest,
+            current.namespace,
+            current.policy_activation_digest,
+            old_digest,
+            current.expires_at_ms - crate::sekai::object_security::OBJECT_QUERY_CURSOR_TTL_MS,
+        )
+        .unwrap()
+        .encode(&svc.object_query_cursor_key)
+        .unwrap();
+        let refused = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor.clone()),
+                    page_token: stale,
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            refused.message(),
+            "object set cursor authority or query has changed"
+        );
+
+        let fresh = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(descriptor),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fresh.total, first.total);
+        assert_eq!(fresh.members.len(), first.members.len());
     }
 
     #[tokio::test]
