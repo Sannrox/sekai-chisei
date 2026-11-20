@@ -40,14 +40,37 @@ impl SekaiServiceImpl {
                     .message()
                     .to_string()
             })?;
+        // One instance's internal error must not starve later instances; the
+        // failed cursor stays put so the next tick retries it.
+        let mut failed = None;
         for instance in agent_wake::instances(db)? {
             for (token, policy) in agent_wake::policies(&instance) {
                 if let WakePolicy::Change { debounce_ms } = policy {
-                    self.tick_change_wake(&schema, &instance, &token, debounce_ms, actor, now_ms)?;
+                    if let Err(error) = self.tick_change_wake(
+                        &schema,
+                        &instance,
+                        &token,
+                        debounce_ms,
+                        actor,
+                        now_ms,
+                    ) {
+                        tracing::error!(
+                            instance_id = %instance.id,
+                            token,
+                            %error,
+                            "agent change wake failed"
+                        );
+                        if failed.is_none() {
+                            failed = Some(error);
+                        }
+                    }
                 }
             }
         }
-        Ok(())
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn tick_change_wake(
