@@ -310,7 +310,7 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
-          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+          bash scripts/release/require-head-tag.sh "$TAG"
       - name: Refuse a published release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -482,7 +482,7 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
-          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+          bash scripts/release/require-head-tag.sh "$TAG"
       - name: Refuse a published release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -495,9 +495,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - run: bash build/release-images.sh
+        env:
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
       - run: bash build/release.sh
         env:
           DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
 
   image-manifest:
     needs: [verify-tag, image]
@@ -519,7 +522,7 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           test "$(git rev-parse HEAD)" = "$SHA"
-          test "$(git describe --tags --exact-match HEAD)" = "$TAG"
+          bash scripts/release/require-head-tag.sh "$TAG"
       - name: Refuse a published release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -535,14 +538,15 @@ jobs:
         env:
           DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
           RELEASE_MANIFEST: "1"
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.tag }}
       - name: Print image digest (version tag only, never latest)
         env:
           DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
         run: |
           set -euo pipefail
           registry="$(printf '%s' "$DOCKER_REGISTRY" | tr '[:upper:]' '[:lower:]')"
-          version="$(git describe --tags --always --abbrev=14 HEAD)"
-          version="${version/+/_}"
+          version="${TAG/+/_}"
           digest="$(docker buildx imagetools inspect "${registry}:${version}" --format '{{json .Manifest.Digest}}')"
           echo "image ${registry}:${version} digest ${digest}"
           echo "Image tags: version only, never latest"

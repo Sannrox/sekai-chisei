@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Push the image produced by ./build/release-images.sh.
-# Same git-describe tag; DOCKER_REGISTRY is only the push destination.
+# Same tag as release-images.sh (RELEASE_TAG or git describe); DOCKER_REGISTRY is only the push destination.
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ if [[ "${RELEASE_MANIFEST:-}" == 1 ]]; then
     echo "Working tree is dirty. Commit or stash before publishing the image manifest." >&2
     exit 1
   fi
-  VERSION="$(git describe --tags --always --abbrev=14 HEAD)"
+  VERSION="${RELEASE_TAG:-$(git describe --tags --always --abbrev=14 HEAD)}"
   VERSION="${VERSION/+/_}"
   docker buildx imagetools create \
     -t "${DOCKER_REGISTRY}:${VERSION}" \
