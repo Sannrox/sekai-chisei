@@ -9,12 +9,16 @@ cleanup() {
   local status=$?
   if [ "$status" -ne 0 ]; then
     echo "gateway smoke failed (exit $status); dumping logs from $TMPDIR" >&2
-    for f in setup-codex.log setup-claude.log model-review-backfill.log sekai.log gateway.log; do
+    for f in setup-codex.log setup-claude.log model-review-backfill.log sekai.log; do
       if [ -f "$TMPDIR/$f" ]; then
         echo "=== $f ===" >&2
         sed -n '1,160p' "$TMPDIR/$f" >&2 || true
       fi
     done
+    if [ -n "${GATEWAY_LOG:-}" ] && [ -f "$GATEWAY_LOG" ]; then
+      echo "=== ${GATEWAY_LOG##*/} ===" >&2
+      sed -n '1,160p' "$GATEWAY_LOG" >&2 || true
+    fi
   fi
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
@@ -365,6 +369,7 @@ env -u DB_PATH -u SEKAI_SHARED_STORE \
 "$SEKAICTL_BIN" admin model-review backfill >"$TMPDIR/model-review-backfill.log" 2>&1
 
 GATEWAY_PORT=""
+GATEWAY_LOG=""
 for attempt in $(seq 1 10); do
   candidate_port="$(free_port)"
   gateway_log="$TMPDIR/gateway-$attempt.log"
@@ -382,7 +387,7 @@ for attempt in $(seq 1 10); do
   if wait_for_http_or_exit "http://127.0.0.1:$candidate_port/v1/responses" "$gateway_pid" "$gateway_log"; then
     PIDS+=("$gateway_pid")
     GATEWAY_PORT="$candidate_port"
-    cp "$gateway_log" "$TMPDIR/gateway.log"
+    GATEWAY_LOG="$gateway_log"
     break
   fi
   kill "$gateway_pid" >/dev/null 2>&1 || true
@@ -396,7 +401,7 @@ fi
 wait_for_gateway_response \
   "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
   "$TMPDIR/openai-response.json" \
-  "$TMPDIR/gateway.log"
+  "$GATEWAY_LOG"
 
 curl -fsS "http://127.0.0.1:$GATEWAY_PORT/v1/responses" \
   -H "authorization: Bearer codex-local-login-smoke-token" \
