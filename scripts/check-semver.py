@@ -67,7 +67,34 @@ def last_final_tag(rev: str) -> str | None:
         text=True,
     )
     tag = proc.stdout.strip()
-    return tag or None
+    if proc.returncode == 0:
+        if tag:
+            return tag
+        fail("git describe produced no tag")
+    err = (proc.stderr or "").strip()
+    # Without matching tags, git describe reports "No names found" even for a
+    # missing revision or a shallow clone that never fetched tags.
+    if "No names found, cannot describe anything." not in err:
+        fail(err or f"git describe exited {proc.returncode}")
+    verified = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if verified.returncode != 0:
+        fail((verified.stderr or err).strip())
+    shallow = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if shallow.returncode != 0:
+        fail((shallow.stderr or err).strip())
+    if shallow.stdout.strip() == "true":
+        fail(err)
+    return None
 
 
 def breaking_waiver(title: str, body: str, labels: list[str]) -> bool:

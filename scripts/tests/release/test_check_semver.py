@@ -127,6 +127,41 @@ class LastFinalTag(unittest.TestCase):
         self.assertEqual(semver.last_final_tag("HEAD"), "v1.6.0")
         self.assertEqual(semver.last_final_tag("HEAD^"), "v1.5.0")
 
+    def test_no_matching_final_tag_returns_none(self):
+        self.git("tag", "-d", "v1.5.0")
+        self.assertIsNone(semver.last_final_tag("HEAD"))
+
+    def test_unknown_revision_stops_the_check(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                semver.last_final_tag("not-a-rev")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("Not a valid object name", stderr.getvalue())
+
+    def test_a_shallow_repository_stops_the_check(self):
+        clone = tempfile.TemporaryDirectory(prefix=f"svs{os.getpid()}-")
+        self.addCleanup(clone.cleanup)
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                pathlib.Path(self.work).resolve().as_uri(),
+                clone.name,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        semver.ROOT = pathlib.Path(clone.name)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                semver.last_final_tag("HEAD")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("No names found", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
