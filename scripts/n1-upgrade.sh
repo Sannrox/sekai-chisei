@@ -85,6 +85,19 @@ fail() {
   done
 }
 
+# Concatenate nonempty files into dest so fail prints the step that failed,
+# not leftover output in $detail (#2851).
+detail_cat() {
+  local dest="$1" f
+  shift
+  : >"$dest"
+  for f in "$@"; do
+    [[ -s "$f" ]] || continue
+    printf '%s\n' "--- ${f##*/} ---" >>"$dest"
+    cat "$f" >>"$dest"
+  done
+}
+
 # --- N-1 resolution and builds ---------------------------------------------------
 
 resolve_n1_tag() {
@@ -383,7 +396,8 @@ run_backend() {
       && expect_graph "$dir/mixed-n1.expand" m2; then
       pass "[$label] mixed window: each server reads the other's writes"
     else
-      fail "[$label] mixed window: each server reads the other's writes" "$dir/mixed-n1.expand" "$n1_log" "$cur_log"
+      detail_cat "$dir/mixed-read.detail" "$dir/mixed-cur.expand" "$dir/mixed-n1.expand"
+      fail "[$label] mixed window: each server reads the other's writes" "$dir/mixed-read.detail" "$n1_log" "$cur_log"
     fi
     if { [[ "$N1_GOVERNED" == 0 ]] \
       || { governed "$N1_CTL" "$n1_sock" "$dir" inc-m2 mixed-n1-op \
@@ -392,7 +406,10 @@ run_backend() {
       && verify_receipt "$cur_sock" "$dir" mixed-cur-op; then
       pass "[$label] mixed window: governed operations on both servers; N-1's receipt verifies on current${GOV_SKIPPED}"
     else
-      fail "[$label] mixed window: governed operations on both servers" "$detail" "$n1_log" "$cur_log"
+      detail_cat "$dir/mixed-gov.detail" \
+        "$dir/mixed-n1-op.run" "$dir/mixed-n1-op.attest-export" "$dir/mixed-n1-op.attest-verify" \
+        "$dir/mixed-cur-op.run" "$dir/mixed-cur-op.attest-export" "$dir/mixed-cur-op.attest-verify"
+      fail "[$label] mixed window: governed operations on both servers" "$dir/mixed-gov.detail" "$n1_log" "$cur_log"
     fi
     stop_server "$n1_pid"
   else
@@ -446,7 +463,9 @@ run_backend() {
     && verify_receipt "$cur_sock" "$dir" cur-op; then
     pass "[$label] current server writes objects, a link, and a governed operation whose receipt verifies"
   else
-    fail "[$label] current server writes on the upgraded store" "$detail" "$cur_log"
+    detail_cat "$dir/cur-write.detail" "$detail" "$dir/cur-b.expand" \
+      "$dir/cur-op.run" "$dir/cur-op.attest-export" "$dir/cur-op.attest-verify"
+    fail "[$label] current server writes on the upgraded store" "$dir/cur-write.detail" "$cur_log"
   fi
 
   # Wire: N-1 sekaictl against the current server.
@@ -466,7 +485,9 @@ run_backend() {
     && verify_receipt "$cur_sock" "$dir" wire-op; then
     pass "[$label] wire: N-1 sekaictl writes to the current server (objects, link, governed operation)"
   else
-    fail "[$label] wire: N-1 sekaictl writes to the current server" "$detail" "$cur_log"
+    detail_cat "$dir/wire-write.detail" "$detail" "$dir/cur-c.expand" \
+      "$dir/wire-op.run" "$dir/wire-op.attest-export" "$dir/wire-op.attest-verify"
+    fail "[$label] wire: N-1 sekaictl writes to the current server" "$dir/wire-write.detail" "$cur_log"
   fi
 
   stop_server "$cur_pid"
