@@ -1708,6 +1708,35 @@ fn test_direct_risk_scored_context_raises_pipeline_risk() {
 }
 
 #[test]
+fn capacity_risk_with_more_than_24_snapshots_uses_the_newest() {
+    let db = ChiseiStore::memory();
+    for timestamp in 1..=30 {
+        sekai_core::sekai::capacity::record_snapshot(
+            db.runtime(),
+            &sekai_core::sekai::capacity::CapacityMetrics {
+                timestamp,
+                queue_depth: if timestamp == 30 { 10 } else { 0 },
+                running_tasks: 0,
+                agent_count: 1,
+                avg_wait_seconds: 0,
+                failure_rate: 0,
+                utilization: 0,
+            },
+        )
+        .unwrap();
+    }
+    let p = default_pipeline();
+    let mut req = make_req(&db);
+    let result = p.run(&mut req, &db);
+    assert_eq!(result.risk_score, 0.5);
+    assert!(
+        result.warnings()[0].contains("capacity queue depth 10"),
+        "{:?}",
+        result.warnings()
+    );
+}
+
+#[test]
 fn test_context_expansion_allows_related_verdict_context() {
     let db = ChiseiStore::memory();
     db.runtime()

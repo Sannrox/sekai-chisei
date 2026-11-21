@@ -4,11 +4,22 @@
 use crate::db::runtime_db::RuntimeDb;
 #[cfg(test)]
 use crate::db::sekai::SekaiDb;
-use crate::domain::Object;
+use crate::domain::{ListFilter, Object};
 use metrics::gauge;
 use std::collections::HashMap;
 
 pub const KIND_CAPACITY_SNAPSHOT: &str = "capacity_snapshot";
+
+/// Newest-first page of stored capacity snapshots.
+pub fn latest_snapshot_filter(limit: usize) -> ListFilter {
+    ListFilter {
+        kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
+        order_by: "created".into(),
+        descending: true,
+        limit: limit.min(i32::MAX as usize) as i32,
+        ..Default::default()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CapacityMetrics {
@@ -23,7 +34,11 @@ pub struct CapacityMetrics {
 
 /// The stored object for one snapshot.
 pub fn snapshot_object(metrics: &CapacityMetrics) -> Object {
-    let id = format!("cap:{}", metrics.timestamp);
+    let id = format!(
+        "cap:{}:{}",
+        metrics.timestamp,
+        uuid::Uuid::new_v4().simple()
+    );
     let props = HashMap::from([
         ("queue_depth".into(), metrics.queue_depth.to_string()),
         ("running_tasks".into(), metrics.running_tasks.to_string()),
@@ -47,13 +62,10 @@ pub fn snapshot_object(metrics: &CapacityMetrics) -> Object {
     }
 }
 
-/// The newest `limit` snapshots, most recent first, from stored snapshot objects.
+/// Metrics for stored snapshot objects, in the order the store returned them.
 pub fn snapshots_from_objects(objs: Vec<Object>, limit: usize) -> Vec<CapacityMetrics> {
-    let mut sorted = objs;
-    sorted.sort_by_key(|o| std::cmp::Reverse(o.created));
-    sorted.truncate(limit);
-    sorted
-        .into_iter()
+    objs.into_iter()
+        .take(limit)
         .map(|o| CapacityMetrics {
             timestamp: o.created,
             queue_depth: o
@@ -108,10 +120,7 @@ pub fn record_snapshot(db: &RuntimeDb, metrics: &CapacityMetrics) -> Result<(), 
 }
 
 pub fn latest_snapshots(db: &RuntimeDb, limit: usize) -> Result<Vec<CapacityMetrics>, String> {
-    let objs = db.list_all_objects(&crate::domain::ListFilter {
-        kind: Some(KIND_CAPACITY_SNAPSHOT.into()),
-        ..Default::default()
-    })?;
+    let objs = db.list_objects(&latest_snapshot_filter(limit))?;
     Ok(snapshots_from_objects(objs, limit))
 }
 
@@ -153,5 +162,43 @@ mod tests {
         assert_eq!(snaps.len(), 2);
         assert_eq!(snaps[0].timestamp, 200); // most recent first
         assert_eq!(snaps[0].queue_depth, 2);
+    }
+
+    fn metrics(timestamp: i64, queue_depth: i32) -> CapacityMetrics {
+        CapacityMetrics {
+            timestamp,
+            queue_depth,
+            running_tasks: 0,
+            agent_count: 1,
+            avg_wait_seconds: 0,
+            failure_rate: 0,
+            utilization: 0,
+        }
+    }
+
+    #[test]
+    fn same_millisecond_snapshots_both_record() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        record_snapshot(&db, &metrics(100, 1)).unwrap();
+        record_snapshot(&db, &metrics(100, 9)).unwrap();
+        let snaps = latest_snapshots(&db, 10).unwrap();
+        assert_eq!(snaps.len(), 2);
+        assert!(snaps.iter().all(|snap| snap.timestamp == 100));
+        let depths: Vec<_> = snaps.iter().map(|snap| snap.queue_depth).collect();
+        assert!(depths.contains(&1) && depths.contains(&9), "{depths:?}");
+    }
+
+    #[test]
+    fn latest_snapshots_returns_the_newest_page_from_the_store() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        for timestamp in 1..=30 {
+            record_snapshot(&db, &metrics(timestamp, timestamp as i32)).unwrap();
+        }
+        let snaps = latest_snapshots(&db, 24).unwrap();
+        assert_eq!(snaps.len(), 24);
+        assert_eq!(
+            snaps.iter().map(|snap| snap.timestamp).collect::<Vec<_>>(),
+            (7..=30).rev().collect::<Vec<_>>()
+        );
     }
 }

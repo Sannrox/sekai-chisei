@@ -1952,10 +1952,7 @@ impl Step for RiskStep {
         let snapshots = capacity::snapshots_from_objects(
             facts
                 .reader()
-                .list_objects(&sekai_core::domain::ListFilter {
-                    kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
-                    ..Default::default()
-                })
+                .list_objects(&capacity::latest_snapshot_filter(24))
                 .unwrap_or_default(),
             24,
         );
@@ -2070,10 +2067,7 @@ fn raw_risk_score(req: &PipelineRequest, _db: &ChiseiStore) -> f64 {
     let snapshots = capacity::snapshots_from_objects(
         facts
             .reader()
-            .list_objects(&sekai_core::domain::ListFilter {
-                kind: Some(capacity::KIND_CAPACITY_SNAPSHOT.into()),
-                ..Default::default()
-            })
+            .list_objects(&capacity::latest_snapshot_filter(24))
             .unwrap_or_default(),
         24,
     );
