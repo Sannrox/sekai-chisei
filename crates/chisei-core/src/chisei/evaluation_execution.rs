@@ -231,9 +231,17 @@ pub struct ExternalHttpEvaluator {
     implementation_digest: String,
     endpoint: String,
     secret_override: Option<String>,
+    client: reqwest::blocking::Client,
 }
 
 impl ExternalHttpEvaluator {
+    fn blocking_http_client() -> Result<reqwest::blocking::Client, String> {
+        reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())
+    }
+
     pub fn new(
         namespace: &str,
         implementation_digest: &str,
@@ -248,6 +256,7 @@ impl ExternalHttpEvaluator {
             implementation_digest: implementation_digest.into(),
             endpoint: endpoint.into(),
             secret_override: None,
+            client: Self::blocking_http_client()?,
         })
     }
 
@@ -267,6 +276,7 @@ impl ExternalHttpEvaluator {
             implementation_digest: implementation_digest.into(),
             endpoint: endpoint.into(),
             secret_override: Some(secret.to_string()),
+            client: Self::blocking_http_client()?,
         })
     }
 
@@ -375,16 +385,13 @@ impl ExternalHttpEvaluator {
         let body = sekai_core::shomei::canonical_json_with_finite_numbers(&request)?;
         let request_digest = format!("sha256:{:x}", Sha256::digest(&body));
         let signature = Self::signature(&secret, &request_digest);
-        let client = reqwest::blocking::Client::builder()
-            .timeout(timeout.max(Duration::from_millis(1)))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| REASON_EVALUATOR_UNAVAILABLE.to_string())?;
         // Trace headers stay outside the HMAC: they route telemetry, not the request.
         let mut trace_headers = http::HeaderMap::new();
         sekai_obs::otel::inject_current_context_into_headers(&mut trace_headers);
-        let response = client
+        let response = self
+            .client
             .post(&self.endpoint)
+            .timeout(timeout.max(Duration::from_millis(1)))
             .headers(trace_headers)
             .header("content-type", "application/json")
             .header(
@@ -3396,6 +3403,172 @@ mod tests {
         assert_eq!(output.status, STATUS_PASS);
         assert_eq!(output.reason_code, "fixture_pass");
         server.join().unwrap();
+    }
+
+    fn read_one_http_request(stream: &mut impl Read) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4 * 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + content_length {
+                let body = request[header_end + 4..header_end + 4 + content_length].to_vec();
+                return (headers.into_owned(), body);
+            }
+        }
+        panic!("incomplete HTTP request");
+    }
+
+    fn signed_adapter_http_response(
+        secret: &str,
+        request_digest: &str,
+        implementation_digest: &str,
+    ) -> String {
+        let result_body = r#"{"contract_version":"chisei.deterministic-evaluator-result/v1","status":"pass","reason_code":"fixture_pass","result":{"ok":true}}"#;
+        let response_digest = format!("sha256:{:x}", Sha256::digest(result_body.as_bytes()));
+        let response_signature = ExternalHttpEvaluator::response_signature(
+            secret,
+            request_digest,
+            &response_digest,
+            implementation_digest,
+        );
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-sekai-adapter-response-digest: {}\r\nx-sekai-adapter-response-signature: {}\r\n\r\n{}",
+            result_body.len(),
+            response_digest,
+            response_signature,
+            result_body
+        )
+    }
+
+    fn adapter_eval_input() -> DeterministicEvaluatorInput {
+        let manifest = manifest(vec![node("check", NODE_REQUIRED, &[])]);
+        input(&manifest, &manifest.nodes[0])
+    }
+
+    #[test]
+    fn external_adapter_reuses_one_client_across_evaluations() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let implementation_digest = digest('e');
+        let server_implementation_digest = implementation_digest.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            server_connections.fetch_add(1, Ordering::Relaxed);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            for _ in 0..2 {
+                let (headers, _) = read_one_http_request(&mut stream);
+                let request_digest = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("x-sekai-adapter-request-digest:")
+                            .map(str::trim)
+                    })
+                    .unwrap();
+                let response = signed_adapter_http_response(
+                    "fixture-secret",
+                    request_digest,
+                    &server_implementation_digest,
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                listener.accept().is_err(),
+                "second evaluation opened a new TCP connection"
+            );
+        });
+        let evaluator = ExternalHttpEvaluator::new_with_secret(
+            "acme",
+            &implementation_digest,
+            &format!("http://{address}/evaluate"),
+            "fixture-secret",
+        )
+        .unwrap();
+        let evaluator_input = adapter_eval_input();
+        evaluator.evaluate(&evaluator_input).unwrap();
+        evaluator.evaluate(&evaluator_input).unwrap();
+        server.join().unwrap();
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn external_adapter_refuses_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirected.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect_addr = redirected.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_one_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{redirect_addr}/evaluate\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let evaluator = ExternalHttpEvaluator::new_with_secret(
+            "acme",
+            &digest('e'),
+            &format!("http://{address}/evaluate"),
+            "fixture-secret",
+        )
+        .unwrap();
+        assert_eq!(
+            evaluator.evaluate(&adapter_eval_input()).unwrap_err(),
+            REASON_EVALUATOR_UNAVAILABLE
+        );
+        assert_eq!(
+            redirected.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a 302 must not be followed"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn external_adapter_per_call_timeout_still_applies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let evaluator = ExternalHttpEvaluator::new_with_secret(
+            "acme",
+            &digest('e'),
+            &format!("http://{address}/evaluate"),
+            "fixture-secret",
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            evaluator
+                .evaluate_with_timeout(&adapter_eval_input(), Duration::from_millis(50))
+                .unwrap_err(),
+            REASON_EVALUATOR_UNAVAILABLE
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "per-call timeout must bound the request"
+        );
+        drop(listener);
     }
 
     const CALLER_TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
