@@ -1,7 +1,8 @@
 //! PostgreSQL receipt persistence used by `RuntimeDb`.
 
 use crate::db::chisei_receipt::{
-    WindowOrder, open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+    WindowOrder, logical_operation_id_prefix_range, open_receipt_min_started_at_ms,
+    validate_evaluation_receipt_event_order,
 };
 use crate::db::postgres::PostgresDb;
 use postgres::GenericClient;
@@ -471,17 +472,17 @@ impl PostgresDb {
         operation_id: &str,
         attempt: Option<u32>,
     ) -> Result<Option<OperationReceipt>, String> {
-        let prefix = format!("{operation_id}:__attempt__:");
+        let (prefix, upper) = logical_operation_id_prefix_range(operation_id);
         let attempt = attempt.map(|value| value.to_string());
         let rows = self
             .connection()?
             .query(
                 "SELECT receipt_json FROM chisei_operation_receipts
-                 WHERE position($1 in operation_id) = 1
-                   AND ($2::text IS NULL OR operation_id LIKE '%:' || $2)
+                 WHERE operation_id COLLATE \"C\" >= $1 AND operation_id COLLATE \"C\" < $2
+                   AND ($3::text IS NULL OR operation_id LIKE '%:' || $3)
                  ORDER BY updated_at DESC, operation_id DESC
                  LIMIT 2",
-                &[&prefix, &attempt],
+                &[&prefix, &upper, &attempt],
             )
             .map_err(|error| error.to_string())?;
         if rows.len() > 1 {

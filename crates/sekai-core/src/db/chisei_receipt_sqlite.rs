@@ -1,13 +1,23 @@
 //! Receipt persistence moved with `RuntimeDb` so Sekai admission can record events.
 
 use crate::db::chisei_receipt::{
-    WindowOrder, open_receipt_min_started_at_ms, validate_evaluation_receipt_event_order,
+    WindowOrder, logical_operation_id_prefix_range, open_receipt_min_started_at_ms,
+    validate_evaluation_receipt_event_order,
 };
 use crate::db::sekai::SekaiDb;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sekai_domain::receipt::{
     OperationReceipt, OperationReceiptEvent, OperationReporterGrant, ReceiptEventKind,
 };
+
+/// Prefix-range lookup of stored gateway attempt ids. Attempt is a suffix
+/// after a request-hash segment, so it cannot be an equality lookup without
+/// `request_id`; the LIKE keeps result parity on top of the sargable range.
+const SQLITE_FIND_GATEWAY_RECEIPT_BY_LOGICAL_OPERATION_ID: &str = "
+SELECT receipt_json FROM chisei_operation_receipts
+ WHERE operation_id >= ?1 AND operation_id < ?2
+   AND (?3 IS NULL OR operation_id LIKE '%:' || ?3)
+ ORDER BY updated_at DESC, operation_id DESC LIMIT 2";
 
 impl SekaiDb {
     pub fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
@@ -411,17 +421,13 @@ impl SekaiDb {
         attempt: Option<u32>,
     ) -> Result<Option<OperationReceipt>, String> {
         let conn = self.conn();
+        let (prefix, upper) = logical_operation_id_prefix_range(operation_id);
         let attempt = attempt.map(|attempt| attempt.to_string());
         let mut statement = conn
-            .prepare(
-                "SELECT receipt_json FROM chisei_operation_receipts
-                 WHERE instr(operation_id, ?1 || ':__attempt__:')=1
-                   AND (?2 IS NULL OR operation_id LIKE '%:' || ?2)
-                 ORDER BY updated_at DESC, operation_id DESC LIMIT 2",
-            )
+            .prepare(SQLITE_FIND_GATEWAY_RECEIPT_BY_LOGICAL_OPERATION_ID)
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(params![operation_id, attempt], |row| {
+            .query_map(params![prefix, upper, attempt], |row| {
                 row.get::<_, String>(0)
             })
             .map_err(|error| error.to_string())?
@@ -681,4 +687,92 @@ fn receipt_intent_attr<'a>(receipt: &'a OperationReceipt, name: &str) -> Option<
             .flatten()
             .filter(|value| !value.is_empty())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sekai_domain::receipt::OPERATION_RECEIPT_VERSION;
+
+    fn receipt(id: &str) -> OperationReceipt {
+        OperationReceipt {
+            version: OPERATION_RECEIPT_VERSION.into(),
+            operation_id: id.into(),
+            parent_operation_id: None,
+            namespace: "ns".into(),
+            operation_class: "gateway".into(),
+            initiating_actor: "agent".into(),
+            schema_version: "v1".into(),
+            policy_version: "v1".into(),
+            started_at_ms: 1,
+            completed_at_ms: Some(2),
+            events: vec![],
+            uncovered_surfaces: vec![],
+            reporter_grants: vec![],
+            ontology_digest: None,
+            artifact: None,
+        }
+    }
+
+    #[test]
+    fn logical_operation_lookup_uses_the_operation_id_primary_key() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let conn = db.conn();
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {SQLITE_FIND_GATEWAY_RECEIPT_BY_LOGICAL_OPERATION_ID}"
+            ))
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map(rusqlite::params!["a", "b", "1"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("SEARCH")
+                    && step.contains("sqlite_autoindex_chisei_operation_receipts_1")
+            }),
+            "expected operation_id primary key search, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn logical_operation_lookup_matches_one_attempt_and_rejects_prefix_neighbors() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.put_operation_receipt(&receipt("op:__attempt__:aa:1"))
+            .unwrap();
+        db.put_operation_receipt(&receipt("op:__attempt__:bb:2"))
+            .unwrap();
+        db.put_operation_receipt(&receipt("op-extra:__attempt__:cc:1"))
+            .unwrap();
+
+        let err = db
+            .find_gateway_receipt_by_logical_operation_id("op", None)
+            .unwrap_err();
+        assert!(
+            err.contains("logical operation id matches multiple receipt attempts"),
+            "{err}"
+        );
+
+        let one = db
+            .find_gateway_receipt_by_logical_operation_id("op", Some(1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(one.operation_id, "op:__attempt__:aa:1");
+
+        let extra = db
+            .find_gateway_receipt_by_logical_operation_id("op-extra", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extra.operation_id, "op-extra:__attempt__:cc:1");
+
+        assert!(
+            db.find_gateway_receipt_by_logical_operation_id("op", Some(9))
+                .unwrap()
+                .is_none()
+        );
+    }
 }
