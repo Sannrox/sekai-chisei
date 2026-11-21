@@ -81,13 +81,14 @@ for attempt in 1 2 3 4 5; do
   postgres_port="$(free_port)"
 done
 
+# Probe over TCP, the path the tests use (the local socket comes up first).
 for _ in {1..30}; do
-  if container exec "$container_name" pg_isready -U sekai -d sekai_test >/dev/null 2>&1; then
+  if container exec "$container_name" pg_isready -h 127.0.0.1 -p 5432 -U sekai -d sekai_test >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-container exec "$container_name" pg_isready -U sekai -d sekai_test >/dev/null
+container exec "$container_name" pg_isready -h 127.0.0.1 -p 5432 -U sekai -d sekai_test >/dev/null
 
 SEKAI_TEST_POSTGRES_URL="postgresql://sekai:${postgres_password}@localhost:${postgres_port}/sekai_test" \
 SEKAI_TEST_POSTGRES_CA_CERT="$certificate_dir/ca.crt" \
