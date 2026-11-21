@@ -50,7 +50,9 @@ jobs:
       - name: Resolve N-1
         id: n1
         run: |
-          echo "tag=$(bash scripts/n1-upgrade.sh --resolve)" >>"$GITHUB_OUTPUT"
+          tag=$(bash scripts/n1-upgrade.sh --resolve)
+          test -n "$tag"
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
           echo "target=${RUNNER_TEMP}/n1-target" >>"$GITHUB_OUTPUT"
       # N-1's sources never change, so its build cache is keyed by tag alone.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -269,5 +269,27 @@ class Performance(unittest.TestCase):
         )
 
 
+class N1Upgrade(unittest.TestCase):
+    """A failed or empty N-1 resolve must fail the step, not write tag=."""
+
+    def setUp(self):
+        self.wf = load("n1-upgrade.yml")
+        self.steps = self.wf["jobs"]["n1-upgrade"]["steps"]
+
+    def test_resolve_n1_fails_when_the_tag_cannot_be_resolved(self):
+        step = next(s for s in self.steps if s.get("id") == "n1")
+        lines = [line.strip() for line in runs(step).splitlines() if line.strip()]
+        resolve = next(line for line in lines if "scripts/n1-upgrade.sh --resolve" in line)
+        self.assertTrue(resolve.startswith("tag="), resolve)
+        self.assertNotIn("echo", resolve)
+        empty = next(i for i, line in enumerate(lines) if line == 'test -n "$tag"')
+        write = next(
+            i
+            for i, line in enumerate(lines)
+            if 'echo "tag=$tag"' in line and "GITHUB_OUTPUT" in line
+        )
+        self.assertLess(empty, write)
+
+
 if __name__ == "__main__":
     unittest.main()
