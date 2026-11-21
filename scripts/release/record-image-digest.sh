@@ -17,8 +17,7 @@ tag="$1"
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 registry="$(printf '%s' "$DOCKER_REGISTRY" | tr '[:upper:]' '[:lower:]')"
-version="$(git describe --tags --always --abbrev=14 HEAD)"
-version="${version/+/_}"
+version="${tag/+/_}"
 image="${registry}:${version}"
 [[ "${image##*:}" != latest ]] || fail "must not produce a latest image tag"
 # Structured read, no pipe: an awk that exits on the Digest line can end the

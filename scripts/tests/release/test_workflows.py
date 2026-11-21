@@ -113,6 +113,40 @@ class Release(unittest.TestCase):
         self.assertIn("${MAIN_TREE}/security/release-tag-fingerprints", verify["run"])
         self.assertIn('ancestry "$TAG" "$sha"', verify["run"])
 
+    def test_image_jobs_check_tag_membership_not_git_describe(self):
+        for name in ("record-image-digest", "image", "image-manifest"):
+            with self.subTest(job=name):
+                step = next(
+                    s
+                    for s in self.jobs[name]["steps"]
+                    if "require-head-tag.sh" in runs(s) or "git describe --tags --exact-match" in runs(s)
+                )
+                self.assertIn("require-head-tag.sh", runs(step))
+                self.assertNotIn("git describe --tags --exact-match", runs(step))
+
+    def test_image_jobs_tag_images_with_the_verified_tag(self):
+        verified = "${{ needs.verify-tag.outputs.tag }}"
+        image = self.jobs["image"]["steps"]
+        build = next(s for s in image if "build/release-images.sh" in runs(s))
+        self.assertEqual(build.get("env", {}).get("RELEASE_TAG"), verified)
+        push = next(s for s in image if "build/release.sh" in runs(s))
+        self.assertEqual(push.get("env", {}).get("RELEASE_TAG"), verified)
+        manifest = next(s for s in self.jobs["image-manifest"]["steps"] if "build/release.sh" in runs(s))
+        self.assertEqual(manifest.get("env", {}).get("RELEASE_TAG"), verified)
+        digest = next(
+            s for s in self.jobs["record-image-digest"]["steps"] if "record-image-digest.sh" in runs(s)
+        )
+        self.assertEqual(digest.get("env", {}).get("TAG"), verified)
+        self.assertIn('record-image-digest.sh "$TAG"', runs(digest))
+        print_digest = next(
+            s
+            for s in self.jobs["image-manifest"]["steps"]
+            if s.get("name", "").startswith("Print image digest")
+        )
+        self.assertEqual(print_digest.get("env", {}).get("TAG"), verified)
+        self.assertIn("${TAG", runs(print_digest))
+        self.assertNotIn("git describe", runs(print_digest))
+
     def test_every_later_job_builds_the_verified_commit(self):
         for name, job in self.jobs.items():
             if name == "verify-tag":

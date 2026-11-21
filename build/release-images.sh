@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compile linux binaries in the pinned rust image, then wrap them.
-# The image tag is git describe, never a separate "local" name.
+# The image tag is RELEASE_TAG, or git describe when that is unset.
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ if [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 GIT_COMMIT="$(git rev-parse HEAD)"
-GIT_VERSION="$(git describe --tags --always --abbrev=14 HEAD)"
+GIT_VERSION="${RELEASE_TAG:-$(git describe --tags --always --abbrev=14 HEAD)}"
 GIT_VERSION="${GIT_VERSION/+/_}"
 if [[ -z "${GIT_VERSION}" || "${GIT_VERSION}" == *dirty* ]]; then
   echo "Refusing to build a dirty image tag: ${GIT_VERSION:-<empty>}" >&2
