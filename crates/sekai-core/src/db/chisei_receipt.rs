@@ -139,6 +139,21 @@ pub fn record_receipt_durability_lag(produced_at_ms: i64, durable_at_ms: i64) {
     }
 }
 
+/// Exclusive `operation_id` range covering stored gateway attempt ids
+/// `{logical}:__attempt__:{hex}:{attempt}` (and an optional `:p{ordinal}` suffix).
+///
+/// The exclusive upper bound increments the last `:` of the prefix to `;`.
+/// That successor is valid in byte order (SQLite BINARY, PostgreSQL
+/// `COLLATE "C"`); locale collations can ignore punctuation and empty the range.
+pub(crate) fn logical_operation_id_prefix_range(operation_id: &str) -> (String, String) {
+    let prefix = format!("{operation_id}:__attempt__:");
+    let mut upper = prefix.clone();
+    let last = upper.pop();
+    debug_assert_eq!(last, Some(':'));
+    upper.push(';');
+    (prefix, upper)
+}
+
 pub trait ChiseiReceiptBackend: Send + Sync {
     fn put_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
     fn get_operation_receipt(&self, operation_id: &str)
