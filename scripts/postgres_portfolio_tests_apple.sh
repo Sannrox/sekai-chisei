@@ -16,7 +16,11 @@ cleanup() {
   container stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
   rm -rf "$CERTIFICATE_DIR"
 }
-trap cleanup EXIT INT TERM
+# An interrupt exits with the conventional status so the EXIT trap cleans up
+# once and no later suite runs against the stopped container.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 command -v container >/dev/null || {
   echo "Apple container CLI is required: https://github.com/apple/container" >&2

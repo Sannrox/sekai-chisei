@@ -39,7 +39,11 @@ cleanup() {
   "$CLI" stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
   rm -rf "$CERTIFICATE_DIR"
 }
-trap cleanup EXIT INT TERM
+# An interrupt exits with the conventional status so the EXIT trap cleans up
+# once and no later command runs against the stopped container.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Config and extension files instead of -addext/-copy_extensions, so both
 # OpenSSL and the LibreSSL shipped with macOS can build the chain.

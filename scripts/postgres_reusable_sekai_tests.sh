@@ -16,7 +16,11 @@ cleanup() {
   container stop "$container_name" >/dev/null 2>&1 || true
   rm -rf "$certificate_dir"
 }
-trap cleanup EXIT INT TERM
+# An interrupt exits with the conventional status so the EXIT trap cleans up
+# once and no later suite runs against the stopped container.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 command -v container >/dev/null
 command -v openssl >/dev/null
