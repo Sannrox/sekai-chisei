@@ -269,6 +269,27 @@ class Performance(unittest.TestCase):
         )
 
 
+class CiPathScope(unittest.TestCase):
+    """Both optional-lane filters use scripts/ci/path-scope.sh (#2807)."""
+
+    def setUp(self):
+        self.wf = load("ci.yml")
+
+    def test_scope_and_template_call_the_same_script(self):
+        scope = next(
+            step
+            for step in self.wf["jobs"]["changes"]["steps"]
+            if step.get("id") == "scope"
+        )
+        template = next(
+            step
+            for step in self.wf["jobs"]["build-and-test"]["steps"]
+            if step.get("id") == "template"
+        )
+        self.assertIn("scripts/ci/path-scope.sh images", runs(scope))
+        self.assertIn("scripts/ci/path-scope.sh run", runs(template))
+
+
 class N1Upgrade(unittest.TestCase):
     """A failed or empty N-1 resolve must fail the step, not write tag=."""
 
