@@ -38,14 +38,7 @@ jobs:
       - id: scope
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "images=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "$BASE"...HEAD | grep -Eq "$IMAGE_PATHS"; then
-            echo "images=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "images=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash scripts/ci/path-scope.sh images "$IMAGE_PATHS"
 
   rustfmt:
     name: Rustfmt
@@ -153,14 +146,7 @@ jobs:
       - id: template
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif git diff --name-only "$BASE"...HEAD | grep -Eq "$TEMPLATE_PATHS"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash scripts/ci/path-scope.sh run "$TEMPLATE_PATHS"
       - if: steps.template.outputs.run == 'true'
         run: bash scripts/check-connector-template.sh
       - run: bash scripts/validate-ontology-deps.sh
