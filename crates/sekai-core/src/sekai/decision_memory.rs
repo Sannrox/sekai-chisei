@@ -151,7 +151,7 @@ impl SekaiDb {
             .prepare(
                 "SELECT body_json FROM sekai_action_decision_memory
                  WHERE namespace = ?1 AND type_id = ?2
-                 ORDER BY decided_at_ms DESC
+                 ORDER BY decided_at_ms DESC, memory_id ASC
                  LIMIT ?3 OFFSET ?4",
             )
             .map_err(|error| error.to_string())?;
@@ -438,6 +438,32 @@ mod tests {
         assert_eq!(
             db.list_decision_memory_page("acme", "spend", 1, 1).unwrap()[0].memory_id,
             "m1"
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_pages_return_each_row_once_in_memory_id_order() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        for id in ["m-c", "m-a", "m-b"] {
+            db.put_decision_memory(&memory(id, id, r#"{"object_id":"rec-1"}"#, false))
+                .unwrap();
+        }
+        let mut newer = memory("m-z", "ai-z", r#"{"object_id":"rec-1"}"#, false);
+        newer.decided_at_ms = 20;
+        db.put_decision_memory(&newer).unwrap();
+        let mut paged = Vec::new();
+        for offset in 0..4 {
+            let page = db
+                .list_decision_memory_page("acme", "spend", offset, 1)
+                .unwrap();
+            assert_eq!(page.len(), 1);
+            paged.push(page[0].memory_id.clone());
+        }
+        assert_eq!(paged, vec!["m-z", "m-a", "m-b", "m-c"]);
+        assert!(
+            db.list_decision_memory_page("acme", "spend", 4, 1)
+                .unwrap()
+                .is_empty()
         );
     }
 }

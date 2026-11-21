@@ -934,7 +934,7 @@ impl PostgresDb {
             .query(
                 "SELECT body_json FROM sekai_action_decision_memory
                  WHERE namespace = $1 AND type_id = $2
-                 ORDER BY decided_at_ms DESC
+                 ORDER BY decided_at_ms DESC, memory_id ASC
                  LIMIT $3 OFFSET $4",
                 &[&namespace, &type_id, &limit, &offset],
             )
