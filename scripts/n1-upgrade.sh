@@ -106,17 +106,32 @@ resolve_n1_tag() {
 # lived at src/bin/sekaictl.rs, then at crates/sekaictl/src/main.rs. Check that
 # the revision has the server and one of those sekaictl paths.
 server_bin_name() {
-  local rev="$1" manifest
-  manifest="$(git show "$rev:Cargo.toml")"
+  local rev="$1" manifest name
+  # Called from $(...); errexit does not apply inside the function.
+  manifest="$(git show "$rev:Cargo.toml")" || {
+    echo "cannot read Cargo.toml at $rev" >&2
+    return 1
+  }
   if grep -Eq '^autobins *= *false' <<<"$manifest"; then
     echo "autobins is off at $rev; name the server binary explicitly" >&2
     return 1
   fi
-  git cat-file -e "$rev:src/main.rs" || return 1
+  git cat-file -e "$rev:src/main.rs" || {
+    echo "revision $rev has no src/main.rs" >&2
+    return 1
+  }
   git cat-file -e "$rev:src/bin/sekaictl.rs" \
     || git cat-file -e "$rev:crates/sekaictl/src/main.rs" \
-    || return 1
-  awk '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^name *=/{gsub(/[" ]/,""); sub(/^name=/,""); print; exit}' <<<"$manifest"
+    || {
+      echo "revision $rev has no sekaictl entry point" >&2
+      return 1
+    }
+  name="$(awk '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^name *=/{gsub(/[" ]/,""); sub(/^name=/,""); print; exit}' <<<"$manifest")"
+  [[ -n "$name" ]] || {
+    echo "revision $rev has an empty package name" >&2
+    return 1
+  }
+  printf '%s\n' "$name"
 }
 
 build_bins() {
@@ -132,8 +147,14 @@ if [[ "${1:-}" == "--resolve" ]]; then
   exit 0
 fi
 git rev-parse -q --verify "refs/tags/$N1_TAG" >/dev/null || { echo "tag $N1_TAG is not fetched" >&2; exit 2; }
-N1_SERVER_NAME="$(server_bin_name "refs/tags/$N1_TAG")"
-CUR_SERVER_NAME="$(server_bin_name HEAD)"
+N1_SERVER_NAME="$(server_bin_name "refs/tags/$N1_TAG")" || {
+  echo "could not determine the N-1 server binary name for $N1_TAG" >&2
+  exit 1
+}
+CUR_SERVER_NAME="$(server_bin_name HEAD)" || {
+  echo "could not determine the current server binary name" >&2
+  exit 1
+}
 N1_TARGET="$(abs_dir "${N1_TARGET_DIR:-$TARGET_ROOT/n1/$N1_TAG}")"
 echo "N-1 gate: $N1_TAG ($(git rev-parse --short "$N1_TAG^{commit}")) -> current $(git rev-parse --short HEAD)"
 
