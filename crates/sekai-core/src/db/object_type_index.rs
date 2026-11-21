@@ -6,7 +6,7 @@ use crate::sekai::object_type_index::{
     coerce_index_edit, coerce_index_member, mapping_renames, member_from_row, overlay_member,
     parse_property_edit_times, schema_drift,
 };
-use rusqlite::{TransactionBehavior, params};
+use rusqlite::{Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, HashMap};
 
 impl SekaiDb {
@@ -398,30 +398,6 @@ impl SekaiDb {
             }
         }
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
-        if full_rebuild {
-            self.conn()
-                .execute(
-                    "DELETE FROM sekai_object_type_index_member WHERE namespace = ?1 AND kind = ?2 AND from_edit = 0",
-                    params![namespace, kind],
-                )
-                .map_err(|error| error.to_string())?;
-            self.conn()
-                .execute(
-                    "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
-                    params![namespace, kind],
-                )
-                .map_err(|error| error.to_string())?;
-            // Cursor 0 before recreate: a crash that left some members cannot
-            // resume from the previous high-water mark and skip deleted rows.
-            self.conn()
-                .execute(
-                    "UPDATE sekai_object_type_index_status
-                     SET last_dataset_row_id = 0
-                     WHERE namespace = ?1 AND kind = ?2",
-                    params![namespace, kind],
-                )
-                .map_err(|error| error.to_string())?;
-        }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut touched_source_keys = Vec::new();
@@ -453,16 +429,13 @@ impl SekaiDb {
         }
         let processed: BTreeMap<String, ()> =
             members.keys().cloned().map(|key| (key, ())).collect();
+        let mut pending: Vec<(ObjectTypeIndexMember, bool)> = Vec::new();
         for (source_key, mut member) in members {
             touched_source_keys.push(source_key.clone());
             if let Some(edit) = edits.get(&source_key) {
                 member = overlay_member(&binding, Some(member), edit)?;
             }
-            if self.upsert_index_member(&member)? {
-                rewritten += 1;
-            } else {
-                skipped += 1;
-            }
+            pending.push((member, false));
         }
         let leftover_keys: BTreeMap<String, ()> = edits
             .keys()
@@ -482,9 +455,65 @@ impl SekaiDb {
             let source = sources.remove(source_key);
             let mut member = overlay_member(&binding, source, edit)?;
             self.bind_index_member_object_id(namespace, &mut member)?;
-            self.force_upsert_index_member(&member)?;
-            rewritten += 1;
             touched_source_keys.push(source_key.clone());
+            pending.push((member, true));
+        }
+        // One IMMEDIATE txn owns delete, member upserts, and status so WAL
+        // readers see the old complete set or the new one, never a hole.
+        {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            if full_rebuild {
+                tx.execute(
+                    "DELETE FROM sekai_object_type_index_member WHERE namespace = ?1 AND kind = ?2 AND from_edit = 0",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
+                // Cursor 0 before recreate: a crash that left some members cannot
+                // resume from the previous high-water mark and skip deleted rows.
+                tx.execute(
+                    "UPDATE sekai_object_type_index_status
+                     SET last_dataset_row_id = 0
+                     WHERE namespace = ?1 AND kind = ?2",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            for (member, force) in &pending {
+                if *force {
+                    Self::force_upsert_index_member_tx(&tx, member)?;
+                    rewritten += 1;
+                } else if Self::upsert_index_member_tx(&tx, member)? {
+                    rewritten += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            if commit_joins {
+                let member_count: i32 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM sekai_object_type_index_member
+                         WHERE namespace = ?1 AND kind = ?2 AND hidden = 0",
+                        params![namespace, kind],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO sekai_object_type_index_status
+                     (namespace, kind, indexed_at_ms, last_dataset_row_id, member_count, stale, quarantine_reason)
+                     VALUES (?1,?2,?3,?4,?5,0,'')",
+                    params![namespace, kind, now_ms, last_row_id, member_count],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            tx.commit().map_err(|error| error.to_string())?;
         }
         if !commit_joins {
             return Ok(ReindexReport {
@@ -500,17 +529,8 @@ impl SekaiDb {
             Some(touched_source_keys.as_slice())
         };
         self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
-        let member_count = self.count_visible_index_members(namespace, kind)?;
         self.rebuild_kind_join(namespace, kind, now_ms)?;
         self.stamp_datasource_to_published(namespace, kind)?;
-        self.conn()
-            .execute(
-                "INSERT OR REPLACE INTO sekai_object_type_index_status
-                 (namespace, kind, indexed_at_ms, last_dataset_row_id, member_count, stale, quarantine_reason)
-                 VALUES (?1,?2,?3,?4,?5,0,'')",
-                params![namespace, kind, now_ms, last_row_id, member_count],
-            )
-            .map_err(|error| error.to_string())?;
         Ok(ReindexReport {
             rewritten_keys: rewritten,
             skipped_unchanged: skipped,
@@ -1026,9 +1046,11 @@ impl SekaiDb {
         Ok(keys)
     }
 
-    fn upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<bool, String> {
-        let existing: Option<(String, String)> = self
-            .conn()
+    fn upsert_index_member_tx(
+        tx: &Transaction<'_>,
+        member: &ObjectTypeIndexMember,
+    ) -> Result<bool, String> {
+        let existing: Option<(String, String)> = tx
             .query_row(
                 "SELECT object_id, content_hash FROM sekai_object_type_index_member
                  WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
@@ -1042,29 +1064,31 @@ impl SekaiDb {
         }) {
             return Ok(false);
         }
-        self.force_upsert_index_member(member)?;
+        Self::force_upsert_index_member_tx(tx, member)?;
         Ok(true)
     }
 
-    fn force_upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
+    fn force_upsert_index_member_tx(
+        tx: &Transaction<'_>,
+        member: &ObjectTypeIndexMember,
+    ) -> Result<(), String> {
         let properties = serde_json::to_string(&member.properties).map_err(|e| e.to_string())?;
-        self.conn()
-            .execute(
-                "INSERT OR REPLACE INTO sekai_object_type_index_member
-                 (namespace, kind, source_key, object_id, properties, content_hash, hidden, from_edit)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![
-                    member.namespace,
-                    member.kind,
-                    member.source_key,
-                    member.object_id,
-                    properties,
-                    member.content_hash,
-                    i64::from(member.hidden),
-                    i64::from(member.from_edit)
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sekai_object_type_index_member
+             (namespace, kind, source_key, object_id, properties, content_hash, hidden, from_edit)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                member.namespace,
+                member.kind,
+                member.source_key,
+                member.object_id,
+                properties,
+                member.content_hash,
+                i64::from(member.hidden),
+                i64::from(member.from_edit)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -1518,7 +1542,9 @@ mod tests {
     use super::*;
     use crate::sekai::dataset::{ColumnDef, Dataset, RowFilter, RowQuery};
     use crate::sekai::object_type_index::CONTRACT_VERSION;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn db() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
@@ -3170,5 +3196,135 @@ mod tests {
                 ("sales".into(), "Customer".into(), "c1".into()),
             ]
         );
+    }
+
+    fn customer_rows(count: usize, region: &str) -> Vec<HashMap<String, String>> {
+        (0..count)
+            .map(|index| {
+                HashMap::from([
+                    ("customer_id".into(), format!("c{index:04}")),
+                    ("region".into(), region.into()),
+                    ("hidden".into(), "0".into()),
+                ])
+            })
+            .collect()
+    }
+
+    fn visible_fingerprints(db: &SekaiDb) -> BTreeSet<(String, String)> {
+        db.list_visible_index_members("sales", "Customer", &RowQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|member| {
+                (
+                    member.source_key,
+                    member
+                        .properties
+                        .get("region")
+                        .map(|value| value.as_cell())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_rebuild_reader_sees_old_or_new_complete_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!(
+            "oti-rebuild-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        let old_rows = customer_rows(120, "eu");
+        db.append_rows("ds-customers", &old_rows).unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let old = visible_fingerprints(&db);
+        assert_eq!(old.len(), 120);
+
+        let new_rows = customer_rows(120, "us");
+        db.append_rows("ds-customers", &new_rows).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let reader = {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            let samples = Arc::clone(&samples);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let snapshot = visible_fingerprints(&db);
+                    samples.lock().unwrap().push(snapshot);
+                }
+            })
+        };
+        db.apply_object_type_index("sales", "Customer", true, 30)
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let new = visible_fingerprints(&db);
+        assert_eq!(new.len(), 120);
+        assert_ne!(old, new);
+        let observed = samples.lock().unwrap();
+        assert!(!observed.is_empty());
+        for snapshot in observed.iter() {
+            assert!(
+                *snapshot == old || *snapshot == new,
+                "reader saw a hole or mix of {} members",
+                snapshot.len()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_full_rebuilds_end_with_one_consistent_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!(
+            "oti-concurrent-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Arc::new(SekaiDb::new(path.to_str().unwrap()).unwrap());
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows("ds-customers", &customer_rows(80, "eu"))
+            .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index("sales", "Customer", true, 20)
+            .unwrap();
+        let expected = visible_fingerprints(&db);
+        let first = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.apply_object_type_index("sales", "Customer", true, 30))
+        };
+        let second = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.apply_object_type_index("sales", "Customer", true, 40))
+        };
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let visible = visible_fingerprints(&db);
+        assert_eq!(visible, expected);
+        let status = db
+            .object_type_index_status("sales", "Customer", 50)
+            .unwrap()
+            .unwrap();
+        assert!(!status.stale);
+        assert_eq!(status.member_count as usize, visible.len());
     }
 }

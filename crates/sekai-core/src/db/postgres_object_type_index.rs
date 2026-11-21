@@ -272,28 +272,6 @@ impl PostgresDb {
             }
         }
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
-        if full_rebuild {
-            self.connection()?
-                .execute(
-                    "DELETE FROM sekai_object_type_index_member WHERE namespace=$1 AND kind=$2 AND from_edit=FALSE",
-                    &[&namespace, &kind],
-                )
-                .map_err(|error| error.to_string())?;
-            self.connection()?
-                .execute(
-                    "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
-                    &[&namespace, &kind],
-                )
-                .map_err(|error| error.to_string())?;
-            self.connection()?
-                .execute(
-                    "UPDATE sekai_object_type_index_status
-                     SET last_dataset_row_id = 0
-                     WHERE namespace=$1 AND kind=$2",
-                    &[&namespace, &kind],
-                )
-                .map_err(|error| error.to_string())?;
-        }
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut touched_source_keys = Vec::new();
@@ -324,16 +302,13 @@ impl PostgresDb {
         }
         let processed: BTreeMap<String, ()> =
             members.keys().cloned().map(|key| (key, ())).collect();
+        let mut pending: Vec<(ObjectTypeIndexMember, bool)> = Vec::new();
         for (source_key, mut member) in members {
             touched_source_keys.push(source_key.clone());
             if let Some(edit) = edits.get(&source_key) {
                 member = overlay_member(&binding, Some(member), edit)?;
             }
-            if self.upsert_index_member(&member)? {
-                rewritten += 1;
-            } else {
-                skipped += 1;
-            }
+            pending.push((member, false));
         }
         let leftover_keys: BTreeMap<String, ()> = edits
             .keys()
@@ -353,21 +328,55 @@ impl PostgresDb {
             let source = sources.remove(source_key);
             let mut member = overlay_member(&binding, source, edit)?;
             self.bind_index_member_object_id(namespace, &mut member)?;
-            self.force_upsert_index_member(&member)?;
-            rewritten += 1;
             touched_source_keys.push(source_key.clone());
+            pending.push((member, true));
         }
-        let rematerialize_keys = if full_rebuild {
-            None
-        } else {
-            Some(touched_source_keys.as_slice())
-        };
-        self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
-        let member_count = self.count_visible_index_members(namespace, kind)?;
-        self.rebuild_kind_join(namespace, kind, now_ms)?;
-        self.stamp_datasource_to_published(namespace, kind)?;
-        self.connection()?
-            .execute(
+        {
+            let mut connection = self.connection()?;
+            let mut tx = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            // Advisory lock plus one txn: concurrent rebuilds serialize, and
+            // readers never see a hole between delete and the new status row.
+            crate::db::postgres::lock_object_type_datasource(&mut tx, namespace, kind)?;
+            if full_rebuild {
+                tx.execute(
+                    "DELETE FROM sekai_object_type_index_member WHERE namespace=$1 AND kind=$2 AND from_edit=FALSE",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "UPDATE sekai_object_type_index_status
+                     SET last_dataset_row_id = 0
+                     WHERE namespace=$1 AND kind=$2",
+                    &[&namespace, &kind],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            for (member, force) in &pending {
+                if *force {
+                    Self::force_upsert_index_member_tx(&mut tx, member)?;
+                    rewritten += 1;
+                } else if Self::upsert_index_member_tx(&mut tx, member)? {
+                    rewritten += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+            let member_count: i32 = tx
+                .query_one(
+                    "SELECT COUNT(*)::int FROM sekai_object_type_index_member
+                     WHERE namespace=$1 AND kind=$2 AND hidden=FALSE",
+                    &[&namespace, &kind],
+                )
+                .map(|row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            tx.execute(
                 "INSERT INTO sekai_object_type_index_status
                  (namespace, kind, indexed_at_ms, last_dataset_row_id, member_count, stale, quarantine_reason)
                  VALUES ($1,$2,$3,$4,$5,FALSE,'')
@@ -380,6 +389,16 @@ impl PostgresDb {
                 &[&namespace, &kind, &now_ms, &last_row_id, &member_count],
             )
             .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+        }
+        let rematerialize_keys = if full_rebuild {
+            None
+        } else {
+            Some(touched_source_keys.as_slice())
+        };
+        self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
+        self.rebuild_kind_join(namespace, kind, now_ms)?;
+        self.stamp_datasource_to_published(namespace, kind)?;
         Ok(ReindexReport {
             rewritten_keys: rewritten,
             skipped_unchanged: skipped,
@@ -862,9 +881,11 @@ impl PostgresDb {
             .collect()
     }
 
-    fn upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<bool, String> {
-        let existing = self
-            .connection()?
+    fn upsert_index_member_tx(
+        tx: &mut postgres::Transaction<'_>,
+        member: &ObjectTypeIndexMember,
+    ) -> Result<bool, String> {
+        let existing = tx
             .query_opt(
                 "SELECT object_id, content_hash FROM sekai_object_type_index_member
                  WHERE namespace=$1 AND kind=$2 AND source_key=$3",
@@ -877,35 +898,37 @@ impl PostgresDb {
         }) {
             return Ok(false);
         }
-        self.force_upsert_index_member(member)?;
+        Self::force_upsert_index_member_tx(tx, member)?;
         Ok(true)
     }
 
-    fn force_upsert_index_member(&self, member: &ObjectTypeIndexMember) -> Result<(), String> {
+    fn force_upsert_index_member_tx(
+        tx: &mut postgres::Transaction<'_>,
+        member: &ObjectTypeIndexMember,
+    ) -> Result<(), String> {
         let properties = serde_json::to_string(&member.properties).map_err(|e| e.to_string())?;
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_object_type_index_member
-                 (namespace, kind, source_key, object_id, properties, content_hash, hidden, from_edit)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (namespace, kind, source_key) DO UPDATE SET
-                   object_id = EXCLUDED.object_id,
-                   properties = EXCLUDED.properties,
-                   content_hash = EXCLUDED.content_hash,
-                   hidden = EXCLUDED.hidden,
-                   from_edit = EXCLUDED.from_edit",
-                &[
-                    &member.namespace,
-                    &member.kind,
-                    &member.source_key,
-                    &member.object_id,
-                    &properties,
-                    &member.content_hash,
-                    &member.hidden,
-                    &member.from_edit,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_object_type_index_member
+             (namespace, kind, source_key, object_id, properties, content_hash, hidden, from_edit)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT (namespace, kind, source_key) DO UPDATE SET
+               object_id = EXCLUDED.object_id,
+               properties = EXCLUDED.properties,
+               content_hash = EXCLUDED.content_hash,
+               hidden = EXCLUDED.hidden,
+               from_edit = EXCLUDED.from_edit",
+            &[
+                &member.namespace,
+                &member.kind,
+                &member.source_key,
+                &member.object_id,
+                &properties,
+                &member.content_hash,
+                &member.hidden,
+                &member.from_edit,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 
