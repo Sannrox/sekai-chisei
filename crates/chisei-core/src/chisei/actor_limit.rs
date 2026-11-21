@@ -15,6 +15,9 @@ use sekai_core::enterprise::{ActorChain, ActorKind};
 /// Default refill when enforcement is on and the env value is missing or zero.
 pub const DEFAULT_REQUESTS_PER_MINUTE: u32 = 60;
 
+/// Sweep idle-full buckets once the map grows past this many entries.
+const BUCKET_SWEEP_THRESHOLD: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenBucketLimits {
     pub requests_per_minute: u32,
@@ -74,6 +77,7 @@ struct ActorRateInner {
 struct Bucket {
     tokens: f64,
     last: Instant,
+    limits: TokenBucketLimits,
 }
 
 impl ActorRateGate {
@@ -121,6 +125,15 @@ impl ActorRateGate {
         self.inner.enabled
     }
 
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.inner
+            .buckets
+            .lock()
+            .map(|buckets| buckets.len())
+            .unwrap_or(0)
+    }
+
     pub fn admit(&self, chain: &ActorChain) -> Result<(), ActorRateError> {
         self.admit_at(chain, Instant::now())
     }
@@ -138,6 +151,9 @@ impl ActorRateGate {
             .buckets
             .lock()
             .map_err(|_| ActorRateError::Unavailable)?;
+        if buckets.len() > BUCKET_SWEEP_THRESHOLD {
+            evict_idle_buckets(&mut buckets, now);
+        }
         let mut charged: Vec<(String, TokenBucketLimits)> = Vec::new();
         for (kind, key) in &keys {
             let limits = match kind {
@@ -148,6 +164,7 @@ impl ActorRateGate {
                 let bucket = buckets.entry(key.clone()).or_insert_with(|| Bucket {
                     tokens: limits.burst(),
                     last: now,
+                    limits,
                 });
                 refill(bucket, now, limits);
                 if bucket.tokens >= 1.0 {
@@ -184,6 +201,13 @@ impl ActorRateGate {
 
 fn bucket_key(kind: ActorKind, id: &str) -> String {
     format!("{}:{id}", kind.as_str())
+}
+
+fn evict_idle_buckets(buckets: &mut HashMap<String, Bucket>, now: Instant) {
+    buckets.retain(|_, bucket| {
+        refill(bucket, now, bucket.limits);
+        bucket.tokens < bucket.limits.burst()
+    });
 }
 
 fn refill(bucket: &mut Bucket, now: Instant, limits: TokenBucketLimits) {
@@ -278,5 +302,50 @@ mod tests {
         gate.admit_at(&first, now).unwrap();
         gate.admit_at(&first, now).unwrap_err();
         gate.admit_at(&chain("alice", None), now).unwrap();
+    }
+
+    fn fill_distinct_principals(gate: &ActorRateGate, now: Instant, count: usize) {
+        for i in 0..count {
+            gate.admit_at(&chain(&format!("u{i}"), None), now).unwrap();
+        }
+    }
+
+    #[test]
+    fn idle_buckets_are_evicted_so_the_map_stays_bounded() {
+        let limits = TokenBucketLimits {
+            requests_per_minute: 2,
+        };
+        let gate = ActorRateGate::enabled(limits.requests_per_minute, limits.requests_per_minute);
+        let now = Instant::now();
+        let idle = Duration::from_secs_f64(limits.burst() / limits.rate_per_sec());
+        let alice = chain("alice", None);
+        gate.admit_at(&alice, now).unwrap();
+        gate.admit_at(&alice, now).unwrap();
+        gate.admit_at(&alice, now).unwrap_err();
+        fill_distinct_principals(&gate, now, BUCKET_SWEEP_THRESHOLD);
+        assert!(gate.bucket_count() > BUCKET_SWEEP_THRESHOLD);
+
+        let later = now + idle;
+        gate.admit_at(&chain("fresh", None), later).unwrap();
+        assert_eq!(gate.bucket_count(), 1);
+
+        gate.admit_at(&alice, later).unwrap();
+        gate.admit_at(&alice, later).unwrap();
+        gate.admit_at(&alice, later).unwrap_err();
+    }
+
+    #[test]
+    fn sweep_keeps_active_buckets_throttled() {
+        let gate = ActorRateGate::enabled(1, 60);
+        let now = Instant::now();
+        let alice = chain("alice", None);
+        gate.admit_at(&alice, now).unwrap();
+        fill_distinct_principals(&gate, now, BUCKET_SWEEP_THRESHOLD);
+        let error = gate.admit_at(&alice, now).unwrap_err();
+        match error {
+            ActorRateError::Exhausted { kind, .. } => assert_eq!(kind, ActorKind::Principal),
+            other => panic!("{other}"),
+        }
+        assert!(gate.bucket_count() > BUCKET_SWEEP_THRESHOLD);
     }
 }
