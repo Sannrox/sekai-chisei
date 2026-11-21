@@ -52,6 +52,15 @@ class Manifest(unittest.TestCase):
         self.assertEqual(got["images"], [image])
         self.assertNotIn("latest", json.dumps(got))
 
+    def test_skips_every_cyclonedx_sbom_file(self):
+        (self.dist / "sekai-1.4.0-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"bin")
+        (self.dist / "sekai-1.4.0-x86_64.cdx.json").write_text("{}\n")
+        got = build(self.dist)
+        self.assertEqual(
+            [binary["name"] for binary in got["binaries"]],
+            ["sekai-1.4.0-x86_64-unknown-linux-gnu.tar.gz"],
+        )
+
 
 class Record(unittest.TestCase):
     BASE = {"schema": "tenkai.family-release-manifest.v1", "images": [], "attestations": []}
