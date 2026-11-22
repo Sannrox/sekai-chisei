@@ -57,17 +57,16 @@ impl SchemaPlane {
     /// Offline single-store CLIs keep a historical dual-schema file readable.
     /// A missing path or a Sekai-only file stays Sekai-owned so reports do not
     /// recreate Chisei tables. Populated unfenced Chisei rows mean the file is
-    /// still the pre-split shared store.
-    pub fn for_existing_sqlite(path: &str) -> Self {
+    /// still the pre-split shared store. Open or probe failures return to the
+    /// caller instead of guessing Shared or Sekai.
+    pub fn for_existing_sqlite(path: &str) -> Result<Self, String> {
         if !std::path::Path::new(path).exists() {
-            return Self::Sekai;
+            return Ok(Self::Sekai);
         }
-        let Ok(conn) = rusqlite::Connection::open(path) else {
-            return Self::Sekai;
-        };
-        match reject_populated_foreign_sqlite_conn(&conn, Self::Sekai) {
-            Ok(()) => Self::Sekai,
-            Err(_) => Self::Shared,
+        let conn = rusqlite::Connection::open(path).map_err(|error| error.to_string())?;
+        match scan_unfenced_foreign_sqlite(&conn, Self::Sekai)? {
+            None => Ok(Self::Sekai),
+            Some(_) => Ok(Self::Shared),
         }
     }
 }
@@ -140,8 +139,20 @@ pub fn reject_populated_foreign_sqlite_conn(
     if plane == SchemaPlane::Shared {
         return Ok(());
     }
+    match scan_unfenced_foreign_sqlite(conn, plane)? {
+        None => Ok(()),
+        Some((table, count)) => Err(foreign_rows_message(plane, &table, count)),
+    }
+}
+
+/// None: no populated unfenced foreign rows. Some: first populated foreign
+/// table. Err: open-side prepare, query, count, or lock probe failed.
+fn scan_unfenced_foreign_sqlite(
+    conn: &rusqlite::Connection,
+    plane: SchemaPlane,
+) -> Result<Option<(String, i64)>, String> {
     if sqlite_cutover_fence_raised(conn)? {
-        return Ok(());
+        return Ok(None);
     }
     let mut stmt = conn
         .prepare(
@@ -160,10 +171,10 @@ pub fn reject_populated_foreign_sqlite_conn(
         }
         let count = sqlite_foreign_row_count(conn, &name)?;
         if count > 0 {
-            return Err(foreign_rows_message(plane, &name, count));
+            return Ok(Some((name, count)));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn reject_populated_foreign_postgres(
@@ -373,14 +384,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing.db");
         assert_eq!(
-            SchemaPlane::for_existing_sqlite(missing.to_str().unwrap()),
+            SchemaPlane::for_existing_sqlite(missing.to_str().unwrap()).unwrap(),
             SchemaPlane::Sekai
         );
 
         let sekai_only = directory.path().join("sekai.db");
         let _ = crate::db::store::SekaiStore::open_sqlite(sekai_only.to_str().unwrap());
         assert_eq!(
-            SchemaPlane::for_existing_sqlite(sekai_only.to_str().unwrap()),
+            SchemaPlane::for_existing_sqlite(sekai_only.to_str().unwrap()).unwrap(),
             SchemaPlane::Sekai
         );
 
@@ -405,8 +416,28 @@ mod tests {
             .unwrap();
         drop(db);
         assert_eq!(
-            SchemaPlane::for_existing_sqlite(shared.to_str().unwrap()),
+            SchemaPlane::for_existing_sqlite(shared.to_str().unwrap()).unwrap(),
             SchemaPlane::Shared
+        );
+    }
+
+    #[test]
+    fn existing_sqlite_plane_returns_read_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let junk = directory.path().join("junk.db");
+        std::fs::write(&junk, b"not a sqlite database").unwrap();
+        assert!(
+            !SchemaPlane::for_existing_sqlite(junk.to_str().unwrap())
+                .unwrap_err()
+                .is_empty()
+        );
+
+        let as_dir = directory.path().join("not-a-db");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(
+            !SchemaPlane::for_existing_sqlite(as_dir.to_str().unwrap())
+                .unwrap_err()
+                .is_empty()
         );
     }
 }
