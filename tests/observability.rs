@@ -1,9 +1,10 @@
-//! Ops and signal tests, isolated in their own test binary.
+//! Ops and signal tests, kept out of the grouped `it` binary.
 //!
-//! Several cases exact-assert process-global Prometheus gauges (saturation
-//! clamp, empty-before families). Sibling `SekaiDb` opens in the grouped `it`
-//! process overwrite `sekai_saturation_ratio`. Reference-platform analog: isolate
-//! process-global recorder state.
+//! Several cases exact-assert process-global Prometheus gauges. Every `SekaiDb`
+//! pool checkout writes `sekai_saturation_ratio` for the persistence subsystem,
+//! and tests in this binary still open a `SekaiDb` in parallel. So the
+//! saturation clamp test writes the evidence subsystem, which no database open
+//! writes, rather than relying on running alone.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -373,13 +374,17 @@ fn every_signal_family_renders_with_bounded_labels() {
 fn saturation_ratio_is_clamped_in_rendered_output() {
     sekai_chisei::obs::metrics::handle();
 
-    // A miscounted denominator must not render a ratio above 1.0.
-    signals::set_saturation(Subsystem::Persistence, 4.2);
+    // Evidence, not persistence: a concurrent `SekaiDb` checkout in this
+    // binary writes the persistence series. A miscounted denominator must
+    // not render a ratio above 1.0.
+    signals::set_saturation(Subsystem::Evidence, 4.2);
     let rendered = sekai_chisei::obs::metrics::handle().render();
     let line = rendered
         .lines()
-        .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
-        .expect("saturation series for persistence");
+        .find(|line| {
+            line.starts_with(signals::SATURATION_RATIO) && line.contains(r#"subsystem="evidence""#)
+        })
+        .expect("saturation series for evidence");
     let value: f64 = line
         .rsplit(' ')
         .next()
@@ -388,12 +393,14 @@ fn saturation_ratio_is_clamped_in_rendered_output() {
         .expect("numeric gauge value");
     assert_eq!(value, 1.0, "saturation rendered above unit range: {line}");
 
-    signals::set_saturation(Subsystem::Persistence, f64::NAN);
+    signals::set_saturation(Subsystem::Evidence, f64::NAN);
     let rendered = sekai_chisei::obs::metrics::handle().render();
     let line = rendered
         .lines()
-        .find(|line| line.starts_with(signals::SATURATION_RATIO) && line.contains("persistence"))
-        .expect("saturation series for persistence");
+        .find(|line| {
+            line.starts_with(signals::SATURATION_RATIO) && line.contains(r#"subsystem="evidence""#)
+        })
+        .expect("saturation series for evidence");
     assert!(
         !line.contains("NaN"),
         "non-finite saturation leaked into output: {line}"
