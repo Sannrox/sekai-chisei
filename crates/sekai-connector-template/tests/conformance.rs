@@ -239,3 +239,35 @@ fn completion_before_any_committed_page_is_refused() {
     let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
     assert!(run_once(&config, &outbox, &mut Empty, &mut Plane::default()).is_err());
 }
+
+#[test]
+fn a_failed_sync_state_read_names_the_transport_kind() {
+    struct FailingState(TransportFailure);
+    impl SourceSyncTransport for FailingState {
+        fn apply_source_batch(
+            &mut self,
+            _batch: &SourceBatch,
+        ) -> Result<ApplySourceBatchReply, TransportFailure> {
+            Err(self.0)
+        }
+
+        fn get_source_sync_state(
+            &mut self,
+            _input: &GetSourceSyncStateInput,
+        ) -> Result<SourceSyncStateView, TransportFailure> {
+            Err(self.0)
+        }
+    }
+
+    let config = config();
+    let root = tempfile::tempdir().unwrap();
+    let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
+    let mut source = FakeSource::new(&config.source, &config.source_instance);
+    for kind in [TransportFailure::Unavailable, TransportFailure::Ambiguous] {
+        let error = run_once(&config, &outbox, &mut source, &mut FailingState(kind)).unwrap_err();
+        assert!(
+            error.contains(&format!("{kind:?}")),
+            "expected {kind:?} in {error:?}"
+        );
+    }
+}
