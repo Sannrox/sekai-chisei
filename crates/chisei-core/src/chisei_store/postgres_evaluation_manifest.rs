@@ -161,7 +161,7 @@ fn get_manifest(
             &[&manifest_digest],
         )
         .map_err(|error| error.to_string())?
-        .map(|row| decode_manifest(row.get(0)))
+        .map(|row| decode_manifest(manifest_digest, row.get(0)))
         .transpose()
 }
 
@@ -186,21 +186,19 @@ fn get_request(
         .map_err(|error| error.to_string())?
         .map(|row| {
             let manifest_digest: String = row.get(1);
-            let manifest = decode_manifest(row.get(2))?;
-            if manifest.manifest_digest != manifest_digest {
-                return Err(
-                    "persisted evaluation manifest digest does not match its storage key".into(),
-                );
-            }
             Ok(EvaluationManifestReplay {
                 request_digest: row.get(0),
-                manifest,
+                manifest: decode_manifest(&manifest_digest, row.get(2))?,
             })
         })
         .transpose()
 }
 
-fn decode_manifest(body: &str) -> Result<ResolvedEvaluationManifest, String> {
-    serde_json::from_str(body)
-        .map_err(|error| format!("invalid persisted evaluation manifest: {error}"))
+fn decode_manifest(storage_key: &str, body: &str) -> Result<ResolvedEvaluationManifest, String> {
+    let manifest: ResolvedEvaluationManifest = serde_json::from_str(body)
+        .map_err(|error| format!("invalid persisted evaluation manifest: {error}"))?;
+    if manifest.manifest_digest != storage_key {
+        return Err("persisted evaluation manifest digest does not match its storage key".into());
+    }
+    Ok(manifest)
 }
