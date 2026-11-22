@@ -429,6 +429,38 @@ fn a_learning_changed_after_activation_or_under_reconciliation_is_refused() {
 }
 
 #[test]
+fn rollback_after_lease_loss_sets_the_learning_to_candidate() {
+    let db = db();
+    let active = activate_candidate(&db);
+    note_lease_loss(&db, "operator", "payments", "learning-1", 4_100).unwrap();
+
+    let rolled = rollback_change(&db, "operator", "payments", "learning-1", 4_300).unwrap();
+    assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    assert_eq!(
+        db.runtime()
+            .get_object("learning-1")
+            .unwrap()
+            .unwrap()
+            .properties["status"],
+        "candidate"
+    );
+    let audits = db
+        .list_decisions_for_action_namespace(ROLLBACK_ACTION, "payments")
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].outcome, "rolled_back");
+    assert_eq!(audits[0].actor, "operator");
+    assert_eq!(
+        resolve_pin(&db, "payments", "learning-1", &active.candidate_digest).unwrap_err(),
+        UNAVAILABLE
+    );
+    assert_eq!(
+        approve_change(&db, "reviewer", "payments", "learning-1", 4_400).unwrap_err(),
+        UNAVAILABLE
+    );
+}
+
+#[test]
 fn context_is_one_line_of_plain_text() {
     assert_eq!(
         render_context("  Two\nlines\u{0} ", "do\tthis\r\n\r\nfirst"),
