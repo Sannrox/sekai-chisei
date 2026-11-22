@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 const TEMPLATE_NAME: &str = "sekai-connector-template";
 const REPOSITORY: &str = "https://github.com/Sannrox/sekai-chisei";
+const RELEASE_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 macro_rules! template_files {
     ($($path:literal),* $(,)?) => {
@@ -106,7 +107,9 @@ fn manifest(contents: &str, sdk: &SdkSource) -> String {
                             root.join("crates").join(krate).display().to_string()
                         )
                     ),
-                    SdkSource::Repository => format!("{head}git = \"{REPOSITORY}\" }}"),
+                    SdkSource::Repository => {
+                        format!("{head}git = \"{REPOSITORY}\", tag = \"{RELEASE_TAG}\" }}")
+                    }
                 }
             }
             None => line.to_string(),
@@ -131,8 +134,15 @@ mod tests {
         let quoted = manifest(template, &SdkSource::Checkout(r#"/src/a"b\c"#.into()));
         assert!(quoted.contains(r#"path = "/src/a\"b\\c/crates/sekai-proto" }"#));
         let repository = manifest(template, &SdkSource::Repository);
+        let git_pin = format!(r#"git = "{REPOSITORY}", tag = "{RELEASE_TAG}""#);
+        for line in repository.lines().filter(|line| line.contains("git = ")) {
+            assert!(line.contains(&git_pin), "{line}");
+        }
         assert!(repository.contains(&format!(
-            r#"sekai-proto = {{ version = "3.0.0", git = "{REPOSITORY}" }}"#
+            r#"sekai-proto = {{ version = "3.0.0", {git_pin} }}"#
+        )));
+        assert!(repository.contains(&format!(
+            r#"sekai-source-sdk = {{ version = "2.0.0", {git_pin} }}"#
         )));
         assert!(!repository.contains("path = "));
         assert!(repository.ends_with("[workspace]\n"));
