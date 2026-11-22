@@ -176,8 +176,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let branch = load_branch(&tx, dataset_id, name)
-            .map_err(|_| dataset_branch::BRANCH_CHANGED.to_string())?;
+        let branch = load_branch(&tx, dataset_id, name).map_err(missing_branch_as_changed)?;
         if branch.incarnation != incarnation {
             return Err(dataset_branch::BRANCH_CHANGED.into());
         }
@@ -1129,6 +1128,16 @@ fn map_branch(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatasetBranch> {
     })
 }
 
+/// A fenced fill treats a missing branch as a concurrent change; storage and
+/// decode faults stay as themselves.
+pub(crate) fn missing_branch_as_changed(error: String) -> String {
+    if error == dataset_branch::BRANCH_NOT_FOUND {
+        dataset_branch::BRANCH_CHANGED.to_string()
+    } else {
+        error
+    }
+}
+
 fn load_branch(
     tx: &Transaction<'_>,
     dataset_id: &str,
@@ -1152,10 +1161,11 @@ fn load_owned_branch(
     name: &str,
     tenant: &str,
 ) -> Result<DatasetBranch, String> {
-    load_branch(tx, dataset_id, name)
-        .ok()
-        .filter(|branch| branch.tenant == tenant)
-        .ok_or_else(|| dataset_branch::BRANCH_NOT_FOUND.to_string())
+    let branch = load_branch(tx, dataset_id, name)?;
+    if branch.tenant != tenant {
+        return Err(dataset_branch::BRANCH_NOT_FOUND.into());
+    }
+    Ok(branch)
 }
 
 fn branch_rows_tx(
@@ -1342,6 +1352,53 @@ mod tests {
 
     fn live(db: &dyn DatasetBackend, id: &str) -> Vec<HashMap<String, String>> {
         db.query_rows(id, &RowQuery::default()).unwrap()
+    }
+
+    #[test]
+    fn a_corrupt_branch_row_is_a_storage_error_not_a_changed_branch() {
+        let db = crate::db::sekai::SekaiDb::new(":memory:").unwrap();
+        let id = format!("ds-{}", uuid::Uuid::new_v4().as_simple());
+        db.create_dataset(&Dataset {
+            id: id.clone(),
+            name: id.clone(),
+            columns: ["id", "value"]
+                .map(|name| ColumnDef {
+                    name: name.into(),
+                    col_type: "string".into(),
+                    classification: "internal".into(),
+                })
+                .to_vec(),
+            object_id: String::new(),
+            created: 0,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(&id, &[row("1", "a")]).unwrap();
+        let branch = db
+            .create_dataset_branch(&CreateDatasetBranch {
+                dataset_id: id.clone(),
+                name: "fix".into(),
+                actor: "dev".into(),
+                tenant: "t1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE sekai_dataset_branches SET created_at_ms = 'garbage'",
+                [],
+            )
+            .unwrap();
+        let fill = db
+            .fill_dataset_branch_from_base(&id, "fix", &branch.incarnation, &|_, _| Ok(Vec::new()))
+            .expect_err("corrupt branch row");
+        assert_ne!(fill, dataset_branch::BRANCH_CHANGED, "{fill}");
+        assert_ne!(fill, dataset_branch::BRANCH_NOT_FOUND, "{fill}");
+        let compare = db
+            .compare_dataset_branch(&id, "fix", "t1")
+            .expect_err("corrupt branch row");
+        assert_ne!(compare, dataset_branch::BRANCH_CHANGED, "{compare}");
+        assert_ne!(compare, dataset_branch::BRANCH_NOT_FOUND, "{compare}");
     }
 
     /// A checked merge (#1693) writes nothing when its check refuses the
