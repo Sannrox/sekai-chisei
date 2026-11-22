@@ -29,7 +29,6 @@ impl SekaiServiceImpl {
                 principals,
             )?;
         }
-        self.ensure_mapped_kind(&parsed, principals)?;
         let mut registry = self
             .db
             .runtime()
@@ -39,6 +38,7 @@ impl SekaiServiceImpl {
         registry.remove_class(&parsed.name);
         ontology::validate_class_definition(&parsed, existing.as_ref(), &registry)
             .map_err(Status::invalid_argument)?;
+        self.ensure_mapped_kind(&parsed, principals)?;
         self.db
             .runtime()
             .upsert_ontology_class_with_audit(&parsed, actor(principals))

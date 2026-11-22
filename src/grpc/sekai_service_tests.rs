@@ -12086,6 +12086,43 @@ async fn create_ontology_class_ensures_mapped_kind() {
 }
 
 #[tokio::test]
+async fn an_invalid_class_does_not_leave_a_mapped_schema_kind() {
+    let svc = service();
+    grant_ontology_admin(&svc);
+    svc.create_ontology_class(with_principal(CreateOntologyClassRequest {
+        class: Some(ontology_class("Person")),
+    }))
+    .await
+    .unwrap();
+    grant_ontology_reader(&svc, "ontology:class:Person");
+
+    let mut engineer = ontology_class("Engineer");
+    engineer.superclasses = vec!["Person".into()];
+    engineer.disjoint_classes = vec!["Person".into()];
+    engineer.mapped_kind = "engineer_kind".into();
+    let err = svc
+        .create_ontology_class(with_principal(CreateOntologyClassRequest {
+            class: Some(engineer),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("disjoint with its ancestor"),
+        "{}",
+        err.message()
+    );
+    assert!(
+        svc.schema_definitions
+            .snapshot()
+            .unwrap()
+            .get("engineer_kind")
+            .is_none(),
+        "invalid CreateOntologyClass must not persist the mapped schema kind"
+    );
+}
+
+#[tokio::test]
 async fn submit_action_instance_creates_record_of_ensured_kind() {
     let svc = service();
     grant_ontology_admin(&svc);
