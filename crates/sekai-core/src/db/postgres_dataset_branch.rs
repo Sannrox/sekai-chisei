@@ -3,7 +3,7 @@
 //! first takes the dataset rows lock that appends, rollback and redaction
 //! use, so they serialize with one another and with retention.
 
-use crate::db::dataset_branch::{check_mergeable, merge_reason};
+use crate::db::dataset_branch::{check_mergeable, merge_reason, missing_branch_as_changed};
 use crate::db::postgres::{PostgresDb, lock_dataset_rows};
 use crate::db::postgres_dataset::{
     mark_consuming_transform_outputs_stale_pg, snapshot_dataset_version_pg,
@@ -102,8 +102,8 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut tx, dataset_id)?;
-        let branch = load_branch(&mut tx, dataset_id, name, true)
-            .map_err(|_| dataset_branch::BRANCH_CHANGED.to_string())?;
+        let branch =
+            load_branch(&mut tx, dataset_id, name, true).map_err(missing_branch_as_changed)?;
         if branch.incarnation != incarnation {
             return Err(dataset_branch::BRANCH_CHANGED.into());
         }
