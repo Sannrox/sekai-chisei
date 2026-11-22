@@ -88,12 +88,9 @@ mod tests {
         );
         let round_trip: PropertyValue = serde_json::from_value(encoded).unwrap();
         assert_eq!(round_trip, named_string_value);
-        let snake_struct: PropertyValue = serde_json::from_str(r#"{"string_value":"x"}"#).unwrap();
-        let Some(Kind::StructValue(snake_struct)) = snake_struct.kind else {
-            panic!("expected struct");
-        };
+        let snake_cell: PropertyValue = serde_json::from_str(r#"{"string_value":"x"}"#).unwrap();
         assert!(matches!(
-            &snake_struct.fields["string_value"].kind,
+            snake_cell.kind,
             Some(Kind::StringValue(text)) if text == "x"
         ));
         let labeled_kind: PropertyValue =
