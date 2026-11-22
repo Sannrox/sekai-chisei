@@ -57,7 +57,7 @@ pub fn run_once<S: SnapshotPageSource, T: SourceSyncTransport>(
             source_instance: config.source_instance.clone(),
             type_digest: config.type_digest.clone(),
         })
-        .map_err(|_| "source sync state is unavailable".to_string())?;
+        .map_err(|failure| format!("source sync state failed: {failure:?}"))?;
     if state.open_transaction {
         return Ok(RunOutcome::Pending);
     }
