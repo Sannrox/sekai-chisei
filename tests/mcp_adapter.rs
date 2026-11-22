@@ -73,7 +73,8 @@ async fn framed_client_rejects_unknown_mapping_forged_metadata_and_oversize() {
     let (client_out, server_in) = tokio::io::duplex(64 * 1024);
     let (server_out, client_in) = tokio::io::duplex(64 * 1024);
     let served = surface.clone();
-    tokio::spawn(async move { serve_io(served, BufReader::new(server_in), server_out).await });
+    let server =
+        tokio::spawn(async move { serve_io(served, BufReader::new(server_in), server_out).await });
     let mut writer = client_out;
     let mut reader = BufReader::new(client_in);
 
@@ -114,10 +115,30 @@ async fn framed_client_rejects_unknown_mapping_forged_metadata_and_oversize() {
         "invalid_argument"
     );
 
-    let oversize = vec![b'x'; MAX_FRAME_BYTES + 8];
-    tokio::io::AsyncWriteExt::write_all(&mut writer, &oversize)
+    // A frame of exactly MAX_FRAME_BYTES is still served: JSON allows the
+    // trailing whitespace that pads it to the limit.
+    let mut at_limit =
+        serde_json::to_vec(&json!({"jsonrpc":"2.0","id":3,"method":"ping"})).unwrap();
+    at_limit.resize(MAX_FRAME_BYTES, b' ');
+    at_limit.push(b'\n');
+    tokio::io::AsyncWriteExt::write_all(&mut writer, &at_limit)
         .await
         .unwrap();
+    let pong = read_frame(&mut reader).await.unwrap();
+    assert_eq!(pong["id"], 3);
+    assert_eq!(pong["result"], json!({}));
+
+    // One past the limit ends the session with the size error. The server
+    // stops reading at the limit, so the rest of the write may see a closed
+    // pipe; only the server's outcome matters.
+    let oversize = vec![b'x'; MAX_FRAME_BYTES + 8];
+    let _ = tokio::io::AsyncWriteExt::write_all(&mut writer, &oversize).await;
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("server kept reading past MAX_FRAME_BYTES")
+        .unwrap();
+    assert_eq!(outcome, Err("mcp frame exceeds size limit".to_string()));
+    assert_eq!(read_frame(&mut reader).await, Err("eof".to_string()));
 }
 
 #[tokio::test]
