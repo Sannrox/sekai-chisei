@@ -9,6 +9,7 @@
 //! from the file.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -140,16 +141,47 @@ async fn serve() -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     runtime
-        .serve(Duration::from_millis(config.poll_ms), async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .serve(Duration::from_millis(config.poll_ms), shutdown_signal()?)
         .await;
     Ok(())
 }
 
+/// Resolves on SIGINT or SIGTERM (unix) or Ctrl-C (elsewhere) so
+/// `Runtime::serve` returns between passes. Installing the handler is
+/// fallible: a process that cannot listen exits with an error instead of
+/// succeeding without work.
+fn shutdown_signal() -> Result<impl Future<Output = ()>, String> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::SignalKind;
+        let mut sigterm = unix_signal(SignalKind::terminate(), "SIGTERM")?;
+        let mut sigint = unix_signal(SignalKind::interrupt(), "SIGINT")?;
+        Ok(async move {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = sigint.recv() => {}
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            tokio::signal::ctrl_c().await.expect("listen for interrupt");
+        })
+    }
+}
+
+#[cfg(unix)]
+fn unix_signal(
+    kind: tokio::signal::unix::SignalKind,
+    name: &'static str,
+) -> Result<tokio::signal::unix::Signal, String> {
+    tokio::signal::unix::signal(kind).map_err(|error| format!("listen for {name}: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{gateway_route, parse_config};
+    use super::{gateway_route, parse_config, shutdown_signal};
 
     #[test]
     fn a_gateway_url_without_a_key_is_refused() {
@@ -176,5 +208,40 @@ mod tests {
         let lease = parse_config(&config(r#","lease_ms":2"#)).err().unwrap();
         assert!(lease.contains("lease_ms"), "{lease}");
         assert!(parse_config(&config(r#","lease_ms":3,"poll_ms":1"#)).is_ok());
+    }
+
+    #[cfg(unix)]
+    fn raise(signal: &str) {
+        let ok = std::process::Command::new("kill")
+            .args(["-s", signal, &std::process::id().to_string()])
+            .status()
+            .expect("run kill")
+            .success();
+        assert!(ok, "kill -s {signal}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_term_and_int_resolve_the_shutdown_future() {
+        let term = shutdown_signal().expect("install SIGTERM listener");
+        raise("TERM");
+        tokio::time::timeout(std::time::Duration::from_secs(2), term)
+            .await
+            .expect("SIGTERM should resolve shutdown");
+
+        let interrupt = shutdown_signal().expect("install SIGINT listener");
+        raise("INT");
+        tokio::time::timeout(std::time::Duration::from_secs(2), interrupt)
+            .await
+            .expect("SIGINT should resolve shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_signal_handler_install_is_an_error() {
+        // SIGKILL cannot be caught; the OS refuses the handler.
+        let error = super::unix_signal(tokio::signal::unix::SignalKind::from_raw(9), "SIGKILL")
+            .expect_err("SIGKILL cannot be caught");
+        assert!(error.contains("listen for SIGKILL"), "{error}");
     }
 }
