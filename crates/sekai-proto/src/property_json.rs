@@ -123,63 +123,74 @@ fn parse_wire(value: Value) -> Result<PropertyValue, String> {
     }
 }
 
-const ONEOF_KEYS: &[&str] = &[
-    "stringValue",
-    "intValue",
-    "floatValue",
-    "boolValue",
-    "structValue",
-];
+const STRING_KEYS: &[&str] = &["stringValue", "string_value"];
+const INT_KEYS: &[&str] = &["intValue", "int_value"];
+const FLOAT_KEYS: &[&str] = &["floatValue", "float_value"];
+const BOOL_KEYS: &[&str] = &["boolValue", "bool_value"];
+const STRUCT_KEYS: &[&str] = &["structValue", "struct_value"];
+
+fn is_tagged_key(key: &str) -> bool {
+    [STRING_KEYS, INT_KEYS, FLOAT_KEYS, BOOL_KEYS, STRUCT_KEYS]
+        .into_iter()
+        .any(|keys| keys.contains(&key))
+}
 
 fn is_tagged(fields: &Map<String, Value>) -> bool {
     match fields.get("kind") {
         Some(kind) if fields.len() == 1 => is_kind_envelope(kind),
         Some(_) => false,
-        None => {
-            fields.len() == 1
-                && fields
-                    .keys()
-                    .next()
-                    .is_some_and(|key| ONEOF_KEYS.contains(&key.as_str()))
-        }
+        None => fields.len() == 1 && fields.keys().next().is_some_and(|key| is_tagged_key(key)),
     }
 }
 
 fn is_kind_envelope(kind: &Value) -> bool {
     kind.as_object().is_some_and(|envelope| {
-        envelope.len() == 1
-            && envelope
-                .keys()
-                .any(|key| ONEOF_KEYS.contains(&key.as_str()))
+        envelope.len() == 1 && envelope.keys().any(|key| is_tagged_key(key))
     })
+}
+
+fn take_i64(key: &str, value: Value) -> Result<i64, String> {
+    if let Some(int) = value.as_i64() {
+        return Ok(int);
+    }
+    if let Some(text) = value.as_str() {
+        return text.parse().map_err(|_| format!("{key} must be an int"));
+    }
+    Err(format!("{key} must be an int"))
 }
 
 fn parse_tagged(mut fields: Map<String, Value>) -> Result<PropertyValue, String> {
     if let Some(kind) = fields.remove("kind") {
-        let kind = serde_json::from_value(kind).map_err(|error| error.to_string())?;
-        return Ok(PropertyValue { kind });
+        let Value::Object(inner) = kind else {
+            return Err("property value kind must be an object".into());
+        };
+        return parse_tagged(inner);
     }
-    // `is_tagged` admits exactly one key from `ONEOF_KEYS`.
+    // `is_tagged` admits exactly one camelCase or snake_case oneof key.
     let Some((key, value)) = fields.into_iter().next() else {
         return Err("property value object is missing a typed cell".into());
     };
-    let kind = match key.as_str() {
-        "stringValue" => match value {
+    let key_str = key.as_str();
+    let kind = if STRING_KEYS.contains(&key_str) {
+        match value {
             Value::String(text) => Kind::StringValue(text),
             other => return Err(format!("{key} must be a string, got {other}")),
-        },
-        "intValue" => Kind::IntValue(value.as_i64().ok_or(format!("{key} must be an int"))?),
-        "floatValue" => Kind::FloatValue(
+        }
+    } else if INT_KEYS.contains(&key_str) {
+        Kind::IntValue(take_i64(key_str, value)?)
+    } else if FLOAT_KEYS.contains(&key_str) {
+        Kind::FloatValue(
             value
                 .as_f64()
                 .filter(|float| float.is_finite())
                 .ok_or(format!("{key} must be a finite float"))?,
-        ),
-        "boolValue" => Kind::BoolValue(value.as_bool().ok_or(format!("{key} must be a bool"))?),
-        "structValue" => {
-            Kind::StructValue(serde_json::from_value(value).map_err(|error| error.to_string())?)
-        }
-        _ => return Err("property value object is missing a typed cell".into()),
+        )
+    } else if BOOL_KEYS.contains(&key_str) {
+        Kind::BoolValue(value.as_bool().ok_or(format!("{key} must be a bool"))?)
+    } else if STRUCT_KEYS.contains(&key_str) {
+        Kind::StructValue(serde_json::from_value(value).map_err(|error| error.to_string())?)
+    } else {
+        return Err("property value object is missing a typed cell".into());
     };
     Ok(PropertyValue { kind: Some(kind) })
 }
@@ -202,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn only_camel_case_oneof_keys_are_tagged() {
+    fn tagged_cells_accept_string_int64_and_snake_case_keys() {
         let parse = |json: &str| serde_json::from_str::<Wire>(json).map(|wire| wire.0.kind);
         assert_eq!(
             parse(r#"{"stringValue":"a"}"#).unwrap(),
@@ -213,12 +224,21 @@ mod tests {
             parse(r#"{"kind":{"boolValue":true}}"#).unwrap(),
             Some(Kind::BoolValue(true))
         );
-        assert!(parse(r#"{"intValue":"3"}"#).is_err());
-        let Some(Kind::StructValue(nested)) = parse(r#"{"string_value":"a"}"#).unwrap() else {
-            panic!("snake_case key parses as a struct field");
-        };
         assert_eq!(
-            nested.fields["string_value"].kind,
+            parse(r#"{"intValue":"5"}"#).unwrap(),
+            Some(Kind::IntValue(5))
+        );
+        assert!(parse(r#"{"intValue":"nope"}"#).is_err());
+        assert_eq!(
+            parse(r#"{"int_value":5}"#).unwrap(),
+            Some(Kind::IntValue(5))
+        );
+        assert_eq!(
+            parse(r#"{"kind":{"int_value":5}}"#).unwrap(),
+            Some(Kind::IntValue(5))
+        );
+        assert_eq!(
+            parse(r#"{"string_value":"a"}"#).unwrap(),
             Some(Kind::StringValue("a".into()))
         );
     }
