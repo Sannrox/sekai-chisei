@@ -3,6 +3,7 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
 use crate::sekai::coordination::RequestOutcome;
+use crate::sekai::handoff_lifecycle::HandoffLifecycleError;
 use crate::sekai::work_unit_lifecycle::WorkUnitTransition;
 
 impl RuntimeDb {
@@ -206,7 +207,7 @@ impl RuntimeDb {
         &self,
         manifest: &HandoffManifest,
         request_id: &str,
-    ) -> Result<HandoffManifest, String> {
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
         match self {
             Self::Sqlite(db) => db.create_handoff(manifest, request_id),
             Self::Postgres(db) => {
@@ -537,7 +538,7 @@ impl RuntimeDb {
         reason: &str,
         request_id: &str,
         now_ms: i64,
-    ) -> Result<HandoffManifest, String> {
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
         match self {
             Self::Sqlite(db) => db.revoke_handoff(id, actor, reason, request_id, now_ms),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
