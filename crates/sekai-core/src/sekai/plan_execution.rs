@@ -213,6 +213,11 @@ pub fn execute_plan(
         .get_plan_simulation(namespace, plan_id, &review.simulation_id)?
         .filter(|simulation| simulation.digest == review.simulation_digest)
         .ok_or(PlanError::NotFound)?;
+    // An empty decision is pending, not a deny. Creating an execution here
+    // would make a later grant return the stored stop and never run.
+    if review.decision.is_empty() {
+        return Err(PlanError::Invalid("plan review is undecided".into()).into());
+    }
     let mut execution = match db.get_plan_execution(namespace, plan_id)? {
         Some(execution) if execution.status != EXECUTION_RUNNING => return Ok(execution),
         Some(execution) => execution,
@@ -1126,31 +1131,94 @@ mod tests {
         assert!(taken.claim_holder.is_empty());
     }
 
-    #[test]
-    fn a_plan_without_a_grant_never_executes() {
-        let db = RuntimeDb::memory();
-        approved_plan_pending(&db);
-        let submits = RefCell::new(Vec::new());
-        let submit = submitter(&db, &submits);
+    fn execute_plan_2<'a>(
+        db: &'a RuntimeDb,
+        submits: &'a RefCell<Vec<String>>,
+        visible: &'a dyn Fn(&str) -> Result<Option<Object>, String>,
+    ) -> Result<PlanExecution, ExecutionError> {
+        let submit = submitter(db, submits);
         let decide =
             |_: &ActionInstance, _: &str| Err::<Admitted, _>(PortError::Refused("unused".into()));
-        let visible = visible(&db);
-        let execution = execute_plan(
-            &db,
+        execute_plan(
+            db,
             &ExecutionPorts {
                 submit: &submit,
                 decide: &decide,
                 approver_may_decide: &|_, _| Ok(true),
                 planner_may_submit: &|_| Ok(true),
                 clock: &|| 100,
-                simulation: context(&visible, 100),
+                simulation: context(visible, 100),
             },
             NS,
             "plan-2",
             APPROVER,
         )
+    }
+
+    #[test]
+    fn a_plan_without_a_grant_never_executes() {
+        let db = RuntimeDb::memory();
+        approved_plan_pending(&db);
+        let submits = RefCell::new(Vec::new());
+        let visible = visible(&db);
+        let error = execute_plan_2(&db, &submits, &visible).unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::Plan(PlanError::Invalid(_))),
+            "{error:?}"
+        );
+        assert_eq!(db.get_plan_execution(NS, "plan-2").unwrap(), None);
+        assert!(submits.borrow().is_empty());
+
+        let review = db.get_plan_review(NS, "plan-2").unwrap().unwrap();
+        decide_review(
+            &db,
+            NS,
+            "plan-2",
+            &ReviewDecision {
+                simulation_digest: &review.simulation_digest,
+                decision: DECISION_GRANT,
+                reason: "ok",
+                in_space: false,
+            },
+            APPROVER,
+            &|_, _| true,
+            6,
+        )
         .unwrap();
+        let execution = execute_plan_2(&db, &submits, &visible).unwrap();
+        assert_eq!(execution.status, EXECUTION_COMPLETED, "{execution:?}");
+        assert_eq!(submits.borrow().len(), 3);
+    }
+
+    #[test]
+    fn a_denied_plan_stops_without_running_steps() {
+        let db = RuntimeDb::memory();
+        approved_plan_pending(&db);
+        let review = db.get_plan_review(NS, "plan-2").unwrap().unwrap();
+        decide_review(
+            &db,
+            NS,
+            "plan-2",
+            &ReviewDecision {
+                simulation_digest: &review.simulation_digest,
+                decision: crate::sekai::action_instance::DECISION_DENY,
+                reason: "no",
+                in_space: false,
+            },
+            APPROVER,
+            &|_, _| true,
+            6,
+        )
+        .unwrap();
+        let submits = RefCell::new(Vec::new());
+        let visible = visible(&db);
+        let execution = execute_plan_2(&db, &submits, &visible).unwrap();
+        assert_eq!(execution.status, EXECUTION_STOPPED);
         assert_eq!(execution.stop_reason, STOP_NOT_APPROVED);
+        assert_eq!(
+            db.get_plan_execution(NS, "plan-2").unwrap(),
+            Some(execution)
+        );
         assert!(submits.borrow().is_empty());
     }
 
