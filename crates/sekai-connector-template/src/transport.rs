@@ -8,8 +8,14 @@ use sekai_source_sdk::{
     ApplySourceBatchReply, GetSourceSyncStateInput, SourceBatch, SourceSyncStateView,
     SourceSyncTransport, TransportFailure,
 };
+use std::time::Duration;
 use tonic::metadata::MetadataValue;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct GrpcTransport {
     runtime: tokio::runtime::Runtime,
@@ -24,7 +30,12 @@ impl GrpcTransport {
             .build()
             .map_err(|error| format!("cannot start runtime: {error}"))?;
         let mut endpoint = Endpoint::from_shared(target.to_string())
-            .map_err(|_| "control plane target is not a URI".to_string())?;
+            .map_err(|_| "control plane target is not a URI".to_string())?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+            .keep_alive_while_idle(true);
         let loopback = matches!(
             endpoint.uri().host(),
             Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
@@ -37,9 +48,13 @@ impl GrpcTransport {
                 .tls_config(ClientTlsConfig::new().with_native_roots())
                 .map_err(|_| "control plane TLS is unavailable".to_string())?;
         }
-        let channel = runtime
-            .block_on(endpoint.connect())
-            .map_err(|_| "control plane is unreachable".to_string())?;
+        // tonic's connect_timeout covers TCP only; bound the HTTP/2 handshake too.
+        let channel = match runtime
+            .block_on(async { tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect()).await })
+        {
+            Ok(Ok(channel)) => channel,
+            _ => return Err("control plane is unreachable".into()),
+        };
         let client = SekaiServiceClient::new(channel);
         Ok(Self {
             runtime,
@@ -103,7 +118,9 @@ fn aborted(state: &pb::SourceSyncState, batch: &SourceBatch) -> bool {
 
 fn failure(status: &tonic::Status) -> TransportFailure {
     match status.code() {
-        tonic::Code::Unavailable => TransportFailure::Unavailable,
+        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded | tonic::Code::Cancelled => {
+            TransportFailure::Unavailable
+        }
         _ => TransportFailure::Ambiguous,
     }
 }
@@ -312,5 +329,82 @@ mod tests {
         assert!(!aborted(&state(transaction("ABORTED", "other")), &batch));
         assert!(!aborted(&state(transaction("OPEN", "key")), &batch));
         assert!(!aborted(&pb::SourceSyncState::default(), &batch));
+    }
+
+    fn never_speaks_http2() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    std::thread::park();
+                    drop(stream);
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn hang_after_http2() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ready, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                ready.send(()).ok();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(stream).await.unwrap();
+                let mut held = Vec::new();
+                while let Some(Ok((_request, send_response))) = connection.accept().await {
+                    held.push(send_response);
+                }
+            });
+        });
+        wait.recv().unwrap();
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn connecting_to_a_listener_that_never_speaks_http2_fails_within_the_connect_timeout() {
+        let target = never_speaks_http2();
+        let started = std::time::Instant::now();
+        let failed = match GrpcTransport::connect(&target, None) {
+            Err(error) => error == "control plane is unreachable",
+            Ok(mut transport) => matches!(
+                transport.get_source_sync_state(&GetSourceSyncStateInput {
+                    namespace: "ns".into(),
+                    source_instance: "i".into(),
+                    type_digest: "t".into(),
+                }),
+                Err(TransportFailure::Unavailable)
+            ),
+        };
+        assert!(
+            failed,
+            "a listener that never speaks HTTP/2 must fail retryably"
+        );
+        assert!(started.elapsed() < CONNECT_TIMEOUT + REQUEST_TIMEOUT + Duration::from_secs(2));
+    }
+
+    #[test]
+    fn rpc_to_a_plane_that_stops_answering_returns_retryable_within_the_request_timeout() {
+        let target = hang_after_http2();
+        let mut transport = GrpcTransport::connect(&target, None).unwrap();
+        let started = std::time::Instant::now();
+        let error = transport
+            .get_source_sync_state(&GetSourceSyncStateInput {
+                namespace: "ns".into(),
+                source_instance: "i".into(),
+                type_digest: "t".into(),
+            })
+            .unwrap_err();
+        assert_eq!(error, TransportFailure::Unavailable);
+        assert!(started.elapsed() < REQUEST_TIMEOUT + Duration::from_secs(2));
     }
 }
