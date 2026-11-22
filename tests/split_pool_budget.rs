@@ -136,18 +136,12 @@ fn split_pools_take_per_plane_sizes_and_report_checkouts_per_plane() {
 #[test]
 fn split_pool_sizes_over_the_process_ceiling_refuse_to_start() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let output = split_server(dir.path(), "12", "8")
-        .output()
-        .expect("run sekai-chisei");
-    assert!(
-        !output.status.success(),
-        "over-budget Split pools must not start"
+    let output = crate::refused_boot_output(
+        split_server(dir.path(), "12", "8"),
+        "over-budget Split pools",
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("exceed SEKAI_POSTGRES_MAX_CONNECTIONS (16)")
-            || stdout.contains("exceed SEKAI_POSTGRES_MAX_CONNECTIONS (16)"),
-        "stdout: {stdout}\nstderr: {stderr}"
+        output.contains("exceed SEKAI_POSTGRES_MAX_CONNECTIONS (16)"),
+        "{output}"
     );
 }
