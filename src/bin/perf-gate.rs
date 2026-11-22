@@ -241,6 +241,7 @@ fn run() -> Result<ExitCode, String> {
                     }
                 },
                 BaselineVerdict::MissingFromBaseline => "absent from baseline".to_string(),
+                BaselineVerdict::MissingFromCurrent => "absent from the current runs".to_string(),
             };
             println!(
                 "{:<36}{:>12.1}{:>12.1}{:>8.1}%  {verdict}",
@@ -248,7 +249,11 @@ fn run() -> Result<ExitCode, String> {
             );
         }
         println!("{}", "-".repeat(88));
-        baseline_regressions = comparison.regressions().len();
+        baseline_regressions = comparison
+            .comparisons
+            .iter()
+            .filter(|row| row.verdict.fails_gate())
+            .count();
         println!(
             "{} compared, {} regressions, {} improvements",
             comparison.comparisons.len(),
