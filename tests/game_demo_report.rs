@@ -40,6 +40,7 @@ use sekai_chisei::pricing::{ModelPricing, parse_pricing_table};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tonic::{Code, Status};
 
 use crate::game_ai_players::{
     Outcome, PLAYER, PRICES, Prices, Replay, RoutePrice, SCENARIOS, SEED, Turn, Verdict, play,
@@ -397,18 +398,24 @@ impl Reader<'_> {
     async fn receipt(
         &self,
         request: GetOperationReceiptRequest,
-    ) -> Option<(Value, bool, Vec<String>)> {
-        let response = self
-            .game
-            .server
-            .chisei()
-            .await
-            .get_operation_receipt(request)
-            .await
-            .ok()?
-            .into_inner();
+    ) -> Result<Option<(Value, bool, Vec<String>)>, Status> {
+        let response = match optional_receipt(
+            self.game
+                .server
+                .chisei()
+                .await
+                .get_operation_receipt(request)
+                .await,
+        )? {
+            Some(response) => response.into_inner(),
+            None => return Ok(None),
+        };
         let receipt = serde_json::from_str(&response.receipt_json).expect("receipt json");
-        Some((receipt, response.complete, response.missing_surfaces))
+        Ok(Some((
+            receipt,
+            response.complete,
+            response.missing_surfaces,
+        )))
     }
 
     async fn model(&self, turn: &Turn) -> (ModelReceipt, Tally) {
@@ -418,6 +425,7 @@ impl Reader<'_> {
                 ..Default::default()
             })
             .await
+            .unwrap_or_else(|status| fail_receipt(&turn.request_id, status))
             .unwrap_or_else(|| panic!("{}: no model receipt", turn.request_id));
         let attribute = |kind: &str, name: &str| -> String {
             receipt["events"]
@@ -519,6 +527,7 @@ impl Reader<'_> {
                 ..Default::default()
             })
             .await
+            .unwrap_or_else(|status| fail_receipt(&turn.request_id, status))
             .map(|(receipt, complete, mut missing_surfaces)| {
                 missing_surfaces.sort();
                 let events = receipt["events"]
@@ -695,6 +704,24 @@ impl Reader<'_> {
             lineage,
         }
     }
+}
+
+/// Only `NOT_FOUND` is an absent receipt. Any other status fails the report,
+/// including when `GAME_REPORT_UPDATE=1` would otherwise rewrite the golden copy.
+fn optional_receipt<T>(result: Result<T, Status>) -> Result<Option<T>, Status> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(status) if status.code() == Code::NotFound => Ok(None),
+        Err(status) => Err(status),
+    }
+}
+
+fn fail_receipt(request_id: &str, status: Status) -> ! {
+    panic!(
+        "{request_id}: GetOperationReceipt {}: {}",
+        status.code(),
+        status.message()
+    );
 }
 
 /// The block a verdict records, with the pack rule behind its trigger.
@@ -1112,6 +1139,18 @@ impl Report {
         }
         out
     }
+}
+
+#[test]
+fn only_a_not_found_receipt_lookup_is_absent() {
+    assert_eq!(optional_receipt(Ok(1)).unwrap(), Some(1));
+    assert_eq!(
+        optional_receipt::<i32>(Err(Status::not_found("gone"))).unwrap(),
+        None
+    );
+    let status = optional_receipt::<i32>(Err(Status::unavailable("down"))).unwrap_err();
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "down");
 }
 
 #[tokio::test(flavor = "multi_thread")]
