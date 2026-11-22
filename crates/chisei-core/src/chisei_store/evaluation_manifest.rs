@@ -39,7 +39,7 @@ impl EvaluationManifestSekaiDbExt for SekaiDb {
             )
             .optional()
             .map_err(|error| error.to_string())?
-            .map(|body| decode_manifest(&body))
+            .map(|body| decode_manifest(manifest_digest, &body))
             .transpose()
     }
 
@@ -71,16 +71,9 @@ impl EvaluationManifestSekaiDbExt for SekaiDb {
             .optional()
             .map_err(|error| error.to_string())?
             .map(|(request_digest, manifest_digest, body)| {
-                let manifest = decode_manifest(&body)?;
-                if manifest.manifest_digest != manifest_digest {
-                    return Err(
-                        "persisted evaluation manifest digest does not match its storage key"
-                            .into(),
-                    );
-                }
                 Ok(EvaluationManifestReplay {
                     request_digest,
-                    manifest,
+                    manifest: decode_manifest(&manifest_digest, &body)?,
                 })
             })
             .transpose()
@@ -185,7 +178,7 @@ fn get_manifest_tx(
         )
         .optional()
         .map_err(|error| error.to_string())?
-        .map(|body| decode_manifest(&body))
+        .map(|body| decode_manifest(manifest_digest, &body))
         .transpose()
 }
 
@@ -217,23 +210,21 @@ fn get_request_tx(
         .optional()
         .map_err(|error| error.to_string())?
         .map(|(request_digest, manifest_digest, body)| {
-            let manifest = decode_manifest(&body)?;
-            if manifest.manifest_digest != manifest_digest {
-                return Err(
-                    "persisted evaluation manifest digest does not match its storage key".into(),
-                );
-            }
             Ok(EvaluationManifestReplay {
                 request_digest,
-                manifest,
+                manifest: decode_manifest(&manifest_digest, &body)?,
             })
         })
         .transpose()
 }
 
-fn decode_manifest(body: &str) -> Result<ResolvedEvaluationManifest, String> {
-    serde_json::from_str(body)
-        .map_err(|error| format!("invalid persisted evaluation manifest: {error}"))
+fn decode_manifest(storage_key: &str, body: &str) -> Result<ResolvedEvaluationManifest, String> {
+    let manifest: ResolvedEvaluationManifest = serde_json::from_str(body)
+        .map_err(|error| format!("invalid persisted evaluation manifest: {error}"))?;
+    if manifest.manifest_digest != storage_key {
+        return Err("persisted evaluation manifest digest does not match its storage key".into());
+    }
+    Ok(manifest)
 }
 
 #[cfg(test)]
@@ -320,6 +311,50 @@ mod tests {
             db.put_evaluation_manifest(&manifest, "resolve-1", "changed")
                 .unwrap_err()
                 .contains("different content")
+        );
+    }
+
+    #[test]
+    fn a_manifest_row_whose_body_digest_differs_from_its_key_is_refused() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        let manifest = manifest();
+        let mut corrupt = manifest.clone();
+        corrupt.manifest_digest = format!("sha256:{}", "9".repeat(64));
+        let body = serde_json::to_string(&corrupt).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_evaluation_manifests
+                     (manifest_digest, manifest_id, namespace, plan_version_id,
+                      subject_identity, evaluation_time_ms, body_json, created_at_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    manifest.manifest_digest,
+                    "corrupt-id",
+                    manifest.namespace,
+                    manifest.plan_version_id,
+                    manifest.subject_identity,
+                    manifest.evaluation_time_ms,
+                    body,
+                    manifest.created_at_ms,
+                ],
+            )
+            .unwrap();
+        let error = db
+            .get_evaluation_manifest(&manifest.manifest_digest)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "persisted evaluation manifest digest does not match its storage key"
+        );
+        assert!(
+            db.put_evaluation_manifest(&manifest, "resolve-corrupt", "request-digest")
+                .unwrap_err()
+                .contains("does not match its storage key")
+        );
+        assert!(
+            db.get_evaluation_manifest_for_request("acme", "local", "resolve-corrupt")
+                .unwrap()
+                .is_none()
         );
     }
 }
