@@ -169,6 +169,9 @@ pub fn extract_from_rendition(
             invocation.receipt.schema_error
         ));
     }
+    if !invocation.receipt.budget_exceeded.is_empty() {
+        return Err(invocation.receipt.budget_exceeded.clone());
+    }
     let structured = invocation
         .result
         .structured
@@ -1132,6 +1135,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("confidence_micros must be at most 1000000"));
+        assert!(runtime.get_object("inv-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_exceeded_function_budget_is_named_on_extract() {
+        let runtime = db();
+        admit_invoice_document(&runtime);
+        seed_action(&runtime);
+        let function = extract_function(800_000);
+        runtime.publish_gated_function(&function).unwrap();
+        let llm = RecordingHost {
+            output: serde_json::json!({
+                "id": "inv-1",
+                "vendor": "ACME",
+                "confidence_micros": 900_000
+            }),
+            bound: Mutex::new(None),
+        };
+        let error = extract_from_rendition(FunctionDocumentExtractRequest {
+            db: &runtime,
+            function: &function,
+            actor: "analyst",
+            namespace: "records",
+            document_id: "doc:invoice",
+            purpose: "case-review",
+            extracted_text: EXTRACTED,
+            llm_host: &llm,
+            host: host(),
+            budget: FunctionBudget {
+                max_time_ms: 60_000,
+                max_output_bytes: 8,
+                max_steps: 32,
+            },
+            now_ms: 2_000,
+            object_kind: "invoice",
+            action: action(),
+            authorize_write: &|_| Ok(()),
+        })
+        .unwrap_err();
+        assert_eq!(error, "function budget exceeded: max_output_bytes");
         assert!(runtime.get_object("inv-1").unwrap().is_none());
     }
 
