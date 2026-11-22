@@ -5,6 +5,7 @@
 //! `sekai-core`. It does not depend on the server library.
 
 pub mod action_cli;
+mod artifact_output;
 pub mod attest_cli;
 pub mod audit_export_cli;
 pub mod autonomous_envelope_cli;

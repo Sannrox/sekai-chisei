@@ -11,7 +11,11 @@ use sekai_proto::chisei::GetOperationReceiptRequest;
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use std::path::{Path, PathBuf};
 
+use crate::artifact_output::{publish_new_file, refuse_existing_output};
+
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+const ATTEST_OUTPUT_KIND: &str = "a signed attestation bundle";
 
 pub fn usage() -> &'static str {
     "sekaictl admin assurance attest export <operation-id> --output <bundle> [--attempt <number>] [--signing-key <file> --identity <signer> --key-id <id>] [--artifact <reference>=<path>]... [--policy-attestation <file>]...\n  sekaictl admin assurance attest verify <bundle> [--trusted-key <file> --identity <signer> --key-id <id> --key-state <active|rotated|revoked|unknown>] [--valid-from-ms <time>] [--valid-until-ms <time>] [--revoked-at-ms <time>] [--successor-key-id <id>] [--integrity-only] [--format <text|json|in-toto>]"
@@ -56,6 +60,7 @@ pub async fn run_attest_command(args: Vec<String>) -> Result<(), BoxErr> {
 }
 
 async fn export(config: ExportConfig) -> Result<(), BoxErr> {
+    refuse_existing_output(&config.output, ATTEST_OUTPUT_KIND)?;
     let target = std::env::var("CHISEI_GRPC_URL")
         .or_else(|_| std::env::var("SEKAI_SOCKET"))
         .unwrap_or_else(|_| "./data/sekai.sock".to_string());
@@ -85,7 +90,11 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
         &config.key_id,
         Utc::now().timestamp_millis(),
     )?;
-    std::fs::write(&config.output, canonical_bundle_bytes(&bundle)?)?;
+    publish_new_file(
+        &config.output,
+        &canonical_bundle_bytes(&bundle)?,
+        ATTEST_OUTPUT_KIND,
+    )?;
     println!("exported {}", config.output.display());
     Ok(())
 }
@@ -448,6 +457,31 @@ mod tests {
                 .unwrap();
             assert!(verify_bundle(&bundle, &trusted).integrity.valid);
         }
+    }
+
+    #[tokio::test]
+    async fn export_refuses_an_existing_output_before_signing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bundle.json");
+        std::fs::write(&path, b"signed").unwrap();
+        let error = export(ExportConfig {
+            operation_id: "op-1".into(),
+            attempt: 0,
+            output: path.clone(),
+            signing_key: dir.path().join("missing-key"),
+            identity: "node:test".into(),
+            key_id: "key-1".into(),
+            artifacts: vec![],
+            policy_attestations: vec![],
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("output already exists"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"signed");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

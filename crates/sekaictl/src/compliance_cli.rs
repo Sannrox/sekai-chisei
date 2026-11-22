@@ -1,5 +1,6 @@
 //! sekaictl admin assurance compliance export/verify/report commands (#297, #1468).
 
+use crate::artifact_output::publish_new_file;
 use crate::cli_args::require_value;
 use crate::compliance_pack::{
     PackReportBundle, build_pack_report, builtin_pack_ids, load_builtin_pack, pack_report_bytes,
@@ -287,7 +288,11 @@ fn report(config: ReportConfig) -> Result<(), BoxErr> {
             Utc::now().timestamp_millis(),
         )?;
     }
-    publish_new_file(&config.output, &pack_report_bytes(&report)?)?;
+    publish_new_file(
+        &config.output,
+        &pack_report_bytes(&report)?,
+        "a compliance artifact",
+    )?;
     let met = report
         .controls
         .iter()
@@ -352,70 +357,6 @@ fn list_packs() -> Result<(), BoxErr> {
             pack.version,
             pack.controls.len()
         );
-    }
-    Ok(())
-}
-
-fn publish_new_file(output: &Path, bytes: &[u8]) -> Result<(), BoxErr> {
-    if output.exists() {
-        return Err(std::io::Error::other(format!(
-            "output already exists: {} (refusing to overwrite a compliance artifact)",
-            output.display()
-        ))
-        .into());
-    }
-    let parent = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let staged = parent.join(format!(
-        ".compliance-artifact-{}-{}.partial",
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    ));
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let write_result = (|| {
-            let mut file = options.open(&staged)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            Ok::<(), BoxErr>(())
-        })();
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&staged);
-            return Err(error);
-        }
-    }
-    if let Err(error) = std::fs::hard_link(&staged, output) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to publish {}: {error} (destination must not already exist)",
-                output.display()
-            ),
-        )
-        .into());
-    }
-    let _ = std::fs::remove_file(&staged);
-    match std::fs::File::open(parent) {
-        Ok(dir) => {
-            if let Err(error) = dir.sync_all() {
-                let _ = std::fs::remove_file(output);
-                return Err(error.into());
-            }
-        }
-        Err(error) => {
-            let _ = std::fs::remove_file(output);
-            return Err(error.into());
-        }
     }
     Ok(())
 }
