@@ -272,7 +272,9 @@ pub fn rollback_change(
         return Err("rollback timestamp must be non-negative".into());
     }
     let mut record = get_change(db, namespace, learning_id)?;
-    deny_if_unusable(&record)?;
+    // Rollback is the fail-safe: lease-loss reconciliation must not trap an
+    // active learning as `active`. Approve, activate, and resolve_pin still
+    // call deny_if_unusable.
     if record.status == STATUS_ROLLED_BACK {
         reaudit(db, actor, ROLLBACK_ACTION, "rolled_back", &record)?;
         return Ok(record);
