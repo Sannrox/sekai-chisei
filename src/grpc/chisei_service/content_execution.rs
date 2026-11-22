@@ -314,6 +314,17 @@ impl ChiseiServiceImpl {
                 return Err(Status::internal(error));
             }
         }
+        {
+            // Ownership and delegator checks passed; a later refusal still
+            // records a terminal receipt, so the plan must not run again.
+            let mut plans = self
+                .planned_content_executions
+                .lock()
+                .expect("planned content executions poisoned");
+            plans
+                .remove(requested_plan_id)
+                .ok_or_else(|| Status::not_found("content execution plan not found"))?;
+        }
         let domain_messages = resolve_content_messages(&plan, resolved_parts)?;
 
         let namespace = input.namespace.trim().to_string();
@@ -447,15 +458,6 @@ impl ChiseiServiceImpl {
                     } else {
                         None
                     };
-                    {
-                        let mut plans = self
-                            .planned_content_executions
-                            .lock()
-                            .expect("planned content executions poisoned");
-                        plans
-                            .remove(requested_plan_id)
-                            .ok_or_else(|| Status::not_found("content execution plan not found"))?;
-                    }
 
                     self.invalidate_ineligible_execution_memory_holdouts(
                         &execution.plan_id,

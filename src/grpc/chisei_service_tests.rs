@@ -13421,6 +13421,195 @@ async fn customer_hosted_routes_serve_content_execution_from_live_state() {
 }
 
 #[tokio::test]
+async fn an_eval_regressed_content_plan_cannot_execute_after_its_failed_receipt() {
+    // #2789: a content execute that records a failed receipt must evict the
+    // plan, so clearing the refusal later cannot reach the provider.
+    use sha2::Digest as _;
+    let observed = HostedEndpointObservations::default();
+    let app = Router::new()
+        .route("/v1/chat/completions", post(hosted_endpoint_chat))
+        .with_state(observed.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    super::native_execution_lifecycle::HOSTED_CREDENTIAL_OVERRIDE
+        .with(|value| *value.borrow_mut() = Some("hosted-secret".into()));
+
+    let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+        SekaiDb::new(":memory:").unwrap(),
+    )));
+    let mut config = config(":memory:");
+    config.routing_endpoint_allowlist =
+        crate::chisei::routing_profiles::endpoint_allowlist_from(&origin);
+    config.routing_credential_refs = vec!["ACME".into()];
+    let mut service = ChiseiServiceImpl::new(
+        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
+        config,
+    );
+    service.sekai_facts =
+        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&service.db));
+    service
+        .put_routing_profile(Request::new(PutRoutingProfileRequest {
+            namespace: "support".into(),
+            name: "acme-llm".into(),
+            endpoint_url: origin.clone(),
+            model_patterns: vec!["acme-*".into()],
+            credential_ref: "ACME".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let hosted_policy = crate::chisei::policy::Policy {
+        allowed_runtimes: vec!["hosted.acme-llm".into()],
+        allowed_models: vec!["hosted.acme-llm/acme-1".into()],
+        default_runtime: "hosted.acme-llm".into(),
+        default_model: "hosted.acme-llm/acme-1".into(),
+        data_class: "unclassified".into(),
+    };
+    service
+        .policy
+        .set_namespace_policy("support", hosted_policy);
+
+    let payload = b"Summarize the incident.";
+    let descriptor = ContentPartDescriptorV1 {
+        part_id: "text-1".into(),
+        kind: 1,
+        media_type: "text/plain".into(),
+        byte_length: payload.len() as u64,
+        sha256_digest: format!("sha256:{:x}", sha2::Sha256::digest(payload)),
+        reference: "fixture:text-1".into(),
+        provenance: Some(ContentProvenanceV1 {
+            source: "fixture".into(),
+            source_id: "eval-regressed-content".into(),
+            source_version: "v1".into(),
+            observed_at_ms: 1,
+        }),
+        disclosure_state: 1,
+        disclosure_reason: String::new(),
+    };
+    let content_request = |request_id: &str| PlanContentExecutionRequest {
+        input: Some(ContentExecutionInputV1 {
+            execution: Some(ExecutionInput {
+                request_id: request_id.into(),
+                namespace: "support".into(),
+                spec: "Summarize the incident.".into(),
+                preferred_model: "hosted.acme-llm/acme-1".into(),
+                max_tokens: 64,
+                ..Default::default()
+            }),
+            content_messages: vec![ContentMessageV1 {
+                role: "user".into(),
+                parts: vec![descriptor.clone()],
+                ..Default::default()
+            }],
+            requested_capabilities: Some(ContentCapabilitiesV1 {
+                contract_version: crate::content::CONTENT_CONTRACT_VERSION.into(),
+                input_kinds: vec![1],
+                output_kinds: vec![1],
+                media_types: vec!["text/plain".into()],
+                reference_modes: vec!["opaque".into()],
+                max_parts: 1,
+                max_part_bytes: 1024,
+                max_aggregate_bytes: 1024,
+                streaming: true,
+            }),
+            disclosure_authority: "chisei.policy/v1".into(),
+        }),
+        gunshi_allocation: None,
+    };
+    let resolved = vec![ResolvedContentPartV1 {
+        descriptor: Some(descriptor.clone()),
+        payload: Some(resolved_content_part_v1::Payload::Text(
+            String::from_utf8(payload.to_vec()).unwrap(),
+        )),
+    }];
+    let execute = |plan: ContentExecutionPlanV1| {
+        service.execute_content_plan_stream(Request::new(ExecuteContentPlanRequest {
+            plan: Some(plan),
+            resolved_parts: resolved.clone(),
+        }))
+    };
+
+    let success_plan = service
+        .plan_content_execution(Request::new(content_request("request:content-ok")))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let mut stream = execute(success_plan.clone()).await.unwrap().into_inner();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let replayed = match execute(success_plan).await {
+        Ok(_) => panic!("spent content plan executed again"),
+        Err(error) => error,
+    };
+    assert_eq!(replayed.code(), tonic::Code::NotFound, "{replayed:?}");
+    assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
+
+    let refused_plan = service
+        .plan_content_execution(Request::new(content_request("request:content-regressed")))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    create_suite(&service, "support");
+    seed_eval_run(
+        &service,
+        eval_run("content-regression-baseline", "suite-1", 95, 100),
+        "support",
+        "content-regression-baseline",
+    );
+    seed_eval_run(
+        &service,
+        eval_run("content-regression-candidate", "suite-1", 50, 200),
+        "support",
+        "content-regression-candidate",
+    );
+    assert!(
+        service
+            .eval
+            .namespace_regression_signal("support")
+            .expect("regression signal")
+            .regressed
+    );
+    let refused = match execute(refused_plan.clone()).await {
+        Ok(_) => panic!("eval-regressed content plan executed"),
+        Err(error) => error,
+    };
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .contains("latest eval iteration regressed for namespace support"),
+        "{refused:?}"
+    );
+    seed_eval_run(
+        &service,
+        eval_run("content-regression-recovered", "suite-1", 95, 300),
+        "support",
+        "content-regression-recovered",
+    );
+    assert!(
+        !service
+            .eval
+            .namespace_regression_signal("support")
+            .expect("recovery signal")
+            .regressed
+    );
+    let retried = match execute(refused_plan).await {
+        Ok(_) => panic!("evicted content plan executed after eval recovered"),
+        Err(error) => error,
+    };
+    assert_eq!(retried.code(), tonic::Code::NotFound, "{retried:?}");
+    assert_eq!(observed.authorizations.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn hosted_routes_never_fall_back_and_read_the_catalog_only_when_authorized_and_needed() {
     // #1184: a hosted-shaped model that does not resolve never falls back to
     // another provider. #1185/#1186/#1187: the hosted catalog is read only
