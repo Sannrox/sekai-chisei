@@ -140,5 +140,11 @@ def invoke_http_json(
         with urllib.request.urlopen(request) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        payload = json.loads(error.read().decode() or "{}")
+        raw = error.read().decode()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            raise RuntimeError(f"{error.status} {error.reason}") from error
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{error.status} {error.reason}") from error
         raise RuntimeError(payload.get("message") or error.reason) from error
