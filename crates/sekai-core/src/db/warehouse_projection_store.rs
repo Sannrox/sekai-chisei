@@ -116,7 +116,8 @@ impl SekaiDb {
                 .execute(
                     "INSERT INTO sekai_warehouse_pages
                         (namespace, projection_id, page_digest, record_json)
-                     VALUES (?1, ?2, ?3, ?4)",
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(namespace, projection_id, page_digest) DO NOTHING",
                     params![
                         page.namespace,
                         page.projection_id,
@@ -131,5 +132,96 @@ impl SekaiDb {
         }
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sekai::warehouse_projection::{
+        WarehouseColumn, WarehouseCursor, WarehousePage, WarehouseProjection, WarehouseRow,
+        WarehouseSecurity,
+    };
+    use std::collections::BTreeMap;
+
+    fn digest(tag: u8) -> String {
+        format!("sha256:{tag:02x}{}", "ab".repeat(31))
+    }
+
+    fn projection() -> WarehouseProjection {
+        WarehouseProjection {
+            contract_version: "sekai.warehouse-projection/v1".into(),
+            projection_id: "wh:pages".into(),
+            namespace: "ops".into(),
+            owner: "integrator".into(),
+            adapter_id: "adapter.warehouse.orders".into(),
+            adapter_version: "1.0.0".into(),
+            columns: vec![WarehouseColumn {
+                name: "id".into(),
+                col_type: "string".into(),
+                classification: "internal".into(),
+            }],
+            security: WarehouseSecurity {
+                contract_version: "sekai.security-metadata/v1".into(),
+                classification_ceiling: "internal".into(),
+                purpose: "analytics".into(),
+                residency_class: "eu".into(),
+                trust_pin_digest: digest(1),
+            },
+            lineage_digest: digest(2),
+            cursor: WarehouseCursor {
+                generation: 0,
+                offset: 0,
+                last_page_digest: String::new(),
+            },
+            status: "live".into(),
+            projection_digest: digest(3),
+            admitted_by: "integrator".into(),
+            admitted_at_ms: 1_000,
+        }
+    }
+
+    fn page() -> WarehousePage {
+        WarehousePage {
+            projection_id: "wh:pages".into(),
+            namespace: "ops".into(),
+            mode: "snapshot".into(),
+            generation: 0,
+            offset_start: 0,
+            offset_end: 1,
+            rows: vec![WarehouseRow {
+                row_id: "1".into(),
+                values: BTreeMap::from([("id".into(), "1".into())]),
+                deleted: false,
+            }],
+            page_digest: digest(9),
+            lineage_digest: digest(4),
+        }
+    }
+
+    #[test]
+    fn a_duplicate_warehouse_page_write_returns_unavailable_and_rolls_back() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let expected = projection();
+        db.put_warehouse_projection(&expected).unwrap();
+        let page = page();
+        let mut next = expected.clone();
+        next.cursor.offset = 1;
+        next.cursor.last_page_digest = page.page_digest.clone();
+        db.commit_warehouse_export(&expected, &next, Some(&page))
+            .unwrap();
+        let mut later = next.clone();
+        later.cursor.offset = 2;
+        later.cursor.last_page_digest = digest(10);
+        let error = db
+            .commit_warehouse_export(&next, &later, Some(&page))
+            .unwrap_err();
+        assert_eq!(error, WAREHOUSE_UNAVAILABLE);
+        assert_eq!(
+            db.get_warehouse_projection(&expected.namespace, &expected.projection_id)
+                .unwrap()
+                .unwrap(),
+            next
+        );
     }
 }
