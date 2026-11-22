@@ -239,6 +239,9 @@ impl SekaiServiceImpl {
             {
                 return Err(Status::failed_precondition("capability unavailable"));
             }
+            if let Some(invocation) = receipt_guard.as_mut() {
+                invocation.mark_policy_decided("allow");
+            }
         }
         if is_managed_team_principal(self.db.runtime(), &principals)? {
             let namespace = filter.namespace.as_deref().ok_or_else(|| {

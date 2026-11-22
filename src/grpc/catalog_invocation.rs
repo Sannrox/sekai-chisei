@@ -21,7 +21,6 @@ pub(super) struct CatalogInvocation<'a> {
     capability_name: String,
     catalog_version: Option<String>,
     policy_decision: Option<String>,
-    budget_decision: Option<String>,
     finalized: bool,
 }
 
@@ -52,7 +51,6 @@ impl<'a> CatalogInvocation<'a> {
             capability_name,
             catalog_version,
             policy_decision: None,
-            budget_decision: None,
             finalized: false,
         })
     }
@@ -85,14 +83,8 @@ impl<'a> CatalogInvocation<'a> {
         &self.operation_id
     }
 
-    #[cfg(test)]
     pub(super) fn mark_policy_decided(&mut self, decision: &str) {
         self.policy_decision = Some(decision.to_string());
-    }
-
-    #[cfg(test)]
-    pub(super) fn mark_budget_decided(&mut self, decision: &str) {
-        self.budget_decision = Some(decision.to_string());
     }
 
     pub(super) fn finalize(&mut self, decision: &str, outcome: &str) -> Result<(), Status> {
@@ -117,19 +109,12 @@ impl Drop for CatalogInvocation<'_> {
         if self.finalized {
             return;
         }
-        let budget_outcome = self
-            .budget_decision
+        let (decision, outcome) = self
+            .policy_decision
             .as_deref()
-            .map(|decision| format!("invocation_failed_after_budget:{decision}"));
-        let (decision, outcome) = if let Some(outcome) = budget_outcome.as_deref() {
-            (self.policy_decision.as_deref().unwrap_or("allow"), outcome)
-        } else {
-            self.policy_decision
-                .as_deref()
-                .map(|decision| (decision, "invocation_failed_after_policy"))
-                .unwrap_or(("refuse", "invocation_failed"))
-        };
-        let _ = record(
+            .map(|decision| (decision, "invocation_failed_after_policy"))
+            .unwrap_or(("refuse", "invocation_failed"));
+        if let Err(error) = record(
             self.db,
             &self.operation_id,
             &self.namespace,
@@ -139,7 +124,13 @@ impl Drop for CatalogInvocation<'_> {
             decision,
             outcome,
             false,
-        );
+        ) {
+            tracing::error!(
+                operation_id = %self.operation_id,
+                error = %error.message(),
+                "catalog invocation drop receipt was not recorded"
+            );
+        }
     }
 }
 
@@ -281,38 +272,6 @@ fn record(
             })
             .collect(),
         )
-    } else if let Some(budget_decision) = outcome.strip_prefix("invocation_failed_after_budget:") {
-        (
-            Some(now),
-            vec![
-                intent,
-                event(
-                    "policy",
-                    Some("intent"),
-                    ReceiptEventKind::PolicyDecided,
-                    attributes("decision", decision),
-                ),
-                event(
-                    "routing",
-                    Some("policy"),
-                    ReceiptEventKind::RouteSelected,
-                    attributes("route", "native"),
-                ),
-                event(
-                    "budget",
-                    Some("routing"),
-                    ReceiptEventKind::BudgetDecided,
-                    attributes("decision", budget_decision),
-                ),
-                event(
-                    "outcome",
-                    Some("budget"),
-                    ReceiptEventKind::OutcomeRecorded,
-                    attributes("outcome", "invocation_failed_after_budget"),
-                ),
-            ],
-            Vec::new(),
-        )
     } else if outcome == "invocation_failed_after_policy" {
         (
             Some(now),
@@ -442,7 +401,6 @@ mod tests {
         )
         .unwrap();
         invocation.mark_policy_decided("allow");
-        invocation.mark_budget_decided("within_limit");
         invocation.finalize("allow", "completed").unwrap();
 
         let receipt = db.get_operation_receipt("operation-1").unwrap().unwrap();
@@ -491,6 +449,132 @@ mod tests {
         assert_eq!(
             receipt.uncovered_surfaces[0].surface,
             ReceiptSurface::Budget
+        );
+        assert_eq!(
+            receipt
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+                .and_then(|event| event.attributes.get("decision").map(String::as_str)),
+            Some("allow")
+        );
+    }
+
+    fn service() -> super::super::SekaiServiceImpl {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        crate::chisei_store::apply_chisei_schema(&db);
+        super::super::SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db))
+    }
+
+    fn catalog_request(
+        capability: &str,
+        namespace: &str,
+        operation_id: &str,
+    ) -> tonic::Request<crate::grpc::pb::sekai::RetrieveContextRequest> {
+        let mut req =
+            tonic::Request::new(crate::grpc::pb::sekai::RetrieveContextRequest::default());
+        req.metadata_mut().insert(
+            "x-sekai-capability",
+            tonic::metadata::MetadataValue::try_from(capability).unwrap(),
+        );
+        req.metadata_mut().insert(
+            "x-sekai-namespace",
+            tonic::metadata::MetadataValue::try_from(namespace).unwrap(),
+        );
+        req.metadata_mut().insert(
+            "x-sekai-operation-id",
+            tonic::metadata::MetadataValue::try_from(operation_id).unwrap(),
+        );
+        req
+    }
+
+    #[test]
+    fn a_granted_semantic_invocation_that_fails_before_finalize_keeps_the_policy_decision() {
+        let svc = service();
+        let req = catalog_request(
+            crate::sekai::semantic::CAPABILITY_RETRIEVE_CONTEXT,
+            "acme",
+            "op-after-policy",
+        );
+        {
+            let started = svc
+                .begin_semantic_catalog_invocation(
+                    &req,
+                    crate::sekai::semantic::CAPABILITY_RETRIEVE_CONTEXT,
+                    "acme",
+                    &["alice".into()],
+                )
+                .unwrap();
+            assert!(started.is_some());
+        }
+
+        let receipt = svc
+            .db
+            .runtime()
+            .get_operation_receipt("op-after-policy")
+            .unwrap()
+            .unwrap();
+        let outcome = receipt.events.last().unwrap();
+        assert_eq!(outcome.kind, ReceiptEventKind::OutcomeRecorded);
+        assert_eq!(
+            outcome.attributes.get("outcome").map(String::as_str),
+            Some("invocation_failed_after_policy")
+        );
+        assert_eq!(
+            receipt
+                .events
+                .iter()
+                .find(|event| event.kind == ReceiptEventKind::PolicyDecided)
+                .and_then(|event| event.attributes.get("decision").map(String::as_str)),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn a_semantic_invocation_refused_before_policy_records_refuse() {
+        let svc = service();
+        let req = catalog_request("sekai.unknown.capability", "acme", "op-refused");
+        let Err(status) = svc.begin_semantic_catalog_invocation(
+            &req,
+            "sekai.unknown.capability",
+            "acme",
+            &["alice".into()],
+        ) else {
+            panic!("expected a refused catalog invocation");
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let receipt = svc
+            .db
+            .runtime()
+            .get_operation_receipt("op-refused")
+            .unwrap()
+            .unwrap();
+        let outcome = receipt.events.last().unwrap();
+        assert_eq!(outcome.kind, ReceiptEventKind::OutcomeRecorded);
+        assert_eq!(
+            outcome.attributes.get("outcome").map(String::as_str),
+            Some("capability_unavailable")
+        );
+        assert!(
+            receipt
+                .events
+                .iter()
+                .all(|event| event.kind != ReceiptEventKind::PolicyDecided)
+        );
+        assert_eq!(
+            receipt
+                .uncovered_surfaces
+                .iter()
+                .map(|surface| surface.surface)
+                .collect::<Vec<_>>(),
+            vec![
+                ReceiptSurface::Policy,
+                ReceiptSurface::Routing,
+                ReceiptSurface::Budget,
+            ]
         );
     }
 
