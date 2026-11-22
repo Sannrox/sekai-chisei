@@ -293,18 +293,7 @@ pub async fn dispatch_native(
         }
         NativeRpc::GetOperationReceipt => {
             let request = invocation
-                .bind(GetOperationReceiptRequest {
-                    operation_id: invocation
-                        .input
-                        .get("operation_id")
-                        .or_else(|| invocation.input.get("operationId"))
-                        .and_then(Value::as_str)
-                        .unwrap_or(&invocation.operation_id)
-                        .to_string(),
-                    request_id: String::new(),
-                    caller_scope: String::new(),
-                    attempt: 0,
-                })
+                .bind(receipt_request(&invocation))
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = chisei
                 .get_operation_receipt(request)
@@ -828,19 +817,7 @@ impl NativeSurface for SdkSurface {
             }
             NativeRpc::GetOperationReceipt => {
                 let request = invocation
-                    .bind(GetOperationReceiptRequest {
-                        operation_id: json_string(&invocation.input, "operation_id", "operationId")
-                            .unwrap_or_else(|| invocation.operation_id.clone()),
-                        request_id: json_string(&invocation.input, "request_id", "requestId")
-                            .unwrap_or_default(),
-                        caller_scope: json_string(&invocation.input, "caller_scope", "callerScope")
-                            .unwrap_or_default(),
-                        attempt: invocation
-                            .input
-                            .get("attempt")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0) as u32,
-                    })
+                    .bind(receipt_request(&invocation))
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
                 let channel = self.channel().await?;
                 let mut client = ChiseiServiceClient::new(channel);
@@ -1121,6 +1098,32 @@ fn link_json(link: &Link) -> Value {
     })
 }
 
+/// Builds the receipt lookup. Exactly one of operation_id or request_id is
+/// sent: a caller-supplied request id must not also carry this call's
+/// operation id, or the receipt RPC refuses the lookup.
+fn receipt_request(invocation: &SdkInvocation) -> GetOperationReceiptRequest {
+    let request_id = json_string(&invocation.input, "request_id", "requestId").unwrap_or_default();
+    let operation_id = json_string(&invocation.input, "operation_id", "operationId")
+        .unwrap_or_else(|| {
+            if request_id.is_empty() {
+                invocation.operation_id.clone()
+            } else {
+                String::new()
+            }
+        });
+    GetOperationReceiptRequest {
+        operation_id,
+        request_id,
+        caller_scope: json_string(&invocation.input, "caller_scope", "callerScope")
+            .unwrap_or_default(),
+        attempt: invocation
+            .input
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+    }
+}
+
 fn submit_request(invocation: &SdkInvocation) -> Result<SubmitActionInstanceRequest, AdapterError> {
     Ok(SubmitActionInstanceRequest {
         namespace: invocation.namespace.clone(),
@@ -1304,6 +1307,49 @@ fn required_string(input: &Value, field: &str) -> Result<String, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn receipt_invocation(operation_id: &str, input: Value) -> SdkInvocation {
+        SdkInvocation {
+            projection_version: String::new(),
+            contract_version: String::new(),
+            catalog_version: String::new(),
+            namespace: "acme".into(),
+            principal: "tester".into(),
+            capability: "GetOperationReceipt".into(),
+            operation_id: operation_id.into(),
+            input_type: String::new(),
+            output_type: String::new(),
+            input,
+        }
+    }
+
+    #[test]
+    fn a_receipt_read_with_only_request_id_does_not_look_up_the_tool_call() {
+        let request = receipt_request(&receipt_invocation(
+            "mcp-call",
+            json!({"request_id": "submit-1"}),
+        ));
+        assert_eq!(request.request_id, "submit-1");
+        assert!(request.operation_id.is_empty());
+
+        let camel = receipt_request(&receipt_invocation(
+            "mcp-call",
+            json!({"requestId": "submit-2"}),
+        ));
+        assert_eq!(camel.request_id, "submit-2");
+        assert!(camel.operation_id.is_empty());
+
+        let by_operation = receipt_request(&receipt_invocation(
+            "mcp-call",
+            json!({"operation_id": "op-9"}),
+        ));
+        assert_eq!(by_operation.operation_id, "op-9");
+        assert!(by_operation.request_id.is_empty());
+
+        let fallback = receipt_request(&receipt_invocation("mcp-call", json!({})));
+        assert_eq!(fallback.operation_id, "mcp-call");
+        assert!(fallback.request_id.is_empty());
+    }
 
     #[test]
     fn required_string_accepts_protobuf_json_names() {
