@@ -67,8 +67,10 @@ fn relation_missing(error: &str, table: &str) -> bool {
     error.contains(&table) && (error.contains("no such table") || error.contains("does not exist"))
 }
 
-pub fn quota_gate(db: std::sync::Arc<RuntimeDb>) -> TenantQuotaGate {
-    TenantQuotaGate::new(ChiseiStore::from_shared_runtime(db))
+pub fn quota_gate(db: std::sync::Arc<RuntimeDb>) -> Result<TenantQuotaGate, String> {
+    Ok(TenantQuotaGate::new(ChiseiStore::try_from_shared_runtime(
+        db,
+    )?))
 }
 
 type BudgetLimitRows = Vec<(String, String, i64, String)>;
@@ -211,7 +213,7 @@ mod tests {
     #[test]
     fn configured_limits_reads_assigned_requests() {
         let db = std::sync::Arc::new(RuntimeDb::memory());
-        let gate = quota_gate(db.clone());
+        let gate = quota_gate(db.clone()).unwrap();
         gate.configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -234,7 +236,7 @@ mod tests {
     #[test]
     fn configured_limits_keeps_request_period_when_concurrency_is_monthly() {
         let db = std::sync::Arc::new(RuntimeDb::memory());
-        let gate = quota_gate(db.clone());
+        let gate = quota_gate(db.clone()).unwrap();
         gate.configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -258,7 +260,7 @@ mod tests {
     #[test]
     fn configured_request_quota_refuses_the_third_run() {
         let db = std::sync::Arc::new(RuntimeDb::memory());
-        let gate = quota_gate(db);
+        let gate = quota_gate(db).unwrap();
         let limits = TenantQuotaLimits {
             version: 1,
             max_requests_per_period: Some(2),
@@ -283,7 +285,7 @@ mod tests {
     #[test]
     fn reclaim_does_not_consume_another_request() {
         let db = std::sync::Arc::new(RuntimeDb::memory());
-        let gate = quota_gate(db);
+        let gate = quota_gate(db).unwrap();
         let limits = TenantQuotaLimits {
             version: 1,
             max_requests_per_period: Some(1),

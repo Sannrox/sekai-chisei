@@ -2672,7 +2672,7 @@ pub(super) async fn run_adhoc_governed_transform(
         )?));
     }
     let quota = service.quota_runtime();
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     // Isolated work is admitted against quota when a worker claims it, as
     // for stored runs.
     let held = if isolated {
@@ -3044,7 +3044,7 @@ pub(super) async fn run_governed_transform(
         tenant_context.clone()
     };
     let quota = service.quota_runtime();
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     let held = if isolated {
         None
     } else {
@@ -3266,7 +3266,7 @@ pub(super) async fn run_transform_chain(
             | Some(crate::sekai::transform_chain::CHAIN_WORK_RUNNING)
     );
     let quota = service.quota_runtime();
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     let held = if admit {
         admit_tenant_transform(
             quota.as_ref(),
@@ -3725,8 +3725,7 @@ pub(super) async fn claim_transform_work(
                     prior_admission,
                 ) {
                     Ok(held) => {
-                        let gate =
-                            crate::composition::transform_run_admission::quota_gate(quota.clone());
+                        let gate = transform_quota_gate(quota.clone())?;
                         let bind_tenant = held
                             .as_ref()
                             .map(|admission| admission.tenant_id.as_str())
@@ -4471,6 +4470,12 @@ fn report_complete_transform_run(
     }
 }
 
+fn transform_quota_gate(
+    runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+) -> Result<crate::chisei::tenant_quota::TenantQuotaGate, Status> {
+    crate::composition::transform_run_admission::quota_gate(runtime).map_err(Status::unavailable)
+}
+
 fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Status {
     use crate::chisei::tenant_quota::TenantQuotaError;
     match error {
@@ -4495,7 +4500,7 @@ fn admit_claimed_isolated_process(
     admit_extension_isolated_process(service, owner, work)?;
     admit_tenant_transform(
         quota,
-        &crate::composition::transform_run_admission::quota_gate(service.quota_runtime()),
+        &transform_quota_gate(service.quota_runtime())?,
         owner,
         &format!("transform-claim:{}", work.run_id),
         reclaim,
@@ -4732,9 +4737,7 @@ fn release_retryable_transform_quota(
             idempotency_key: run_id.to_string(),
             concurrency_holder: String::new(),
         };
-        match crate::composition::transform_run_admission::quota_gate(runtime.clone())
-            .abandon(&admission)
-        {
+        match transform_quota_gate(runtime.clone())?.abandon(&admission) {
             Ok(()) => return Ok(true),
             Err(failed) => {
                 let _ = db.restore_abandoned_quota_hold(
@@ -4799,7 +4802,7 @@ fn complete_reserved_transform_quota(
         concurrency_holder: String::new(),
     };
     crate::composition::transform_run_admission::complete_transform_run(
-        &crate::composition::transform_run_admission::quota_gate(runtime),
+        &transform_quota_gate(runtime)?,
         &admission,
     )
     .map_err(map_quota_error)
@@ -5541,7 +5544,7 @@ pub(crate) async fn run_schedule_tick(
     .await
     .map_err(|_| Status::internal("scratch sweep failed"))?
     .map_err(Status::internal)?;
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     for (run_id, _, _, generation) in runtime
         .list_retryable_quota_holds()
         .map_err(Status::internal)?
@@ -6465,7 +6468,7 @@ pub(super) async fn run_governed_transform_on_branch(
         }
     };
     let quota = service.quota_runtime();
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     let admission_id = format!(
         "transform-branch-run:{}:{}:{}:{}",
         input.namespace,
@@ -6607,7 +6610,7 @@ fn with_transform_quota<R>(
     work: impl FnOnce() -> Result<R, String>,
 ) -> Result<R, Status> {
     let quota = service.quota_runtime();
-    let gate = crate::composition::transform_run_admission::quota_gate(quota.clone());
+    let gate = transform_quota_gate(quota.clone())?;
     let held = admit_tenant_transform(quota.as_ref(), &gate, owner_ctx, &admission_id, false)?;
     match work() {
         Ok(result) => {

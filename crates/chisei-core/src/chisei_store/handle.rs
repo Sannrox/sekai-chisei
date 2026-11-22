@@ -54,21 +54,32 @@ pub fn paired_memory() -> (SekaiStore, ChiseiStore) {
 }
 
 impl ChiseiStore {
-    pub fn from_shared_runtime(db: Arc<RuntimeDb>) -> Self {
-        apply_chisei_schema(&db);
-        Self {
+    pub fn try_from_shared_runtime(db: Arc<RuntimeDb>) -> Result<Self, String> {
+        try_apply_chisei_schema(&db)?;
+        Ok(Self {
             inner: db.clone(),
             decisions: db,
-        }
+        })
+    }
+
+    pub fn from_shared_runtime(db: Arc<RuntimeDb>) -> Self {
+        Self::try_from_shared_runtime(db).expect("apply Chisei schema")
     }
 
     /// Combined Split: Chisei families on `chisei`, decision-ledger rows on `sekai`.
-    pub fn from_split_runtimes(chisei: Arc<RuntimeDb>, sekai: Arc<RuntimeDb>) -> Self {
-        apply_chisei_schema(&chisei);
-        Self {
+    pub fn try_from_split_runtimes(
+        chisei: Arc<RuntimeDb>,
+        sekai: Arc<RuntimeDb>,
+    ) -> Result<Self, String> {
+        try_apply_chisei_schema(&chisei)?;
+        Ok(Self {
             inner: chisei,
             decisions: sekai,
-        }
+        })
+    }
+
+    pub fn from_split_runtimes(chisei: Arc<RuntimeDb>, sekai: Arc<RuntimeDb>) -> Self {
+        Self::try_from_split_runtimes(chisei, sekai).expect("apply Chisei schema")
     }
 
     pub fn memory() -> Self {
@@ -191,6 +202,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn schema_apply_failure_returns_instead_of_panicking() {
+        let sqlite = sekai_core::db::sekai::SekaiDb::new(":memory:").unwrap();
+        sqlite.conn().pragma_update(None, "query_only", 1).unwrap();
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(sqlite)));
+        let err = ChiseiStore::try_from_shared_runtime(db).expect_err("schema apply");
+        assert!(
+            err.to_ascii_lowercase().contains("readonly")
+                || err.to_ascii_lowercase().contains("read-only")
+                || err.to_ascii_lowercase().contains("read only"),
+            "{err}"
+        );
     }
 
     #[test]

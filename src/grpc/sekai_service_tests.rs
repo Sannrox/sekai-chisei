@@ -23917,7 +23917,8 @@ async fn run_governed_transform_applies_tenant_quota_and_records_usage() {
             10,
         )
         .unwrap();
-    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
     let limits = TenantQuotaLimits {
         version: 1,
         max_requests_per_period: Some(1),
@@ -24041,7 +24042,8 @@ async fn split_plane_run_records_usage_on_the_chisei_dest() {
             10,
         )
         .unwrap();
-    let gate = crate::composition::transform_run_admission::quota_gate(chisei.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(chisei.runtime_arc()).unwrap();
     let limits = TenantQuotaLimits {
         version: 1,
         max_requests_per_period: Some(1),
@@ -24129,6 +24131,7 @@ async fn in_process_run_without_tenant_meters_the_put_owner() {
         .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -24227,7 +24230,8 @@ async fn in_process_run_with_tenant_meters_the_caller_not_the_put_owner() {
         max_storage_bytes: None,
         period: PeriodType::Daily,
     };
-    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
     gate.configure("tenant-a", &limits).unwrap();
     gate.configure("tenant-b", &limits).unwrap();
     svc.put_governed_transform(with_tenant_admin(
@@ -24616,7 +24620,8 @@ async fn isolated_claim_admits_quota_and_write_records_usage() {
             10,
         )
         .unwrap();
-    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
     gate.configure(
         "tenant-a",
         &TenantQuotaLimits {
@@ -24787,6 +24792,7 @@ async fn isolated_write_records_usage_for_the_claiming_tenant() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -24926,6 +24932,7 @@ async fn isolated_claim_without_tenant_context_meters_the_owner() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -25172,6 +25179,7 @@ async fn scheduled_isolated_tick_meters_the_put_owner() {
         .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -25291,6 +25299,7 @@ async fn scheduled_in_process_tick_admits_owner_quota_before_run() {
         .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -25483,6 +25492,7 @@ async fn triggered_in_process_defers_until_quota_tick() {
         .append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -25741,6 +25751,7 @@ async fn isolated_quota_exhaustion_leaves_work_claimable() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -25855,7 +25866,8 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
     runtime
         .put_governed_transform_owned(&isolated("t-iso-b", "out-b"), 11, "tenant-b")
         .unwrap();
-    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
     gate.configure(
         "tenant-a",
         &TenantQuotaLimits {
@@ -26292,7 +26304,8 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
             "tenant-a",
         )
         .unwrap();
-    let gate = crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc());
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
     gate.configure(
         "tenant-a",
         &TenantQuotaLimits {
@@ -26434,6 +26447,7 @@ async fn triggered_isolated_claim_uses_the_put_owner() {
         .run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -26536,6 +26550,7 @@ async fn isolated_expired_claim_releases_concurrency_for_reclaim() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -26647,6 +26662,7 @@ async fn isolated_terminal_lease_failure_releases_concurrency() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {
@@ -26783,6 +26799,7 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
         )
         .unwrap();
     crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
         .configure(
             "tenant-a",
             &TenantQuotaLimits {

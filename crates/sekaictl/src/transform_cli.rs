@@ -86,7 +86,7 @@ pub fn run_named_with_quota(
         .ok_or_else(|| "governed transform not found".to_string())?;
     let isolated = transform.is_isolated_process();
     let runtime = Arc::new(quota.clone());
-    let gate = chisei_core::transform_run_admission::quota_gate(runtime);
+    let gate = chisei_core::transform_run_admission::quota_gate(runtime)?;
     let ctx = (!owner.is_empty()).then(|| chisei_core::tenant_context(&owner, "local"));
     let held = if isolated || owner.is_empty() {
         None
@@ -566,6 +566,7 @@ mod tests {
         )
         .unwrap();
         chisei_core::transform_run_admission::quota_gate(Arc::new(db.clone()))
+            .unwrap()
             .configure(
                 "tenant-a",
                 &TenantQuotaLimits {
@@ -634,6 +635,7 @@ mod tests {
         )
         .unwrap();
         chisei_core::transform_run_admission::quota_gate(chisei.runtime_arc())
+            .unwrap()
             .configure(
                 "tenant-a",
                 &TenantQuotaLimits {
