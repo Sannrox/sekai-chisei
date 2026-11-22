@@ -181,16 +181,15 @@ fn a_second_combined_process_on_the_same_log_fails_closed() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let mut second = server_command(
-        env!("CARGO_BIN_EXE_sekai-chisei"),
-        cwd.path(),
-        free_port(),
-        &[],
+    let stderr = crate::refused_boot_output(
+        server_command(
+            env!("CARGO_BIN_EXE_sekai-chisei"),
+            cwd.path(),
+            free_port(),
+            &[],
+        ),
+        "second combined writer",
     );
-    second.stderr(Stdio::piped());
-    let output = second.output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "second writer booted: {stderr}");
     // Only the object log's lock contention counts: the boot message names
     // the lock error and that a local log cannot be shared.
     assert!(
@@ -210,11 +209,10 @@ fn a_second_combined_process_on_the_same_log_fails_closed() {
 
 /// Run `bin` with `extras` and require it to refuse boot with the guidance.
 fn refused(bin: &str, cwd: &Path, extras: &[(&str, &str)]) -> String {
-    let mut command = server_command(bin, cwd, free_port(), extras);
-    command.stderr(Stdio::piped());
-    let output = command.output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(!output.status.success(), "{bin} booted with {extras:?}");
+    let stderr = crate::refused_boot_output(
+        server_command(bin, cwd, free_port(), extras),
+        &format!("{bin} with {extras:?}"),
+    );
     assert!(stderr.contains("no longer supported"), "{bin}: {stderr}");
     for replacement in [
         "SEKAI_DATA_DIR",
@@ -286,16 +284,15 @@ fn retired_single_store_variables_refuse_boot_with_guidance() {
 fn an_invalid_model_price_table_refuses_boot() {
     let cwd = tempdir().unwrap();
     for spec in ["native/native-default=1", "gpt-5.5=1:2,gpt-5.5=3:4"] {
-        let mut command = server_command(
-            env!("CARGO_BIN_EXE_sekai-chisei"),
-            cwd.path(),
-            free_port(),
-            &[("CHISEI_GATEWAY_PRICING", spec)],
+        let stderr = crate::refused_boot_output(
+            server_command(
+                env!("CARGO_BIN_EXE_sekai-chisei"),
+                cwd.path(),
+                free_port(),
+                &[("CHISEI_GATEWAY_PRICING", spec)],
+            ),
+            &format!("pricing {spec:?}"),
         );
-        command.stderr(Stdio::piped());
-        let output = command.output().unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "booted with pricing {spec:?}");
         assert!(
             stderr.contains("invalid CHISEI_GATEWAY_PRICING"),
             "{stderr}"

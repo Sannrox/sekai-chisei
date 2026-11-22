@@ -54,6 +54,40 @@ fn isolate_object_log(command: &mut std::process::Command, dir: &std::path::Path
         .env_remove("SEKAI_OBJECT_LOG_HOST");
 }
 
+/// Run a server `command` that must refuse to boot and return its combined
+/// stdout and stderr. A child still running at the deadline is killed and the
+/// test fails, so a regression that lets the server start fails instead of
+/// hanging on a process that never exits.
+fn refused_boot_output(mut command: std::process::Command, label: &str) -> String {
+    use std::time::{Duration, Instant};
+
+    let log = tempfile::NamedTempFile::new().expect("refusal log");
+    let file = log.as_file();
+    command
+        .stdout(file.try_clone().expect("clone refusal log"))
+        .stderr(file.try_clone().expect("clone refusal log"));
+    let mut child = command.spawn().expect("spawn refused server");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll refused server") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let output = std::fs::read_to_string(log.path()).unwrap_or_default();
+            panic!("{label} started instead of refusing boot\n{output}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = std::fs::read_to_string(log.path()).expect("read refusal log");
+    assert!(
+        !status.success(),
+        "{label} exited {status} instead of refusing boot\n{output}"
+    );
+    output
+}
+
 mod action_binding_backend_conformance;
 mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
