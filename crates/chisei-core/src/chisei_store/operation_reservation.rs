@@ -58,6 +58,11 @@ pub trait OperationReservationSekaiDbExt {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String>;
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
+    ) -> Result<Vec<OperationReservation>, String>;
 }
 
 impl OperationReservationSekaiDbExt for SekaiDb {
@@ -212,26 +217,68 @@ impl OperationReservationSekaiDbExt for SekaiDb {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String> {
+        self.list_pending_operation_reservations_after(limit, None)
+    }
+
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
+    ) -> Result<Vec<OperationReservation>, String> {
         let conn = self.conn();
-        let mut statement = conn
-            .prepare(
-                "SELECT namespace, operation_id, request_digest, status, actor,
-                        budget_subject, incurred_usage, sekai_instance_id, sekai_status,
-                        created_at_ms, updated_at_ms, expires_at_ms, charge_key
-                 FROM chisei_operation_reservations
-                 WHERE status=?1
-                 ORDER BY created_at_ms ASC
-                 LIMIT ?2",
-            )
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map(
-                params![RESERVATION_PENDING, limit.min(1_000) as i64],
-                sqlite_row_to_reservation,
-            )
-            .map_err(|error| error.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| error.to_string())
+        let limit = limit.min(1_000) as i64;
+        let rows = match after {
+            None => {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT namespace, operation_id, request_digest, status, actor,
+                                budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                                created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                         FROM chisei_operation_reservations
+                         WHERE status=?1
+                         ORDER BY created_at_ms ASC, namespace ASC, operation_id ASC
+                         LIMIT ?2",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let mapped = statement
+                    .query_map(
+                        params![RESERVATION_PENDING, limit],
+                        sqlite_row_to_reservation,
+                    )
+                    .map_err(|error| error.to_string())?;
+                mapped.collect::<Result<Vec<_>, _>>()
+            }
+            Some(after) => {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT namespace, operation_id, request_digest, status, actor,
+                                budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                                created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                         FROM chisei_operation_reservations
+                         WHERE status=?1
+                           AND (created_at_ms > ?2
+                                OR (created_at_ms = ?2 AND namespace > ?3)
+                                OR (created_at_ms = ?2 AND namespace = ?3 AND operation_id > ?4))
+                         ORDER BY created_at_ms ASC, namespace ASC, operation_id ASC
+                         LIMIT ?5",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let mapped = statement
+                    .query_map(
+                        params![
+                            RESERVATION_PENDING,
+                            after.created_at_ms,
+                            after.namespace,
+                            after.operation_id,
+                            limit
+                        ],
+                        sqlite_row_to_reservation,
+                    )
+                    .map_err(|error| error.to_string())?;
+                mapped.collect::<Result<Vec<_>, _>>()
+            }
+        };
+        rows.map_err(|error| error.to_string())
     }
 }
 
@@ -273,6 +320,11 @@ pub trait OperationReservationPostgresDbExt {
     fn list_pending_operation_reservations(
         &self,
         limit: usize,
+    ) -> Result<Vec<OperationReservation>, String>;
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
     ) -> Result<Vec<OperationReservation>, String>;
 }
 
@@ -428,20 +480,52 @@ impl OperationReservationPostgresDbExt for PostgresDb {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String> {
+        self.list_pending_operation_reservations_after(limit, None)
+    }
+
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
+    ) -> Result<Vec<OperationReservation>, String> {
         let limit = i64::try_from(limit.min(1_000)).unwrap_or(1_000);
-        let rows = self
-            .connection()?
-            .query(
-                "SELECT namespace, operation_id, request_digest, status, actor,
-                        budget_subject, incurred_usage, sekai_instance_id, sekai_status,
-                        created_at_ms, updated_at_ms, expires_at_ms, charge_key
-                 FROM chisei_operation_reservations
-                 WHERE status=$1
-                 ORDER BY created_at_ms ASC
-                 LIMIT $2",
-                &[&RESERVATION_PENDING, &limit],
-            )
-            .map_err(|error| error.to_string())?;
+        let rows = match after {
+            None => self
+                .connection()?
+                .query(
+                    "SELECT namespace, operation_id, request_digest, status, actor,
+                            budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                            created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                     FROM chisei_operation_reservations
+                     WHERE status=$1
+                     ORDER BY created_at_ms ASC, namespace ASC, operation_id ASC
+                     LIMIT $2",
+                    &[&RESERVATION_PENDING, &limit],
+                )
+                .map_err(|error| error.to_string())?,
+            Some(after) => self
+                .connection()?
+                .query(
+                    "SELECT namespace, operation_id, request_digest, status, actor,
+                            budget_subject, incurred_usage, sekai_instance_id, sekai_status,
+                            created_at_ms, updated_at_ms, expires_at_ms, charge_key
+                     FROM chisei_operation_reservations
+                     WHERE status=$1
+                       AND (created_at_ms > $2
+                            OR (created_at_ms = $2 AND namespace > $3)
+                            OR (created_at_ms = $2 AND namespace = $3 AND operation_id > $4))
+                     ORDER BY created_at_ms ASC, namespace ASC, operation_id ASC
+                     LIMIT $5",
+                    &[
+                        &RESERVATION_PENDING,
+                        &after.created_at_ms,
+                        &after.namespace,
+                        &after.operation_id,
+                        &limit,
+                    ],
+                )
+                .map_err(|error| error.to_string())?,
+        };
         rows.into_iter().map(postgres_row_to_reservation).collect()
     }
 }

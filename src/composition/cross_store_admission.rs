@@ -14,7 +14,7 @@ use crate::chisei::receipt::{
 use crate::chisei::sekai_commit::{SekaiCommitLookup, SekaiCommitRef};
 use crate::chisei::system_one_action::SystemOneProposal;
 use crate::chisei_store::{
-    ChiseiReceiptStore, ChiseiStore, OperationReservation, RESERVATION_FINALIZED,
+    ChiseiReceiptStore, ChiseiRuntimeDb, ChiseiStore, OperationReservation, RESERVATION_FINALIZED,
     RESERVATION_PENDING, RESERVATION_RELEASED,
 };
 use crate::db::store::SekaiStore;
@@ -425,14 +425,41 @@ impl CrossStoreAdmission {
         &self,
         now_ms: i64,
     ) -> Result<Vec<OperationReservation>, ActionInstanceAdmissionError> {
-        let pending = self
-            .chisei
-            .list_pending_operation_reservations(256)
-            .map_err(ActionInstanceAdmissionError::Internal)?;
-        pending
-            .iter()
-            .map(|reservation| self.reconcile_one(reservation, now_ms))
-            .collect()
+        const PAGE: usize = 256;
+        let mut settled = Vec::new();
+        let mut failures = Vec::new();
+        let mut after: Option<OperationReservation> = None;
+        loop {
+            let page = self
+                .chisei
+                .runtime()
+                .list_pending_operation_reservations_after(PAGE, after.as_ref())
+                .map_err(ActionInstanceAdmissionError::Internal)?;
+            if page.is_empty() {
+                break;
+            }
+            for reservation in &page {
+                match self.reconcile_one(reservation, now_ms) {
+                    Ok(row) => settled.push(row),
+                    Err(error) => failures.push(error),
+                }
+            }
+            after = page.last().cloned();
+            if page.len() < PAGE {
+                break;
+            }
+        }
+        if failures.is_empty() {
+            Ok(settled)
+        } else {
+            Err(ActionInstanceAdmissionError::Internal(
+                failures
+                    .into_iter()
+                    .map(admission_error_text)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ))
+        }
     }
 
     pub(crate) fn admit(
@@ -604,6 +631,16 @@ impl CrossStoreAdmission {
         self.chisei
             .put_operation_receipt(&receipt)
             .map_err(ActionInstanceAdmissionError::Internal)
+    }
+}
+
+fn admission_error_text(error: ActionInstanceAdmissionError) -> String {
+    match error {
+        ActionInstanceAdmissionError::InvalidArgument(message)
+        | ActionInstanceAdmissionError::FailedPrecondition(message)
+        | ActionInstanceAdmissionError::AlreadyExists(message)
+        | ActionInstanceAdmissionError::PermissionDenied(message)
+        | ActionInstanceAdmissionError::Internal(message) => message,
     }
 }
 
@@ -1359,6 +1396,113 @@ mod tests {
         assert_eq!(
             budget.get_usage("action:governed").tokens_used,
             used_after_reserve
+        );
+    }
+
+    fn pending_row(
+        operation_id: &str,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> OperationReservation {
+        OperationReservation {
+            namespace: "acme".into(),
+            operation_id: operation_id.into(),
+            request_digest: "digest".into(),
+            status: RESERVATION_PENDING.into(),
+            actor: "alice".into(),
+            budget_subject: String::new(),
+            incurred_usage: 0,
+            sekai_instance_id: String::new(),
+            sekai_status: String::new(),
+            created_at_ms,
+            updated_at_ms: created_at_ms,
+            expires_at_ms,
+            charge_key: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_failing_reservation_does_not_stop_later_expired_ones() {
+        let (sekai, chisei) = dest_pair();
+        seed_type(&sekai);
+        let budget = Arc::new(BudgetTracker::new(chisei.clone()));
+        budget
+            .set_limit("action:governed", 8, PeriodType::Daily)
+            .unwrap();
+        let clerk =
+            CrossStoreAdmission::new(chisei, sekai, Some(budget)).with_reservation_ttl_ms(5);
+        let failing = clerk.reserve(&request("op-fail"), "alice", at(10)).unwrap();
+        clerk
+            .chisei
+            .put_operation_reservation(&pending_row(
+                "op-later",
+                failing.created_at_ms + 1,
+                failing.expires_at_ms,
+            ))
+            .unwrap();
+        clerk
+            .chisei
+            .runtime()
+            .conn()
+            .execute("DROP TABLE chisei_budget_usage", [])
+            .unwrap();
+        let error = clerk.reconcile_pending(at(20)).unwrap_err();
+        assert!(
+            matches!(error, ActionInstanceAdmissionError::Internal(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-fail")
+                .unwrap()
+                .unwrap()
+                .status,
+            RESERVATION_PENDING
+        );
+        assert_eq!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-later")
+                .unwrap()
+                .unwrap()
+                .status,
+            RESERVATION_RELEASED
+        );
+    }
+
+    #[test]
+    fn an_expired_reservation_past_the_first_page_is_released() {
+        let (sekai, chisei) = dest_pair();
+        seed_type(&sekai);
+        let clerk = CrossStoreAdmission::new(chisei, sekai, None).with_reservation_ttl_ms(5);
+        for index in 0..257 {
+            clerk
+                .chisei
+                .put_operation_reservation(&pending_row(
+                    &format!("op-page-{index:03}"),
+                    1_000 + index,
+                    5,
+                ))
+                .unwrap();
+        }
+        clerk.reconcile_pending(20).unwrap();
+        assert_eq!(
+            clerk
+                .chisei
+                .get_operation_reservation("acme", "op-page-256")
+                .unwrap()
+                .unwrap()
+                .status,
+            RESERVATION_RELEASED
+        );
+        assert!(
+            clerk
+                .chisei
+                .runtime()
+                .list_pending_operation_reservations(1_000)
+                .unwrap()
+                .is_empty()
         );
     }
 
