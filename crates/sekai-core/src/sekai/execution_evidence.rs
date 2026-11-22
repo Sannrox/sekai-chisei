@@ -234,6 +234,21 @@ impl SekaiDb {
         if submission.evidence_type != EXECUTION_EVIDENCE_TYPE {
             return Ok(false);
         }
+        // A recorded submission keeps its stored status, so an idempotent
+        // retry neither revalidates nor needs the evidence to still be usable.
+        let recorded: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT projection_status FROM sekai_external_action_execution_evidence
+                 WHERE submission_id=?1",
+                [submission_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(status) = recorded {
+            return Ok(status == "projected");
+        }
         if !submission.lifecycle_state.is_usable() {
             return Err("execution evidence must be available before lifecycle projection".into());
         }
