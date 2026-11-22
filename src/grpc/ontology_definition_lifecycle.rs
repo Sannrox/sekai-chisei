@@ -148,13 +148,7 @@ impl SekaiServiceImpl {
         self.db
             .runtime()
             .upsert_ontology_relation_with_audit(&parsed, actor(principals))
-            .map_err(|error| {
-                if error.starts_with(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED) {
-                    Status::failed_precondition(error)
-                } else {
-                    Status::internal(error)
-                }
-            })?;
+            .map_err(relation_upsert_status)?;
         Ok(parsed)
     }
 
@@ -256,6 +250,50 @@ fn persistence_status(error: String) -> Status {
     persistence_status_or(error, Status::internal)
 }
 
+/// Cardinality stays a caller constraint. Lock contention is retryable (#2856).
+fn relation_upsert_status(error: String) -> Status {
+    if error.starts_with(crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED) {
+        Status::failed_precondition(error)
+    } else {
+        persistence_status(error)
+    }
+}
+
 fn actor(principals: &[String]) -> &str {
     principals.first().map(String::as_str).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_upsert_maps_store_errors() {
+        let locked = relation_upsert_status("database is locked".into());
+        assert_eq!(locked.code(), tonic::Code::Unavailable, "{locked}");
+        assert!(
+            locked
+                .message()
+                .to_ascii_lowercase()
+                .contains("database is locked"),
+            "{locked}"
+        );
+
+        let busy = relation_upsert_status("database is busy".into());
+        assert_eq!(busy.code(), tonic::Code::Unavailable, "{busy}");
+
+        let cardinality = relation_upsert_status(format!(
+            "{}: 2 existing source(s) exceed the declared maximum of 1",
+            crate::sekai::ontology::RELATION_CARDINALITY_EXCEEDED
+        ));
+        assert_eq!(
+            cardinality.code(),
+            tonic::Code::FailedPrecondition,
+            "{cardinality}"
+        );
+
+        let other = relation_upsert_status("disk i/o error".into());
+        assert_eq!(other.code(), tonic::Code::Internal, "{other}");
+        assert_eq!(other.message(), "disk i/o error");
+    }
 }
