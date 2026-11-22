@@ -67,8 +67,18 @@ fn adapter_lifecycle(adapter_id: &str) {
     );
     let stopped = stop_envelope(&db, "operator", "ops", &envelope.envelope_id, 2_000).unwrap();
     assert_eq!(stopped.status, STATUS_STOPPED);
+    // Stop and rollback keep the envelope digest, so only the status check
+    // can refuse re-admitting the same signed envelope.
+    assert_eq!(
+        admit_envelope(&db, "operator", &envelope, 2_100).unwrap_err(),
+        AUTONOMY_UNAVAILABLE
+    );
     let rolled = rollback_envelope(&db, "operator", "ops", &envelope.envelope_id, 3_000).unwrap();
     assert_eq!(rolled.status, STATUS_ROLLED_BACK);
+    assert_eq!(
+        admit_envelope(&db, "operator", &envelope, 3_100).unwrap_err(),
+        AUTONOMY_UNAVAILABLE
+    );
 }
 
 #[test]
@@ -95,6 +105,10 @@ fn lease_loss_and_receipt_invalidation_fail_closed() {
             .unwrap()
             .status,
         STATUS_LEASE_LOST
+    );
+    assert_eq!(
+        admit_envelope(&db, "operator", &envelope, 2_100).unwrap_err(),
+        AUTONOMY_UNAVAILABLE
     );
     let mut receipt = envelope.clone();
     receipt.envelope_id = "auto:receipt".into();
