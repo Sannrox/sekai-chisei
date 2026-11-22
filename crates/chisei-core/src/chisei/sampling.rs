@@ -18,8 +18,7 @@
 use super::budget::PressureLevel;
 use super::pipeline::{PipelineRequest, Step, StepDecision, complexity_class};
 use crate::chisei_store::ChiseiStore;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SamplingDecision {
@@ -100,11 +99,16 @@ impl Step for SamplingStep {
 }
 
 /// Maps a request id to a stable pseudo-random value in `[0, 1)`.
+///
+/// SHA-256 of the id bytes, first eight bytes as a big-endian `u64`, then
+/// the top 53 bits. The standard library hasher is not stable across
+/// compiler releases, so a replay would not match the recorded decision.
 fn deterministic_draw(request_id: &str) -> f64 {
-    let mut hasher = DefaultHasher::new();
-    request_id.hash(&mut hasher);
-    // Top 53 bits give an evenly distributed f64 in [0, 1).
-    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+    let digest = Sha256::digest(request_id.as_bytes());
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&digest[..8]);
+    let bits = u64::from_be_bytes(word);
+    (bits >> 11) as f64 / (1u64 << 53) as f64
 }
 
 /// Decodes the `SamplingStep` decision out of the collected pipeline steps.
@@ -170,8 +174,32 @@ mod tests {
     }
 
     #[test]
-    fn draw_is_deterministic_for_a_fixed_request_id() {
-        assert_eq!(deterministic_draw("req-1"), deterministic_draw("req-1"));
+    fn draw_is_sha256_pinned_in_the_unit_interval() {
+        // First eight bytes of SHA-256, big-endian, top 53 bits over 2^53.
+        let pins = [
+            ("req-1", 0.579_448_579_362_102_3),
+            ("req-2", 0.650_756_402_314_324_5),
+            ("alpha", 0.557_921_807_609_416_3),
+        ];
+        for (id, expected) in pins {
+            let draw = deterministic_draw(id);
+            assert_eq!(draw, expected, "{id}");
+            assert!((0.0..1.0).contains(&draw), "{id} {draw}");
+        }
+    }
+
+    #[test]
+    fn base_rate_samples_a_close_share_of_ids() {
+        let step = SamplingStep::new(0.25, 0.7);
+        let n = 2_000;
+        let sampled = (0..n)
+            .filter(|i| step.decide(&req(&format!("id-{i}"))).sampled)
+            .count();
+        let share = sampled as f64 / n as f64;
+        assert!(
+            (0.20..=0.30).contains(&share),
+            "sampled share {share} of {n} ids"
+        );
     }
 
     #[test]
