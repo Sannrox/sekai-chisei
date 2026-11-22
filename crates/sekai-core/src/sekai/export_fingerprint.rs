@@ -225,25 +225,6 @@ pub fn trace_export(
         return Err(format!("sample must be 1 to {MAX_SAMPLE_BYTES} bytes"));
     }
     let records = db.list_export_fingerprints(namespace)?;
-    if !admin {
-        let visible = records.iter().any(|record| {
-            export_receipt(db, &record.operation_id)
-                .ok()
-                .flatten()
-                .is_some_and(|receipt| receipt.initiating_actor == actor)
-        });
-        if !visible {
-            audit("denied", &[])?;
-            return Err(crate::sekai::data_export::EXPORT_DENIED.into());
-        }
-    }
-    let parsed = match parse_sample(format, sample) {
-        Ok(rows) => rows,
-        Err(error) => {
-            audit("invalid", &[])?;
-            return Err(error);
-        }
-    };
     let mut considered = Vec::new();
     for record in &records {
         if !admin {
@@ -256,6 +237,17 @@ pub fn trace_export(
         }
         considered.push(record);
     }
+    if !admin && considered.is_empty() {
+        audit("denied", &[])?;
+        return Err(crate::sekai::data_export::EXPORT_DENIED.into());
+    }
+    let parsed = match parse_sample(format, sample) {
+        Ok(rows) => rows,
+        Err(error) => {
+            audit("invalid", &[])?;
+            return Err(error);
+        }
+    };
     let candidates = considered.len() as u64;
     let mut matches = Vec::new();
     for record in considered {
@@ -1177,6 +1169,58 @@ mod tests {
             invalid_decisions
                 .iter()
                 .any(|decision| decision.outcome == "invalid")
+        );
+    }
+
+    #[test]
+    fn trace_export_returns_receipt_lookup_errors() {
+        use crate::sekai::audit::DecisionFilter;
+
+        let db = crate::db::runtime_db::RuntimeDb::memory();
+        let ns = format!(
+            "fp-lookup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let operation_id = format!("export-{}", uuid::Uuid::new_v4().simple());
+        db.insert_closed_export_receipt(&operation_id, &ns, "not-json")
+            .unwrap();
+        record_export_fingerprint(
+            &db,
+            &ExportFingerprintRecord {
+                operation_id,
+                namespace: ns.clone(),
+                columns: vec!["title".into()],
+                group_size: FINGERPRINT_GROUP_SIZE as u32,
+                id_column: true,
+            },
+        )
+        .unwrap();
+        let error = trace_export(
+            &db,
+            &ns,
+            ExportFormat::Csv,
+            b"id,title\n1,alpha\n",
+            "eve",
+            1,
+            false,
+        )
+        .unwrap_err();
+        assert_ne!(error, crate::sekai::data_export::EXPORT_DENIED);
+        let decisions = db
+            .list_decisions(&DecisionFilter {
+                actor: Some("eve".into()),
+                action: Some("trace_export".into()),
+                target_id: Some(ns),
+                after: 0,
+                limit: 8,
+                offset: 0,
+            })
+            .unwrap();
+        assert!(
+            decisions
+                .iter()
+                .all(|decision| decision.outcome != "denied")
         );
     }
 
