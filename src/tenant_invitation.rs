@@ -437,11 +437,17 @@ impl MemoryInvitationHooks {
             InvitationStatus::Accepted => {
                 if inv.accepted_subject.as_deref() == Some(subject.as_str()) {
                     // Retry-safe: same subject re-accept is success.
+                    let tenant_id = inv.tenant_id.clone();
+                    let invitation_id = inv.invitation_id.clone();
+                    drop(map);
+                    let role = self.membership_role(&tenant_id, subject).ok_or_else(|| {
+                        InvitationError::Invalid("accepted invitation has no membership".into())
+                    })?;
                     return Ok(AcceptedMembership {
-                        tenant_id: inv.tenant_id.clone(),
+                        tenant_id,
                         subject: subject.clone(),
-                        role: inv.proposed_role,
-                        invitation_id: inv.invitation_id.clone(),
+                        role,
+                        invitation_id,
                     });
                 }
                 self.record(
@@ -458,12 +464,12 @@ impl MemoryInvitationHooks {
         }
 
         let tenant_id = inv.tenant_id.clone();
-        let role = inv.proposed_role;
+        let proposed_role = inv.proposed_role;
         drop(map);
 
         // Membership write outside invitation lock to avoid deadlocks; re-check.
-        if self.has_membership(&tenant_id, subject) {
-            // Already a member: consume invitation without double membership.
+        if let Some(role) = self.membership_role(&tenant_id, subject) {
+            // Already a member: consume invitation without changing the stored role.
             let mut map = self.invitations.write().unwrap();
             if let Some(inv) = map.get_mut(&invitation_id) {
                 inv.status = InvitationStatus::Accepted;
@@ -485,7 +491,7 @@ impl MemoryInvitationHooks {
             });
         }
 
-        self.add_membership(&tenant_id, subject, role)?;
+        self.add_membership(&tenant_id, subject, proposed_role)?;
         {
             let mut map = self.invitations.write().unwrap();
             if let Some(inv) = map.get_mut(&invitation_id) {
@@ -499,14 +505,22 @@ impl MemoryInvitationHooks {
             &tenant_id,
             subject,
             "ok",
-            format!("role={}", role.as_str()),
+            format!("role={}", proposed_role.as_str()),
         );
         Ok(AcceptedMembership {
             tenant_id,
             subject: subject.clone(),
-            role,
+            role: proposed_role,
             invitation_id,
         })
+    }
+
+    fn membership_role(&self, tenant_id: &str, subject: &str) -> Option<InvitationRole> {
+        self.memberships
+            .read()
+            .unwrap()
+            .get(tenant_id)
+            .and_then(|members| members.get(subject).copied())
     }
 
     /// Protect last-owner invariant when demoting/removing an owner.
@@ -823,6 +837,59 @@ mod tests {
             .map(|m| m.len())
             .unwrap_or(0);
         assert_eq!(count, 2); // alice owner + bob member
+    }
+
+    #[test]
+    fn an_existing_member_accepts_with_the_role_they_hold() {
+        let hooks = MemoryInvitationHooks::new();
+        hooks.seed_owner("tenant-a", "alice");
+        hooks
+            .add_membership("tenant-a", "bob", InvitationRole::Member)
+            .unwrap();
+        let actor = human_context("alice");
+        let (_, admin_invite) = hooks
+            .create(
+                &actor,
+                "tenant-a",
+                InvitationRole::Admin,
+                1_000,
+                60_000,
+                SecretValue::new("token-existing-member"),
+            )
+            .unwrap();
+        let bob = human_context("bob");
+        let accepted = hooks
+            .accept(&bob, admin_invite.expose(), None, None, 1_001)
+            .unwrap();
+        assert_eq!(accepted.role, InvitationRole::Member);
+        assert_eq!(
+            hooks.membership_role("tenant-a", "bob"),
+            Some(InvitationRole::Member)
+        );
+        let retry = hooks
+            .accept(&bob, admin_invite.expose(), None, None, 1_002)
+            .unwrap();
+        assert_eq!(retry.role, InvitationRole::Member);
+
+        let (_, new_invite) = hooks
+            .create(
+                &actor,
+                "tenant-a",
+                InvitationRole::Admin,
+                2_000,
+                60_000,
+                SecretValue::new("token-new-member-aa"),
+            )
+            .unwrap();
+        let carol = human_context("carol");
+        let created = hooks
+            .accept(&carol, new_invite.expose(), None, None, 2_001)
+            .unwrap();
+        assert_eq!(created.role, InvitationRole::Admin);
+        assert_eq!(
+            hooks.membership_role("tenant-a", "carol"),
+            Some(InvitationRole::Admin)
+        );
     }
 
     #[test]
