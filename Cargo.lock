@@ -2933,6 +2933,7 @@ dependencies = [
 name = "sekai-connector-template"
 version = "0.1.0"
 dependencies = [
+ "h2",
  "sekai-proto",
  "sekai-source-sdk",
  "serde",
