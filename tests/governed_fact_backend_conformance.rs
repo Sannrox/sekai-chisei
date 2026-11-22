@@ -239,7 +239,10 @@ fn exercise(db: &RuntimeDb, namespace: &str) -> (String, String) {
         &evidence_id,
     );
     conflict.statement = "Conflicting immutable content.".into();
-    assert!(put_fact(db, conflict, "human:operator", 999).is_err());
+    assert_eq!(
+        put_fact(db, conflict, "human:operator", 999).unwrap_err(),
+        "governed fact version already exists with different content"
+    );
 
     let mut invalid_reference = invariant(
         namespace,
@@ -249,7 +252,10 @@ fn exercise(db: &RuntimeDb, namespace: &str) -> (String, String) {
         &evidence_id,
     );
     invalid_reference.version = "2.0.0".into();
-    assert!(put_fact(db, invalid_reference, "human:operator", 999).is_err());
+    assert_eq!(
+        put_fact(db, invalid_reference, "human:operator", 999).unwrap_err(),
+        "requirement version reference unavailable"
+    );
     assert!(
         list_facts(db, &format!("{namespace}-other"))
             .unwrap()
@@ -326,12 +332,29 @@ fn exercise_concurrent_history(db: &RuntimeDb, namespace: &str) {
         .into_iter()
         .map(|thread| thread.join().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-    assert_eq!(
-        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
-        1
-    );
-    assert_eq!(list_facts(db, namespace).unwrap().len(), 2);
+    // Exactly one successor wins and supersedes `first`. The loser is refused
+    // as a second successor, by the pre-check or by the store's history
+    // precondition, never by an unrelated busy or lock error.
+    let (winners, losers): (Vec<_>, Vec<_>) = outcomes.into_iter().partition(Result::is_ok);
+    let winners = winners.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1, "{losers:?}");
+    let winner = &winners[0];
+    assert_eq!(winner.input.supersedes_object_id, first.object_id);
+    for loser in losers.into_iter().map(Result::unwrap_err) {
+        assert!(
+            loser.contains("already has a superseding successor"),
+            "loser failed for another reason: {loser}"
+        );
+    }
+    let mut listed = list_facts(db, namespace)
+        .unwrap()
+        .into_iter()
+        .map(|fact| fact.object_id)
+        .collect::<Vec<_>>();
+    listed.sort();
+    let mut expected = vec![first.object_id.clone(), winner.object_id.clone()];
+    expected.sort();
+    assert_eq!(listed, expected);
 }
 
 #[test]
