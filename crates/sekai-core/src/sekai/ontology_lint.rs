@@ -240,12 +240,7 @@ pub fn lint_all(input: &LintInput) -> Vec<LintFinding> {
                 "no visible object of this type is linked, and no consumer references it".into(),
             ));
         }
-        let properties = serde_json::from_str::<serde_json::Value>(&object_type.definition_json)
-            .ok()
-            .and_then(|value| value.get("properties").cloned())
-            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
-            .unwrap_or_default();
-        for property in properties {
+        for property in crate::sekai::object_set::declared_property_names(object_type) {
             if !input
                 .consumed_properties
                 .contains(&(id.clone(), property.clone()))
@@ -615,26 +610,25 @@ mod tests {
     #[test]
     fn a_property_no_consumer_references_is_reported_until_one_does() {
         let mut input = clean();
-        input.members[0] = member(
-            "object_type",
-            "Ticket",
+        for properties in [
             r#"{"owner":"support","properties":["title","legacy"]}"#,
-        );
-        input
-            .consumed_properties
-            .insert(("Ticket".into(), "title".into()));
-        let report = lint(&input);
-        let ids: Vec<(&str, &str)> = report
-            .findings
-            .iter()
-            .map(|finding| (finding.subject_id.as_str(), finding.property.as_str()))
-            .collect();
-        assert_eq!(ids, [("Ticket", "legacy")]);
-        assert_eq!(report.findings[0].rule, RULE_UNREFERENCED_PROPERTY);
-        input
-            .consumed_properties
-            .insert(("Ticket".into(), "legacy".into()));
-        assert!(lint(&input).findings.is_empty());
+            r#"{"owner":"support","properties":{"title":{},"legacy":{}}}"#,
+        ] {
+            input.members[0] = member("object_type", "Ticket", properties);
+            input.consumed_properties = [("Ticket".into(), "title".into())].into();
+            let report = lint(&input);
+            let ids: Vec<(&str, &str)> = report
+                .findings
+                .iter()
+                .map(|finding| (finding.subject_id.as_str(), finding.property.as_str()))
+                .collect();
+            assert_eq!(ids, [("Ticket", "legacy")], "{properties}");
+            assert_eq!(report.findings[0].rule, RULE_UNREFERENCED_PROPERTY);
+            input
+                .consumed_properties
+                .insert(("Ticket".into(), "legacy".into()));
+            assert!(lint(&input).findings.is_empty(), "{properties}");
+        }
     }
 
     #[test]
