@@ -254,9 +254,14 @@ pub struct RunReport {
     pub attempts: Vec<Attempt>,
     /// Advisory draft files written for bypasses.
     pub advisories: Vec<PathBuf>,
-    /// Bypasses recorded whose draft could not be written; retry by hand.
+    /// Non-fatal problems: advisory drafts that could not be written, and
+    /// ledger append failures. The run continues so findings stay in `attempts`.
     pub advisory_failures: Vec<String>,
 }
+
+/// Marker in `RunReport.advisory_failures` for a ledger append that failed
+/// without stopping the run.
+pub(crate) const LEDGER_APPEND_FAILED: &str = "ledger append failed";
 
 fn append(ledger: &Path, attempt: &Attempt) -> Result<(), String> {
     use std::io::{Seek, SeekFrom};
@@ -638,27 +643,28 @@ pub async fn run(
         let outcome = run_probe(probe, target).await;
         let recorded = attempt(Some(probe), None, outcome);
         let draft = || advisory(probe, target, &recorded);
-        record(&mut report, recorded.clone(), draft, ledger, advisory_dir)?;
+        record(&mut report, recorded.clone(), draft, ledger, advisory_dir);
     }
     for spec in &specs {
         let outcome = run_spec(spec, target).await;
         let recorded = attempt(None, Some(spec), outcome);
         let draft = || spec_advisory(spec, target, &recorded);
-        record(&mut report, recorded.clone(), draft, ledger, advisory_dir)?;
+        record(&mut report, recorded.clone(), draft, ledger, advisory_dir);
     }
     Ok(report)
 }
 
 /// Ledger one attempt. A bypass writes its advisory draft first; a crash in
 /// between only leaves a draft, and the next run detects the bypass again.
-/// A draft that cannot be written never hides the finding.
+/// A draft or ledger write that fails never hides the finding or stops later
+/// probes.
 fn record(
     report: &mut RunReport,
     recorded: Attempt,
     draft: impl FnOnce() -> AdvisoryDraft,
     ledger: &Path,
     advisory_dir: &Path,
-) -> Result<(), String> {
+) {
     if recorded.outcome == ProbeOutcome::Bypass {
         let name = format!("advisory-{}.json", recorded.attempt_id);
         let written = serde_json::to_vec_pretty(&draft())
@@ -672,9 +678,13 @@ fn record(
             )),
         }
     }
-    append(ledger, &recorded)?;
+    if let Err(error) = append(ledger, &recorded) {
+        report.advisory_failures.push(format!(
+            "attempt {}: {LEDGER_APPEND_FAILED}: {error}",
+            recorded.attempt_id
+        ));
+    }
     report.attempts.push(recorded);
-    Ok(())
 }
 
 /// Attempts per probe and outcome over one week.

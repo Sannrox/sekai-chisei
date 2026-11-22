@@ -8,7 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::probe_runner::{ProbeTarget, TargetGuard, run, weekly_summary};
+use crate::probe_runner::{
+    LEDGER_APPEND_FAILED, ProbeTarget, RunReport, TargetGuard, run, weekly_summary,
+};
 
 type BoxErr = Box<dyn std::error::Error + Send + Sync>;
 
@@ -77,52 +79,11 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
                     serde_json::to_string(attempt).map_err(std::io::Error::other)?
                 );
             }
-            let inconclusive = report
-                .attempts
-                .iter()
-                .filter(|attempt| {
-                    matches!(attempt.outcome, crate::probe_runner::ProbeOutcome::Error(_))
-                })
-                .count();
             for failure in &report.advisory_failures {
                 eprintln!("{failure}");
             }
-            let mismatches = report
-                .attempts
-                .iter()
-                .filter(|attempt| {
-                    matches!(
-                        attempt.outcome,
-                        crate::probe_runner::ProbeOutcome::Mismatch(_)
-                    )
-                })
-                .count();
-            let bypasses = report
-                .attempts
-                .iter()
-                .filter(|attempt| attempt.outcome == crate::probe_runner::ProbeOutcome::Bypass)
-                .count();
-            if bypasses > 0 {
-                // A bypass is a failed run; the drafts stay local and private.
-                return Err(std::io::Error::other(format!(
-                    "{bypasses} isolation bypass(es); private advisory drafts in {}",
-                    advisories.display()
-                ))
-                .into());
-            }
-            if mismatches > 0 {
-                // Denied, but not as specified: a finding to inspect.
-                return Err(std::io::Error::other(format!(
-                    "{mismatches} probe spec(s) were denied otherwise than expected; see the ledger"
-                ))
-                .into());
-            }
-            if inconclusive > 0 {
-                // Isolation was not verified; the scheduler must see a failure.
-                return Err(std::io::Error::other(format!(
-                    "{inconclusive} probe(s) could not decide; see the ledger"
-                ))
-                .into());
+            if let Some(error) = run_error(&report, &advisories) {
+                return Err(std::io::Error::other(error).into());
             }
             Ok(())
         }
@@ -139,5 +100,108 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
             Ok(())
         }
         _ => Err(std::io::Error::other(usage()).into()),
+    }
+}
+
+/// Bypass findings take the exit message; ledger append failures still fail
+/// the run when nothing more severe was found.
+fn run_error(report: &RunReport, advisories: &Path) -> Option<String> {
+    let inconclusive = report
+        .attempts
+        .iter()
+        .filter(|attempt| matches!(attempt.outcome, crate::probe_runner::ProbeOutcome::Error(_)))
+        .count();
+    let mismatches = report
+        .attempts
+        .iter()
+        .filter(|attempt| {
+            matches!(
+                attempt.outcome,
+                crate::probe_runner::ProbeOutcome::Mismatch(_)
+            )
+        })
+        .count();
+    let bypasses = report
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.outcome == crate::probe_runner::ProbeOutcome::Bypass)
+        .count();
+    let ledger_failures = report
+        .advisory_failures
+        .iter()
+        .filter(|failure| failure.contains(LEDGER_APPEND_FAILED))
+        .count();
+    if bypasses > 0 {
+        return Some(format!(
+            "{bypasses} isolation bypass(es); private advisory drafts in {}",
+            advisories.display()
+        ));
+    }
+    if mismatches > 0 {
+        return Some(format!(
+            "{mismatches} probe spec(s) were denied otherwise than expected; see the ledger"
+        ));
+    }
+    if inconclusive > 0 {
+        return Some(format!(
+            "{inconclusive} probe(s) could not decide; see the ledger"
+        ));
+    }
+    if ledger_failures > 0 {
+        return Some(format!("{ledger_failures} ledger append(s) failed"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe_runner::{Attempt, PROBE_LEDGER_VERSION, ProbeOutcome};
+
+    fn attempt(outcome: ProbeOutcome) -> Attempt {
+        Attempt {
+            schema: PROBE_LEDGER_VERSION.into(),
+            attempt_id: "a1".into(),
+            at_ms: 1,
+            endpoint: "http://probe.example.test".into(),
+            tenant: "ns".into(),
+            probe: None,
+            spec: None,
+            outcome,
+        }
+    }
+
+    fn report(attempts: Vec<Attempt>, advisory_failures: Vec<String>) -> RunReport {
+        RunReport {
+            attempts,
+            advisories: Vec::new(),
+            advisory_failures,
+        }
+    }
+
+    #[test]
+    fn bypasses_are_reported_before_ledger_failures() {
+        let report = report(
+            vec![attempt(ProbeOutcome::Bypass)],
+            vec![format!("attempt a1: {LEDGER_APPEND_FAILED}: disk full")],
+        );
+        let error = run_error(&report, Path::new("advisories")).expect("exit error");
+        assert!(
+            error.starts_with("1 isolation bypass(es); private advisory drafts in advisories"),
+            "{error}"
+        );
+        assert!(!error.contains("ledger"), "{error}");
+    }
+
+    #[test]
+    fn a_run_whose_ledger_appends_fail_still_exits_nonzero() {
+        let report = report(
+            vec![attempt(ProbeOutcome::Denied)],
+            vec![format!("attempt a1: {LEDGER_APPEND_FAILED}: disk full")],
+        );
+        assert_eq!(
+            run_error(&report, Path::new("advisories")).as_deref(),
+            Some("1 ledger append(s) failed")
+        );
     }
 }

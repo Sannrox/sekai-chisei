@@ -334,6 +334,65 @@ async fn a_seeded_bypass_produces_a_private_advisory_draft_and_the_summary_count
     drop(deployment.db);
 }
 
+#[tokio::test]
+async fn a_ledger_that_fails_after_the_first_attempt_still_reports_the_bypass() {
+    let deployment = deployment(|db, north, south| {
+        db.create_grant(&Grant {
+            id: "seeded-bypass".into(),
+            object_id: south.objects[0].id.clone(),
+            principal: viewer(north),
+            role: Role::Viewer,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("ledger.jsonl");
+    let advisories = dir.path().join("advisories");
+    let target = target(&deployment);
+    let watch = ledger.clone();
+    let stopper = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(10) {
+            if fs::read_to_string(&watch)
+                .ok()
+                .is_some_and(|body| body.contains('\n'))
+            {
+                let mut permissions = fs::metadata(&watch).unwrap().permissions();
+                permissions.set_readonly(true);
+                fs::set_permissions(&watch, permissions).unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("ledger never received the first attempt");
+    });
+    let report = run(
+        TargetGuard::parse(Some(&deployment.endpoint)),
+        &target,
+        Ok(Vec::new()),
+        &ledger,
+        &advisories,
+    )
+    .await
+    .unwrap();
+    stopper.join().unwrap();
+    assert_eq!(report.attempts.len(), ProbeKind::ALL.len());
+    assert_eq!(report.attempts[1].probe, Some(ProbeKind::CrossTenantRead));
+    assert_eq!(report.attempts[1].outcome, ProbeOutcome::Bypass);
+    assert!(
+        report
+            .advisory_failures
+            .iter()
+            .any(|failure| failure.contains("ledger append failed")),
+        "{:?}",
+        report.advisory_failures
+    );
+    drop(deployment.db);
+}
+
 fn catalogue() -> Vec<ProbeSpec> {
     sekaictl::probe_spec::load_dir(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe_specs"),
