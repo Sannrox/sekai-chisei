@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sekai_chisei::chisei::budget::{BudgetTracker, PeriodType};
@@ -21,6 +21,7 @@ use serde_json::Value;
 
 const WAIT_BUDGET: Duration = Duration::from_secs(20);
 const SEEDED_USERS: i32 = 200;
+const WRITES_BEFORE_RELOCATE: usize = 5;
 
 fn init_sqlite(path: &str) {
     RuntimeBackend::initialize(
@@ -69,14 +70,18 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
             .expect("seed budget");
     }
 
-    // A Shared-mode writer that keeps running across the relocate.
+    // A Shared-mode writer that keeps running across the relocate. A fence
+    // refusal is expected once the relocate raises it; any other error is
+    // recorded so the test fails on it.
     let stop = Arc::new(AtomicBool::new(false));
+    let acknowledged_count = Arc::new(AtomicUsize::new(0));
     let writer = {
         let stop = Arc::clone(&stop);
+        let acknowledged_count = Arc::clone(&acknowledged_count);
         let source_s = source_s.clone();
         std::thread::spawn(move || {
             let mut acknowledged = Vec::new();
-            let mut fenced = 0usize;
+            let mut unexpected = Vec::new();
             let mut index = 0;
             while !stop.load(Ordering::SeqCst) {
                 match source_tracker(&source_s).set_limit(
@@ -84,15 +89,28 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
                     limit_for(index),
                     PeriodType::Daily,
                 ) {
-                    Ok(()) => acknowledged.push(index),
-                    Err(error) if error.to_string().contains("writer fence raised") => fenced += 1,
-                    Err(_) => {}
+                    Ok(()) => {
+                        acknowledged.push(index);
+                        acknowledged_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error) if error.to_string().contains("writer fence raised") => {}
+                    Err(error) => unexpected.push(format!("live-{index}: {error}")),
                 }
                 index += 1;
             }
-            (acknowledged, fenced)
+            (acknowledged, unexpected)
         })
     };
+    // Start the relocate only once the writer is landing writes, so it is
+    // already running when the copy begins.
+    let deadline = Instant::now() + WAIT_BUDGET;
+    while acknowledged_count.load(Ordering::SeqCst) < WRITES_BEFORE_RELOCATE {
+        assert!(
+            Instant::now() < deadline && !writer.is_finished(),
+            "writer acknowledged fewer than {WRITES_BEFORE_RELOCATE} writes before the relocate"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let output = Command::new(crate::sekaictl_bin())
         .args([
@@ -102,7 +120,16 @@ fn relocate_keeps_every_acknowledged_write_and_fences_the_source_database() {
         .output()
         .expect("run sekaictl");
     stop.store(true, Ordering::SeqCst);
-    let (acknowledged, _fenced) = writer.join().expect("writer thread");
+    let (acknowledged, unexpected) = writer.join().expect("writer thread");
+    assert!(
+        unexpected.is_empty(),
+        "writer failed for a reason other than the fence: {unexpected:?}"
+    );
+    assert!(
+        acknowledged.len() >= WRITES_BEFORE_RELOCATE,
+        "writer acknowledged {} writes",
+        acknowledged.len()
+    );
     assert!(
         output.status.success(),
         "relocate failed ({:?})\nstdout: {}\nstderr: {}",
