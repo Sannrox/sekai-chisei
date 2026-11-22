@@ -21,6 +21,7 @@ use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,10 @@ pub const SESSION_COOKIE: &str = "sekai_console_sid";
 
 /// Default session lifetime (8 hours). Process-local; not shared across replicas.
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 8 * 60 * 60;
+
+/// Expired sessions are swept from the map at most this often. Per-session
+/// expiry is still checked on every resolve.
+const SESSION_PURGE_INTERVAL_SECS: u64 = 60;
 
 #[derive(Clone)]
 pub struct ConsoleState {
@@ -49,6 +54,7 @@ pub struct ConsoleSession {
 #[derive(Default)]
 pub struct SessionStore {
     by_id: RwLock<HashMap<String, ConsoleSession>>,
+    last_purge_unix: AtomicU64,
 }
 
 impl SessionStore {
@@ -73,6 +79,21 @@ impl SessionStore {
 
     pub fn remove(&self, id: &str) {
         self.by_id.write().expect("console session lock").remove(id);
+    }
+
+    fn maybe_purge_expired(&self, now: u64) {
+        let last = self.last_purge_unix.load(Ordering::Acquire);
+        if last != 0 && now.saturating_sub(last) < SESSION_PURGE_INTERVAL_SECS {
+            return;
+        }
+        if self
+            .last_purge_unix
+            .compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.purge_expired(now);
     }
 
     fn purge_expired(&self, now: u64) {
@@ -252,7 +273,7 @@ fn resolve_session(state: &ConsoleState, headers: &HeaderMap) -> SessionResoluti
     let Some(sid) = parse_cookie_value(headers, SESSION_COOKIE) else {
         return SessionResolution::Unauthenticated { had_cookie: false };
     };
-    state.sessions.purge_expired(now_unix());
+    state.sessions.maybe_purge_expired(now_unix());
     let Some(session) = state.sessions.get(&sid) else {
         return SessionResolution::Unauthenticated { had_cookie: true };
     };
@@ -2415,5 +2436,52 @@ mod tests {
         assert_eq!(second.status(), StatusCode::SEE_OTHER);
         assert!(state.sessions.get(&first).is_none());
         assert_eq!(state.sessions.by_id.read().unwrap().len(), 1);
+    }
+
+    fn session_cookie_headers(sid: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{SESSION_COOKIE}={sid}")).unwrap(),
+        );
+        headers
+    }
+
+    fn stored_session(expires_unix: u64) -> ConsoleSession {
+        ConsoleSession {
+            principal: "alice".into(),
+            credential_id: "cred".into(),
+            token_hash: "hash".into(),
+            expires_unix,
+        }
+    }
+
+    #[test]
+    fn expired_sessions_are_refused_immediately_and_purged_once_per_interval() {
+        let state = test_state(test_db());
+        let _ = resolve_session(&state, &session_cookie_headers("warmup"));
+
+        state.sessions.insert("expired-a".into(), stored_session(0));
+        state.sessions.insert("expired-b".into(), stored_session(0));
+
+        assert!(matches!(
+            resolve_session(&state, &session_cookie_headers("expired-a")),
+            SessionResolution::Unauthenticated { had_cookie: true }
+        ));
+        assert!(state.sessions.get("expired-a").is_none());
+        assert!(
+            state.sessions.get("expired-b").is_some(),
+            "sweep must not take the write lock again within the interval"
+        );
+
+        for _ in 0..8 {
+            let _ = resolve_session(&state, &session_cookie_headers("warmup"));
+        }
+        assert!(state.sessions.get("expired-b").is_some());
+
+        state
+            .sessions
+            .maybe_purge_expired(now_unix().saturating_add(SESSION_PURGE_INTERVAL_SECS));
+        assert!(state.sessions.get("expired-b").is_none());
     }
 }
