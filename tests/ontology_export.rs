@@ -211,10 +211,7 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
         }))
         .await
         .unwrap_or_else(|error| panic!("object: {error}\n{}", server.logs()));
-    publish(
-        &server,
-        "export-a",
-        vec![
+    let published: Vec<(String, String, String)> = vec![
             (
                 "object_type".into(),
                 "incident".into(),
@@ -229,45 +226,40 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
             ),
             ("action_type".into(), "close".into(), r#"{"name":"close","mode":"manual"}"#.into()),
             ("function".into(), "sync/feed".into(), r#"{"name":"sync"}"#.into()),
-        ],
-    )
-    .await;
+        ];
+    publish(&server, "export-a", published.clone()).await;
     // A credential the namespace's operators hold; export reads definitions only.
     let credential = server.token("exporter");
-    put_lattice(
-        &server,
-        "export-a",
-        ClassificationLattice {
-            contract_version: "sekai.classification-lattice/v1".into(),
-            namespace: String::new(),
-            tokens: vec![
-                "public".into(),
-                "confidential".into(),
-                "health".into(),
-                "secret".into(),
-            ],
-            parents: vec![
-                ClassificationParentEdge {
-                    child: "public".into(),
-                    parent: "confidential".into(),
-                },
-                ClassificationParentEdge {
-                    child: "confidential".into(),
-                    parent: "secret".into(),
-                },
-                ClassificationParentEdge {
-                    child: "health".into(),
-                    parent: "secret".into(),
-                },
-            ],
-            incomparable: vec![ClassificationIncomparablePair {
-                left: "confidential".into(),
-                right: "health".into(),
-            }],
-            digest: String::new(),
-        },
-    )
-    .await;
+    let lattice_a = ClassificationLattice {
+        contract_version: "sekai.classification-lattice/v1".into(),
+        namespace: String::new(),
+        tokens: vec![
+            "public".into(),
+            "confidential".into(),
+            "health".into(),
+            "secret".into(),
+        ],
+        parents: vec![
+            ClassificationParentEdge {
+                child: "public".into(),
+                parent: "confidential".into(),
+            },
+            ClassificationParentEdge {
+                child: "confidential".into(),
+                parent: "secret".into(),
+            },
+            ClassificationParentEdge {
+                child: "health".into(),
+                parent: "secret".into(),
+            },
+        ],
+        incomparable: vec![ClassificationIncomparablePair {
+            left: "confidential".into(),
+            right: "health".into(),
+        }],
+        digest: String::new(),
+    };
+    put_lattice(&server, "export-a", lattice_a.clone()).await;
 
     // Both exports present the credential, so a leak of it would show in the tree.
     let first = export_as(
@@ -283,6 +275,8 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
         &dir.path().join("again"),
     );
     assert_eq!(first, again, "exporting twice gives identical trees");
+    assert!(first.contains_key("object_type/incident.json"));
+    assert!(first.contains_key("action_type/close.json"));
     assert!(first.contains_key("function/sync%2Ffeed.json"));
     assert!(first.contains_key("link_type/incident%2Eaffects.json"));
     assert!(first.contains_key("markings/lattice.json"));
@@ -293,6 +287,27 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
         assert!(!body.contains(OBJECT_DATA), "{path} leaks object data");
         assert!(!body.contains("export-a"), "{path} names its namespace");
     }
+
+    // The export holds exactly the published members, each as published, so
+    // a round trip cannot pass by dropping or rewriting one.
+    let parsed =
+        |members: &[(String, String, String)]| -> BTreeMap<(String, String), serde_json::Value> {
+            members
+                .iter()
+                .map(|(kind, id, json)| {
+                    (
+                        (kind.clone(), id.clone()),
+                        serde_json::from_str(json).unwrap(),
+                    )
+                })
+                .collect()
+        };
+    let exported = parsed(&members_of(&first));
+    assert_eq!(exported, parsed(&published));
+    assert_eq!(
+        exported[&("object_type".to_string(), "incident".to_string())]["access_marking"],
+        "confidential"
+    );
 
     // Apply the tree into an empty namespace through the governed flow.
     publish(&server, "export-b", members_of(&first)).await;
@@ -319,6 +334,36 @@ async fn an_export_applied_into_an_empty_namespace_exports_byte_identically() {
         },
     )
     .await;
+    // The exported lattice is the one put on export-a, not an emptied copy.
+    let sorted = |mut pairs: Vec<[String; 2]>| {
+        pairs.sort();
+        pairs
+    };
+    let mut tokens: Vec<String> = serde_json::from_value(lattice["tokens"].clone()).unwrap();
+    tokens.sort();
+    let mut tokens_a = lattice_a.tokens.clone();
+    tokens_a.sort();
+    assert_eq!(tokens, tokens_a);
+    assert_eq!(
+        sorted(pairs("parents")),
+        sorted(
+            lattice_a
+                .parents
+                .iter()
+                .map(|edge| [edge.child.clone(), edge.parent.clone()])
+                .collect()
+        )
+    );
+    assert_eq!(
+        sorted(pairs("incomparable")),
+        sorted(
+            lattice_a
+                .incomparable
+                .iter()
+                .map(|pair| [pair.left.clone(), pair.right.clone()])
+                .collect()
+        )
+    );
     let round_trip = export(&server, "export-b", &dir.path().join("round-trip"));
     assert_eq!(first, round_trip, "export, apply, export is byte-identical");
     assert_eq!(server.panics(), 0, "{}", server.logs());
