@@ -335,6 +335,15 @@ impl SourceSyncTransport for GenerationTransport {
                 reason_code: "missing_source_range".into(),
             });
         }
+        // Every rejection is decided before `self.state` changes, as the real
+        // plane commits nothing for a rejected batch.
+        if delivery.mode == SourceDeliveryMode::ChangeFeed
+            && self.state.source_feed_epoch != delivery.source_feed_epoch
+        {
+            return Ok(ApplySourceBatchReply::Rejected {
+                reason_code: "feed_epoch_mismatch".into(),
+            });
+        }
         self.state.found = true;
         self.state.current_cursor = Some(batch.proposed_next_cursor.clone());
         self.state.open_transaction = false;
@@ -355,11 +364,6 @@ impl SourceSyncTransport for GenerationTransport {
                 self.state.committed_offset = None;
             }
             SourceDeliveryMode::ChangeFeed => {
-                if self.state.source_feed_epoch != delivery.source_feed_epoch {
-                    return Ok(ApplySourceBatchReply::Rejected {
-                        reason_code: "feed_epoch_mismatch".into(),
-                    });
-                }
                 self.state.generation_status = Some(SourceGenerationStatus::Active);
                 self.state.delivery_mode = Some(SourceDeliveryMode::ChangeFeed);
                 self.state.committed_offset = delivery.offset_end;
@@ -974,6 +978,55 @@ fn feed_runner_keeps_shared_outbox_bindings_isolated() {
     assert_eq!(transport.applied.len(), 1);
     assert_eq!(outbox.pending().unwrap(), [other]);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn generation_transport_rejects_a_feed_epoch_mismatch_before_it_changes_state() {
+    let before = SourceSyncStateView {
+        found: true,
+        current_cursor: Some("feed:40".into()),
+        last_committed_batch_digest: Some(format!("sha256:{}", "a".repeat(64))),
+        generation_status: Some(SourceGenerationStatus::Active),
+        delivery_mode: Some(SourceDeliveryMode::ChangeFeed),
+        sync_generation: Some(1),
+        source_feed_epoch: Some("feed-epoch-a".into()),
+        committed_offset: Some(40),
+        ..Default::default()
+    };
+    let mut transport = GenerationTransport {
+        state: before.clone(),
+        ..Default::default()
+    };
+    let batch = build_source_batch_v2(
+        &config(),
+        "feed:40",
+        "feed:41",
+        1_787_511_160_000,
+        vec![sequenced_record("674", 41)],
+        SourceDeliveryWindow {
+            mode: SourceDeliveryMode::ChangeFeed,
+            sync_generation: 1,
+            source_feed_epoch: Some("feed-epoch-b".into()),
+            offset_start: Some(40),
+            offset_end: Some(41),
+            snapshot_complete: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        transport.apply_source_batch(&batch).unwrap(),
+        ApplySourceBatchReply::Rejected {
+            reason_code: "feed_epoch_mismatch".into(),
+        }
+    );
+    let after = transport
+        .get_source_sync_state(&GetSourceSyncStateInput {
+            namespace: "acme".into(),
+            source_instance: "sannrox/sekai-chisei".into(),
+            type_digest: TYPE_DIGEST.into(),
+        })
+        .unwrap();
+    assert_eq!(after, before);
 }
 
 #[test]
