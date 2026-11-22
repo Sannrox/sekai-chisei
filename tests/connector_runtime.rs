@@ -1,7 +1,8 @@
 //! The connector runtime against a serving plane (ADR 0148): crash
 //! mid-claim, takeover after lease expiry, a stale fence refused, two
-//! runtime versions side by side, an unresolved credential, and a GitHub
-//! repository moved under a Source with its object ids unchanged.
+//! runtime versions side by side, an unresolved credential, a GitHub
+//! repository moved under a Source with its object ids unchanged, and a
+//! pass that still claims later namespaces when an earlier one cannot.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use sekai_chisei::rpc_maturity::RpcMaturityLayer;
 use sekai_chisei::sekai::security::Role;
 use sekai_chisei::sekai::source::{self, PutSource, SourceSpec};
 use sekai_client::ClientConfig;
+use sekai_client::claim::RuntimeClaimError;
 use sekai_connector_runtime::{
     Connectors, CredentialBindings, Ran, Runtime, RuntimeOptions, SyncFailure, github,
 };
@@ -26,11 +28,31 @@ use sekai_source_sdk::{
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Interceptor;
+use tonic::{Request, Status};
 use tower::Layer;
 
 const NS: &str = "ops";
+const LOCKED: &str = "locked";
 const PRINCIPAL: &str = "local";
 const LEASE: Duration = Duration::from_millis(300);
+
+#[derive(Clone)]
+struct RefuseNamespace(&'static str);
+
+impl Interceptor for RefuseNamespace {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let refused = request
+            .metadata()
+            .get("x-sekai-namespace")
+            .and_then(|value| value.to_str().ok())
+            == Some(self.0);
+        if refused {
+            return Err(Status::permission_denied("namespace denied"));
+        }
+        Ok(request)
+    }
+}
 
 struct Plane {
     db: Arc<RuntimeDb>,
@@ -53,6 +75,36 @@ async fn plane() -> Plane {
     let service = RpcMaturityLayer::new(true).layer(SekaiServiceServer::new(
         SekaiServiceImpl::new(SekaiStore::from_shared_runtime(db.clone())),
     ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    Plane {
+        db,
+        endpoint,
+        stop: Some(stop),
+    }
+}
+
+/// A plane that refuses every RPC in `namespace` with PermissionDenied.
+async fn plane_refusing(namespace: &'static str) -> Plane {
+    let db = Arc::new(RuntimeDb::memory());
+    db.ensure_team_namespace(NS, PRINCIPAL, Role::Admin, PRINCIPAL)
+        .unwrap();
+    db.ensure_team_namespace(namespace, PRINCIPAL, Role::Admin, PRINCIPAL)
+        .unwrap();
+    let service = SekaiServiceServer::with_interceptor(
+        SekaiServiceImpl::new(SekaiStore::from_shared_runtime(db.clone())),
+        RefuseNamespace(namespace),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -244,6 +296,54 @@ async fn runtime(
     .unwrap();
     runtime.register().await.unwrap();
     runtime
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_namespace_does_not_stop_the_pass_for_the_others() {
+    let plane = plane_refusing(LOCKED).await;
+    let dir = tempfile::tempdir().unwrap();
+    plane.put_github("repo", "ops/github-bot");
+    let (connectors, runs) = counted(&[&GITHUB_CONNECTOR]);
+    // Labels live on the plane; the two-namespace runtime reuses them
+    // without registering the namespace whose claim is always refused.
+    let _ = runtime(
+        &plane,
+        "runtime-a",
+        bindings(dir.path()),
+        connectors.clone(),
+    )
+    .await;
+
+    let runtime = Runtime::connect(
+        ClientConfig::new(&plane.endpoint, PRINCIPAL).with_default_timeout(Duration::from_secs(5)),
+        &[LOCKED.to_string(), NS.to_string()],
+        RuntimeOptions {
+            runtime_id: "runtime-a".into(),
+            labels: BTreeMap::from([("zone".into(), "eu".into())]),
+            lease: LEASE,
+        },
+        bindings(dir.path()),
+        connectors,
+    )
+    .await
+    .unwrap();
+
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    for pass in 0..2 {
+        plane
+            .db
+            .tick_source_syncs(NS, now_ms() + pass * 120_000)
+            .unwrap();
+        let error = runtime.pass().await.expect_err("first namespace fails");
+        assert!(matches!(error, RuntimeClaimError::Denied(_)), "{error}");
+        assert_eq!(runs.load(Ordering::SeqCst), pass as usize + 1);
+        assert_eq!(plane.sync_of("repo").0, "runtime-a");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

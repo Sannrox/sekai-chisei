@@ -149,6 +149,8 @@ impl Runtime {
                     return Ok(Some(work));
                 }
                 Ok(_) | Err(RuntimeClaimError::Contention) => continue,
+                // Claimed by another runtime since the list, or gone.
+                Err(RuntimeClaimError::Unavailable(_) | RuntimeClaimError::FenceLost) => continue,
                 Err(error) => return Err(error),
             }
         }
@@ -229,24 +231,44 @@ impl Runtime {
     /// One pass: claims and runs every due Source sync, then every
     /// deliverable artifact and every pending external effect of a Source
     /// this runtime can run, then every model step run it may claim, in each
-    /// namespace in turn.
+    /// namespace in turn. A namespace that fails to claim or run is logged
+    /// and skipped; later namespaces still run. The first such error is
+    /// returned after the pass.
     pub async fn pass(&self) -> Result<Vec<Ran>, RuntimeClaimError> {
         let mut ran = Vec::new();
+        let mut first_error = None;
         for index in 0..self.clients.len() {
-            while let Some(work) = self.claim(index).await? {
-                ran.push(self.run(index, work).await?);
-            }
-            while let Some((source, work)) = self.claim_delivery(index).await? {
-                ran.push(self.deliver(index, source, work).await?);
-            }
-            while let Some(work) = self.claim_effect(index).await? {
-                ran.push(self.apply(index, work).await?);
-            }
-            while let Some(work) = self.claim_llm_rows(index).await? {
-                ran.push(self.run_llm_rows(index, work).await?);
+            if let Err(error) = self.pass_namespace(index, &mut ran).await {
+                eprintln!("connector runtime pass failed: {error}");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(ran)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(ran),
+        }
+    }
+
+    async fn pass_namespace(
+        &self,
+        index: usize,
+        ran: &mut Vec<Ran>,
+    ) -> Result<(), RuntimeClaimError> {
+        while let Some(work) = self.claim(index).await? {
+            ran.push(self.run(index, work).await?);
+        }
+        while let Some((source, work)) = self.claim_delivery(index).await? {
+            ran.push(self.deliver(index, source, work).await?);
+        }
+        while let Some(work) = self.claim_effect(index).await? {
+            ran.push(self.apply(index, work).await?);
+        }
+        while let Some(work) = self.claim_llm_rows(index).await? {
+            ran.push(self.run_llm_rows(index, work).await?);
+        }
+        Ok(())
     }
 
     /// Passes every `poll` until `shutdown` resolves. A failed pass is
