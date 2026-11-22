@@ -6,31 +6,59 @@ use sekai_adapters::sdk;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-const FIXTURES: [(&str, &[u8]); 6] = [
-    (
-        "cancelled.sse",
-        include_bytes!("../../../tests/fixtures/responses/cancelled.sse"),
-    ),
-    (
-        "failed-partial.sse",
-        include_bytes!("../../../tests/fixtures/responses/failed-partial.sse"),
-    ),
-    (
-        "fragmented-and-unknown.sse",
-        include_bytes!("../../../tests/fixtures/responses/fragmented-and-unknown.sse"),
-    ),
-    (
-        "incomplete.sse",
-        include_bytes!("../../../tests/fixtures/responses/incomplete.sse"),
-    ),
-    (
-        "interrupted.sse",
-        include_bytes!("../../../tests/fixtures/responses/interrupted.sse"),
-    ),
-    (
-        "multiple-tools.sse",
-        include_bytes!("../../../tests/fixtures/responses/multiple-tools.sse"),
-    ),
+/// One corpus fixture and the batch harness outcome it must produce.
+struct Fixture {
+    name: &'static str,
+    bytes: &'static [u8],
+    terminal: &'static str,
+    text: &'static str,
+    /// `(input_tokens, output_tokens)` from the terminal, when it reports usage.
+    usage: Option<(u64, u64)>,
+}
+
+const FIXTURES: [Fixture; 6] = [
+    Fixture {
+        name: "cancelled.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/cancelled.sse"),
+        terminal: "response.cancelled",
+        text: "",
+        usage: Some((4, 0)),
+    },
+    Fixture {
+        name: "failed-partial.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/failed-partial.sse"),
+        terminal: "response.failed",
+        text: "partial",
+        usage: Some((4, 1)),
+    },
+    Fixture {
+        name: "fragmented-and-unknown.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/fragmented-and-unknown.sse"),
+        terminal: "response.completed",
+        text: "hello",
+        usage: Some((2, 1)),
+    },
+    Fixture {
+        name: "incomplete.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/incomplete.sse"),
+        terminal: "response.incomplete",
+        text: "bounded",
+        usage: Some((4, 1)),
+    },
+    Fixture {
+        name: "interrupted.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/interrupted.sse"),
+        terminal: "chisei.response.interrupted",
+        text: "",
+        usage: None,
+    },
+    Fixture {
+        name: "multiple-tools.sse",
+        bytes: include_bytes!("../../../tests/fixtures/responses/multiple-tools.sse"),
+        terminal: "response.completed",
+        text: "",
+        usage: Some((8, 12)),
+    },
 ];
 
 #[derive(serde::Deserialize)]
@@ -47,13 +75,21 @@ fn headless_batch_harness_passes_the_canonical_corpus() {
     .unwrap();
     assert_eq!(manifest.profile, batch::HARNESS_PROFILE);
     assert_eq!(manifest.fixtures.len(), FIXTURES.len());
-    for (name, bytes) in FIXTURES {
+    for fixture in FIXTURES {
+        let name = fixture.name;
         assert_eq!(
-            format!("{:x}", Sha256::digest(bytes)),
+            format!("{:x}", Sha256::digest(fixture.bytes)),
             manifest.fixtures[name]
         );
-        let result = batch::run_fixture(bytes).unwrap_or_else(|error| panic!("{name}: {error}"));
-        assert!(result.terminal.starts_with("response.") || result.terminal.starts_with("chisei."));
+        let result =
+            batch::run_fixture(fixture.bytes).unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(result.terminal, fixture.terminal, "{name}");
+        assert_eq!(result.text, fixture.text, "{name}");
+        assert_eq!(
+            (result.input_tokens, result.output_tokens),
+            fixture.usage.unzip(),
+            "{name}"
+        );
     }
     let tools = batch::run_fixture(include_bytes!(
         "../../../tests/fixtures/responses/multiple-tools.sse"
@@ -66,6 +102,12 @@ fn headless_batch_harness_passes_the_canonical_corpus() {
     assert_eq!(first.name, "lookup_weather");
     assert_eq!(first.output_index, 0);
     assert_eq!(first.arguments, r#"{"city":"Berlin"}"#);
+    let second = &tools.tool_calls[&1];
+    assert_eq!(second.item_id, "item_b");
+    assert_eq!(second.call_id, "call_z");
+    assert_eq!(second.name, "search_docs");
+    assert_eq!(second.output_index, 1);
+    assert_eq!(second.arguments, r#"{"query":"docs"}"#);
     let forward = batch::run_fixture(include_bytes!(
         "../../../tests/fixtures/responses/fragmented-and-unknown.sse"
     ))
