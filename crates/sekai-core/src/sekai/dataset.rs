@@ -261,19 +261,20 @@ impl SekaiDb {
         crate::sekai::dataset_health::migrate_dataset_health(&conn)?;
         crate::sekai::consumer_violation::migrate_consumer_violations(&conn)?;
         crate::db::dataset_branch::migrate_dataset_branches(&conn)?;
-        let _ = conn.execute(
+        crate::db::add_sqlite_column(
+            &conn,
             "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute(
+        )?;
+        crate::db::add_sqlite_column(
+            &conn,
             "ALTER TABLE sekai_dataset_rows ADD COLUMN partition_key TEXT NOT NULL DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
+        )?;
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_dataset_rows_partition
              ON sekai_dataset_rows(dataset_id, partition_key)",
             [],
-        );
+        )
+        .map_err(|e| e.to_string())?;
         let stored: Option<String> = conn
             .query_row(
                 "SELECT columns FROM sekai_datasets WHERE id='llm_calls'",
@@ -1887,6 +1888,57 @@ mod tests {
             .unwrap();
         assert_eq!(data_class.col_type, "string");
         assert_eq!(data_class.classification, "public");
+    }
+
+    #[test]
+    fn migrate_datasets_can_run_twice_on_an_upgraded_database() {
+        let db = setup();
+        db.migrate_datasets().unwrap();
+        db.migrate_datasets().unwrap();
+        let datasets_sql: String = db
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sekai_datasets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rows_sql: String = db
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sekai_dataset_rows'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(datasets_sql.contains("partition_keys"), "{datasets_sql}");
+        assert!(rows_sql.contains("partition_key"), "{rows_sql}");
+        let index: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_dataset_rows_partition'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn migrate_datasets_returns_partition_index_errors() {
+        let db = setup();
+        db.conn()
+            .execute_batch(
+                "DROP INDEX idx_dataset_rows_partition;
+                 CREATE TABLE idx_dataset_rows_partition (x TEXT);",
+            )
+            .unwrap();
+        let error = db.migrate_datasets().unwrap_err();
+        assert!(
+            error.contains("there is already a table named idx_dataset_rows_partition"),
+            "{error}"
+        );
     }
 
     #[test]
