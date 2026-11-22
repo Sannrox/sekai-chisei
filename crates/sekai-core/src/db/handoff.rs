@@ -2,13 +2,14 @@
 
 use crate::db::{postgres::PostgresDb, sekai::SekaiDb};
 use crate::sekai::handoff::HandoffManifest;
+use crate::sekai::handoff_lifecycle::HandoffLifecycleError;
 
 pub trait HandoffBackend: Send + Sync {
     fn create_handoff(
         &self,
         manifest: &HandoffManifest,
         request_id: &str,
-    ) -> Result<HandoffManifest, String>;
+    ) -> Result<HandoffManifest, HandoffLifecycleError>;
     fn get_handoff_by_request(
         &self,
         creator: &str,
@@ -23,7 +24,7 @@ pub trait HandoffBackend: Send + Sync {
         reason: &str,
         request_id: &str,
         now_ms: i64,
-    ) -> Result<HandoffManifest, String>;
+    ) -> Result<HandoffManifest, HandoffLifecycleError>;
 }
 
 macro_rules! forward {
@@ -32,7 +33,7 @@ macro_rules! forward {
             &self,
             value: &HandoffManifest,
             request: &str,
-        ) -> Result<HandoffManifest, String> {
+        ) -> Result<HandoffManifest, HandoffLifecycleError> {
             <$target>::create_handoff(self, value, request)
         }
         fn get_handoff_by_request(
@@ -55,7 +56,7 @@ macro_rules! forward {
             reason: &str,
             request: &str,
             now: i64,
-        ) -> Result<HandoffManifest, String> {
+        ) -> Result<HandoffManifest, HandoffLifecycleError> {
             <$target>::revoke_handoff(self, id, actor, reason, request, now)
         }
     };

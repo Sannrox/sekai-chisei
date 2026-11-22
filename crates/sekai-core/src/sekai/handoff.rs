@@ -5,7 +5,20 @@
 pub use sekai_types::handoff::*;
 
 use crate::db::sekai::SekaiDb;
+use crate::sekai::handoff_lifecycle::{HandoffLifecycleError, resolve_create_conflict};
 use rusqlite::{OptionalExtension, params};
+
+fn storage(error: impl ToString) -> HandoffLifecycleError {
+    HandoffLifecycleError::storage(error)
+}
+
+fn unique_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(err, _)
+            if err.code == rusqlite::ErrorCode::ConstraintViolation
+    )
+}
 
 impl SekaiDb {
     pub fn migrate_handoffs(&self) -> Result<(), String> {
@@ -32,36 +45,77 @@ impl SekaiDb {
         &self,
         manifest: &HandoffManifest,
         request_id: &str,
-    ) -> Result<HandoffManifest, String> {
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
         if request_id.trim().is_empty() {
-            return Err("request_id is required".into());
+            return Err(HandoffLifecycleError::InvalidArgument(
+                "request_id is required".into(),
+            ));
         }
-        manifest.validate()?;
-        let request_digest = manifest.canonical_digest()?;
+        manifest
+            .validate()
+            .map_err(HandoffLifecycleError::InvalidArgument)?;
+        let request_digest = manifest
+            .canonical_digest()
+            .map_err(HandoffLifecycleError::InvalidArgument)?;
         let mut stored = manifest.clone();
         stored.digest = request_digest.clone();
-        let json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(&stored).map_err(storage)?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let replay = tx.query_row(
-            "SELECT request_digest, manifest_json FROM sekai_handoffs WHERE creator_principal=?1 AND request_id=?2",
-            params![stored.creator_principal, request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        ).optional().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(storage)?;
+        let replay = tx
+            .query_row(
+                "SELECT request_digest, manifest_json FROM sekai_handoffs WHERE creator_principal=?1 AND request_id=?2",
+                params![stored.creator_principal, request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(storage)?;
         if let Some((existing_digest, existing_json)) = replay {
             if existing_digest != request_digest {
-                return Err("request_id is already bound to different handoff input".into());
+                return Err(HandoffLifecycleError::AlreadyExists(
+                    "request_id is already bound to different handoff input".into(),
+                ));
             }
-            return serde_json::from_str(&existing_json).map_err(|e| e.to_string());
+            return serde_json::from_str(&existing_json).map_err(storage);
         }
-        tx.execute(
+        if let Err(error) = tx.execute(
             "INSERT INTO sekai_handoffs(id, namespace, intended_principal, request_id, request_digest, manifest_json, created_at_ms, expires_at_ms, creator_principal, supersedes_manifest_id)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![stored.id, stored.namespace, stored.intended_principal, request_id, request_digest, json, stored.created_at_ms, stored.expires_at_ms, stored.creator_principal, stored.supersedes_manifest_id]
-        ).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO sekai_handoff_events(manifest_id,event_type,actor,request_id,reason,recorded_at_ms) VALUES(?1,'created',?2,?3,?4,?5)",
-            params![stored.id, stored.creator_principal, request_id, stored.purpose, stored.created_at_ms]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+            params![stored.id, stored.namespace, stored.intended_principal, request_id, request_digest, json, stored.created_at_ms, stored.expires_at_ms, stored.creator_principal, stored.supersedes_manifest_id],
+        ) {
+            if unique_constraint(&error) {
+                drop(tx);
+                drop(conn);
+                return self.existing_after_create_conflict(&stored, request_id);
+            }
+            return Err(storage(error));
+        }
+        tx.execute(
+            "INSERT INTO sekai_handoff_events(manifest_id,event_type,actor,request_id,reason,recorded_at_ms) VALUES(?1,'created',?2,?3,?4,?5)",
+            params![
+                stored.id,
+                stored.creator_principal,
+                request_id,
+                stored.purpose,
+                stored.created_at_ms
+            ],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
         Ok(stored)
+    }
+
+    fn existing_after_create_conflict(
+        &self,
+        stored: &HandoffManifest,
+        request_id: &str,
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
+        resolve_create_conflict(
+            self.get_handoff_by_request(&stored.creator_principal, request_id)
+                .map_err(storage)?,
+            self.get_handoff(&stored.id).map_err(storage)?,
+            &stored.digest,
+        )
     }
 
     pub fn get_handoff_by_request(
@@ -120,35 +174,48 @@ impl SekaiDb {
         reason: &str,
         request_id: &str,
         now_ms: i64,
-    ) -> Result<HandoffManifest, String> {
+    ) -> Result<HandoffManifest, HandoffLifecycleError> {
         if reason.trim().is_empty() || request_id.trim().is_empty() {
-            return Err("revocation reason and request_id are required".into());
+            return Err(HandoffLifecycleError::InvalidArgument(
+                "revocation reason and request_id are required".into(),
+            ));
         }
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(storage)?;
         let changed = tx
             .execute(
                 "UPDATE sekai_handoffs SET revoked_at_ms=COALESCE(revoked_at_ms,?1) WHERE id=?2",
                 params![now_ms, id],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(storage)?;
         if changed == 0 {
-            return Err("handoff not found".into());
+            return Err(HandoffLifecycleError::NotFound("handoff not found".into()));
         }
-        let existing_reason = tx.query_row(
-            "SELECT reason FROM sekai_handoff_events WHERE manifest_id=?1 AND event_type='revoked' AND actor=?2 AND request_id=?3",
-            params![id, actor, request_id], |row| row.get::<_, String>(0)
-        ).optional().map_err(|e| e.to_string())?;
+        let existing_reason = tx
+            .query_row(
+                "SELECT reason FROM sekai_handoff_events WHERE manifest_id=?1 AND event_type='revoked' AND actor=?2 AND request_id=?3",
+                params![id, actor, request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?;
         if existing_reason
             .as_deref()
             .is_some_and(|existing| existing != reason)
         {
-            return Err("request_id is already bound to a different revocation".into());
+            return Err(HandoffLifecycleError::AlreadyExists(
+                "request_id is already bound to a different revocation".into(),
+            ));
         }
-        tx.execute("INSERT OR IGNORE INTO sekai_handoff_events(manifest_id,event_type,actor,request_id,reason,recorded_at_ms) VALUES(?1,'revoked',?2,?3,?4,?5)", params![id,actor,request_id,reason,now_ms]).map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR IGNORE INTO sekai_handoff_events(manifest_id,event_type,actor,request_id,reason,recorded_at_ms) VALUES(?1,'revoked',?2,?3,?4,?5)",
+            params![id, actor, request_id, reason, now_ms],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)?;
         drop(conn);
-        self.get_handoff(id)?
-            .ok_or_else(|| "handoff not found".into())
+        self.get_handoff(id)
+            .map_err(storage)?
+            .ok_or_else(|| HandoffLifecycleError::NotFound("handoff not found".into()))
     }
 }

@@ -6,7 +6,7 @@
 //! and revocation authority so every transport observes the same ordering.
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::handoff::{HandoffManifest, HandoffReference};
+use sekai_types::handoff::{HandoffManifest, HandoffReference};
 
 const MAX_FUTURE_SKEW_MS: i64 = 60_000;
 
@@ -32,6 +32,38 @@ pub enum HandoffLifecycleError {
     FailedPrecondition(String),
     NotFound(String),
     Storage(String),
+}
+
+impl HandoffLifecycleError {
+    pub(crate) fn storage(error: impl ToString) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+/// Classify a unique-constraint race after create: identical replay succeeds,
+/// a reused request id or manifest id is AlreadyExists, and a constraint with
+/// no surviving row is Storage.
+pub(crate) fn resolve_create_conflict(
+    by_request: Option<(String, HandoffManifest)>,
+    by_id: Option<HandoffManifest>,
+    request_digest: &str,
+) -> Result<HandoffManifest, HandoffLifecycleError> {
+    if let Some((digest, existing)) = by_request {
+        if digest == request_digest {
+            return Ok(existing);
+        }
+        return Err(HandoffLifecycleError::AlreadyExists(
+            "request_id is already bound to different handoff input".into(),
+        ));
+    }
+    if by_id.is_some() {
+        return Err(HandoffLifecycleError::AlreadyExists(
+            "handoff id is already bound to a different request".into(),
+        ));
+    }
+    Err(HandoffLifecycleError::Storage(
+        "handoff write conflict could not be classified".into(),
+    ))
 }
 
 pub struct HandoffLifecycle<'a> {
@@ -121,15 +153,7 @@ impl<'a> HandoffLifecycle<'a> {
                 ));
             }
         }
-        self.db
-            .create_handoff(&manifest, command.request_id)
-            .map_err(|error| {
-                if error.contains("different handoff") {
-                    HandoffLifecycleError::AlreadyExists(error)
-                } else {
-                    HandoffLifecycleError::InvalidArgument(error)
-                }
-            })
+        self.db.create_handoff(&manifest, command.request_id)
     }
 
     pub fn revoke(
@@ -148,15 +172,13 @@ impl<'a> HandoffLifecycle<'a> {
             return Err(HandoffLifecycleError::NotFound("handoff not found".into()));
         }
         let actor = command.principals.first().cloned().unwrap_or_default();
-        self.db
-            .revoke_handoff(
-                command.manifest_id,
-                &actor,
-                command.reason,
-                command.request_id,
-                command.now_ms,
-            )
-            .map_err(HandoffLifecycleError::InvalidArgument)
+        self.db.revoke_handoff(
+            command.manifest_id,
+            &actor,
+            command.reason,
+            command.request_id,
+            command.now_ms,
+        )
     }
 }
 
@@ -332,6 +354,50 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn create_reports_id_reuse_as_already_exists() {
+        let db = RuntimeDb::memory();
+        let lifecycle = HandoffLifecycle::new(&db);
+        create(&lifecycle, manifest("handoff-1", 1_000), "request-1").unwrap();
+        assert_eq!(
+            create(&lifecycle, manifest("handoff-1", 1_000), "request-2").unwrap_err(),
+            HandoffLifecycleError::AlreadyExists(
+                "handoff id is already bound to a different request".into()
+            )
+        );
+    }
+
+    #[test]
+    fn revoke_reports_request_id_bound_to_different_reason_as_already_exists() {
+        let db = RuntimeDb::memory();
+        let lifecycle = HandoffLifecycle::new(&db);
+        create(&lifecycle, manifest("handoff-1", 1_000), "request-1").unwrap();
+        let owner = vec!["alice".into()];
+        lifecycle
+            .revoke(RevokeHandoff {
+                manifest_id: "handoff-1",
+                reason: "superseded",
+                request_id: "revoke-1",
+                principals: &owner,
+                now_ms: 2_000,
+            })
+            .unwrap();
+        assert_eq!(
+            lifecycle
+                .revoke(RevokeHandoff {
+                    manifest_id: "handoff-1",
+                    reason: "withdrawn",
+                    request_id: "revoke-1",
+                    principals: &owner,
+                    now_ms: 3_000,
+                })
+                .unwrap_err(),
+            HandoffLifecycleError::AlreadyExists(
+                "request_id is already bound to a different revocation".into()
+            )
+        );
     }
 
     #[test]
