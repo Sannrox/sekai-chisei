@@ -252,22 +252,36 @@ fn exercise(db: RuntimeDb, namespace: &str) {
         .unwrap();
     assert_eq!(restored.properties.get("secret").unwrap(), "classified");
 
-    let missing = ExecuteFactMigration {
+    // A new migration ID after rollback re-migrates every object still bound
+    // to `from`, including one created after the rollback.
+    let remigrate = ExecuteFactMigration {
         namespace: namespace.into(),
-        migration_id: "blocked".into(),
+        migration_id: "after-rollback".into(),
         from_revision_digest: from,
         to_revision_digest: to,
         mode: MODE_EXECUTE.into(),
-        idempotency_key: "block".into(),
+        idempotency_key: "again".into(),
     };
     db.create_object(&object(namespace, "empty", "only-title", None))
         .unwrap();
-    let blocked = db.execute_definition_fact_migration(&missing, "author", &ctx("author"), 12);
-    // empty object still has title; execute after rollback re-migrates remaining
-    // objects bound to from. The empty object is migratable. Use a required-property
-    // case via a second namespace in the unit tests; here assert replay/unknown
-    // still fail closed.
-    let _ = blocked;
+    let remigrated = db
+        .execute_definition_fact_migration(&remigrate, "author", &ctx("author"), 12)
+        .unwrap();
+    assert_eq!(remigrated.status, STATUS_COMMITTED);
+    assert_eq!(remigrated.affected_count, 3);
+    assert_eq!(remigrated.migrated_count, 3);
+    assert_eq!(remigrated.blocked_count, 0);
+    for (id, title) in [("open", "hello"), ("done", "kept"), ("empty", "only-title")] {
+        let stored = db
+            .get_object(&format!("{namespace}:{id}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.properties,
+            HashMap::from([("title".to_string(), title.to_string())]),
+            "{id} after the second execute"
+        );
+    }
     let mut unknown = ExecuteFactMigration {
         namespace: namespace.into(),
         migration_id: "nope".into(),
