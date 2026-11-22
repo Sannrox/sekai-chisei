@@ -204,7 +204,7 @@ impl RuntimeBackendConfig {
                 explicit_sqlite_path
                     .as_deref()
                     .unwrap_or(default_sqlite_path),
-            )
+            )?
         }))
     }
 
