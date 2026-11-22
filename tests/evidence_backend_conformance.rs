@@ -587,6 +587,52 @@ pub(crate) fn exercise_execution_recording(db: &RuntimeDb, prefix: &str) {
         execution_state(db, &redemption.redemption_id),
         "outcome_unknown"
     );
+
+    // #2797: once the redemption is gone, validation of the first report
+    // fails, but its idempotent retry still replays the projected submission.
+    let first = execution_envelope(
+        &execution_report(prefix, ExecutionLifecycleState::Accepted, 1_501),
+        prefix,
+        1,
+    );
+    let stored = db
+        .submit_evidence(&first, &producer.producer_identity, first.observed_at_ms)
+        .unwrap()
+        .submission;
+    delete_redemption(db, &redemption.redemption_id);
+    assert!(
+        db.validate_execution_evidence_envelope(&first, &producer.producer_identity)
+            .is_err()
+    );
+    let replay = lifecycle
+        .admit(&first, &producer.producer_identity, 1_700)
+        .unwrap();
+    assert!(replay.admitted);
+    assert!(replay.deduplicated);
+    assert_eq!(replay.submission, stored);
+}
+
+fn delete_redemption(db: &RuntimeDb, redemption_id: &str) {
+    match db {
+        RuntimeDb::Sqlite(sqlite) => {
+            sqlite
+                .conn()
+                .execute(
+                    "DELETE FROM chisei_external_action_redemptions WHERE redemption_id=?1",
+                    [redemption_id],
+                )
+                .unwrap();
+        }
+        RuntimeDb::Postgres(pg) => off_runtime(|| {
+            pg.connection()
+                .unwrap()
+                .execute(
+                    "DELETE FROM chisei_external_action_redemptions WHERE redemption_id=$1",
+                    &[&redemption_id],
+                )
+                .unwrap();
+        }),
+    }
 }
 
 #[test]

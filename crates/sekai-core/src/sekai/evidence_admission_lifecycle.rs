@@ -6,7 +6,7 @@
 //! resolution behind one domain-shaped interface.
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::evidence::EvidenceEnvelope;
+use crate::sekai::evidence::{EvidenceEnvelope, EvidenceLifecycleState};
 use crate::sekai::evidence_projection::EvidenceProjectionOutcome;
 use crate::sekai::evidence_store::EvidenceSubmissionRecord;
 use crate::sekai::execution_evidence::EXECUTION_EVIDENCE_TYPE;
@@ -50,8 +50,13 @@ impl<'a> EvidenceAdmissionLifecycle<'a> {
             .map_err(EvidenceAdmissionLifecycleError::Admission)?;
         let is_execution_evidence = admission.submission.evidence_type == EXECUTION_EVIDENCE_TYPE;
 
+        // Only unprojected (Authorized) evidence is validated and can be
+        // rejected. A deduplicated retry of evidence that was already
+        // projected replays the stored submission even if validation would
+        // now fail; a retry after a crash before validation still validates.
         if admission.accepted
             && is_execution_evidence
+            && admission.submission.lifecycle_state == EvidenceLifecycleState::Authorized
             && let Err(error) = self
                 .db
                 .validate_execution_evidence_envelope(envelope, authenticated_producer)
