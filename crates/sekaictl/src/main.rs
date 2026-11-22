@@ -14,8 +14,42 @@ use sekaictl::credential_cli::{
 };
 use sekaictl::launch::{LaunchConfig, run_launch, usage as launch_usage};
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("{error}");
+        std::process::exit(exit_code(&*error));
+    }
+}
+
+/// Usage-style errors exit 2; every other error that reaches `main` exits 1.
+///
+/// Only `io::Error` is classified. Server and RPC messages are not usage even
+/// when they mention "unknown argument". CLI usage strings start with
+/// `Usage:`, `usage:`, or `sekaictl `, or are the dispatcher unknown-command
+/// texts. Later lines are checked because parse errors append `usage()`.
+fn exit_code(error: &(dyn std::error::Error + Send + Sync + 'static)) -> i32 {
+    match error.downcast_ref::<std::io::Error>() {
+        Some(io) if is_usage_error(&io.to_string()) => 2,
+        _ => 1,
+    }
+}
+
+fn is_usage_error(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("usage:")
+            || lower == "unknown command"
+            || lower == "unknown admin command"
+            || lower == "unknown gateway command"
+            || line.starts_with("sekaictl ")
+    })
+}
+
+async fn run() -> Result<(), BoxError> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
         print_root_usage();
@@ -432,9 +466,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
     Ok(expanded)
 }
 
-async fn run_credential_command(
-    args: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_credential_command(args: Vec<String>) -> Result<(), BoxError> {
     if args.is_empty() {
         println!("{}", credential_usage());
         return Ok(());
@@ -794,13 +826,41 @@ fn gateway_usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_admin_path, expand_admin_args, expert_usage, handles_own_help, help_requested,
-        removed_alias_help,
+        canonical_admin_path, exit_code, expand_admin_args, expert_usage, handles_own_help,
+        help_requested, removed_alias_help,
     };
 
     fn strings(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| arg.to_string()).collect()
     }
+
+    fn boxed_io(message: impl Into<String>) -> super::BoxError {
+        std::io::Error::other(message.into()).into()
+    }
+
+    #[test]
+    fn usage_errors_exit_2_and_other_errors_exit_1() {
+        assert_eq!(exit_code(&*boxed_io(sekaictl::replay_cli::usage())), 2);
+        assert_eq!(exit_code(&*boxed_io("unknown admin command")), 2);
+        assert_eq!(exit_code(&*boxed_io("doctor found blocking failures")), 1);
+        assert_eq!(
+            exit_code(&*boxed_io("unknown argument 'foo' in request")),
+            1
+        );
+        assert_eq!(exit_code(&*boxed_io("usage limit exceeded")), 1);
+        assert_eq!(exit_code(&Rpc("unknown argument 'foo' in request")), 1);
+    }
+
+    #[derive(Debug)]
+    struct Rpc(&'static str);
+
+    impl std::fmt::Display for Rpc {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Rpc {}
 
     #[test]
     fn help_after_double_dash_is_a_value() {
