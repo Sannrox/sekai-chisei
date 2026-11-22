@@ -1,7 +1,8 @@
 #[cfg(test)]
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
-use rusqlite::{OptionalExtension, params};
+use crate::sekai::work_unit_lifecycle::WorkUnitTransition;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -152,6 +153,18 @@ pub struct RequestDedup {
     pub queue_position: Option<i32>,
     pub reason: String,
     pub lease_owner: String,
+}
+
+/// Result of a work unit mutation committed together with its request dedup
+/// row, so a retry or a concurrent duplicate never applies it twice.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestOutcome<T> {
+    /// This request applied the mutation and recorded its dedup row.
+    Applied(T),
+    /// A request with the same id and operation already committed, so nothing
+    /// was applied; the caller replays from the stored row.
+    Replayed(RequestDedup),
 }
 
 impl SekaiDb {
@@ -353,8 +366,11 @@ impl SekaiDb {
     }
 
     pub fn create_work_unit(&self, work_unit: &WorkUnit) -> Result<(), String> {
+        Self::insert_work_unit(&self.conn(), work_unit)
+    }
+
+    fn insert_work_unit(conn: &Connection, work_unit: &WorkUnit) -> Result<(), String> {
         validate_work_unit(work_unit)?;
-        let conn = self.conn();
         conn.execute(
             "INSERT INTO sekai_work_units
              (id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at)
@@ -597,7 +613,10 @@ impl SekaiDb {
     }
 
     pub fn append_run_event(&self, event: &RunEvent) -> Result<(), String> {
-        let conn = self.conn();
+        Self::insert_run_event(&self.conn(), event)
+    }
+
+    fn insert_run_event(conn: &Connection, event: &RunEvent) -> Result<(), String> {
         let evidence_json = serde_json::to_string(&event.evidence).map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO sekai_run_events (id,work_unit_id,event_type,message,evidence_json,created_at)
@@ -620,10 +639,17 @@ impl SekaiDb {
         request_id: &str,
         operation: &str,
     ) -> Result<Option<RequestDedup>, String> {
+        Self::select_dedup_request(&self.conn(), request_id, operation)
+    }
+
+    fn select_dedup_request(
+        conn: &Connection,
+        request_id: &str,
+        operation: &str,
+    ) -> Result<Option<RequestDedup>, String> {
         if request_id.is_empty() {
             return Ok(None);
         }
-        let conn = self.conn();
         conn.query_row(
             "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at,
                     admitted,queue_position,reason,lease_owner
@@ -650,10 +676,15 @@ impl SekaiDb {
     }
 
     pub fn record_dedup_request(&self, request: &RequestDedup) -> Result<(), String> {
+        Self::insert_dedup_request(&self.conn(), request).map(drop)
+    }
+
+    /// Inserts `request` unless its id and operation already have a row;
+    /// returns whether it inserted.
+    fn insert_dedup_request(conn: &Connection, request: &RequestDedup) -> Result<bool, String> {
         if request.request_id.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        let conn = self.conn();
         conn.execute(
             "INSERT OR IGNORE INTO sekai_coordination_requests
              (request_id,operation,principal,scope_id,work_unit_id,created_at,
@@ -672,8 +703,8 @@ impl SekaiDb {
                 request.lease_owner,
             ],
         )
-        .map_err(|e| e.to_string())?;
-        Ok(())
+        .map_err(|e| e.to_string())
+        .map(|inserted| inserted == 1)
     }
 
     pub fn list_run_events(
@@ -755,7 +786,15 @@ impl SekaiDb {
         lease_owner: &str,
         now_ms: i64,
     ) -> Result<AdmissionResult, String> {
-        let conn = self.conn();
+        Self::admit_work_unit_on(&self.conn(), work_unit_id, lease_owner, now_ms)
+    }
+
+    fn admit_work_unit_on(
+        conn: &Connection,
+        work_unit_id: &str,
+        lease_owner: &str,
+        now_ms: i64,
+    ) -> Result<AdmissionResult, String> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -775,7 +814,7 @@ impl SekaiDb {
                 work_unit,
             });
         }
-        let candidate_chain = scope_chain_locked(&conn, &work_unit.scope_id)?;
+        let candidate_chain = scope_chain_locked(conn, &work_unit.scope_id)?;
         let all_pending = {
             let mut stmt = conn
                 .prepare(
@@ -794,7 +833,7 @@ impl SekaiDb {
             if other.id == work_unit.id {
                 break;
             }
-            let other_chain = scope_chain_locked(&conn, &other.scope_id)?;
+            let other_chain = scope_chain_locked(conn, &other.scope_id)?;
             if chains_overlap(&candidate_chain, &other_chain) {
                 conflicting_older += 1;
             }
@@ -898,7 +937,14 @@ impl SekaiDb {
     }
 
     pub fn heartbeat_work_unit(&self, work_unit_id: &str, now_ms: i64) -> Result<WorkUnit, String> {
-        let conn = self.conn();
+        Self::heartbeat_work_unit_on(&self.conn(), work_unit_id, now_ms)
+    }
+
+    fn heartbeat_work_unit_on(
+        conn: &Connection,
+        work_unit_id: &str,
+        now_ms: i64,
+    ) -> Result<WorkUnit, String> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -918,7 +964,7 @@ impl SekaiDb {
                 work_unit.status
             ));
         }
-        let chain = scope_chain_locked(&conn, &work_unit.scope_id)?;
+        let chain = scope_chain_locked(conn, &work_unit.scope_id)?;
         for scope in &chain {
             let ttl_seconds = if work_unit.heartbeat_ttl_seconds > 0 {
                 work_unit.heartbeat_ttl_seconds
@@ -1160,6 +1206,125 @@ impl SekaiDb {
         Ok(summary)
     }
 
+    /// Creates `work_unit` with its `created_event` and records `request` in
+    /// one transaction.
+    pub fn create_work_unit_for_request(
+        &self,
+        work_unit: &WorkUnit,
+        created_event: &RunEvent,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<()>, String> {
+        self.apply_for_request(request, |conn, row| {
+            Self::insert_work_unit(conn, work_unit)?;
+            Self::insert_run_event(conn, created_event)?;
+            row.scope_id = work_unit.scope_id.clone();
+            row.work_unit_id = work_unit.id.clone();
+            Ok(())
+        })
+    }
+
+    /// Admits a work unit and records `request` with its outcome in one
+    /// transaction.
+    pub fn try_admit_work_unit_for_request(
+        &self,
+        work_unit_id: &str,
+        lease_owner: &str,
+        now_ms: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+        self.apply_for_request(request, |conn, row| {
+            let result = Self::admit_work_unit_on(conn, work_unit_id, lease_owner, now_ms)?;
+            fill_admission_row(row, &result);
+            Ok(result)
+        })
+    }
+
+    /// Applies `transition` to a work unit and records `request` in one
+    /// transaction.
+    pub fn transition_work_unit_for_request(
+        &self,
+        work_unit_id: &str,
+        transition: &WorkUnitTransition<'_>,
+        now_ms: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<WorkUnit>, String> {
+        self.apply_for_request(request, |conn, row| {
+            let work_unit = match transition {
+                WorkUnitTransition::Heartbeat => {
+                    Self::heartbeat_work_unit_on(conn, work_unit_id, now_ms)
+                }
+                WorkUnitTransition::Complete => Self::finish_work_unit_on(
+                    conn,
+                    work_unit_id,
+                    WORK_UNIT_STATUS_COMPLETED,
+                    "",
+                    "",
+                    now_ms,
+                ),
+                WorkUnitTransition::Fail(reason) => Self::finish_work_unit_on(
+                    conn,
+                    work_unit_id,
+                    WORK_UNIT_STATUS_FAILED,
+                    reason,
+                    "",
+                    now_ms,
+                ),
+                WorkUnitTransition::Cancel(reason) => Self::finish_work_unit_on(
+                    conn,
+                    work_unit_id,
+                    WORK_UNIT_STATUS_CANCELLED,
+                    "",
+                    reason,
+                    now_ms,
+                ),
+            }?;
+            row.scope_id = work_unit.scope_id.clone();
+            row.work_unit_id = work_unit.id.clone();
+            Ok(work_unit)
+        })
+    }
+
+    /// Reserves `request`, runs `apply`, and stores the row `apply` completed,
+    /// all in one immediate transaction. A request that already has a row is
+    /// replayed without running `apply`; a failure rolls back both.
+    fn apply_for_request<T>(
+        &self,
+        request: &RequestDedup,
+        apply: impl FnOnce(&Connection, &mut RequestDedup) -> Result<T, String>,
+    ) -> Result<RequestOutcome<T>, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let tracked = !request.request_id.is_empty();
+        if tracked && !Self::insert_dedup_request(&tx, request)? {
+            return Self::select_dedup_request(&tx, &request.request_id, &request.operation)?
+                .map(RequestOutcome::Replayed)
+                .ok_or_else(|| "request dedup row missing after conflict".into());
+        }
+        let mut row = request.clone();
+        let value = apply(&tx, &mut row)?;
+        if tracked {
+            tx.execute(
+                "UPDATE sekai_coordination_requests
+                 SET scope_id=?3, work_unit_id=?4, admitted=?5, queue_position=?6, reason=?7
+                 WHERE request_id=?1 AND operation=?2",
+                params![
+                    row.request_id,
+                    row.operation,
+                    row.scope_id,
+                    row.work_unit_id,
+                    row.admitted.map(i32::from),
+                    row.queue_position,
+                    row.reason,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(RequestOutcome::Applied(value))
+    }
+
     fn finish_work_unit(
         &self,
         work_unit_id: &str,
@@ -1168,7 +1333,24 @@ impl SekaiDb {
         cancel_reason: &str,
         now_ms: i64,
     ) -> Result<WorkUnit, String> {
-        let conn = self.conn();
+        Self::finish_work_unit_on(
+            &self.conn(),
+            work_unit_id,
+            status,
+            failure_reason,
+            cancel_reason,
+            now_ms,
+        )
+    }
+
+    fn finish_work_unit_on(
+        conn: &Connection,
+        work_unit_id: &str,
+        status: &str,
+        failure_reason: &str,
+        cancel_reason: &str,
+        now_ms: i64,
+    ) -> Result<WorkUnit, String> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -1236,6 +1418,15 @@ impl SekaiDb {
         .map_err(|e| e.to_string())?;
         Ok(work_unit)
     }
+}
+
+/// Stores an admission outcome so a replay returns the original answer.
+pub(crate) fn fill_admission_row(row: &mut RequestDedup, result: &AdmissionResult) {
+    row.scope_id = result.work_unit.scope_id.clone();
+    row.work_unit_id = result.work_unit.id.clone();
+    row.admitted = Some(result.admitted);
+    row.queue_position = Some(result.queue_position);
+    row.reason = result.reason.clone();
 }
 
 fn validate_scope(scope: &ContentionScope) -> Result<(), String> {

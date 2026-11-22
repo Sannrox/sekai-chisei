@@ -1,12 +1,14 @@
 use crate::db::postgres::PostgresDb;
+use crate::sekai::coordination::fill_admission_row;
 use crate::sekai::coordination::{
     AdmissionResult, ContentionScope, RESERVATION_STATUS_ACTIVE, RESERVATION_STATUS_RELEASED,
-    ReconcileFilter, ReconcileSummary, ReconciliationRecord, RequestDedup, Reservation,
-    ReservationFilter, RunEvent, WORK_UNIT_STATUS_ADMITTED, WORK_UNIT_STATUS_CANCELLED,
-    WORK_UNIT_STATUS_COMPLETED, WORK_UNIT_STATUS_FAILED, WORK_UNIT_STATUS_PENDING,
-    WORK_UNIT_STATUS_RECONCILED, WORK_UNIT_STATUS_RUNNING, WORK_UNIT_STATUS_STALE,
-    WORK_UNIT_STATUS_TIMED_OUT, WorkUnit, WorkUnitFilter,
+    ReconcileFilter, ReconcileSummary, ReconciliationRecord, RequestDedup, RequestOutcome,
+    Reservation, ReservationFilter, RunEvent, WORK_UNIT_STATUS_ADMITTED,
+    WORK_UNIT_STATUS_CANCELLED, WORK_UNIT_STATUS_COMPLETED, WORK_UNIT_STATUS_FAILED,
+    WORK_UNIT_STATUS_PENDING, WORK_UNIT_STATUS_RECONCILED, WORK_UNIT_STATUS_RUNNING,
+    WORK_UNIT_STATUS_STALE, WORK_UNIT_STATUS_TIMED_OUT, WorkUnit, WorkUnitFilter,
 };
+use crate::sekai::work_unit_lifecycle::WorkUnitTransition;
 use postgres::{GenericClient, IsolationLevel, Row, types::ToSql};
 use std::collections::{HashMap, HashSet};
 
@@ -72,10 +74,14 @@ impl PostgresDb {
     }
 
     pub fn create_work_unit(&self, work: &WorkUnit) -> Result<(), String> {
+        Self::insert_work_unit_in(&mut *self.connection()?, work)
+    }
+
+    fn insert_work_unit_in(client: &mut impl GenericClient, work: &WorkUnit) -> Result<(), String> {
         validate_work(work)?;
         let values = work_params(work);
         let params = refs(&values);
-        self.connection()?.execute(
+        client.execute(
             "INSERT INTO sekai_work_units
              (id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,
               heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,
@@ -240,10 +246,18 @@ impl PostgresDb {
         request_id: &str,
         operation: &str,
     ) -> Result<Option<RequestDedup>, String> {
+        Self::select_request_in(&mut *self.connection()?, request_id, operation)
+    }
+
+    fn select_request_in(
+        client: &mut impl GenericClient,
+        request_id: &str,
+        operation: &str,
+    ) -> Result<Option<RequestDedup>, String> {
         if request_id.is_empty() {
             return Ok(None);
         }
-        self.connection()?
+        client
             .query_opt(
                 "SELECT request_id,operation,principal,scope_id,work_unit_id,created_at,
                     admitted,queue_position,reason,lease_owner
@@ -255,11 +269,21 @@ impl PostgresDb {
     }
 
     pub fn record_dedup_request(&self, request: &RequestDedup) -> Result<(), String> {
+        Self::insert_request_in(&mut *self.connection()?, request).map(drop)
+    }
+
+    /// Inserts `request` unless its id and operation already have a row;
+    /// returns whether it inserted. A concurrent insert of the same key waits
+    /// for the other transaction and then reports the committed row present.
+    fn insert_request_in(
+        client: &mut impl GenericClient,
+        request: &RequestDedup,
+    ) -> Result<bool, String> {
         if request.request_id.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let admitted = request.admitted.map(i32::from);
-        self.connection()?
+        client
             .execute(
                 "INSERT INTO sekai_coordination_requests
              (request_id,operation,principal,scope_id,work_unit_id,created_at,
@@ -278,7 +302,7 @@ impl PostgresDb {
                     &request.lease_owner,
                 ],
             )
-            .map(|_| ())
+            .map(|count| count == 1)
             .map_err(string)
     }
 
@@ -341,6 +365,17 @@ impl PostgresDb {
     ) -> Result<AdmissionResult, String> {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction().map_err(string)?;
+        let result = Self::admit_work_unit_in(&mut tx, id, owner, now)?;
+        tx.commit().map_err(string)?;
+        Ok(result)
+    }
+
+    fn admit_work_unit_in(
+        tx: &mut impl GenericClient,
+        id: &str,
+        owner: &str,
+        now: i64,
+    ) -> Result<AdmissionResult, String> {
         // Admission compares the global FIFO queue and may lock several
         // hierarchy rows. A single transaction-scoped lock gives every
         // contender the same first lock and prevents candidate/scope inversion.
@@ -365,7 +400,7 @@ impl PostgresDb {
         }
         // Lock every scope in root-to-leaf order. Overlapping hierarchies then
         // serialize capacity checks and prevent admission races.
-        let chain = scope_chain(&mut tx, &work.scope_id, true)?;
+        let chain = scope_chain(tx, &work.scope_id, true)?;
         let pending = tx.query(
             &format!("SELECT {WORK_COLUMNS} FROM sekai_work_units WHERE status=$1 ORDER BY created_at,id FOR UPDATE"),
             &[&WORK_UNIT_STATUS_PENDING],
@@ -375,7 +410,7 @@ impl PostgresDb {
             if other.id == work.id {
                 break;
             }
-            if chains_overlap(&chain, &scope_chain(&mut tx, &other.scope_id, true)?) {
+            if chains_overlap(&chain, &scope_chain(tx, &other.scope_id, true)?) {
                 older += 1;
             }
         }
@@ -425,7 +460,7 @@ impl PostgresDb {
                 released_at: 0,
                 created_at: now,
             };
-            insert_reservation(&mut tx, &reservation)?;
+            insert_reservation(tx, &reservation)?;
             reservations.push(reservation);
         }
         ensure_transition(&work.status, WORK_UNIT_STATUS_RUNNING)?;
@@ -439,7 +474,7 @@ impl PostgresDb {
             &[&work.id,&work.status,&now,&now,&now,&now],
         ).map_err(string)?;
         insert_event(
-            &mut tx,
+            tx,
             &RunEvent {
                 id: format!("evt:{}:admitted:{now}", work.id),
                 work_unit_id: work.id.clone(),
@@ -449,7 +484,6 @@ impl PostgresDb {
                 created_at: now,
             },
         )?;
-        tx.commit().map_err(string)?;
         Ok(AdmissionResult {
             admitted: true,
             queue_position: 0,
@@ -462,11 +496,21 @@ impl PostgresDb {
     pub fn heartbeat_work_unit(&self, id: &str, now: i64) -> Result<WorkUnit, String> {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction().map_err(string)?;
+        let result = Self::heartbeat_work_unit_in(&mut tx, id, now)?;
+        tx.commit().map_err(string)?;
+        Ok(result)
+    }
+
+    fn heartbeat_work_unit_in(
+        tx: &mut impl GenericClient,
+        id: &str,
+        now: i64,
+    ) -> Result<WorkUnit, String> {
         // Share admission's first lock so an expired reservation cannot be
         // counted as free capacity while this transaction renews it.
         tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&ADMISSION_LOCK_ID])
             .map_err(string)?;
-        let mut work = locked_work(&mut tx, id)?;
+        let mut work = locked_work(tx, id)?;
         if work.status != WORK_UNIT_STATUS_RUNNING && work.status != WORK_UNIT_STATUS_ADMITTED {
             return Err(format!("work unit is not active: {}", work.status));
         }
@@ -508,7 +552,7 @@ impl PostgresDb {
         work.last_heartbeat_at = now;
         work.updated_at = now;
         insert_event(
-            &mut tx,
+            tx,
             &RunEvent {
                 id: format!("evt:{id}:heartbeat:{now}"),
                 work_unit_id: id.into(),
@@ -518,7 +562,6 @@ impl PostgresDb {
                 created_at: now,
             },
         )?;
-        tx.commit().map_err(string)?;
         Ok(work)
     }
 
@@ -675,6 +718,108 @@ impl PostgresDb {
         Ok(summary)
     }
 
+    /// Creates `work` with its `created_event` and records `request` in one
+    /// transaction.
+    pub fn create_work_unit_for_request(
+        &self,
+        work: &WorkUnit,
+        created_event: &RunEvent,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<()>, String> {
+        self.apply_for_request(request, |tx, row| {
+            Self::insert_work_unit_in(tx, work)?;
+            insert_event(tx, created_event)?;
+            row.scope_id = work.scope_id.clone();
+            row.work_unit_id = work.id.clone();
+            Ok(())
+        })
+    }
+
+    /// Admits a work unit and records `request` with its outcome in one
+    /// transaction.
+    pub fn try_admit_work_unit_for_request(
+        &self,
+        id: &str,
+        owner: &str,
+        now: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+        self.apply_for_request(request, |tx, row| {
+            let result = Self::admit_work_unit_in(tx, id, owner, now)?;
+            fill_admission_row(row, &result);
+            Ok(result)
+        })
+    }
+
+    /// Applies `transition` to a work unit and records `request` in one
+    /// transaction.
+    pub fn transition_work_unit_for_request(
+        &self,
+        id: &str,
+        transition: &WorkUnitTransition<'_>,
+        now: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<WorkUnit>, String> {
+        self.apply_for_request(request, |tx, row| {
+            let work = match transition {
+                WorkUnitTransition::Heartbeat => Self::heartbeat_work_unit_in(tx, id, now),
+                WorkUnitTransition::Complete => {
+                    Self::finish_work_unit_in(tx, id, WORK_UNIT_STATUS_COMPLETED, "", "", now)
+                }
+                WorkUnitTransition::Fail(reason) => {
+                    Self::finish_work_unit_in(tx, id, WORK_UNIT_STATUS_FAILED, reason, "", now)
+                }
+                WorkUnitTransition::Cancel(reason) => {
+                    Self::finish_work_unit_in(tx, id, WORK_UNIT_STATUS_CANCELLED, "", reason, now)
+                }
+            }?;
+            row.scope_id = work.scope_id.clone();
+            row.work_unit_id = work.id.clone();
+            Ok(work)
+        })
+    }
+
+    /// Reserves `request`, runs `apply`, and stores the row `apply` completed,
+    /// all in one transaction. The reservation comes first, so a concurrent
+    /// duplicate waits for this transaction and then replays its row instead
+    /// of applying again; a failure rolls back both.
+    fn apply_for_request<T>(
+        &self,
+        request: &RequestDedup,
+        apply: impl FnOnce(&mut postgres::Transaction<'_>, &mut RequestDedup) -> Result<T, String>,
+    ) -> Result<RequestOutcome<T>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection.transaction().map_err(string)?;
+        let tracked = !request.request_id.is_empty();
+        if tracked && !Self::insert_request_in(&mut tx, request)? {
+            return Self::select_request_in(&mut tx, &request.request_id, &request.operation)?
+                .map(RequestOutcome::Replayed)
+                .ok_or_else(|| "request dedup row missing after conflict".into());
+        }
+        let mut row = request.clone();
+        let value = apply(&mut tx, &mut row)?;
+        if tracked {
+            let admitted = row.admitted.map(i32::from);
+            tx.execute(
+                "UPDATE sekai_coordination_requests
+                 SET scope_id=$3,work_unit_id=$4,admitted=$5,queue_position=$6,reason=$7
+                 WHERE request_id=$1 AND operation=$2",
+                &[
+                    &row.request_id,
+                    &row.operation,
+                    &row.scope_id,
+                    &row.work_unit_id,
+                    &admitted,
+                    &row.queue_position,
+                    &row.reason,
+                ],
+            )
+            .map_err(string)?;
+        }
+        tx.commit().map_err(string)?;
+        Ok(RequestOutcome::Applied(value))
+    }
+
     fn finish_work_unit(
         &self,
         id: &str,
@@ -685,7 +830,20 @@ impl PostgresDb {
     ) -> Result<WorkUnit, String> {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction().map_err(string)?;
-        let mut work = locked_work(&mut tx, id)?;
+        let result = Self::finish_work_unit_in(&mut tx, id, status, failure, cancel, now)?;
+        tx.commit().map_err(string)?;
+        Ok(result)
+    }
+
+    fn finish_work_unit_in(
+        tx: &mut impl GenericClient,
+        id: &str,
+        status: &str,
+        failure: &str,
+        cancel: &str,
+        now: i64,
+    ) -> Result<WorkUnit, String> {
+        let mut work = locked_work(tx, id)?;
         if terminal(&work.status) {
             return Ok(work);
         }
@@ -709,7 +867,7 @@ impl PostgresDb {
         tx.execute("UPDATE sekai_work_units SET status=$2,finished_at=$3,failure_reason=$4,cancel_reason=$5,updated_at=$3 WHERE id=$1",
             &[&id,&work.status,&now,&work.failure_reason,&work.cancel_reason]).map_err(string)?;
         insert_event(
-            &mut tx,
+            tx,
             &RunEvent {
                 id: format!("evt:{id}:{status}:{now}"),
                 work_unit_id: id.into(),
@@ -725,7 +883,6 @@ impl PostgresDb {
                 created_at: now,
             },
         )?;
-        tx.commit().map_err(string)?;
         Ok(work)
     }
 }
