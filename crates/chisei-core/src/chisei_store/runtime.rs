@@ -814,6 +814,31 @@ pub trait ChiseiRuntimeDb {
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String>;
 
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
+    ) -> Result<Vec<OperationReservation>, String> {
+        let listed = self.list_pending_operation_reservations(1_000)?;
+        Ok(listed
+            .into_iter()
+            .filter(|row| {
+                after.is_none_or(|cursor| {
+                    (
+                        row.created_at_ms,
+                        row.namespace.as_str(),
+                        row.operation_id.as_str(),
+                    ) > (
+                        cursor.created_at_ms,
+                        cursor.namespace.as_str(),
+                        cursor.operation_id.as_str(),
+                    )
+                })
+            })
+            .take(limit)
+            .collect())
+    }
+
     fn export_receipt_chain(&self, namespace: &str) -> Result<ReceiptChainBundle, String>;
 
     fn budget_adjust_chain(
@@ -3148,10 +3173,18 @@ impl ChiseiRuntimeDb for RuntimeDb {
         &self,
         limit: usize,
     ) -> Result<Vec<OperationReservation>, String> {
+        self.list_pending_operation_reservations_after(limit, None)
+    }
+
+    fn list_pending_operation_reservations_after(
+        &self,
+        limit: usize,
+        after: Option<&OperationReservation>,
+    ) -> Result<Vec<OperationReservation>, String> {
         match self {
-            Self::Sqlite(db) => db.list_pending_operation_reservations(limit),
+            Self::Sqlite(db) => db.list_pending_operation_reservations_after(limit, after),
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
-                db.list_pending_operation_reservations(limit)
+                db.list_pending_operation_reservations_after(limit, after)
             }),
         }
     }
