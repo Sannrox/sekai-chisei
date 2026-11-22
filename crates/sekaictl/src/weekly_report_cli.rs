@@ -172,7 +172,10 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
             "atomic weekly report replacement is unsupported on this platform",
         ));
     }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -186,7 +189,10 @@ fn write_atomically(path: &std::path::Path, contents: &[u8]) -> std::io::Result<
         let mut file = options.open(&temporary)?;
         file.write_all(contents)?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
