@@ -77,14 +77,24 @@ fn adapter_lifecycle(adapter_id: &str) {
     )
     .unwrap();
     assert_eq!(deleted.partitions.len(), 1);
+    // Positive control: the owner can reimport `deleted`, so the two refusals
+    // below come from the caller check and the revoke, not from the input.
+    assert_eq!(
+        reimport_snapshot(&db, "integrator", &deleted, 4_050)
+            .unwrap()
+            .outcome,
+        OUTCOME_REPLAYED
+    );
     assert_eq!(
         reimport_snapshot(&db, "intruder", &deleted, 4_100).unwrap_err(),
         LAKEHOUSE_UNAVAILABLE
     );
     let revoked = revoke_snapshot(&db, "integrator", "ops", &snapshot.snapshot_id, 5_000).unwrap();
     assert_eq!(revoked.status, STATUS_REVOKED);
+    // Revoking changes the stored digest, so reimport the stored revoked
+    // snapshot itself: only the revoked status can refuse it.
     assert_eq!(
-        reimport_snapshot(&db, "integrator", &deleted, 5_100).unwrap_err(),
+        reimport_snapshot(&db, "integrator", &revoked, 5_100).unwrap_err(),
         LAKEHOUSE_UNAVAILABLE
     );
 }
