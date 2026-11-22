@@ -267,11 +267,21 @@ pub enum BaselineVerdict {
     NotComparable(Ineligibility),
     /// Present in the current runs but absent from the baseline.
     MissingFromBaseline,
+    /// Present in the baseline but absent from every current run.
+    MissingFromCurrent,
 }
 
 impl BaselineVerdict {
     pub fn is_regression(&self) -> bool {
         matches!(self, BaselineVerdict::Regressed { .. })
+    }
+
+    /// A slower-than-baseline result, or a baseline workload that disappeared.
+    pub fn fails_gate(&self) -> bool {
+        matches!(
+            self,
+            BaselineVerdict::Regressed { .. } | BaselineVerdict::MissingFromCurrent
+        )
     }
 }
 
@@ -286,7 +296,7 @@ pub struct BaselineComparison {
     pub verdict: BaselineVerdict,
 }
 
-/// Comparison across every workload shared by the runs and the baseline.
+/// Comparison across every workload in the runs or the baseline.
 #[derive(Debug, Clone, Serialize)]
 pub struct BaselineReport {
     pub comparisons: Vec<BaselineComparison>,
@@ -308,7 +318,9 @@ impl BaselineReport {
     }
 
     pub fn passed(&self) -> bool {
-        self.regressions().is_empty()
+        self.comparisons
+            .iter()
+            .all(|comparison| !comparison.verdict.fails_gate())
     }
 }
 
@@ -436,9 +448,9 @@ pub fn compare_to_baseline_with_threshold(
         .map(|sample| (sample.id.as_str(), sample))
         .collect();
 
-    let comparisons = by_workload
-        .iter()
-        .map(|(id, samples)| match baseline_by_id.get(id.as_str()) {
+    let mut comparisons: BTreeMap<String, BaselineComparison> = BTreeMap::new();
+    for (id, samples) in &by_workload {
+        let comparison = match baseline_by_id.get(id.as_str()) {
             Some(baseline_sample) => compare_workload_with_threshold(
                 id,
                 samples,
@@ -461,10 +473,29 @@ pub fn compare_to_baseline_with_threshold(
                     verdict: BaselineVerdict::MissingFromBaseline,
                 }
             }
-        })
-        .collect();
+        };
+        comparisons.insert(id.clone(), comparison);
+    }
+    for (id, baseline_sample) in &baseline_by_id {
+        if comparisons.contains_key(*id) {
+            continue;
+        }
+        comparisons.insert(
+            (*id).to_string(),
+            BaselineComparison {
+                id: (*id).to_string(),
+                baseline_p95_us: baseline_sample.p95_latency_us,
+                current_median_p95_us: 0.0,
+                delta_percent: 0.0,
+                combined_noise_percent: 0.0,
+                verdict: BaselineVerdict::MissingFromCurrent,
+            },
+        );
+    }
 
-    BaselineReport { comparisons }
+    BaselineReport {
+        comparisons: comparisons.into_values().collect(),
+    }
 }
 
 #[cfg(test)]
@@ -719,13 +750,25 @@ mod tests {
             vec![sample("brand_new", 10.0, 1.0)],
             vec![sample("brand_new", 10.0, 1.0)],
         ];
-        let report = compare_to_baseline(&runs, &[sample("other", 5.0, 1.0)]);
+        let report = compare_to_baseline(&runs, &[]);
         assert_eq!(report.comparisons.len(), 1);
         assert_eq!(
             report.comparisons[0].verdict,
             BaselineVerdict::MissingFromBaseline
         );
         assert!(report.passed());
+    }
+
+    #[test]
+    fn baseline_workload_missing_from_current_runs_fails_the_gate() {
+        let report = compare_to_baseline(&[vec![]], &[sample("gone", 5.0, 1.0)]);
+        assert_eq!(report.comparisons.len(), 1);
+        assert_eq!(report.comparisons[0].id, "gone");
+        assert_eq!(
+            report.comparisons[0].verdict,
+            BaselineVerdict::MissingFromCurrent
+        );
+        assert!(!report.passed());
     }
 
     #[test]
