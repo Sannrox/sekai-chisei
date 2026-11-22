@@ -2,12 +2,15 @@
 //!
 //! The gRPC adapter authenticates and authorizes a request before crossing this
 //! seam. This module owns replay identity, transition persistence, and durable
-//! request deduplication so every transport observes the same ordering.
+//! request deduplication so every transport observes the same ordering. Each
+//! mutation commits in one transaction with its request dedup row, so a retry
+//! or a concurrent duplicate replays the first result instead of applying again.
 
 use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::coordination::{
     AdmissionResult, RESERVATION_STATUS_ACTIVE, ReconcileFilter, ReconcileSummary, RequestDedup,
-    ReservationFilter, RunEvent, WORK_UNIT_STATUS_PENDING, WORK_UNIT_STATUS_RUNNING, WorkUnit,
+    RequestOutcome, ReservationFilter, RunEvent, WORK_UNIT_STATUS_PENDING,
+    WORK_UNIT_STATUS_RUNNING, WorkUnit,
 };
 
 pub struct CreateWorkUnit<'a> {
@@ -102,15 +105,8 @@ impl<'a> WorkUnitLifecycle<'a> {
                 CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::Storage(error))
             })?
         {
-            if record.principal != command.principal {
-                return Err(CreateWorkUnitError::Lifecycle(
-                    WorkUnitLifecycleError::AlreadyExists(
-                        "request_id already used for create_work_unit by another principal".into(),
-                    ),
-                ));
-            }
             return self
-                .load(&record.work_unit_id)
+                .replay_create(&record, command.principal)
                 .map_err(CreateWorkUnitError::Lifecycle);
         }
 
@@ -130,91 +126,64 @@ impl<'a> WorkUnitLifecycle<'a> {
         authorize(CreateAuthorizationTarget::New(&command.work_unit))
             .map_err(CreateWorkUnitError::Authorization)?;
         initialize_for_create(&mut command.work_unit, command.principal);
-        self.db
-            .create_work_unit(&command.work_unit)
+        let work_unit = command.work_unit;
+        let created_event = RunEvent {
+            id: format!("evt:{}:created:{}", work_unit.id, work_unit.created_at),
+            work_unit_id: work_unit.id.clone(),
+            event_type: "created".into(),
+            message: "work unit created".into(),
+            evidence: std::collections::HashMap::from([(
+                "scope_id".into(),
+                work_unit.scope_id.clone(),
+            )]),
+            created_at: work_unit.created_at,
+        };
+        let request = RequestDedup {
+            request_id: command.request_id.into(),
+            operation: "create_work_unit".into(),
+            principal: command.principal.into(),
+            created_at: command.now_ms,
+            ..Default::default()
+        };
+        match self
+            .db
+            .create_work_unit_for_request(&work_unit, &created_event, &request)
             .map_err(|error| {
                 CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::InvalidArgument(error))
-            })?;
-        self.db
-            .append_run_event(&RunEvent {
-                id: format!(
-                    "evt:{}:created:{}",
-                    command.work_unit.id, command.work_unit.created_at
-                ),
-                work_unit_id: command.work_unit.id.clone(),
-                event_type: "created".into(),
-                message: "work unit created".into(),
-                evidence: std::collections::HashMap::from([(
-                    "scope_id".into(),
-                    command.work_unit.scope_id.clone(),
-                )]),
-                created_at: command.work_unit.created_at,
-            })
-            .map_err(|error| {
-                CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::Storage(error))
-            })?;
-        self.record(
-            command.request_id,
-            "create_work_unit",
-            command.principal,
-            &command.work_unit,
-            command.now_ms,
-        )
-        .map_err(CreateWorkUnitError::Lifecycle)?;
-        Ok(command.work_unit)
+            })? {
+            RequestOutcome::Applied(()) => Ok(work_unit),
+            RequestOutcome::Replayed(record) => self
+                .replay_create(&record, command.principal)
+                .map_err(CreateWorkUnitError::Lifecycle),
+        }
     }
 
     pub fn admit(
         &self,
         command: AdmitWorkUnit<'_>,
     ) -> Result<AdmissionResult, WorkUnitLifecycleError> {
-        if let Some(record) = self
+        let request = RequestDedup {
+            request_id: command.request_id.into(),
+            operation: "try_admit_work_unit".into(),
+            principal: command.principal.into(),
+            work_unit_id: command.work_unit_id.into(),
+            created_at: command.now_ms,
+            lease_owner: command.lease_owner.into(),
+            ..Default::default()
+        };
+        match self
             .db
-            .get_dedup_request(command.request_id, "try_admit_work_unit")
-            .map_err(WorkUnitLifecycleError::Storage)?
+            .try_admit_work_unit_for_request(
+                command.work_unit_id,
+                command.lease_owner,
+                command.now_ms,
+                &request,
+            )
+            .map_err(WorkUnitLifecycleError::FailedPrecondition)?
         {
-            if record.work_unit_id != command.work_unit_id
-                || record.principal != command.principal
-                || (record.admitted.is_some() && record.lease_owner != command.lease_owner)
-            {
-                return Err(WorkUnitLifecycleError::AlreadyExists(
-                    "request_id already used for try_admit_work_unit with a different binding"
-                        .into(),
-                ));
-            }
-            let work_unit = self.load(&record.work_unit_id)?;
-            let reservations = self
-                .db
-                .list_reservations(&ReservationFilter {
-                    work_unit_id: Some(record.work_unit_id),
-                    status: Some(RESERVATION_STATUS_ACTIVE.into()),
-                    ..Default::default()
-                })
-                .map_err(WorkUnitLifecycleError::Storage)?;
-            if let Some(admitted) = record.admitted {
-                return Ok(AdmissionResult {
-                    admitted,
-                    queue_position: record.queue_position.unwrap_or(0),
-                    reason: record.reason,
-                    work_unit,
-                    reservations,
-                });
-            }
-            return Ok(AdmissionResult {
-                admitted: work_unit.status == WORK_UNIT_STATUS_RUNNING,
-                queue_position: 0,
-                reason: String::new(),
-                work_unit,
-                reservations,
-            });
+            RequestOutcome::Applied(result) => Ok(result),
+            RequestOutcome::Replayed(record) => self.replay_admission(&command, record),
         }
-
-        let result = self
-            .db
-            .try_admit_work_unit(command.work_unit_id, command.lease_owner, command.now_ms)
-            .map_err(WorkUnitLifecycleError::FailedPrecondition)?;
-        self.record_admission(&command, &result)?;
-        Ok(result)
     }
 
     pub fn transition(
@@ -222,45 +191,36 @@ impl<'a> WorkUnitLifecycle<'a> {
         command: TransitionWorkUnit<'_>,
     ) -> Result<WorkUnit, WorkUnitLifecycleError> {
         let operation = command.transition.operation();
-        if let Some(record) = self
+        let request = RequestDedup {
+            request_id: command.request_id.into(),
+            operation: operation.into(),
+            principal: command.principal.into(),
+            work_unit_id: command.work_unit_id.into(),
+            created_at: command.now_ms,
+            ..Default::default()
+        };
+        match self
             .db
-            .get_dedup_request(command.request_id, operation)
-            .map_err(WorkUnitLifecycleError::Storage)?
+            .transition_work_unit_for_request(
+                command.work_unit_id,
+                &command.transition,
+                command.now_ms,
+                &request,
+            )
+            .map_err(WorkUnitLifecycleError::FailedPrecondition)?
         {
-            if record.work_unit_id != command.work_unit_id || record.principal != command.principal
-            {
-                return Err(WorkUnitLifecycleError::AlreadyExists(format!(
-                    "request_id already used for {operation} with a different binding"
-                )));
-            }
-            return self.load(command.work_unit_id);
-        }
-
-        let work_unit = match command.transition {
-            WorkUnitTransition::Heartbeat => self
-                .db
-                .heartbeat_work_unit(command.work_unit_id, command.now_ms),
-            WorkUnitTransition::Complete => self
-                .db
-                .complete_work_unit(command.work_unit_id, command.now_ms),
-            WorkUnitTransition::Fail(reason) => {
-                self.db
-                    .fail_work_unit(command.work_unit_id, reason, command.now_ms)
-            }
-            WorkUnitTransition::Cancel(reason) => {
-                self.db
-                    .cancel_work_unit(command.work_unit_id, reason, command.now_ms)
+            RequestOutcome::Applied(work_unit) => Ok(work_unit),
+            RequestOutcome::Replayed(record) => {
+                if record.work_unit_id != command.work_unit_id
+                    || record.principal != command.principal
+                {
+                    return Err(WorkUnitLifecycleError::AlreadyExists(format!(
+                        "request_id already used for {operation} with a different binding"
+                    )));
+                }
+                self.load(command.work_unit_id)
             }
         }
-        .map_err(WorkUnitLifecycleError::FailedPrecondition)?;
-        self.record(
-            command.request_id,
-            operation,
-            command.principal,
-            &work_unit,
-            command.now_ms,
-        )?;
-        Ok(work_unit)
     }
 
     pub fn reconcile(
@@ -366,46 +326,61 @@ impl<'a> WorkUnitLifecycle<'a> {
             .map_err(WorkUnitLifecycleError::Storage)
     }
 
-    fn record(
+    /// Returns the unit an earlier create with this request id made, unless
+    /// another principal used the id.
+    fn replay_create(
         &self,
-        request_id: &str,
-        operation: &str,
+        record: &RequestDedup,
         principal: &str,
-        work_unit: &WorkUnit,
-        now_ms: i64,
-    ) -> Result<(), WorkUnitLifecycleError> {
-        self.db
-            .record_dedup_request(&RequestDedup {
-                request_id: request_id.into(),
-                operation: operation.into(),
-                principal: principal.into(),
-                scope_id: work_unit.scope_id.clone(),
-                work_unit_id: work_unit.id.clone(),
-                created_at: now_ms,
-                ..Default::default()
-            })
-            .map_err(WorkUnitLifecycleError::Storage)
+    ) -> Result<WorkUnit, WorkUnitLifecycleError> {
+        if record.principal != principal {
+            return Err(WorkUnitLifecycleError::AlreadyExists(
+                "request_id already used for create_work_unit by another principal".into(),
+            ));
+        }
+        self.load(&record.work_unit_id)
     }
 
-    fn record_admission(
+    /// Returns the admission an earlier request with this id stored. Rows
+    /// written before admission outcomes were stored replay from current state.
+    fn replay_admission(
         &self,
         command: &AdmitWorkUnit<'_>,
-        result: &AdmissionResult,
-    ) -> Result<(), WorkUnitLifecycleError> {
-        self.db
-            .record_dedup_request(&RequestDedup {
-                request_id: command.request_id.into(),
-                operation: "try_admit_work_unit".into(),
-                principal: command.principal.into(),
-                scope_id: result.work_unit.scope_id.clone(),
-                work_unit_id: result.work_unit.id.clone(),
-                created_at: command.now_ms,
-                admitted: Some(result.admitted),
-                queue_position: Some(result.queue_position),
-                reason: result.reason.clone(),
-                lease_owner: command.lease_owner.into(),
+        record: RequestDedup,
+    ) -> Result<AdmissionResult, WorkUnitLifecycleError> {
+        if record.work_unit_id != command.work_unit_id
+            || record.principal != command.principal
+            || (record.admitted.is_some() && record.lease_owner != command.lease_owner)
+        {
+            return Err(WorkUnitLifecycleError::AlreadyExists(
+                "request_id already used for try_admit_work_unit with a different binding".into(),
+            ));
+        }
+        let work_unit = self.load(&record.work_unit_id)?;
+        let reservations = self
+            .db
+            .list_reservations(&ReservationFilter {
+                work_unit_id: Some(record.work_unit_id),
+                status: Some(RESERVATION_STATUS_ACTIVE.into()),
+                ..Default::default()
             })
-            .map_err(WorkUnitLifecycleError::Storage)
+            .map_err(WorkUnitLifecycleError::Storage)?;
+        if let Some(admitted) = record.admitted {
+            return Ok(AdmissionResult {
+                admitted,
+                queue_position: record.queue_position.unwrap_or(0),
+                reason: record.reason,
+                work_unit,
+                reservations,
+            });
+        }
+        Ok(AdmissionResult {
+            admitted: work_unit.status == WORK_UNIT_STATUS_RUNNING,
+            queue_position: 0,
+            reason: String::new(),
+            work_unit,
+            reservations,
+        })
     }
 }
 
@@ -451,7 +426,7 @@ mod tests {
     use super::*;
     use crate::sekai::coordination::{
         ADMISSION_POLICY_FIFO, ContentionScope, WORK_UNIT_STATUS_CANCELLED,
-        WORK_UNIT_STATUS_PENDING,
+        WORK_UNIT_STATUS_COMPLETED, WORK_UNIT_STATUS_PENDING,
     };
 
     fn work_unit() -> WorkUnit {
@@ -831,6 +806,140 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, WorkUnitLifecycleError::AlreadyExists(_)));
+    }
+
+    /// Makes every dedup write that carries a mutation result fail, the way a
+    /// storage fault after the mutation would.
+    fn fail_dedup_writes(db: &RuntimeDb, fail: bool) {
+        let conn = db.as_sqlite().expect("sqlite").conn();
+        conn.execute_batch(if fail {
+            "CREATE TRIGGER fail_dedup_insert BEFORE INSERT ON sekai_coordination_requests
+             WHEN NEW.scope_id <> '' BEGIN SELECT RAISE(ABORT, 'injected'); END;
+             CREATE TRIGGER fail_dedup_update BEFORE UPDATE ON sekai_coordination_requests
+             WHEN NEW.scope_id <> '' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+        } else {
+            "DROP TRIGGER fail_dedup_insert; DROP TRIGGER fail_dedup_update;"
+        })
+        .unwrap();
+    }
+
+    // #2724: the mutation committed before its dedup row, so a retry after a
+    // failed dedup write re-ran it: a retried admit reported "not pending".
+    #[test]
+    fn a_failed_dedup_write_rolls_back_the_mutation_and_the_retry_applies_it() {
+        let db = database();
+        let lifecycle = WorkUnitLifecycle::new(&db);
+        let status = || db.get_work_unit("work-1").unwrap().unwrap().status;
+        let admit = |now_ms| {
+            lifecycle.admit(AdmitWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "admit-1",
+                principal: "alice",
+                lease_owner: "alice",
+                now_ms,
+            })
+        };
+        let complete = |now_ms| {
+            lifecycle.transition(TransitionWorkUnit {
+                work_unit_id: "work-1",
+                request_id: "complete-1",
+                principal: "alice",
+                transition: WorkUnitTransition::Complete,
+                now_ms,
+            })
+        };
+
+        fail_dedup_writes(&db, true);
+        assert!(admit(10).is_err());
+        assert_eq!(status(), WORK_UNIT_STATUS_PENDING);
+        fail_dedup_writes(&db, false);
+        assert!(admit(20).unwrap().admitted);
+
+        fail_dedup_writes(&db, true);
+        assert!(complete(30).is_err());
+        assert_eq!(status(), WORK_UNIT_STATUS_RUNNING);
+        fail_dedup_writes(&db, false);
+        let completed = complete(40).unwrap();
+        assert_eq!(completed.status, WORK_UNIT_STATUS_COMPLETED);
+        assert_eq!(completed.finished_at, 40);
+    }
+
+    /// Several threads send the same heartbeat at once; one applies it and
+    /// the rest replay it.
+    fn concurrent_duplicates_apply_once(db: &RuntimeDb, prefix: &str) {
+        let scope_id = format!("{prefix}-scope");
+        let work_unit_id = format!("{prefix}-work");
+        db.create_contention_scope(&ContentionScope {
+            id: scope_id.clone(),
+            name: scope_id.clone(),
+            parent_scope_id: String::new(),
+            max_concurrency: 1,
+            admission_policy: ADMISSION_POLICY_FIFO.into(),
+            heartbeat_ttl_seconds: 30,
+            timeout_seconds: 60,
+            owner_principal: "alice".into(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        db.create_work_unit(&WorkUnit {
+            id: work_unit_id.clone(),
+            scope_id,
+            idempotency_key: format!("{prefix}-key"),
+            ..work_unit()
+        })
+        .unwrap();
+        assert!(
+            db.try_admit_work_unit(&work_unit_id, "alice", 10)
+                .unwrap()
+                .admitted
+        );
+
+        let request_id = format!("{prefix}-heartbeat");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    threads.spawn(|| {
+                        barrier.wait();
+                        WorkUnitLifecycle::new(db).transition(TransitionWorkUnit {
+                            work_unit_id: &work_unit_id,
+                            request_id: &request_id,
+                            principal: "alice",
+                            transition: WorkUnitTransition::Heartbeat,
+                            now_ms: 20,
+                        })
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap().unwrap().last_heartbeat_at, 20);
+            }
+        });
+        let heartbeats = db
+            .list_run_events(&work_unit_id, 100, 0, &["heartbeat".into()], None)
+            .unwrap();
+        assert_eq!(heartbeats.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_concurrent_duplicate_requests_apply_once() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL")
+            .expect("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database");
+        let db = match std::env::var("SEKAI_TEST_POSTGRES_CA_CERT") {
+            Ok(path) => crate::db::postgres::PostgresDb::connect_with_ca_certificate(
+                &url,
+                8,
+                &std::fs::read(path).unwrap(),
+            ),
+            Err(_) => crate::db::postgres::PostgresDb::connect(&url, 8),
+        };
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
+        concurrent_duplicates_apply_once(
+            &db,
+            &format!("dedup-{}-{}", std::process::id(), uuid::Uuid::new_v4()),
+        );
     }
 
     #[test]

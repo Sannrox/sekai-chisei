@@ -2,6 +2,8 @@
 #![allow(unused_imports)]
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use crate::sekai::coordination::RequestOutcome;
+use crate::sekai::work_unit_lifecycle::WorkUnitTransition;
 
 impl RuntimeDb {
     pub fn list_active_credentials(&self) -> Result<Vec<PrincipalCredential>, String> {
@@ -636,6 +638,54 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.try_admit_work_unit(work_unit_id, lease_owner, now_ms),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.try_admit_work_unit(work_unit_id, lease_owner, now_ms)
+            }),
+        }
+    }
+
+    pub fn create_work_unit_for_request(
+        &self,
+        work_unit: &WorkUnit,
+        created_event: &RunEvent,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<()>, String> {
+        match self {
+            Self::Sqlite(db) => db.create_work_unit_for_request(work_unit, created_event, request),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.create_work_unit_for_request(work_unit, created_event, request)
+            }),
+        }
+    }
+
+    pub fn try_admit_work_unit_for_request(
+        &self,
+        work_unit_id: &str,
+        lease_owner: &str,
+        now_ms: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.try_admit_work_unit_for_request(work_unit_id, lease_owner, now_ms, request)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.try_admit_work_unit_for_request(work_unit_id, lease_owner, now_ms, request)
+            }),
+        }
+    }
+
+    pub fn transition_work_unit_for_request(
+        &self,
+        work_unit_id: &str,
+        transition: &WorkUnitTransition<'_>,
+        now_ms: i64,
+        request: &RequestDedup,
+    ) -> Result<RequestOutcome<WorkUnit>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.transition_work_unit_for_request(work_unit_id, transition, now_ms, request)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transition_work_unit_for_request(work_unit_id, transition, now_ms, request)
             }),
         }
     }
