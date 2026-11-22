@@ -199,6 +199,23 @@ fn run_until_exit(mut command: Command, timeout: Duration) -> std::process::Exit
     }
 }
 
+/// Runs a plane process that must refuse to boot and returns its stderr.
+/// Stderr goes to a file in `dir` so a chatty child never blocks on a full
+/// pipe while `run_until_exit` polls it.
+fn refusal_stderr(mut command: Command, dir: &std::path::Path, label: &str) -> String {
+    let path = dir.join(format!("{label}.stderr"));
+    command
+        .env_remove("SEKAI_DATABASE_URL")
+        .env_remove("CHISEI_DATABASE_URL")
+        .env_remove("DATABASE_URL")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&path).unwrap());
+    let status = run_until_exit(command, Duration::from_secs(10));
+    let stderr = std::fs::read_to_string(&path).unwrap();
+    assert!(!status.success(), "{label} booted: {stderr}");
+    stderr
+}
+
 async fn plane_endpoint(port: u16) -> tonic::transport::Channel {
     tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
         .unwrap()
@@ -489,13 +506,13 @@ async fn two_plane_processes_submit_receipt_and_reject_wrong_plane_inner(killer:
         .env("OPS_PORT", "")
         .env("SEKAI_HTTP_PORT", "")
         .env_remove("CHISEI_DB_PATH")
-        .env_remove("CHISEI_DATABASE_URL")
-        .env("SEKAI_DB_PATH", chisei_db.to_str().unwrap())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("SEKAI_DB_PATH", chisei_db.to_str().unwrap());
     crate::isolate_object_log(&mut refuse, dir.path());
-    let status = run_until_exit(refuse, Duration::from_secs(10));
-    assert!(!status.success(), "sekai process opened a Chisei store");
+    let stderr = refusal_stderr(refuse, dir.path(), "sekai-on-chisei-store");
+    assert!(
+        stderr.contains("cannot open a store stamped for chisei"),
+        "expected the Chisei store refusal, got {stderr}"
+    );
 }
 
 #[test]
@@ -512,10 +529,11 @@ fn sekai_binary_refuses_chisei_destination_variables() {
         .env("OPS_PORT", "")
         .env("SEKAI_HTTP_PORT", "")
         .env("SEKAI_DB_PATH", sekai_db.to_str().unwrap())
-        .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("CHISEI_DB_PATH", chisei_db.to_str().unwrap());
     crate::isolate_object_log(&mut command, dir.path());
-    let status = run_until_exit(command, Duration::from_secs(10));
-    assert!(!status.success());
+    let stderr = refusal_stderr(command, dir.path(), "sekai-with-chisei-path");
+    assert!(
+        stderr.contains("refuses Chisei destination variables"),
+        "expected the CHISEI_DB_PATH refusal, got {stderr}"
+    );
 }
