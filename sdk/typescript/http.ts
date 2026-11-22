@@ -128,9 +128,19 @@ export async function invokeHttpJson<T>(
     },
     body: JSON.stringify(body ?? {}),
   });
-  const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.message ?? response.statusText);
+    const text = await response.text();
+    try {
+      const payload = JSON.parse(text);
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+        throw new Error(payload.message ?? `${response.status} ${response.statusText}`);
+      }
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) {
+        throw error;
+      }
+    }
+    throw new Error(`${response.status} ${response.statusText}`);
   }
-  return payload as T;
+  return (await response.json()) as T;
 }
