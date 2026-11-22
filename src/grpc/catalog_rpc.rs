@@ -600,7 +600,7 @@ impl SekaiServiceImpl {
             return Err(Status::failed_precondition("capability unavailable"));
         }
 
-        let invocation = CatalogInvocation::begin(
+        let mut invocation = CatalogInvocation::begin(
             self.db.runtime(),
             operation_id.clone(),
             namespace,
@@ -608,6 +608,7 @@ impl SekaiServiceImpl {
             capability_name,
             catalog_version,
         )?;
+        invocation.mark_policy_decided("allow");
         Ok(Some((operation_id, invocation)))
     }
 }
