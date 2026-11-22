@@ -7,8 +7,6 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::Value;
-
 pub const PART_FRESHNESS: &str = "freshness";
 pub const PART_QUALITY: &str = "quality";
 pub const PART_CONTRACT: &str = "contract";
@@ -165,14 +163,9 @@ fn has_property(
     member: &crate::sekai::definition_branch::DefinitionMember,
     property: &str,
 ) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(&member.definition_json) else {
-        return false;
-    };
-    match value.get("properties") {
-        Some(Value::Array(names)) => names.iter().any(|name| name.as_str() == Some(property)),
-        Some(Value::Object(names)) => names.contains_key(property),
-        _ => false,
-    }
+    crate::sekai::object_set::declared_property_names(member)
+        .iter()
+        .any(|name| name == property)
 }
 
 /// One lint finding, as the lint part reads it.
