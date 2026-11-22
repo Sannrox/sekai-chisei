@@ -443,6 +443,25 @@ impl EvalStore {
         changed_file: &str,
         diff_hash: &str,
     ) -> Result<Iteration, String> {
+        self.track_iteration_at(
+            suite_id,
+            run_id,
+            changed_file,
+            diff_hash,
+            chrono::Utc::now().timestamp_millis(),
+        )
+    }
+
+    /// `track_iteration` at an explicit creation millisecond, so tests can
+    /// create two iterations in the same millisecond without racing the clock.
+    fn track_iteration_at(
+        &self,
+        suite_id: &str,
+        run_id: &str,
+        changed_file: &str,
+        diff_hash: &str,
+        now: i64,
+    ) -> Result<Iteration, String> {
         let run = self
             .get_run(run_id)
             .ok_or_else(|| format!("eval run not found: {run_id}"))?;
@@ -454,7 +473,6 @@ impl EvalStore {
         }
         let namespace = self.infer_iteration_namespace(suite_id, &run, changed_file)?;
         let previous = self.latest_iteration_for_suite_file(suite_id, changed_file);
-        let now = chrono::Utc::now().timestamp_millis();
         let seq = self.next_sequence();
         let mut iteration = Iteration {
             id: format!("iter-{}-{now}-{seq}", run.id),
@@ -1757,30 +1775,14 @@ mod tests {
     }
 
     fn assert_same_millisecond_iterations_persist(store: &EvalStore, suite_id: &str, run_id: &str) {
-        let mut pair = None;
-        for attempt in 0..1_000 {
-            let first = store
-                .track_iteration(
-                    suite_id,
-                    run_id,
-                    &format!("skills/same-ms-{attempt}.md"),
-                    "hash-a",
-                )
-                .expect("first iteration");
-            let second = store
-                .track_iteration(
-                    suite_id,
-                    run_id,
-                    &format!("skills/same-ms-{attempt}.md"),
-                    "hash-b",
-                )
-                .expect("second iteration");
-            if first.created == second.created {
-                pair = Some((first, second));
-                break;
-            }
-        }
-        let (first, second) = pair.expect("two track_iteration calls shared a millisecond");
+        const CREATED: i64 = 1_700_000_000_000;
+        let first = store
+            .track_iteration_at(suite_id, run_id, "skills/same-ms.md", "hash-a", CREATED)
+            .expect("first iteration");
+        let second = store
+            .track_iteration_at(suite_id, run_id, "skills/same-ms.md", "hash-b", CREATED)
+            .expect("second iteration");
+        assert_eq!(first.created, second.created);
         assert_ne!(first.id, second.id);
         assert_iteration_id_uses_created(&first, run_id);
         assert_iteration_id_uses_created(&second, run_id);
