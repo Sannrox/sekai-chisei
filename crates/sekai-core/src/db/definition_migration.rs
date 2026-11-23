@@ -686,19 +686,9 @@ fn load_ancestors_sqlite(
     tx: &rusqlite::Transaction<'_>,
     to: &crate::sekai::definition_branch::DefinitionRevision,
 ) -> Result<Vec<crate::sekai::definition_branch::DefinitionRevision>, String> {
-    let mut ancestors = Vec::new();
-    let mut current = to.parent_revision_digest.clone();
-    for _ in 0..4_096 {
-        if current.is_empty() {
-            break;
-        }
-        let Ok(revision) = load_revision_required_sqlite(tx, &to.namespace, &current) else {
-            break;
-        };
-        current = revision.parent_revision_digest.clone();
-        ancestors.push(revision);
-    }
-    Ok(ancestors)
+    crate::sekai::definition_migration::load_ancestors(to, |digest| {
+        load_revision_required_sqlite(tx, &to.namespace, digest)
+    })
 }
 
 fn list_namespace_objects_sqlite(
@@ -1332,19 +1322,9 @@ fn load_ancestors_postgres(
     tx: &mut postgres::Transaction<'_>,
     to: &crate::sekai::definition_branch::DefinitionRevision,
 ) -> Result<Vec<crate::sekai::definition_branch::DefinitionRevision>, String> {
-    let mut ancestors = Vec::new();
-    let mut current = to.parent_revision_digest.clone();
-    for _ in 0..4_096 {
-        if current.is_empty() {
-            break;
-        }
-        let Ok(revision) = load_revision_required_postgres(tx, &to.namespace, &current) else {
-            break;
-        };
-        current = revision.parent_revision_digest.clone();
-        ancestors.push(revision);
-    }
-    Ok(ancestors)
+    crate::sekai::definition_migration::load_ancestors(to, |digest| {
+        load_revision_required_postgres(tx, &to.namespace, digest)
+    })
 }
 
 fn list_namespace_objects_postgres(
