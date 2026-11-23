@@ -121,6 +121,93 @@ pub struct EvalCaseResult {
     pub case_id: String,
     pub outcome: CaseOutcome,
     pub recorded_at_ms: i64,
+    /// The case's operation receipt, [`case_operation_id`], in the run's
+    /// namespace (#2694). Absent on results recorded before case
+    /// receipts existed, and when the store keeps no receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+/// The operation id of `case_id`'s receipt in run `run_id` of `namespace`:
+/// `eval-case:` and the first 32 hex digits of a SHA-256 over the three
+/// length-prefixed ids. Operation ids are global while run ids are unique
+/// only per namespace, and ids may hold `:`, so the plain ids joined could
+/// name another tenant's case. Fixed per case, so every start of the run
+/// names the same receipt and only the start that records the case writes
+/// it.
+pub fn case_operation_id(namespace: &str, run_id: &str, case_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for id in [namespace, run_id, case_id] {
+        hash.update((id.len() as u64).to_be_bytes());
+        hash.update(id.as_bytes());
+    }
+    let digest = hash.finalize();
+    let hex: String = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("eval-case:{hex}")
+}
+
+/// The receipt of one executed case: its evaluator verdict, reason, tokens
+/// and cost as a verification event.
+pub(crate) fn case_receipt(
+    spec: &EvalRunSpec,
+    initiated_by: &str,
+    case_id: &str,
+    outcome: &CaseOutcome,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+) -> sekai_domain::receipt::OperationReceipt {
+    use sekai_domain::receipt::{
+        OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent, ReceiptEventKind,
+    };
+    let operation_id = case_operation_id(&spec.namespace, &spec.run_id, case_id);
+    let kind = ReceiptEventKind::VerificationRecorded;
+    let status = if outcome.passed { "pass" } else { "fail" };
+    OperationReceipt {
+        version: OPERATION_RECEIPT_VERSION.into(),
+        operation_id: operation_id.clone(),
+        parent_operation_id: None,
+        namespace: spec.namespace.clone(),
+        operation_class: "eval_case".into(),
+        initiating_actor: initiated_by.into(),
+        schema_version: EVAL_RUN_CONTRACT.into(),
+        policy_version: spec.evaluator_digest.clone(),
+        started_at_ms,
+        completed_at_ms: Some(completed_at_ms),
+        events: vec![OperationReceiptEvent {
+            event_id: format!("{operation_id}:evaluator"),
+            operation_id,
+            parent_event_id: None,
+            timestamp_ms: completed_at_ms,
+            kind,
+            surface: kind.surface(),
+            actor: initiated_by.into(),
+            references: Vec::new(),
+            attributes: [
+                ("run_id", spec.run_id.clone()),
+                ("case_id", case_id.to_string()),
+                (
+                    "evaluator_definition_id",
+                    spec.evaluator_definition_id.clone(),
+                ),
+                ("status", status.to_string()),
+                ("reason_code", outcome.reason.clone()),
+                ("input_tokens", outcome.input_tokens.to_string()),
+                ("output_tokens", outcome.output_tokens.to_string()),
+                ("cost_micros", outcome.cost_micros.to_string()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        }],
+        uncovered_surfaces: Vec::new(),
+        reporter_grants: Vec::new(),
+        ontology_digest: None,
+        artifact: None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +257,28 @@ pub trait EvalRunStore: Sync {
         reserve_micros: i64,
         now_ms: i64,
     ) -> Result<Option<EvalCaseResult>, String>;
+    /// [`Self::record_dataset_run_case`] that, in the same transaction,
+    /// also writes `receipt` when this call is the one that records the
+    /// case, so a recorded `operation_id` always names a stored receipt
+    /// whose verdict is the recorded one. The default keeps no receipts and
+    /// records the result without an `operation_id`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        _receipt: &sekai_domain::receipt::OperationReceipt,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String> {
+        let result = EvalCaseResult {
+            operation_id: None,
+            ..result.clone()
+        };
+        self.record_dataset_run_case(namespace, run_id, holder, &result, reserve_micros, now_ms)
+    }
     /// Gives back a reservation for a case that spent nothing, while
     /// `holder` holds the lease.
     fn unreserve_dataset_run_case(
@@ -260,11 +369,37 @@ struct Budget {
 /// Runs, or resumes, `spec` over `dataset`. Errors only for a spec that
 /// does not match the dataset or the recorded run, or a store failure; a
 /// case that fails to run is left unrun, and the run is `incomplete`.
+/// Case receipts name [`DEFAULT_CASE_INITIATOR`]; [`run_as`] names the
+/// principal that started the run.
 pub fn run(
     store: &impl EvalRunStore,
     executor: &impl EvalCaseExecutor,
     spec: &EvalRunSpec,
     dataset: &EvalDataset,
+    now_ms: impl Fn() -> i64 + Sync,
+) -> Result<EvalRunReport, String> {
+    run_as(
+        store,
+        executor,
+        spec,
+        dataset,
+        DEFAULT_CASE_INITIATOR,
+        now_ms,
+    )
+}
+
+/// The initiating actor of case receipts written by [`run`].
+pub const DEFAULT_CASE_INITIATOR: &str = "eval-run";
+
+/// [`run`] whose case receipts name `initiated_by` as their initiating
+/// actor, so the operation workspace shows each case to the principal that
+/// ran it (#2694).
+pub fn run_as(
+    store: &impl EvalRunStore,
+    executor: &impl EvalCaseExecutor,
+    spec: &EvalRunSpec,
+    dataset: &EvalDataset,
+    initiated_by: &str,
     now_ms: impl Fn() -> i64 + Sync,
 ) -> Result<EvalRunReport, String> {
     spec.validate()?;
@@ -293,17 +428,28 @@ pub fn run(
     )? {
         return Err(RUN_IN_PROGRESS.into());
     }
-    let report = run_leased(store, executor, spec, dataset, &holder, lease_ms, &now_ms);
+    let report = run_leased(
+        store,
+        executor,
+        spec,
+        dataset,
+        initiated_by,
+        &holder,
+        lease_ms,
+        &now_ms,
+    );
     // The lease lapses on its own if this fails; the next start waits that long.
     let _ = store.release_dataset_run(&spec.namespace, &spec.run_id, &holder);
     report
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_leased(
     store: &impl EvalRunStore,
     executor: &impl EvalCaseExecutor,
     spec: &EvalRunSpec,
     dataset: &EvalDataset,
+    initiated_by: &str,
     holder: &str,
     lease_ms: i64,
     now_ms: &(impl Fn() -> i64 + Sync),
@@ -415,6 +561,7 @@ fn run_leased(
                             return;
                         }
                     }
+                    let started_at_ms = now_ms();
                     match executor.run_case(spec, dataset, case) {
                         Ok(mut outcome) => {
                             // The reservation covered only `0..=cap`; a cost
@@ -436,16 +583,27 @@ fn run_leased(
                                 &policy,
                                 outcome.receipts.take().as_ref(),
                             ));
+                            let recorded_at_ms = now_ms();
+                            let receipt = case_receipt(
+                                spec,
+                                initiated_by,
+                                &case.case_id,
+                                &outcome,
+                                started_at_ms,
+                                recorded_at_ms,
+                            );
                             let result = EvalCaseResult {
                                 case_id: case.case_id.clone(),
                                 outcome,
-                                recorded_at_ms: now_ms(),
+                                recorded_at_ms,
+                                operation_id: Some(receipt.operation_id.clone()),
                             };
-                            match store.record_dataset_run_case(
+                            match store.record_dataset_run_case_with_receipt(
                                 &spec.namespace,
                                 &spec.run_id,
                                 holder,
                                 &result,
+                                &receipt,
                                 cap,
                                 now_ms(),
                             ) {
@@ -1296,6 +1454,52 @@ pub(crate) mod tests {
                 .iter()
                 .map(|r| r.outcome.cost_micros)
                 .sum::<i64>()
+        );
+    }
+
+    #[test]
+    fn a_case_operation_id_is_scoped_to_its_namespace_run_and_case() {
+        let id = case_operation_id("acme", "r1", "c1");
+        assert!(id.starts_with("eval-case:"));
+        assert_eq!(id, case_operation_id("acme", "r1", "c1"));
+        // Another tenant's run of the same name, or ids split at another
+        // `:`, name another receipt.
+        assert_ne!(id, case_operation_id("other", "r1", "c1"));
+        assert_ne!(
+            case_operation_id("a:b", "c", "d"),
+            case_operation_id("a", "b:c", "d")
+        );
+    }
+
+    #[test]
+    fn a_store_without_receipts_records_cases_without_an_operation() {
+        let store = MemoryStore::default();
+        let report = run(
+            &store,
+            &Fake::new(1, usize::MAX),
+            &spec(1, 1_000),
+            &dataset(2),
+            || 1,
+        )
+        .unwrap();
+        assert_eq!(report.results.len(), 2);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.operation_id.is_none())
+        );
+    }
+
+    #[test]
+    fn a_result_recorded_before_case_receipts_reads_without_an_operation() {
+        let json = r#"{"case_id":"c","outcome":{"passed":true,"reason":"match","input_tokens":1,"output_tokens":1,"cost_micros":1},"recorded_at_ms":1}"#;
+        let result: EvalCaseResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.operation_id, None);
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("operation_id")
         );
     }
 

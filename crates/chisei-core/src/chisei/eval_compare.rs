@@ -377,6 +377,7 @@ mod tests {
                     }),
                 },
                 recorded_at_ms: 1,
+                operation_id: None,
             })
             .collect()
     }

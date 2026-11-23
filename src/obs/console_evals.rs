@@ -613,9 +613,18 @@ pub fn render_run(view: &EvalRunView) -> String {
                 .flat_map(|policy| policy.violations.iter())
                 .map(|violation| violation.kind.as_str().to_string()),
         );
+        // A case with an operation receipt (#2694) opens its workspace, which
+        // applies the receipt ACL; older results render without a link.
+        let id = match &result.operation_id {
+            Some(operation_id) => format!(
+                r#"<a href="/console/n/{ns}/ops/{op}"><code>{id}</code></a>"#,
+                op = escape_html(operation_id),
+                id = escape_html(&result.case_id),
+            ),
+            None => format!("<code>{}</code>", escape_html(&result.case_id)),
+        };
         cases.push_str(&format!(
-            r#"<tr><td><code>{id}</code></td><td class="{class}">{verdict}</td><td><code>{reason}</code></td><td class="bad">{violations}</td><td class="num">{tokens}</td><td class="num">{cost}</td></tr>"#,
-            id = escape_html(&result.case_id),
+            r#"<tr><td>{id}</td><td class="{class}">{verdict}</td><td><code>{reason}</code></td><td class="bad">{violations}</td><td class="num">{tokens}</td><td class="num">{cost}</td></tr>"#,
             class = if outcome.passed { "ok" } else { "bad" },
             verdict = if outcome.passed { "pass" } else { "fail" },
             reason = escape_html(&outcome.reason),
@@ -783,6 +792,9 @@ mod tests {
                     }),
                 },
                 recorded_at_ms: at,
+                // The first case carries a receipt; the rest read as results
+                // recorded before case receipts (#2694).
+                operation_id: (index == 0).then(|| format!("eval-case:{run_id}-0")),
             };
             EvalRunStore::record_dataset_run_case(db, "alpha", run_id, "t", &result, 0, at)
                 .unwrap()
@@ -860,6 +872,12 @@ mod tests {
         let html = render_run(&view);
         assert_operator_html(&html);
         assert!(html.contains("Gate: fail vs"), "{html}");
+        // Only the case with a receipt links to its operation workspace.
+        let first = &dataset.cases[0].case_id;
+        assert!(html.contains(&format!(
+            r#"<a href="/console/n/alpha/ops/eval-case:r42-0"><code>{first}</code></a>"#
+        )));
+        assert_eq!(html.matches(r#"href="/console/n/alpha/ops/"#).count(), 1);
         assert!(html.contains("marking leak 0 to 1"));
         let mismatch = html.find("<code>expected_mismatch</code> · 4").unwrap();
         let threshold = html.find("<code>score_below_threshold</code> · 2").unwrap();

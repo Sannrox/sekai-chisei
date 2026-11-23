@@ -14781,6 +14781,77 @@ fn an_eval_dataset_run_resumes_and_is_bound_to_its_first_spec() {
                 assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
                 assert_eq!(trend.runs[0].cases_recorded as usize, version.cases.len());
                 assert_eq!(trend.runs[0].policy.len(), 4);
+
+                // Each case leaves a receipt naming the caller (#2694): the
+                // ops workspace shows its evaluator step to them, and to a
+                // namespace viewer it answers as an unknown id.
+                let runtime_db = svc.db.runtime_arc();
+                let namespace_id = "eval-ns-acme";
+                runtime_db
+                    .create_object(&Object {
+                        id: namespace_id.into(),
+                        kind: "namespace".into(),
+                        name: "acme".into(),
+                        namespace: String::new(),
+                        external_id: "namespace:acme".into(),
+                        properties: HashMap::new(),
+                        created: 1,
+                        updated: 1,
+                    })
+                    .unwrap();
+                for (principal, role) in [("alice", Role::Editor), ("bob", Role::Viewer)] {
+                    runtime_db
+                        .create_grant(&Grant {
+                            id: format!("eval-{principal}"),
+                            object_id: namespace_id.into(),
+                            principal: principal.into(),
+                            role,
+                            created: 1,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+                let mut as_alice = Request::new(RunEvalDatasetRequest {
+                    run_id: "release-5".into(),
+                    ..request("deterministic").into_inner()
+                });
+                as_alice
+                    .metadata_mut()
+                    .insert("x-principal", "alice".parse().unwrap());
+                svc.run_eval_dataset(as_alice).await.unwrap();
+                let cases = crate::chisei::eval_run::EvalRunStore::list_dataset_run_cases(
+                    runtime_db.as_ref(),
+                    "acme",
+                    "release-5",
+                )
+                .unwrap();
+                assert_eq!(cases.len(), version.cases.len());
+                for case in &cases {
+                    let id = case.operation_id.as_deref().expect("case receipt");
+                    let report = crate::obs::console_workspace::load_authorized_report(
+                        runtime_db.as_ref(),
+                        "alice",
+                        "acme",
+                        id,
+                    )
+                    .unwrap();
+                    let step = &report.sections["verification"][0];
+                    assert_eq!(step.attributes["case_id"], case.case_id);
+                    assert_eq!(
+                        step.attributes["status"],
+                        if case.outcome.passed { "pass" } else { "fail" }
+                    );
+                    assert_eq!(
+                        crate::obs::console_workspace::load_authorized_report(
+                            runtime_db.as_ref(),
+                            "bob",
+                            "acme",
+                            id,
+                        )
+                        .unwrap_err(),
+                        crate::obs::console_workspace::WorkspaceError::NotFound
+                    );
+                }
             })
         },
     );

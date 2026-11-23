@@ -8,6 +8,7 @@
 use crate::chisei::eval_run::{EvalCaseResult, EvalRunSpec};
 use sekai_core::db::postgres::PostgresDb;
 use sekai_core::db::sekai::SekaiDb;
+use sekai_domain::receipt::OperationReceipt;
 
 /// The lease-held predicate over `chisei_dataset_runs`, with the holder and
 /// the time as the given parameters.
@@ -59,6 +60,21 @@ pub trait EvalRunSekaiDbExt {
         run_id: &str,
         holder: &str,
         result: &EvalCaseResult,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String>;
+
+    /// [`Self::record_dataset_run_case`] that also writes `receipt`, with
+    /// its chain entry, in the same transaction when this call inserts the
+    /// result (#2694).
+    #[allow(clippy::too_many_arguments)]
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        receipt: &OperationReceipt,
         reserve_micros: i64,
         now_ms: i64,
     ) -> Result<Option<EvalCaseResult>, String>;
@@ -195,49 +211,38 @@ impl EvalRunSekaiDbExt for SekaiDb {
         reserve_micros: i64,
         now_ms: i64,
     ) -> Result<Option<EvalCaseResult>, String> {
-        let json = serde_json::to_string(result).map_err(|error| error.to_string())?;
-        let mut conn = self.conn();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        let released = tx
-            .execute(
-                &format!(
-                    "UPDATE chisei_dataset_runs
-                     SET uncertain_micros = MAX(uncertain_micros - ?5, 0)
-                     WHERE namespace = ?1 AND run_id = ?2 AND {}",
-                    held("?3", "?4")
-                ),
-                rusqlite::params![namespace, run_id, holder, now_ms, reserve_micros],
-            )
-            .map_err(|error| error.to_string())?;
-        if released != 1 {
-            return Ok(None);
-        }
-        tx.execute(
-            "INSERT INTO chisei_dataset_run_cases
-                (namespace, run_id, case_id, result_json, cost_micros, recorded_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
-            rusqlite::params![
-                namespace,
-                run_id,
-                result.case_id,
-                json,
-                result.outcome.cost_micros,
-                result.recorded_at_ms
-            ],
+        sqlite_record_case(
+            self,
+            namespace,
+            run_id,
+            holder,
+            result,
+            None,
+            reserve_micros,
+            now_ms,
         )
-        .map_err(|error| error.to_string())?;
-        let stored: String = tx
-            .query_row(
-                "SELECT result_json FROM chisei_dataset_run_cases
-                 WHERE namespace = ?1 AND run_id = ?2 AND case_id = ?3",
-                rusqlite::params![namespace, run_id, result.case_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
-        result_from(&stored).map(Some)
+    }
+
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        receipt: &OperationReceipt,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String> {
+        sqlite_record_case(
+            self,
+            namespace,
+            run_id,
+            holder,
+            result,
+            Some(receipt),
+            reserve_micros,
+            now_ms,
+        )
     }
 
     fn unreserve_dataset_run_case(
@@ -429,6 +434,21 @@ pub trait EvalRunPostgresDbExt {
         now_ms: i64,
     ) -> Result<Option<EvalCaseResult>, String>;
 
+    /// [`Self::record_dataset_run_case`] that also writes `receipt`, with
+    /// its chain entry, in the same transaction when this call inserts the
+    /// result (#2694).
+    #[allow(clippy::too_many_arguments)]
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        receipt: &OperationReceipt,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String>;
+
     fn unreserve_dataset_run_case(
         &self,
         namespace: &str,
@@ -563,49 +583,38 @@ impl EvalRunPostgresDbExt for PostgresDb {
         reserve_micros: i64,
         now_ms: i64,
     ) -> Result<Option<EvalCaseResult>, String> {
-        let json = serde_json::to_string(result).map_err(|error| error.to_string())?;
-        let mut connection = self.connection()?;
-        let mut tx = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        let released = tx
-            .execute(
-                &format!(
-                    "UPDATE chisei_dataset_runs
-                     SET uncertain_micros = GREATEST(uncertain_micros - $5, 0)
-                     WHERE namespace = $1 AND run_id = $2 AND {}",
-                    held("$3", "$4")
-                ),
-                &[&namespace, &run_id, &holder, &now_ms, &reserve_micros],
-            )
-            .map_err(|error| error.to_string())?;
-        if released != 1 {
-            return Ok(None);
-        }
-        tx.execute(
-            "INSERT INTO chisei_dataset_run_cases
-                (namespace, run_id, case_id, result_json, cost_micros, recorded_at_ms)
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
-            &[
-                &namespace,
-                &run_id,
-                &result.case_id,
-                &json,
-                &result.outcome.cost_micros,
-                &result.recorded_at_ms,
-            ],
+        postgres_record_case(
+            self,
+            namespace,
+            run_id,
+            holder,
+            result,
+            None,
+            reserve_micros,
+            now_ms,
         )
-        .map_err(|error| error.to_string())?;
-        let row = tx
-            .query_one(
-                "SELECT result_json FROM chisei_dataset_run_cases
-                 WHERE namespace = $1 AND run_id = $2 AND case_id = $3",
-                &[&namespace, &run_id, &result.case_id],
-            )
-            .map_err(|error| error.to_string())?;
-        let stored: String = row.get(0);
-        tx.commit().map_err(|error| error.to_string())?;
-        result_from(&stored).map(Some)
+    }
+
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        receipt: &OperationReceipt,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String> {
+        postgres_record_case(
+            self,
+            namespace,
+            run_id,
+            holder,
+            result,
+            Some(receipt),
+            reserve_micros,
+            now_ms,
+        )
     }
 
     fn unreserve_dataset_run_case(
@@ -737,6 +746,132 @@ impl EvalRunPostgresDbExt for PostgresDb {
     }
 }
 
+/// Records one case result while `holder` holds the lease, first result
+/// wins; with `receipt`, the call that inserts the result also writes the
+/// receipt and its chain entry, in the same transaction.
+#[allow(clippy::too_many_arguments)]
+fn sqlite_record_case(
+    db: &SekaiDb,
+    namespace: &str,
+    run_id: &str,
+    holder: &str,
+    result: &EvalCaseResult,
+    receipt: Option<&OperationReceipt>,
+    reserve_micros: i64,
+    now_ms: i64,
+) -> Result<Option<EvalCaseResult>, String> {
+    let json = serde_json::to_string(result).map_err(|error| error.to_string())?;
+    let mut conn = db.conn();
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let released = tx
+        .execute(
+            &format!(
+                "UPDATE chisei_dataset_runs
+                     SET uncertain_micros = MAX(uncertain_micros - ?5, 0)
+                     WHERE namespace = ?1 AND run_id = ?2 AND {}",
+                held("?3", "?4")
+            ),
+            rusqlite::params![namespace, run_id, holder, now_ms, reserve_micros],
+        )
+        .map_err(|error| error.to_string())?;
+    if released != 1 {
+        return Ok(None);
+    }
+    let inserted = tx
+        .execute(
+            "INSERT INTO chisei_dataset_run_cases
+                (namespace, run_id, case_id, result_json, cost_micros, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
+            rusqlite::params![
+                namespace,
+                run_id,
+                result.case_id,
+                json,
+                result.outcome.cost_micros,
+                result.recorded_at_ms
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(receipt) = receipt.filter(|_| inserted == 1) {
+        sekai_core::db::chisei_receipt_sqlite::upsert_operation_receipt(&tx, receipt)?;
+        sekai_core::db::receipt_chain::append_operation_receipt_chain(&tx, receipt)?;
+    }
+    let stored: String = tx
+        .query_row(
+            "SELECT result_json FROM chisei_dataset_run_cases
+                 WHERE namespace = ?1 AND run_id = ?2 AND case_id = ?3",
+            rusqlite::params![namespace, run_id, result.case_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())?;
+    result_from(&stored).map(Some)
+}
+
+/// [`sqlite_record_case`] on PostgreSQL.
+#[allow(clippy::too_many_arguments)]
+fn postgres_record_case(
+    db: &PostgresDb,
+    namespace: &str,
+    run_id: &str,
+    holder: &str,
+    result: &EvalCaseResult,
+    receipt: Option<&OperationReceipt>,
+    reserve_micros: i64,
+    now_ms: i64,
+) -> Result<Option<EvalCaseResult>, String> {
+    let json = serde_json::to_string(result).map_err(|error| error.to_string())?;
+    let mut connection = db.connection()?;
+    let mut tx = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let released = tx
+        .execute(
+            &format!(
+                "UPDATE chisei_dataset_runs
+                     SET uncertain_micros = GREATEST(uncertain_micros - $5, 0)
+                     WHERE namespace = $1 AND run_id = $2 AND {}",
+                held("$3", "$4")
+            ),
+            &[&namespace, &run_id, &holder, &now_ms, &reserve_micros],
+        )
+        .map_err(|error| error.to_string())?;
+    if released != 1 {
+        return Ok(None);
+    }
+    let inserted = tx
+        .execute(
+            "INSERT INTO chisei_dataset_run_cases
+                (namespace, run_id, case_id, result_json, cost_micros, recorded_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+            &[
+                &namespace,
+                &run_id,
+                &result.case_id,
+                &json,
+                &result.outcome.cost_micros,
+                &result.recorded_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if let Some(receipt) = receipt.filter(|_| inserted == 1) {
+        db.upsert_operation_receipt_on(&mut tx, receipt)?;
+        sekai_core::db::postgres_receipt_chain::append_operation_receipt_chain(&mut tx, receipt)?;
+    }
+    let row = tx
+        .query_one(
+            "SELECT result_json FROM chisei_dataset_run_cases
+                 WHERE namespace = $1 AND run_id = $2 AND case_id = $3",
+            &[&namespace, &run_id, &result.case_id],
+        )
+        .map_err(|error| error.to_string())?;
+    let stored: String = row.get(0);
+    tx.commit().map_err(|error| error.to_string())?;
+    result_from(&stored).map(Some)
+}
+
 pub trait EvalRunRuntimeDbExt {
     fn put_bound_dataset_run(
         &self,
@@ -833,6 +968,21 @@ impl crate::chisei::eval_run::EvalRunStore for sekai_core::db::runtime_db::Runti
     ) -> Result<Option<EvalCaseResult>, String> {
         dispatch!(self, db => db.record_dataset_run_case(
             namespace, run_id, holder, result, reserve_micros, now_ms
+        ))
+    }
+
+    fn record_dataset_run_case_with_receipt(
+        &self,
+        namespace: &str,
+        run_id: &str,
+        holder: &str,
+        result: &EvalCaseResult,
+        receipt: &OperationReceipt,
+        reserve_micros: i64,
+        now_ms: i64,
+    ) -> Result<Option<EvalCaseResult>, String> {
+        dispatch!(self, db => db.record_dataset_run_case_with_receipt(
+            namespace, run_id, holder, result, receipt, reserve_micros, now_ms
         ))
     }
 
@@ -993,6 +1143,7 @@ mod tests {
                 policy: None,
             },
             recorded_at_ms: 3,
+            operation_id: None,
         };
         // Reserved, then recorded: the reservation moves into the ledger.
         assert!(
@@ -1067,10 +1218,122 @@ mod tests {
         );
     }
 
+    /// A case's receipt is written by the call that records the case, so a
+    /// recorded `operation_id` names a receipt whose verdict is the
+    /// recorded one, however many starts ran the case (#2694).
+    fn receipt_contract(db: &RuntimeDb, namespace: &str) {
+        use crate::chisei::eval_run::{case_operation_id, case_receipt};
+        let mut spec = spec(1, 1_000);
+        spec.namespace = namespace.into();
+        spec.run_id = "receipts".into();
+        let run_id = spec.run_id.clone();
+        db.put_dataset_run(&spec, 1).unwrap();
+        let operation_id = case_operation_id(namespace, &run_id, "case-x");
+        let case = |passed: bool, reason: &str| {
+            let outcome = CaseOutcome {
+                passed,
+                reason: reason.into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_micros: 5,
+                receipts: None,
+                policy: None,
+            };
+            let receipt = case_receipt(&spec, "alice", "case-x", &outcome, 1, 2);
+            let result = EvalCaseResult {
+                case_id: "case-x".into(),
+                outcome,
+                recorded_at_ms: 2,
+                operation_id: Some(receipt.operation_id.clone()),
+            };
+            (result, receipt)
+        };
+        let reason_of = |db: &RuntimeDb| {
+            let receipt = db.get_operation_receipt(&operation_id).unwrap()?;
+            assert_eq!(receipt.namespace, namespace);
+            Some(receipt.events[0].attributes["reason_code"].clone())
+        };
+        assert!(
+            db.lease_dataset_run(namespace, &run_id, "a", false, 10, 100)
+                .unwrap()
+        );
+        // "a" runs the case, loses its lease mid-case and records nothing,
+        // receipt included.
+        assert!(
+            db.lease_dataset_run(namespace, &run_id, "b", false, 101, 200)
+                .unwrap()
+        );
+        let (stale, stale_receipt) = case(false, "stale");
+        assert_eq!(
+            db.record_dataset_run_case_with_receipt(
+                namespace,
+                &run_id,
+                "a",
+                &stale,
+                &stale_receipt,
+                0,
+                102
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(reason_of(db), None);
+        // "b" reruns and records it with its receipt.
+        let (first, first_receipt) = case(true, "first");
+        assert_eq!(
+            db.record_dataset_run_case_with_receipt(
+                namespace,
+                &run_id,
+                "b",
+                &first,
+                &first_receipt,
+                0,
+                103
+            )
+            .unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(reason_of(db).as_deref(), Some("first"));
+        // A later run of the recorded case keeps the first result and the
+        // receipt that matches it.
+        let (later, later_receipt) = case(false, "later");
+        assert_eq!(
+            db.record_dataset_run_case_with_receipt(
+                namespace,
+                &run_id,
+                "b",
+                &later,
+                &later_receipt,
+                0,
+                104
+            )
+            .unwrap(),
+            Some(first)
+        );
+        assert_eq!(reason_of(db).as_deref(), Some("first"));
+        db.release_dataset_run(namespace, &run_id, "b").unwrap();
+        // The runner names a stored receipt on every case it records.
+        // The report also lists the recorded "case-x".
+        let report = run(db, &Flat, &spec, &dataset(3), || 500).unwrap();
+        assert_eq!(report.results.len(), 4);
+        for result in &report.results {
+            let id = result.operation_id.as_deref().expect("case receipt id");
+            assert_eq!(id, case_operation_id(namespace, &run_id, &result.case_id));
+            let receipt = db.get_operation_receipt(id).unwrap().expect("stored");
+            let event = &receipt.events[0];
+            assert_eq!(
+                event.kind,
+                sekai_domain::receipt::ReceiptEventKind::VerificationRecorded
+            );
+            assert_eq!(event.attributes["case_id"], result.case_id);
+        }
+    }
+
     #[test]
     fn sqlite_eval_runs_keep_the_first_spec_and_result() {
         let db = crate::chisei_store::ChiseiStore::memory().runtime_arc();
         contract(db.as_ref(), "acme");
+        receipt_contract(db.as_ref(), "acme");
     }
 
     #[test]
@@ -1094,5 +1357,6 @@ mod tests {
         // share a run.
         let namespace = format!("eval-run-{}-{}", std::process::id(), uuid::Uuid::new_v4());
         contract(db.as_ref(), &namespace);
+        receipt_contract(db.as_ref(), &namespace);
     }
 }

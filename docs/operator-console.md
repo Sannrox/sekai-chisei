@@ -170,8 +170,11 @@ Deep links: `/console/n/{namespace}/evals` and
   recorded reason code. No cause is inferred beyond the code.
 - The full case table (verdict, reason code, policy violations, tokens, cost)
   is folded below the comparison.
-- Case results record no operation id, so cases do not link to the causal
-  operation workspace yet.
+- A case id links to its operation workspace
+  (`/console/n/{namespace}/ops/{operation_id}`), which shows the case's
+  evaluator step under the receipt rule: the principal that ran the case,
+  or `root`/`local`. Results recorded before case receipts render without
+  a link.
 - The underlying eval dataset RPCs are experimental, so these pages share
   their gate: without `SEKAI_EXPERIMENTAL_RPCS=1` (or the `experimental-rpcs`
   build feature), and on a process that does not serve Chisei, they answer

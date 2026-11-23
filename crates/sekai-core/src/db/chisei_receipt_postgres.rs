@@ -151,7 +151,9 @@ impl PostgresDb {
         Ok(FencedAdmissionWrite::Applied(()))
     }
 
-    pub(crate) fn upsert_operation_receipt_on<C: GenericClient>(
+    /// Upserts `receipt` on `client`, so a caller can write it inside its
+    /// own transaction; pair it with the receipt chain append.
+    pub fn upsert_operation_receipt_on<C: GenericClient>(
         &self,
         client: &mut C,
         receipt: &OperationReceipt,
