@@ -5,9 +5,10 @@ use sekai_connector_template::config::ConnectorConfig;
 use sekai_connector_template::fake::{FakeSource, RECORD_KIND, SCHEMA_REVISION};
 use sekai_connector_template::{RunOutcome, run_once};
 use sekai_source_sdk::{
-    ApplySourceBatchReply, GetSourceSyncStateInput, OutboxLimits, SnapshotPageSource, SnapshotRead,
-    SnapshotSourceFailure, SourceBatch, SourceOutbox, SourceSyncStateView, SourceSyncTransport,
-    TransportFailure, assert_deterministic_discovery, assert_snapshot_chain, run_check_conformance,
+    ApplySourceBatchReply, ConnectionFailure, GetSourceSyncStateInput, OutboxLimits,
+    SnapshotPageSource, SnapshotRead, SnapshotSourceFailure, SourceBatch, SourceDiscovery,
+    SourceInspector, SourceOutbox, SourceSyncStateView, SourceSyncTransport, TransportFailure,
+    assert_deterministic_discovery, assert_snapshot_chain, run_check_conformance,
 };
 use std::cell::RefCell;
 use std::path::Path;
@@ -67,6 +68,20 @@ impl SourceSyncTransport for Plane {
             ..SourceSyncStateView::default()
         })
     }
+}
+
+/// Wrappers around the fake source check and discover through it.
+macro_rules! inspect_through_fake {
+    ($($wrapper:ty),*) => {$(
+        impl SourceInspector for $wrapper {
+            fn check(&mut self) -> Result<(), ConnectionFailure> {
+                self.0.check()
+            }
+            fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+                self.0.discover()
+            }
+        }
+    )*};
 }
 
 fn config() -> ConnectorConfig {
@@ -156,6 +171,7 @@ impl SnapshotPageSource for Logged {
         self.0.read_page(committed_cursor, max_records)
     }
 }
+inspect_through_fake!(Logged);
 
 #[test]
 fn an_unfinished_apply_is_replayed_before_the_next_page_is_read() {
@@ -205,6 +221,86 @@ fn an_unfinished_apply_is_replayed_before_the_next_page_is_read() {
         assert_snapshot_chain(&plane.committed).unwrap();
         assert!(outbox.pending().unwrap().is_empty());
     }
+}
+
+/// The logged fake source whose check fails while `down` is set.
+struct Switchable {
+    source: Logged,
+    down: bool,
+}
+
+impl SourceInspector for Switchable {
+    fn check(&mut self) -> Result<(), ConnectionFailure> {
+        if self.down {
+            return Err(ConnectionFailure::Unreachable);
+        }
+        self.source.check()
+    }
+    fn discover(&mut self) -> Result<SourceDiscovery, ConnectionFailure> {
+        self.source.discover()
+    }
+}
+
+impl SnapshotPageSource for Switchable {
+    fn read_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<SnapshotRead, SnapshotSourceFailure> {
+        self.source.read_page(committed_cursor, max_records)
+    }
+}
+
+#[test]
+fn a_pending_batch_is_delivered_while_the_source_is_down() {
+    let config = config();
+    let root = tempfile::tempdir().unwrap();
+    let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut source = Switchable {
+        source: Logged(
+            FakeSource::new(&config.source, &config.source_instance),
+            log.clone(),
+        ),
+        down: false,
+    };
+    let mut plane = Plane {
+        fail_next: Some(TransportFailure::Unavailable),
+        log: log.clone(),
+        ..Plane::default()
+    };
+    assert_eq!(
+        run_once(&config, &outbox, &mut source, &mut plane),
+        Ok(RunOutcome::Pending)
+    );
+
+    source.down = true;
+    let error = run_once(&config, &outbox, &mut source, &mut plane).unwrap_err();
+    assert!(error.contains("source check failed"), "{error:?}");
+    assert_eq!(plane.committed.len(), 1);
+    assert!(outbox.pending().unwrap().is_empty());
+    // read, failed apply, replayed apply; no page read while down.
+    assert_eq!(log.borrow().len(), 3, "{:?}", log.borrow());
+}
+
+#[test]
+fn a_down_source_with_nothing_pending_fails_before_any_read() {
+    let config = config();
+    let root = tempfile::tempdir().unwrap();
+    let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut source = Switchable {
+        source: Logged(
+            FakeSource::new(&config.source, &config.source_instance),
+            log.clone(),
+        ),
+        down: true,
+    };
+    let mut plane = Plane::default();
+    let error = run_once(&config, &outbox, &mut source, &mut plane).unwrap_err();
+    assert!(error.contains("source check failed"), "{error:?}");
+    assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+    assert!(plane.committed.is_empty());
 }
 
 #[test]
@@ -258,6 +354,7 @@ fn a_page_that_repeats_the_committed_cursor_is_refused() {
             self.0.read_page(None, max_records)
         }
     }
+    inspect_through_fake!(Stuck);
     let config = config();
     let root = tempfile::tempdir().unwrap();
     let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
@@ -328,7 +425,8 @@ fn a_credential_never_goes_to_a_remote_plaintext_target() {
 
 #[test]
 fn completion_before_any_committed_page_is_refused() {
-    struct Empty;
+    struct Empty(FakeSource);
+    inspect_through_fake!(Empty);
     impl SnapshotPageSource for Empty {
         fn read_page(
             &mut self,
@@ -341,7 +439,8 @@ fn completion_before_any_committed_page_is_refused() {
     let config = config();
     let root = tempfile::tempdir().unwrap();
     let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
-    assert!(run_once(&config, &outbox, &mut Empty, &mut Plane::default()).is_err());
+    let mut source = Empty(FakeSource::new(&config.source, &config.source_instance));
+    assert!(run_once(&config, &outbox, &mut source, &mut Plane::default()).is_err());
 }
 
 #[test]
