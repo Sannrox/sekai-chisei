@@ -41,7 +41,7 @@ pub fn usage() -> &'static str {
     "sekaictl ontology <inspect|apply|export|import|draft|seed|run|first-run|context|expand|explain|lint> ...\n  \
      sekaictl ontology export --namespace <ns> --out <dir> [--target <url-or-socket>]\n  \
      sekaictl ontology import --namespace <ns> --dir <dir> --source-commit <sha> [--target <url-or-socket>]\n  \
-     sekaictl ontology draft --discovery <file> --out <dir> [--namespace <ns>] [--overwrite] [--target <url-or-socket>]\n  \
+     sekaictl ontology draft --discovery <file> --out <dir> [--namespace <ns>] [--update] [--target <url-or-socket>]\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
@@ -1144,17 +1144,26 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
             let rest = &args[1..];
             let discovery = require_flag(rest, "--discovery").map_err(std::io::Error::other)?;
             let out = require_flag(rest, "--out").map_err(std::io::Error::other)?;
-            let overwrite = rest.iter().any(|flag| flag == "--overwrite");
+            let update = rest.iter().any(|flag| flag == "--update");
             let namespace = flag_value(rest, "--namespace");
             let outcome = crate::ontology_draft::run(
                 &target_from_args(rest),
                 Path::new(&discovery),
                 Path::new(&out),
                 namespace.as_deref(),
-                overwrite,
+                update,
             )
             .await?;
             println!("drafted {} files to {out}", outcome.files);
+            for path in &outcome.removed {
+                println!("removed {path}");
+            }
+            for change in &outcome.changes {
+                println!("{change}");
+            }
+            for decision in &outcome.stale {
+                println!("stale decision, the source no longer has its subject: {decision}");
+            }
             Ok(())
         }
         "apply" => {

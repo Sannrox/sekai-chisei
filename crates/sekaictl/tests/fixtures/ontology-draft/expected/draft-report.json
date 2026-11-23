@@ -41,6 +41,9 @@
   ],
   "object_types": [
     {
+      "columns": [
+        "id"
+      ],
       "dropped_key_candidates": [],
       "findings": [],
       "id": "Account",
@@ -51,6 +54,10 @@
       "record_kind": "Account"
     },
     {
+      "columns": [
+        "id",
+        "account_id"
+      ],
       "dropped_key_candidates": [],
       "findings": [],
       "id": "Contact",
@@ -61,6 +68,10 @@
       "record_kind": "Contact"
     },
     {
+      "columns": [
+        "id",
+        "account_id"
+      ],
       "dropped_key_candidates": [],
       "findings": [],
       "id": "Invoice",
@@ -71,6 +82,11 @@
       "record_kind": "Invoice"
     },
     {
+      "columns": [
+        "id",
+        "account_id",
+        "contact_id"
+      ],
       "dropped_key_candidates": [],
       "findings": [
         {
