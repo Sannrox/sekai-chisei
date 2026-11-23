@@ -203,31 +203,23 @@ fn duplicate_work_unit_idempotency_key_converges() {
     let unit = work("wu-1", "scope-dup", 10, "same-key");
     pair.a.create_work_unit(&unit).unwrap();
 
-    // Second create with same idempotency key should not invent a second authority.
+    // A second create with the same idempotency key may refuse or be absorbed,
+    // but it must never invent a second authority under that key.
     let duplicate = work("wu-2", "scope-dup", 11, "same-key");
-    let err = pair.b.create_work_unit(&duplicate);
-    // Either error or resolve to the first — both are safe if get-by-key is unique.
-    match err {
-        Ok(()) => {
-            // If insert is ignored/accepted, lookup must still return a single logical unit.
-            let found = pair
-                .a
-                .get_work_unit_by_idempotency_key("same-key")
-                .unwrap()
-                .expect("key present");
-            assert_eq!(found.idempotency_key, "same-key");
-        }
-        Err(message) => {
-            assert!(
-                !message.is_empty(),
-                "duplicate create should surface a clear error"
-            );
-            let found = pair
-                .b
-                .get_work_unit_by_idempotency_key("same-key")
-                .unwrap()
-                .unwrap();
-            assert_eq!(found.id, "wu-1");
+    if let Err(message) = pair.b.create_work_unit(&duplicate) {
+        assert!(
+            !message.is_empty(),
+            "duplicate create should surface a clear error"
+        );
+    }
+    for replica in [&pair.a, &pair.b] {
+        let found = replica
+            .get_work_unit_by_idempotency_key("same-key")
+            .unwrap()
+            .expect("key present");
+        assert_eq!(found.id, "wu-1");
+        if let Some(second) = replica.get_work_unit("wu-2").unwrap() {
+            assert_eq!(second.id, "wu-1", "wu-2 must not exist as its own unit");
         }
     }
 }
