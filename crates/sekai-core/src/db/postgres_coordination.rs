@@ -7,6 +7,7 @@ use crate::sekai::coordination::{
     WORK_UNIT_STATUS_CANCELLED, WORK_UNIT_STATUS_COMPLETED, WORK_UNIT_STATUS_FAILED,
     WORK_UNIT_STATUS_PENDING, WORK_UNIT_STATUS_RECONCILED, WORK_UNIT_STATUS_RUNNING,
     WORK_UNIT_STATUS_STALE, WORK_UNIT_STATUS_TIMED_OUT, WorkUnit, WorkUnitFilter,
+    WorkUnitStoreError,
 };
 use crate::sekai::work_unit_lifecycle::WorkUnitTransition;
 use postgres::{GenericClient, IsolationLevel, Row, types::ToSql};
@@ -70,15 +71,18 @@ impl PostgresDb {
 
     pub fn contention_scope_chain(&self, scope_id: &str) -> Result<Vec<ContentionScope>, String> {
         let mut connection = self.connection()?;
-        scope_chain(&mut *connection, scope_id, false)
+        scope_chain(&mut *connection, scope_id, false).map_err(String::from)
     }
 
     pub fn create_work_unit(&self, work: &WorkUnit) -> Result<(), String> {
-        Self::insert_work_unit_in(&mut *self.connection()?, work)
+        Self::insert_work_unit_in(&mut *self.connection()?, work).map_err(String::from)
     }
 
-    fn insert_work_unit_in(client: &mut impl GenericClient, work: &WorkUnit) -> Result<(), String> {
-        validate_work(work)?;
+    fn insert_work_unit_in(
+        client: &mut impl GenericClient,
+        work: &WorkUnit,
+    ) -> Result<(), WorkUnitStoreError> {
+        validate_work(work).map_err(WorkUnitStoreError::Rejected)?;
         let values = work_params(work);
         let params = refs(&values);
         client.execute(
@@ -88,7 +92,16 @@ impl PostgresDb {
               failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
             &params,
-        ).map(|_| ()).map_err(string)
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            // SQLSTATE class 23: integrity constraint violation.
+            if error.code().is_some_and(|code| code.code().starts_with("23")) {
+                WorkUnitStoreError::Rejected(error.to_string())
+            } else {
+                WorkUnitStoreError::Backend(error.to_string())
+            }
+        })
     }
 
     pub fn get_work_unit(&self, id: &str) -> Result<Option<WorkUnit>, String> {
@@ -375,7 +388,7 @@ impl PostgresDb {
         id: &str,
         owner: &str,
         now: i64,
-    ) -> Result<AdmissionResult, String> {
+    ) -> Result<AdmissionResult, WorkUnitStoreError> {
         // Admission compares the global FIFO queue and may lock several
         // hierarchy rows. A single transaction-scoped lock gives every
         // contender the same first lock and prevents candidate/scope inversion.
@@ -388,7 +401,7 @@ impl PostgresDb {
             )
             .map_err(string)?
             .map(row_to_work)
-            .ok_or_else(|| "work unit not found".to_string())?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected("work unit not found".into()))?;
         if work.status != WORK_UNIT_STATUS_PENDING {
             return Ok(AdmissionResult {
                 admitted: false,
@@ -463,7 +476,8 @@ impl PostgresDb {
             insert_reservation(tx, &reservation)?;
             reservations.push(reservation);
         }
-        ensure_transition(&work.status, WORK_UNIT_STATUS_RUNNING)?;
+        ensure_transition(&work.status, WORK_UNIT_STATUS_RUNNING)
+            .map_err(WorkUnitStoreError::Rejected)?;
         work.status = WORK_UNIT_STATUS_RUNNING.into();
         work.admitted_at = now;
         work.started_at = now;
@@ -505,14 +519,17 @@ impl PostgresDb {
         tx: &mut impl GenericClient,
         id: &str,
         now: i64,
-    ) -> Result<WorkUnit, String> {
+    ) -> Result<WorkUnit, WorkUnitStoreError> {
         // Share admission's first lock so an expired reservation cannot be
         // counted as free capacity while this transaction renews it.
         tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&ADMISSION_LOCK_ID])
             .map_err(string)?;
         let mut work = locked_work(tx, id)?;
         if work.status != WORK_UNIT_STATUS_RUNNING && work.status != WORK_UNIT_STATUS_ADMITTED {
-            return Err(format!("work unit is not active: {}", work.status));
+            return Err(WorkUnitStoreError::Rejected(format!(
+                "work unit is not active: {}",
+                work.status
+            )));
         }
         let reservation_expiries = tx
             .query(
@@ -528,7 +545,9 @@ impl PostgresDb {
                 .iter()
                 .any(|row| row.get::<_, i64>(0) <= now)
         {
-            return Err("work unit reservation lease expired".into());
+            return Err(WorkUnitStoreError::Rejected(
+                "work unit reservation lease expired".into(),
+            ));
         }
         let requested_ttl = i64::from(work.heartbeat_ttl_seconds);
         tx.execute(
@@ -725,7 +744,7 @@ impl PostgresDb {
         work: &WorkUnit,
         created_event: &RunEvent,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<()>, String> {
+    ) -> Result<RequestOutcome<()>, WorkUnitStoreError> {
         self.apply_for_request(request, |tx, row| {
             Self::insert_work_unit_in(tx, work)?;
             insert_event(tx, created_event)?;
@@ -743,7 +762,7 @@ impl PostgresDb {
         owner: &str,
         now: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+    ) -> Result<RequestOutcome<AdmissionResult>, WorkUnitStoreError> {
         self.apply_for_request(request, |tx, row| {
             let result = Self::admit_work_unit_in(tx, id, owner, now)?;
             fill_admission_row(row, &result);
@@ -759,7 +778,7 @@ impl PostgresDb {
         transition: &WorkUnitTransition<'_>,
         now: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<WorkUnit>, String> {
+    ) -> Result<RequestOutcome<WorkUnit>, WorkUnitStoreError> {
         self.apply_for_request(request, |tx, row| {
             let work = match transition {
                 WorkUnitTransition::Heartbeat => Self::heartbeat_work_unit_in(tx, id, now),
@@ -786,15 +805,20 @@ impl PostgresDb {
     fn apply_for_request<T>(
         &self,
         request: &RequestDedup,
-        apply: impl FnOnce(&mut postgres::Transaction<'_>, &mut RequestDedup) -> Result<T, String>,
-    ) -> Result<RequestOutcome<T>, String> {
+        apply: impl FnOnce(
+            &mut postgres::Transaction<'_>,
+            &mut RequestDedup,
+        ) -> Result<T, WorkUnitStoreError>,
+    ) -> Result<RequestOutcome<T>, WorkUnitStoreError> {
         let mut connection = self.connection()?;
         let mut tx = connection.transaction().map_err(string)?;
         let tracked = !request.request_id.is_empty();
         if tracked && !Self::insert_request_in(&mut tx, request)? {
             return Self::select_request_in(&mut tx, &request.request_id, &request.operation)?
                 .map(RequestOutcome::Replayed)
-                .ok_or_else(|| "request dedup row missing after conflict".into());
+                .ok_or_else(|| {
+                    WorkUnitStoreError::Backend("request dedup row missing after conflict".into())
+                });
         }
         let mut row = request.clone();
         let value = apply(&mut tx, &mut row)?;
@@ -842,12 +866,12 @@ impl PostgresDb {
         failure: &str,
         cancel: &str,
         now: i64,
-    ) -> Result<WorkUnit, String> {
+    ) -> Result<WorkUnit, WorkUnitStoreError> {
         let mut work = locked_work(tx, id)?;
         if terminal(&work.status) {
             return Ok(work);
         }
-        ensure_transition(&work.status, status)?;
+        ensure_transition(&work.status, status).map_err(WorkUnitStoreError::Rejected)?;
         tx.execute(
             "UPDATE sekai_reservations SET status=$2,released_at=$3
             WHERE work_unit_id=$1 AND status=$4 AND released_at=0",
@@ -939,7 +963,7 @@ fn insert_event(client: &mut impl GenericClient, event: &RunEvent) -> Result<(),
         VALUES ($1,$2,$3,$4,$5,$6)", &[&event.id,&event.work_unit_id,&event.event_type,&event.message,&evidence,&event.created_at])
         .map(|_|()).map_err(string)
 }
-fn locked_work(client: &mut impl GenericClient, id: &str) -> Result<WorkUnit, String> {
+fn locked_work(client: &mut impl GenericClient, id: &str) -> Result<WorkUnit, WorkUnitStoreError> {
     client
         .query_opt(
             &format!("SELECT {WORK_COLUMNS} FROM sekai_work_units WHERE id=$1 FOR UPDATE"),
@@ -947,19 +971,21 @@ fn locked_work(client: &mut impl GenericClient, id: &str) -> Result<WorkUnit, St
         )
         .map_err(string)?
         .map(row_to_work)
-        .ok_or_else(|| "work unit not found".into())
+        .ok_or_else(|| WorkUnitStoreError::Rejected("work unit not found".into()))
 }
 fn scope_chain(
     client: &mut impl GenericClient,
     id: &str,
     lock: bool,
-) -> Result<Vec<ContentionScope>, String> {
+) -> Result<Vec<ContentionScope>, WorkUnitStoreError> {
     let mut chain = vec![];
     let mut current = id.to_string();
     let mut seen = HashSet::new();
     while !current.is_empty() {
         if !seen.insert(current.clone()) {
-            return Err(format!("scope cycle detected at {current}"));
+            return Err(WorkUnitStoreError::Rejected(format!(
+                "scope cycle detected at {current}"
+            )));
         }
         let suffix = if lock { " FOR UPDATE" } else { "" };
         let scope = client
@@ -969,7 +995,7 @@ fn scope_chain(
             )
             .map_err(string)?
             .map(row_to_scope)
-            .ok_or_else(|| format!("scope not found: {id}"))?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected(format!("scope not found: {id}")))?;
         current = scope.parent_scope_id.clone();
         chain.push(scope);
     }

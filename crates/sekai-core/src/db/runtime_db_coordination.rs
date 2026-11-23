@@ -648,7 +648,7 @@ impl RuntimeDb {
         work_unit: &WorkUnit,
         created_event: &RunEvent,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<()>, String> {
+    ) -> Result<RequestOutcome<()>, crate::sekai::coordination::WorkUnitStoreError> {
         match self {
             Self::Sqlite(db) => db.create_work_unit_for_request(work_unit, created_event, request),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
@@ -663,7 +663,8 @@ impl RuntimeDb {
         lease_owner: &str,
         now_ms: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+    ) -> Result<RequestOutcome<AdmissionResult>, crate::sekai::coordination::WorkUnitStoreError>
+    {
         match self {
             Self::Sqlite(db) => {
                 db.try_admit_work_unit_for_request(work_unit_id, lease_owner, now_ms, request)
@@ -680,7 +681,7 @@ impl RuntimeDb {
         transition: &WorkUnitTransition<'_>,
         now_ms: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<WorkUnit>, String> {
+    ) -> Result<RequestOutcome<WorkUnit>, crate::sekai::coordination::WorkUnitStoreError> {
         match self {
             Self::Sqlite(db) => {
                 db.transition_work_unit_for_request(work_unit_id, transition, now_ms, request)
