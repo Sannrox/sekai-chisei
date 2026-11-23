@@ -1,6 +1,8 @@
 use crate::db::postgres::PostgresDb;
 use crate::sekai::handoff::HandoffManifest;
-use crate::sekai::handoff_lifecycle::{HandoffLifecycleError, resolve_create_conflict};
+use crate::sekai::handoff_lifecycle::{
+    HandoffLifecycleError, Predecessor, check_predecessor, resolve_create_conflict,
+};
 use postgres::error::SqlState;
 
 fn storage(error: impl ToString) -> HandoffLifecycleError {
@@ -56,6 +58,12 @@ impl PostgresDb {
                 serde_json::from_str(row.get::<_, String>(1).as_str()).map_err(storage)?;
             replay.revoked = row.get::<_, Option<i64>>(2).is_some();
             return Ok(replay);
+        }
+        if !stored.supersedes_manifest_id.is_empty() {
+            check_predecessor(
+                &stored,
+                postgres_predecessor(&mut tx, &stored.supersedes_manifest_id)?,
+            )?;
         }
         if let Err(error) = tx.execute(
             "INSERT INTO sekai_handoffs
@@ -222,4 +230,36 @@ impl PostgresDb {
             .map_err(storage)?
             .ok_or_else(|| HandoffLifecycleError::NotFound("handoff not found".into()))
     }
+}
+
+/// Reads the predecessor, locked `FOR UPDATE` so concurrent supersedes and
+/// revokes of it serialize, and whether a live handoff supersedes it, in `tx`.
+fn postgres_predecessor(
+    tx: &mut postgres::Transaction<'_>,
+    id: &str,
+) -> Result<Option<Predecessor>, HandoffLifecycleError> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT manifest_json, revoked_at_ms FROM sekai_handoffs WHERE id=$1 FOR UPDATE",
+            &[&id],
+        )
+        .map_err(storage)?
+    else {
+        return Ok(None);
+    };
+    let mut manifest: HandoffManifest =
+        serde_json::from_str(row.get::<_, String>(0).as_str()).map_err(storage)?;
+    manifest.revoked = row.get::<_, Option<i64>>(1).is_some();
+    let superseded = tx
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM sekai_handoffs
+             WHERE supersedes_manifest_id=$1 AND revoked_at_ms IS NULL)",
+            &[&id],
+        )
+        .map_err(storage)?
+        .get(0);
+    Ok(Some(Predecessor {
+        manifest,
+        superseded,
+    }))
 }

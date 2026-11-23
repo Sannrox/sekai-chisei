@@ -5,7 +5,9 @@
 pub use sekai_types::handoff::*;
 
 use crate::db::sekai::SekaiDb;
-use crate::sekai::handoff_lifecycle::{HandoffLifecycleError, resolve_create_conflict};
+use crate::sekai::handoff_lifecycle::{
+    HandoffLifecycleError, Predecessor, check_predecessor, resolve_create_conflict,
+};
 use rusqlite::{OptionalExtension, params};
 
 fn storage(error: impl ToString) -> HandoffLifecycleError {
@@ -61,22 +63,41 @@ impl SekaiDb {
         stored.digest = request_digest.clone();
         let json = serde_json::to_string(&stored).map_err(storage)?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(storage)?;
+        // Immediate: the predecessor check and the insert hold the write lock,
+        // so two supersedes of one predecessor run one after the other.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage)?;
         let replay = tx
             .query_row(
-                "SELECT request_digest, manifest_json FROM sekai_handoffs WHERE creator_principal=?1 AND request_id=?2",
+                "SELECT request_digest, manifest_json, revoked_at_ms FROM sekai_handoffs WHERE creator_principal=?1 AND request_id=?2",
                 params![stored.creator_principal, request_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(storage)?;
-        if let Some((existing_digest, existing_json)) = replay {
+        if let Some((existing_digest, existing_json, revoked_at)) = replay {
             if existing_digest != request_digest {
                 return Err(HandoffLifecycleError::AlreadyExists(
                     "request_id is already bound to different handoff input".into(),
                 ));
             }
-            return serde_json::from_str(&existing_json).map_err(storage);
+            let mut replay: HandoffManifest =
+                serde_json::from_str(&existing_json).map_err(storage)?;
+            replay.revoked = revoked_at.is_some();
+            return Ok(replay);
+        }
+        if !stored.supersedes_manifest_id.is_empty() {
+            check_predecessor(
+                &stored,
+                sqlite_predecessor(&tx, &stored.supersedes_manifest_id)?,
+            )?;
         }
         if let Err(error) = tx.execute(
             "INSERT INTO sekai_handoffs(id, namespace, intended_principal, request_id, request_digest, manifest_json, created_at_ms, expires_at_ms, creator_principal, supersedes_manifest_id)
@@ -218,4 +239,35 @@ impl SekaiDb {
             .map_err(storage)?
             .ok_or_else(|| HandoffLifecycleError::NotFound("handoff not found".into()))
     }
+}
+
+/// Reads the predecessor and whether a live handoff supersedes it, in `tx`.
+fn sqlite_predecessor(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> Result<Option<Predecessor>, HandoffLifecycleError> {
+    let Some((json, revoked_at)) = tx
+        .query_row(
+            "SELECT manifest_json, revoked_at_ms FROM sekai_handoffs WHERE id=?1",
+            [id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(storage)?
+    else {
+        return Ok(None);
+    };
+    let mut manifest: HandoffManifest = serde_json::from_str(&json).map_err(storage)?;
+    manifest.revoked = revoked_at.is_some();
+    let superseded = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sekai_handoffs WHERE supersedes_manifest_id=?1 AND revoked_at_ms IS NULL)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    Ok(Some(Predecessor {
+        manifest,
+        superseded,
+    }))
 }
