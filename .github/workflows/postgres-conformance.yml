@@ -16,6 +16,13 @@ on:
     - cron: "41 3 * * 1"
   workflow_dispatch:
 
+# A newer push to a pull request cancels its older run. Every other run gets
+# its own group, so main, release, scheduled, and manual runs never cancel or
+# replace one another (#2809).
+concurrency:
+  group: postgres-conformance-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

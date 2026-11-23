@@ -338,6 +338,16 @@ class PostgresConformance(unittest.TestCase):
         self.assertNotIn("paths", trigger)
         self.assertLessEqual(set(trigger.get("paths-ignore", [])), self.DOCS_ONLY)
 
+    def test_a_new_push_cancels_only_its_own_pull_requests_run(self):
+        concurrency = self.wf["concurrency"]
+        self.assertEqual(
+            concurrency["group"],
+            "postgres-conformance-${{ github.event.pull_request.number || github.run_id }}",
+        )
+        self.assertEqual(
+            concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}"
+        )
+
 
 class N1Upgrade(unittest.TestCase):
     """A failed or empty N-1 resolve must fail the step, not write tag=."""
