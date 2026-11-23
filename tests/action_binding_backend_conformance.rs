@@ -3,7 +3,8 @@
 //! cursor round-trips with its pending events and read marker, and a cursor
 //! write for a superseded revision changes nothing. The schedule tick lists
 //! only enabled scheduled bindings, across namespaces (#3033). Dataset-commit
-//! cursors move forward only, for the installed revision only (#3034).
+//! cursors move forward only, for the installed revision only (#3034). An
+//! approval binding reads back enabled from its fail-closed stored form (#3035).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ fn binding(namespace: &str) -> ActionBinding {
         ops: vec![OP_UPDATE.into()],
         schedule: None,
         dataset_commit: None,
+        require_approval: false,
         type_id: "incident.escalate".into(),
         version: "1".into(),
         run_as: "svc-escalator".into(),
@@ -248,6 +250,36 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
             .unwrap()
             .get("orders"),
         Some(&1)
+    );
+    // An approval binding is stored disabled for older planes and reads
+    // back enabled, through get, list and the schedule listing (#3035).
+    let gated = db
+        .put_action_binding(
+            &ActionBinding {
+                require_approval: true,
+                ..scheduled("gated", namespace, true)
+            },
+            "admin",
+            19,
+        )
+        .unwrap();
+    let (read, _) = db.get_action_binding(namespace, "gated").unwrap().unwrap();
+    assert!(read.enabled && read.require_approval);
+    assert_eq!(
+        read.approval_rule(),
+        format!("action_binding:gated@{}", gated.revision)
+    );
+    assert!(
+        db.list_action_bindings(namespace)
+            .unwrap()
+            .iter()
+            .any(|binding| binding.binding_id == "gated" && binding.enabled)
+    );
+    assert!(
+        db.list_scheduled_action_bindings()
+            .unwrap()
+            .iter()
+            .any(|binding| binding.binding_id == "gated" && binding.require_approval)
     );
 }
 

@@ -54,6 +54,44 @@ pub const DATASET_COMMIT_PINNED: &str = "dataset-versions";
 /// The `op` a dataset-commit submission reports.
 pub const OP_DATASET_COMMIT: &str = "dataset_commit";
 
+/// Stored in place of `enabled` for an enabled binding that requires
+/// approval (#3035). The stored body then says `enabled: false`, so a plane
+/// that predates `require_approval` refuses the run instead of submitting
+/// without a park; this plane reads the binding back as enabled.
+const STORED_APPROVAL_GATED_ENABLED: &str = "approval_gated_enabled";
+
+/// The stored form of a binding. See [`STORED_APPROVAL_GATED_ENABLED`].
+pub fn encode_binding_body(binding: &ActionBinding) -> Result<String, String> {
+    let mut body = serde_json::to_value(binding).map_err(|error| error.to_string())?;
+    if binding.require_approval && binding.enabled {
+        let fields = body
+            .as_object_mut()
+            .ok_or("action binding must encode as an object")?;
+        fields.insert("enabled".into(), serde_json::Value::Bool(false));
+        fields.insert(
+            STORED_APPROVAL_GATED_ENABLED.into(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    Ok(body.to_string())
+}
+
+/// Reads a stored binding body, written by [`encode_binding_body`] or by a
+/// plane that predates it.
+pub fn decode_binding_body(body: &str) -> Result<ActionBinding, String> {
+    let corrupt = |error: serde_json::Error| format!("corrupt action binding: {error}");
+    let mut value: serde_json::Value = serde_json::from_str(body).map_err(corrupt)?;
+    let gated = value
+        .as_object_mut()
+        .and_then(|fields| fields.remove(STORED_APPROVAL_GATED_ENABLED))
+        .is_some_and(|gated| gated == serde_json::Value::Bool(true));
+    let mut binding: ActionBinding = serde_json::from_value(value).map_err(corrupt)?;
+    if gated && binding.require_approval {
+        binding.enabled = true;
+    }
+    Ok(binding)
+}
+
 /// Where one Action parameter comes from. Closed: no expressions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", content = "value", rename_all = "snake_case")]
@@ -94,6 +132,10 @@ pub struct ActionBinding {
     /// Fires on new dataset versions instead of on object changes (#3034).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_commit: Option<ActionBindingDatasetCommit>,
+    /// Parks every submit for a human decision, whatever the policy allows
+    /// (#3035). It only adds a park: a denial or a policy park stands.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_approval: bool,
     pub type_id: String,
     /// Pinned `GovernedActionType` version.
     pub version: String,
@@ -214,6 +256,17 @@ impl ActionBinding {
             }
         }
         Ok(())
+    }
+
+    /// The approval rule a submit carries: `action_binding:<id>@<revision>`
+    /// when the binding requires approval, so a parked instance names the
+    /// automation that requested it; empty otherwise.
+    pub fn approval_rule(&self) -> String {
+        if self.require_approval {
+            format!("action_binding:{}@{}", self.binding_id, self.revision)
+        } else {
+            String::new()
+        }
     }
 
     /// A dataset-commit binding has no object event, so it names no kind, ops
@@ -372,8 +425,7 @@ pub fn scheduled_bindings(
 ) -> Result<Vec<ActionBinding>, String> {
     let mut scheduled = Vec::new();
     for body in bodies {
-        let binding: ActionBinding = serde_json::from_str(&body)
-            .map_err(|error| format!("corrupt action binding: {error}"))?;
+        let binding = decode_binding_body(&body)?;
         if binding.enabled && binding.schedule.is_some() {
             scheduled.push(binding);
         }
@@ -432,8 +484,7 @@ pub fn decode_stored(
     pending: &str,
     marker: &str,
 ) -> Result<(ActionBinding, ActionBindingCursor), String> {
-    let binding: ActionBinding =
-        serde_json::from_str(body).map_err(|error| format!("corrupt action binding: {error}"))?;
+    let binding = decode_binding_body(body)?;
     let pending_events = serde_json::from_str(pending)
         .map_err(|error| format!("corrupt action binding cursor: {error}"))?;
     let read_marker = match marker {
@@ -509,7 +560,7 @@ impl SekaiDb {
         stored.revision = previous.map_or(1, |revision| revision as u64 + 1);
         stored.created_by = actor.to_string();
         stored.updated_at_ms = now_ms;
-        let body = serde_json::to_string(&stored).map_err(|error| error.to_string())?;
+        let body = encode_binding_body(&stored)?;
         transaction
             .execute(
                 "INSERT INTO sekai_action_bindings
@@ -553,8 +604,7 @@ impl SekaiDb {
         let mut bindings = Vec::new();
         for body in rows {
             let body = body.map_err(|error| error.to_string())?;
-            let binding: ActionBinding = serde_json::from_str(&body)
-                .map_err(|error| format!("corrupt action binding: {error}"))?;
+            let binding = decode_binding_body(&body)?;
             bindings.push(binding);
         }
         Ok(bindings)
@@ -768,6 +818,7 @@ mod tests {
             ops: vec![OP_UPDATE.into()],
             schedule: None,
             dataset_commit: None,
+            require_approval: false,
             type_id: "incident.escalate".into(),
             version: "1".into(),
             run_as: "svc-escalator".into(),
@@ -926,6 +977,41 @@ mod tests {
                 .unwrap()
                 .contains("dataset_commit")
         );
+    }
+
+    #[test]
+    fn a_plane_without_require_approval_reads_an_approval_binding_as_disabled() {
+        let gated = ActionBinding {
+            require_approval: true,
+            revision: 4,
+            ..binding()
+        };
+        let body = encode_binding_body(&gated).unwrap();
+        // An older plane decodes the body with plain serde and ignores the
+        // fields it does not know: it sees a disabled binding and refuses
+        // the run instead of submitting without a park.
+        let older: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(older["enabled"], serde_json::Value::Bool(false));
+        let decoded = decode_binding_body(&body).unwrap();
+        assert!(decoded.enabled && decoded.require_approval);
+        assert_eq!(
+            decoded.approval_rule(),
+            "action_binding:escalate-on-update@4"
+        );
+
+        let paused = ActionBinding {
+            enabled: false,
+            ..gated
+        };
+        assert!(
+            !decode_binding_body(&encode_binding_body(&paused).unwrap())
+                .unwrap()
+                .enabled
+        );
+        // A binding without the flag is stored exactly as before.
+        let plain = encode_binding_body(&binding()).unwrap();
+        assert_eq!(plain, serde_json::to_value(binding()).unwrap().to_string());
+        assert!(binding().approval_rule().is_empty());
     }
 
     #[test]

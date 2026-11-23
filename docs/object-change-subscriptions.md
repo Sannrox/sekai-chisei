@@ -90,6 +90,21 @@ is never submitted or named, and its cursor moves past what it hid. A
 reinstall bumps the revision and re-pins. Planes from before #3034 refuse a
 dataset-commit binding (its empty `kind` is invalid) without submitting.
 
+Any binding can set `"require_approval": true` (#3035). A submit admission
+would admit then parks instead, with `ActionApprovalRequirement.rule`
+`action_binding:<binding_id>@<revision>` and an empty `policy_scope`, so an
+approver sees that an automation requested it. Approvers come from the
+Action type (named approvers, else namespace administrators), and
+`DecideActionInstance` decides it as any parked instance; `run_as` never
+decides its own. A grant admits that instance once, and a rerun replays it
+under the same idempotency key. The flag only adds a park: a submit the
+policy denies stays denied, and one the policy parks keeps the policy's rule.
+An enabled binding with the flag is stored as `"enabled": false` plus
+`"approval_gated_enabled": true`; this plane reads it back as enabled, and a
+plane from before #3035 sees it disabled and refuses the run with
+`FAILED_PRECONDITION` instead of submitting without a park, during a rolling
+deploy or after a rollback.
+
 ## Backends
 
 SQLite and PostgreSQL read the same `sekai_object_changes` log and the same

@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key};
 use crate::sekai::action_binding::{
-    ActionBinding, ActionBindingCursor, decode_stored, encode_cursor, scheduled_bindings,
+    ActionBinding, ActionBindingCursor, decode_binding_body, decode_stored, encode_binding_body,
+    encode_cursor, scheduled_bindings,
 };
 
 impl PostgresDb {
@@ -43,7 +44,7 @@ impl PostgresDb {
         stored.revision = previous.map_or(1, |revision| revision as u64 + 1);
         stored.created_by = actor.to_string();
         stored.updated_at_ms = now_ms;
-        let body = serde_json::to_string(&stored).map_err(|error| error.to_string())?;
+        let body = encode_binding_body(&stored)?;
         tx.execute(
             "INSERT INTO sekai_action_bindings
                 (namespace, binding_id, revision, body_json, updated_at_ms)
@@ -204,8 +205,7 @@ impl PostgresDb {
         let mut bindings = Vec::new();
         for row in rows {
             let body: String = row.get(0);
-            let binding: ActionBinding = serde_json::from_str(&body)
-                .map_err(|error| format!("corrupt action binding: {error}"))?;
+            let binding = decode_binding_body(&body)?;
             bindings.push(binding);
         }
         Ok(bindings)

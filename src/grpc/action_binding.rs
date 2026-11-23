@@ -468,6 +468,7 @@ impl SekaiServiceImpl {
                                 parameters_json: binding
                                     .dataset_parameters(&dataset.id, &version.version_id),
                                 idempotency_key,
+                                approval_rule: binding.approval_rule(),
                             },
                             tenant,
                             resource_tenant,
@@ -570,6 +571,7 @@ impl SekaiServiceImpl {
                             run_as: &binding.run_as,
                             parameters_json: binding.tick_parameters(),
                             idempotency_key: binding.tick_idempotency_key(due_at_ms)?,
+                            approval_rule: binding.approval_rule(),
                         },
                         &tenant,
                         &resource_tenant,
@@ -723,6 +725,7 @@ impl SekaiServiceImpl {
                 run_as: &binding.run_as,
                 parameters_json,
                 idempotency_key,
+                approval_rule: binding.approval_rule(),
             },
             tenant,
             resource_tenant,
@@ -772,6 +775,7 @@ impl SekaiServiceImpl {
                 action.namespace,
             ),
             expected_object_revision: String::new(),
+            binding_approval_rule: action.approval_rule,
             offline: None,
         };
         let result = if let Some(clerk) = &self.cross_store {
@@ -832,6 +836,8 @@ pub(super) struct BoundAction<'a> {
     pub run_as: &'a str,
     pub parameters_json: String,
     pub idempotency_key: String,
+    /// The binding's approval rule; empty adds no park (#3035).
+    pub approval_rule: String,
 }
 
 /// The objects of `kind` in `namespace` among `object_ids` that `principals`
@@ -987,6 +993,7 @@ mod tests {
                     ops: vec!["update".into()],
                     schedule: None,
                     dataset_commit: None,
+                    require_approval: false,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1119,6 +1126,7 @@ mod tests {
                     ops: vec!["update".into()],
                     schedule: None,
                     dataset_commit: None,
+                    require_approval: false,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1280,6 +1288,7 @@ mod tests {
                     every_ms: 60_000,
                 }),
                 dataset_commit: None,
+                require_approval: false,
                 type_id: "component.escalate".into(),
                 version: "1".into(),
                 run_as: "svc-escalator".into(),
@@ -1356,6 +1365,84 @@ mod tests {
         assert_eq!(parked[0].principal, "svc-escalator");
     }
 
+    /// Reinstalls `scheduled_escalator`'s binding with `require_approval`.
+    fn require_approval(db: &RuntimeDb) -> ActionBinding {
+        let (mut binding, _) = db
+            .get_action_binding("demo", "escalate-hourly")
+            .unwrap()
+            .unwrap();
+        binding.require_approval = true;
+        db.put_action_binding(&binding, "local", 3).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_binding_that_requires_approval_parks_until_one_grant_admits() {
+        use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_PARKED};
+        let (db, svc) = scheduled_escalator(crate::sekai::action_policy::ActionDecision::Allow);
+        let binding = require_approval(&db);
+        let now = 1_000 * 60_000;
+        tick(&svc, now).await;
+        let parked = instances(&db);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].status, STATUS_PARKED);
+        let requirement = parked[0].approval.clone().unwrap();
+        assert_eq!(
+            requirement.rule,
+            format!("action_binding:escalate-hourly@{}", binding.revision)
+        );
+        assert!(requirement.policy_scope.is_empty());
+
+        let granted =
+            crate::sekai::action_instance_admission::ActionInstanceAdmission::new(&db, None)
+                .decide(
+                    crate::sekai::action_instance_admission::ActionInstanceDecisionRequest {
+                        instance_id: parked[0].instance_id.clone(),
+                        decision: "grant".into(),
+                        reason: "reviewed".into(),
+                        decider_principals: vec!["ops-admin".into()],
+                        decider_is_namespace_admin: true,
+                        delegating_actor: None,
+                        execution_claim: None,
+                    },
+                    "ops-admin",
+                    now + 1,
+                )
+                .unwrap();
+        assert_eq!(granted.instance.status, STATUS_ADMITTED);
+        // The same bucket again replays the granted instance.
+        tick(&svc, now + 30_000).await;
+        let after = instances(&db);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].status, STATUS_ADMITTED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn require_approval_never_loosens_a_denial_or_a_policy_park() {
+        use crate::sekai::action_instance::{STATUS_DENIED, STATUS_PARKED};
+        use crate::sekai::action_policy::ActionDecision;
+        let (db, svc) = scheduled_escalator(ActionDecision::Deny);
+        require_approval(&db);
+        tick(&svc, 1_000 * 60_000).await;
+        assert_eq!(instances(&db)[0].status, STATUS_DENIED);
+
+        let (db, svc) = scheduled_escalator(ActionDecision::RequireApproval);
+        require_approval(&db);
+        tick(&svc, 1_000 * 60_000).await;
+        let parked = &instances(&db)[0];
+        assert_eq!(parked.status, STATUS_PARKED);
+        // The policy parked it first, so its rule is recorded, not the binding.
+        assert!(
+            !parked
+                .approval
+                .as_ref()
+                .unwrap()
+                .rule
+                .starts_with("action_binding:"),
+            "{:?}",
+            parked.approval
+        );
+    }
+
     fn bound_escalator() -> (Arc<RuntimeDb>, SekaiServiceImpl) {
         let db = Arc::new(RuntimeDb::memory());
         let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
@@ -1411,6 +1498,7 @@ mod tests {
                     ops: vec!["update".into()],
                     schedule: None,
                     dataset_commit: None,
+                    require_approval: false,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1626,6 +1714,7 @@ mod tests {
                 dataset_commit: Some(
                     crate::sekai::action_binding::ActionBindingDatasetCommit::default(),
                 ),
+                require_approval: false,
                 type_id: "component.escalate".into(),
                 version: "1".into(),
                 run_as: "svc-escalator".into(),

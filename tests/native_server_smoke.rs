@@ -1225,8 +1225,27 @@ async fn spawned_binary_admits_one_action_per_committed_dataset_version() {
     // #3034: a dataset-commit binding pins on its first run, admits exactly
     // one instance for the next committed version, and a rerun admits
     // nothing new.
-    let (_fake, server) = mocked_server().await;
+    dataset_commit_binding_smoke(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_parks_every_submit_of_a_binding_that_requires_approval() {
+    // #3035: with no policy parking it, the binding's require_approval parks
+    // the submit under a rule naming the binding and revision; the named
+    // approver's grant admits it once and a rerun admits nothing new.
+    dataset_commit_binding_smoke(true).await;
+}
+
+/// Installs a dataset-commit binding on `orders`, commits two versions
+/// around its pinning run, and checks the one submit. With
+/// `require_approval` the submit parks and `bob-approver` grants it.
+async fn dataset_commit_binding_smoke(require_approval: bool) {
+    let (_fake, mut server) = mocked_server().await;
+    let approver = server.create_principal_token("bob-approver");
     server.grant_namespace("demo", "svc-loader", "editor").await;
+    server
+        .grant_namespace("demo", "bob-approver", "viewer")
+        .await;
     let mut sekai = server.sekai().await;
     sekai
         .put_governed_action_type(PutGovernedActionTypeRequest {
@@ -1237,6 +1256,7 @@ async fn spawned_binary_admits_one_action_per_committed_dataset_version() {
                 description: "Refresh a report from a dataset version".into(),
                 parameter_schema_json: r#"{"type":"object","properties":{"dataset":{"type":"string"},"version":{"type":"string"}},"required":["dataset","version"],"additionalProperties":false}"#.into(),
                 allowed_effect_kinds: vec!["notify".into()],
+                approvers: vec!["bob-approver".into()],
                 enabled: true,
                 ..Default::default()
             }),
@@ -1290,6 +1310,7 @@ async fn spawned_binary_admits_one_action_per_committed_dataset_version() {
                     "dataset": {"source": "dataset_id"},
                     "version": {"source": "version_id"}
                 },
+                "require_approval": require_approval,
                 "enabled": true
             })
             .to_string(),
@@ -1338,6 +1359,40 @@ async fn spawned_binary_admits_one_action_per_committed_dataset_version() {
     assert!(!submission.version_id.is_empty());
     assert!(!submission.instance_id.is_empty(), "{admitted:?}");
     assert!(!submission.replay);
+    if require_approval {
+        assert_eq!(submission.status, "parked", "{admitted:?}");
+        let parked = sekai
+            .get_action_instance(bearer(
+                &approver,
+                GetActionInstanceRequest {
+                    instance_id: submission.instance_id.clone(),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("get instance: {error}\n{}", server.logs()))
+            .into_inner()
+            .instance
+            .expect("instance");
+        let requirement = parked.approval.expect("approval requirement");
+        assert_eq!(requirement.rule, "action_binding:refresh-on-commit@1");
+        assert_eq!(parked.principal, "svc-loader");
+        let granted = sekai
+            .decide_action_instance(bearer(
+                &approver,
+                DecideActionInstanceRequest {
+                    instance_id: submission.instance_id.clone(),
+                    decision: "grant".into(),
+                    reason: "reviewed".into(),
+                },
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("grant: {error}\n{}", server.logs()))
+            .into_inner();
+        assert_eq!(granted.instance.expect("instance").status, "admitted");
+    } else {
+        assert_eq!(submission.status, "admitted", "{admitted:?}");
+    }
 
     let rerun = run(&sekai).await.expect("rerun");
     assert!(rerun.submissions.is_empty(), "{rerun:?}");
