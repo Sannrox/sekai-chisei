@@ -349,6 +349,31 @@ class PostgresConformance(unittest.TestCase):
         )
 
 
+class CodeQL(unittest.TestCase):
+    """CodeQL scans the Rust server and the Python tooling and SDK (#2808)."""
+
+    def setUp(self):
+        self.job = load("codeql.yml")["jobs"]["analyze"]
+
+    def init(self, language: str) -> dict:
+        return next(
+            step["with"]
+            for step in self.job["steps"]
+            if uses(step).startswith("github/codeql-action/init@")
+            and step["with"]["languages"] == language
+        )
+
+    def test_analyzes_rust_and_python_each_under_its_own_category(self):
+        self.assertEqual(self.job["strategy"]["matrix"]["language"], ["rust", "python"])
+        analyze = next(
+            step for step in self.job["steps"] if uses(step).startswith("github/codeql-action/analyze@")
+        )
+        self.assertEqual(analyze["with"]["category"], "/language:${{ matrix.language }}")
+
+    def test_python_needs_no_build(self):
+        self.assertEqual(self.init("python").get("build-mode"), "none")
+
+
 class N1Upgrade(unittest.TestCase):
     """A failed or empty N-1 resolve must fail the step, not write tag=."""
 
