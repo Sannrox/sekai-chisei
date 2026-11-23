@@ -44,26 +44,24 @@ pub fn ensure_local_credential(
         {
             return Ok(credential);
         }
-        let replacement = new_local_credential(&database_identity, socket);
-        if db
-            .list_credentials(Some(LOCAL_PRINCIPAL), Some("active"))?
-            .is_empty()
-        {
-            db.create_principal_credential(
-                LOCAL_PRINCIPAL,
-                &hash_gateway_key(&replacement.token),
-                chrono::Utc::now().timestamp_millis(),
-            )?;
-        } else {
-            db.rotate_principal_credential(LOCAL_PRINCIPAL, &hash_gateway_key(&replacement.token))?;
-        }
-        std::fs::remove_file(credential_path)
-            .map_err(|error| format!("replace {}: {error}", credential_path.display()))?;
-        write_private_json(credential_path, &replacement)?;
-        return Ok(replacement);
     }
+    issue_local_credential(&db, &database_identity, socket, credential_path)
+}
 
-    let credential = new_local_credential(&database_identity, socket);
+/// Issues a new local credential without ever leaving the old file as the only
+/// copy of a token the database no longer accepts: the replacement is staged
+/// in a private temp file first, the database is rotated second, and the
+/// staged file is renamed over the old one last. A failure before the rotation
+/// leaves both unchanged; a crash after it leaves the old file, which the next
+/// run finds invalid and replaces again.
+fn issue_local_credential(
+    db: &SekaiDb,
+    database_identity: &str,
+    socket: &str,
+    credential_path: &Path,
+) -> Result<LocalCredential, String> {
+    let credential = new_local_credential(database_identity, socket);
+    let staged = StagedPrivateFile::write(credential_path, &credential)?;
     if db
         .list_credentials(Some(LOCAL_PRINCIPAL), Some("active"))?
         .is_empty()
@@ -76,7 +74,7 @@ pub fn ensure_local_credential(
     } else {
         db.rotate_principal_credential(LOCAL_PRINCIPAL, &hash_gateway_key(&credential.token))?;
     }
-    write_private_json(credential_path, &credential)?;
+    staged.commit()?;
     Ok(credential)
 }
 
@@ -113,31 +111,73 @@ fn canonical_path(path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("database path {path:?} is not valid UTF-8"))
 }
 
-fn write_private_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+/// A private (0600 on unix) file written and synced next to its destination,
+/// renamed over it only on `commit`. Dropping it uncommitted removes it.
+struct StagedPrivateFile {
+    temporary: PathBuf,
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StagedPrivateFile {
+    fn write(path: &Path, value: &impl Serialize) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("local-credential.json");
+        let staged = Self {
+            temporary: parent.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple())),
+            path: path.to_path_buf(),
+            committed: false,
+        };
+        let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let write = || {
+            use std::io::Write;
+            let mut file = options.open(&staged.temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        };
+        write().map_err(|error| format!("write {}: {error}", path.display()))?;
+        Ok(staged)
     }
-    let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(|error| format!("create {}: {error}", path.display()))?;
-        file.write_all(&bytes)
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
+
+    fn commit(mut self) -> Result<(), String> {
+        std::fs::rename(&self.temporary, &self.path)
+            .map_err(|error| format!("replace {}: {error}", self.path.display()))?;
+        self.committed = true;
+        #[cfg(unix)]
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        }
+        Ok(())
     }
-    #[cfg(not(unix))]
-    std::fs::write(path, bytes).map_err(|error| format!("write {}: {error}", path.display()))?;
-    Ok(())
+}
+
+impl Drop for StagedPrivateFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.temporary);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,6 +629,74 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let stored: LocalCredential =
+            serde_json::from_slice(&std::fs::read(&credential_path).unwrap()).unwrap();
+        assert_eq!(stored.token, second.token);
+        let staged: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(".credential.json."))
+            .collect();
+        assert!(staged.is_empty(), "staged files left behind: {staged:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&credential_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A replacement that cannot be written leaves the old file and the
+    /// database credential as they were (#2835).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_replacement_write_rotates_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("chisei-onboarding-{}", Uuid::new_v4()));
+        let state = root.join("state");
+        let db_path = root.join("sekai.db");
+        let credential_path = state.join("credential.json");
+        ensure_local_credential(
+            db_path.to_str().unwrap(),
+            "./data/sekai.sock",
+            &credential_path,
+        )
+        .unwrap();
+        let db = SekaiDb::new(db_path.to_str().unwrap()).unwrap();
+        db.revoke_principal_credential(LOCAL_PRINCIPAL).unwrap();
+        let before = std::fs::read(&credential_path).unwrap();
+        let active_before = db
+            .list_credentials(Some(LOCAL_PRINCIPAL), Some("active"))
+            .unwrap()
+            .len();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A privileged runner can write into a read-only directory; nothing to prove then.
+        let writable = std::fs::File::create(state.join("probe")).is_ok();
+        let result = (!writable).then(|| {
+            ensure_local_credential(
+                db_path.to_str().unwrap(),
+                "./data/sekai.sock",
+                &credential_path,
+            )
+        });
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if let Some(result) = result {
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&credential_path).unwrap(), before);
+            assert_eq!(
+                db.list_credentials(Some(LOCAL_PRINCIPAL), Some("active"))
+                    .unwrap()
+                    .len(),
+                active_before
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
