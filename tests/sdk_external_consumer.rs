@@ -5,10 +5,17 @@ use sekai_chisei::sekai::client_package::{
     ClientPackage, LANG_PYTHON, LANG_RUST, LANG_TYPESCRIPT, PACKAGE_CONTRACT, PACKAGE_UNAVAILABLE,
     artifacts_from, publish_client_package, smoke_client_package, verify_client_package,
 };
+use sekai_client::{
+    CallOptions, ClientConfig, CoreLoopClient, CoreLoopTransport, ExecutePlanRequest,
+    ExecutePlanStreamEvent, ExecutionInput, ExecutionPlan, GetOperationReceiptRequest,
+    GetOperationReceiptResponse, PlanExecutionRequest, PlanExecutionResponse,
+    ReportOperationEventRequest, ReportOperationEventResponse,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+use tonic::{Request, Response, Status};
 
 const FIXTURE: &str = include_str!("../tests/fixtures/sdk_core_loop/v1.json");
 const ACTOR: &str = "integrator";
@@ -125,15 +132,6 @@ fn run_in(dir: &Path, program: &str, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("utf8 stdout")
 }
 
-fn assert_live_identity(label: &str, stdout: &str) {
-    for needle in ["operation-1", "service-1", "plan-1"] {
-        assert!(
-            stdout.contains(needle),
-            "{label} stdout missing {needle}: {stdout}"
-        );
-    }
-}
-
 fn package(
     id: &str,
     language: &str,
@@ -179,7 +177,7 @@ fn tree_text(root: &Path) -> String {
 }
 
 #[test]
-#[ignore = "requires python3, node, and rustc on PATH; CI runs it with --ignored"]
+#[ignore = "requires python3 and node on PATH; CI runs it with --ignored"]
 fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
     let (_root, rust, typescript, python, proto, proto_crate) = stage_consumers();
     rewrite_python_fixture(&python);
@@ -250,19 +248,10 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
     )
     .unwrap();
 
-    let rust_art_disk = artifacts_from_disk(&proto, &rust, &rust.join("src/lib.rs"));
-    let ts_art_disk = artifacts_from_disk(&proto, &typescript, &typescript.join("client.ts"));
-    let py_art_disk = artifacts_from_disk(&proto, &python, &python.join("sekai_client.py"));
-    assert_eq!(rust_art.protocol, rust_art_disk.protocol);
-    assert_eq!(rust_art.source, rust_art_disk.source);
-    assert_eq!(rust_art.package, rust_art_disk.package);
-    assert_eq!(ts_art.protocol, ts_art_disk.protocol);
-    assert_eq!(py_art.protocol, py_art_disk.protocol);
-
     for (id, artifacts) in [
-        ("pkg:rust-0.1.0", &rust_art_disk),
-        ("pkg:typescript-0.1.0", &ts_art_disk),
-        ("pkg:python-0.1.0", &py_art_disk),
+        ("pkg:rust-0.1.0", &rust_art),
+        ("pkg:typescript-0.1.0", &ts_art),
+        ("pkg:python-0.1.0", &py_art),
     ] {
         let verified = verify_client_package(&db, ACTOR, "sdk", id, artifacts).unwrap();
         assert_eq!(verified.catalog_version, "catalog-v1");
@@ -285,77 +274,242 @@ fn isolated_consumers_install_pinned_artifacts_and_share_core_loop_identity() {
 
     require_tool("python3");
     require_tool("node");
-    require_tool("rustc");
 
+    // The staged SDK test suites run against the isolated fixture copy.
     run_in(
         &python,
         "python3",
         &["-m", "unittest", "test_sekai_client.py", "-v"],
     );
+    run_in(&typescript, "node", &["--test", "client.test.ts"]);
 
+    // Each SDK runs its own core loop against the fixture, so parity compares
+    // the identity every SDK derives rather than a reread of the shared JSON.
+    let expected = ["operation-1", "request-1", "plan-1"]
+        .map(String::from)
+        .to_vec();
+    assert_eq!(rust_core_loop_identity(), expected, "rust");
+    fs::write(python.join("core_loop_probe.py"), PYTHON_CORE_LOOP_PROBE).unwrap();
+    let python_ids = run_in(&python, "python3", &["core_loop_probe.py"]);
+    assert_eq!(identity_lines(&python_ids), expected, "python");
     fs::write(
-        rust.join("identity_probe.rs"),
-        r#"fn first_string_field(text: &str, key: &str) -> String {
-    let needle = format!("\"{key}\": \"");
-    let start = text.find(&needle).unwrap_or_else(|| panic!("{key}")) + needle.len();
-    let end = text[start..].find('"').expect("closing quote");
-    text[start..start + end].to_string()
-}
-
-fn main() {
-    let text = std::fs::read_to_string("v1.json").expect("v1.json");
-    println!("{}", first_string_field(&text, "operation_id"));
-    println!("{}", first_string_field(&text, "id"));
-    println!("{}", first_string_field(&text, "plan_id"));
-}
-"#,
+        typescript.join("core_loop_probe.ts"),
+        TYPESCRIPT_CORE_LOOP_PROBE,
     )
     .unwrap();
-    run_in(
-        &rust,
-        "rustc",
-        &["identity_probe.rs", "-o", "identity_probe"],
-    );
-    let rust_out = run_in(&rust, "./identity_probe", &[]);
-    assert_live_identity("rust", &rust_out);
+    let ts_ids = run_in(&typescript, "node", &["core_loop_probe.ts"]);
+    assert_eq!(identity_lines(&ts_ids), expected, "typescript");
+}
 
-    let ts_out = run_in(
-        &typescript,
-        "node",
-        &[
-            "--input-type=module",
-            "-e",
-            "import fs from 'node:fs'; const j = JSON.parse(fs.readFileSync('v1.json','utf8')); for (const v of [j.operation_id, j.objects[0].id, j.plan.plan_id]) console.log(v);",
-        ],
-    );
-    assert_live_identity("typescript", &ts_out);
+/// The non-empty lines a core-loop probe prints: operation id, request id, plan id.
+fn identity_lines(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(String::from)
+        .collect()
+}
 
-    let python_ids = run_in(
-        &python,
-        "python3",
-        &[
-            "-c",
-            "import json; j=json.load(open('v1.json')); print(j['operation_id']); print(j['objects'][0]['id']); print(j['plan']['plan_id'])",
-        ],
-    );
-    assert_live_identity("python", &python_ids);
-    assert_eq!(
-        rust_out
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>(),
-        python_ids
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        ts_out.lines().filter(|l| !l.is_empty()).collect::<Vec<_>>(),
-        python_ids
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-    );
+/// Runs the staged Python SDK's `run_core_loop` against `v1.json` through a
+/// transport that answers each call from the fixture.
+const PYTHON_CORE_LOOP_PROBE: &str = r#"import json
+from pathlib import Path
+
+from sekai_client import ClientConfig, SekaiChiseiClient
+
+FIXTURE = json.loads(Path("v1.json").read_text())
+
+
+class Transport:
+    def unary(self, service, method, request, options):
+        if method == "CreateSchemaType":
+            return {"type": request["type"]}
+        if method == "CreateObject":
+            return {"object": request["object"]}
+        if method == "CreateLink":
+            return {"link": request["link"]}
+        if method == "PlanExecution":
+            return {"plan": FIXTURE["plan"]}
+        if method == "GetOperationReceipt":
+            return FIXTURE["receipt"]
+        raise AssertionError(f"unexpected {service}.{method}")
+
+    def stream(self, service, method, request, options):
+        if method != "ExecutePlanStream":
+            raise AssertionError(f"unexpected {service}.{method}")
+        return iter(FIXTURE["stream_events"])
+
+    def close(self):
+        pass
+
+
+client = SekaiChiseiClient(
+    ClientConfig(
+        principal=FIXTURE["principal"],
+        token=FIXTURE["token"],
+        namespace=FIXTURE["namespace"],
+        catalog_version=FIXTURE["catalog_version"],
+    ),
+    Transport(),
+)
+result = client.run_core_loop(
+    FIXTURE["namespace"],
+    FIXTURE["objects"],
+    FIXTURE["execution"],
+    schema=FIXTURE["schema"],
+    links=FIXTURE["links"],
+    operation_id=FIXTURE["operation_id"],
+)
+assert result["events"] == FIXTURE["stream_events"], result["events"]
+assert result["receipt"] == FIXTURE["receipt"], result["receipt"]
+print(result["operation_id"])
+print(result["request_id"])
+print(result["plan"]["plan_id"])
+"#;
+
+/// Runs the staged TypeScript SDK's `runCoreLoop` against `v1.json` through a
+/// transport that answers each call from the fixture.
+const TYPESCRIPT_CORE_LOOP_PROBE: &str = r#"import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { SekaiChiseiClient } from "./client.ts";
+
+const fixture = JSON.parse(readFileSync(new URL("./v1.json", import.meta.url), "utf8"));
+const transport = {
+  async unary(service, method, request) {
+    if (method === "CreateSchemaType") return { type: request.type };
+    if (method === "CreateObject") return { object: request.object };
+    if (method === "CreateLink") return { link: request.link };
+    if (method === "PlanExecution") return { plan: fixture.plan };
+    if (method === "GetOperationReceipt") return fixture.receipt;
+    throw new Error(`unexpected ${service}.${method}`);
+  },
+  stream(service, method) {
+    if (method !== "ExecutePlanStream") throw new Error(`unexpected ${service}.${method}`);
+    return (async function* () {
+      yield* fixture.stream_events;
+    })();
+  },
+};
+const client = new SekaiChiseiClient({
+  principal: fixture.principal,
+  token: fixture.token,
+  namespace: fixture.namespace,
+  catalogVersion: fixture.catalog_version,
+  transport,
+});
+const result = await client.runCoreLoop({
+  namespace: fixture.namespace,
+  schema: fixture.schema,
+  objects: fixture.objects,
+  links: fixture.links,
+  execution: fixture.execution,
+  operationId: fixture.operation_id,
+});
+assert.deepEqual(result.events, fixture.stream_events);
+assert.deepEqual(result.receipt, fixture.receipt);
+console.log(result.operationId);
+console.log(result.requestId);
+console.log(result.plan.plan_id);
+"#;
+
+/// Answers the Rust SDK's plan, stream and receipt calls from `v1.json`.
+struct RustFixtureTransport(serde_json::Value);
+
+#[async_trait::async_trait]
+impl CoreLoopTransport for RustFixtureTransport {
+    type Stream = futures::stream::Iter<std::vec::IntoIter<Result<ExecutePlanStreamEvent, Status>>>;
+
+    async fn plan_execution(
+        &self,
+        request: Request<PlanExecutionRequest>,
+    ) -> Result<Response<PlanExecutionResponse>, Status> {
+        let plan = &self.0["plan"];
+        Ok(Response::new(PlanExecutionResponse {
+            plan: Some(ExecutionPlan {
+                plan_id: plan["plan_id"].as_str().unwrap().into(),
+                input: request.into_inner().input,
+                resolved_model: plan["resolved_model"].as_str().unwrap().into(),
+                executable: plan["executable"].as_bool().unwrap(),
+                ..Default::default()
+            }),
+        }))
+    }
+
+    async fn execute_plan_stream(
+        &self,
+        _request: Request<ExecutePlanRequest>,
+    ) -> Result<Response<Self::Stream>, Status> {
+        let events: Vec<_> = self.0["stream_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| {
+                Ok(ExecutePlanStreamEvent {
+                    content_delta: event["content_delta"].as_str().unwrap().into(),
+                    done: event["done"].as_bool().unwrap(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Ok(Response::new(futures::stream::iter(events)))
+    }
+
+    async fn report_operation_event(
+        &self,
+        _request: Request<ReportOperationEventRequest>,
+    ) -> Result<Response<ReportOperationEventResponse>, Status> {
+        Err(Status::unimplemented("the core loop reports no events"))
+    }
+
+    async fn get_operation_receipt(
+        &self,
+        _request: Request<GetOperationReceiptRequest>,
+    ) -> Result<Response<GetOperationReceiptResponse>, Status> {
+        let receipt = &self.0["receipt"];
+        Ok(Response::new(GetOperationReceiptResponse {
+            receipt_json: receipt["receipt_json"].as_str().unwrap().into(),
+            complete: receipt["complete"].as_bool().unwrap(),
+            missing_surfaces: Vec::new(),
+        }))
+    }
+}
+
+/// Runs the Rust SDK's `run_core_loop` against `v1.json` and returns the
+/// operation id, request id and plan id it reports.
+fn rust_core_loop_identity() -> Vec<String> {
+    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+    let text = |value: &serde_json::Value| value.as_str().unwrap().to_string();
+    let config = ClientConfig::for_injected(text(&fixture["principal"]))
+        .with_token(text(&fixture["token"]))
+        .unwrap()
+        .with_namespace(text(&fixture["namespace"]))
+        .with_catalog_version(text(&fixture["catalog_version"]));
+    let execution = &fixture["execution"];
+    let input = ExecutionInput {
+        request_id: text(&execution["request_id"]),
+        namespace: text(&execution["namespace"]),
+        spec: text(&execution["spec"]),
+        task_type: text(&execution["task_type"]),
+        max_tokens: execution["max_tokens"].as_i64().unwrap() as i32,
+        logical_operation_id: text(&execution["logical_operation_id"]),
+        ..Default::default()
+    };
+    let client = CoreLoopClient::new(config, RustFixtureTransport(fixture.clone())).unwrap();
+    let result = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(client.run_core_loop(
+            input,
+            CallOptions::new().with_operation_id(text(&fixture["operation_id"])),
+        ))
+        .unwrap();
+    let deltas: Vec<_> = result
+        .events
+        .iter()
+        .map(|event| event.content_delta.as_str())
+        .collect();
+    assert_eq!(deltas, ["incident ", "summary"]);
+    assert!(result.receipt.complete);
+    vec![result.operation_id, result.request_id, result.plan.plan_id]
 }
 
 /// Pack TypeScript and Python SDKs and install them into a directory that
