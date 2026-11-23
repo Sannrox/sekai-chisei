@@ -11,6 +11,7 @@ use crate::db::postgres_objects::postgres_object_security_filter;
 use crate::db::sekai::{SekaiDb, sqlite_object_security_filter};
 use crate::domain::{Object, storage_properties_json};
 use crate::sekai::audit::{insert_object_changes, object_diff_changes};
+use crate::sekai::definition_diff::operational_compatibility_class;
 use crate::sekai::definition_migration::{
     ExecuteFactMigration, FactMigrationKeptEdit, FactMigrationResult, MODE_EXECUTE, MODE_ROLLBACK,
     PreparedObjectMigration, STATUS_COMMITTED, finish_migration_result, plan_fact_migration,
@@ -102,14 +103,15 @@ impl SekaiDb {
             let policy = load_active_policy_sqlite(&tx, &item.object.namespace, &item.object.kind)?;
             reconcile_planned_grants(policy.as_ref(), &policy_context, item)?;
         }
-        if matches!(compatibility.class.as_str(), "breaking" | "conditional")
-            && !has_merged_proposal_sqlite(
-                &tx,
-                &request.namespace,
-                &request.from_revision_digest,
-                &request.to_revision_digest,
-            )?
-        {
+        if matches!(
+            operational_compatibility_class(&compatibility).as_str(),
+            "breaking" | "conditional"
+        ) && !has_merged_proposal_sqlite(
+            &tx,
+            &request.namespace,
+            &request.from_revision_digest,
+            &request.to_revision_digest,
+        )? {
             return Err(
                 "fact_migration_unapproved: breaking or conditional changes require a merged proposal"
                     .into(),
@@ -903,14 +905,15 @@ impl PostgresDb {
                 load_active_policy_postgres(&mut tx, &item.object.namespace, &item.object.kind)?;
             reconcile_planned_grants(policy.as_ref(), &policy_context, item)?;
         }
-        if matches!(compatibility.class.as_str(), "breaking" | "conditional")
-            && !has_merged_proposal_postgres(
-                &mut tx,
-                &request.namespace,
-                &request.from_revision_digest,
-                &request.to_revision_digest,
-            )?
-        {
+        if matches!(
+            operational_compatibility_class(&compatibility).as_str(),
+            "breaking" | "conditional"
+        ) && !has_merged_proposal_postgres(
+            &mut tx,
+            &request.namespace,
+            &request.from_revision_digest,
+            &request.to_revision_digest,
+        )? {
             return Err(
                 "fact_migration_unapproved: breaking or conditional changes require a merged proposal"
                     .into(),
