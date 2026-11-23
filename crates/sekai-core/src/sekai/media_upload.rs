@@ -21,6 +21,8 @@ pub const REFERENCE_PREFIX: &str = "sekai-media:";
 pub const MAX_MEDIA_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest chunk one call may send or read, well under the gRPC frame cap.
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
+/// An unfinished upload not touched for this long loses its bytes (#3042).
+pub const UNFINISHED_UPLOAD_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const MAX_KEY_BYTES: usize = 256;
 const MAX_MEDIA_TYPE_BYTES: usize = 255;
 const MAX_FILE_NAME_BYTES: usize = 255;
@@ -63,8 +65,20 @@ pub struct MediaUpload {
 }
 
 impl MediaUpload {
+    /// The reference of a completed upload, none once deleted.
     pub fn reference(&self) -> Option<String> {
+        if self.is_deleted() {
+            return None;
+        }
         self.object_id.as_deref().map(reference)
+    }
+
+    /// A deleted attachment's session (#3042): it names the object it was
+    /// but holds no bytes. Every upload holds at least one byte once
+    /// complete, so nothing else looks like this. The row stays so the
+    /// idempotency key stays spent.
+    pub fn is_deleted(&self) -> bool {
+        self.object_id.is_some() && self.received_bytes == 0
     }
 }
 

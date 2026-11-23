@@ -6,7 +6,9 @@
 //! object, so generic object RPCs never touch it, and `ReadMedia` applies the
 //! ordinary object read checks: namespace role, tenant and collaboration
 //! scope, grants, marking and object security policy. A caller who fails
-//! any of them gets `NOT_FOUND`.
+//! any of them gets `NOT_FOUND`. `DeleteMedia` (#3042) applies the object
+//! delete checks and removes the object and its bytes; the session row stays
+//! as a deleted marker so its idempotency key cannot bring the file back.
 
 use super::*;
 use crate::sekai::media_upload::{
@@ -180,13 +182,56 @@ impl<'a> Caller<'a> {
         check_team_namespace(self.db(), &self.principals, namespace, false)
     }
 
-    /// The caller's own session. Another uploader's session is `NOT_FOUND`.
+    /// The caller's own session. Another uploader's session, or one whose
+    /// attachment was deleted, is `NOT_FOUND`.
     fn own_upload(&self, upload_id: &str) -> Result<MediaUpload, Status> {
         self.db()
             .get_media_upload(upload_id)
             .map_err(media_status)?
-            .filter(|upload| upload.request.uploader == self.actor())
+            .filter(|upload| upload.request.uploader == self.actor() && !upload.is_deleted())
             .ok_or_else(|| media_status(MediaError::NotFound))
+    }
+
+    /// The caller may delete `object`: namespace write, no freeze, and the
+    /// object's delete checks, which record the decision.
+    fn authorize_delete(&self, object: &domain::Object) -> Result<(), Status> {
+        let db = self.db();
+        let tenant = self.tenant_context.as_ref();
+        enforce_collaboration_namespace(db, tenant, &object.namespace, true)?;
+        check_team_namespace(db, &self.principals, &object.namespace, true)?;
+        refuse_frozen_object_write(
+            db,
+            &object.namespace,
+            &self.principals,
+            tenant,
+            crate::enterprise::NamespaceAction::Write,
+        )?;
+        if !collaboration_object_permitted(
+            db,
+            tenant,
+            object,
+            crate::enterprise::NamespaceAction::Write,
+        )? {
+            return Err(Status::permission_denied("access denied"));
+        }
+        check_object_acl_with_audit(
+            db,
+            &self.service.security,
+            &object.id,
+            &self.principals,
+            tenant,
+            ObjectSecurityOperation::Delete,
+        )?;
+        enforce_object_operation_access(
+            db,
+            object,
+            &self.principals,
+            tenant,
+            ObjectSecurityOperation::Delete,
+            "delete_media",
+            self.purpose.as_ref(),
+        )?;
+        Ok(())
     }
 
     /// Whether the caller may read a stored media object: the object read
@@ -223,54 +268,60 @@ impl<'a> Caller<'a> {
 
 // Every handler runs on the bounded database worker pool: sessions and
 // chunks are database reads and writes, and completion hashes the file.
-pub(super) async fn begin_media_upload(
-    service: &SekaiServiceImpl,
-    req: Request<BeginMediaUploadRequest>,
-) -> Result<Response<MediaUploadStatus>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || begin_media_upload_blocking(&owned, req))
-        .await
-}
+impl SekaiServiceImpl {
+    pub(super) async fn begin_media_upload_rpc(
+        &self,
+        req: Request<BeginMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || begin_media_upload_blocking(&owned, req))
+            .await
+    }
 
-pub(super) async fn upload_media_chunk(
-    service: &SekaiServiceImpl,
-    req: Request<UploadMediaChunkRequest>,
-) -> Result<Response<MediaUploadStatus>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || upload_media_chunk_blocking(&owned, req))
-        .await
-}
+    pub(super) async fn upload_media_chunk_rpc(
+        &self,
+        req: Request<UploadMediaChunkRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || upload_media_chunk_blocking(&owned, req))
+            .await
+    }
 
-pub(super) async fn complete_media_upload(
-    service: &SekaiServiceImpl,
-    req: Request<CompleteMediaUploadRequest>,
-) -> Result<Response<MediaUploadStatus>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || complete_media_upload_blocking(&owned, req))
-        .await
-}
+    pub(super) async fn complete_media_upload_rpc(
+        &self,
+        req: Request<CompleteMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || complete_media_upload_blocking(&owned, req))
+            .await
+    }
 
-pub(super) async fn get_media_upload(
-    service: &SekaiServiceImpl,
-    req: Request<GetMediaUploadRequest>,
-) -> Result<Response<MediaUploadStatus>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || get_media_upload_blocking(&owned, req))
-        .await
-}
+    pub(super) async fn get_media_upload_rpc(
+        &self,
+        req: Request<GetMediaUploadRequest>,
+    ) -> Result<Response<MediaUploadStatus>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || get_media_upload_blocking(&owned, req))
+            .await
+    }
 
-pub(super) async fn read_media(
-    service: &SekaiServiceImpl,
-    req: Request<ReadMediaRequest>,
-) -> Result<Response<ReadMediaResponse>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || read_media_blocking(&owned, req))
-        .await
+    pub(super) async fn delete_media_rpc(
+        &self,
+        req: Request<DeleteMediaRequest>,
+    ) -> Result<Response<DeleteMediaResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || delete_media_blocking(&owned, req))
+            .await
+    }
+
+    pub(super) async fn read_media_rpc(
+        &self,
+        req: Request<ReadMediaRequest>,
+    ) -> Result<Response<ReadMediaResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || read_media_blocking(&owned, req))
+            .await
+    }
 }
 
 fn begin_media_upload_blocking(
@@ -305,6 +356,11 @@ fn begin_media_upload_blocking(
         .db()
         .begin_media_upload(&pending.request, now)
         .map_err(media_status)?;
+    if upload.is_deleted() {
+        return Err(Status::failed_precondition(
+            "the file uploaded under this idempotency key was deleted; use a new key",
+        ));
+    }
     Ok(Response::new(upload_status(&upload)))
 }
 
@@ -431,7 +487,7 @@ fn read_media_blocking(
     let upload = db
         .get_media_upload(&upload_id)
         .map_err(media_status)?
-        .filter(|upload| upload.object_id.as_deref() == Some(object_id))
+        .filter(|upload| upload.object_id.as_deref() == Some(object_id) && !upload.is_deleted())
         .ok_or_else(hidden)?;
     // Metadata as a read of the object shows it: a property the caller may
     // not read comes back empty.
@@ -467,4 +523,58 @@ fn read_media_blocking(
         file_name: property(media_upload::PROPERTY_FILE_NAME),
         access_marking: property(markings::OBJECT_CLASSIFICATION_PROPERTY),
     }))
+}
+
+/// Delete order makes a retry after a crash finish the job: the session's
+/// bytes go first, so a half-done delete already reads as `NOT_FOUND`, then
+/// the object, fenced on the policy generation the checks saw.
+fn delete_media_blocking(
+    service: &SekaiServiceImpl,
+    req: Request<DeleteMediaRequest>,
+) -> Result<Response<DeleteMediaResponse>, Status> {
+    let caller = Caller::new(service, &req)?;
+    let input = req.into_inner();
+    let object_id = media_upload::parse_reference(&input.media_reference).map_err(media_status)?;
+    let db = caller.db();
+    // Missing and unreadable answer alike, as a generic delete does, so a
+    // delete never tells a caller that a file it may not see exists.
+    let Some(object) = db
+        .get_object(object_id)
+        .map_err(Status::internal)?
+        .filter(|object| object.kind == MEDIA_KIND && caller.may_read(object))
+    else {
+        return Ok(Response::new(DeleteMediaResponse {}));
+    };
+    let generation = object_security_generation(db, &object.namespace)?;
+    caller.authorize_delete(&object)?;
+    let upload_id = object.properties.get(media_upload::PROPERTY_UPLOAD_ID);
+    // Recorded before anything is removed, so every delete that removed
+    // something has a decision; a retry after a crash adds another.
+    db.record_decision(&crate::sekai::audit::Decision {
+        id: format!("media-delete:{}", uuid::Uuid::new_v4().as_simple()),
+        timestamp: now_millis(),
+        actor: caller.actor(),
+        action: "media.delete".into(),
+        reason: "media attachment deleted".into(),
+        target_id: object.id.clone(),
+        outcome: "allowed".into(),
+        evidence: HashMap::from([
+            ("namespace".into(), object.namespace.clone()),
+            ("upload_id".into(), upload_id.cloned().unwrap_or_default()),
+        ]),
+    })
+    .map_err(Status::internal)?;
+    if let Some(upload_id) = upload_id {
+        db.delete_media_upload(upload_id, &object.id, now_millis())
+            .map_err(media_status)?;
+    }
+    ObjectMutation::direct(db)
+        .with_policy_generation(&generation)
+        .delete(&object.id, Some(&object), &caller.actor(), now_millis())
+        .or_else(|error| match error {
+            // Another delete got there first.
+            crate::sekai::object_mutation::MutationPersistenceError::NotFound => Ok(()),
+            error => Err(map_mutation_persistence_error(error)),
+        })?;
+    Ok(Response::new(DeleteMediaResponse {}))
 }

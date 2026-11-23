@@ -37,6 +37,13 @@ const UPLOAD_COLUMNS: &str = "SELECT upload_id, namespace, uploader, idempotency
     sha256, media_type, file_name, access_marking, received_bytes, attempt, object_id,
     created_at_ms, updated_at_ms FROM sekai_media_uploads WHERE upload_id = ?1";
 
+/// Drop the bytes of a session still unfinished, at `attempt`, and idle
+/// since before the cutoff: the fence that keeps expiry from racing a
+/// completion or a new chunk.
+const EXPIRE_UPLOAD: &str = "UPDATE sekai_media_uploads
+    SET received_bytes = 0, attempt = attempt + 1, updated_at_ms = ?4
+    WHERE upload_id = ?1 AND object_id IS NULL AND attempt = ?2 AND updated_at_ms < ?3";
+
 fn storage(error: impl ToString) -> MediaError {
     MediaError::Storage(error.to_string())
 }
@@ -240,6 +247,81 @@ impl SekaiDb {
         }
         Ok(upload)
     }
+
+    fn delete_media_upload(
+        &self,
+        upload_id: &str,
+        object_id: &str,
+        now_ms: i64,
+    ) -> Result<(), MediaError> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage)?;
+        tx.execute(
+            "UPDATE sekai_media_uploads
+             SET object_id = ?2, received_bytes = 0, attempt = attempt + 1, updated_at_ms = ?3
+             WHERE upload_id = ?1 AND (object_id IS NULL OR object_id = ?2)
+               AND NOT (object_id IS NOT NULL AND received_bytes = 0)",
+            params![upload_id, object_id, now_ms],
+        )
+        .map_err(storage)?;
+        tx.execute(
+            "DELETE FROM sekai_media_chunks WHERE upload_id = ?1",
+            params![upload_id],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
+
+    fn expire_media_uploads(
+        &self,
+        cutoff_ms: i64,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<usize, MediaError> {
+        let stale = {
+            let conn = self.conn();
+            let mut statement = conn
+                .prepare(
+                    "SELECT upload_id, attempt FROM sekai_media_uploads
+                     WHERE object_id IS NULL AND received_bytes > 0 AND updated_at_ms < ?1
+                     ORDER BY updated_at_ms LIMIT ?2",
+                )
+                .map_err(storage)?;
+            statement
+                .query_map(params![cutoff_ms, limit as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(storage)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage)?
+        };
+        let mut expired = 0;
+        for (upload_id, attempt) in stale {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            if tx
+                .execute(
+                    EXPIRE_UPLOAD,
+                    params![upload_id, attempt, cutoff_ms, now_ms],
+                )
+                .map_err(storage)?
+                == 1
+            {
+                tx.execute(
+                    "DELETE FROM sekai_media_chunks WHERE upload_id = ?1",
+                    params![upload_id],
+                )
+                .map_err(storage)?;
+                expired += 1;
+            }
+            tx.commit().map_err(storage)?;
+        }
+        Ok(expired)
+    }
 }
 
 impl RuntimeDb {
@@ -331,6 +413,41 @@ impl RuntimeDb {
             }),
         }
     }
+    /// Delete a media attachment's session (#3042): drop its bytes and keep
+    /// the row naming `object_id`, so its idempotency key stays spent and
+    /// the session reads as deleted. Repeating it changes nothing.
+    pub fn delete_media_upload(
+        &self,
+        upload_id: &str,
+        object_id: &str,
+        now_ms: i64,
+    ) -> Result<(), MediaError> {
+        match self {
+            Self::Sqlite(db) => db.delete_media_upload(upload_id, object_id, now_ms),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.delete_media_upload(upload_id, object_id, now_ms)
+            }),
+        }
+    }
+
+    /// Drop the bytes of up to `limit` unfinished uploads idle since before
+    /// `cutoff_ms`, oldest first; returns how many it dropped. Each drop is
+    /// fenced on the session's attempt and idle time, so a chunk or a
+    /// completion that got there first wins, and several instances may run
+    /// it at once.
+    pub fn expire_media_uploads(
+        &self,
+        cutoff_ms: i64,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<usize, MediaError> {
+        match self {
+            Self::Sqlite(db) => db.expire_media_uploads(cutoff_ms, now_ms, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.expire_media_uploads(cutoff_ms, now_ms, limit)
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -387,5 +504,56 @@ mod tests {
             ..request
         };
         assert_eq!(db.begin_media_upload(&other, 8), Err(MediaError::Conflict));
+    }
+
+    #[test]
+    fn expiry_spares_a_session_touched_since_and_spends_a_deleted_key() {
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(":memory:").unwrap()));
+        let request = MediaUploadRequest {
+            namespace: "field".into(),
+            uploader: "alice".into(),
+            idempotency_key: "k".into(),
+            size_bytes: 4,
+            sha256: hex(&Sha256::digest(b"abcd")),
+            media_type: "image/png".into(),
+            file_name: String::new(),
+            access_marking: String::new(),
+        };
+        let upload = db.begin_media_upload(&request, 1).unwrap();
+        db.append_media_chunk(&upload.upload_id, 0, b"ab", 10)
+            .unwrap();
+        // Touched at 10: a cutoff at 10 spares it, one at 11 expires it.
+        assert_eq!(db.expire_media_uploads(10, 20, 10).unwrap(), 0);
+        assert_eq!(db.expire_media_uploads(11, 20, 10).unwrap(), 1);
+        let expired = db.get_media_upload(&upload.upload_id).unwrap().unwrap();
+        assert_eq!((expired.received_bytes, expired.attempt), (0, 1));
+        assert!(
+            db.read_media_bytes(&upload.upload_id, 0, 4)
+                .unwrap()
+                .is_empty()
+        );
+        // Nothing left to drop: a second pass is a no-op.
+        assert_eq!(db.expire_media_uploads(30, 40, 10).unwrap(), 0);
+
+        // A finished upload is never expired; deleting it keeps the row as
+        // a marker, and repeating the delete changes nothing.
+        db.append_media_chunk(&upload.upload_id, 0, b"abcd", 50)
+            .unwrap();
+        db.finish_media_upload(&upload.upload_id, "media-x", 1, 51)
+            .unwrap();
+        assert_eq!(db.expire_media_uploads(1000, 1000, 10).unwrap(), 0);
+        db.delete_media_upload(&upload.upload_id, "media-x", 60)
+            .unwrap();
+        db.delete_media_upload(&upload.upload_id, "media-x", 61)
+            .unwrap();
+        let deleted = db.get_media_upload(&upload.upload_id).unwrap().unwrap();
+        assert!(deleted.is_deleted());
+        assert_eq!((deleted.attempt, deleted.reference()), (2, None));
+        assert!(
+            db.read_media_bytes(&upload.upload_id, 0, 4)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.begin_media_upload(&request, 70).unwrap(), deleted);
     }
 }

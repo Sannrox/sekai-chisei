@@ -205,4 +205,74 @@ impl PostgresDb {
         }
         Ok(upload)
     }
+
+    pub fn delete_media_upload(
+        &self,
+        upload_id: &str,
+        object_id: &str,
+        now_ms: i64,
+    ) -> Result<(), MediaError> {
+        let mut connection = self.connection().map_err(storage)?;
+        let mut tx = connection.transaction().map_err(storage)?;
+        tx.execute(
+            "UPDATE sekai_media_uploads
+             SET object_id = $2, received_bytes = 0, attempt = attempt + 1, updated_at_ms = $3
+             WHERE upload_id = $1 AND (object_id IS NULL OR object_id = $2)
+               AND NOT (object_id IS NOT NULL AND received_bytes = 0)",
+            &[&upload_id, &object_id, &now_ms],
+        )
+        .map_err(storage)?;
+        tx.execute(
+            "DELETE FROM sekai_media_chunks WHERE upload_id = $1",
+            &[&upload_id],
+        )
+        .map_err(storage)?;
+        tx.commit().map_err(storage)
+    }
+
+    pub fn expire_media_uploads(
+        &self,
+        cutoff_ms: i64,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<usize, MediaError> {
+        let mut connection = self.connection().map_err(storage)?;
+        let stale = connection
+            .query(
+                "SELECT upload_id, attempt FROM sekai_media_uploads
+                 WHERE object_id IS NULL AND received_bytes > 0 AND updated_at_ms < $1
+                 ORDER BY updated_at_ms LIMIT $2",
+                &[&cutoff_ms, &(limit as i64)],
+            )
+            .map_err(storage)?
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+            .collect::<Vec<_>>();
+        let mut expired = 0;
+        for (upload_id, attempt) in stale {
+            let mut tx = connection.transaction().map_err(storage)?;
+            // The row lock makes a concurrent append finish first; the
+            // re-checked idle time then spares the session it touched.
+            if tx
+                .execute(
+                    "UPDATE sekai_media_uploads
+                     SET received_bytes = 0, attempt = attempt + 1, updated_at_ms = $4
+                     WHERE upload_id = $1 AND object_id IS NULL AND attempt = $2
+                       AND updated_at_ms < $3",
+                    &[&upload_id, &attempt, &cutoff_ms, &now_ms],
+                )
+                .map_err(storage)?
+                == 1
+            {
+                tx.execute(
+                    "DELETE FROM sekai_media_chunks WHERE upload_id = $1",
+                    &[&upload_id],
+                )
+                .map_err(storage)?;
+                expired += 1;
+            }
+            tx.commit().map_err(storage)?;
+        }
+        Ok(expired)
+    }
 }

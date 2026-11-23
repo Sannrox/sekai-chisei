@@ -268,6 +268,12 @@ macro_rules! delegate_rpcs {
 #[tonic::async_trait]
 impl SekaiService for SekaiServiceImpl {
     delegate_rpcs! {
+        begin_media_upload => begin_media_upload_rpc(BeginMediaUploadRequest) -> MediaUploadStatus;
+        upload_media_chunk => upload_media_chunk_rpc(UploadMediaChunkRequest) -> MediaUploadStatus;
+        complete_media_upload => complete_media_upload_rpc(CompleteMediaUploadRequest) -> MediaUploadStatus;
+        get_media_upload => get_media_upload_rpc(GetMediaUploadRequest) -> MediaUploadStatus;
+        delete_media => delete_media_rpc(DeleteMediaRequest) -> DeleteMediaResponse;
+        read_media => read_media_rpc(ReadMediaRequest) -> ReadMediaResponse;
         wake_site_agent_instance => wake_site_agent_instance_rpc(WakeSiteAgentInstanceRequest) -> WakeSiteAgentInstanceResponse;
         list_site_agent_instance_turns => list_site_agent_instance_turns_rpc(ListSiteAgentInstanceTurnsRequest) -> ListSiteAgentInstanceTurnsResponse;
         list_claimable_agent_turns => list_claimable_agent_turns_rpc(ListClaimableAgentTurnsRequest) -> ListClaimableAgentTurnsResponse;
@@ -900,41 +906,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ScoreObjectTrustRequest>,
     ) -> Result<Response<ScoreObjectTrustResponse>, Status> {
         trust_score_rpc::score_object_trust(self, req).await
-    }
-
-    async fn begin_media_upload(
-        &self,
-        req: Request<BeginMediaUploadRequest>,
-    ) -> Result<Response<MediaUploadStatus>, Status> {
-        media_upload_rpc::begin_media_upload(self, req).await
-    }
-
-    async fn upload_media_chunk(
-        &self,
-        req: Request<UploadMediaChunkRequest>,
-    ) -> Result<Response<MediaUploadStatus>, Status> {
-        media_upload_rpc::upload_media_chunk(self, req).await
-    }
-
-    async fn complete_media_upload(
-        &self,
-        req: Request<CompleteMediaUploadRequest>,
-    ) -> Result<Response<MediaUploadStatus>, Status> {
-        media_upload_rpc::complete_media_upload(self, req).await
-    }
-
-    async fn get_media_upload(
-        &self,
-        req: Request<GetMediaUploadRequest>,
-    ) -> Result<Response<MediaUploadStatus>, Status> {
-        media_upload_rpc::get_media_upload(self, req).await
-    }
-
-    async fn read_media(
-        &self,
-        req: Request<ReadMediaRequest>,
-    ) -> Result<Response<ReadMediaResponse>, Status> {
-        media_upload_rpc::read_media(self, req).await
     }
 
     async fn put_sync_scope(

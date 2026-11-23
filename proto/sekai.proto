@@ -6347,6 +6347,11 @@ service SekaiService {
   rpc CompleteMediaUpload(CompleteMediaUploadRequest) returns (MediaUploadStatus);
   rpc GetMediaUpload(GetMediaUploadRequest) returns (MediaUploadStatus);
   rpc ReadMedia(ReadMediaRequest) returns (ReadMediaResponse);
+  // Delete a media attachment (#3042): the object, its bytes and its
+  // upload. Needs what deleting the object needs. A missing attachment, or
+  // one the caller may not read, deletes nothing and succeeds, as a
+  // repeated delete does. The upload's idempotency key stays spent.
+  rpc DeleteMedia(DeleteMediaRequest) returns (DeleteMediaResponse);
   // Offline sync scopes (#1632, ADR 0124), contract `sekai.sync/v1`.
   // Experimental. A principal defines a scope, takes a snapshot of it, then
   // reads deltas from the cursor the snapshot ends with. Every object passes
@@ -6563,6 +6568,12 @@ message ReadMediaRequest {
   // Default and maximum 1 MiB.
   uint32 limit = 3;
 }
+
+message DeleteMediaRequest {
+  string media_reference = 1;
+}
+
+message DeleteMediaResponse {}
 
 message ReadMediaResponse {
   bytes data = 1;

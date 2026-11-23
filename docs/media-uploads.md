@@ -29,3 +29,24 @@ role, tenant scope, grants, marking and object security policy. Other
 callers get `NOT_FOUND`. Only the uploader sees or continues a session.
 Every write needs namespace write access and clearance for the marking,
 and is stopped by a write freeze.
+
+## Delete and expiry
+
+`DeleteMedia` with a `media_reference` removes the attachment: its object,
+its bytes and its upload (#3042). It needs what deleting the object needs:
+namespace write access, no write freeze, and the object's delete grant and
+object security policy. A caller who may read but not delete the file gets
+`PERMISSION_DENIED`, and the file stays readable. Each delete records a
+`media.delete` decision naming the caller. Afterwards `ReadMedia` returns
+`NOT_FOUND`. A missing file, or one the caller may not read, deletes nothing
+and succeeds, as a repeated delete does. The upload's idempotency key stays
+spent: a begin with it is refused with `FAILED_PRECONDITION`, so a deleted
+reference never comes back. References held in Action parameters or media
+properties stay as they are and read as `NOT_FOUND`.
+
+An unfinished upload not touched for 7 days loses its bytes. A later begin
+with the same key, or `GetMediaUpload`, shows `received_bytes = 0`; send the
+file again from offset 0. Every plane instance runs the expiry every ten
+minutes as the `media_upload_expiry` background job. A completion that
+races it is refused with `FAILED_PRECONDITION` and can be sent again; a
+completed file is never expired.
