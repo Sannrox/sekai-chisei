@@ -18,7 +18,7 @@ use crate::sekai::definition_branch::{
 };
 use crate::sekai::definition_diff::{
     DefinitionCompatibilityClass, DefinitionRevisionCompatibility,
-    classify_definition_revision_compatibility,
+    classify_definition_revision_compatibility, operational_compatibility_class,
 };
 
 pub const FACT_MIGRATION_CONTRACT_VERSION: &str = "sekai.fact-migration/v1";
@@ -193,7 +193,7 @@ pub fn plan_fact_migration(
 > {
     let compatibility =
         classify_definition_revision_compatibility(from, from_members, to, to_members)?;
-    if compatibility.class == DefinitionCompatibilityClass::Unknown.as_str() {
+    if operational_compatibility_class(&compatibility) == DefinitionCompatibilityClass::Unknown {
         return Err("fact_migration_unknown: unknown compatibility cannot migrate facts".into());
     }
     if objects.len() > MAX_MIGRATION_OBJECTS {
@@ -565,6 +565,48 @@ mod tests {
         assert_eq!(planned[0].outcome, "skip");
         assert_eq!(planned[1].outcome, "blocked");
         assert_eq!(planned[1].stripped_properties, ["mixed_revision"]);
+    }
+
+    #[test]
+    fn added_agent_does_not_block_object_type_fact_migration() {
+        let from_ticket = prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title","secret"]}"#,
+        );
+        let to_ticket = prepared(
+            "object_type",
+            "Ticket",
+            r#"{"name":"Ticket","properties":["title"]}"#,
+        );
+        let agent = prepared(
+            "agent",
+            "triage",
+            r#"{"contract_version":"sekai.agent-definition/v1","name":"Triage","task_class":"lookup","instructions":"Inspect records.","allowed_action_types":["Ticket.inspect"]}"#,
+        );
+        let from = revision(&[from_ticket.clone()], "", true);
+        let to = revision(
+            &[to_ticket.clone(), agent.clone()],
+            &from.revision_digest,
+            false,
+        );
+        let object = ticket("t1", &[("title", "hello"), ("secret", "hidden")]);
+        let (compat, planned) = plan_fact_migration(
+            &from,
+            &[from_ticket],
+            &to,
+            &[to_ticket, agent],
+            &[object],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            operational_compatibility_class(&compat),
+            DefinitionCompatibilityClass::Breaking
+        );
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].outcome, "migrate");
+        assert_eq!(planned[0].stripped_properties, ["secret"]);
     }
 
     #[test]

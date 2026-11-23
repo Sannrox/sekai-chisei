@@ -242,7 +242,7 @@ pub fn require_merge_compatibility(
 ) -> Result<(), String> {
     let report = classify_definition_revision_compatibility(from, from_members, to, to_members)?;
     let gate = report.reasons.iter().find(|reason| {
-        reason.member_kind != crate::sekai::agent_promotion::MEMBER_KIND_AGENT
+        !agent_owned_reason(reason)
             && (reason.class == "unknown"
                 || (reason.class == "breaking"
                     && MERGE_GATED_KINDS.contains(&reason.member_kind.as_str())))
@@ -251,6 +251,24 @@ pub fn require_merge_compatibility(
         Some(reason) => Err(format!("compatibility_gate:{}", reason.member_kind)),
         None => Ok(()),
     }
+}
+
+fn agent_owned_reason(reason: &DefinitionCompatibilityReason) -> bool {
+    reason.member_kind == crate::sekai::agent_promotion::MEMBER_KIND_AGENT
+}
+
+/// Worst class among non-agent reasons. Agent members are classified by
+/// ADR 0079 and do not make a revision unknown for fact migration.
+pub fn operational_compatibility_class(
+    report: &DefinitionRevisionCompatibility,
+) -> DefinitionCompatibilityClass {
+    report
+        .reasons
+        .iter()
+        .filter(|reason| !agent_owned_reason(reason))
+        .filter_map(|item| parse_class(&item.class))
+        .max_by_key(|item| item.severity())
+        .unwrap_or(DefinitionCompatibilityClass::Compatible)
 }
 
 fn added_member_reason(change: &DefinitionMemberChange) -> DefinitionCompatibilityReason {
