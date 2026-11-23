@@ -1984,6 +1984,7 @@ fn spawn_service_background_tasks(
     if plane.serves_sekai() {
         spawn_catalog_reconciler(db.clone());
         spawn_export_sweeper(db.clone());
+        spawn_media_upload_expiry(db.clone());
         spawn_consumer_violation_sweeper(db.clone());
         spawn_criticality_outbox_sweeper(db.clone());
         spawn_object_log_ingest_sweeper(db.clone());
@@ -2344,6 +2345,46 @@ fn spawn_export_sweeper(db: Arc<RuntimeDb>) {
                 }
                 Err(error) => {
                     tracing::error!(%error, "export sweep task failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+            }
+        }
+    });
+}
+
+/// Drop the bytes of unfinished media uploads idle past
+/// `UNFINISHED_UPLOAD_TTL_MS` (#3042) every ten minutes. Safe on every
+/// instance at once: each drop is fenced on the session's attempt and idle
+/// time, so it never races a chunk or a completion into a half state.
+fn spawn_media_upload_expiry(db: Arc<RuntimeDb>) {
+    const BATCH: usize = 100;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            interval.tick().await;
+            let db = db.clone();
+            let pass = JobPass::start(JobKind::MediaUploadExpiry);
+            let result = tokio::task::spawn_blocking(move || {
+                let mut expired = 0;
+                loop {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let cutoff = now - crate::sekai::media_upload::UNFINISHED_UPLOAD_TTL_MS;
+                    let batch = db.expire_media_uploads(cutoff, now, BATCH)?;
+                    expired += batch;
+                    if batch < BATCH {
+                        return Ok::<_, crate::sekai::media_upload::MediaError>(expired);
+                    }
+                }
+            })
+            .await;
+            match result {
+                Ok(Ok(expired)) => pass.finish(JobOutcome::Ok, expired as u64),
+                Ok(Err(error)) => {
+                    tracing::error!(error = ?error, "media upload expiry failed");
+                    pass.finish(JobOutcome::Failed, 0);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "media upload expiry task failed");
                     pass.finish(JobOutcome::Failed, 0);
                 }
             }

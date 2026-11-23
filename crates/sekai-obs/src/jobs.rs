@@ -31,6 +31,7 @@ pub enum JobKind {
     SecurityReopen,
     CatalogReconcile,
     ScheduleTick,
+    MediaUploadExpiry,
 }
 
 impl JobKind {
@@ -46,6 +47,7 @@ impl JobKind {
         JobKind::SecurityReopen,
         JobKind::CatalogReconcile,
         JobKind::ScheduleTick,
+        JobKind::MediaUploadExpiry,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -61,6 +63,7 @@ impl JobKind {
             JobKind::SecurityReopen => "security_reopen",
             JobKind::CatalogReconcile => "catalog_reconcile",
             JobKind::ScheduleTick => "schedule_tick",
+            JobKind::MediaUploadExpiry => "media_upload_expiry",
         }
     }
 }

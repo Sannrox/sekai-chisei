@@ -52,7 +52,7 @@ an Action parameter or a media property can hold.
   `media_attachment` policy, as for any instantiated kind.
 - Bytes live in the Sekai database. The 64 MiB cap keeps that bounded;
   larger media need an external store behind the same RPCs.
-- Unfinished sessions are kept. Expiring them is follow-up work.
+- Unfinished sessions lose their bytes after 7 idle days (#3042, below).
 
 ## Rejected alternatives
 
@@ -60,3 +60,18 @@ an Action parameter or a media property can hold.
 - Trusting the client checksum without hashing the stored bytes.
 - Storing files on the server's disk: another instance could not continue
   the upload.
+
+## Addendum: delete and expiry (#3042)
+
+- `DeleteMedia` applies the object delete checks, records a `media.delete`
+  decision, then drops the session's bytes and deletes the object. The bytes
+  go first, so a delete cut short already reads as `NOT_FOUND` and a retry
+  finishes it. The session row stays as a marker (it names the object but
+  holds no bytes), so its idempotency key cannot recreate the object id. No
+  schema changes: a completed upload always holds at least one byte, so the
+  marker is unambiguous.
+- An unfinished session idle for 7 days loses its bytes. Every instance
+  runs the expiry on a timer; each drop is conditional on the session's
+  attempt and idle time and bumps the attempt, like a checksum reset, so a
+  completion that hashed the old bytes is refused at the finish and a chunk
+  that arrived first spares the session.

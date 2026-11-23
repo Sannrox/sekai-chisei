@@ -2456,6 +2456,20 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "DeleteMedia",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/media_upload.rs",
+        "src/grpc/media_upload_rpc.rs",
+        "docs/decisions/0123-governed-media-uploads.md"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutSyncScope",
       "kind": "persistent",
       "surfaces": [

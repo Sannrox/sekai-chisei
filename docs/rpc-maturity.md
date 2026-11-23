@@ -283,6 +283,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.CompleteMediaUpload` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetMediaUpload` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadMedia` | `sekai.graph` | yes | none | `experimental` |
+| `SekaiService.DeleteMedia` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.PutSyncScope` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncSnapshot` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncDeltas` | `sekai.graph` | yes | none | `experimental` |
