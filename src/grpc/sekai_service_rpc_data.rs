@@ -5500,7 +5500,8 @@ pub(super) async fn tick_governed_transforms(
 
 /// One pass of the schedule graph at `now_ms`, acting as `actor`: due
 /// transform runs, export schedules, agent wakes, the scratch sweep,
-/// quota releases, pending usage, and the health and Source members.
+/// quota releases, pending usage, and the health, Source and scheduled
+/// Action binding members.
 /// The `TickGovernedTransforms` RPC and the background schedule tick on
 /// every replica both call it. Each step claims or keys its due work in
 /// the store, so replicas ticking at once do each due bucket once.
@@ -5640,9 +5641,17 @@ pub(crate) async fn run_schedule_tick(
             .map_err(Status::internal);
     let ontology =
         super::ontology_health_rpc::tick_ontology_health_schedules(service, now_ms).await;
+    // Scheduled Action bindings (#3033).
+    let binding_service = service.clone();
+    let bindings =
+        tokio::task::spawn_blocking(move || binding_service.tick_scheduled_action_bindings(now_ms))
+            .await
+            .map_err(|_| Status::internal("action binding tick failed"))?
+            .map_err(Status::internal);
     datasets?;
     sources?;
     ontology?;
+    bindings?;
     Ok(runs)
 }
 

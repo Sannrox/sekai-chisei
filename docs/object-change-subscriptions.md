@@ -51,6 +51,23 @@ read as that principal sees them, so hidden fields never become parameters.
 A rerun admits nothing new, and `require_approval` parks. See
 [ADR 0090](decisions/0090-object-change-action-bindings.md).
 
+A binding can fire on a fixed interval instead (#3033): it carries
+`"schedule": {"every_ms": N}` with N from 60000 (one minute) to 604800000
+(seven days), names no `kind`, `ops` or `property_filters`, and maps every
+parameter from a constant. The plane's schedule tick submits it, never
+`RunActionBinding`, which refuses it with `FAILED_PRECONDITION`. Each binding's
+buckets are phased by its namespace and id. Every tick submits the current
+bucket as `run_as` through normal admission, with an idempotency key from the
+namespace, binding id, revision, and bucket start. That key is the only fence: planes
+ticking the same bucket, and a tick rerun after a crash, replay one instance,
+and nothing is recorded after the submit. Buckets missed while no plane ran
+collapse into the current one. A refusal (grants, write freeze, policy) is
+logged and retried on the next tick, so it never fails the other bindings; a
+reinstall bumps the revision, so it can submit once more in the current
+bucket. Planes from before #3033 never tick a binding, and their
+`RunActionBinding` fails on a scheduled one (its empty `kind` is invalid)
+without submitting.
+
 ## Backends
 
 SQLite and PostgreSQL read the same `sekai_object_changes` log and the same

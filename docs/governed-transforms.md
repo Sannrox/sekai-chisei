@@ -84,10 +84,12 @@ plane instance runs the schedule tick in the background once a minute, as
 `system:transform-scheduler`, with no leader and no caller outside the plane.
 The tick admits due transform runs (schedule buckets and debounced change
 triggers), dataset and ontology health checks, Source sync buckets, export
-schedules, site agent schedule and change wakes, the ad-hoc scratch sweep,
-retryable quota releases and pending transform usage. Each member claims its
-due bucket in the store: SQLite admits transform runs in one `IMMEDIATE`
-transaction with the bucket cursor, and PostgreSQL behind a
+schedules, site agent schedule and change wakes, scheduled Action bindings
+([object-change-subscriptions.md](object-change-subscriptions.md#action-bindings)),
+the ad-hoc scratch sweep, retryable quota releases and pending transform
+usage. Scheduled bindings key admission by their bucket; every other member
+claims its due bucket in the store: SQLite admits transform runs in one
+`IMMEDIATE` transaction with the bucket cursor, and PostgreSQL behind a
 transaction-scoped advisory lock. So instances ticking at once admit a bucket
 once, and an instance that dies before its claim commits leaves the bucket
 to the next tick on any instance. A schedule that missed several buckets while

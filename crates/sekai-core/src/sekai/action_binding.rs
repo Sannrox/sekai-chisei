@@ -1,12 +1,15 @@
-//! Plane-owned automation bindings from object changes to governed Actions
-//! (#1092, ADR 0090).
+//! Plane-owned automation bindings from object changes, or from a fixed
+//! schedule, to governed Actions (#1092, ADR 0090; #3033).
 //!
 //! A binding maps authorized object-change events for one namespace and kind
 //! onto one pinned `GovernedActionType` through a closed parameter mapping.
+//! A scheduled binding instead submits one Action per interval bucket from
+//! constant parameters; the plane's schedule tick runs it.
 //! It runs as an explicit service principal whose grants, policy, budget, and
 //! schema are checked on every submit. The subscription itself never carries
 //! authority. Idempotency comes from the binding revision and the delivered
-//! event, so a redelivered page admits nothing new.
+//! event, or the schedule bucket, so a redelivered page or a second tick of
+//! one bucket admits nothing new.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +27,16 @@ pub const MAX_BINDING_PARAMETERS: usize = 16;
 /// A mapped source the service principal cannot read, or an event that
 /// carries no object for it, skips the event instead of submitting.
 pub const SKIP_SOURCE_UNAVAILABLE: &str = "parameter_source_unavailable";
+/// The schedule tick runs once a minute, so a shorter interval cannot fire.
+pub const MIN_SCHEDULE_EVERY_MS: i64 = 60_000;
+pub const MAX_SCHEDULE_EVERY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// A fixed-interval trigger. Buckets are phased per binding, so bindings with
+/// one interval do not all fire on the same tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionBindingSchedule {
+    pub every_ms: i64,
+}
 
 /// Where one Action parameter comes from. Closed: no expressions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,12 +59,18 @@ pub struct ActionBinding {
     pub contract_version: String,
     pub binding_id: String,
     pub namespace: String,
-    /// Object kind whose changes trigger the binding.
+    /// Object kind whose changes trigger the binding; empty when scheduled.
+    #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub property_filters: Vec<PropertyFilter>,
     /// Event operations that submit: a subset of create, update, delete.
+    /// Empty when scheduled.
+    #[serde(default)]
     pub ops: Vec<String>,
+    /// Fires on this interval instead of on object changes (#3033).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ActionBindingSchedule>,
     pub type_id: String,
     /// Pinned `GovernedActionType` version.
     pub version: String,
@@ -82,7 +101,6 @@ impl ActionBinding {
         for (field, value) in [
             ("binding_id", &self.binding_id),
             ("namespace", &self.namespace),
-            ("kind", &self.kind),
             ("type_id", &self.type_id),
             ("version", &self.version),
             ("run_as", &self.run_as),
@@ -90,6 +108,24 @@ impl ActionBinding {
             if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
                 return Err(format!("{field} must be non-empty without whitespace"));
             }
+        }
+        if self.parameters.len() > MAX_BINDING_PARAMETERS {
+            return Err(format!(
+                "at most {MAX_BINDING_PARAMETERS} mapped parameters are allowed"
+            ));
+        }
+        if self
+            .parameters
+            .keys()
+            .any(|name| name.trim().is_empty() || name.chars().any(char::is_whitespace))
+        {
+            return Err("parameter names must be non-empty without whitespace".into());
+        }
+        if let Some(schedule) = self.schedule {
+            return self.validate_scheduled(schedule);
+        }
+        if self.kind.trim().is_empty() || self.kind.chars().any(char::is_whitespace) {
+            return Err("kind must be non-empty without whitespace".into());
         }
         if self.property_filters.len() > MAX_PROPERTY_FILTERS {
             return Err(format!(
@@ -104,15 +140,7 @@ impl ActionBinding {
                 return Err(format!("unsupported op {op:?}"));
             }
         }
-        if self.parameters.len() > MAX_BINDING_PARAMETERS {
-            return Err(format!(
-                "at most {MAX_BINDING_PARAMETERS} mapped parameters are allowed"
-            ));
-        }
-        for (name, source) in &self.parameters {
-            if name.trim().is_empty() || name.chars().any(char::is_whitespace) {
-                return Err("parameter names must be non-empty without whitespace".into());
-            }
+        for source in self.parameters.values() {
             if let ParameterSource::Property(property) = source {
                 if property == crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY {
                     return Err("the marking property cannot be mapped into parameters".into());
@@ -128,6 +156,68 @@ impl ActionBinding {
             }
         }
         Ok(())
+    }
+
+    /// A scheduled binding has no object or event, so it names no kind, ops
+    /// or filters and maps constants only.
+    fn validate_scheduled(&self, schedule: ActionBindingSchedule) -> Result<(), String> {
+        if !(MIN_SCHEDULE_EVERY_MS..=MAX_SCHEDULE_EVERY_MS).contains(&schedule.every_ms) {
+            return Err(format!(
+                "schedule.every_ms must be between {MIN_SCHEDULE_EVERY_MS} and {MAX_SCHEDULE_EVERY_MS}"
+            ));
+        }
+        if !self.kind.is_empty() || !self.ops.is_empty() || !self.property_filters.is_empty() {
+            return Err("a scheduled binding must not name kind, ops or property filters".into());
+        }
+        for (name, source) in &self.parameters {
+            if !matches!(source, ParameterSource::Constant(_)) {
+                return Err(format!(
+                    "a scheduled binding must map parameter {name:?} from a constant"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The latest bucket start at or before `now_ms` of a scheduled binding,
+    /// phased per binding as site agent schedule wakes are (ADR 0137). Ticks
+    /// missed while no plane ran collapse into this one bucket.
+    pub fn due_at_ms(&self, schedule: ActionBindingSchedule, now_ms: i64) -> i64 {
+        crate::sekai::agent_wake::due_at(
+            &format!("{}/{}", self.namespace, self.binding_id),
+            schedule.every_ms,
+            now_ms,
+        )
+    }
+
+    /// Stable per binding revision and bucket, so two planes ticking the same
+    /// bucket, or a rerun after a crash, replay one instance.
+    pub fn tick_idempotency_key(&self, due_at_ms: i64) -> Result<String, String> {
+        Ok(format!(
+            "binding-{}",
+            crate::shomei::digest_serializable(&(
+                &self.namespace,
+                &self.binding_id,
+                self.revision,
+                "schedule",
+                due_at_ms,
+            ))?
+        ))
+    }
+
+    /// Parameters for one scheduled submit: validation allows constants only.
+    pub fn tick_parameters(&self) -> String {
+        let parameters = self
+            .parameters
+            .iter()
+            .filter_map(|(name, source)| match source {
+                ParameterSource::Constant(value) => {
+                    Some((name.clone(), serde_json::Value::String(value.clone())))
+                }
+                _ => None,
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::Value::Object(parameters).to_string()
     }
 
     /// Stable per binding revision and delivered event, so a redelivered or
@@ -168,6 +258,21 @@ impl ActionBinding {
         }
         Ok(serde_json::Value::Object(parameters).to_string())
     }
+}
+
+/// Decodes stored binding bodies and keeps the enabled scheduled ones.
+pub fn scheduled_bindings(
+    bodies: impl IntoIterator<Item = String>,
+) -> Result<Vec<ActionBinding>, String> {
+    let mut scheduled = Vec::new();
+    for body in bodies {
+        let binding: ActionBinding = serde_json::from_str(&body)
+            .map_err(|error| format!("corrupt action binding: {error}"))?;
+        if binding.enabled && binding.schedule.is_some() {
+            scheduled.push(binding);
+        }
+    }
+    Ok(scheduled)
 }
 
 /// Delivery state the plane keeps per binding between runs.
@@ -341,6 +446,22 @@ impl SekaiDb {
         Ok(bindings)
     }
 
+    /// Enabled scheduled bindings in every namespace, for the schedule tick.
+    pub fn list_scheduled_action_bindings(&self) -> Result<Vec<ActionBinding>, String> {
+        self.migrate_action_bindings()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT body_json FROM sekai_action_bindings ORDER BY namespace, binding_id")
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        let bodies = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        scheduled_bindings(bodies)
+    }
+
     pub fn get_action_binding(
         &self,
         namespace: &str,
@@ -471,6 +592,7 @@ mod tests {
             kind: "incident".into(),
             property_filters: Vec::new(),
             ops: vec![OP_UPDATE.into()],
+            schedule: None,
             type_id: "incident.escalate".into(),
             version: "1".into(),
             run_as: "svc-escalator".into(),
@@ -501,6 +623,69 @@ mod tests {
             committed_at_ms: 1,
             operation_id: "op".into(),
         }
+    }
+
+    fn scheduled(every_ms: i64) -> ActionBinding {
+        ActionBinding {
+            kind: String::new(),
+            ops: Vec::new(),
+            schedule: Some(ActionBindingSchedule { every_ms }),
+            parameters: BTreeMap::from([(
+                "channel".into(),
+                ParameterSource::Constant("pager".into()),
+            )]),
+            ..binding()
+        }
+    }
+
+    #[test]
+    fn a_scheduled_binding_maps_constants_only_within_the_interval_range() {
+        assert_eq!(scheduled(MIN_SCHEDULE_EVERY_MS).validate(), Ok(()));
+        assert_eq!(scheduled(MAX_SCHEDULE_EVERY_MS).validate(), Ok(()));
+        assert!(scheduled(MIN_SCHEDULE_EVERY_MS - 1).validate().is_err());
+        assert!(scheduled(MAX_SCHEDULE_EVERY_MS + 1).validate().is_err());
+        let with_kind = ActionBinding {
+            kind: "incident".into(),
+            ..scheduled(MIN_SCHEDULE_EVERY_MS)
+        };
+        assert!(with_kind.validate().is_err());
+        let mut from_object = scheduled(MIN_SCHEDULE_EVERY_MS);
+        from_object
+            .parameters
+            .insert("object_id".into(), ParameterSource::ObjectId);
+        assert!(from_object.validate().is_err());
+        assert_eq!(
+            scheduled(MIN_SCHEDULE_EVERY_MS).tick_parameters(),
+            r#"{"channel":"pager"}"#
+        );
+    }
+
+    #[test]
+    fn a_scheduled_key_is_stable_per_bucket_and_changes_with_bucket_or_revision() {
+        let binding = scheduled(MIN_SCHEDULE_EVERY_MS);
+        let schedule = binding.schedule.unwrap();
+        let due = binding.due_at_ms(schedule, 10 * MIN_SCHEDULE_EVERY_MS);
+        // Any time within one bucket names that bucket; a later bucket does not.
+        assert_eq!(
+            binding.due_at_ms(schedule, due + MIN_SCHEDULE_EVERY_MS - 1),
+            due
+        );
+        assert_eq!(
+            binding.tick_idempotency_key(due),
+            binding.tick_idempotency_key(due)
+        );
+        assert_ne!(
+            binding.tick_idempotency_key(due),
+            binding.tick_idempotency_key(due + MIN_SCHEDULE_EVERY_MS)
+        );
+        let reinstalled = ActionBinding {
+            revision: binding.revision + 1,
+            ..binding.clone()
+        };
+        assert_ne!(
+            binding.tick_idempotency_key(due),
+            reinstalled.tick_idempotency_key(due)
+        );
     }
 
     #[test]

@@ -1,14 +1,16 @@
 //! Object-change Action bindings behave the same on SQLite and PostgreSQL
 //! (#1319): each install gets the next revision and restarts delivery, the
 //! cursor round-trips with its pending events and read marker, and a cursor
-//! write for a superseded revision changes nothing.
+//! write for a superseded revision changes nothing. The schedule tick lists
+//! only enabled scheduled bindings, across namespaces (#3033).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::sekai::action_binding::{
-    ACTION_BINDING_CONTRACT, ActionBinding, ActionBindingCursor, ParameterSource, ReadMarker,
+    ACTION_BINDING_CONTRACT, ActionBinding, ActionBindingCursor, ActionBindingSchedule,
+    ParameterSource, ReadMarker,
 };
 use sekai_chisei::sekai::event_subscription::{EventSubscription, EventSubscriptionCursor};
 use sekai_chisei::sekai::object_change_subscription::{OP_UPDATE, ObjectChangeEvent};
@@ -23,6 +25,7 @@ fn binding(namespace: &str) -> ActionBinding {
         kind: "incident".into(),
         property_filters: Vec::new(),
         ops: vec![OP_UPDATE.into()],
+        schedule: None,
         type_id: "incident.escalate".into(),
         version: "1".into(),
         run_as: "svc-escalator".into(),
@@ -160,6 +163,38 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
     let listed = db.list_action_bindings(namespace).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].revision, 2);
+
+    let scheduled = |binding_id: &str, scope: &str, enabled: bool| ActionBinding {
+        binding_id: binding_id.into(),
+        namespace: scope.into(),
+        kind: String::new(),
+        ops: Vec::new(),
+        schedule: Some(ActionBindingSchedule { every_ms: 60_000 }),
+        parameters: BTreeMap::from([("channel".into(), ParameterSource::Constant("pager".into()))]),
+        enabled,
+        ..binding(scope)
+    };
+    for binding in [
+        scheduled("hourly", namespace, true),
+        scheduled("paused", namespace, false),
+        scheduled("hourly", "elsewhere", true),
+    ] {
+        db.put_action_binding(&binding, "admin", 16).unwrap();
+    }
+    let due = db
+        .list_scheduled_action_bindings()
+        .unwrap()
+        .into_iter()
+        .map(|binding| (binding.namespace, binding.binding_id, binding.schedule))
+        .collect::<Vec<_>>();
+    let every_minute = Some(ActionBindingSchedule { every_ms: 60_000 });
+    assert_eq!(
+        due,
+        [
+            ("elsewhere".into(), "hourly".into(), every_minute),
+            (namespace.to_string(), "hourly".into(), every_minute),
+        ]
+    );
 }
 
 #[test]
