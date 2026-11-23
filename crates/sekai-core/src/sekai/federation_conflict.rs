@@ -154,14 +154,21 @@ pub fn prepare_import_collision(
         if existing.namespace != *namespace || existing.object_id != local.id {
             return Err("conflict identity does not match stored record".into());
         }
-        let added_peer = existing
-            .claims
-            .iter()
-            .all(|claim| claim.claim_id != peer_claim.claim_id);
+        // A new claim on either side means the resolution no longer describes
+        // both current versions: the local claim id follows the local object's
+        // digest, so a changed local object adds a claim just as a new peer
+        // fact does.
+        let is_new = |incoming: &FederationConflictClaim| {
+            existing
+                .claims
+                .iter()
+                .all(|claim| claim.claim_id != incoming.claim_id)
+        };
+        let added_claim = is_new(&local_claim) || is_new(&peer_claim);
         let local_changed = merge_claim(&mut existing.claims, local_claim);
         let peer_changed = merge_claim(&mut existing.claims, peer_claim);
         let changed = local_changed || peer_changed;
-        if added_peer && existing.status == STATUS_RESOLVED {
+        if added_claim && existing.status == STATUS_RESOLVED {
             if let Some(current) = existing.resolution.take() {
                 existing.resolution_history.push(current);
             }
@@ -638,6 +645,46 @@ mod tests {
             resolved_again.resolution.as_ref().unwrap().claim_id
         );
         assert_eq!(later_snapshot.claims.len(), 2);
+    }
+
+    #[test]
+    fn a_changed_local_object_reopens_a_resolved_conflict() {
+        let db = db();
+        register_local(&db);
+        let local = object("local");
+        db.create_object(&local).unwrap();
+        let collision = |local: &Object, now_ms| ImportCollision {
+            actor: "admin".into(),
+            namespace: "ops".into(),
+            local: local.clone(),
+            peer_fact: fact("peer"),
+            peer_site_id: "site-a".into(),
+            snapshot_digest: "sha256:snap".into(),
+            import_id: "import-1".into(),
+            now_ms,
+        };
+        let admitted = admit_import_collision(&db, &collision(&local, 10)).unwrap();
+        let local_claim = admitted
+            .claims
+            .iter()
+            .find(|claim| claim.side == SIDE_LOCAL)
+            .unwrap()
+            .claim_id
+            .clone();
+        resolve_conflict(&db, "admin", "ops", "ticket-1", &local_claim, 11).unwrap();
+
+        let unchanged = admit_import_collision(&db, &collision(&local, 12)).unwrap();
+        assert_eq!(unchanged.status, STATUS_RESOLVED);
+        assert_eq!(unchanged.resolution.unwrap().claim_id, local_claim);
+
+        let edited = object("local-edited");
+        let observed = admit_import_collision(&db, &collision(&edited, 13)).unwrap();
+        assert_eq!(observed.status, STATUS_OPEN);
+        assert!(observed.resolution.is_none());
+        assert_eq!(observed.resolution_history.len(), 1);
+        assert_eq!(observed.resolution_history[0].claim_id, local_claim);
+        assert_eq!(observed.claims.len(), 3);
+        assert_eq!(get_conflict(&db, "ops", "ticket-1").unwrap(), observed);
     }
 
     #[test]
