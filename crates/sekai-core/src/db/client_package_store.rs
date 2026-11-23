@@ -1,6 +1,6 @@
 //! SQLite persistence for versioned client packages (#702).
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::sekai::SekaiDb;
 use crate::sekai::client_package::{ClientPackage, PACKAGE_UNAVAILABLE};
@@ -56,10 +56,33 @@ impl SekaiDb {
 
     pub fn commit_client_packages(&self, packages: &[&ClientPackage]) -> Result<(), String> {
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         for package in packages {
-            let json = serde_json::to_string(package)
-                .map_err(|error| format!("encode client package: {error}"))?;
+            // A supersede rewrites the predecessor as stored now, changing
+            // only `superseded_by`, so a concurrent change is not overwritten.
+            let json = if package.superseded_by.is_empty() {
+                serde_json::to_string(package)
+                    .map_err(|error| format!("encode client package: {error}"))?
+            } else {
+                let current_json: Option<String> = tx
+                    .query_row(
+                        "SELECT record_json FROM sekai_client_packages
+                         WHERE namespace = ?1 AND package_id = ?2",
+                        params![package.namespace, package.package_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let next = superseded(
+                    serde_json::from_str(&current_json.ok_or(PACKAGE_UNAVAILABLE)?)
+                        .map_err(|error| format!("decode client package: {error}"))?,
+                    package,
+                )?;
+                serde_json::to_string(&next)
+                    .map_err(|error| format!("encode client package: {error}"))?
+            };
             let changed = if package.superseded_by.is_empty() {
                 tx.execute(
                     "INSERT INTO sekai_client_packages
@@ -91,6 +114,19 @@ impl SekaiDb {
         tx.commit().map_err(constraint_unavailable)?;
         Ok(())
     }
+}
+
+/// The stored predecessor with only `superseded_by` taken from the caller's
+/// copy. Refuses a predecessor owned by someone else or already superseded.
+pub(crate) fn superseded(
+    mut current: ClientPackage,
+    package: &ClientPackage,
+) -> Result<ClientPackage, String> {
+    if current.owner != package.owner || !current.superseded_by.is_empty() {
+        return Err(PACKAGE_UNAVAILABLE.into());
+    }
+    current.superseded_by = package.superseded_by.clone();
+    Ok(current)
 }
 
 fn constraint_unavailable(error: rusqlite::Error) -> String {

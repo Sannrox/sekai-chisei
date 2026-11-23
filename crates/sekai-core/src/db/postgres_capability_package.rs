@@ -106,8 +106,31 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         for package in packages {
-            let json = serde_json::to_string(package)
-                .map_err(|error| format!("encode capability package: {error}"))?;
+            // A supersede rewrites the predecessor as stored now (row locked),
+            // changing only `superseded_by`, so a revocation committed after
+            // the caller read it survives.
+            let json = if package.superseded_by.is_empty() {
+                serde_json::to_string(package)
+                    .map_err(|error| format!("encode capability package: {error}"))?
+            } else {
+                let current: String = tx
+                    .query_opt(
+                        "SELECT record_json FROM sekai_capability_packages
+                         WHERE namespace = $1 AND certification_id = $2
+                         FOR UPDATE",
+                        &[&package.namespace, &package.certification_id],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or(PACKAGE_UNAVAILABLE)?
+                    .get(0);
+                let next = crate::db::capability_package_store::superseded(
+                    serde_json::from_str(&current)
+                        .map_err(|error| format!("decode capability package: {error}"))?,
+                    package,
+                )?;
+                serde_json::to_string(&next)
+                    .map_err(|error| format!("encode capability package: {error}"))?
+            };
             let changed = if package.superseded_by.is_empty() {
                 tx.execute(
                     "INSERT INTO sekai_capability_packages
@@ -123,24 +146,18 @@ impl PostgresDb {
                 )
                 .map_err(constraint_unavailable)?
             } else {
-                // Keep a concurrent revoke: the unique live index ignores
-                // revoked rows, and sequential recertify-after-revoke must
-                // still see the stored revocation. Match that revocation
-                // (empty or revoked) so a stale supersede cannot clear it.
                 tx.execute(
                     "UPDATE sekai_capability_packages
                      SET record_json = $4
                      WHERE namespace = $1
                        AND certification_id = $2
                        AND owner = $3
-                       AND (record_json::jsonb) ->> 'superseded_by' = ''
-                       AND (record_json::jsonb) ->> 'revocation' = $5",
+                       AND (record_json::jsonb) ->> 'superseded_by' = ''",
                     &[
                         &package.namespace,
                         &package.certification_id,
                         &package.owner,
                         &json,
-                        &package.revocation,
                     ],
                 )
                 .map_err(constraint_unavailable)?

@@ -133,8 +133,30 @@ impl SekaiDb {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         for package in packages {
-            let json = serde_json::to_string(package)
-                .map_err(|error| format!("encode capability package: {error}"))?;
+            // A supersede rewrites the predecessor as stored now, changing
+            // only `superseded_by`, so a revocation committed after the
+            // caller read it survives.
+            let json = if package.superseded_by.is_empty() {
+                serde_json::to_string(package)
+                    .map_err(|error| format!("encode capability package: {error}"))?
+            } else {
+                let current_json: Option<String> = tx
+                    .query_row(
+                        "SELECT record_json FROM sekai_capability_packages
+                         WHERE namespace = ?1 AND certification_id = ?2",
+                        params![package.namespace, package.certification_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                let next = superseded(
+                    serde_json::from_str(&current_json.ok_or(PACKAGE_UNAVAILABLE)?)
+                        .map_err(|error| format!("decode capability package: {error}"))?,
+                    package,
+                )?;
+                serde_json::to_string(&next)
+                    .map_err(|error| format!("encode capability package: {error}"))?
+            };
             let changed = if package.superseded_by.is_empty() {
                 tx.execute(
                     "INSERT INTO sekai_capability_packages
@@ -220,6 +242,20 @@ impl SekaiDb {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
+}
+
+/// The stored predecessor with only `superseded_by` taken from the caller's
+/// copy; its revocation stays as stored. Refuses a predecessor owned by
+/// someone else or already superseded.
+pub(crate) fn superseded(
+    mut current: CapabilityPackageCertification,
+    package: &CapabilityPackageCertification,
+) -> Result<CapabilityPackageCertification, String> {
+    if current.owner != package.owner || !current.superseded_by.is_empty() {
+        return Err(PACKAGE_UNAVAILABLE.into());
+    }
+    current.superseded_by = package.superseded_by.clone();
+    Ok(current)
 }
 
 fn constraint_unavailable(error: rusqlite::Error) -> String {

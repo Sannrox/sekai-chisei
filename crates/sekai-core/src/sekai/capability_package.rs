@@ -638,6 +638,51 @@ mod tests {
         .unwrap();
     }
 
+    /// A supersede built from a copy read before a revoke keeps the revoke.
+    fn stale_supersede_keeps_a_later_revocation(runtime: &RuntimeDb) {
+        certify(runtime);
+        let mut stale = get_package(runtime, "reviewer", "ops", "cert:1").unwrap();
+        stale.superseded_by = "cert:2".into();
+        revoke_package(
+            runtime,
+            "reviewer",
+            "ops",
+            "cert:1",
+            "signer rotated",
+            4_000,
+        )
+        .unwrap();
+        let mut chained = certification();
+        chained.certification_id = "cert:2".into();
+        chained.predecessor_id = "cert:1".into();
+        chained.certification_digest.clear();
+        let successor = validate_certification(&chained, "reviewer", 5_000).unwrap();
+        runtime
+            .commit_capability_packages(&[&stale, &successor])
+            .unwrap();
+        let stored = get_package(runtime, "reviewer", "ops", "cert:1").unwrap();
+        assert_eq!(stored.revocation, REVOCATION_REVOKED);
+        assert_eq!(stored.revocation_reason, "signer rotated");
+        assert_eq!(stored.superseded_by, "cert:2");
+        assert!(
+            runtime
+                .get_capability_package("ops", "cert:2")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sqlite_stale_supersede_keeps_a_later_revocation() {
+        stale_supersede_keeps_a_later_revocation(&db());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_stale_supersede_keeps_a_later_revocation() {
+        stale_supersede_keeps_a_later_revocation(&crate::sekai::work_claim_conformance::postgres());
+    }
+
     #[test]
     fn postgres_surface_is_explicitly_unavailable() {
         assert_eq!(
