@@ -187,13 +187,20 @@ impl SekaiDb {
             .transpose()
     }
 
+    /// Sets only the stored `superseded` flag in one statement, so an upsert
+    /// committed concurrently (or a field a newer version wrote) is kept.
+    /// Returns whether the memory exists.
     pub fn mark_decision_memory_superseded(&self, memory_id: &str) -> Result<bool, String> {
-        let Some(mut memory) = self.get_decision_memory(memory_id)? else {
-            return Ok(false);
-        };
-        memory.superseded = true;
-        self.put_decision_memory(&memory)?;
-        Ok(true)
+        self.migrate_decision_memory()?;
+        self.conn()
+            .execute(
+                "UPDATE sekai_action_decision_memory
+                 SET body_json = json_set(body_json, '$.superseded', json('true'))
+                 WHERE memory_id = ?1",
+                params![memory_id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -417,6 +424,38 @@ mod tests {
                 .join("\n");
             assert!(plan.contains(index), "{index} not used: {plan}");
         }
+    }
+
+    #[test]
+    fn supersede_sets_only_the_flag_and_keeps_the_stored_body() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        assert!(!db.mark_decision_memory_superseded("missing").unwrap());
+        let row = memory("m1", "ai-1", r#"{"object_id":"rec-1"}"#, false);
+        db.put_decision_memory(&row).unwrap();
+        // A field this version does not model, as a newer replica would write it.
+        db.conn()
+            .execute(
+                "UPDATE sekai_action_decision_memory
+                 SET body_json = json_set(body_json, '$.written_by_newer_version', 'kept')
+                 WHERE memory_id = 'm1'",
+                [],
+            )
+            .unwrap();
+        assert!(db.mark_decision_memory_superseded("m1").unwrap());
+        let body: serde_json::Value = serde_json::from_str(
+            &db.conn()
+                .query_row(
+                    "SELECT body_json FROM sekai_action_decision_memory WHERE memory_id = 'm1'",
+                    [],
+                    |stored| stored.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["written_by_newer_version"], "kept");
+        let mut expected = row.clone();
+        expected.superseded = true;
+        assert_eq!(db.get_decision_memory("m1").unwrap(), Some(expected));
     }
 
     #[test]

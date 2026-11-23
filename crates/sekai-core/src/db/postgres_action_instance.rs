@@ -967,13 +967,19 @@ impl PostgresDb {
             .transpose()
     }
 
+    /// Sets only the stored `superseded` flag in one statement, so an upsert
+    /// committed concurrently (or a field a newer version wrote) is kept.
+    /// Returns whether the memory exists.
     pub fn mark_decision_memory_superseded(&self, memory_id: &str) -> Result<bool, String> {
-        let Some(mut memory) = self.get_decision_memory(memory_id)? else {
-            return Ok(false);
-        };
-        memory.superseded = true;
-        self.put_decision_memory(&memory)?;
-        Ok(true)
+        self.connection()?
+            .execute(
+                "UPDATE sekai_action_decision_memory
+                 SET body_json = jsonb_set(body_json::jsonb, '{superseded}', 'true'::jsonb)::text
+                 WHERE memory_id = $1",
+                &[&memory_id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1624,6 +1630,48 @@ mod tests {
         assert_lists_between(&RuntimeDb::Sqlite(Arc::new(
             crate::db::sekai::SekaiDb::new(":memory:").unwrap(),
         )));
+    }
+
+    /// Supersede sets only the flag, keeping a body field this version does
+    /// not model, as the SQLite store does (#2828).
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_supersede_sets_only_the_flag_and_keeps_the_stored_body() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = scratch.connect();
+        assert!(!db.mark_decision_memory_superseded("missing").unwrap());
+        let row: crate::sekai::decision_memory::DecisionMemory =
+            serde_json::from_value(serde_json::json!({
+                "memory_id": "m1", "namespace": "acme", "type_id": "spend",
+                "version": "v1", "instance_id": "ai-1", "outcome": "granted",
+                "reason": "fits", "decided_by": "alice", "decided_at_ms": 10,
+            }))
+            .unwrap();
+        db.put_decision_memory(&row).unwrap();
+        db.connection()
+            .unwrap()
+            .execute(
+                "UPDATE sekai_action_decision_memory
+                 SET body_json = jsonb_set(body_json::jsonb, '{written_by_newer_version}', '\"kept\"')::text
+                 WHERE memory_id = 'm1'",
+                &[],
+            )
+            .unwrap();
+        assert!(db.mark_decision_memory_superseded("m1").unwrap());
+        let body: String = db
+            .connection()
+            .unwrap()
+            .query_one(
+                "SELECT body_json FROM sekai_action_decision_memory WHERE memory_id = 'm1'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["written_by_newer_version"], "kept");
+        let mut expected = row.clone();
+        expected.superseded = true;
+        assert_eq!(db.get_decision_memory("m1").unwrap(), Some(expected));
     }
 
     #[test]
