@@ -2014,6 +2014,29 @@ async fn propose_and_merge_definition(
     proposal_id: &str,
     upserts: Vec<DefinitionMemberInput>,
 ) -> Result<MergeDefinitionProposalResponse, Status> {
+    propose_and_merge_definition_as(
+        svc,
+        namespace,
+        parent,
+        branch_id,
+        proposal_id,
+        upserts,
+        None,
+    )
+    .await
+}
+
+/// [`propose_and_merge_definition`], sending `operation_id` as the merge
+/// call's operation identity header when set.
+async fn propose_and_merge_definition_as(
+    svc: &SekaiServiceImpl,
+    namespace: &str,
+    parent: &str,
+    branch_id: &str,
+    proposal_id: &str,
+    upserts: Vec<DefinitionMemberInput>,
+    operation_id: Option<&str>,
+) -> Result<MergeDefinitionProposalResponse, Status> {
     svc.create_definition_branch(with_named_principal(
         CreateDefinitionBranchRequest {
             namespace: namespace.into(),
@@ -2069,7 +2092,7 @@ async fn propose_and_merge_definition(
     ))
     .await
     .unwrap();
-    svc.merge_definition_proposal(with_named_principal(
+    let mut merge = with_named_principal(
         MergeDefinitionProposalRequest {
             namespace: namespace.into(),
             proposal_id: proposal_id.into(),
@@ -2077,9 +2100,16 @@ async fn propose_and_merge_definition(
             idempotency_key: format!("{branch_id}-merge"),
         },
         "root",
-    ))
-    .await
-    .map(Response::into_inner)
+    );
+    if let Some(operation_id) = operation_id {
+        merge.metadata_mut().insert(
+            crate::sekai::operation_correlation::OPERATION_METADATA,
+            MetadataValue::try_from(operation_id).unwrap(),
+        );
+    }
+    svc.merge_definition_proposal(merge)
+        .await
+        .map(Response::into_inner)
 }
 
 #[tokio::test]
@@ -40042,3 +40072,6 @@ async fn a_failed_profile_admin_grant_reverses_the_guarded_create() {
 
 #[path = "transform_chain_rpc_tests.rs"]
 mod transform_chain_rpc_tests;
+
+#[path = "operation_identity_read_tests.rs"]
+mod operation_identity_read_tests;

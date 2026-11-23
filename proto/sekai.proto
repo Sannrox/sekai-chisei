@@ -4771,6 +4771,10 @@ message SourceBatchTransaction {
   optional uint64 offset_start = 18;
   optional uint64 offset_end = 19;
   optional bool snapshot_complete = 20;
+  // Operation identity of the call that opened the transaction (#3087):
+  // the caller's x-sekai-operation-id, or one the plane minted. Empty for a
+  // transaction opened before the plane recorded it.
+  string operation_id = 21;
 }
 
 message SourceCheckpoint {
@@ -5298,6 +5302,9 @@ message PublishedDefinitionRevisionHistoryEntry {
   string receipt_id = 4;
   string actor = 5;
   int64 published_at_ms = 6;
+  // Operation identity of the merge that published the revision (#3087);
+  // empty for a revision published before the plane recorded it.
+  string operation_id = 7;
 }
 
 message ListPublishedDefinitionRevisionsRequest {
@@ -5717,6 +5724,9 @@ message SourceHealth {
   optional int64 lag = 9;
   optional int64 last_success_at_ms = 10;
   int64 observed_at_ms = 11;
+  // Operation identity of the source batch transaction the outcome derives
+  // from (#3087); empty when none does or it carries none.
+  string operation_id = 12;
 }
 message GetSourceHealthResponse {
   SourceHealth health = 1;

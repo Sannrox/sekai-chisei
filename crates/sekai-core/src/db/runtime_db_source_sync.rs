@@ -27,6 +27,27 @@ impl RuntimeDb {
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_operation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            expected_policy_generation,
+            authorized_objects,
+            None,
+        )
+    }
+
+    /// As [`Self::apply_source_batch_with_policy_generation`], recording the
+    /// caller's `operation_id` on the transaction it opens (#3087).
+    pub fn apply_source_batch_with_operation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+        operation_id: Option<&str>,
+    ) -> Result<SourceBatchResult, String> {
         // A disabled Source stops every batch for its tokens (ADR 0148),
         // whichever path the batch takes.
         crate::sekai::source::admit_batch(
@@ -37,21 +58,37 @@ impl RuntimeDb {
             "",
         )?;
         match self {
-            Self::Sqlite(db) => db.apply_source_batch_with_policy_generation(
+            Self::Sqlite(db) => db.apply_source_batch_with_operation(
                 batch,
                 authenticated_producer,
                 now_ms,
                 expected_policy_generation,
                 authorized_objects,
+                operation_id,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.apply_source_batch_with_policy_generation(
+                db.apply_source_batch_with_operation(
                     batch,
                     authenticated_producer,
                     now_ms,
                     expected_policy_generation,
                     authorized_objects,
+                    operation_id,
                 )
+            }),
+        }
+    }
+
+    /// Operation identities recorded on `transaction_ids` in `namespace`.
+    pub fn source_batch_operation_ids(
+        &self,
+        namespace: &str,
+        transaction_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        match self {
+            Self::Sqlite(db) => db.source_batch_operation_ids(namespace, transaction_ids),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.source_batch_operation_ids(namespace, transaction_ids)
             }),
         }
     }

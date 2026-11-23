@@ -242,6 +242,8 @@ const COORDINATION_REQUEST_OUTCOME_SCHEMA: &str =
     include_str!("postgres/0168_coordination_request_outcome.sql");
 const ACTION_BINDING_DATASET_CURSORS_SCHEMA: &str =
     include_str!("postgres/0170_action_binding_dataset_cursors.sql");
+const OPERATION_IDENTITY_COLUMNS_SCHEMA: &str =
+    include_str!("postgres/0171_operation_identity_columns.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1232,6 +1234,12 @@ const MIGRATIONS: &[Migration] = &[
         170,
         "action_binding_dataset_cursors",
         ACTION_BINDING_DATASET_CURSORS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        171,
+        "operation_identity_columns",
+        OPERATION_IDENTITY_COLUMNS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

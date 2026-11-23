@@ -941,6 +941,7 @@ pub(super) async fn merge_definition_proposal(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let operation_id = call_operation_identity(&req, "op-definition-merge")?;
     let input = req.into_inner();
     authorize_source_sync_namespace(
         service,
@@ -994,7 +995,13 @@ pub(super) async fn merge_definition_proposal(
     let result = service
         .db
         .runtime()
-        .merge_definition_proposal(&request, actor, now_millis())
+        .merge_definition_proposal_with_operation(
+            &request,
+            crate::sekai::definition_proposal::DefinitionMergePath::Direct,
+            actor,
+            Some(&operation_id),
+            now_millis(),
+        )
         .map_err(map_definition_write_error)?;
     let definition_branch_domain::DefinitionWriteResult::MergeProposal { result } = result else {
         return Err(Status::internal("definition replay result is invalid"));
@@ -1162,10 +1169,20 @@ pub(super) async fn list_published_definition_revisions(
                 Status::internal("definition revision unavailable")
             }
         })?;
+    let proposal_ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.proposal_id.as_str())
+        .collect();
+    let mut operation_ids = service
+        .db
+        .runtime()
+        .definition_proposal_operation_ids(&input.namespace, &proposal_ids)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
     Ok(Response::new(ListPublishedDefinitionRevisionsResponse {
         entries: entries
             .into_iter()
             .map(|entry| PublishedDefinitionRevisionHistoryEntry {
+                operation_id: operation_ids.remove(&entry.proposal_id).unwrap_or_default(),
                 revision_digest: entry.revision_digest,
                 previous_published_digest: entry.previous_published_digest,
                 proposal_id: entry.proposal_id,

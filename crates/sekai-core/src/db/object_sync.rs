@@ -666,6 +666,7 @@ impl SekaiDb {
                     dataset_landed INTEGER NOT NULL DEFAULT 0,
                     dataset_row_from INTEGER,
                     dataset_row_to INTEGER,
+                    operation_id TEXT,
                     UNIQUE(namespace, producer_identity, idempotency_key),
                     FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
                 );
@@ -1028,6 +1029,8 @@ impl SekaiDb {
             "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_landed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_row_from INTEGER",
             "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_row_to INTEGER",
+            // Operation identity of the call that opened the batch (#3087).
+            "ALTER TABLE sekai_source_batch_transactions ADD COLUMN operation_id TEXT",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}
@@ -1071,6 +1074,28 @@ impl SekaiDb {
         now_ms: i64,
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
+    ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_operation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            expected_policy_generation,
+            authorized_objects,
+            None,
+        )
+    }
+
+    /// As [`Self::apply_source_batch_with_policy_generation`], recording
+    /// `operation_id` on the transaction this call opens (#3087). A replay
+    /// keeps the identity of the call that opened the transaction.
+    pub fn apply_source_batch_with_operation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+        operation_id: Option<&str>,
     ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
@@ -1127,7 +1152,7 @@ impl SekaiDb {
             .retain_original_batch_json(batch)
             .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
-            .persist_source_batch_open(batch, &prepared, now_ms)
+            .persist_source_batch_open(batch, &prepared, now_ms, operation_id)
             .map_err(|error| error.to_string())?
         {
             OpenDisposition::Committed(result) => (*result, false),
@@ -1171,6 +1196,7 @@ impl SekaiDb {
         batch: &SourceBatch,
         prepared: &PreparedBatch,
         now_ms: i64,
+        operation_id: Option<&str>,
     ) -> Result<OpenDisposition, ApplyError> {
         let mut conn = self.conn();
         let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1304,10 +1330,10 @@ impl SekaiDb {
                 batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
                 outcome, opened_at_ms, closed_at_ms, reason, result_json, contract_version,
                 delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
-                snapshot_complete
+                snapshot_complete, operation_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'OPEN',
                        'unavailable', ?10, NULL, 'awaiting atomic commit', '', ?11,
-                       ?12, ?13, ?14, ?15, ?16, ?17)",
+                       ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 prepared.transaction_id,
                 prepared.binding_id,
@@ -1346,6 +1372,7 @@ impl SekaiDb {
                     .delivery
                     .as_ref()
                     .map(|delivery| delivery.snapshot_complete),
+                operation_id.filter(|id| !id.is_empty()),
             ],
         )?;
         transaction.commit()?;
@@ -1407,6 +1434,7 @@ impl SekaiDb {
             )
         })?;
         let dataset_landed = transaction_dataset_landed(&transaction, &prepared.transaction_id)?;
+        let operation_id = transaction_operation_id(&transaction, &prepared.transaction_id)?;
         if !dataset_landed {
             if let Err(error) = require_live_registered_descriptor(&transaction, batch) {
                 abort_open_source_batch(&transaction, prepared, now_ms, &error)?;
@@ -1523,10 +1551,12 @@ impl SekaiDb {
                         object.updated,
                     ],
                 )?;
-                // Attributed to the committed source transaction (#1690).
-                let changes = crate::sekai::audit::ChangeAttribution::source(
-                    &prepared.transaction_id,
-                )
+                // Attributed to the committed source transaction (#1690)
+                // and the operation that opened it (#3087).
+                let changes = crate::sekai::audit::ChangeAttribution {
+                    operation_id: operation_id.clone(),
+                    ..crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
+                }
                 .stamp(object_diff_changes(
                     authenticated_producer,
                     before.as_ref(),
@@ -1981,6 +2011,35 @@ impl SekaiDb {
             )
             .and_then(Iterator::collect)
             .map_err(|error| error.to_string())
+    }
+
+    /// Operation identities recorded on `transaction_ids` in `namespace`
+    /// (#3087). Transactions without one are absent from the map.
+    pub fn source_batch_operation_ids(
+        &self,
+        namespace: &str,
+        transaction_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT operation_id FROM sekai_source_batch_transactions
+                 WHERE namespace=?1 AND transaction_id=?2 AND operation_id IS NOT NULL",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut found = std::collections::HashMap::new();
+        for transaction_id in transaction_ids {
+            if let Some(operation_id) = statement
+                .query_row(params![namespace, transaction_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()
+                .map_err(|error| error.to_string())?
+            {
+                found.insert((*transaction_id).to_string(), operation_id);
+            }
+        }
+        Ok(found)
     }
 
     pub fn list_source_batch_transactions(
@@ -2865,6 +2924,7 @@ fn rebuild_source_batch_status_constraint(conn: &Connection) -> Result<(), Strin
             dataset_landed INTEGER NOT NULL DEFAULT 0,
             dataset_row_from INTEGER,
             dataset_row_to INTEGER,
+            operation_id TEXT,
             UNIQUE(namespace, producer_identity, idempotency_key),
             FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
          );
@@ -3104,6 +3164,23 @@ fn require_live_registered_descriptor(
         return Err(unbound_type_revision());
     }
     Ok(())
+}
+
+/// The operation identity stored when the transaction opened; empty for a
+/// transaction opened without one or before #3087.
+fn transaction_operation_id(
+    transaction: &rusqlite::Transaction<'_>,
+    transaction_id: &str,
+) -> Result<String, ApplyError> {
+    Ok(transaction
+        .query_row(
+            "SELECT COALESCE(operation_id, '') FROM sekai_source_batch_transactions
+             WHERE transaction_id=?1",
+            params![transaction_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
 }
 
 fn transaction_dataset_landed(
@@ -3949,7 +4026,7 @@ pub mod tests {
             let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
             let prepared = PreparedBatch::new(&snapshot, &SourceBatchMapper::Github).unwrap();
             assert!(matches!(
-                db.persist_source_batch_open(&snapshot, &prepared, 100)
+                db.persist_source_batch_open(&snapshot, &prepared, 100, None)
                     .unwrap(),
                 OpenDisposition::Open
             ));
@@ -4013,7 +4090,7 @@ pub mod tests {
             let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
             let prepared = PreparedBatch::new(&batch, &SourceBatchMapper::Github).unwrap();
             assert!(matches!(
-                db.persist_source_batch_open(&batch, &prepared, 100)
+                db.persist_source_batch_open(&batch, &prepared, 100, None)
                     .unwrap(),
                 OpenDisposition::Open
             ));
@@ -4038,12 +4115,54 @@ pub mod tests {
     /// Persists `batch` as an open transaction in the store at `path` and
     /// drops the handle, as a crashed applier would.
     fn leave_open(path: &std::path::Path, batch: &SourceBatch) {
+        leave_open_as(path, batch, None);
+    }
+
+    /// [`leave_open`], recording `operation_id` as the opening call's
+    /// identity.
+    fn leave_open_as(path: &std::path::Path, batch: &SourceBatch, operation_id: Option<&str>) {
         let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
         let prepared = PreparedBatch::new(batch, &SourceBatchMapper::Github).unwrap();
         assert!(matches!(
-            db.persist_source_batch_open(batch, &prepared, 100).unwrap(),
+            db.persist_source_batch_open(batch, &prepared, 100, operation_id)
+                .unwrap(),
             OpenDisposition::Open
         ));
+    }
+
+    /// Asserts that batch `transaction_id` and every change to the objects in
+    /// `namespace` carry `operation_id` (#3087).
+    pub(crate) fn assert_batch_operation(
+        db: &crate::db::runtime_db::RuntimeDb,
+        namespace: &str,
+        transaction_id: &str,
+        operation_id: &str,
+    ) {
+        let ids = db
+            .source_batch_operation_ids(namespace, &[transaction_id])
+            .unwrap();
+        assert_eq!(
+            ids.get(transaction_id).map(String::as_str),
+            Some(operation_id)
+        );
+        let objects = db
+            .list_objects(&crate::domain::ListFilter {
+                namespace: Some(namespace.into()),
+                limit: 16,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!objects.is_empty());
+        for object in objects {
+            let changes = db.list_object_changes(&object.id, 16, 0).unwrap();
+            assert!(!changes.is_empty());
+            assert!(
+                changes
+                    .iter()
+                    .all(|change| change.operation_id == operation_id),
+                "{changes:?}"
+            );
+        }
     }
 
     fn runtime(path: &std::path::Path) -> crate::db::runtime_db::RuntimeDb {
@@ -4056,13 +4175,20 @@ pub mod tests {
     fn a_fresh_handle_resumes_an_open_batch_from_its_stored_body() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("sync.sqlite");
-        leave_open(&path, &batch("", "cursor:1", "batch-1"));
-        // A replacement process without the batch resumes it.
+        leave_open_as(&path, &batch("", "cursor:1", "batch-1"), Some("op-crashed"));
+        // A replacement process without the batch resumes it, under the
+        // identity of the call that opened it.
         let db = runtime(&path);
         let result = db
             .resume_open_source_batch("acme", "acme/ops", TYPE_DIGEST, PRODUCER, 200)
             .unwrap()
             .unwrap();
+        assert_batch_operation(
+            &db,
+            "acme",
+            &result.transaction.transaction_id,
+            "op-crashed",
+        );
         assert_eq!(result.transaction.opened_at_ms, 100);
         assert_eq!(result.transaction.closed_at_ms, Some(200));
         let state = db
@@ -4480,7 +4606,7 @@ pub mod tests {
         let db = db();
         let batch = batch("", "cursor:1", "batch-1");
         let prepared = PreparedBatch::new(&batch, &SourceBatchMapper::Github).unwrap();
-        db.persist_source_batch_open(&batch, &prepared, 100)
+        db.persist_source_batch_open(&batch, &prepared, 100, None)
             .unwrap();
         db.conn()
             .execute(
@@ -4677,7 +4803,7 @@ pub mod tests {
         assert!(sql.contains("QUARANTINED"), "{sql}");
 
         let first = batch("", "cursor:1", "batch-1");
-        db.apply_source_batch(&first, PRODUCER, 100).unwrap();
+        let first = db.apply_source_batch(&first, PRODUCER, 100).unwrap();
         let mut conflicting = batch("cursor:1", "cursor:2", "batch-2");
         conflicting.records[0].type_name = "PullRequest".into();
         redigest(&mut conflicting);
@@ -4687,6 +4813,26 @@ pub mod tests {
             SourceBatchStatus::Quarantined
         );
         assert!(!quarantined.checkpoint_advanced);
+
+        // The upgraded table records the operation identity (#3087); rows
+        // from before it report none.
+        let third = batch("cursor:1", "cursor:3", "batch-3");
+        let recorded = db
+            .apply_source_batch_with_operation(&third, PRODUCER, 300, None, None, Some("op-up"))
+            .unwrap();
+        let ids = db
+            .source_batch_operation_ids(
+                "acme",
+                &[
+                    first.transaction.transaction_id.as_str(),
+                    recorded.transaction.transaction_id.as_str(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            ids,
+            HashMap::from([(recorded.transaction.transaction_id.clone(), "op-up".into())])
+        );
     }
 
     fn pager_alert_record() -> SourceRecord {

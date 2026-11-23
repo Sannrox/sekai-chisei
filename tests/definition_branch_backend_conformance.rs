@@ -1739,6 +1739,125 @@ fn exercise_rollback_live_values(
     );
 }
 
+/// The merge [`publish_revision`] sends for `proposal_id`.
+fn merge_request(
+    namespace: &str,
+    parent_digest: &str,
+    branch_id: &str,
+    proposal_id: &str,
+) -> MergeDefinitionProposal {
+    MergeDefinitionProposal {
+        namespace: namespace.into(),
+        proposal_id: proposal_id.into(),
+        expected_published_digest: parent_digest.into(),
+        idempotency_key: format!("{branch_id}-merge"),
+        expected_dataset_versions: Vec::new(),
+        expected_datasources: Vec::new(),
+    }
+}
+
+type MergeWithOperation<'a> = dyn Fn(&MergeDefinitionProposal, Option<&str>, i64) -> Result<DefinitionWriteResult, String>
+    + 'a;
+type OperationIds<'a> = dyn Fn(&str, &[&str]) -> Result<HashMap<String, String>, String> + 'a;
+
+/// Merging with an operation identity records it on the proposal; a replay
+/// under another identity keeps the first, and a merge without one records
+/// none (#3087). `merge` and `operation_ids` are the backend's
+/// `merge_definition_proposal_with_operation` and
+/// `definition_proposal_operation_ids`.
+fn exercise_merge_operation_identity(
+    db: &dyn DefinitionBranchBackend,
+    merge: &MergeWithOperation<'_>,
+    operation_ids: &OperationIds<'_>,
+    namespace: &str,
+) {
+    let (parent, _) = seed(db, namespace);
+    // Opens and approves `proposal_id`; publish_revision's merge then
+    // replays it, so the recorded identity is the one sent first.
+    let approve = |parent: &str, branch: &str, proposal: &str, operation_id, t| {
+        db.create_definition_branch(
+            &CreateDefinitionBranch {
+                namespace: namespace.into(),
+                branch_id: branch.into(),
+                parent_revision_digest: parent.into(),
+                idempotency_key: format!("{branch}-create"),
+            },
+            "author",
+            t,
+        )
+        .unwrap();
+        let DefinitionWriteResult::ApplyEdit { result } = db
+            .apply_definition_branch_edit(
+                &ApplyDefinitionBranchEdit {
+                    namespace: namespace.into(),
+                    branch_id: branch.into(),
+                    expected_head_digest: parent.into(),
+                    upserts: vec![member(
+                        namespace,
+                        "Ticket",
+                        &format!(r#"{{"name":"Ticket","properties":["{branch}"]}}"#),
+                    )],
+                    removals: Vec::new(),
+                    idempotency_key: format!("{branch}-edit"),
+                },
+                "author",
+                t + 1,
+            )
+            .unwrap()
+        else {
+            panic!("expected branch edit");
+        };
+        db.create_definition_proposal(
+            &CreateDefinitionProposal {
+                namespace: namespace.into(),
+                branch_id: branch.into(),
+                proposal_id: proposal.into(),
+                base_digest: parent.into(),
+                candidate_digest: result.revision.revision_digest.clone(),
+                eval_plan_digests: Vec::new(),
+                named_foreign_digests: Vec::new(),
+                idempotency_key: format!("{branch}-propose"),
+                major_revision: false,
+                migration_plan_digest: String::new(),
+                dataset_proposals: Vec::new(),
+                tenant: String::new(),
+            },
+            "author",
+            t + 2,
+        )
+        .unwrap();
+        db.approve_definition_proposal(
+            &ApproveDefinitionProposal {
+                namespace: namespace.into(),
+                proposal_id: proposal.into(),
+                idempotency_key: format!("{branch}-approve"),
+            },
+            "merger",
+            t + 3,
+        )
+        .unwrap();
+        let request = merge_request(namespace, parent, branch, proposal);
+        let DefinitionWriteResult::MergeProposal { result } =
+            merge(&request, operation_id, t + 4).unwrap()
+        else {
+            panic!("expected merge");
+        };
+        assert_eq!(
+            merge(&request, Some("op-retry"), t + 5).unwrap(),
+            DefinitionWriteResult::MergeProposal {
+                result: result.clone()
+            }
+        );
+        result.published_revision.revision_digest.clone()
+    };
+    let first = approve(&parent, "op-b1", "op-p1", Some("op-merge-1"), 10);
+    approve(&first, "op-b2", "op-p2", None, 20);
+    assert_eq!(
+        operation_ids(namespace, &["op-p1", "op-p2", "op-missing"]).unwrap(),
+        HashMap::from([("op-p1".to_string(), "op-merge-1".to_string())])
+    );
+}
+
 pub(crate) fn publish_revision(
     db: &dyn DefinitionBranchBackend,
     namespace: &str,
@@ -1808,14 +1927,7 @@ pub(crate) fn publish_revision(
     .unwrap();
     let DefinitionWriteResult::MergeProposal { result } = db
         .merge_definition_proposal(
-            &MergeDefinitionProposal {
-                namespace: namespace.into(),
-                proposal_id: proposal_id.into(),
-                expected_published_digest: parent_digest.into(),
-                idempotency_key: format!("{branch_id}-merge"),
-                expected_dataset_versions: Vec::new(),
-                expected_datasources: Vec::new(),
-            },
+            &merge_request(namespace, parent_digest, branch_id, proposal_id),
             "merger",
             t + 4,
         )
@@ -2738,6 +2850,21 @@ fn sqlite_definition_branch_backend_conformance() {
     exercise_agent_draft(&SekaiDb::new(":memory:").unwrap(), "sqlite-agent");
     exercise_backend(&SekaiDb::new(":memory:").unwrap(), "sqlite-definition");
     exercise_proposal_publish(&SekaiDb::new(":memory:").unwrap(), "sqlite-proposal");
+    let sqlite = SekaiDb::new(":memory:").unwrap();
+    exercise_merge_operation_identity(
+        &sqlite,
+        &|request, operation_id, t| {
+            sqlite.merge_definition_proposal_with_operation(
+                request,
+                DefinitionMergePath::Direct,
+                "merger",
+                operation_id,
+                t,
+            )
+        },
+        &|namespace, ids| sqlite.definition_proposal_operation_ids(namespace, ids),
+        "sqlite-operation",
+    );
     exercise_revision_diff(&SekaiDb::new(":memory:").unwrap(), "sqlite-diff");
     exercise_revision_compatibility(&SekaiDb::new(":memory:").unwrap(), "sqlite-compat");
     exercise_coordinated_artifact_merge(&SekaiDb::new(":memory:").unwrap(), "sqlite-four-kind");
@@ -2795,6 +2922,20 @@ fn postgres_definition_branch_backend_conformance() {
     exercise_agent_draft(db.as_ref(), &format!("{prefix}-agent"));
     exercise_backend(db.as_ref(), &prefix);
     exercise_proposal_publish(db.as_ref(), &format!("{prefix}-proposal"));
+    exercise_merge_operation_identity(
+        db.as_ref(),
+        &|request, operation_id, t| {
+            db.merge_definition_proposal_with_operation(
+                request,
+                DefinitionMergePath::Direct,
+                "merger",
+                operation_id,
+                t,
+            )
+        },
+        &|namespace, ids| db.definition_proposal_operation_ids(namespace, ids),
+        &format!("{prefix}-operation"),
+    );
     exercise_revision_diff(db.as_ref(), &format!("{prefix}-diff"));
     exercise_revision_compatibility(db.as_ref(), &format!("{prefix}-compat"));
     exercise_coordinated_artifact_merge(db.as_ref(), &format!("{prefix}-four-kind"));

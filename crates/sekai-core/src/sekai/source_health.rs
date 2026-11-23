@@ -13,8 +13,8 @@ use crate::sekai::audit::{Decision, DecisionFilter};
 use crate::sekai::namespace_access::{is_safe_namespace, principal_can_access_namespace};
 use crate::sekai::object_sync::{
     OperationOutcome, SOURCE_BATCH_V2_VERSION, SOURCE_BATCH_V3_VERSION, SOURCE_BATCH_VERSION,
-    SourceBatchStatus, SourceBinding, SourceCheckpoint, SourceSyncGenerationStatus,
-    SourceSyncState, contains_secret_like_text, identity_looks_secret,
+    SourceBatchStatus, SourceBatchTransaction, SourceBinding, SourceCheckpoint,
+    SourceSyncGenerationStatus, SourceSyncState, contains_secret_like_text, identity_looks_secret,
 };
 
 pub const HEALTH_CONTRACT: &str = "sekai.source-health/v1";
@@ -129,6 +129,21 @@ pub fn report_authorized_source_health(
     now_ms: i64,
     authorized: bool,
 ) -> Result<SourceHealth, String> {
+    report_authorized_source_health_with_operation(db, actor, query, now_ms, authorized)
+        .map(|(report, _)| report)
+}
+
+/// As [`report_authorized_source_health`], with the operation identity of
+/// the transaction the outcome derives from (#3087). It is empty when no
+/// transaction does, the transaction carries none, or the source is not
+/// disclosed to the caller.
+pub fn report_authorized_source_health_with_operation(
+    db: &RuntimeDb,
+    actor: &str,
+    query: &SourceHealthQuery,
+    now_ms: i64,
+    authorized: bool,
+) -> Result<(SourceHealth, String), String> {
     validate_observation(actor, now_ms)?;
     let state = if authorized {
         db.get_source_sync_state(&query.namespace, &query.source_instance, &query.type_digest)
@@ -136,12 +151,20 @@ pub fn report_authorized_source_health(
     } else {
         None
     };
-    let report = match state {
-        Some(state) => project_source_health(&state, query, now_ms),
-        None => undisclosed(query, now_ms),
+    let (report, transaction_id) = match state {
+        Some(state) => project_with_transaction(&state, query, now_ms),
+        None => (undisclosed(query, now_ms), None),
     };
     audit_health(db, actor, &report)?;
-    Ok(report)
+    let operation_id = match transaction_id {
+        Some(transaction_id) => db
+            .source_batch_operation_ids(&query.namespace, &[transaction_id.as_str()])
+            .map_err(|_| "source health identity is unavailable".to_string())?
+            .remove(&transaction_id)
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    Ok((report, operation_id))
 }
 
 pub fn project_source_health(
@@ -149,13 +172,23 @@ pub fn project_source_health(
     query: &SourceHealthQuery,
     now_ms: i64,
 ) -> SourceHealth {
+    project_with_transaction(state, query, now_ms).0
+}
+
+/// The projection and the transaction its outcome derives from. A
+/// fail-closed report names none.
+fn project_with_transaction(
+    state: &SourceSyncState,
+    query: &SourceHealthQuery,
+    now_ms: i64,
+) -> (SourceHealth, Option<String>) {
     match classify(state, query, now_ms) {
-        Ok(mut report) => {
+        Ok((mut report, transaction_id)) => {
             report.source_instance = query.source_instance.clone();
             report.type_digest = query.type_digest.clone();
-            report
+            (report, transaction_id)
         }
-        Err(closed) => fail_closed(query, now_ms, closed),
+        Err(closed) => (fail_closed(query, now_ms, closed), None),
     }
 }
 
@@ -180,11 +213,14 @@ enum ClosedClass {
     Ambiguous,
 }
 
+/// The report and the id of the transaction its outcome derives from, when
+/// one does (#3087).
 fn classify(
     state: &SourceSyncState,
     query: &SourceHealthQuery,
     now_ms: i64,
-) -> Result<SourceHealth, ClosedClass> {
+) -> Result<(SourceHealth, Option<String>), ClosedClass> {
+    let id = |transaction: &SourceBatchTransaction| Some(transaction.transaction_id.clone());
     if state.binding.namespace != query.namespace
         || state.binding.source_instance != query.source_instance
         || state.binding.type_digest != query.type_digest
@@ -223,27 +259,33 @@ fn classify(
         }
         match result.transaction.outcome {
             OperationOutcome::Partial => {
-                return Ok(report(
-                    query,
-                    now_ms,
-                    CLASS_UNAVAILABLE,
-                    FAILURE_AMBIGUOUS,
-                    OUTCOME_PARTIAL,
-                    None,
-                    None,
-                    None,
+                return Ok((
+                    report(
+                        query,
+                        now_ms,
+                        CLASS_UNAVAILABLE,
+                        FAILURE_AMBIGUOUS,
+                        OUTCOME_PARTIAL,
+                        None,
+                        None,
+                        None,
+                    ),
+                    id(&result.transaction),
                 ));
             }
             OperationOutcome::Unknown => {
-                return Ok(report(
-                    query,
-                    now_ms,
-                    CLASS_UNAVAILABLE,
-                    FAILURE_AMBIGUOUS,
-                    OUTCOME_UNKNOWN,
-                    None,
-                    None,
-                    None,
+                return Ok((
+                    report(
+                        query,
+                        now_ms,
+                        CLASS_UNAVAILABLE,
+                        FAILURE_AMBIGUOUS,
+                        OUTCOME_UNKNOWN,
+                        None,
+                        None,
+                        None,
+                    ),
+                    id(&result.transaction),
                 ));
             }
             OperationOutcome::Success
@@ -258,40 +300,45 @@ fn classify(
     if let Some(generation) = &state.current_generation
         && generation.status == SourceSyncGenerationStatus::RecoveryRequired
     {
-        return Ok(blocked(query, now_ms, FAILURE_RECOVERY_REQUIRED, state));
+        return Ok((
+            blocked(query, now_ms, FAILURE_RECOVERY_REQUIRED, state),
+            None,
+        ));
     }
-    if state.open_transaction.is_some() {
-        return Ok(blocked(query, now_ms, FAILURE_OPEN_TRANSACTION, state));
+    if let Some(open) = &state.open_transaction {
+        return Ok((
+            blocked(query, now_ms, FAILURE_OPEN_TRANSACTION, state),
+            id(open),
+        ));
     }
     if let Some(latest) = &state.latest_transaction {
-        match latest.status {
-            SourceBatchStatus::Aborted => {
-                return Ok(blocked(query, now_ms, FAILURE_ABORTED, state));
-            }
-            SourceBatchStatus::Quarantined => {
-                return Ok(blocked(query, now_ms, FAILURE_QUARANTINED, state));
-            }
-            SourceBatchStatus::Open => {
-                return Ok(blocked(query, now_ms, FAILURE_OPEN_TRANSACTION, state));
-            }
-            SourceBatchStatus::Committed => {}
+        let failure = match latest.status {
+            SourceBatchStatus::Aborted => Some(FAILURE_ABORTED),
+            SourceBatchStatus::Quarantined => Some(FAILURE_QUARANTINED),
+            SourceBatchStatus::Open => Some(FAILURE_OPEN_TRANSACTION),
+            SourceBatchStatus::Committed => None,
+        };
+        if let Some(failure) = failure {
+            return Ok((blocked(query, now_ms, failure, state), id(latest)));
         }
     }
     if let Some(result) = &state.last_result {
-        match result.transaction.status {
-            SourceBatchStatus::Aborted => {
-                return Ok(blocked(query, now_ms, FAILURE_ABORTED, state));
-            }
-            SourceBatchStatus::Quarantined => {
-                return Ok(blocked(query, now_ms, FAILURE_QUARANTINED, state));
-            }
-            SourceBatchStatus::Committed | SourceBatchStatus::Open => {}
+        let failure = match result.transaction.status {
+            SourceBatchStatus::Aborted => Some(FAILURE_ABORTED),
+            SourceBatchStatus::Quarantined => Some(FAILURE_QUARANTINED),
+            SourceBatchStatus::Committed | SourceBatchStatus::Open => None,
+        };
+        if let Some(failure) = failure {
+            return Ok((
+                blocked(query, now_ms, failure, state),
+                id(&result.transaction),
+            ));
         }
     }
 
     let last_success_at_ms = last_success_at(state);
     let Some(last_success_at_ms) = last_success_at_ms else {
-        return Ok(undisclosed(query, now_ms));
+        return Ok((undisclosed(query, now_ms), None));
     };
     if last_success_at_ms > now_ms {
         return Err(ClosedClass::InvalidCheckpoint);
@@ -303,15 +350,22 @@ fn classify(
     } else {
         CLASS_HEALTHY
     };
-    Ok(report(
-        query,
-        now_ms,
-        class,
-        FAILURE_NONE,
-        OUTCOME_SUCCESS,
-        Some(checkpoint_age_ms),
-        lag,
-        Some(last_success_at_ms),
+    // Success derives from the newest committed batch.
+    Ok((
+        report(
+            query,
+            now_ms,
+            class,
+            FAILURE_NONE,
+            OUTCOME_SUCCESS,
+            Some(checkpoint_age_ms),
+            lag,
+            Some(last_success_at_ms),
+        ),
+        state
+            .last_result
+            .as_ref()
+            .and_then(|result| id(&result.transaction)),
     ))
 }
 

@@ -43,6 +43,29 @@ value. `ListObjectChanges` has the same semantics and paging on SQLite and
 PostgreSQL; it is experimental and needs `SEKAI_EXPERIMENTAL_RPCS=1` or the
 `experimental-rpcs` build feature.
 
+Source batch applies are attributed the same way: the change rows a committed
+batch writes carry the operation identity of the call that opened the batch.
+
+## Source syncs and definition publishes
+
+`ApplySourceBatch` and `MergeDefinitionProposal` (direct and through bundle
+apply) take the identity from `x-sekai-operation-id`, or mint
+`op-source-batch-*` or `op-definition-merge-*` when the header is absent.
+The plane stores it with the entry it writes, on SQLite and PostgreSQL
+(`0171_operation_identity_columns`), and reads report it:
+
+| Read | Field | Identity of |
+| --- | --- | --- |
+| `ApplySourceBatch`, `GetSourceSyncState`, `ListSourceBatchTransactions` | `SourceBatchTransaction.operation_id` | the call that opened the batch |
+| `GetSourceHealth` | `SourceHealth.operation_id` | the transaction the health class derives from; empty when none does or the report discloses nothing |
+| `ListPublishedDefinitionRevisions` | `PublishedDefinitionRevisionHistoryEntry.operation_id` | the merge that published the revision |
+
+A replayed apply or merge reports the identity of the first call, whatever
+header the replay sends. A batch resumed after a crash keeps the identity it
+was opened under. Entries written before this field existed, or by an older
+version during a rolling deploy, report an empty identity; there is no
+backfill.
+
 ### Writer attribution
 
 Each change row also records who wrote it (#1690): `writer_kind`,

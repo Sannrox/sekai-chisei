@@ -444,10 +444,12 @@ impl<T: 'static> StepContext<'_, T> {
                     expected_datasources: datasources,
                 };
                 request.request_digest().map_err(Status::invalid_argument)?;
-                let result = match db.merge_definition_proposal_via(
+                let operation_id = call_operation_identity(self.req, "op-definition-merge")?;
+                let result = match db.merge_definition_proposal_with_operation(
                     &request,
                     crate::sekai::definition_proposal::DefinitionMergePath::BundleApply,
                     self.actor,
+                    Some(&operation_id),
                     now_millis(),
                 ) {
                     Ok(result) => result,
