@@ -3110,10 +3110,26 @@ pub(crate) mod tests {
             "editor",
         )
         .unwrap();
-        let later = db.status("acme", now + 5_000).unwrap();
+        // The gauge is process-wide and other tests publish to it in
+        // parallel (#3417), so read what this status call published on this
+        // thread.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let later =
+            metrics::with_local_recorder(&recorder, || db.status("acme", now + 5_000).unwrap());
         assert!(early.pending_changes > 0);
         assert!(later.lag_ms > early.lag_ms);
-        assert!(crate::obs::metrics::search_index_lag_ms() >= later.lag_ms as u64);
+        let published: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, ..)| key.key().name() == "sekai_search_index_lag_ms")
+            .map(|(.., value)| value)
+            .collect();
+        let [metrics_util::debugging::DebugValue::Gauge(lag)] = published.as_slice() else {
+            panic!("status publishes the lag gauge once: {published:?}");
+        };
+        assert!(lag.into_inner() >= later.lag_ms as f64);
         db.catch_up_search_namespace("acme", now + 5_000).unwrap();
         assert_eq!(db.status("acme", now + 5_000).unwrap().lag_ms, 0);
     }

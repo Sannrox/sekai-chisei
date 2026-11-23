@@ -55,6 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 rusqlite = { version = "0.41", default-features = false, features = ["trace"] }
 mikura-host = { git = "https://github.com/Sannrox/mikura", tag = "v0.5.0" }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
