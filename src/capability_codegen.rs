@@ -32,12 +32,29 @@ pub struct GeneratedClient {
     pub scope: CapabilityScopeManifest,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodegenError {
     EmptySelection,
-    CatalogPinMismatch { expected: String, actual: String },
+    CatalogPinMismatch {
+        expected: String,
+        actual: String,
+    },
     MissingCapability(String),
     InvalidContext(&'static str),
+    /// A selected capability was projected for a different namespace,
+    /// principal, contract, or projection version than the selection.
+    ContextMismatch {
+        capability: String,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    /// Two selected capabilities sanitize to the same TypeScript method.
+    MethodNameCollision {
+        method: String,
+        capabilities: [String; 2],
+    },
 }
 
 impl std::fmt::Display for CodegenError {
@@ -52,6 +69,22 @@ impl std::fmt::Display for CodegenError {
                 write!(f, "selected capability not in catalog: {name}")
             }
             Self::InvalidContext(field) => write!(f, "codegen context requires {field}"),
+            Self::ContextMismatch {
+                capability,
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "capability {capability} {field} mismatch: expected {expected}, got {actual}"
+            ),
+            Self::MethodNameCollision {
+                method,
+                capabilities: [first, second],
+            } => write!(
+                f,
+                "capabilities {first} and {second} both generate method {method}"
+            ),
         }
     }
 }
@@ -128,7 +161,7 @@ pub fn generate_typescript_client(
         .map(|capability| (capability.name.as_str(), capability))
         .collect();
     let mut selected = Vec::new();
-    let mut method_names = BTreeSet::new();
+    let mut method_names = BTreeMap::new();
     for name in &selection.capability_names {
         let capability = by_name
             .get(name.as_str())
@@ -136,25 +169,65 @@ pub fn generate_typescript_client(
             .ok_or_else(|| CodegenError::MissingCapability(name.clone()))?;
         // Reject capabilities from a different authorization context or with
         // contract/projection drift (same boundary as ProjectedCapability::invocation).
-        if capability.projection_version != crate::capability_projection::PROJECTION_VERSION
-            || capability.context.catalog_version != selection.context.catalog_version
-            || capability.context.namespace != selection.context.namespace
-            || capability.context.principal != selection.context.principal
-            || capability.context.contract_version != selection.context.contract_version
-            || capability.contract_version != selection.context.contract_version
-            || capability.minimum_compatible_version != selection.context.contract_version
-            || capability.maximum_compatible_version != selection.context.contract_version
-        {
+        if capability.context.catalog_version != selection.context.catalog_version {
             return Err(CodegenError::CatalogPinMismatch {
                 expected: selection.context.catalog_version.clone(),
                 actual: capability.context.catalog_version.clone(),
             });
         }
+        let contract = selection.context.contract_version.as_str();
+        for (field, expected, actual) in [
+            (
+                "projection_version",
+                crate::capability_projection::PROJECTION_VERSION,
+                capability.projection_version.as_str(),
+            ),
+            (
+                "namespace",
+                selection.context.namespace.as_str(),
+                capability.context.namespace.as_str(),
+            ),
+            (
+                "principal",
+                selection.context.principal.as_str(),
+                capability.context.principal.as_str(),
+            ),
+            (
+                "context contract_version",
+                contract,
+                capability.context.contract_version.as_str(),
+            ),
+            (
+                "contract_version",
+                contract,
+                capability.contract_version.as_str(),
+            ),
+            (
+                "minimum_compatible_version",
+                contract,
+                capability.minimum_compatible_version.as_str(),
+            ),
+            (
+                "maximum_compatible_version",
+                contract,
+                capability.maximum_compatible_version.as_str(),
+            ),
+        ] {
+            if expected != actual {
+                return Err(CodegenError::ContextMismatch {
+                    capability: name.clone(),
+                    field,
+                    expected: expected.into(),
+                    actual: actual.into(),
+                });
+            }
+        }
         let method = sanitize_method_name(&capability.name);
-        if !method_names.insert(method) {
-            return Err(CodegenError::MissingCapability(format!(
-                "method name collision for {name}"
-            )));
+        if let Some(first) = method_names.insert(method.clone(), name) {
+            return Err(CodegenError::MethodNameCollision {
+                method,
+                capabilities: [first.clone(), name.clone()],
+            });
         }
         selected.push(capability);
     }
@@ -435,10 +508,67 @@ mod tests {
             capability_names: BTreeSet::from(["sekai.action.assign_color".into()]),
             catalog_version_pin: None,
         };
+        assert_eq!(
+            generate_typescript_client(&[capability], &selection)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "capability sekai.action.assign_color projection_version mismatch: expected {}, got sekai.capability-projection/v0",
+                crate::capability_projection::PROJECTION_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn context_drift_names_the_field_that_differs() {
+        let capability = fixture_capability("sekai.action.assign_color");
+        let mut context = capability.context.clone();
+        context.principal = "someone-else".into();
+        let selection = CodegenSelection {
+            context,
+            capability_names: BTreeSet::from(["sekai.action.assign_color".into()]),
+            catalog_version_pin: None,
+        };
+        assert_eq!(
+            generate_typescript_client(std::slice::from_ref(&capability), &selection),
+            Err(CodegenError::ContextMismatch {
+                capability: "sekai.action.assign_color".into(),
+                field: "principal",
+                expected: "someone-else".into(),
+                actual: capability.context.principal.clone(),
+            })
+        );
+
+        let mut other_catalog = capability.clone();
+        other_catalog.context.catalog_version = "sha256:other".into();
+        let selection = CodegenSelection {
+            context: capability.context.clone(),
+            capability_names: BTreeSet::from(["sekai.action.assign_color".into()]),
+            catalog_version_pin: None,
+        };
         assert!(matches!(
-            generate_typescript_client(&[capability], &selection),
+            generate_typescript_client(&[other_catalog], &selection),
             Err(CodegenError::CatalogPinMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn method_collision_names_the_method_and_both_capabilities() {
+        let catalog = vec![
+            fixture_capability("sekai.action.assign_color"),
+            fixture_capability("sekai.action.assign-color"),
+        ];
+        let selection = CodegenSelection {
+            context: catalog[0].context.clone(),
+            capability_names: catalog.iter().map(|c| c.name.clone()).collect(),
+            catalog_version_pin: None,
+        };
+        assert_eq!(
+            generate_typescript_client(&catalog, &selection)
+                .unwrap_err()
+                .to_string(),
+            "capabilities sekai.action.assign-color and sekai.action.assign_color both generate method sekaiActionAssignColor"
+        );
     }
 
     #[test]
