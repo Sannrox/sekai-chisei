@@ -318,7 +318,7 @@ leaves nothing behind.
 ## Draft a definition tree from a source discovery
 
 ```sh
-sekaictl ontology draft --discovery <file> --out <dir> [--overwrite] [--namespace <ns>] [--target <url-or-socket>]
+sekaictl ontology draft --discovery <file> --out <dir> [--update] [--namespace <ns>] [--target <url-or-socket>]
 ```
 
 Writes a definition tree in the export layout from one
@@ -330,16 +330,50 @@ the files, then import them as a proposal.
 - one link type per declared reference, and per inferred reference whose
   present-row match is at least 8000 basis points; weaker candidates are listed
   as dropped in the report
-- `draft-report.json`: every key choice, kept and dropped reference, and
-  value-shape finding
+- `draft-report.json`: every record kind with its columns, key choice, kept and
+  dropped reference, and value-shape finding
 - columns flagged `possibly_sensitive` take the namespace's most restrictive
   marking (`--namespace` is required then; the only plane read is the lattice)
-- `--overwrite` rewrites only members listed in a previous
-  `draft-report.json`, plus `layout.json` and the report
 
 Record kind and column names are the discovery's own tokens. Import skips
 `draft-report.json` and `draft-decisions.json`. Each drafted object type
 carries an `orphan_object_type` suppression until something consumes it.
+
+### Redraft without losing review decisions
+
+`--update` redrafts over a previous draft. It rewrites only the members the
+previous `draft-report.json` lists, removes the ones it no longer drafts, and
+prints what the source gained or lost since that report: new record kinds, new
+columns, new or vanished reference candidates, and new findings. A file the
+draft does not own is never overwritten unless its content already matches.
+An interrupted update finishes when rerun.
+
+Review decisions live next to the tree in `draft-decisions.json`. Each names
+its subject by the source, so a rename does not orphan other decisions:
+
+```json
+{
+  "contract_version": "sekai.ontology-draft-decisions/v1",
+  "decisions": [
+    {"decision":"keep","record_kind":"Account"},
+    {"decision":"reject","record_kind":"Order","column":"legacy_code"},
+    {"decision":"reject","reference":{"from":"Order","columns":["contact_id"],"to":"Contact"}},
+    {"decision":"rename","record_kind":"Order","id":"SalesOrder"}
+  ]
+}
+```
+
+- `reject`: a record kind, a column (`record_kind` plus `column`), or a
+  reference is never drafted again; links through a rejected kind or column go
+  with it
+- `rename`: the object type (`record_kind`) or link type (`reference`) is
+  drafted under `id`; links point at renamed types
+- `keep`: the reviewer owns that member's file and a redraft never writes it
+
+A draft rewrites the file with one decision per line in sorted order, so two
+reviewers who add different decisions usually merge without a conflict. A
+decision whose subject the source no longer has is printed as stale and stays
+in the file.
 
 ## Import a file tree as a proposal
 
