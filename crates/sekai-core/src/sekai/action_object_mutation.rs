@@ -708,9 +708,16 @@ fn validate_object_write(
     .map_err(ActionObjectMutationError::FailedPrecondition)
 }
 
-/// Best-effort follow-up after an Action's object write is durable. Runs
-/// again on admission replay, so each step must be idempotent.
-pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_ms: i64) {
+/// Follow-up after an Action's object write is durable. Runs again on
+/// admission replay, so each step must be idempotent. Every step runs; only a
+/// failed security freeze or lift proposal is returned, because nothing else
+/// repairs it and the caller must retry.
+pub fn complete_object_write(
+    db: &RuntimeDb,
+    object: &Object,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
     crate::sekai::feedback_package::complete_object_write(db, object, now_ms);
     let _ = crate::sekai::function_document::complete_lineage_write(db, actor, object, now_ms);
     // A failed append is not lost: every instance's outbox reconcile
@@ -720,7 +727,7 @@ pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_m
     {
         tracing::warn!(entry_id = %object.id, ?error, "criticality outbox append deferred to reconcile");
     }
-    crate::sekai::security_remediation::complete_object_write(db, object, actor, now_ms);
+    crate::sekai::security_remediation::complete_object_write(db, object, actor, now_ms)
 }
 
 impl AppliedObjectMutation {

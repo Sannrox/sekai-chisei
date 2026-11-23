@@ -296,19 +296,28 @@ pub(crate) fn rollback_unapplied_freeze(
 /// After a mitigation write is durable, lift a freeze or catch up an enable
 /// from a recovered admission (`apply` and `grant_parked` enable first).
 /// After a `fixed` disposition, propose lifting every active mitigation.
-pub fn complete_object_write(db: &RuntimeDb, object: &Object, actor: &str, now_ms: i64) {
-    match object.kind.as_str() {
-        KIND_MITIGATION => {
-            let _ = apply_freeze(db, object, now_ms);
-        }
+/// A failure is logged with the object id and returned; both steps are
+/// idempotent, so the caller retries by replaying the admission.
+pub fn complete_object_write(
+    db: &RuntimeDb,
+    object: &Object,
+    actor: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    let result = match object.kind.as_str() {
+        KIND_MITIGATION => apply_freeze(db, object, now_ms),
         KIND_DISPOSITION
             if object.properties.get("disposition").map(String::as_str)
                 == Some(DISPOSITION_FIXED) =>
         {
-            let _ = propose_lifts_for_fixed(db, object, actor, now_ms);
+            propose_lifts_for_fixed(db, object, actor, now_ms)
         }
-        _ => {}
-    }
+        _ => Ok(()),
+    };
+    result.map_err(|error| {
+        tracing::error!(object_id = %object.id, kind = %object.kind, %error, "security remediation follow-up failed");
+        format!("security remediation follow-up for {}: {error}", object.id)
+    })
 }
 
 fn validate_remediation(db: &RuntimeDb, object: &mut Object) -> Result<String, String> {
@@ -1135,6 +1144,57 @@ mod tests {
         publish(&runtime, "doc-after", "doc-after").unwrap();
     }
 
+    /// A freeze lost after the mitigation landed is reported to the replaying
+    /// caller, and the next replay restores it once.
+    #[test]
+    fn a_failed_freeze_completion_reaches_the_caller_and_retries_once() {
+        let runtime = with_exposure();
+        admit(
+            &runtime,
+            ACTION_REMEDIATION_PROPOSE,
+            propose_freeze(),
+            "r-1",
+        )
+        .unwrap();
+        let parked = admit(
+            &runtime,
+            ACTION_MITIGATION_APPLY,
+            apply_freeze_params(),
+            "m-1",
+        )
+        .unwrap();
+        grant(&runtime, &parked.instance.instance_id).unwrap();
+        runtime
+            .conn()
+            .execute_batch(
+                "DELETE FROM sekai_write_freeze;
+                 CREATE TRIGGER refuse_freeze BEFORE INSERT ON sekai_write_freeze
+                 BEGIN SELECT RAISE(ABORT, 'freeze store unavailable'); END;",
+            )
+            .unwrap();
+
+        match grant(&runtime, &parked.instance.instance_id) {
+            Err(ActionInstanceAdmissionError::Internal(message)) => assert!(
+                message.contains("security remediation follow-up for m-1")
+                    && message.contains("freeze store unavailable"),
+                "{message}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+        assert!(runtime.list_write_freezes().unwrap().is_empty());
+
+        runtime
+            .conn()
+            .execute_batch("DROP TRIGGER refuse_freeze;")
+            .unwrap();
+        grant(&runtime, &parked.instance.instance_id).unwrap();
+        grant(&runtime, &parked.instance.instance_id).unwrap();
+        let freezes = runtime.list_write_freezes().unwrap();
+        assert_eq!(freezes.len(), 1);
+        assert!(freezes[0].enabled);
+        assert_eq!(freezes[0].reason, freeze_reason_for("m-1"));
+    }
+
     /// Enable-before-persist must not leave a freeze when the object never lands.
     #[test]
     fn rollback_clears_a_freeze_that_never_landed() {
@@ -1529,7 +1589,7 @@ mod tests {
         };
         enable_applied_freeze(&runtime, &in_flight, 3_000).unwrap();
         let landed = runtime.get_object("m-1").unwrap().unwrap();
-        complete_object_write(&runtime, &landed, ACTOR, 3_500);
+        complete_object_write(&runtime, &landed, ACTOR, 3_500).unwrap();
         let freeze = runtime
             .list_write_freezes()
             .unwrap()
@@ -2485,7 +2545,7 @@ mod tests {
         .unwrap();
         grant(&runtime, &later.instance.instance_id).unwrap();
         let fixed = runtime.get_object("d-1").unwrap().unwrap();
-        complete_object_write(&runtime, &fixed, ACTOR, 5_000);
+        complete_object_write(&runtime, &fixed, ACTOR, 5_000).unwrap();
         assert_eq!(
             runtime.get_object("m-2").unwrap().unwrap().properties["state"],
             STATE_APPLIED
