@@ -77,6 +77,28 @@ impl PostgresDb {
         expected_policy_generation: Option<&str>,
         authorized_objects: Option<&[Object]>,
     ) -> Result<SourceBatchResult, String> {
+        self.apply_source_batch_with_operation(
+            batch,
+            authenticated_producer,
+            now_ms,
+            expected_policy_generation,
+            authorized_objects,
+            None,
+        )
+    }
+
+    /// As [`Self::apply_source_batch_with_policy_generation`], recording
+    /// `operation_id` on the transaction this call opens (#3087). A replay
+    /// keeps the identity of the call that opened the transaction.
+    pub fn apply_source_batch_with_operation(
+        &self,
+        batch: &SourceBatch,
+        authenticated_producer: &str,
+        now_ms: i64,
+        expected_policy_generation: Option<&str>,
+        authorized_objects: Option<&[Object]>,
+        operation_id: Option<&str>,
+    ) -> Result<SourceBatchResult, String> {
         batch
             .validate_for_producer(authenticated_producer)
             .map_err(|error| error.to_string())?;
@@ -134,7 +156,7 @@ impl PostgresDb {
             .retain_original_batch_json(batch)
             .map_err(|error| error.to_string())?;
         let (result, newly_committed) = match self
-            .persist_source_batch_open(batch, &prepared, now_ms)
+            .persist_source_batch_open(batch, &prepared, now_ms, operation_id)
             .map_err(|error| error.to_string())?
         {
             OpenDisposition::Committed(result) => (*result, false),
@@ -169,6 +191,7 @@ impl PostgresDb {
         batch: &SourceBatch,
         prepared: &PreparedBatch,
         now_ms: i64,
+        operation_id: Option<&str>,
     ) -> Result<OpenDisposition, ApplyError> {
         let mut connection = self.connection().map_err(ApplyError::storage)?;
         let mut transaction = connection.transaction()?;
@@ -308,11 +331,11 @@ impl PostgresDb {
                 batch_digest, batch_json, current_cursor, proposed_next_cursor, status,
                 outcome, opened_at_ms, closed_at_ms, reason, result_json, contract_version,
                 delivery_mode, sync_generation, feed_epoch, offset_start, offset_end,
-                snapshot_complete
+                snapshot_complete, operation_id
              ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, 'OPEN',
                 'unavailable', $10, NULL, 'awaiting atomic commit', '', $11,
-                $12, $13, $14, $15, $16, $17
+                $12, $13, $14, $15, $16, $17, $18
              )",
             &[
                 &prepared.transaction_id,
@@ -352,6 +375,7 @@ impl PostgresDb {
                     .delivery
                     .as_ref()
                     .map(|delivery| delivery.snapshot_complete),
+                &operation_id.filter(|id| !id.is_empty()),
             ],
         )?;
         transaction.commit()?;
@@ -419,6 +443,7 @@ impl PostgresDb {
             })?;
         let dataset_landed =
             transaction_dataset_landed(&mut transaction, &prepared.transaction_id)?;
+        let operation_id = transaction_operation_id(&mut transaction, &prepared.transaction_id)?;
         if !dataset_landed {
             if let Err(error) = require_live_registered_descriptor(&mut transaction, batch) {
                 abort_open_source_batch(&mut transaction, prepared, now_ms, &error)?;
@@ -532,16 +557,20 @@ impl PostgresDb {
                         &object.updated,
                     ],
                 )?;
-                // Attributed to the committed source transaction (#1690).
+                // Attributed to the committed source transaction (#1690)
+                // and the operation that opened it (#3087).
                 insert_changes(
                     &mut transaction,
-                    &crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
-                        .stamp(object_diff_changes(
-                            authenticated_producer,
-                            before.as_ref(),
-                            Some(&object),
-                            now_ms,
-                        )),
+                    &crate::sekai::audit::ChangeAttribution {
+                        operation_id: operation_id.clone(),
+                        ..crate::sekai::audit::ChangeAttribution::source(&prepared.transaction_id)
+                    }
+                    .stamp(object_diff_changes(
+                        authenticated_producer,
+                        before.as_ref(),
+                        Some(&object),
+                        now_ms,
+                    )),
                 )
                 .map_err(ApplyError::storage)?;
 
@@ -913,6 +942,27 @@ impl PostgresDb {
                 "SELECT DISTINCT source_instance, type_digest FROM sekai_source_bindings
                  WHERE namespace = $1 ORDER BY source_instance, type_digest LIMIT $2",
                 &[&namespace, &i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Operation identities recorded on `transaction_ids` in `namespace`
+    /// (#3087). Transactions without one are absent from the map.
+    pub fn source_batch_operation_ids(
+        &self,
+        namespace: &str,
+        transaction_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let ids: Vec<String> = transaction_ids.iter().map(|id| (*id).to_string()).collect();
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT transaction_id, operation_id FROM sekai_source_batch_transactions
+                 WHERE namespace = $1 AND transaction_id = ANY($2) AND operation_id IS NOT NULL",
+                &[&namespace, &ids],
             )
             .map_err(|error| error.to_string())?
             .iter()
@@ -1680,6 +1730,23 @@ fn land_source_batch_dataset_rows_pg(
     Ok(())
 }
 
+/// The operation identity stored when the transaction opened; empty for a
+/// transaction opened without one or before #3087.
+fn transaction_operation_id(
+    client: &mut impl GenericClient,
+    transaction_id: &str,
+) -> Result<String, ApplyError> {
+    Ok(client
+        .query_opt(
+            "SELECT COALESCE(operation_id, '') FROM sekai_source_batch_transactions
+             WHERE transaction_id = $1",
+            &[&transaction_id],
+        )
+        .map_err(ApplyError::storage)?
+        .map(|row| row.get::<_, String>(0))
+        .unwrap_or_default())
+}
+
 fn transaction_dataset_landed(
     client: &mut impl GenericClient,
     transaction_id: &str,
@@ -2172,7 +2239,7 @@ mod tests {
         // A namespace of its own, so concurrent or repeated runs never share
         // a binding.
         let namespace = format!("recover-{}", uuid::Uuid::new_v4().simple());
-        let open = |key: &str, next: &str, current: &str| {
+        let open = |key: &str, next: &str, current: &str, operation_id: Option<&str>| {
             let mut source = batch(current, next, key);
             source.namespace = namespace.clone();
             crate::db::object_sync::tests::redigest(&mut source);
@@ -2180,10 +2247,10 @@ mod tests {
                 unreachable!()
             };
             let prepared = PreparedBatch::new(&source, &SourceBatchMapper::Github).unwrap();
-            db.persist_source_batch_open(&source, &prepared, 100)
+            db.persist_source_batch_open(&source, &prepared, 100, operation_id)
                 .unwrap();
         };
-        open("batch-1", "cursor:1", "");
+        open("batch-1", "cursor:1", "", Some("op-crashed"));
         let db = connect();
         let instance = "acme/ops";
         let resumed = db
@@ -2191,12 +2258,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(resumed.transaction.closed_at_ms, Some(200));
+        // The resumed commit keeps the identity of the call that opened it.
+        crate::db::object_sync::tests::assert_batch_operation(
+            &db,
+            &namespace,
+            &resumed.transaction.transaction_id,
+            "op-crashed",
+        );
         assert!(
             db.resume_open_source_batch(&namespace, instance, TYPE_DIGEST, PRODUCER, 300)
                 .unwrap()
                 .is_none()
         );
-        open("batch-2", "cursor:2", "cursor:1");
+        open("batch-2", "cursor:2", "cursor:1", None);
         assert!(
             db.abort_open_source_batch(&namespace, instance, TYPE_DIGEST, PRODUCER, "gone", 400)
                 .unwrap()

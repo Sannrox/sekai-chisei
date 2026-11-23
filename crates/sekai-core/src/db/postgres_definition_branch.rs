@@ -770,6 +770,41 @@ impl PostgresDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
+        self.merge_definition_proposal_with_operation(request, path, actor, None, now_ms)
+    }
+
+    /// Operation identities recorded on merged `proposal_ids` in `namespace`
+    /// (#3087). Proposals without one are absent from the map.
+    pub fn definition_proposal_operation_ids(
+        &self,
+        namespace: &str,
+        proposal_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let ids: Vec<String> = proposal_ids.iter().map(|id| (*id).to_string()).collect();
+        Ok(self
+            .connection()?
+            .query(
+                "SELECT proposal_id, operation_id FROM sekai_definition_proposals
+                 WHERE namespace = $1 AND proposal_id = ANY($2) AND operation_id IS NOT NULL",
+                &[&namespace, &ids],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// As [`Self::merge_definition_proposal_via`], recording `operation_id`
+    /// on the proposal in the merge transaction (#3087). A replayed merge
+    /// keeps the identity of the merge that published it.
+    pub fn merge_definition_proposal_with_operation(
+        &self,
+        request: &MergeDefinitionProposal,
+        path: DefinitionMergePath,
+        actor: &str,
+        operation_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
         let request_digest = request.request_digest()?;
         // Blocking consumer bindings (ADR 0067, amended) are checked before
         // anything is published.
@@ -1064,6 +1099,15 @@ impl PostgresDb {
         proposal.updated_at_ms = now_ms;
         proposal.receipt_id = receipt_id.clone();
         update_proposal_postgres(&mut transaction, &proposal)?;
+        if let Some(operation_id) = operation_id.filter(|id| !id.is_empty()) {
+            transaction
+                .execute(
+                    "UPDATE sekai_definition_proposals SET operation_id = $1
+                     WHERE namespace = $2 AND proposal_id = $3",
+                    &[&operation_id, &proposal.namespace, &proposal.proposal_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let result = DefinitionWriteResult::MergeProposal {
             result: Box::new(DefinitionProposalMergeResult {
                 proposal: proposal.clone(),

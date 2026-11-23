@@ -192,6 +192,7 @@ fn apply_source_batch_blocking(
     let principals = caller_principals(&req);
     let principal = require_single_source_principal(&principals)?.to_string();
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let operation_id = call_operation_identity(&req, "op-source-batch")?;
     let proto = req
         .into_inner()
         .batch
@@ -264,17 +265,21 @@ fn apply_source_batch_blocking(
     let result = service
         .db
         .runtime()
-        .apply_source_batch_with_policy_generation(
+        .apply_source_batch_with_operation(
             &batch,
             &principal,
             now_millis(),
             Some(&policy_generation),
             Some(&authorized_objects),
+            Some(&operation_id),
         )
         .map_err(map_source_sync_apply_error)?;
     ensure_authoritative_source_result(&result)?;
+    let mut proto_result = to_proto_source_batch_result(&result);
+    // A replay reports the identity of the call that opened the transaction.
+    fill_operation_ids(service, &batch.namespace, proto_result.transaction.as_mut())?;
     Ok(Response::new(ApplySourceBatchResponse {
-        result: Some(to_proto_source_batch_result(&result)),
+        result: Some(proto_result),
     }))
 }
 pub(super) async fn get_source_sync_state(
@@ -299,10 +304,53 @@ pub(super) async fn get_source_sync_state(
         .runtime()
         .get_source_sync_state(&input.namespace, &input.source_instance, &input.type_digest)
         .map_err(|_| Status::internal("source sync state unavailable"))?;
+    let mut proto_state = state.as_ref().map(to_proto_source_sync_state);
+    if let Some(state) = proto_state.as_mut() {
+        fill_operation_ids(
+            service,
+            &input.namespace,
+            [
+                state.open_transaction.as_mut(),
+                state.latest_transaction.as_mut(),
+                state
+                    .last_result
+                    .as_mut()
+                    .and_then(|result| result.transaction.as_mut()),
+            ]
+            .into_iter()
+            .flatten(),
+        )?;
+    }
     Ok(Response::new(GetSourceSyncStateResponse {
         found: state.is_some(),
-        state: state.as_ref().map(to_proto_source_sync_state),
+        state: proto_state,
     }))
+}
+
+/// Sets `operation_id` on each of `transactions` from the identity recorded
+/// when the batch opened (#3087); empty for a batch opened before it was.
+fn fill_operation_ids<'a>(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    transactions: impl IntoIterator<Item = &'a mut SourceBatchTransaction>,
+) -> Result<(), Status> {
+    let mut transactions: Vec<_> = transactions.into_iter().collect();
+    let ids: Vec<&str> = transactions
+        .iter()
+        .map(|transaction| transaction.transaction_id.as_str())
+        .collect();
+    let operation_ids = service
+        .db
+        .runtime()
+        .source_batch_operation_ids(namespace, &ids)
+        .map_err(|_| Status::internal("source batch identity unavailable"))?;
+    for transaction in &mut transactions {
+        transaction.operation_id = operation_ids
+            .get(&transaction.transaction_id)
+            .cloned()
+            .unwrap_or_default();
+    }
+    Ok(())
 }
 /// Most batch transactions one page returns.
 const MAX_BATCH_HISTORY_PAGE: usize = 100;
@@ -406,13 +454,15 @@ pub(super) async fn list_source_batch_transactions(
         })?,
         _ => String::new(),
     };
+    let mut transactions: Vec<_> = history
+        .transactions
+        .iter()
+        .map(to_proto_source_transaction)
+        .collect();
+    fill_operation_ids(service, &input.namespace, &mut transactions)?;
     Ok(Response::new(ListSourceBatchTransactionsResponse {
         found: true,
-        transactions: history
-            .transactions
-            .iter()
-            .map(to_proto_source_transaction)
-            .collect(),
+        transactions,
         next_page_token,
     }))
 }

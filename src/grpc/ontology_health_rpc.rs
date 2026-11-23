@@ -343,7 +343,7 @@ pub(super) async fn get_source_health(
         Err(status) if status.code() == tonic::Code::Internal => return Err(status),
         Err(_) => false,
     };
-    let report = source_health::report_authorized_source_health(
+    let (report, operation_id) = source_health::report_authorized_source_health_with_operation(
         db,
         &actor,
         &query,
@@ -364,6 +364,7 @@ pub(super) async fn get_source_health(
             lag: report.lag,
             last_success_at_ms: report.last_success_at_ms,
             observed_at_ms: report.observed_at_ms,
+            operation_id,
         }),
     }))
 }

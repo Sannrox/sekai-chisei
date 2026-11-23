@@ -1307,6 +1307,22 @@ pub(super) fn to_proto_source_binding(
         active: binding.active,
     }
 }
+/// The operation identity of a write call (#3087): the request's
+/// `x-sekai-operation-id`, or one minted with `prefix` when it carries none.
+pub(super) fn call_operation_identity<T>(req: &Request<T>, prefix: &str) -> Result<String, Status> {
+    let header = req
+        .metadata()
+        .get(crate::sekai::operation_correlation::OPERATION_METADATA)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| Status::invalid_argument("operation identity must be text"))
+        })
+        .transpose()?;
+    crate::sekai::operation_correlation::call_identity(header, prefix)
+        .map_err(Status::invalid_argument)
+}
+
 pub(super) fn to_proto_source_transaction(
     transaction: &source_sync_domain::SourceBatchTransaction,
 ) -> SourceBatchTransaction {
@@ -1331,6 +1347,7 @@ pub(super) fn to_proto_source_transaction(
         offset_start: transaction.offset_start,
         offset_end: transaction.offset_end,
         snapshot_complete: transaction.snapshot_complete,
+        operation_id: String::new(),
     }
 }
 pub(super) fn to_proto_source_checkpoint(

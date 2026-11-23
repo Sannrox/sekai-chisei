@@ -49,6 +49,16 @@ pub fn normalize_identity(value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// The identity of a write call (#3087): the caller's header when it carries
+/// one, otherwise `<prefix>-<uuid>` minted by the plane, as receipts do.
+pub fn call_identity(header: Option<&str>, prefix: &str) -> Result<String, String> {
+    let header = normalize_identity(header.unwrap_or(""))?;
+    if header.is_empty() {
+        return Ok(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()));
+    }
+    Ok(header)
+}
+
 /// Submit decisions read per page while correlating objects to operations.
 const SUBMIT_PAGE: i32 = 512;
 

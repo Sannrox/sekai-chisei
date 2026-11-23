@@ -271,6 +271,20 @@ impl RuntimeDb {
         }
     }
 
+    /// Operation identities recorded on merged `proposal_ids` in `namespace`.
+    pub fn definition_proposal_operation_ids(
+        &self,
+        namespace: &str,
+        proposal_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        match self {
+            Self::Sqlite(db) => db.definition_proposal_operation_ids(namespace, proposal_ids),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.definition_proposal_operation_ids(namespace, proposal_ids)
+            }),
+        }
+    }
+
     pub fn list_published_definition_revisions(
         &self,
         namespace: &str,
@@ -456,10 +470,35 @@ impl RuntimeDb {
         actor: &str,
         now_ms: i64,
     ) -> Result<DefinitionWriteResult, String> {
+        self.merge_definition_proposal_with_operation(request, path, actor, None, now_ms)
+    }
+
+    /// As [`Self::merge_definition_proposal_via`], recording the caller's
+    /// `operation_id` on the published proposal (#3087).
+    pub fn merge_definition_proposal_with_operation(
+        &self,
+        request: &MergeDefinitionProposal,
+        path: crate::sekai::definition_proposal::DefinitionMergePath,
+        actor: &str,
+        operation_id: Option<&str>,
+        now_ms: i64,
+    ) -> Result<DefinitionWriteResult, String> {
         let result = match self {
-            Self::Sqlite(db) => db.merge_definition_proposal_via(request, path, actor, now_ms),
+            Self::Sqlite(db) => db.merge_definition_proposal_with_operation(
+                request,
+                path,
+                actor,
+                operation_id,
+                now_ms,
+            ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
-                db.merge_definition_proposal_via(request, path, actor, now_ms)
+                db.merge_definition_proposal_with_operation(
+                    request,
+                    path,
+                    actor,
+                    operation_id,
+                    now_ms,
+                )
             }),
         }?;
         if matches!(result, DefinitionWriteResult::MergeProposal { .. }) {
