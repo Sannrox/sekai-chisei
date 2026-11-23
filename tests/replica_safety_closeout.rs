@@ -12,12 +12,13 @@ use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
 
-use crate::replica_safety_harness::open_replica_pair;
+use crate::replica_safety_harness::{assert_losers_are_budget_refusals, open_replica_pair};
 use sekai_chisei::sekai::coordination::{
     ADMISSION_POLICY_FIFO, ContentionScope, ReconcileFilter, WORK_UNIT_STATUS_PENDING,
     WORK_UNIT_STATUS_STALE, WorkUnit,
 };
 use sekai_chisei::sekai::credentials::PrincipalCredentialStore;
+use sekai_chisei::sekai::lease::LeaseError;
 use sekai_domain::gateway_keys::hash_gateway_key;
 use std::path::Path;
 use std::sync::Arc;
@@ -46,6 +47,7 @@ fn budget_cannot_overspend_under_two_replicas() {
     let results = pair.race_results(2, |_i, db| {
         db.budget_check_and_reserve_chain("closeout", METRIC_TOKENS, 6, 1)
     });
+    assert_losers_are_budget_refusals(&results);
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
     assert_eq!(
         pair.b.budget_usage("closeout", METRIC_TOKENS, 1).unwrap().0,
@@ -70,6 +72,13 @@ fn lease_and_admission_converge_and_stale_work_recovers() {
             10,
         )
     });
+    // The loser sees the live lease, not a storage or validation failure.
+    for lost in leases.iter().filter(|r| r.is_err()) {
+        assert!(
+            matches!(lost, Err(LeaseError::Conflict(message)) if message == "lease is already active"),
+            "a losing acquire failed with a non-conflict error: {lost:?}"
+        );
+    }
     assert_eq!(leases.iter().filter(|r| r.is_ok()).count(), 1);
 
     pair.a

@@ -6,6 +6,18 @@ use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::{ReplicaSafetyInventory, TwoReplicaSqlite};
 
+/// Requires every losing reserve in a budget race to fail with the budget
+/// refusal, so a busy, locked or other storage error never counts as
+/// enforcement.
+pub(crate) fn assert_losers_are_budget_refusals(results: &[Result<(), String>]) {
+    for error in results.iter().filter_map(|result| result.as_ref().err()) {
+        assert!(
+            error.starts_with("budget exceeded at "),
+            "a losing reserve failed with a non-budget error: {error}\n{results:?}"
+        );
+    }
+}
+
 pub(crate) fn open_replica_pair() -> TwoReplicaSqlite {
     let pair = TwoReplicaSqlite::open().expect("shared sqlite pair");
     sekai_chisei::chisei_store::apply_chisei_schema(pair.a.as_ref());
@@ -30,6 +42,7 @@ fn two_independent_stores_share_budget_authority() {
     let results = pair.race_results(4, |_index, db| {
         db.budget_check_and_reserve_chain("global", METRIC_TOKENS, 6, 0)
     });
+    assert_losers_are_budget_refusals(&results);
     let successes = results.iter().filter(|result| result.is_ok()).count();
     assert_eq!(
         successes, 1,
