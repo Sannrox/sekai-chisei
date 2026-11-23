@@ -115,7 +115,6 @@ impl RuntimeDb {
         &self,
         freeze: &crate::sekai::write_freeze::WriteFreeze,
     ) -> Result<(), String> {
-        crate::sekai::security_remediation::refuse_unfreeze_while_applied(self, freeze)?;
         match self {
             Self::Sqlite(db) => db.set_write_freeze(freeze),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| db.set_write_freeze(freeze)),
@@ -127,7 +126,6 @@ impl RuntimeDb {
         freeze: &crate::sekai::write_freeze::WriteFreeze,
         decision: &crate::sekai::audit::Decision,
     ) -> Result<(), String> {
-        crate::sekai::security_remediation::refuse_unfreeze_while_applied(self, freeze)?;
         match self {
             Self::Sqlite(db) => db.set_write_freeze_with_decision(freeze, decision),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {

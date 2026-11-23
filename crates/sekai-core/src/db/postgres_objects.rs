@@ -1291,6 +1291,21 @@ fn require_postgres_authorized_link_endpoints(
     Ok(())
 }
 
+/// Every object of `kind`, read on the caller's transaction.
+pub(crate) fn objects_of_kind(
+    tx: &mut postgres::Transaction<'_>,
+    kind: &str,
+) -> Result<Vec<Object>, String> {
+    tx.query(
+        &format!("SELECT {OBJECT_COLUMNS} FROM sekai_objects WHERE kind = $1"),
+        &[&kind],
+    )
+    .map_err(|error| error.to_string())?
+    .into_iter()
+    .map(row_to_object)
+    .collect()
+}
+
 fn row_to_object(row: postgres::Row) -> Result<Object, String> {
     let properties_json: String = row.get(5);
     let properties: HashMap<String, String> =

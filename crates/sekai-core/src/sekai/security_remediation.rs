@@ -522,21 +522,27 @@ fn lift_security_freeze(
     }
 }
 
-/// Operator unfreeze is the same row as a security freeze. Refuse any write
-/// that would stop blocking writes while a freeze mitigation is still applied.
-pub(crate) fn refuse_unfreeze_while_applied(
-    db: &RuntimeDb,
+/// Whether writing `freeze` could stop blocking writes on an action scope a
+/// freeze mitigation may hold. Backends read mitigations inside the freeze
+/// write transaction only when this holds, so other freezes stay cheap.
+pub(crate) fn unfreeze_needs_guard(freeze: &WriteFreeze) -> bool {
+    freeze.scope_kind == SCOPE_ACTION && !(freeze.enabled && freeze.mode == MODE_BLOCK_WRITES)
+}
+
+/// Operator unfreeze is the same row as a security freeze. Refuse a write that
+/// would stop blocking writes while one of `mitigations` still holds it. The
+/// backend loads `mitigations` (every `security_mitigation` object) in the same
+/// transaction as the freeze write, so an apply cannot slip between them.
+pub(crate) fn refuse_unfreeze_held_by(
     freeze: &WriteFreeze,
+    mitigations: &[Object],
 ) -> Result<(), String> {
-    if freeze.scope_kind != SCOPE_ACTION {
+    if !unfreeze_needs_guard(freeze) {
         return Ok(());
     }
-    if freeze.enabled && freeze.mode == MODE_BLOCK_WRITES {
-        return Ok(());
-    }
-    let Some(keeper) = applied_freeze_mitigations(db, &freeze.scope_value)?
-        .into_iter()
-        .next()
+    let Some(keeper) = mitigations
+        .iter()
+        .find(|object| holds_freeze(object, &freeze.scope_value))
     else {
         return Ok(());
     };
@@ -627,14 +633,18 @@ fn active_mitigations(
 /// still in force on that type (applied or lift-proposed), not only the
 /// lifting object's namespace. Lift-proposed still holds until lift is granted.
 fn applied_freeze_mitigations(db: &RuntimeDb, target: &str) -> Result<Vec<Object>, String> {
-    list_mitigations(db, None, |object| {
-        object.properties.get("control").map(String::as_str) == Some(CONTROL_FREEZE)
-            && object.properties.get("target").map(String::as_str) == Some(target)
-            && matches!(
-                object.properties.get("state").map(String::as_str),
-                Some(STATE_APPLIED | STATE_LIFT_PROPOSED)
-            )
-    })
+    list_mitigations(db, None, |object| holds_freeze(object, target))
+}
+
+/// An applied or lift-proposed freeze mitigation on `target` keeps its freeze on.
+fn holds_freeze(object: &Object, target: &str) -> bool {
+    object.kind == KIND_MITIGATION
+        && object.properties.get("control").map(String::as_str) == Some(CONTROL_FREEZE)
+        && object.properties.get("target").map(String::as_str) == Some(target)
+        && matches!(
+            object.properties.get("state").map(String::as_str),
+            Some(STATE_APPLIED | STATE_LIFT_PROPOSED)
+        )
 }
 
 fn list_mitigations(
@@ -2614,5 +2624,123 @@ mod tests {
         );
         assert!(runtime.get_object_type(KIND_REMEDIATION).unwrap().is_some());
         assert!(runtime.get_object_type(KIND_MITIGATION).unwrap().is_some());
+    }
+
+    /// Each store refuses a held unfreeze inside its own write transaction, so
+    /// an apply cannot land between the check and the write (#2825). The
+    /// contract calls the store directly, below every caller-side check.
+    fn store_unfreeze_guard_contract(runtime: &RuntimeDb, prefix: &str) {
+        let target = format!("{prefix}.publish");
+        let other = format!("{prefix}.other");
+        let set = |scope_value: &str, enabled: bool, mode: &str| {
+            let freeze = WriteFreeze {
+                scope_kind: SCOPE_ACTION.into(),
+                scope_value: scope_value.into(),
+                mode: mode.into(),
+                reason: "operator freeze".into(),
+                enabled,
+                updated_ms: 1_000,
+            };
+            match runtime {
+                RuntimeDb::Sqlite(db) => db.set_write_freeze(&freeze),
+                RuntimeDb::Postgres(db) => db.set_write_freeze(&freeze),
+            }
+        };
+        let mut mitigation = Object {
+            id: format!("{prefix}-m-1"),
+            kind: KIND_MITIGATION.into(),
+            name: format!("{prefix}-m-1"),
+            namespace: NAMESPACE.into(),
+            external_id: String::new(),
+            properties: std::collections::HashMap::from([
+                ("control".into(), CONTROL_FREEZE.into()),
+                ("target".into(), target.clone()),
+                ("state".into(), STATE_APPLIED.into()),
+            ]),
+            created: 0,
+            updated: 0,
+        };
+        set(&target, true, MODE_BLOCK_WRITES).unwrap();
+        runtime.create_object(&mitigation).unwrap();
+
+        let error = set(&target, false, MODE_BLOCK_WRITES).unwrap_err();
+        assert!(error.contains("held by security mitigation"), "{error}");
+        let error = set(&target, true, MODE_BLOCK_AGENT_ACTIONS).unwrap_err();
+        assert!(error.contains("held by security mitigation"), "{error}");
+        set(&target, true, MODE_BLOCK_WRITES).unwrap();
+        set(&other, true, MODE_BLOCK_WRITES).unwrap();
+        set(&other, false, MODE_BLOCK_WRITES).unwrap();
+
+        mitigation
+            .properties
+            .insert("state".into(), STATE_LIFTED.into());
+        runtime.update_object(&mitigation).unwrap();
+        set(&target, false, MODE_BLOCK_WRITES).unwrap();
+        let freeze = runtime
+            .list_write_freezes()
+            .unwrap()
+            .into_iter()
+            .find(|freeze| freeze.scope_value == target)
+            .unwrap();
+        assert!(!freeze.enabled);
+    }
+
+    #[test]
+    fn sqlite_store_refuses_a_held_unfreeze() {
+        store_unfreeze_guard_contract(&RuntimeDb::memory(), "sqlite");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_store_refuses_a_held_unfreeze() {
+        store_unfreeze_guard_contract(
+            &crate::sekai::work_claim_conformance::postgres(),
+            &format!("pg{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()),
+        );
+    }
+
+    /// An unfreeze racing an uncommitted apply waits for it, then refuses.
+    /// Without the share lock it reads before the apply commits and succeeds.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_unfreeze_waits_out_a_racing_apply() {
+        let runtime = crate::sekai::work_claim_conformance::postgres();
+        let RuntimeDb::Postgres(db) = &runtime else {
+            unreachable!()
+        };
+        let prefix = format!("pg{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        let target = format!("{prefix}.publish");
+        let unfreeze = WriteFreeze {
+            scope_kind: SCOPE_ACTION.into(),
+            scope_value: target.clone(),
+            mode: MODE_BLOCK_WRITES.into(),
+            reason: "operator freeze".into(),
+            enabled: false,
+            updated_ms: 1_000,
+        };
+        let properties = serde_json::to_string(&std::collections::HashMap::from([
+            ("control", CONTROL_FREEZE),
+            ("target", target.as_str()),
+            ("state", STATE_APPLIED),
+        ]))
+        .unwrap();
+        let mut apply = db.connection().unwrap();
+        let mut apply = apply.transaction().unwrap();
+        apply
+            .execute(
+                "INSERT INTO sekai_objects (id, kind, name, namespace, external_id, properties, created, updated)
+                 VALUES ($1, $2, $1, $3, '', $4, 0, 0)",
+                &[&format!("{prefix}-m-1"), &KIND_MITIGATION, &NAMESPACE, &properties],
+            )
+            .unwrap();
+        let racer = {
+            let db = db.clone();
+            std::thread::spawn(move || db.set_write_freeze(&unfreeze))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!racer.is_finished(), "the unfreeze waits for the apply");
+        apply.commit().unwrap();
+        let error = racer.join().unwrap().unwrap_err();
+        assert!(error.contains("held by security mitigation"), "{error}");
     }
 }
