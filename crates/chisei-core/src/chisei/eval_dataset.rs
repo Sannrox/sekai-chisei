@@ -597,8 +597,10 @@ mod tests {
             .register(&digest('e'), Arc::new(CaseShape))
             .unwrap();
         let node = ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "case".into(),
             evaluator: ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: "definition:case-shape".into(),
                 definition_digest: digest('d'),
                 implementation_digest: digest('e'),

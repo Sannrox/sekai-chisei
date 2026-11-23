@@ -1066,8 +1066,10 @@ fn stochastic_admission_manifest(
         resolved_by: "operator".into(),
         requirements: vec![],
         nodes: vec![evaluation_manifest_domain::ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "model-review".into(),
             evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: "definition:model-review".into(),
                 definition_digest: digest('f'),
                 implementation_digest: digest('1'),
@@ -15613,3 +15615,6 @@ async fn tenant_assertion_reads_its_namespaces_eval_datasets() {
         }
     }
 }
+
+#[path = "chisei_evaluation_metrics_tests.rs"]
+mod chisei_evaluation_metrics_tests;

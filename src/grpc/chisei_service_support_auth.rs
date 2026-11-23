@@ -1,4 +1,5 @@
 use super::*;
+use crate::chisei::evaluation_metrics as metrics_domain;
 use crate::chisei::sekai_facts::{SekaiFactError, SekaiFactReader};
 use crate::ext::*;
 
@@ -1257,6 +1258,7 @@ pub(super) fn from_proto_evaluator_definition(
         .resource_limits
         .ok_or_else(|| Status::invalid_argument("evaluator resource_limits required"))?;
     Ok(evaluation_plan_domain::EvaluatorDefinition {
+        declared_metrics: from_proto_metric_declarations(value.declared_metrics)?,
         contract_version: value.contract_version,
         definition_id: value.definition_id,
         namespace: value.namespace,
@@ -1285,6 +1287,89 @@ pub(super) fn from_proto_evaluator_definition(
         created_at_ms: value.created_at_ms,
     })
 }
+fn from_proto_metric_declarations(
+    values: Vec<EvaluationMetricDeclaration>,
+) -> Result<Vec<metrics_domain::MetricDeclaration>, Status> {
+    values
+        .into_iter()
+        .map(|value| {
+            Ok(metrics_domain::MetricDeclaration {
+                kind: metrics_domain::MetricKind::parse(&value.kind)
+                    .map_err(Status::invalid_argument)?,
+                name: value.name,
+            })
+        })
+        .collect()
+}
+fn to_proto_metric_declarations(
+    values: &[metrics_domain::MetricDeclaration],
+) -> Vec<EvaluationMetricDeclaration> {
+    values
+        .iter()
+        .map(|value| EvaluationMetricDeclaration {
+            name: value.name.clone(),
+            kind: value.kind.as_str().into(),
+        })
+        .collect()
+}
+fn from_proto_metric_objectives(
+    values: Vec<EvaluationMetricObjective>,
+) -> Result<Vec<metrics_domain::MetricObjective>, Status> {
+    values
+        .into_iter()
+        .map(|value| {
+            Ok(metrics_domain::MetricObjective {
+                objective: metrics_domain::Objective::from_parts(
+                    &value.objective,
+                    value.expected,
+                    value.threshold_micros,
+                )
+                .map_err(Status::invalid_argument)?,
+                metric: value.metric,
+            })
+        })
+        .collect()
+}
+fn to_proto_metric_objective(
+    metric: &str,
+    objective: metrics_domain::Objective,
+) -> EvaluationMetricObjective {
+    let (name, expected, threshold_micros) = objective.parts();
+    EvaluationMetricObjective {
+        metric: metric.into(),
+        objective: name.into(),
+        expected,
+        threshold_micros,
+    }
+}
+fn to_proto_metric_objectives(
+    values: &[metrics_domain::MetricObjective],
+) -> Vec<EvaluationMetricObjective> {
+    values
+        .iter()
+        .map(|value| to_proto_metric_objective(&value.metric, value.objective))
+        .collect()
+}
+fn to_proto_metric_verdicts(
+    values: &[metrics_domain::MetricVerdict],
+) -> Vec<EvaluationMetricVerdict> {
+    values
+        .iter()
+        .map(|value| {
+            let (bool_value, integer_micros_value) = value.value.parts();
+            EvaluationMetricVerdict {
+                name: value.name.clone(),
+                kind: value.kind.as_str().into(),
+                bool_value,
+                integer_micros_value,
+                objective: value
+                    .objective
+                    .map(|objective| to_proto_metric_objective(&value.name, objective)),
+                verdict: value.verdict.as_str().into(),
+            }
+        })
+        .collect()
+}
 pub(super) fn to_proto_evaluator_definition(
     value: &evaluation_plan_domain::EvaluatorDefinition,
 ) -> EvaluatorDefinition {
@@ -1308,6 +1393,7 @@ pub(super) fn to_proto_evaluator_definition(
             max_evidence_items: value.resource_limits.max_evidence_items,
         }),
         adapter_endpoint: value.adapter_endpoint.clone(),
+        declared_metrics: to_proto_metric_declarations(&value.declared_metrics),
         stochastic_policy: value
             .stochastic_policy
             .as_ref()
@@ -1416,41 +1502,42 @@ pub(super) fn evaluator_record_with_availability(
 }
 pub(super) fn from_proto_evaluation_plan(
     value: EvaluationPlan,
-) -> evaluation_plan_domain::EvaluationPlan {
-    evaluation_plan_domain::EvaluationPlan {
+) -> Result<evaluation_plan_domain::EvaluationPlan, Status> {
+    let mut nodes = Vec::with_capacity(value.nodes.len());
+    for node in value.nodes {
+        nodes.push(evaluation_plan_domain::EvaluationPlanNode {
+            metric_objectives: from_proto_metric_objectives(node.metric_objectives)?,
+            node_id: node.node_id,
+            evaluator_definition_id: node.evaluator_definition_id,
+            depends_on_node_ids: node.depends_on_node_ids,
+            input_bindings: node
+                .input_bindings
+                .into_iter()
+                .map(|binding| evaluation_plan_domain::EvaluationInputBinding {
+                    name: binding.name,
+                    source_kind: binding.source_kind,
+                    schema_id: binding.schema_id,
+                })
+                .collect(),
+            parameters_json: node.parameters_json,
+            invariant_version_ids: node.invariant_version_ids,
+            classification: node.classification,
+        });
+    }
+    Ok(evaluation_plan_domain::EvaluationPlan {
         contract_version: value.contract_version,
         plan_version_id: value.plan_version_id,
         namespace: value.namespace,
         plan_id: value.plan_id,
         version: value.version,
         accepted_subject_profiles: value.accepted_subject_profiles,
-        nodes: value
-            .nodes
-            .into_iter()
-            .map(|node| evaluation_plan_domain::EvaluationPlanNode {
-                node_id: node.node_id,
-                evaluator_definition_id: node.evaluator_definition_id,
-                depends_on_node_ids: node.depends_on_node_ids,
-                input_bindings: node
-                    .input_bindings
-                    .into_iter()
-                    .map(|binding| evaluation_plan_domain::EvaluationInputBinding {
-                        name: binding.name,
-                        source_kind: binding.source_kind,
-                        schema_id: binding.schema_id,
-                    })
-                    .collect(),
-                parameters_json: node.parameters_json,
-                invariant_version_ids: node.invariant_version_ids,
-                classification: node.classification,
-            })
-            .collect(),
+        nodes,
         reducer: value.reducer,
         source_ref: value.source_ref,
         content_digest: value.content_digest,
         created_by: value.created_by,
         created_at_ms: value.created_at_ms,
-    }
+    })
 }
 pub(super) fn to_proto_evaluation_plan(
     value: &evaluation_plan_domain::EvaluationPlan,
@@ -1481,6 +1568,7 @@ pub(super) fn to_proto_evaluation_plan(
                 parameters_json: node.parameters_json.clone(),
                 invariant_version_ids: node.invariant_version_ids.clone(),
                 classification: node.classification.clone(),
+                metric_objectives: to_proto_metric_objectives(&node.metric_objectives),
             })
             .collect(),
         reducer: value.reducer.clone(),
@@ -1539,7 +1627,11 @@ pub(super) fn to_proto_evaluation_manifest(
             .iter()
             .map(|node| ResolvedEvaluationNode {
                 node_id: node.node_id.clone(),
+                metric_objectives: to_proto_metric_objectives(&node.metric_objectives),
                 evaluator: Some(ResolvedEvaluatorBinding {
+                    declared_metrics: to_proto_metric_declarations(
+                        &node.evaluator.declared_metrics,
+                    ),
                     definition_id: node.evaluator.definition_id.clone(),
                     definition_digest: node.evaluator.definition_digest.clone(),
                     implementation_digest: node.evaluator.implementation_digest.clone(),
@@ -1656,6 +1748,7 @@ pub(super) fn to_proto_evaluation_step(
         dependency_result_digests: value.dependency_result_digests.clone(),
         result_digest: value.result_digest.clone(),
         step_receipt_digest: value.step_receipt_digest.clone(),
+        metric_verdicts: to_proto_metric_verdicts(&value.metric_verdicts),
         stochastic_evidence: value.stochastic_evidence.as_ref().map(|evidence| {
             StochasticStepEvidence {
                 contract_version: evidence.contract_version.clone(),

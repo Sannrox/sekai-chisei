@@ -28,8 +28,10 @@ fn manifest(
         resolved_by: "operator".into(),
         requirements: vec![],
         nodes: vec![ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "schema".into(),
             evaluator: ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: "evaluator-definition:fixture".into(),
                 definition_digest: format!("sha256:{}", "e".repeat(64)),
                 implementation_digest: format!("sha256:{}", "f".repeat(64)),

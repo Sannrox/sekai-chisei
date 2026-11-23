@@ -359,6 +359,10 @@ fn require_enabled_plan_definitions(
         let body: String = row.get(2);
         let definition = decode_definition(&body)?;
         require_stochastic_gate_eligibility(node, &definition)?;
+        crate::chisei::evaluation_metrics::check_objectives(
+            &definition.declared_metrics,
+            &node.metric_objectives,
+        )?;
         definitions.insert(definition_id, definition);
     }
     Ok(())

@@ -413,6 +413,10 @@ fn require_enabled_plan_definitions_tx(
         }
         let definition = decode_definition(&row.2)?;
         require_stochastic_gate_eligibility(node, &definition)?;
+        crate::chisei::evaluation_metrics::check_objectives(
+            &definition.declared_metrics,
+            &node.metric_objectives,
+        )?;
         definitions.insert(definition_id, definition);
     }
     Ok(())
@@ -543,6 +547,7 @@ mod tests {
 
     fn definition() -> EvaluatorDefinition {
         EvaluatorDefinition {
+            declared_metrics: Vec::new(),
             contract_version: EVALUATOR_DEFINITION_CONTRACT.into(),
             definition_id: String::new(),
             namespace: "acme".into(),

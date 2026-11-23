@@ -22,6 +22,7 @@ pub mod eval_run;
 pub mod evaluation_compare;
 pub mod evaluation_execution;
 pub mod evaluation_manifest;
+pub mod evaluation_metrics;
 pub mod evaluation_plan;
 pub mod evaluation_rationale;
 pub mod evidence_vocabulary;

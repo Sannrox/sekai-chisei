@@ -984,8 +984,10 @@ mod tests {
             source_identity_digest: "src".into(),
         };
         let node = evaluation_manifest_domain::ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "schema".into(),
             evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: "def".into(),
                 definition_digest: "def-digest".into(),
                 implementation_digest: "impl".into(),

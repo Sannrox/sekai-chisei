@@ -32,8 +32,10 @@ fn manifest(namespace: &str, suffix: &str) -> ResolvedEvaluationManifest {
         resolved_by: "operator".into(),
         requirements: vec![],
         nodes: vec![ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "schema".into(),
             evaluator: ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: format!("evaluator-definition:{suffix}"),
                 definition_digest: format!("sha256:{}", "e".repeat(64)),
                 implementation_digest: format!("sha256:{}", "f".repeat(64)),

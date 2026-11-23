@@ -121,6 +121,34 @@ recorded without changing the gate; and allow requires every applicable
 gate-blocking invariant to be covered by a passing required node or exact valid
 waiver.
 
+## Multi-metric evaluators
+
+ADR 0154 lets one evaluator report several named metrics and leaves the pass
+condition for each metric to the plan.
+
+- **Declaration.** A deterministic or external definition lists
+  `declared_metrics`: up to 32 `{name, kind}` pairs, `kind` being `bool` or
+  `integer_micros`. It must also list the closed
+  `chisei.evaluation-metrics/v1` result schema. Each one requires the other.
+  Stochastic definitions cannot declare metrics.
+- **Objectives.** A plan node binds `metric_objectives`, at most one per
+  declared metric:
+  - `{"metric", "objective": "equals", "expected": bool}` for a `bool` metric;
+  - `{"metric", "objective": "maximize" | "minimize", "threshold_micros"?}`
+    for an `integer_micros` metric.
+
+  Thresholds are inclusive: `maximize` passes at `value >= threshold`,
+  `minimize` at `value <= threshold`. A direction with no threshold sets no
+  pass condition.
+- **Refusal.** Publication refuses an objective on an undeclared metric, or
+  one whose kind does not fit the metric. This check runs at the gRPC
+  boundary and again in both stores.
+- **Digests.** Definitions and plans without metrics keep their v1 content
+  digests, because empty metric fields are left out of canonical JSON.
+
+[Evaluation execution](evaluation-execution.md#multi-metric-steps) describes
+how the executor judges the reported values.
+
 ## Parameter-schema subset
 
 `parameter_schema_json` uses a deliberately closed JSON-Schema subset:

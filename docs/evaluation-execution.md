@@ -210,6 +210,39 @@ returns; a permanently hung evaluator therefore consumes bounded quarantined
 capacity, and new work closes as `unavailable/evaluator_capacity_exhausted`
 instead of creating unbounded threads.
 
+## Multi-metric steps
+
+When a node's definition declares metrics (ADR 0154), the evaluator measures
+and the frozen plan objectives decide. The executor reads `result` as
+`{"contract_version": "chisei.evaluation-metrics/v1", "metrics": [{"name",
+"kind", "value"}]}` and handles it as follows:
+
+- **Invalid result.** The step is `error/invalid_result` when the result:
+  - is not that exact shape;
+  - reports 0 metrics or more than 32;
+  - repeats a metric;
+  - reports an undeclared metric, or a value of the wrong kind;
+  - omits a metric that an objective is bound to.
+- **Derived status.** The evaluator's own `pass` or `fail` is ignored. The
+  step is `fail/metric_objective_unmet` when any bound objective is unmet, and
+  `pass/metric_objectives_met` otherwise. `unknown` from the evaluator still
+  means it could not measure, and passes through unchanged.
+- **Receipt.** The step receipt adds `metric_verdicts`, one per reported
+  metric, sorted by name. Each entry holds the name, kind, value, and frozen
+  objective, plus a verdict:
+  - `met` or `unmet` when the objective sets a pass condition;
+  - `advisory` when no objective is bound or the objective has no threshold.
+- **Digests.** The verdicts are part of the step receipt digest. Receipt
+  validation recomputes them from the frozen manifest and the recorded
+  values. Steps without metrics keep the v1 digest.
+- **Comparisons.** Comparing two executions also diffs each node's metrics.
+  `unmet` to `met` is `improved`, `met` to `unmet` is `regressed`, and a
+  different value or objective under the same verdict is `changed`.
+
+Metric values are bounded, declared numbers. They are the only part of the
+evaluator output a receipt records. Other `result` content still enters only
+`result_digest`.
+
 ## Receipt authority and recovery
 
 The canonical `operation.receipt/v1` record is the execution authority:

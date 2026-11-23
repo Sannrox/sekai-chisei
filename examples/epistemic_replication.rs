@@ -1300,6 +1300,7 @@ fn install_evaluation_plan(
     let invariant = install_governed_invariant(db)?;
     let definition = prepare_definition(
         EvaluatorDefinition {
+            declared_metrics: Vec::new(),
             contract_version: EVALUATOR_DEFINITION_CONTRACT.into(),
             definition_id: String::new(),
             namespace: NAMESPACE.into(),
@@ -1337,6 +1338,7 @@ fn install_evaluation_plan(
             version: "1.0.0".into(),
             accepted_subject_profiles: vec![REPLICATION_CLAIM_PROFILE.into()],
             nodes: vec![EvaluationPlanNode {
+                metric_objectives: Vec::new(),
                 node_id: "claim-digest".into(),
                 evaluator_definition_id: definition.definition_id.clone(),
                 depends_on_node_ids: Vec::new(),
@@ -1366,6 +1368,7 @@ fn install_evaluation_plan(
         &service,
         authenticated_request(chisei::PutEvaluatorDefinitionRequest {
             definition: Some(chisei::EvaluatorDefinition {
+                declared_metrics: Vec::new(),
                 contract_version: definition.contract_version.clone(),
                 definition_id: definition.definition_id.clone(),
                 namespace: definition.namespace.clone(),
@@ -1417,6 +1420,7 @@ fn install_evaluation_plan(
                     .nodes
                     .iter()
                     .map(|node| chisei::EvaluationPlanNode {
+                        metric_objectives: Vec::new(),
                         node_id: node.node_id.clone(),
                         evaluator_definition_id: node.evaluator_definition_id.clone(),
                         depends_on_node_ids: node.depends_on_node_ids.clone(),
