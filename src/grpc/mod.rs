@@ -924,6 +924,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "TakeoverExpiredLease"
             | "CreateObject"
             | "GetObject"
+            // The source record (#3271) reads through GetObject's visibility
+            // and payload withholding.
+            | "GetObjectSourceRecord"
             | "UpdateObject"
             | "DeleteObject"
             | "ListObjects"
@@ -3574,9 +3577,14 @@ mod tests {
             "CompareDefinitionRevisions",
             "QueryObjectPolicyAudit",
             "DryRunActionPolicy",
+            "GetObjectSourceRecord",
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
+        assert_eq!(
+            rpc_namespace_action("GetObjectSourceRecord"),
+            crate::enterprise::NamespaceAction::Read
+        );
         assert_eq!(
             rpc_namespace_action("DryRunActionPolicy"),
             crate::enterprise::NamespaceAction::Read
