@@ -244,33 +244,25 @@ impl PostgresDb {
         if !crate::sekai::schema::is_restricted_property_classification(classification) {
             return Err("classification must be internal or sensitive".into());
         }
-        let dataset = self
-            .get_dataset(dataset_id)?
-            .ok_or_else(|| "dataset not found".to_string())?;
-        validate_filters(&dataset, filters)?;
         let classification =
             crate::sekai::schema::normalize_property_classification(classification);
-        let fields = dataset
-            .columns
-            .iter()
-            .filter(|column| {
-                crate::sekai::schema::normalize_property_classification(&column.classification)
-                    == classification
-            })
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
         let mut connection = self.connection()?;
         let mut transaction = connection
             .transaction()
             .map_err(|error| error.to_string())?;
         lock_dataset_rows(&mut transaction, dataset_id)?;
-        let keys_json: String = transaction
-            .query_one(
-                "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
+        // Columns are read under the dataset lock, so a classification change
+        // committed before this call takes the lock is honored (#2821).
+        let (columns_json, keys_json): (String, String) = transaction
+            .query_opt(
+                "SELECT columns, partition_keys FROM sekai_datasets WHERE id=$1",
                 &[&dataset_id],
             )
             .map_err(|error| error.to_string())?
-            .get(0);
+            .map(|row| (row.get(0), row.get(1)))
+            .ok_or_else(|| "dataset not found".to_string())?;
+        let columns = crate::sekai::dataset::parse_columns(&columns_json)?;
+        let fields = crate::sekai::dataset::redaction_fields(&columns, classification, filters)?;
         let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
         let rows = transaction
             .query(
@@ -821,25 +813,6 @@ fn row_to_dataset(row: postgres::Row) -> Result<Dataset, String> {
         created: row.get(4),
         partition_keys: crate::sekai::dataset::parse_partition_keys(&keys)?,
     })
-}
-
-fn validate_filters(dataset: &Dataset, filters: &[RowFilter]) -> Result<(), String> {
-    for filter in filters {
-        if !dataset
-            .columns
-            .iter()
-            .any(|column| column.name == filter.column)
-        {
-            return Err(format!("unknown filter column: {}", filter.column));
-        }
-        if !matches!(
-            filter.op.as_str(),
-            "eq" | "neq" | "gt" | "lt" | "gte" | "lte"
-        ) {
-            return Err(format!("unsupported filter operator: {}", filter.op));
-        }
-    }
-    Ok(())
 }
 
 /// The shared row filter, so both backends answer a query alike.

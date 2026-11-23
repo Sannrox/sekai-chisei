@@ -830,46 +830,26 @@ impl SekaiDb {
         }
         let classification =
             crate::sekai::schema::normalize_property_classification(classification);
-        let dataset = self
-            .get_dataset(dataset_id)?
+        let mut conn = self.conn();
+        // Columns are read under the write lock, so a classification change
+        // committed before this call starts redacting is honored (#2821).
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let (columns_json, keys_json): (String, String) = tx
+            .query_row(
+                "SELECT columns, partition_keys FROM sekai_datasets WHERE id=?1",
+                params![dataset_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
             .ok_or_else(|| "dataset not found".to_string())?;
-        for filter in filters {
-            if !dataset
-                .columns
-                .iter()
-                .any(|column| column.name == filter.column)
-            {
-                return Err(format!("unknown filter column: {}", filter.column));
-            }
-            if !matches!(
-                filter.op.as_str(),
-                "eq" | "neq" | "gt" | "lt" | "gte" | "lte"
-            ) {
-                return Err(format!("unsupported filter operator: {}", filter.op));
-            }
-        }
-        let fields: Vec<&str> = dataset
-            .columns
-            .iter()
-            .filter(|column| {
-                crate::sekai::schema::normalize_property_classification(&column.classification)
-                    == classification
-            })
-            .map(|column| column.name.as_str())
-            .collect();
+        let columns = parse_columns(&columns_json)?;
+        let fields = redaction_fields(&columns, classification, filters)?;
         if fields.is_empty() {
             return Ok(DatasetRedaction::default());
         }
-
-        let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let keys_json: String = tx
-            .query_row(
-                "SELECT partition_keys FROM sekai_datasets WHERE id=?1",
-                params![dataset_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
         let keys = parse_partition_keys(&keys_json)?;
         let rows = {
             let mut stmt = tx
@@ -1093,6 +1073,35 @@ pub fn query_dataset_version_rows_tx(
         rows.push(serde_json::from_str(&data).map_err(|error| error.to_string())?);
     }
     Ok(rows)
+}
+
+/// Check `filters` against `columns` and pick the columns that carry
+/// `classification` (already normalized). Both stores call this on columns
+/// read inside their redaction write transaction.
+pub(crate) fn redaction_fields<'a>(
+    columns: &'a [ColumnDef],
+    classification: &str,
+    filters: &[RowFilter],
+) -> Result<Vec<&'a str>, String> {
+    for filter in filters {
+        if !columns.iter().any(|column| column.name == filter.column) {
+            return Err(format!("unknown filter column: {}", filter.column));
+        }
+        if !matches!(
+            filter.op.as_str(),
+            "eq" | "neq" | "gt" | "lt" | "gte" | "lte"
+        ) {
+            return Err(format!("unsupported filter operator: {}", filter.op));
+        }
+    }
+    Ok(columns
+        .iter()
+        .filter(|column| {
+            crate::sekai::schema::normalize_property_classification(&column.classification)
+                == classification
+        })
+        .map(|column| column.name.as_str())
+        .collect())
 }
 
 /// The redaction of one branch working-copy row: matching rows get the
@@ -1939,6 +1948,142 @@ mod tests {
             error.contains("there is already a table named idx_dataset_rows_partition"),
             "{error}"
         );
+    }
+
+    /// Redaction reads columns under the dataset write lock (#2821). A
+    /// writer holding that lock reclassifies `identity` as sensitive and
+    /// drops `note`; the redaction that waited on it redacts `identity` and
+    /// refuses a filter on `note`.
+    fn redaction_reads_columns_under_the_lock(
+        db: &crate::db::runtime_db::RuntimeDb,
+        dataset_id: &str,
+        hold: impl Fn(&str) -> Box<dyn FnOnce() + Send>,
+    ) {
+        use crate::db::runtime_db::RuntimeDb;
+        let column = |name: &str, classification: &str| ColumnDef {
+            name: name.into(),
+            col_type: "string".into(),
+            classification: classification.into(),
+        };
+        db.create_dataset(&Dataset {
+            id: dataset_id.into(),
+            name: dataset_id.into(),
+            columns: vec![
+                column("namespace", "public"),
+                column("identity", "public"),
+                column("note", "public"),
+            ],
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        db.append_rows(
+            dataset_id,
+            &[HashMap::from([
+                ("namespace".into(), "ops".into()),
+                ("identity".into(), "alice".into()),
+                ("note".into(), "n".into()),
+            ])],
+        )
+        .unwrap();
+        let reclassified = r#"[["namespace","string","public"],["identity","string","sensitive"]]"#;
+        let filter = |column: &str| RowFilter {
+            column: column.into(),
+            op: "eq".into(),
+            value: "ops".into(),
+        };
+        for (filters, expect_refused) in [
+            (vec![filter("note")], true),
+            (vec![filter("namespace")], false),
+        ] {
+            let release = hold(reclassified);
+            let result = std::thread::scope(|scope| {
+                let redaction = scope.spawn(|| match db {
+                    RuntimeDb::Sqlite(sqlite) => {
+                        sqlite.redact_dataset_fields(dataset_id, "sensitive", &filters)
+                    }
+                    RuntimeDb::Postgres(postgres) => {
+                        postgres.redact_dataset_fields(dataset_id, "sensitive", &filters)
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                assert!(!redaction.is_finished(), "the redaction waits for the lock");
+                release();
+                redaction.join().unwrap()
+            });
+            if expect_refused {
+                let error = result.unwrap_err();
+                assert!(error.contains("unknown filter column: note"), "{error}");
+            } else {
+                assert_eq!(result.unwrap().fields_redacted, 1);
+                let rows = db.query_rows(dataset_id, &Default::default()).unwrap();
+                assert_eq!(rows[0]["identity"], "[redacted]");
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_redaction_reads_columns_under_the_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-redaction-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let path = path.to_str().unwrap().to_string();
+        let db = crate::db::runtime_db::RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(&path).unwrap(),
+        ));
+        redaction_reads_columns_under_the_lock(&db, "reclassified", |columns| {
+            let writer = rusqlite::Connection::open(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            writer
+                .execute(
+                    "UPDATE sekai_datasets SET columns=?1 WHERE id='reclassified'",
+                    params![columns],
+                )
+                .unwrap();
+            Box::new(move || writer.execute_batch("COMMIT").unwrap())
+        });
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_redaction_reads_columns_under_the_lock() {
+        let db = crate::sekai::work_claim_conformance::postgres();
+        let crate::db::runtime_db::RuntimeDb::Postgres(postgres) = &db else {
+            unreachable!()
+        };
+        let dataset_id = format!("reclassified-{}", uuid::Uuid::new_v4().simple());
+        redaction_reads_columns_under_the_lock(&db, &dataset_id, |columns| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let postgres = postgres.clone();
+            let dataset_id = dataset_id.clone();
+            let columns = columns.to_string();
+            let holder = std::thread::spawn(move || {
+                let mut connection = postgres.connection().unwrap();
+                let mut tx = connection.transaction().unwrap();
+                crate::db::postgres::lock_dataset_rows(&mut tx, &dataset_id).unwrap();
+                tx.execute(
+                    "UPDATE sekai_datasets SET columns=$1 WHERE id=$2",
+                    &[&columns, &dataset_id],
+                )
+                .unwrap();
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                tx.commit().unwrap();
+            });
+            ready_rx.recv().unwrap();
+            Box::new(move || {
+                release_tx.send(()).unwrap();
+                holder.join().unwrap();
+            })
+        });
     }
 
     #[test]
