@@ -28,15 +28,20 @@ use crate::sekai::schema::ObjectType;
 struct SekaiHop {
     endpoint: String,
     credential: Option<String>,
+    request_timeout: Duration,
     channel: OnceLock<Channel>,
     fallback_runtime: OnceLock<Runtime>,
 }
+
+/// Per-request deadline for a hop RPC.
+const HOP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl SekaiHop {
     fn new(endpoint: String, credential: Option<String>) -> Self {
         Self {
             endpoint,
             credential: credential.filter(|value| !value.trim().is_empty()),
+            request_timeout: HOP_REQUEST_TIMEOUT,
             channel: OnceLock::new(),
             fallback_runtime: OnceLock::new(),
         }
@@ -78,7 +83,7 @@ impl SekaiHop {
         if let Some(channel) = self.channel.get() {
             return Ok(channel.clone());
         }
-        let channel = self.run(connect_channel(&self.endpoint))?;
+        let channel = self.run(connect_channel(&self.endpoint, self.request_timeout))?;
         Ok(self.channel.get_or_init(|| channel.clone()).clone())
     }
 
@@ -146,6 +151,14 @@ impl RemoteSekaiFactReader {
 
     pub fn from_env(endpoint: String) -> Self {
         Self::new(endpoint, std::env::var("SEKAI_CREDENTIAL").ok())
+    }
+
+    /// Tests that walk many pages on a loaded machine assert paging, not
+    /// latency, so they raise the per-request deadline.
+    #[cfg(test)]
+    fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.hop.request_timeout = timeout;
+        self
     }
 
     fn call<T: Send, F: Future<Output = Result<T, String>> + Send>(
@@ -457,11 +470,11 @@ async fn find_by_external_id_on(
     }
 }
 
-async fn connect_channel(endpoint: &str) -> Result<Channel, String> {
+async fn connect_channel(endpoint: &str, request_timeout: Duration) -> Result<Channel, String> {
     tonic::transport::Endpoint::from_shared(endpoint.to_string())
         .map_err(|error| format!("SEKAI_ENDPOINT: {error}"))?
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(5))
+        .timeout(request_timeout)
         .connect()
         .await
         .map_err(|error| format!("sekai hop connect: {error}"))
@@ -756,7 +769,8 @@ mod tests {
                 .unwrap();
         }
         let endpoint = serve_sekai(sekai).await;
-        let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()));
+        let reader = RemoteSekaiFactReader::new(endpoint, Some("hop-token".into()))
+            .with_request_timeout(Duration::from_secs(120));
         let filter = ListFilter {
             kind: Some("widget".into()),
             namespace: Some("acme".into()),
