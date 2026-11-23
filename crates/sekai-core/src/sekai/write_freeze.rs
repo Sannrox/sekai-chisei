@@ -258,10 +258,18 @@ impl SekaiDb {
         .map_err(|e| e.to_string())
     }
 
+    /// Upsert `freeze`. An unfreeze of an action scope is refused while a
+    /// freeze mitigation holds it; the check and the write share one
+    /// immediate transaction, so a concurrent apply lands before or after both.
     pub fn set_write_freeze(&self, freeze: &WriteFreeze) -> Result<(), String> {
         freeze.validate()?;
-        let conn = self.conn();
-        upsert_write_freeze(&conn, freeze)
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        guard_unfreeze(&tx, freeze)?;
+        upsert_write_freeze(&tx, freeze)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn set_write_freeze_with_decision(
@@ -272,7 +280,10 @@ impl SekaiDb {
         freeze.validate()?;
         crate::sekai::audit::validate_decision(decision)?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        guard_unfreeze(&tx, freeze)?;
         upsert_write_freeze(&tx, freeze)?;
         crate::sekai::ledger::insert_chained_decision(&tx, decision)?;
         tx.commit().map_err(|e| e.to_string())
@@ -301,6 +312,29 @@ impl SekaiDb {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
     }
+}
+
+/// Refuse an unfreeze held by a security mitigation, reading mitigations on
+/// the caller's write transaction.
+fn guard_unfreeze(conn: &rusqlite::Connection, freeze: &WriteFreeze) -> Result<(), String> {
+    use crate::sekai::security_remediation::{
+        KIND_MITIGATION, refuse_unfreeze_held_by, unfreeze_needs_guard,
+    };
+    if !unfreeze_needs_guard(freeze) {
+        return Ok(());
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT id, kind, name, namespace, external_id, properties, created, updated
+             FROM sekai_objects WHERE kind = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mitigations = statement
+        .query_map([KIND_MITIGATION], crate::db::sekai::row_to_object)
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    refuse_unfreeze_held_by(freeze, &mitigations)
 }
 
 fn upsert_write_freeze(conn: &rusqlite::Connection, freeze: &WriteFreeze) -> Result<(), String> {

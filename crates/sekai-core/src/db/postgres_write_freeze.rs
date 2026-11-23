@@ -9,6 +9,7 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        guard_unfreeze(&mut tx, freeze)?;
         upsert_write_freeze(&mut tx, freeze)?;
         tx.commit().map_err(|error| error.to_string())
     }
@@ -24,6 +25,7 @@ impl PostgresDb {
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        guard_unfreeze(&mut tx, freeze)?;
         upsert_write_freeze(&mut tx, freeze)?;
         crate::db::postgres_decision::insert_chained_decision(&mut tx, decision)?;
         tx.commit().map_err(|error| error.to_string())
@@ -50,6 +52,24 @@ impl PostgresDb {
             })
             .collect()
     }
+}
+
+/// Refuse an unfreeze held by a security mitigation. The share lock on
+/// `sekai_objects` waits out in-flight object writes and blocks new ones until
+/// the freeze commits, so a racing apply commits before this read or after the
+/// freeze write, where its own catch-up re-enables the freeze. It is taken
+/// before the freeze row so it cannot deadlock against an apply.
+fn guard_unfreeze(tx: &mut postgres::Transaction<'_>, freeze: &WriteFreeze) -> Result<(), String> {
+    use crate::sekai::security_remediation::{
+        KIND_MITIGATION, refuse_unfreeze_held_by, unfreeze_needs_guard,
+    };
+    if !unfreeze_needs_guard(freeze) {
+        return Ok(());
+    }
+    tx.batch_execute("LOCK TABLE sekai_objects IN SHARE MODE")
+        .map_err(|error| error.to_string())?;
+    let mitigations = crate::db::postgres_objects::objects_of_kind(tx, KIND_MITIGATION)?;
+    refuse_unfreeze_held_by(freeze, &mitigations)
 }
 
 fn upsert_write_freeze(
