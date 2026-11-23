@@ -184,3 +184,15 @@ the shrink-only SQLite-only list.
   five on a spawned default plane, ahead of the external runner adapter
   (#2182). The HTTP/JSON projection and generated stable SDKs pick them up
   as unary stables.
+- 2026-11-23, Issue [#3036](https://github.com/Sannrox/sekai-chisei/issues/3036):
+  `PutActionBinding` and `RunActionBinding` become `stable`, with the new
+  `GetActionBinding` and `ListActionBindings` reads, after meeting the #2089
+  promotion criteria. Every call checks tenant context; install needs
+  namespace administration, and run and read need the binding's `run_as`
+  principal or a namespace administrator, filtered before the page is cut.
+  A run persists its page before any submit and derives idempotency keys
+  from events, so a crash resumes without double submits. Lists page at most
+  100 bindings and a run reads a bounded page. RPC-level tests run on SQLite
+  and PostgreSQL through the typed `sekai-client` methods on a plane with
+  experimental RPCs off. Messages stay as they are: a binding travels as
+  `sekai.action-binding/v1` JSON.

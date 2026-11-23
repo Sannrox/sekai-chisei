@@ -3662,6 +3662,34 @@ message PutActionBindingResponse {
   string binding_json = 1;
   uint64 revision = 2;
 }
+// One stored binding as `sekai.action-binding/v1` JSON, with its revision.
+message ActionBindingRecord {
+  string binding_json = 1;
+  uint64 revision = 2;
+}
+// Reads one binding. Callers who are neither its `run_as` principal nor a
+// namespace administrator get NOT_FOUND, as for a missing binding.
+message GetActionBindingRequest {
+  string namespace = 1;
+  string binding_id = 2;
+}
+message GetActionBindingResponse {
+  ActionBindingRecord binding = 1;
+}
+// Lists a namespace's bindings by binding_id. A namespace administrator sees
+// every binding; another caller sees the ones it runs as.
+message ListActionBindingsRequest {
+  string namespace = 1;
+  // At most 100; 0 means 100.
+  int32 page_size = 2;
+  // Opaque; empty for the first page.
+  string page_token = 3;
+}
+message ListActionBindingsResponse {
+  repeated ActionBindingRecord bindings = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message RunActionBindingRequest {
   string namespace = 1;
   string binding_id = 2;
@@ -6452,8 +6480,11 @@ service SekaiService {
   // Governed ActionInstance admission (#397).
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
   rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
+  // Action bindings (ADR 0090, `sekai.action-binding/v1`): stable (#3036).
   rpc PutActionBinding(PutActionBindingRequest) returns (PutActionBindingResponse);
   rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);
+  rpc GetActionBinding(GetActionBindingRequest) returns (GetActionBindingResponse);
+  rpc ListActionBindings(ListActionBindingsRequest) returns (ListActionBindingsResponse);
   rpc DescribeObjectAction(DescribeObjectActionRequest) returns (DescribeObjectActionResponse);
   rpc PreviewObjectAction(PreviewObjectActionRequest) returns (PreviewObjectActionResponse);
   rpc CreatePlanIntent(CreatePlanIntentRequest) returns (CreatePlanIntentResponse);

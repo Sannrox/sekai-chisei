@@ -2187,8 +2187,8 @@
       "rpc": "PutActionBinding",
       "storage_path": "sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "sdk",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {
@@ -2196,8 +2196,26 @@
       "rpc": "RunActionBinding",
       "storage_path": "sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetActionBinding",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "ListActionBindings",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "sdk",
+      "classification": "stable",
       "product_tier": "advanced"
     },
     {

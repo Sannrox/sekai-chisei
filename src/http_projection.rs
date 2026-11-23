@@ -218,6 +218,30 @@ async fn dispatch<I>(
     body: Bytes,
 ) -> Response {
     match (service, method) {
+        ("sekai.SekaiService", "PutActionBinding") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::put_action_binding(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RunActionBinding") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::run_action_binding(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetActionBinding") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_action_binding(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListActionBindings") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_action_bindings(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "AcquireLease") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::acquire_lease(&*svc, req).await

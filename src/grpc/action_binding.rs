@@ -16,6 +16,36 @@ use crate::sekai::object_change_subscription::{
 use std::collections::{HashMap, HashSet};
 
 const BINDING_UNAVAILABLE: &str = "action binding unavailable";
+/// Most bindings one ListActionBindings page returns.
+const MAX_BINDING_PAGE: i32 = 100;
+
+fn binding_record(binding: &ActionBinding) -> Result<ActionBindingRecord, Status> {
+    Ok(ActionBindingRecord {
+        binding_json: serde_json::to_string(binding)
+            .map_err(|_| Status::internal(BINDING_UNAVAILABLE))?,
+        revision: binding.revision,
+    })
+}
+
+/// The page token is the last binding_id returned, opaque to callers.
+fn encode_binding_page_token(binding_id: &str) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(binding_id)
+}
+
+fn decode_binding_page_token(token: &str) -> Result<Option<String>, Status> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    if token.is_empty() {
+        return Ok(None);
+    }
+    URL_SAFE_NO_PAD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|binding_id| !binding_id.is_empty())
+        .map(Some)
+        .ok_or_else(|| Status::invalid_argument("invalid page_token"))
+}
 
 impl SekaiServiceImpl {
     pub(super) async fn put_action_binding_definition(
@@ -54,6 +84,104 @@ impl SekaiServiceImpl {
                 .map_err(|error| Status::internal(error.to_string()))?,
             revision: stored.revision,
         }))
+    }
+
+    /// Reads one binding for its `run_as` principal or a namespace
+    /// administrator; anyone else gets the NOT_FOUND a missing binding gets.
+    pub(super) async fn get_action_binding_record(
+        &self,
+        req: Request<GetActionBindingRequest>,
+    ) -> Result<Response<GetActionBindingResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let input = req.into_inner();
+        let namespace = input.namespace.trim();
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            namespace,
+            false,
+        )?;
+        let binding = self
+            .db
+            .runtime()
+            .get_action_binding(namespace, input.binding_id.trim())
+            .map_err(map_binding_store_error)?
+            .map(|(binding, _)| binding)
+            .filter(|binding| self.may_read_binding(&principals, binding))
+            .ok_or_else(|| Status::not_found(BINDING_UNAVAILABLE))?;
+        Ok(Response::new(GetActionBindingResponse {
+            binding: Some(binding_record(&binding)?),
+        }))
+    }
+
+    /// Lists a namespace's bindings by `binding_id`, keeping only those the
+    /// caller may read before the page is cut, so hidden bindings take no
+    /// slot.
+    pub(super) async fn list_action_binding_records(
+        &self,
+        req: Request<ListActionBindingsRequest>,
+    ) -> Result<Response<ListActionBindingsResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let input = req.into_inner();
+        let namespace = input.namespace.trim();
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        let page_size = match input.page_size {
+            0 => MAX_BINDING_PAGE,
+            size @ 1..=MAX_BINDING_PAGE => size,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "page_size must be between 0 and {MAX_BINDING_PAGE}"
+                )));
+            }
+        } as usize;
+        let after = decode_binding_page_token(&input.page_token)?;
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            namespace,
+            false,
+        )?;
+        let mut bindings: Vec<_> = self
+            .db
+            .runtime()
+            .list_action_bindings(namespace)
+            .map_err(map_binding_store_error)?
+            .into_iter()
+            .filter(|binding| {
+                after
+                    .as_ref()
+                    .is_none_or(|after| &binding.binding_id > after)
+            })
+            .filter(|binding| self.may_read_binding(&principals, binding))
+            .collect();
+        bindings.sort_by(|a, b| a.binding_id.cmp(&b.binding_id));
+        let next_page_token = match bindings.get(page_size) {
+            Some(_) => encode_binding_page_token(&bindings[page_size - 1].binding_id),
+            None => String::new(),
+        };
+        bindings.truncate(page_size);
+        Ok(Response::new(ListActionBindingsResponse {
+            bindings: bindings
+                .iter()
+                .map(binding_record)
+                .collect::<Result<_, _>>()?,
+            next_page_token,
+        }))
+    }
+
+    /// A binding is readable by the principal it runs as and by a namespace
+    /// administrator, the callers who may also run it.
+    fn may_read_binding(&self, principals: &[String], binding: &ActionBinding) -> bool {
+        principals
+            .iter()
+            .any(|principal| principal == &binding.run_as)
+            || authorize_source_type_namespace_admin(self, principals, &binding.namespace).is_ok()
     }
 
     /// Checks what a binding install pins: the bound type and version exist
