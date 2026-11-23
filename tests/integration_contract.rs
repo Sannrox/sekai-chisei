@@ -61,28 +61,50 @@ fn rows() -> Vec<Vec<String>> {
         .collect()
 }
 
-fn rpc_exists(rpc: &str) -> bool {
+/// Row surfaces no live check here can resolve. Each is matched exactly, so a
+/// new or edited row of one of these kinds fails until it is reviewed, and the
+/// row's proof column carries the evidence instead.
+const UNCHECKED_SURFACES: &[&str] = &[
+    "HTTP `chisei.provider-capabilities/v1",
+    "POST /sekai.SekaiService/{Method}` / `POST /chisei.ChiseiService/{Method}",
+    "POST /mcp",
+    "TypeScript / Python / Rust goldens",
+    "npm pack` / `pip wheel` of `sdk/typescript` and `sdk/python`; operator publish to npm/PyPI",
+];
+
+/// The `sekaictl` subcommand path a row names, such as `admin sdk-packages`.
+fn sekaictl_path(rpc: &str) -> Option<String> {
+    let (_, rest) = rpc.split_once("sekaictl ")?;
+    let path = rest.split('`').next().unwrap_or(rest).trim();
+    Some(path.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Whether the real `sekaictl` prints usage for `path`. Help for an unknown
+/// subcommand falls back to the parent's usage, which never names `path`.
+fn sekaictl_has_subcommand(path: &str) -> bool {
+    let output = std::process::Command::new(crate::sekaictl_bin())
+        .args(path.split(' '))
+        .arg("--help")
+        .output()
+        .expect("run sekaictl --help");
+    let help = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    help.contains(&format!("sekaictl {path} "))
+}
+
+/// Resolves a checkable row surface against the CLI, the MCP binary, or the protos.
+fn surface_exists(rpc: &str) -> bool {
     if rpc == "—" {
         return true;
     }
-    if rpc.starts_with("HTTP ") {
-        return DOC.contains("chisei.provider-capabilities/v1");
+    if let Some(path) = sekaictl_path(rpc) {
+        return sekaictl_has_subcommand(&path);
     }
-    if rpc.contains("sekaictl") {
-        return Path::new("docs/sdk-packages.md").exists();
-    }
-    if rpc.contains("sekai-mcp") {
-        return Path::new("src/bin/sekai_mcp.rs").exists();
-    }
-    if rpc.contains("POST /") || rpc.contains("/mcp") {
-        return Path::new("src/http_projection.rs").exists();
-    }
-    if rpc.contains("TypeScript") || rpc.contains("goldens") {
-        return Path::new("src/http_codegen.rs").exists();
-    }
-    if rpc.contains("npm pack") || rpc.contains("pip wheel") {
-        return Path::new("sdk/typescript/package.json").exists()
-            && Path::new("sdk/python/pyproject.toml").exists();
+    if rpc == "sekai-mcp` stdio host" {
+        return Path::new(env!("CARGO_BIN_EXE_sekai-mcp")).is_file();
     }
     let name = rpc
         .rsplit('.')
@@ -116,7 +138,11 @@ fn supported_rows_link_protocol_docs_and_proof() {
         match status {
             "supported" | "experimental" => {
                 supported += 1;
-                assert!(rpc_exists(rpc), "missing RPC {rpc}");
+                if UNCHECKED_SURFACES.contains(&rpc) {
+                    eprintln!("unchecked integration-contract surface: {rpc}");
+                } else {
+                    assert!(surface_exists(rpc), "missing surface {rpc}");
+                }
                 let doc_path = markdown_target(docs).expect("docs link");
                 assert!(
                     Path::new("docs").join(&doc_path).exists()
