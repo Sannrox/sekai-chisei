@@ -163,8 +163,21 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 - drafts the GitHub Release from the matching CHANGELOG section, uploads the
   `sekai` binary matrix and `compatibility.json` once the Tenkai products
   provide its contracts, pushes the GHCR image by
-  version only (no `latest` tag), records its digest, writes an SBOM, attests
-  provenance, and publishes only after every asset is attached
+  version only (no `latest` tag), records its digest, and writes an SBOM
+- after the last change to `SHA256SUMS` and the family manifest, attests
+  provenance for `SHA256SUMS`, the SBOM, and the manifest, and the SBOM for
+  `SHA256SUMS`; then checks the draft's copies against their checksums and
+  attestations, and publishes only after every asset is attached
+
+Verify a published release by digest:
+
+```sh
+gh attestation verify SHA256SUMS --repo Sannrox/sekai-chisei
+sha256sum --check SHA256SUMS
+```
+
+The manifest's `attestations` list stays empty. The manifest is itself an
+attested subject, so it cannot carry the URL of its own attestation.
 
 To retry a failed release, fix the workflow on `main` and run it again for the
 same tag:

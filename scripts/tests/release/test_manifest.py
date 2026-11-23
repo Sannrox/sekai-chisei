@@ -65,10 +65,6 @@ class Manifest(unittest.TestCase):
 class Record(unittest.TestCase):
     BASE = {"schema": "tenkai.family-release-manifest.v1", "images": [], "attestations": []}
 
-    def test_attestations_drop_empty_urls(self):
-        got = record.with_attestations(self.BASE, ["https://example.invalid/a", ""])
-        self.assertEqual(got["attestations"], ["https://example.invalid/a"])
-
     def test_image_sets_the_one_published_image(self):
         got = record.with_image(self.BASE, "ghcr.io/example/sekai-chisei:v1.4.0", "sha256:" + "c" * 64)
         self.assertEqual(got["images"], [{"name": "ghcr.io/example/sekai-chisei:v1.4.0", "digest": "sha256:" + "c" * 64}])
