@@ -2,13 +2,16 @@
 //! submit scheduled bindings from the plane's schedule tick (#3033).
 
 use super::*;
-use crate::sekai::action_binding::{ActionBinding, ParameterSource, ReadMarker};
+use crate::sekai::action_binding::{
+    ActionBinding, DATASET_COMMIT_PINNED, OP_DATASET_COMMIT, ParameterSource, ReadMarker,
+};
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
 };
 use crate::sekai::object_change_subscription::{
     OP_DELETE, OUTCOME_DISCONNECTED, OUTCOME_PAGE, OUTCOME_RESNAPSHOT, ObjectChangeReadRequest,
-    ObjectChangeScope, authorization_pin, read_object_change_subscription_with_resolved_objects,
+    ObjectChangeScope, authorization_pin, page_limit,
+    read_object_change_subscription_with_resolved_objects,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -154,6 +157,17 @@ impl SekaiServiceImpl {
             &binding.run_as,
             &binding.type_id,
         )?;
+        if binding.dataset_commit.is_some() {
+            return self
+                .run_dataset_commit_binding(
+                    &binding,
+                    &cursor,
+                    input.limit,
+                    &tenant,
+                    &resource_tenant,
+                )
+                .map(Response::new);
+        }
 
         let scope = ObjectChangeScope {
             namespace: binding.namespace.clone(),
@@ -375,6 +389,156 @@ impl SekaiServiceImpl {
             .advance_action_binding_cursor(&binding, &cursor, now_millis())
             .map_err(map_binding_store_error)?;
         Ok(Response::new(response))
+    }
+
+    /// Submits one Action per dataset version committed since the last run
+    /// (#3034). The first run records every scoped dataset's latest version
+    /// and submits nothing (no backfill). Each dataset's cursor moves only
+    /// after its versions were admitted, so a crash in between replays them
+    /// under the same keys. A dataset `run_as` cannot read is skipped and
+    /// never named, and its cursor moves past what it hid.
+    fn run_dataset_commit_binding(
+        &self,
+        binding: &ActionBinding,
+        cursor: &crate::sekai::action_binding::ActionBindingCursor,
+        limit: i32,
+        tenant: &str,
+        resource_tenant: &str,
+    ) -> Result<RunActionBindingResponse, Status> {
+        let db = self.db.runtime();
+        let run_as = [binding.run_as.clone()];
+        let mut response = RunActionBindingResponse {
+            outcome: OUTCOME_PAGE.into(),
+            binding_revision: binding.revision,
+            ..Default::default()
+        };
+        let pinned = cursor.snapshot_revision == DATASET_COMMIT_PINNED;
+        let cursors = db
+            .action_binding_dataset_cursors(binding)
+            .map_err(map_binding_store_error)?;
+        let limit = page_limit(limit);
+        for (dataset, object) in self.dataset_commit_scope(binding)? {
+            let mut versions = db
+                .list_dataset_versions(&dataset.id)
+                .map_err(Status::internal)?;
+            versions.sort_by_key(|version| version.seq);
+            let after = cursors.get(&dataset.id).copied().unwrap_or(0);
+            let latest = versions
+                .last()
+                .map_or(after, |version| version.seq.max(after));
+            let readable =
+                dataset_binding_after_access(db, &self.security, &run_as, &dataset, false).is_ok()
+                    && object_passes_marking(db, &object, &run_as).unwrap_or(false);
+            if !pinned || !readable {
+                if latest > after {
+                    db.advance_action_binding_dataset_cursor(binding, &dataset.id, latest)
+                        .map_err(map_binding_store_error)?;
+                }
+                continue;
+            }
+            let markings = snapshot_markings(&binding.markings, Some(&object));
+            let mut delivered = after;
+            for version in versions.iter().filter(|version| version.seq > after) {
+                if response.submissions.len() >= limit {
+                    break;
+                }
+                delivered = version.seq;
+                if version.purged {
+                    continue;
+                }
+                let mut submission = ActionBindingSubmission {
+                    object_id: object.id.clone(),
+                    op: OP_DATASET_COMMIT.into(),
+                    dataset_id: dataset.id.clone(),
+                    version_id: version.version_id.clone(),
+                    ..Default::default()
+                };
+                let outcome = binding
+                    .dataset_idempotency_key(&dataset.id, &version.version_id)
+                    .map_err(|error| format!("internal: {error}"))
+                    .and_then(|idempotency_key| {
+                        self.admit_bound_action(
+                            BoundAction {
+                                namespace: &binding.namespace,
+                                markings: &markings,
+                                source_object_id: &object.id,
+                                type_id: &binding.type_id,
+                                version: &binding.version,
+                                run_as: &binding.run_as,
+                                parameters_json: binding
+                                    .dataset_parameters(&dataset.id, &version.version_id),
+                                idempotency_key,
+                            },
+                            tenant,
+                            resource_tenant,
+                        )
+                    });
+                match outcome {
+                    Ok((instance_id, status, replay)) => {
+                        submission.instance_id = instance_id;
+                        submission.status = status;
+                        submission.replay = replay;
+                    }
+                    Err(reason) => {
+                        if let Some(reason) = reason
+                            .strip_prefix("failed_precondition: ")
+                            .filter(|reason| reason.contains("write freeze"))
+                        {
+                            return Err(Status::failed_precondition(reason.to_string()));
+                        }
+                        // Retryable: the cursor stays before this version.
+                        if is_internal_skip(&reason) {
+                            return Err(Status::internal(reason));
+                        }
+                        submission.skipped_reason = reason;
+                    }
+                }
+                response.submissions.push(submission);
+            }
+            if delivered > after {
+                db.advance_action_binding_dataset_cursor(binding, &dataset.id, delivered)
+                    .map_err(map_binding_store_error)?;
+            }
+        }
+        if !pinned {
+            let pin = crate::sekai::action_binding::ActionBindingCursor {
+                snapshot_revision: DATASET_COMMIT_PINNED.into(),
+                ..Default::default()
+            };
+            db.advance_action_binding_cursor(binding, &pin, now_millis())
+                .map_err(map_binding_store_error)?;
+        }
+        Ok(response)
+    }
+
+    /// The datasets a dataset-commit binding watches, with their binding
+    /// objects: those bound to an object in the binding's namespace,
+    /// narrowed to `dataset_id` when it names one.
+    fn dataset_commit_scope(
+        &self,
+        binding: &ActionBinding,
+    ) -> Result<Vec<(dataset::Dataset, domain::Object)>, Status> {
+        let trigger = binding
+            .dataset_commit
+            .as_ref()
+            .map_or("", |trigger| trigger.dataset_id.as_str());
+        let db = self.db.runtime();
+        let mut scoped = Vec::new();
+        for dataset in db.list_datasets().map_err(Status::internal)? {
+            if dataset.object_id.is_empty() || (!trigger.is_empty() && dataset.id != trigger) {
+                continue;
+            }
+            let Some(object) = db
+                .get_object(&dataset.object_id)
+                .map_err(Status::internal)?
+            else {
+                continue;
+            };
+            if object.namespace == binding.namespace {
+                scoped.push((dataset, object));
+            }
+        }
+        Ok(scoped)
     }
 
     /// Submits the current bucket of every enabled scheduled binding as its
@@ -822,6 +986,7 @@ mod tests {
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
                     schedule: None,
+                    dataset_commit: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -953,6 +1118,7 @@ mod tests {
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
                     schedule: None,
+                    dataset_commit: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1113,6 +1279,7 @@ mod tests {
                 schedule: Some(crate::sekai::action_binding::ActionBindingSchedule {
                     every_ms: 60_000,
                 }),
+                dataset_commit: None,
                 type_id: "component.escalate".into(),
                 version: "1".into(),
                 run_as: "svc-escalator".into(),
@@ -1243,6 +1410,7 @@ mod tests {
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
                     schedule: None,
+                    dataset_commit: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1406,5 +1574,158 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// `bound_escalator`'s namespace with a dataset-commit binding on every
+    /// dataset in `demo`, and datasets `orders` and `secret` bound to objects
+    /// there. `secret`'s object is readable only by another principal.
+    fn dataset_escalator() -> (Arc<RuntimeDb>, SekaiServiceImpl) {
+        let (db, svc) = bound_escalator();
+        for (id, object) in [("orders", "orders-object"), ("secret", "secret-object")] {
+            db.create_object_with_audit(
+                &domain::Object {
+                    id: object.into(),
+                    kind: "dataset".into(),
+                    name: object.into(),
+                    namespace: "demo".into(),
+                    external_id: String::new(),
+                    properties: HashMap::new(),
+                    created: 1,
+                    updated: 1,
+                },
+                "local",
+            )
+            .unwrap();
+            db.create_dataset(&crate::sekai::dataset::Dataset {
+                id: id.into(),
+                name: id.into(),
+                columns: Vec::new(),
+                object_id: object.into(),
+                created: 1,
+                partition_keys: Vec::new(),
+            })
+            .unwrap();
+        }
+        svc.security.add_grant(&security::Grant {
+            id: "secret-reader".into(),
+            object_id: "secret-object".into(),
+            principal: "other-reader".into(),
+            role: security::Role::Viewer,
+            created: 1,
+            ..Default::default()
+        });
+        db.put_action_binding(
+            &ActionBinding {
+                contract_version: ACTION_BINDING_CONTRACT.into(),
+                binding_id: "on-commit".into(),
+                namespace: "demo".into(),
+                kind: String::new(),
+                property_filters: Vec::new(),
+                ops: Vec::new(),
+                schedule: None,
+                dataset_commit: Some(
+                    crate::sekai::action_binding::ActionBindingDatasetCommit::default(),
+                ),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                run_as: "svc-escalator".into(),
+                parameters: BTreeMap::from([
+                    ("component".into(), ParameterSource::DatasetId),
+                    ("severity".into(), ParameterSource::VersionId),
+                ]),
+                markings: Vec::new(),
+                enabled: true,
+                revision: 0,
+                created_by: String::new(),
+                updated_at_ms: 0,
+            },
+            "local",
+            2,
+        )
+        .unwrap();
+        (db, svc)
+    }
+
+    async fn run_on_commit(svc: &SekaiServiceImpl) -> RunActionBindingResponse {
+        svc.run_action_binding_once(local(RunActionBindingRequest {
+            namespace: "demo".into(),
+            binding_id: "on-commit".into(),
+            limit: 16,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    fn append(db: &RuntimeDb, dataset_id: &str) -> String {
+        db.append_rows(dataset_id, &[HashMap::from([("k".into(), "v".into())])])
+            .unwrap();
+        db.list_dataset_versions(dataset_id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .version_id
+            .clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_committed_dataset_version_admits_one_action_even_after_a_crash() {
+        let (db, svc) = dataset_escalator();
+        append(&db, "orders");
+        // The first run pins: versions before it are not backfilled.
+        assert!(run_on_commit(&svc).await.submissions.is_empty());
+        assert!(instances(&db).is_empty());
+
+        let version = append(&db, "orders");
+        let first = run_on_commit(&svc).await;
+        assert_eq!(first.submissions.len(), 1);
+        let submission = &first.submissions[0];
+        assert_eq!(
+            (
+                submission.dataset_id.as_str(),
+                submission.version_id.as_str()
+            ),
+            ("orders", version.as_str())
+        );
+        assert_eq!(submission.op, "dataset_commit");
+        assert!(!submission.replay, "{submission:?}");
+        let admitted = instances(&db);
+        assert_eq!(admitted.len(), 1);
+        assert!(admitted[0].parameters_json.contains(&version));
+
+        assert!(run_on_commit(&svc).await.submissions.is_empty());
+
+        // A crash between the submit and the cursor write: the cursor is
+        // still before the version, so the rerun replays the same instance.
+        let (binding, _) = db.get_action_binding("demo", "on-commit").unwrap().unwrap();
+        let RuntimeDb::Sqlite(sqlite) = db.as_ref() else {
+            unreachable!("memory store is SQLite")
+        };
+        sqlite
+            .conn()
+            .execute(
+                "UPDATE sekai_action_binding_dataset_cursors SET seq = seq - 1
+                 WHERE binding_id = 'on-commit' AND dataset_id = 'orders'",
+                [],
+            )
+            .unwrap();
+        let replayed = run_on_commit(&svc).await;
+        assert_eq!(replayed.submissions.len(), 1);
+        assert!(replayed.submissions[0].replay);
+        assert_eq!(replayed.binding_revision, binding.revision);
+        assert_eq!(instances(&db).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dataset_run_as_cannot_read_is_never_submitted_or_named() {
+        let (db, svc) = dataset_escalator();
+        run_on_commit(&svc).await;
+        append(&db, "secret");
+        append(&db, "orders");
+        let response = run_on_commit(&svc).await;
+        assert_eq!(response.submissions.len(), 1);
+        assert_eq!(response.submissions[0].dataset_id, "orders");
+        assert!(!format!("{response:?}").contains("secret"));
+        assert_eq!(instances(&db).len(), 1);
     }
 }

@@ -240,6 +240,8 @@ const DROP_LEGACY_SEARCH_INDEX_SCHEMA: &str =
     include_str!("postgres/0167_drop_legacy_search_index.sql");
 const COORDINATION_REQUEST_OUTCOME_SCHEMA: &str =
     include_str!("postgres/0168_coordination_request_outcome.sql");
+const ACTION_BINDING_DATASET_CURSORS_SCHEMA: &str =
+    include_str!("postgres/0170_action_binding_dataset_cursors.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1225,6 +1227,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_tenant_concurrency_holds",
         "",
         MigrationOwner::Chisei,
+    ),
+    mig(
+        170,
+        "action_binding_dataset_cursors",
+        ACTION_BINDING_DATASET_CURSORS_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 

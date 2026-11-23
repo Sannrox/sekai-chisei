@@ -2,15 +2,16 @@
 //! (#1319): each install gets the next revision and restarts delivery, the
 //! cursor round-trips with its pending events and read marker, and a cursor
 //! write for a superseded revision changes nothing. The schedule tick lists
-//! only enabled scheduled bindings, across namespaces (#3033).
+//! only enabled scheduled bindings, across namespaces (#3033). Dataset-commit
+//! cursors move forward only, for the installed revision only (#3034).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::sekai::action_binding::{
-    ACTION_BINDING_CONTRACT, ActionBinding, ActionBindingCursor, ActionBindingSchedule,
-    ParameterSource, ReadMarker,
+    ACTION_BINDING_CONTRACT, ActionBinding, ActionBindingCursor, ActionBindingDatasetCommit,
+    ActionBindingSchedule, ParameterSource, ReadMarker,
 };
 use sekai_chisei::sekai::event_subscription::{EventSubscription, EventSubscriptionCursor};
 use sekai_chisei::sekai::object_change_subscription::{OP_UPDATE, ObjectChangeEvent};
@@ -26,6 +27,7 @@ fn binding(namespace: &str) -> ActionBinding {
         property_filters: Vec::new(),
         ops: vec![OP_UPDATE.into()],
         schedule: None,
+        dataset_commit: None,
         type_id: "incident.escalate".into(),
         version: "1".into(),
         run_as: "svc-escalator".into(),
@@ -194,6 +196,58 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
             ("elsewhere".into(), "hourly".into(), every_minute),
             (namespace.to_string(), "hourly".into(), every_minute),
         ]
+    );
+
+    let on_commit = db
+        .put_action_binding(
+            &ActionBinding {
+                binding_id: "on-commit".into(),
+                kind: String::new(),
+                ops: Vec::new(),
+                dataset_commit: Some(ActionBindingDatasetCommit::default()),
+                parameters: BTreeMap::from([("dataset".into(), ParameterSource::DatasetId)]),
+                ..binding(namespace)
+            },
+            "admin",
+            17,
+        )
+        .unwrap();
+    assert!(
+        db.action_binding_dataset_cursors(&on_commit)
+            .unwrap()
+            .is_empty()
+    );
+    db.advance_action_binding_dataset_cursor(&on_commit, "orders", 3)
+        .unwrap();
+    db.advance_action_binding_dataset_cursor(&on_commit, "orders", 2)
+        .unwrap();
+    db.advance_action_binding_dataset_cursor(&on_commit, "audit", 1)
+        .unwrap();
+    let cursors = db.action_binding_dataset_cursors(&on_commit).unwrap();
+    assert_eq!(cursors.get("orders"), Some(&3));
+    assert_eq!(cursors.get("audit"), Some(&1));
+    // A reinstall starts from no cursors; the old revision then writes none,
+    // and the new revision's first write replaces the old row.
+    let reinstalled = db.put_action_binding(&on_commit, "admin", 18).unwrap();
+    assert!(
+        db.action_binding_dataset_cursors(&reinstalled)
+            .unwrap()
+            .is_empty()
+    );
+    db.advance_action_binding_dataset_cursor(&on_commit, "orders", 9)
+        .unwrap();
+    assert!(
+        db.action_binding_dataset_cursors(&reinstalled)
+            .unwrap()
+            .is_empty()
+    );
+    db.advance_action_binding_dataset_cursor(&reinstalled, "orders", 1)
+        .unwrap();
+    assert_eq!(
+        db.action_binding_dataset_cursors(&reinstalled)
+            .unwrap()
+            .get("orders"),
+        Some(&1)
     );
 }
 

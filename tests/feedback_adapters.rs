@@ -131,6 +131,7 @@ fn dispatch_binding() -> ActionBinding {
         property_filters: Vec::new(),
         ops: vec![OP_CREATE.into()],
         schedule: None,
+        dataset_commit: None,
         type_id: ACTION_DISPATCH.into(),
         version: PACKAGE_VERSION.into(),
         run_as: INVESTIGATION_RUNTIME.into(),

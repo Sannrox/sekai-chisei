@@ -3643,6 +3643,10 @@ message ActionBindingSubmission {
   bool replay = 6;
   // Bounded reason when the event did not submit or admission refused it.
   string skipped_reason = 7;
+  // Set by dataset-commit bindings (#3034), whose `op` is "dataset_commit"
+  // and whose `object_id` is the dataset's binding object.
+  string dataset_id = 8;
+  string version_id = 9;
 }
 message RunActionBindingResponse {
   // The subscription outcome: page, replayed, resnapshot_required,

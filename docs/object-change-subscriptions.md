@@ -68,6 +68,28 @@ bucket. Planes from before #3033 never tick a binding, and their
 `RunActionBinding` fails on a scheduled one (its empty `kind` is invalid)
 without submitting.
 
+A binding can fire on dataset commits instead (#3034): it carries
+`"dataset_commit": {"dataset_id": "<id>"}`, or `{}` for every dataset bound to
+an object in the binding's namespace. It names no `kind`, `ops` or
+`property_filters`, and maps each parameter from a constant,
+`{"source": "dataset_id"}` or `{"source": "version_id"}`; `schedule` and
+`dataset_commit` exclude each other. Every new dataset version fires it: an
+append, a rollback, or a branch merge. Branch working copies write no
+version and do not fire; purged versions are skipped. `RunActionBinding`
+drives it. The first run records each scoped dataset's latest version and
+submits nothing (no backfill); a dataset created later starts from its first
+version. Each later run submits one Action per new version, in commit order
+and up to `limit`, as `run_as` through normal admission, with an idempotency
+key from the namespace, binding id, revision, dataset id and version id. The
+submission reports `op` `dataset_commit`, the binding object as `object_id`,
+and the `dataset_id` and `version_id`. A dataset's cursor
+(`sekai_action_binding_dataset_cursors`) moves only after its versions were
+admitted, so a rerun after a crash in between replays the same instances. A
+dataset `run_as` cannot read (object ACL, marking, or a source-owned dataset)
+is never submitted or named, and its cursor moves past what it hid. A
+reinstall bumps the revision and re-pins. Planes from before #3034 refuse a
+dataset-commit binding (its empty `kind` is invalid) without submitting.
+
 ## Backends
 
 SQLite and PostgreSQL read the same `sekai_object_changes` log and the same
