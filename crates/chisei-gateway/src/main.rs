@@ -61,6 +61,8 @@ fn refresh_usage() -> &'static str {
      Uses CHISEI_GATEWAY_ADMIN_TOKEN as a bearer token when set."
 }
 
+/// POST /_chisei/admin/refresh. Connect and request timeouts come from
+/// `HttpTimeouts` so a listener that accepts and never answers cannot hang.
 async fn run_refresh(args: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut url =
         std::env::var("CHISEI_GATEWAY_URL").unwrap_or_else(|_| "http://127.0.0.1:8788".to_string());
@@ -79,7 +81,12 @@ async fn run_refresh(args: Vec<String>) -> Result<(), Box<dyn std::error::Error 
         "{}/_chisei/admin/refresh",
         url.trim_end_matches('/').trim_end_matches("/v1")
     );
-    let mut request = reqwest::Client::new().post(endpoint);
+    let timeouts = chisei_gateway::llm::HttpTimeouts::from_env();
+    let client = reqwest::Client::builder()
+        .connect_timeout(timeouts.connect_timeout)
+        .timeout(timeouts.request_timeout)
+        .build()?;
+    let mut request = client.post(endpoint);
     if let Ok(token) = std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN")
         && !token.trim().is_empty()
     {
