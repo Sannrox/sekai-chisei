@@ -120,6 +120,15 @@ enabled. Datasets resolve from the definitions in
   ledger (tokens and cost per case) and its total cover every start. A
   `run_id` is bound to its first spec, including the evaluator definition and
   its digest; another spec under it is refused.
+- Each recorded case also leaves one operation receipt in the run's
+  namespace, and the result names it as `operation_id`. The id is
+  `eval-case:` and 32 hex digits of a SHA-256 over the namespace, run id and
+  case id, so it is fixed per case and never shared across namespaces. Its
+  verification event carries the run and case ids, the evaluator
+  definition, the pass or fail status, the reason code, tokens and cost; its
+  initiator is the principal that called `RunEvalDataset`. The receipt is
+  written in the transaction that records the result, and only by the start
+  that records it.
 - Only a pass or fail verdict is a result. A case that failed to run stays
   unrun and the run is `incomplete`, to be resumed. If nothing was
   dispatched (a deterministic evaluator unavailable) its reservation is

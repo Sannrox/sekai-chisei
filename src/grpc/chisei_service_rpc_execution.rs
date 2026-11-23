@@ -850,7 +850,8 @@ pub(super) async fn run_eval_dataset(
     req: Request<RunEvalDatasetRequest>,
 ) -> Result<Response<RunEvalDatasetResponse>, Status> {
     use crate::chisei::eval_run::{
-        DefinitionCaseExecutor, EVAL_RUN_CONTRACT, EvalRunSpec, RUN_CONFLICT, RUN_IN_PROGRESS, run,
+        DefinitionCaseExecutor, EVAL_RUN_CONTRACT, EvalRunSpec, RUN_CONFLICT, RUN_IN_PROGRESS,
+        run_as,
     };
     let actor = authenticated_actor(&req);
     let context = enterprise_authenticated_context(&req)?.cloned();
@@ -942,7 +943,9 @@ pub(super) async fn run_eval_dataset(
         if !artifact_digest.is_empty() {
             bind_artifact(store.as_ref(), &spec, &artifact_digest)?;
         }
-        run(store.as_ref(), &executor, &spec, &dataset, || {
+        // Case receipts name the caller, so the operation workspace shows
+        // each case to the principal that ran it (#2694).
+        run_as(store.as_ref(), &executor, &spec, &dataset, &actor, || {
             chrono::Utc::now().timestamp_millis()
         })
         .map_err(|error| {
