@@ -4432,6 +4432,38 @@ async fn source_sync_v2_state_and_bounded_errors_are_exposed() {
     }
 }
 
+/// Connectors classify these statuses by message (see the connector template's
+/// transport), so the plane must emit the shared constants.
+#[test]
+fn source_sync_apply_errors_emit_the_messages_connectors_classify() {
+    for (error, message) in [
+        (
+            "unsupported_version",
+            sekai_source_sdk::SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE,
+        ),
+        (
+            "unsupported_adapter",
+            sekai_source_sdk::SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE,
+        ),
+        (
+            "unbound_type_revision",
+            sekai_source_sdk::SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE,
+        ),
+        (
+            "batch_aborted: key",
+            sekai_source_sdk::SOURCE_SYNC_STATE_CONFLICT_MESSAGE,
+        ),
+        (
+            "recovery_required",
+            sekai_source_sdk::SOURCE_SYNC_STATE_CONFLICT_MESSAGE,
+        ),
+    ] {
+        let status = map_source_sync_apply_error(error.into());
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{error}");
+        assert_eq!(status.message(), message, "{error}");
+    }
+}
+
 #[test]
 fn source_sync_proto_rejects_unspecified_delivery_mode() {
     let mut proto = source_batch("sync-v2-conversion", "connector/test", "", "next", "key");

@@ -5,8 +5,9 @@
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_proto::sekai::{self as pb, ApplySourceBatchRequest, GetSourceSyncStateRequest};
 use sekai_source_sdk::{
-    ApplySourceBatchReply, GetSourceSyncStateInput, SourceBatch, SourceSyncStateView,
-    SourceSyncTransport, TransportFailure,
+    ApplySourceBatchReply, GetSourceSyncStateInput, SOURCE_SYNC_STATE_CONFLICT_MESSAGE,
+    SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE, SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE,
+    SourceBatch, SourceSyncStateView, SourceSyncTransport, TransportFailure,
 };
 use std::time::Duration;
 use tonic::metadata::MetadataValue;
@@ -133,10 +134,10 @@ fn denial(status: &tonic::Status) -> Option<ApplySourceBatchReply> {
     let reason_code = match (status.code(), status.message()) {
         (tonic::Code::InvalidArgument, _) => "invalid_argument",
         (tonic::Code::PermissionDenied, _) => "permission_denied",
-        (tonic::Code::FailedPrecondition, "source sync contract version is unsupported") => {
+        (tonic::Code::FailedPrecondition, SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE) => {
             "unsupported_contract"
         }
-        (tonic::Code::FailedPrecondition, "source type revision is not bound") => {
+        (tonic::Code::FailedPrecondition, SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE) => {
             "unbound_type_revision"
         }
         _ => return None,
@@ -144,6 +145,12 @@ fn denial(status: &tonic::Status) -> Option<ApplySourceBatchReply> {
     Some(ApplySourceBatchReply::Rejected {
         reason_code: reason_code.into(),
     })
+}
+
+/// A state conflict, or the replay of a durably aborted batch; the caller asks
+/// the plane's transaction record which one it is.
+fn state_conflict(status: &tonic::Status) -> bool {
+    status.message() == SOURCE_SYNC_STATE_CONFLICT_MESSAGE
 }
 
 impl SourceSyncTransport for GrpcTransport {
@@ -159,7 +166,7 @@ impl SourceSyncTransport for GrpcTransport {
             .block_on(self.client.apply_source_batch(request))
         {
             Ok(response) => response,
-            Err(status) if status.message() == "source sync state conflict" => {
+            Err(status) if state_conflict(&status) => {
                 // A replay of a durably aborted batch lands here too; only the
                 // plane's transaction record tells it apart from a live conflict.
                 return match self.raw_state(batch)? {
@@ -329,6 +336,69 @@ mod tests {
         assert!(!aborted(&state(transaction("ABORTED", "other")), &batch));
         assert!(!aborted(&state(transaction("OPEN", "key")), &batch));
         assert!(!aborted(&pb::SourceSyncState::default(), &batch));
+    }
+
+    fn rejected(reason_code: &str) -> Option<ApplySourceBatchReply> {
+        Some(ApplySourceBatchReply::Rejected {
+            reason_code: reason_code.into(),
+        })
+    }
+
+    #[test]
+    fn plane_statuses_classify_as_refusal_conflict_or_retry() {
+        use tonic::{Code, Status};
+        let refused = [
+            (Code::InvalidArgument, "anything", "invalid_argument"),
+            (Code::PermissionDenied, "anything", "permission_denied"),
+            (
+                Code::FailedPrecondition,
+                SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE,
+                "unsupported_contract",
+            ),
+            (
+                Code::FailedPrecondition,
+                SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE,
+                "unbound_type_revision",
+            ),
+        ];
+        for (code, message, reason_code) in refused {
+            let status = Status::new(code, message);
+            assert_eq!(denial(&status), rejected(reason_code), "{status:?}");
+            assert!(!state_conflict(&status), "{status:?}");
+        }
+
+        let conflict = Status::failed_precondition(SOURCE_SYNC_STATE_CONFLICT_MESSAGE);
+        assert!(state_conflict(&conflict));
+        assert_eq!(denial(&conflict), None);
+
+        // Other preconditions, such as an object changed since authorization,
+        // may succeed on retry and stay pending.
+        let pending = [
+            (
+                Code::FailedPrecondition,
+                "source is disabled",
+                TransportFailure::Ambiguous,
+            ),
+            (
+                Code::AlreadyExists,
+                "source sync identity conflict",
+                TransportFailure::Ambiguous,
+            ),
+            (
+                Code::Aborted,
+                "source checkpoint conflict",
+                TransportFailure::Ambiguous,
+            ),
+            (Code::Unavailable, "", TransportFailure::Unavailable),
+            (Code::DeadlineExceeded, "", TransportFailure::Unavailable),
+            (Code::Cancelled, "", TransportFailure::Unavailable),
+        ];
+        for (code, message, expected) in pending {
+            let status = Status::new(code, message);
+            assert_eq!(denial(&status), None, "{status:?}");
+            assert!(!state_conflict(&status), "{status:?}");
+            assert_eq!(failure(&status), expected, "{status:?}");
+        }
     }
 
     fn never_speaks_http2() -> String {
