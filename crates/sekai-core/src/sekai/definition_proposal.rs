@@ -478,10 +478,19 @@ pub fn list_published_definition_history(
                         "definition_history_revision_missing: merged candidate is absent"
                             .to_string()
                     })?;
+                // An absent previous revision would make every member look
+                // added, so it fails like an absent current one.
                 let previous = if row.previous_published_digest.is_empty() {
                     None
                 } else {
-                    store.load_history_revision(namespace, &row.previous_published_digest)?
+                    Some(
+                        store
+                            .load_history_revision(namespace, &row.previous_published_digest)?
+                            .ok_or_else(|| {
+                                "definition_history_revision_missing: previous published revision is absent"
+                                    .to_string()
+                            })?,
+                    )
                 };
                 if !history_member_changed(&current, previous.as_ref(), kind, id) {
                     continue;
@@ -1589,6 +1598,118 @@ mod tests {
             "ontology_class",
             "TicketClass"
         ));
+    }
+
+    /// History rows over an in-memory revision table.
+    struct MemoryHistory {
+        rows: Vec<PublishedDefinitionRevisionHistoryEntry>,
+        revisions: Vec<DefinitionRevision>,
+    }
+
+    impl PublishedDefinitionHistoryStore for MemoryHistory {
+        fn fetch_merged_history(
+            &mut self,
+            _namespace: &str,
+            cursor: Option<(i64, String)>,
+            limit: usize,
+        ) -> Result<Vec<PublishedDefinitionRevisionHistoryEntry>, String> {
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    cursor
+                        .as_ref()
+                        .is_none_or(|(ms, id)| (row.published_at_ms, &row.proposal_id) < (*ms, id))
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn load_history_revision(
+            &mut self,
+            _namespace: &str,
+            revision_digest: &str,
+        ) -> Result<Option<DefinitionRevision>, String> {
+            Ok(self
+                .revisions
+                .iter()
+                .find(|revision| revision.revision_digest == revision_digest)
+                .cloned())
+        }
+    }
+
+    #[test]
+    fn filtered_history_fails_when_a_previous_revision_is_missing() {
+        let revision = |digest: String, parent: String| DefinitionRevision {
+            contract_version: crate::sekai::definition_branch::REVISION_CONTRACT_VERSION.into(),
+            namespace: "team-a".into(),
+            revision_digest: digest,
+            parent_revision_digest: parent,
+            members: vec![DefinitionRevisionMember {
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+                member_digest: "sha256:same".into(),
+            }],
+            published: true,
+            created_by: "author".into(),
+            created_at_ms: 1,
+        };
+        let row = |digest: String, previous: String, proposal: &str, at: i64| {
+            PublishedDefinitionRevisionHistoryEntry {
+                revision_digest: digest,
+                previous_published_digest: previous,
+                proposal_id: proposal.into(),
+                receipt_id: format!("receipt-{proposal}"),
+                actor: "author".into(),
+                published_at_ms: at,
+            }
+        };
+        // Newest first: b replaces a without touching Ticket; a is the first publish.
+        let mut store = MemoryHistory {
+            rows: vec![
+                row(digest('b'), digest('a'), "cs-2", 2),
+                row(digest('a'), String::new(), "cs-1", 1),
+            ],
+            revisions: vec![
+                revision(digest('a'), String::new()),
+                revision(digest('b'), digest('a')),
+            ],
+        };
+        let (entries, _) = list_published_definition_history(
+            &mut store,
+            "team-a",
+            "object_type",
+            "Ticket",
+            "",
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.proposal_id.as_str())
+                .collect::<Vec<_>>(),
+            ["cs-1"],
+            "an empty previous digest compares against no revision"
+        );
+
+        store
+            .revisions
+            .retain(|revision| revision.revision_digest != digest('a'));
+        store.rows.pop();
+        assert_eq!(
+            list_published_definition_history(
+                &mut store,
+                "team-a",
+                "object_type",
+                "Ticket",
+                "",
+                10
+            )
+            .unwrap_err(),
+            "definition_history_revision_missing: previous published revision is absent"
+        );
     }
 
     #[test]
