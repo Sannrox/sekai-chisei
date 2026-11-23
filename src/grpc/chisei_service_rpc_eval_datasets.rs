@@ -157,9 +157,9 @@ pub(super) async fn get_eval_dataset_definition(
     service: &ChiseiServiceImpl,
     req: Request<GetEvalDatasetDefinitionRequest>,
 ) -> Result<Response<GetEvalDatasetDefinitionResponse>, Status> {
-    let actor = authenticated_actor(&req);
+    // Admitted for tenant assertions (#3056).
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let store = service.db.runtime_arc();
     let record = tokio::task::spawn_blocking(move || {
         let version = Some(request.version.as_str()).filter(|version| !version.is_empty());
@@ -195,9 +195,9 @@ pub(super) async fn list_eval_dataset_definitions(
     service: &ChiseiServiceImpl,
     req: Request<ListEvalDatasetDefinitionsRequest>,
 ) -> Result<Response<ListEvalDatasetDefinitionsResponse>, Status> {
-    let actor = authenticated_actor(&req);
+    // Admitted for tenant assertions (#3056).
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let limit = page_size(request.page_size, DEFINITION_PAGE);
     let store = service.db.runtime_arc();
     let response = tokio::task::spawn_blocking(move || {
@@ -251,9 +251,9 @@ pub(super) async fn list_eval_dataset_cases(
     service: &ChiseiServiceImpl,
     req: Request<ListEvalDatasetCasesRequest>,
 ) -> Result<Response<ListEvalDatasetCasesResponse>, Status> {
-    let actor = authenticated_actor(&req);
+    // Admitted for tenant assertions (#3056).
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let limit = page_size(request.page_size, CASE_PAGE);
     // The token is `<version>/<offset>`: a version never changes, so an
     // offset into it is stable across pages.

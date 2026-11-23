@@ -736,6 +736,18 @@ fn execution_namespace_access(
 /// and shared-space grants, and the extension's decision, with their audit.
 /// Without an in-process Sekai store the read is refused; without an
 /// extension the principal's namespace grant is required too.
+/// Namespace read for `req`'s caller: a tenant context reads only its
+/// tenant's namespaces (#1770); any other caller needs a live grant.
+pub(super) fn require_request_namespace_read<T>(
+    facts: &dyn SekaiFactReader,
+    req: &Request<T>,
+    namespace: &str,
+) -> Result<(), Status> {
+    match enterprise_authenticated_context(req)? {
+        Some(context) => require_enterprise_namespace_read(facts, context, namespace),
+        None => require_namespace_access(facts, &authenticated_actor(req), namespace),
+    }
+}
 pub(super) fn require_enterprise_namespace_read(
     facts: &dyn SekaiFactReader,
     context: &crate::enterprise::AuthenticatedContext,

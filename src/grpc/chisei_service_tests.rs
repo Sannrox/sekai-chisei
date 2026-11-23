@@ -15390,3 +15390,226 @@ async fn service_principal_reads_follow_its_live_registration_scope() {
         tonic::Code::PermissionDenied
     );
 }
+
+/// #3056: through the real token interceptor, a tenant assertion lists its
+/// namespace's eval dataset definitions, reads one, pages its cases, reads
+/// the run trend and compares two runs with their cases, getting what a
+/// local caller gets; in another tenant's namespace each call is refused.
+#[tokio::test]
+async fn tenant_assertion_reads_its_namespaces_eval_datasets() {
+    use crate::chisei::eval_run::{
+        CaseError, CaseOutcome, EVAL_RUN_CONTRACT, EvalCaseExecutor, EvalRunSpec, run,
+    };
+    struct Passes;
+    impl EvalCaseExecutor for Passes {
+        fn run_case(
+            &self,
+            spec: &EvalRunSpec,
+            _dataset: &crate::chisei::eval_dataset::EvalDataset,
+            case: &crate::chisei::eval_dataset::EvalCase,
+        ) -> Result<CaseOutcome, CaseError> {
+            // The candidate fails one case, so the comparison lists it.
+            let passed = !(spec.run_id == "candidate" && case.case_id.ends_with('1'));
+            Ok(CaseOutcome {
+                passed,
+                reason: if passed { "match" } else { "expected_mismatch" }.into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_micros: 1,
+                receipts: Some(Default::default()),
+                policy: None,
+            })
+        }
+    }
+    let mut fixture = TenantReadFixture::new("subject-a", &[]);
+    let definition_json = |namespace: &str| {
+        format!(
+            r#"{{
+            "contract_version": "chisei.eval-dataset-definition/v1",
+            "name": "shipments",
+            "generator": "supply_chain",
+            "namespace": "{namespace}",
+            "seed": 7,
+            "preset": "demo",
+            "templates": [{{
+                "id": "shipment-status",
+                "kind": "synthetic_shipment",
+                "input_properties": ["tracking"],
+                "expected_property": "status"
+            }}]
+        }}"#
+        )
+    };
+    for namespace in ["ns-a", "ns-b"] {
+        let record = fixture
+            .svc
+            .put_eval_dataset_definition(Request::new(PutEvalDatasetDefinitionRequest {
+                namespace: namespace.into(),
+                definition_json: definition_json(namespace),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        let dataset: crate::chisei::eval_dataset::EvalDatasetDefinition =
+            serde_json::from_str(&definition_json(namespace)).unwrap();
+        let dataset = dataset.generate().unwrap();
+        assert_eq!(record.version, dataset.version);
+        for run_id in ["baseline", "candidate"] {
+            let spec = EvalRunSpec {
+                contract_version: EVAL_RUN_CONTRACT.into(),
+                namespace: namespace.into(),
+                run_id: run_id.into(),
+                dataset: dataset.name.clone(),
+                dataset_version: dataset.version.clone(),
+                agent: "triage@1".into(),
+                model: "local/m".into(),
+                tool_version: "tools@1".into(),
+                evaluator_definition_id: "status-match".into(),
+                evaluator_digest: "digest".into(),
+                concurrency: 1,
+                budget_micros: 1_000_000,
+                max_case_cost_micros: 10,
+            };
+            run(fixture.svc.db.runtime(), &Passes, &spec, &dataset, || 1).unwrap();
+        }
+    }
+    // subject-a holds a grant in ns-b, so only the tenant check keeps the
+    // assertion out of it.
+    let runtime = fixture.svc.db.runtime();
+    runtime
+        .create_object(&Object {
+            id: "eval-tenant-ns-b".into(),
+            kind: "namespace".into(),
+            name: "ns-b".into(),
+            namespace: String::new(),
+            external_id: "namespace:ns-b".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    runtime
+        .create_grant(&Grant {
+            id: "eval-tenant-subject-a".into(),
+            object_id: "eval-tenant-ns-b".into(),
+            principal: "subject-a".into(),
+            role: Role::Viewer,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let version = fixture
+        .svc
+        .list_eval_dataset_definitions(Request::new(ListEvalDatasetDefinitionsRequest {
+            namespace: "ns-a".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .definitions
+        .into_iter()
+        .find(|record| record.name == "shipments")
+        .unwrap()
+        .version;
+    let authority = fixture.authority.clone();
+    let token = move || {
+        authority
+            .sign(&crate::identity_assertion::IdentityAssertion {
+                contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "subject-a".into(),
+                credential_id: "credential-a".into(),
+                credential_kind: "human_session".into(),
+                space: None,
+                space_role: None,
+                act: None,
+                tenant_id: Some("tenant-a".into()),
+                scopes: vec!["sekai.read".into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    };
+    // Each read as the tenant through the interceptor, or as a local caller.
+    macro_rules! read {
+        ($method:literal, $call:ident, $body:expr, $tenant:expr) => {{
+            let request = if $tenant {
+                let (metadata, extensions) = fixture.admit(&token, $method);
+                Request::from_parts(metadata, extensions, $body)
+            } else {
+                Request::new($body)
+            };
+            fixture.svc.$call(request).await.map(|r| r.into_inner())
+        }};
+    }
+    for (namespace, tenant_reads) in [("ns-a", true), ("ns-b", false)] {
+        let list = ListEvalDatasetDefinitionsRequest {
+            namespace: namespace.into(),
+            ..Default::default()
+        };
+        let get = GetEvalDatasetDefinitionRequest {
+            namespace: namespace.into(),
+            name: "shipments".into(),
+            version: version.clone(),
+        };
+        let cases = ListEvalDatasetCasesRequest {
+            namespace: namespace.into(),
+            dataset: "shipments".into(),
+            dataset_version: version.clone(),
+            page_size: 2,
+            ..Default::default()
+        };
+        let trend = ListEvalDatasetRunTrendRequest {
+            namespace: namespace.into(),
+            dataset: "shipments".into(),
+        };
+        let compare = CompareEvalDatasetRunsRequest {
+            namespace: namespace.into(),
+            baseline_run_id: "baseline".into(),
+            candidate_run_id: "candidate".into(),
+            include_cases: true,
+            ..Default::default()
+        };
+        // In its own namespace the tenant reads what a local caller reads;
+        // in another tenant's each call is refused.
+        macro_rules! check {
+            ($method:literal, $call:ident, $body:expr) => {{
+                let tenant = read!($method, $call, $body.clone(), true);
+                if tenant_reads {
+                    let tenant = tenant.unwrap();
+                    assert_eq!(tenant, read!($method, $call, $body, false).unwrap());
+                    Some(tenant)
+                } else {
+                    assert_eq!(
+                        tenant.unwrap_err().code(),
+                        tonic::Code::PermissionDenied,
+                        $method
+                    );
+                    None
+                }
+            }};
+        }
+        check!(
+            "ListEvalDatasetDefinitions",
+            list_eval_dataset_definitions,
+            list
+        );
+        check!("GetEvalDatasetDefinition", get_eval_dataset_definition, get);
+        check!("ListEvalDatasetCases", list_eval_dataset_cases, cases);
+        check!(
+            "ListEvalDatasetRunTrend",
+            list_eval_dataset_run_trend,
+            trend
+        );
+        if let Some(compared) = check!("CompareEvalDatasetRuns", compare_eval_dataset_runs, compare)
+        {
+            assert!(compared.regressions > 0);
+            assert_eq!(compared.differing_cases.len() as u64, compared.regressions);
+        }
+    }
+}

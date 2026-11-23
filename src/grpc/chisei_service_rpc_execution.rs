@@ -532,17 +532,9 @@ pub(super) async fn get_quality_trend(
     service: &ChiseiServiceImpl,
     req: Request<GetQualityTrendRequest>,
 ) -> Result<Response<GetQualityTrendResponse>, Status> {
-    let actor = authenticated_actor(&req);
-    let context = enterprise_authenticated_context(&req)?.cloned();
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
     let namespace = canonical_namespace(&request.namespace)?.to_string();
-    match context.as_ref() {
-        // A tenant context reads only its tenant's namespaces (#1770).
-        Some(context) => {
-            require_enterprise_namespace_read(service.sekai_facts.reader(), context, &namespace)?
-        }
-        None => require_namespace_access(service.sekai_facts.reader(), &actor, &namespace)?,
-    }
     let report = crate::quality_trend::query_quality_trends_after_access_check(
         service.db.runtime(),
         &namespace,
@@ -1200,9 +1192,9 @@ pub(super) async fn compare_eval_dataset_runs(
     service: &ChiseiServiceImpl,
     req: Request<CompareEvalDatasetRunsRequest>,
 ) -> Result<Response<CompareEvalDatasetRunsResponse>, Status> {
-    let actor = authenticated_actor(&req);
+    // Admitted for tenant assertions (#3056).
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let detailed = compare_dataset_runs_detailed(
         service,
         &request.namespace,
@@ -1251,9 +1243,9 @@ pub(super) async fn list_eval_dataset_run_trend(
     req: Request<ListEvalDatasetRunTrendRequest>,
 ) -> Result<Response<ListEvalDatasetRunTrendResponse>, Status> {
     use crate::chisei::eval_run::EvalRunStore;
-    let actor = authenticated_actor(&req);
+    // Admitted for tenant assertions (#3056).
+    require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
     let request = req.into_inner();
-    require_namespace_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
     let store = service.db.runtime_arc();
     let runs = tokio::task::spawn_blocking(move || {
         store

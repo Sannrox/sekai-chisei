@@ -365,6 +365,8 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "QueryObjectPolicyAudit"
                 // The policy dry-run (#3262) writes only its audit decision.
                 | "DryRunActionPolicy"
+                // Comparing two eval runs (#3056) reads both runs only.
+                | "CompareEvalDatasetRuns"
                 // Offline sync (#1836) needs namespace read: a scope is the
                 // caller's own definition, not namespace data.
                 | "PutSyncScope"
@@ -905,6 +907,11 @@ fn enterprise_namespace_rpc(service: &str, method: &str) -> bool {
             | "ExecuteContentPlanStream"
             | "GetOperationReceipt"
             | "GetQualityTrend"
+            | "ListEvalDatasetDefinitions"
+            | "GetEvalDatasetDefinition"
+            | "ListEvalDatasetCases"
+            | "ListEvalDatasetRunTrend"
+            | "CompareEvalDatasetRuns"
     );
     let expected = if chisei {
         "chisei.ChiseiService"
@@ -1063,6 +1070,13 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // namespaces reads as not found.
             | "GetOperationReceipt"
             | "GetQualityTrend"
+            // Eval dataset reads (#3056) read the request's namespace under
+            // the tenant check.
+            | "ListEvalDatasetDefinitions"
+            | "GetEvalDatasetDefinition"
+            | "ListEvalDatasetCases"
+            | "ListEvalDatasetRunTrend"
+            | "CompareEvalDatasetRuns"
             | "ListSchemaTypes"
             | "ListGovernedTransforms"
             | "ListGovernedTransformRuns"
@@ -3599,7 +3613,16 @@ mod tests {
             crate::enterprise::NamespaceAction::Read
         );
         // #1770: Chisei reads, admitted only on their own service.
-        for method in ["GetOperationReceipt", "GetQualityTrend"] {
+        for method in [
+            "GetOperationReceipt",
+            "GetQualityTrend",
+            // #3056
+            "ListEvalDatasetDefinitions",
+            "GetEvalDatasetDefinition",
+            "ListEvalDatasetCases",
+            "ListEvalDatasetRunTrend",
+            "CompareEvalDatasetRuns",
+        ] {
             assert!(enterprise_namespace_rpc("chisei.ChiseiService", method));
             assert!(!enterprise_namespace_rpc("sekai.SekaiService", method));
             assert_eq!(
