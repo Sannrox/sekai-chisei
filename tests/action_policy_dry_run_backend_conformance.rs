@@ -63,6 +63,7 @@ fn submit(namespace: &str, key: &str) -> ActionInstanceAdmissionRequest {
         source_object_id: String::new(),
         marking_gate: Default::default(),
         expected_object_revision: String::new(),
+        binding_approval_rule: String::new(),
         offline: None,
     }
 }

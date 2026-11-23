@@ -291,6 +291,7 @@ async fn isolation_probe_1140_only_one_credentialed_subject_decides() {
                 source_object_id: String::new(),
                 marking_gate: Default::default(),
                 expected_object_revision: String::new(),
+                binding_approval_rule: String::new(),
                 offline: None,
             },
             &editor,

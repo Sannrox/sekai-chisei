@@ -107,3 +107,20 @@ fields. Older planes refuse such a binding through the existing empty-`kind`
 validation. Proof: `tests/native_server_smoke.rs::spawned_binary_admits_one_action_per_committed_dataset_version`
 and the SQLite and PostgreSQL cases of
 `tests/action_binding_backend_conformance.rs`.
+
+## Addendum: binding-level approval (#3035)
+
+A binding may set `require_approval`. Admission then parks a submit it would
+admit, after agent autonomy so auto-apply cannot lift it, and records the
+rule `action_binding:<binding_id>@<revision>`, following the
+`agent_autonomy:propose_only` precedent. It never loosens a decision: denials
+and policy parks stand, and approvers stay those of the Action type. Because
+the flag is a trust control, an older plane must not run such a binding
+without it: an enabled binding that requires approval is stored with
+`enabled: false` and a marker this plane reads back, so an older plane
+refuses the run rather than submitting unparked, across a rolling deploy or a
+rollback. Proof:
+`tests/native_server_smoke.rs::spawned_binary_parks_every_submit_of_a_binding_that_requires_approval`
+and the SQLite and PostgreSQL cases of
+`tests/action_binding_backend_conformance.rs`.
+

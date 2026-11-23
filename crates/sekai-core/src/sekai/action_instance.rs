@@ -293,11 +293,12 @@ impl AdmissionLease {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequirement {
     /// Action policy scope whose rule required approval. Empty when agent
-    /// autonomy parked a submit the policy allowed.
+    /// autonomy or an Action binding parked a submit the policy allowed.
     pub policy_scope: String,
     /// The deciding clause: `action_override:<action>`,
     /// `risk_override:<class>`, `default_decision`, or
-    /// `agent_autonomy:propose_only`.
+    /// `agent_autonomy:propose_only`, or `action_binding:<id>@<revision>`
+    /// when only the binding's `require_approval` parked it (#3035).
     pub rule: String,
     /// Principals the Action type names as approvers. The submitter never
     /// decides their own instance, even when listed.

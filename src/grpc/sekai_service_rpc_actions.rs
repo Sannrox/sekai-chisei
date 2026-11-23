@@ -283,6 +283,7 @@ pub(super) async fn submit_action_instance(
         source_object_id: String::new(),
         marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
         expected_object_revision: String::new(),
+        binding_approval_rule: String::new(),
         offline: inner
             .offline
             .map(|offline| from_proto_offline_submission(offline, device_id))
@@ -2747,6 +2748,7 @@ pub(super) async fn execute_action_plan(
             source_object_id: String::new(),
             marking_gate: submitter_marking_gate(service, &principals, &inner.namespace),
             expected_object_revision: expected_revision.into(),
+            binding_approval_rule: String::new(),
             offline: None,
         };
         let outcome = match &service.cross_store {

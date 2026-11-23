@@ -124,6 +124,10 @@ pub struct ActionInstanceAdmissionRequest {
     /// against still has it, in the same read the write applies against.
     /// Empty checks nothing.
     pub expected_object_revision: String,
+    /// Set by an Action binding that requires approval (#3035): a submit
+    /// that would admit parks instead, with this as its approval rule.
+    /// Empty adds no park.
+    pub binding_approval_rule: String,
 }
 
 /// Clearance check admission runs against the marking it derives (#1706).
@@ -709,6 +713,17 @@ impl<'a> ActionInstanceAdmission<'a> {
             }
             _ => {}
         }
+        // After autonomy, so auto-apply cannot lift it, and only on a submit
+        // that would admit, so a denial or an earlier park stands.
+        let mut parked_by_binding = false;
+        if status == STATUS_ADMITTED && !request.binding_approval_rule.is_empty() {
+            status = STATUS_PARKED.into();
+            parked_by_binding = true;
+            policy_decision_text = "require_approval".into();
+            if !budget_already_reserved && self.budget.is_some() {
+                budget_decision = "deferred".into();
+            }
+        }
         if status == STATUS_ADMITTED
             && let Some(budget) = self.budget
             && !budget_already_reserved
@@ -722,6 +737,7 @@ impl<'a> ActionInstanceAdmission<'a> {
         if self.budget_refused && status != STATUS_DENIED {
             status = STATUS_DENIED.into();
             parked_by_autonomy = false;
+            parked_by_binding = false;
             deny_reason = format!("action budget exhausted for {budget_subject}");
             budget_decision = "budget_exceeded".into();
         }
@@ -864,6 +880,12 @@ impl<'a> ActionInstanceAdmission<'a> {
                     ApprovalRequirement::new(
                         "",
                         RULE_AGENT_PROPOSE_ONLY.into(),
+                        &type_def.approvers,
+                    )
+                } else if parked_by_binding {
+                    ApprovalRequirement::new(
+                        "",
+                        request.binding_approval_rule.clone(),
                         &type_def.approvers,
                     )
                 } else {
@@ -3472,6 +3494,7 @@ mod tests {
             source_object_id: String::new(),
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
+            binding_approval_rule: String::new(),
             offline: None,
         }
     }
@@ -4393,6 +4416,7 @@ mod tests {
             source_object_id: String::new(),
             marking_gate: Default::default(),
                     expected_object_revision: String::new(),
+                    binding_approval_rule: String::new(),
                     offline: None,
                 },
                 "alice",
@@ -4570,6 +4594,7 @@ mod tests {
             source_object_id: String::new(),
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
+            binding_approval_rule: String::new(),
             offline: None,
         }
     }
