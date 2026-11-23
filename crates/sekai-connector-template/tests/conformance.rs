@@ -9,15 +9,22 @@ use sekai_source_sdk::{
     SnapshotSourceFailure, SourceBatch, SourceOutbox, SourceSyncStateView, SourceSyncTransport,
     TransportFailure, assert_deterministic_discovery, assert_snapshot_chain, run_check_conformance,
 };
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 /// In-memory plane: commits every valid batch that resumes from its cursor,
-/// unless it denies the descriptor.
+/// unless it denies the descriptor. `fail_next` fails one apply before it
+/// commits; `open_transaction` reports a transaction another run left open.
+/// `log` records each apply as `apply <key> <digest>`.
 #[derive(Default)]
 struct Plane {
     cursor: Option<String>,
     committed: Vec<SourceBatch>,
     deny: bool,
+    fail_next: Option<TransportFailure>,
+    open_transaction: bool,
+    log: Rc<RefCell<Vec<String>>>,
 }
 
 impl SourceSyncTransport for Plane {
@@ -25,6 +32,13 @@ impl SourceSyncTransport for Plane {
         &mut self,
         batch: &SourceBatch,
     ) -> Result<ApplySourceBatchReply, TransportFailure> {
+        self.log.borrow_mut().push(format!(
+            "apply {} {}",
+            batch.idempotency_key, batch.batch_digest
+        ));
+        if let Some(failure) = self.fail_next.take() {
+            return Err(failure);
+        }
         if self.deny
             || batch.validate().is_err()
             || batch.current_cursor != self.cursor.clone().unwrap_or_default()
@@ -49,6 +63,7 @@ impl SourceSyncTransport for Plane {
         Ok(SourceSyncStateView {
             found: self.cursor.is_some(),
             current_cursor: self.cursor.clone(),
+            open_transaction: self.open_transaction,
             ..SourceSyncStateView::default()
         })
     }
@@ -123,6 +138,95 @@ fn run_commits_one_batch_per_page_through_the_final_page() {
         run_once(&config, &outbox, &mut source, &mut plane),
         Ok(RunOutcome::UpToDate)
     );
+    assert!(outbox.pending().unwrap().is_empty());
+}
+
+/// The fake source, logging `read <cursor>` for every page read.
+struct Logged(FakeSource, Rc<RefCell<Vec<String>>>);
+
+impl SnapshotPageSource for Logged {
+    fn read_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<SnapshotRead, SnapshotSourceFailure> {
+        self.1
+            .borrow_mut()
+            .push(format!("read {}", committed_cursor.unwrap_or_default()));
+        self.0.read_page(committed_cursor, max_records)
+    }
+}
+
+#[test]
+fn an_unfinished_apply_is_replayed_before_the_next_page_is_read() {
+    for failure in [TransportFailure::Ambiguous, TransportFailure::Unavailable] {
+        let config = config();
+        let root = tempfile::tempdir().unwrap();
+        let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut source = Logged(
+            FakeSource::new(&config.source, &config.source_instance),
+            log.clone(),
+        );
+        let mut plane = Plane {
+            fail_next: Some(failure),
+            log: log.clone(),
+            ..Plane::default()
+        };
+
+        assert_eq!(
+            run_once(&config, &outbox, &mut source, &mut plane),
+            Ok(RunOutcome::Pending),
+            "{failure:?}"
+        );
+        assert_eq!(outbox.pending().unwrap().len(), 1, "{failure:?}");
+        let first = log.borrow().clone();
+        let [read, apply] = first.as_slice() else {
+            panic!("one read and one apply: {first:?}");
+        };
+        assert_eq!(read, "read ");
+
+        assert_eq!(
+            run_once(&config, &outbox, &mut source, &mut plane),
+            Ok(RunOutcome::Committed {
+                cursor: "page-2".into(),
+                complete: true,
+            }),
+            "{failure:?}"
+        );
+        // The same key and digest go out again before the source is read.
+        let second = log.borrow()[2..].to_vec();
+        assert_eq!(second[0], *apply, "{failure:?}");
+        assert_eq!(second[1], "read page-1", "{failure:?}");
+        assert_eq!(second.len(), 3, "{second:?}");
+
+        // Each page commits exactly once.
+        assert_eq!(plane.committed.len(), 2, "{failure:?}");
+        assert_snapshot_chain(&plane.committed).unwrap();
+        assert!(outbox.pending().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn an_open_transaction_waits_without_reading_the_source() {
+    let config = config();
+    let root = tempfile::tempdir().unwrap();
+    let outbox = SourceOutbox::open(root.path(), OutboxLimits::default()).unwrap();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let mut source = Logged(
+        FakeSource::new(&config.source, &config.source_instance),
+        log.clone(),
+    );
+    let mut plane = Plane {
+        open_transaction: true,
+        log: log.clone(),
+        ..Plane::default()
+    };
+    assert_eq!(
+        run_once(&config, &outbox, &mut source, &mut plane),
+        Ok(RunOutcome::Pending)
+    );
+    assert!(log.borrow().is_empty(), "{:?}", log.borrow());
     assert!(outbox.pending().unwrap().is_empty());
 }
 
