@@ -59,6 +59,11 @@
       "summary": "Untrusted key id is refused (issuer may still match)."
     },
     {
+      "id": "verify_rejects_untrusted_key",
+      "class": "negative",
+      "summary": "A permit signed by a key other than the trusted key is refused by verify and redeem, even with the trusted issuer and key id."
+    },
+    {
       "id": "redeem_is_idempotent",
       "class": "positive",
       "summary": "Same idempotency key returns the same redemption without double consume (one-invocation permit)."

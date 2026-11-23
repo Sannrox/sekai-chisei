@@ -160,6 +160,7 @@ fn profile_fixture_is_complete() {
         ("verify_rejects_precondition_mismatch", "negative"),
         ("verify_rejects_untrusted_issuer", "negative"),
         ("verify_rejects_untrusted_key_id", "negative"),
+        ("verify_rejects_untrusted_key", "negative"),
         ("redeem_is_idempotent", "positive"),
         ("redeem_after_revoke_fails", "negative"),
         ("execution_evidence_shape", "positive"),
@@ -455,6 +456,74 @@ fn assert_verify_fails_with_trust(
     );
 }
 
+/// Signs with key A under the trusted issuer and key id, then trusts key B:
+/// `verify_for_executor` and `redeem_permit` must both refuse, while the
+/// broken harness accepts. Redeeming with key A afterwards still works, so the
+/// refusal is the key, not some other state.
+fn assert_untrusted_key_refused() {
+    let db = RuntimeDb::Sqlite(Arc::new(
+        sekai_chisei::chisei_store::memory_sekai_with_chisei_schema(),
+    ));
+    let (permit, signer) = persist_and_issue(&db, &authorization(10_000, 2));
+    let trusted = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+    assert_ne!(trusted, signer.verifying_key());
+    let context = host_context(&permit, permit.required_host_capabilities.clone());
+    assert!(
+        BrokenHarness::verify_for_executor(
+            &permit,
+            &trusted,
+            "issuer:test",
+            "key-1",
+            &context,
+            3_000
+        )
+        .is_ok()
+    );
+    assert!(
+        verify_for_executor(&permit, &trusted, "issuer:test", "key-1", &context, 3_000).is_err(),
+        "verify must refuse a permit signed by an untrusted key"
+    );
+    assert!(
+        BrokenHarness::redeem_permit(
+            &permit,
+            &context,
+            &trusted,
+            "idem-untrusted",
+            "execution-untrusted",
+            3_000
+        )
+        .is_ok()
+    );
+    assert!(
+        db.redeem_permit(
+            &permit,
+            &context,
+            &trusted,
+            "idem-untrusted",
+            "execution-untrusted",
+            "local",
+            3_000,
+        )
+        .is_err(),
+        "redeem must refuse a permit signed by an untrusted key"
+    );
+    db.redeem_permit(
+        &permit,
+        &context,
+        &signer.verifying_key(),
+        "idem-trusted",
+        "execution-trusted",
+        "local",
+        3_000,
+    )
+    .expect("the signing key still redeems");
+}
+
+#[test]
+fn verify_and_redeem_reject_a_permit_signed_by_an_untrusted_key() {
+    assert_untrusted_key_refused();
+}
+
 #[test]
 fn verify_rejects_host_context_and_trust_binding_mismatches() {
     let (permit, key) = signed_permit("executor:filesystem", "atomic_rename");
@@ -713,6 +782,10 @@ fn broken_harness_fails_every_negative_case() {
             }
             "verify_rejects_outside_validity_window" => {
                 host_context(&permit, vec!["atomic_rename".into()])
+            }
+            "verify_rejects_untrusted_key" => {
+                assert_untrusted_key_refused();
+                continue;
             }
             "redeem_after_revoke_fails" => {
                 let db = RuntimeDb::Sqlite(Arc::new(

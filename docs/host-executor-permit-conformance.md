@@ -40,6 +40,7 @@ fixture. A third-party harness maps each id to an automated test.
 | `verify_rejects_precondition_mismatch` | negative | observed preconditions must match |
 | `verify_rejects_untrusted_issuer` | negative | untrusted issuer is refused |
 | `verify_rejects_untrusted_key_id` | negative | untrusted key id is refused (issuer may match) |
+| `verify_rejects_untrusted_key` | negative | a permit signed by another key is refused by verify and redeem (issuer and key id match) |
 | `redeem_is_idempotent` | positive | same key converges without double consume |
 | `redeem_after_revoke_fails` | negative | revoked permit cannot be redeemed |
 | `execution_evidence_shape` | positive | terminal host report validates |
