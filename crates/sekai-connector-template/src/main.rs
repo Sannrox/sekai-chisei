@@ -36,9 +36,6 @@ fn sync<S: SourceInspector + SnapshotPageSource>(
     config: &ConnectorConfig,
     mut source: S,
 ) -> Result<(), String> {
-    source
-        .check()
-        .map_err(|failure| format!("source check failed: {failure}"))?;
     let outbox = SourceOutbox::open(&config.outbox_dir, OutboxLimits::default())?;
     let mut transport = GrpcTransport::connect(&config.target, config.credential())?;
     loop {

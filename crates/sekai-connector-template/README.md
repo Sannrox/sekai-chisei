@@ -14,8 +14,9 @@ sekaictl admin connectors new <name> --out <dir> [--sdk-path <checkout>]
   contiguous sequence.
 - `src/fake.rs`: fixed in-memory source for local development and tests.
 - `src/transport.rs`: `ApplySourceBatch` and `GetSourceSyncState` over gRPC.
-- `src/lib.rs`: `run_once` replays the outbox, reads the page after the
-  plane-committed cursor, and commits it as one transaction.
+- `src/lib.rs`: `run_once` replays the outbox, then checks the source, reads
+  the page after the plane-committed cursor, and commits it as one transaction.
+  A down source does not hold back a batch that was already read.
 - `connector.json`: configuration. Credentials are environment variable
   names (`credential_env`, `source_credential_env`), never values. A config
   that contains secret-like text is refused.

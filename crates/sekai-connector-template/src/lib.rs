@@ -1,8 +1,9 @@
 //! Source connector built on `sekai-source-sdk`.
 //!
-//! `run_once` is one sync step: replay this binding's pending outbox batch, read the page
-//! after the plane-committed cursor, and commit it as exactly one
-//! `ApplySourceBatch` transaction. Call it until it reports `UpToDate` or a
+//! `run_once` is one sync step: replay this binding's pending outbox batch, check
+//! the source, read the page after the plane-committed cursor, and commit it as
+//! exactly one `ApplySourceBatch` transaction. Replay needs no source, so a down
+//! source never strands a batch that was already read. Call it until it reports `UpToDate` or a
 //! committed final page.
 
 pub mod config;
@@ -13,7 +14,8 @@ pub mod transport;
 use config::ConnectorConfig;
 use sekai_source_sdk::{
     FlushDisposition, GetSourceSyncStateInput, MAX_SOURCE_BATCH_RECORDS, SnapshotPageSource,
-    SnapshotRead, SourceOutbox, SourceSyncTransport, build_registered_source_batch,
+    SnapshotRead, SourceInspector, SourceOutbox, SourceSyncTransport,
+    build_registered_source_batch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +31,7 @@ pub enum RunOutcome {
     UpToDate,
 }
 
-pub fn run_once<S: SnapshotPageSource, T: SourceSyncTransport>(
+pub fn run_once<S: SourceInspector + SnapshotPageSource, T: SourceSyncTransport>(
     config: &ConnectorConfig,
     outbox: &SourceOutbox,
     source: &mut S,
@@ -62,6 +64,9 @@ pub fn run_once<S: SnapshotPageSource, T: SourceSyncTransport>(
         return Ok(RunOutcome::Pending);
     }
     let cursor = state.current_cursor;
+    source
+        .check()
+        .map_err(|failure| format!("source check failed: {failure}"))?;
     let page = match source
         .read_page(cursor.as_deref(), MAX_SOURCE_BATCH_RECORDS)
         .map_err(|failure| format!("source read failed: {failure:?}"))?
