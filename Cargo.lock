@@ -2957,6 +2957,7 @@ dependencies = [
  "fs2",
  "hmac 0.12.1",
  "metrics",
+ "metrics-util",
  "mikura",
  "mikura-host",
  "mikura-ingest",
