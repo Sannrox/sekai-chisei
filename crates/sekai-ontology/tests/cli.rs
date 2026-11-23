@@ -113,6 +113,17 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
             .status
             .success()
     );
+    let imported = SqliteOntology::open_read_only(database)
+        .unwrap()
+        .export()
+        .unwrap();
+    let assert_unchanged = |after: &str| {
+        let current = SqliteOntology::open_read_only(database)
+            .unwrap()
+            .export()
+            .unwrap();
+        assert_eq!(current, imported, "the database changed after {after}");
+    };
 
     let find = sekai(&["--db", database, "--json", "find", "language"]);
     assert!(find.status.success());
@@ -123,11 +134,9 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         find["data"]["matches"][0]["matched_fields"],
         serde_json::json!(["properties"])
     );
+    assert_unchanged("find");
 
-    let before = SqliteOntology::open_read_only(database)
-        .unwrap()
-        .export()
-        .unwrap();
+    let before = imported.clone();
     let before_path = directory.path().join("before.json");
     fs::write(&before_path, serde_json::to_vec_pretty(&before).unwrap()).unwrap();
     let mut after = before.clone();
@@ -172,6 +181,7 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         ask["data"]["answer"]["data"]["classes"][0]["name"],
         "Database"
     );
+    assert_unchanged("ask (query)");
 
     let find_ask = sekai(&["--db", database, "--json", "ask", "find language"]);
     assert!(
@@ -189,6 +199,7 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         find_ask["data"]["answer"]["data"]["matches"][0]["name"],
         "Api"
     );
+    assert_unchanged("ask (find)");
 
     let deep = sekai(&[
         "--db",
@@ -204,6 +215,7 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         2
     );
     assert_eq!(deep["data"]["answer"]["kind"], "query");
+    assert_unchanged("ask (depth 2)");
 
     let unsupported = sekai(&[
         "--db",
@@ -219,6 +231,7 @@ fn find_diff_and_ask_are_read_only_and_machine_inspectable() {
         "unsupported"
     );
     assert!(unsupported["data"]["answer"].is_null());
+    assert_unchanged("ask (unsupported)");
 }
 
 #[test]
