@@ -659,10 +659,20 @@ impl BudgetPostgresDbExt for PostgresDb {
         require_home_pin: bool,
         local_site_id: &str,
     ) -> Result<(), String> {
-        if require_home_pin && delta > 0 {
-            self.budget_assert_home_writable(scope_id, metric, local_site_id)?;
-        }
-        self.budget_adjust_chain(scope_id, metric, delta, now_ms)
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        adjust_chain_tx_for_site(
+            &mut transaction,
+            scope_id,
+            metric,
+            delta,
+            now_ms,
+            require_home_pin,
+            local_site_id,
+        )?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     fn budget_adjust_chain(
@@ -672,12 +682,7 @@ impl BudgetPostgresDbExt for PostgresDb {
         delta: i64,
         now_ms: i64,
     ) -> Result<(), String> {
-        let mut connection = self.connection()?;
-        let mut transaction = connection
-            .transaction()
-            .map_err(|error| error.to_string())?;
-        adjust_chain_tx(&mut transaction, scope_id, metric, delta, now_ms)?;
-        transaction.commit().map_err(|error| error.to_string())
+        self.budget_adjust_chain_for_site(scope_id, metric, delta, now_ms, false, "")
     }
 
     /// Applies a usage delta once for a stable caller-generated key.
@@ -1256,6 +1261,20 @@ pub fn adjust_chain_tx(
     delta: i64,
     now_ms: i64,
 ) -> Result<(), String> {
+    adjust_chain_tx_for_site(transaction, scope_id, metric, delta, now_ms, false, "")
+}
+
+/// [`adjust_chain_tx`] with the home-site pin checked after the scope locks
+/// and before the debit, matching the reserve path.
+fn adjust_chain_tx_for_site(
+    transaction: &mut postgres::Transaction<'_>,
+    scope_id: &str,
+    metric: &str,
+    delta: i64,
+    now_ms: i64,
+    require_home_pin: bool,
+    local_site_id: &str,
+) -> Result<(), String> {
     let chain = scope_chain(scope_id);
     for scope in &chain {
         let key = budget_lock_key(metric, scope);
@@ -1265,6 +1284,13 @@ pub fn adjust_chain_tx(
                 &[&key],
             )
             .map_err(|error| format!("lock budget scope {scope}: {error}"))?;
+    }
+    if require_home_pin && delta > 0 {
+        for scope in &chain {
+            if let Some(limit) = effective_limit(transaction, scope, metric)? {
+                pg_assert_home_pin(scope, &limit.home_site_id, local_site_id)?;
+            }
+        }
     }
     for scope in &chain {
         let period_type = charge_period_type(transaction, scope, metric)?;
@@ -1338,5 +1364,87 @@ mod tests {
             error.contains("chisei_budget_limits") && error.contains("does not exist"),
             "{error}"
         );
+    }
+
+    fn pinned_scope() -> String {
+        format!(
+            "region:pin-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_positive_adjust_on_a_non_home_site_fails_with_the_home_pin_error() {
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        let db = crate::chisei_store::postgres_with_chisei_schema(scratch.connect());
+        let scope = pinned_scope();
+        db.budget_set_limit_scoped(&scope, "tokens", 100, "daily", "eu-west", "")
+            .unwrap();
+        let error = db
+            .budget_adjust_chain_for_site(&scope, "tokens", 10, 0, true, "us-east")
+            .unwrap_err();
+        assert!(
+            error.contains("pinned to home site eu-west") && error.contains("us-east"),
+            "{error}"
+        );
+        assert_eq!(db.budget_usage(&scope, "tokens", 0).unwrap().0, 0);
+        db.budget_adjust_chain_for_site(&scope, "tokens", 10, 0, false, "us-east")
+            .unwrap();
+        assert_eq!(db.budget_usage(&scope, "tokens", 0).unwrap().0, 10);
+        db.budget_adjust_chain_for_site(&scope, "tokens", -4, 0, true, "us-east")
+            .unwrap();
+        assert_eq!(db.budget_usage(&scope, "tokens", 0).unwrap().0, 6);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_adjust_sees_a_home_site_change_that_commits_while_it_waits_on_the_scope_lock() {
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        let db = std::sync::Arc::new(crate::chisei_store::postgres_with_chisei_schema(
+            scratch.connect(),
+        ));
+        let scope = pinned_scope();
+        db.budget_set_limit_scoped(&scope, "tokens", 100, "daily", "eu-west", "")
+            .unwrap();
+
+        let mut holder = db.connection().unwrap();
+        let mut transaction = holder.transaction().unwrap();
+        let key = budget_lock_key("tokens", &scope);
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&key],
+            )
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let db = std::sync::Arc::clone(&db);
+            let scope = scope.clone();
+            std::thread::spawn(move || {
+                tx.send(db.budget_adjust_chain_for_site(&scope, "tokens", 10, 0, true, "eu-west"))
+                    .unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the adjustment must wait on the held scope lock"
+        );
+        db.budget_set_limit_scoped(&scope, "tokens", 100, "daily", "us-east", "")
+            .unwrap();
+        transaction.commit().unwrap();
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("waiter finished")
+            .unwrap_err();
+        waiter.join().unwrap();
+        assert!(
+            error.contains("pinned to home site us-east") && error.contains("eu-west"),
+            "{error}"
+        );
+        assert_eq!(db.budget_usage(&scope, "tokens", 0).unwrap().0, 0);
     }
 }
