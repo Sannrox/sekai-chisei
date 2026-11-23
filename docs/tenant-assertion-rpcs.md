@@ -123,6 +123,24 @@ withholds the payload from an assertion that may not read them.
 `object_source_record_admits_a_tenant_assertion_under_get_object_rules` covers
 it.
 
+## Added in #3056
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `ChiseiService.ListEvalDatasetDefinitions` | request | read |
+| `ChiseiService.GetEvalDatasetDefinition` | request | read |
+| `ChiseiService.ListEvalDatasetCases` | request | read |
+| `ChiseiService.ListEvalDatasetRunTrend` | request | read |
+| `ChiseiService.CompareEvalDatasetRuns` | request | read (it reads both runs only) |
+
+Admitted on `ChiseiService` only, like the #1770 reads, and authorized on
+the same tenant path: an assertion reads only its tenant's namespaces, even
+where its subject holds a grant elsewhere. Token callers keep the namespace
+grant check. They stay experimental. `RunEvalDataset` and
+`PutEvalDatasetDefinition` are not admitted.
+`tenant_assertion_reads_its_namespaces_eval_datasets` covers all five
+through the token interceptor.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials
