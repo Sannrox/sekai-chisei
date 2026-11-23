@@ -71,6 +71,8 @@ mod scored_knowledge_admission;
 mod search_rpc;
 #[path = "sync_scope_rpc.rs"]
 mod sync_scope_rpc;
+#[path = "transform_chain_rpc.rs"]
+mod transform_chain_rpc;
 #[path = "transform_placement_rpc.rs"]
 mod transform_placement_rpc;
 #[cfg(test)]
@@ -284,6 +286,10 @@ impl SekaiService for SekaiServiceImpl {
         get_decision_trend => get_decision_trend_rpc(GetDecisionTrendRequest) -> GetDecisionTrendResponse;
         get_object_source_record => get_object_source_record_rpc(GetObjectSourceRecordRequest) -> GetObjectSourceRecordResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
+        get_transform_chain_run => get_transform_chain_run_rpc(GetTransformChainRunRequest) -> GetTransformChainRunResponse;
+        list_transform_chains => list_transform_chains_rpc(ListTransformChainsRequest) -> ListTransformChainsResponse;
+        get_transform_chain => get_transform_chain_rpc(GetTransformChainRequest) -> GetTransformChainResponse;
+        list_transform_chain_runs => list_transform_chain_runs_rpc(ListTransformChainRunsRequest) -> ListTransformChainRunsResponse;
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;
         promote_model_version => promote_model_version_rpc(PromoteModelVersionRequest) -> PromoteModelVersionResponse;
@@ -1616,12 +1622,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<RunTransformChainRequest>,
     ) -> Result<Response<RunTransformChainResponse>, Status> {
         rpc_data::run_transform_chain(self, req).await
-    }
-    async fn get_transform_chain_run(
-        &self,
-        req: Request<GetTransformChainRunRequest>,
-    ) -> Result<Response<GetTransformChainRunResponse>, Status> {
-        rpc_data::get_transform_chain_run(self, req).await
     }
     async fn cancel_governed_transform_run(
         &self,

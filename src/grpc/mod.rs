@@ -1086,6 +1086,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PutGovernedTransform"
             | "PutTransformChain"
             | "GetTransformChainRun"
+            // Chain reads (#3084) check namespace read.
+            | "ListTransformChains"
+            | "GetTransformChain"
+            | "ListTransformChainRuns"
             // Model version reads (#3020) check namespace read and the
             // version's marking.
             | "GetModelVersion"
@@ -3730,6 +3734,9 @@ mod tests {
             "PutGovernedTransform",
             "PutTransformChain",
             "GetTransformChainRun",
+            "ListTransformChains",
+            "GetTransformChain",
+            "ListTransformChainRuns",
             "GetModelVersion",
             "ListModelVersions",
             "PutModelStage",

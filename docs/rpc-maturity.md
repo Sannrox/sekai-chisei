@@ -231,6 +231,9 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutTransformChain` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RunTransformChain` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformChainRun` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListTransformChains` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetTransformChain` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListTransformChainRuns` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetModelVersion` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListModelVersions` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.PutModelStage` | `sekai.datasets` | yes | none | `experimental` |

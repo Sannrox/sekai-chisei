@@ -40037,3 +40037,6 @@ async fn a_failed_profile_admin_grant_reverses_the_guarded_create() {
             .any(|grant| grant.principal == "root")
     );
 }
+
+#[path = "transform_chain_rpc_tests.rs"]
+mod transform_chain_rpc_tests;

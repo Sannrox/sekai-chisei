@@ -451,6 +451,68 @@ impl PostgresDb {
     ) -> Result<Option<TransformChainRun>, String> {
         get_transform_chain_run(self, run_id, now_ms)
     }
+
+    pub fn get_transform_chain(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+    ) -> Result<Option<TransformChain>, String> {
+        self.load_chain(namespace, chain_id)
+    }
+
+    /// The namespace's chain definitions, ordered by chain id.
+    pub fn list_transform_chains(&self, namespace: &str) -> Result<Vec<TransformChain>, String> {
+        self.connection()?
+            .query(
+                "SELECT definition_json FROM sekai_transform_chain
+                 WHERE namespace = $1 ORDER BY chain_id",
+                &[&namespace],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| {
+                serde_json::from_str(row.get::<_, &str>(0)).map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    /// One page of a chain's runs, newest first. `after` is the
+    /// `(created_at_ms, run_id)` of the last run on the previous page, so a
+    /// run started while paging never shifts older runs between pages.
+    /// Stored status is returned as is; running runs are not advanced.
+    pub fn list_transform_chain_runs(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<TransformChainRun>, String> {
+        let mut client = self.connection()?;
+        let (after_ms, after_id) = after.unwrap_or((i64::MAX, ""));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let ids: Vec<String> = client
+            .query(
+                "SELECT run_id FROM sekai_transform_chain_run
+                 WHERE namespace = $1 AND chain_id = $2
+                   AND ($5 OR created_at_ms < $3 OR (created_at_ms = $3 AND run_id < $4))
+                 ORDER BY created_at_ms DESC, run_id DESC LIMIT $6",
+                &[
+                    &namespace,
+                    &chain_id,
+                    &after_ms,
+                    &after_id,
+                    &after.is_none(),
+                    &limit,
+                ],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        ids.iter()
+            .filter_map(|id| load_run_pg(&mut *client, "run_id = $1", &[id]).transpose())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -705,6 +767,63 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
             now_ms + 10,
         )
         .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_chain_lists_and_run_pages_survive_a_new_run() {
+        let scratch = ScratchDatabase::create();
+        let db = connect_with_receipts(&scratch);
+        let keys = SigningKeySet::from_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            1,
+        )
+        .unwrap();
+        let _guard = install_test_signer(keys);
+        seed_projection(&db);
+        let mut alpha = three_step_chain();
+        alpha.chain_id = "alpha".into();
+        db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        db.put_transform_chain(&alpha, 21).unwrap();
+        let ids: Vec<_> = db
+            .list_transform_chains("ops")
+            .unwrap()
+            .into_iter()
+            .map(|chain| chain.chain_id)
+            .collect();
+        assert_eq!(ids, ["alpha", "pipe"]);
+        assert!(db.get_transform_chain("ops", "pipe").unwrap().is_some());
+        let mut older: Vec<_> = [("k1", 30), ("k2", 40), ("k3", 40)]
+            .into_iter()
+            .map(|(key, now_ms)| {
+                db.run_transform_chain("ops", "pipe", key, "", now_ms)
+                    .unwrap()
+                    .0
+                    .run_id
+            })
+            .collect();
+        let first = db
+            .list_transform_chain_runs("ops", "pipe", None, 2)
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|run| run.steps.len() == 3));
+        let newer = db
+            .run_transform_chain("ops", "pipe", "k4", "", 50)
+            .unwrap()
+            .0;
+        let last = first.last().unwrap();
+        let second = db
+            .list_transform_chain_runs("ops", "pipe", Some((last.created_at_ms, &last.run_id)), 2)
+            .unwrap();
+        let mut seen: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|run| run.run_id.clone())
+            .collect();
+        assert!(!seen.contains(&newer.run_id));
+        seen.sort();
+        older.sort();
+        assert_eq!(seen, older);
     }
 
     #[test]

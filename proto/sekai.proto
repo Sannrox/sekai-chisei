@@ -1406,6 +1406,34 @@ message GetTransformChainRunRequest {
 message GetTransformChainRunResponse {
   TransformChainRun run = 1;
 }
+message ListTransformChainsRequest {
+  string namespace = 1;
+}
+message ListTransformChainsResponse {
+  // Ordered by chain_id.
+  repeated TransformChain chains = 1;
+}
+message GetTransformChainRequest {
+  string namespace = 1;
+  string chain_id = 2;
+}
+message GetTransformChainResponse {
+  TransformChain chain = 1;
+}
+message ListTransformChainRunsRequest {
+  string namespace = 1;
+  string chain_id = 2;
+  // 0 means the server maximum (100).
+  int32 page_size = 3;
+  // Opaque; the next_page_token of the previous page.
+  string page_token = 4;
+}
+message ListTransformChainRunsResponse {
+  // Newest first. A run reports its stored status; GetTransformChainRun
+  // advances a running run.
+  repeated TransformChainRun runs = 1;
+  string next_page_token = 2;
+}
 message ListGovernedTransformsRequest {
   string namespace = 1;
 }
@@ -6243,6 +6271,10 @@ service SekaiService {
   rpc PutTransformChain(PutTransformChainRequest) returns (PutTransformChainResponse);
   rpc RunTransformChain(RunTransformChainRequest) returns (RunTransformChainResponse);
   rpc GetTransformChainRun(GetTransformChainRunRequest) returns (GetTransformChainRunResponse);
+  // Experimental (#3084): read a namespace's chains and a chain's run history.
+  rpc ListTransformChains(ListTransformChainsRequest) returns (ListTransformChainsResponse);
+  rpc GetTransformChain(GetTransformChainRequest) returns (GetTransformChainResponse);
+  rpc ListTransformChainRuns(ListTransformChainRunsRequest) returns (ListTransformChainRunsResponse);
   // Experimental (#3020): model version references. A reader sees a version
   // only with the marking it inherits from its training inputs.
   rpc GetModelVersion(GetModelVersionRequest) returns (GetModelVersionResponse);

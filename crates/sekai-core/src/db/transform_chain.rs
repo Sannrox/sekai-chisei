@@ -1119,6 +1119,75 @@ impl SekaiDb {
     ) -> Result<Option<TransformChainRun>, String> {
         get_transform_chain_run(self, run_id, now_ms)
     }
+
+    pub fn get_transform_chain(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+    ) -> Result<Option<TransformChain>, String> {
+        self.load_chain(namespace, chain_id)
+    }
+
+    /// The namespace's chain definitions, ordered by chain id.
+    pub fn list_transform_chains(&self, namespace: &str) -> Result<Vec<TransformChain>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT definition_json FROM sekai_transform_chain
+                 WHERE namespace = ?1 ORDER BY chain_id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![namespace], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let json = row.map_err(|error| error.to_string())?;
+            serde_json::from_str(&json).map_err(|error| error.to_string())
+        })
+        .collect()
+    }
+
+    /// One page of a chain's runs, newest first. `after` is the
+    /// `(created_at_ms, run_id)` of the last run on the previous page, so a
+    /// run started while paging never shifts older runs between pages.
+    /// Stored status is returned as is; running runs are not advanced.
+    pub fn list_transform_chain_runs(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<TransformChainRun>, String> {
+        let conn = self.conn();
+        let (after_ms, after_id) = after.unwrap_or((i64::MAX, ""));
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id FROM sekai_transform_chain_run
+                 WHERE namespace = ?1 AND chain_id = ?2
+                   AND (created_at_ms < ?3 OR (created_at_ms = ?3 AND run_id < ?4) OR ?5)
+                 ORDER BY created_at_ms DESC, run_id DESC LIMIT ?6",
+            )
+            .map_err(|error| error.to_string())?;
+        let ids = stmt
+            .query_map(
+                params![
+                    namespace,
+                    chain_id,
+                    after_ms,
+                    after_id,
+                    after.is_none(),
+                    limit
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids.iter()
+            .filter_map(|id| load_run_sqlite(&conn, "run_id = ?1", params![id]).transpose())
+            .collect()
+    }
 }
 
 #[cfg(test)]

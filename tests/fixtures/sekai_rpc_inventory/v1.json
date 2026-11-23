@@ -1741,6 +1741,51 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ListTransformChains",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_chain.rs",
+        "crates/sekai-core/src/db/postgres_transform_chain.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetTransformChain",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_chain.rs",
+        "crates/sekai-core/src/db/postgres_transform_chain.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "ListTransformChainRuns",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/transform_chain.rs",
+        "crates/sekai-core/src/db/postgres_transform_chain.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "GetModelVersion",
       "kind": "persistent",
       "surfaces": [
