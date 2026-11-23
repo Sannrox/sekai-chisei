@@ -482,7 +482,9 @@ impl ExternalActionSekaiDbExt for SekaiDb {
         };
         self.ensure_external_action_tables()?;
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let existing_claim: Option<(String, String, String, u32, u32)> = tx
             .query_row(
                 "SELECT actor,namespace,operation_id,mutations,deletes
@@ -787,6 +789,108 @@ mod tests {
                 .unwrap(),
             Some(record)
         );
+    }
+
+    fn file_backed_pair() -> (
+        tempfile::TempDir,
+        std::sync::Arc<SekaiDb>,
+        std::sync::Arc<SekaiDb>,
+    ) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("blast-reserve-{}-", std::process::id()))
+            .tempdir()
+            .unwrap();
+        let path = dir.path().join("chisei.db");
+        let first = std::sync::Arc::new(crate::chisei_store::open_sekai_with_chisei_schema(
+            path.to_str().unwrap(),
+        ));
+        let second = std::sync::Arc::new(crate::chisei_store::open_sekai_with_chisei_schema(
+            path.to_str().unwrap(),
+        ));
+        (dir, first, second)
+    }
+
+    fn reservation_counters(db: &SekaiDb, request: &ExternalActionRequest) -> (u32, u32) {
+        db.conn()
+            .query_row(
+                "SELECT mutations, deletes FROM chisei_external_action_reservations
+                 WHERE actor=?1 AND namespace=?2 AND operation_id=?3",
+                rusqlite::params![request.actor, request.namespace, request.operation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn concurrent_reserves(
+        first: &std::sync::Arc<SekaiDb>,
+        second: &std::sync::Arc<SekaiDb>,
+        request: &ExternalActionRequest,
+        first_id: &str,
+        second_id: &str,
+        max_mutations: Option<u32>,
+    ) -> (Result<(), String>, Result<(), String>) {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_handle = {
+            let db = std::sync::Arc::clone(first);
+            let request = request.clone();
+            let id = first_id.to_string();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.reserve_external_action_blast_radius(&id, &request, max_mutations, None)
+            })
+        };
+        let second_handle = {
+            let db = std::sync::Arc::clone(second);
+            let request = request.clone();
+            let id = second_id.to_string();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                db.reserve_external_action_blast_radius(&id, &request, max_mutations, None)
+            })
+        };
+        (first_handle.join().unwrap(), second_handle.join().unwrap())
+    }
+
+    #[test]
+    fn concurrent_blast_reservations_serialize_and_sum_under_the_cap() {
+        let (_dir, first, second) = file_backed_pair();
+        let request = fixture();
+        let (left, right) =
+            concurrent_reserves(&first, &second, &request, "auth-a", "auth-b", Some(2));
+        left.expect("first reservation");
+        right.expect("second reservation");
+        assert_eq!(reservation_counters(&first, &request), (2, 0));
+    }
+
+    #[test]
+    fn concurrent_blast_reservations_over_the_cap_fail_with_the_cap_error() {
+        let (_dir, first, second) = file_backed_pair();
+        let request = fixture();
+        let (left, right) =
+            concurrent_reserves(&first, &second, &request, "auth-a", "auth-b", Some(1));
+        let outcomes = [left, right];
+        let successes = outcomes.iter().filter(|result| result.is_ok()).count();
+        let failures: Vec<_> = outcomes
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(successes, 1);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0], "external-action blast-radius cap exceeded");
+        assert_eq!(reservation_counters(&first, &request), (1, 0));
+    }
+
+    #[test]
+    fn concurrent_replay_of_the_same_blast_reservation_does_not_double_count() {
+        let (_dir, first, second) = file_backed_pair();
+        let request = fixture();
+        let (left, right) =
+            concurrent_reserves(&first, &second, &request, "auth-a", "auth-a", Some(1));
+        left.expect("first reservation");
+        right.expect("replayed reservation");
+        assert_eq!(reservation_counters(&first, &request), (1, 0));
     }
 
     #[test]
