@@ -205,14 +205,16 @@ struct ScratchDir {
 }
 
 impl ScratchDir {
+    /// Create a fresh directory. The random suffix keeps a later process that
+    /// reuses this pid away from a store left by a killed run, and `create_dir`
+    /// refuses an existing directory instead of opening its old database.
     fn create() -> Result<Self, String> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         let path = env::temp_dir().join(format!(
             "sekai-object-path-{}-{}",
             std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
+            uuid::Uuid::new_v4().simple()
         ));
-        std::fs::create_dir_all(&path)
+        std::fs::create_dir(&path)
             .map_err(|error| format!("create object-path directory: {error}"))?;
         Ok(Self { path })
     }
