@@ -115,23 +115,7 @@ impl ChainStore for PostgresDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        for step in &run.steps {
-            tx.execute(
-                "INSERT INTO sekai_transform_chain_step_run
-                 (chain_run_id, step_name, transform_run_id, status)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (chain_run_id, step_name) DO UPDATE SET
-                    transform_run_id = CASE WHEN sekai_transform_chain_step_run.transform_run_id = '' THEN EXCLUDED.transform_run_id ELSE sekai_transform_chain_step_run.transform_run_id END,
-                    status = CASE WHEN sekai_transform_chain_step_run.status IN ('completed', 'failed', 'cancelled') THEN sekai_transform_chain_step_run.status ELSE EXCLUDED.status END",
-                &[
-                    &run.run_id,
-                    &step.step,
-                    &step.transform_run_id,
-                    &step.status,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+        upsert_step_runs_pg(&mut tx, run)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -311,15 +295,56 @@ impl ChainStore for PostgresDb {
         self.query_dataset_rows(dataset_id, &RowQuery::default())
     }
 
-    fn append_chain_receipt(&self, receipt: &TransformRun) -> Result<(), String> {
+    fn finish_run(&self, run: &TransformChainRun, receipt: &TransformRun) -> Result<bool, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
             .map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE sekai_transform_chain_run
+                 SET status = $2, failed_step = $3, error = $4, completed_at_ms = $5,
+                     input_digest = $6, output_digest = $7
+                 WHERE run_id = $1 AND status = 'running'",
+                &[
+                    &run.run_id,
+                    &run.status,
+                    &run.failed_step,
+                    &run.error,
+                    &run.completed_at_ms,
+                    &run.input_digest,
+                    &run.output_digest,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        upsert_step_runs_pg(&mut tx, run)?;
         crate::db::postgres_receipt_chain::append_transform_run_chain(&mut tx, receipt)?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(true)
     }
+}
+
+/// Upsert step rows; a step that reached a terminal status keeps it.
+fn upsert_step_runs_pg(
+    tx: &mut postgres::Transaction<'_>,
+    run: &TransformChainRun,
+) -> Result<(), String> {
+    for step in &run.steps {
+        tx.execute(
+            "INSERT INTO sekai_transform_chain_step_run
+             (chain_run_id, step_name, transform_run_id, status)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (chain_run_id, step_name) DO UPDATE SET
+                transform_run_id = CASE WHEN sekai_transform_chain_step_run.transform_run_id = '' THEN EXCLUDED.transform_run_id ELSE sekai_transform_chain_step_run.transform_run_id END,
+                status = CASE WHEN sekai_transform_chain_step_run.status IN ('completed', 'failed', 'cancelled') THEN sekai_transform_chain_step_run.status ELSE EXCLUDED.status END",
+            &[&run.run_id, &step.step, &step.transform_run_id, &step.status],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn load_run_pg(
@@ -712,6 +737,49 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
         let receipt: TransformRun = serde_json::from_str(&chain_entry.receipt_json).unwrap();
         assert_eq!(receipt.profile, CHAIN_PROFILE);
         assert!(receipt.trigger_ref.contains(&run.steps[0].transform_run_id));
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_finish_run_leaves_a_terminal_run_and_its_receipts_unchanged() {
+        let scratch = ScratchDatabase::create();
+        let db = connect_with_receipts(&scratch);
+        let keys = SigningKeySet::from_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000004",
+            1,
+        )
+        .unwrap();
+        let _guard = install_test_signer(keys);
+        seed_projection(&db);
+        db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        let (run, _) = db
+            .run_transform_chain("ops", "pipe", "k-term", "", 30)
+            .unwrap();
+        assert_eq!(run.status, CHAIN_WORK_COMPLETED);
+        let receipts = || {
+            crate::db::postgres_receipt_chain::export_receipt_chain(&db, "ops")
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|entry| entry.receipt_id == run.run_id)
+                .count()
+        };
+        assert_eq!(receipts(), 1);
+
+        for status in [CHAIN_WORK_COMPLETED, CHAIN_WORK_FAILED] {
+            let mut late = run.clone();
+            late.status = status.into();
+            late.failed_step = "a".into();
+            late.error = "late".into();
+            late.completed_at_ms = 900;
+            let receipt = crate::sekai::transform_chain::chain_receipt(&late, "", "");
+            assert!(!db.finish_run(&late, &receipt).unwrap(), "{status}");
+        }
+        let stored = db.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(stored.status, CHAIN_WORK_COMPLETED);
+        assert_eq!(stored.completed_at_ms, run.completed_at_ms);
+        assert!(stored.error.is_empty());
+        assert_eq!(receipts(), 1);
     }
 
     #[test]

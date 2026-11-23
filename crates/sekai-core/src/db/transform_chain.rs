@@ -63,7 +63,10 @@ pub(crate) trait ChainStore {
     ) -> Result<TransformRun, String>;
     fn get_transform_run(&self, run_id: &str) -> Result<Option<TransformRun>, String>;
     fn query_output_rows(&self, dataset_id: &str) -> Result<Vec<HashMap<String, String>>, String>;
-    fn append_chain_receipt(&self, receipt: &TransformRun) -> Result<(), String>;
+    /// Move a RUNNING run to the terminal status in `run` and append its chain
+    /// receipt in one transaction. Returns false, writing nothing, when the
+    /// stored run is no longer RUNNING.
+    fn finish_run(&self, run: &TransformChainRun, receipt: &TransformRun) -> Result<bool, String>;
 }
 
 pub(crate) const CHAIN_STEP_CLAIM_LEASE_MS: i64 = 60_000;
@@ -529,14 +532,14 @@ fn complete_chain<S: ChainStore>(
     chain: &TransformChain,
     now_ms: i64,
 ) -> Result<(), String> {
-    run.status = CHAIN_WORK_COMPLETED.into();
-    run.completed_at_ms = now_ms;
-    let (input_digest, output_digest) = endpoint_digests(store, chain, run)?;
-    run.input_digest = input_digest;
-    run.output_digest = output_digest;
-    let receipt = chain_receipt(run, &run.input_digest, &run.output_digest);
-    store.append_chain_receipt(&receipt)?;
-    store.persist_run(run)
+    let mut next = run.clone();
+    next.status = CHAIN_WORK_COMPLETED.into();
+    next.completed_at_ms = now_ms;
+    let (input_digest, output_digest) = endpoint_digests(store, chain, &next)?;
+    next.input_digest = input_digest;
+    next.output_digest = output_digest;
+    let receipt = chain_receipt(&next, &next.input_digest, &next.output_digest);
+    finish_chain(store, run, next, &receipt)
 }
 
 fn fail_chain<S: ChainStore>(
@@ -547,19 +550,37 @@ fn fail_chain<S: ChainStore>(
     error: &str,
     now_ms: i64,
 ) -> Result<(), String> {
-    let existing_run_id = run.step_run_id(failed_step).unwrap_or("").to_string();
-    if existing_run_id.is_empty() && run.step_status(failed_step).is_none() {
-        run.record_step(failed_step, "", status);
+    let mut next = run.clone();
+    let existing_run_id = next.step_run_id(failed_step).unwrap_or("").to_string();
+    if existing_run_id.is_empty() && next.step_status(failed_step).is_none() {
+        next.record_step(failed_step, "", status);
     } else {
-        run.record_step(failed_step, &existing_run_id, status);
+        next.record_step(failed_step, &existing_run_id, status);
     }
-    run.status = status.to_string();
-    run.failed_step = failed_step.to_string();
-    run.error = error.to_string();
-    run.completed_at_ms = now_ms;
-    let receipt = chain_receipt(run, "", "");
-    store.append_chain_receipt(&receipt)?;
-    store.persist_run(run)
+    next.status = status.to_string();
+    next.failed_step = failed_step.to_string();
+    next.error = error.to_string();
+    next.completed_at_ms = now_ms;
+    let receipt = chain_receipt(&next, "", "");
+    finish_chain(store, run, next, &receipt)
+}
+
+/// Apply a terminal transition. When another caller already ended the run,
+/// `run` becomes the stored run and its recorded cause and receipt stay.
+fn finish_chain<S: ChainStore>(
+    store: &S,
+    run: &mut TransformChainRun,
+    next: TransformChainRun,
+    receipt: &TransformRun,
+) -> Result<(), String> {
+    *run = if store.finish_run(&next, receipt)? {
+        next
+    } else {
+        store
+            .load_run(&run.run_id)?
+            .ok_or_else(|| "transform chain run not found".to_string())?
+    };
+    Ok(())
 }
 
 fn endpoint_digests<S: ChainStore>(
@@ -764,18 +785,7 @@ impl ChainStore for SekaiDb {
             ],
         )
         .map_err(|error| error.to_string())?;
-        for step in &run.steps {
-            tx.execute(
-                "INSERT INTO sekai_transform_chain_step_run
-                 (chain_run_id, step_name, transform_run_id, status)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(chain_run_id, step_name) DO UPDATE SET
-                    transform_run_id = CASE WHEN transform_run_id = '' THEN excluded.transform_run_id ELSE transform_run_id END,
-                    status = CASE WHEN status IN ('completed', 'failed', 'cancelled') THEN status ELSE excluded.status END",
-                params![run.run_id, step.step, step.transform_run_id, step.status],
-            )
-            .map_err(|error| error.to_string())?;
-        }
+        upsert_step_runs_sqlite(&tx, run)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -952,9 +962,56 @@ impl ChainStore for SekaiDb {
         self.query_rows(dataset_id, &RowQuery::default())
     }
 
-    fn append_chain_receipt(&self, receipt: &TransformRun) -> Result<(), String> {
-        crate::db::receipt_chain::append_transform_run_chain(&self.conn(), receipt)
+    fn finish_run(&self, run: &TransformChainRun, receipt: &TransformRun) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE sekai_transform_chain_run
+                 SET status = ?2, failed_step = ?3, error = ?4, completed_at_ms = ?5,
+                     input_digest = ?6, output_digest = ?7
+                 WHERE run_id = ?1 AND status = 'running'",
+                params![
+                    run.run_id,
+                    run.status,
+                    run.failed_step,
+                    run.error,
+                    run.completed_at_ms,
+                    run.input_digest,
+                    run.output_digest
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        upsert_step_runs_sqlite(&tx, run)?;
+        crate::db::receipt_chain::append_transform_run_chain(&tx, receipt)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(true)
     }
+}
+
+/// Upsert step rows; a step that reached a terminal status keeps it.
+fn upsert_step_runs_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    run: &TransformChainRun,
+) -> Result<(), String> {
+    for step in &run.steps {
+        tx.execute(
+            "INSERT INTO sekai_transform_chain_step_run
+             (chain_run_id, step_name, transform_run_id, status)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chain_run_id, step_name) DO UPDATE SET
+                transform_run_id = CASE WHEN transform_run_id = '' THEN excluded.transform_run_id ELSE transform_run_id END,
+                status = CASE WHEN status IN ('completed', 'failed', 'cancelled') THEN status ELSE excluded.status END",
+            params![run.run_id, step.step, step.transform_run_id, step.status],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn load_run_sqlite(
@@ -1409,6 +1466,95 @@ mod tests {
             run.step_status("b").is_none() || run.step_status("b") != Some(CHAIN_WORK_COMPLETED)
         );
         assert!(run.step_status("c").is_none());
+    }
+
+    fn chain_receipts(db: &SekaiDb, run_id: &str) -> usize {
+        export_receipt_chain(db, "ops")
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| entry.receipt_id == run_id)
+            .count()
+    }
+
+    #[test]
+    fn a_late_step_event_leaves_a_failed_run_unchanged() {
+        let db = db_with_receipts();
+        let keys = SigningKeySet::from_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000002",
+            1,
+        )
+        .unwrap();
+        let _guard = install_test_signer(keys);
+        seed_projection(&db);
+        db.append_rows(
+            "in",
+            &[HashMap::from([
+                ("id".into(), String::new()),
+                ("keep".into(), "yes".into()),
+            ])],
+        )
+        .unwrap();
+        db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        let (failed, _) = db
+            .run_transform_chain("ops", "pipe", "k-late", "", 30)
+            .unwrap();
+        assert_eq!(failed.status, CHAIN_WORK_FAILED);
+        assert_eq!(chain_receipts(&db, &failed.run_id), 1);
+
+        let mut late = db
+            .get_governed_transform_run(failed.step_run_id("a").unwrap())
+            .unwrap()
+            .unwrap();
+        late.dispatch_status = TRANSFORM_WORK_FAILED.into();
+        late.quality_rule = "late failure".into();
+        on_transform_run_written(&db, &late, 90).unwrap();
+        let reread = db
+            .get_transform_chain_run(&failed.run_id, 95)
+            .unwrap()
+            .unwrap();
+        for run in [db.load_run(&failed.run_id).unwrap().unwrap(), reread] {
+            assert_eq!(run.status, CHAIN_WORK_FAILED);
+            assert_eq!(run.failed_step, failed.failed_step);
+            assert_eq!(run.error, failed.error);
+            assert_eq!(run.completed_at_ms, failed.completed_at_ms);
+        }
+        assert_eq!(chain_receipts(&db, &failed.run_id), 1);
+
+        // Retry with the same idempotency key reopens the run.
+        let (retried, _) = db
+            .run_transform_chain("ops", "pipe", "k-late", "", 100)
+            .unwrap();
+        assert_eq!(retried.run_id, failed.run_id);
+        assert_eq!(retried.status, CHAIN_WORK_FAILED);
+        assert_eq!(retried.completed_at_ms, 100);
+        assert_eq!(chain_receipts(&db, &failed.run_id), 2);
+    }
+
+    #[test]
+    fn a_second_completion_appends_no_receipt() {
+        let db = db_with_receipts();
+        let keys = SigningKeySet::from_seed_hex(
+            "0000000000000000000000000000000000000000000000000000000000000003",
+            1,
+        )
+        .unwrap();
+        let _guard = install_test_signer(keys);
+        seed_projection(&db);
+        let chain = db.put_transform_chain(&three_step_chain(), 20).unwrap();
+        let (run, _) = db
+            .run_transform_chain("ops", "pipe", "k-twice", "", 30)
+            .unwrap();
+        assert_eq!(run.status, CHAIN_WORK_COMPLETED);
+        assert_eq!(chain_receipts(&db, &run.run_id), 1);
+
+        // A caller that read the run while it was still running.
+        let mut stale = run.clone();
+        stale.status = CHAIN_WORK_RUNNING.into();
+        stale.completed_at_ms = 0;
+        complete_chain(&db, &mut stale, &chain, 500).unwrap();
+        assert_eq!(stale.completed_at_ms, run.completed_at_ms);
+        assert_eq!(chain_receipts(&db, &run.run_id), 1);
     }
 
     #[test]
