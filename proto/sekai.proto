@@ -2163,6 +2163,13 @@ message ObjectChangeEvent {
   string field = 6;
   int64 committed_at_ms = 7;
   string operation_id = 8;
+  // The changed field's value before and after an update, decided for the
+  // reader as ListObjectChanges decides it. Empty on create, delete, and
+  // invalidate events, and when values_withheld is set.
+  string old_value = 9;
+  string new_value = 10;
+  // Set on an update whose values the reader may not see.
+  bool values_withheld = 11;
 }
 message ReadObjectChangeSubscriptionRequest {
   string subscription_id = 1;

@@ -6,7 +6,7 @@ use crate::sekai::object_change_subscription::{
     ObjectChangeReadRequest, ObjectChangeScope, ReaderVisibility, authorization_pin,
     object_matches_filters, read_object_change_subscription_for_reader,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl SekaiServiceImpl {
     pub(super) async fn read_visible_object_change_subscription(
@@ -107,6 +107,22 @@ impl SekaiServiceImpl {
             .unwrap_or_else(|| "legacy".into());
         let pin = authorization_pin(&activation_id, &principals)
             .map_err(|_| Status::internal("object-change authorization pin unavailable"))?;
+        // Update values follow ListObjectChanges' redaction for this reader.
+        // Guest and shared-space history is reconstructed per change against
+        // the collaboration ceiling; a subscription page cannot, so those
+        // readers get no values at all.
+        let collaboration_ceiling = tenant_context.as_ref().is_some_and(|context| {
+            context.guest_home_tenant().is_some() || context.named_space().is_some()
+        });
+        let value_schema = self
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        let value_policy = self
+            .db
+            .runtime()
+            .active_object_policy(&scope_filter.namespace, &scope_filter.kind)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?;
         let now_ms = now_millis();
         let mut recorded_purposes = HashSet::new();
         let mut resolver_error = None;
@@ -129,7 +145,7 @@ impl SekaiServiceImpl {
             },
             now_ms,
             &mut visible,
-            |object_ids, deleted_ids| {
+            |object_ids, deleted_ids, updated_fields| {
                 self.resolve_visible_changed_objects(
                     object_ids,
                     &scope_filter,
@@ -147,11 +163,35 @@ impl SekaiServiceImpl {
                         })
                         .cloned()
                         .collect();
+                    let readable_values = if collaboration_ceiling {
+                        BTreeMap::new()
+                    } else {
+                        updated_fields
+                            .iter()
+                            .map(|(object_id, fields)| {
+                                let rule = ChangeValueRule::new(
+                                    object_id,
+                                    &scope_filter.kind,
+                                    &value_schema,
+                                    &self.security,
+                                    &policy_context,
+                                    value_policy.as_ref(),
+                                );
+                                let fields = fields
+                                    .iter()
+                                    .filter(|field| rule.readable(field))
+                                    .cloned()
+                                    .collect();
+                                (object_id.clone(), fields)
+                            })
+                            .collect()
+                    };
                     (
                         visible,
                         ReaderVisibility {
                             readable_ids,
                             readable_deletes,
+                            readable_values,
                         },
                     )
                 })
@@ -188,6 +228,9 @@ impl SekaiServiceImpl {
                     field: event.field,
                     committed_at_ms: event.committed_at_ms,
                     operation_id: event.operation_id,
+                    old_value: event.old_value,
+                    new_value: event.new_value,
+                    values_withheld: event.values_withheld,
                 })
                 .collect(),
             authority: false,
@@ -583,5 +626,191 @@ mod tests {
             })
             .collect();
         assert_eq!(events, [(last.as_str(), OP_UPDATE, "properties.tier")]);
+    }
+
+    async fn read_as(
+        svc: &SekaiServiceImpl,
+        principal: &str,
+        snapshot: &str,
+        last_digest: &str,
+    ) -> ReadObjectChangeSubscriptionResponse {
+        svc.read_object_change_subscription(with_named_principal(
+            ReadObjectChangeSubscriptionRequest {
+                subscription_id: format!("sales-customers-{principal}"),
+                scope: Some(scope()),
+                snapshot_revision: snapshot.into(),
+                limit: 32,
+                retention_ms: 0,
+                last_page_digest: last_digest.into(),
+                revoke: false,
+            },
+            principal,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    #[tokio::test]
+    async fn update_events_carry_the_values_list_object_changes_shows_the_reader() {
+        exercise_update_values(RuntimeDb::memory()).await;
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_update_events_carry_the_values_list_object_changes_shows_the_reader() {
+        // The PostgreSQL store blocks in place, so it needs a multi-thread
+        // runtime, and drops after it: closing its pool blocks.
+        let scratch = crate::db::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(Arc::new(scratch.connect()));
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(exercise_update_values(db.clone()));
+        drop(db);
+    }
+
+    /// A reader allowed restricted properties gets an update's old and new
+    /// values; a viewer gets the public change's values and, for the
+    /// restricted one, neither value and the withheld flag, while
+    /// ListObjectChanges redacts the same change for the same viewer.
+    async fn exercise_update_values(db: RuntimeDb) {
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            Arc::new(db),
+        ));
+        grant_namespace(&svc, "sales", "root_page");
+        let (_, grants) = svc
+            .db
+            .runtime()
+            .ensure_team_namespace("sales", "bob", security::Role::Viewer, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        let text = |name: &str, classification: &str| PropertyDef {
+            name: name.into(),
+            r#type: "string".into(),
+            classification: classification.into(),
+            ..Default::default()
+        };
+        svc.create_schema_type(with_named_principal(
+            CreateSchemaTypeRequest {
+                r#type: Some(ObjectType {
+                    kind: "Customer".into(),
+                    properties: vec![text("region", "public"), text("secret", "sensitive")],
+                    ..Default::default()
+                }),
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+        let mut customer = proto_customer("c-eu", "North", "eu");
+        customer
+            .properties
+            .insert("secret".into(), "old-secret".into());
+        let created = svc
+            .create_object(with_named_principal(
+                CreateObjectRequest {
+                    object: Some(customer),
+                    lease_precondition: None,
+                },
+                "root",
+            ))
+            .await
+            .unwrap()
+            .into_inner()
+            .object
+            .unwrap();
+        let snapshots = [
+            read_as(&svc, "root", "", "").await.snapshot_revision,
+            read_as(&svc, "bob", "", "").await.snapshot_revision,
+        ];
+        for (principal, snapshot) in [("root", &snapshots[0]), ("bob", &snapshots[1])] {
+            assert!(
+                read_as(&svc, principal, snapshot, "")
+                    .await
+                    .events
+                    .is_empty()
+            );
+        }
+        let mut updated = created.clone();
+        updated.properties.insert("region".into(), "apac".into());
+        updated
+            .properties
+            .insert("secret".into(), "new-secret".into());
+        // `updated` is the revision token the PostgreSQL store advances by.
+        updated.updated += 1;
+        svc.update_object(with_named_principal(
+            UpdateObjectRequest {
+                object: Some(updated),
+                lease_precondition: None,
+            },
+            "root",
+        ))
+        .await
+        .unwrap();
+
+        let values = |page: &ReadObjectChangeSubscriptionResponse, field: &str| {
+            let event = page
+                .events
+                .iter()
+                .find(|event| event.field == field)
+                .unwrap();
+            (
+                event.old_value.clone(),
+                event.new_value.clone(),
+                event.values_withheld,
+            )
+        };
+        let shown = |old: &str, new: &str| (old.to_string(), new.to_string(), false);
+        let withheld = (String::new(), String::new(), true);
+
+        // A reader allowed restricted properties sees both values.
+        let root_page = read_as(&svc, "root", &snapshots[0], "").await;
+        assert_eq!(values(&root_page, "properties.region"), shown("eu", "apac"));
+        assert_eq!(
+            values(&root_page, "properties.secret"),
+            shown("old-secret", "new-secret")
+        );
+
+        // A viewer sees the public change and neither value of the restricted
+        // one, never the redaction sentinel.
+        let bob = read_as(&svc, "bob", &snapshots[1], "").await;
+        assert_eq!(values(&bob, "properties.region"), shown("eu", "apac"));
+        assert_eq!(values(&bob, "properties.secret"), withheld);
+        assert_ne!(root_page.page_digest, bob.page_digest);
+        let replay = read_as(&svc, "bob", &snapshots[1], &bob.page_digest).await;
+        assert_eq!(replay.outcome, OUTCOME_REPLAYED);
+
+        // ListObjectChanges redacts the same change for the same reader.
+        let history = svc
+            .list_object_changes(with_named_principal(
+                ListObjectChangesRequest {
+                    object_id: created.id.clone(),
+                    limit: 10,
+                    offset: 0,
+                },
+                "bob",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        let secret = history
+            .changes
+            .iter()
+            .find(|change| change.field == "properties.secret" && !change.new_value.is_empty())
+            .unwrap();
+        assert_eq!(
+            (secret.old_value.as_str(), secret.new_value.as_str()),
+            (REDACTED_VALUE, REDACTED_VALUE)
+        );
+        let region = history
+            .changes
+            .iter()
+            .find(|change| change.field == "properties.region" && change.old_value == "eu")
+            .unwrap();
+        assert_eq!(region.new_value, "apac");
     }
 }

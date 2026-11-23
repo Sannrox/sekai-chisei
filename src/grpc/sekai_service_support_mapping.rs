@@ -322,36 +322,8 @@ pub(super) fn redact_object_change_values(
     context: &crate::sekai::object_security::PrincipalPolicyContext,
     policy: Option<&crate::sekai::object_security::ObjectSecurityPolicy>,
 ) -> ObjectChange {
-    let object = domain::Object {
-        id: object_id.into(),
-        kind: kind.into(),
-        name: String::new(),
-        namespace: String::new(),
-        external_id: String::new(),
-        properties: HashMap::new(),
-        created: 0,
-        updated: 0,
-    };
-    let restricted = if can_read_restricted_properties(security, &object, &context.subjects)
-        && context.delegated_subject.as_ref().is_none_or(|actor| {
-            can_read_restricted_properties(security, &object, std::slice::from_ref(actor))
-        }) {
-        std::collections::HashSet::new()
-    } else {
-        restricted_property_names_for_kind(schema, kind)
-    };
-    let should_redact = change
-        .field
-        .strip_prefix("properties.")
-        .is_some_and(|property| {
-            restricted.contains(property)
-                || policy.is_some_and(|policy| {
-                    !policy.allows_property_access(
-                        property,
-                        crate::sekai::object_security::PropertyGrantAccess::Read,
-                    )
-                })
-        });
+    let should_redact = !ChangeValueRule::new(object_id, kind, schema, security, context, policy)
+        .readable(&change.field);
     ObjectChange {
         id: change.id,
         object_id: change.object_id,
@@ -369,6 +341,59 @@ pub(super) fn redact_object_change_values(
         changed_by: change.changed_by,
         timestamp: change.timestamp,
         ..Default::default()
+    }
+}
+
+/// Whether a reader may see the old and new values of a change to one
+/// object: the rule ListObjectChanges redacts by and object-change
+/// subscriptions withhold by. A property the kind restricts (unless the
+/// reader and any delegated subject may read restricted properties) or one
+/// outside the active policy's read grant is unreadable.
+pub(super) struct ChangeValueRule<'a> {
+    restricted: HashSet<String>,
+    policy: Option<&'a crate::sekai::object_security::ObjectSecurityPolicy>,
+}
+
+impl<'a> ChangeValueRule<'a> {
+    pub(super) fn new(
+        object_id: &str,
+        kind: &str,
+        schema: &schema::SchemaRegistry,
+        security: &SecurityChecker,
+        context: &crate::sekai::object_security::PrincipalPolicyContext,
+        policy: Option<&'a crate::sekai::object_security::ObjectSecurityPolicy>,
+    ) -> Self {
+        let object = domain::Object {
+            id: object_id.into(),
+            kind: kind.into(),
+            name: String::new(),
+            namespace: String::new(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 0,
+            updated: 0,
+        };
+        let restricted = if can_read_restricted_properties(security, &object, &context.subjects)
+            && context.delegated_subject.as_ref().is_none_or(|actor| {
+                can_read_restricted_properties(security, &object, std::slice::from_ref(actor))
+            }) {
+            HashSet::new()
+        } else {
+            restricted_property_names_for_kind(schema, kind)
+        };
+        Self { restricted, policy }
+    }
+
+    pub(super) fn readable(&self, field: &str) -> bool {
+        field.strip_prefix("properties.").is_none_or(|property| {
+            !self.restricted.contains(property)
+                && self.policy.is_none_or(|policy| {
+                    policy.allows_property_access(
+                        property,
+                        crate::sekai::object_security::PropertyGrantAccess::Read,
+                    )
+                })
+        })
     }
 }
 pub(super) fn to_proto_link(l: &domain::Link) -> Link {
