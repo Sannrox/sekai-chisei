@@ -1912,6 +1912,20 @@ impl SekaiServiceImpl {
     ) -> Result<Response<DryRunActionPolicyResponse>, Status> {
         dry_run_action_policy(self, req)
     }
+
+    pub(super) async fn list_action_instances_rpc(
+        &self,
+        req: Request<ListActionInstancesRequest>,
+    ) -> Result<Response<ListActionInstancesResponse>, Status> {
+        list_action_instances(self, req).await
+    }
+
+    pub(super) async fn get_decision_trend_rpc(
+        &self,
+        req: Request<GetDecisionTrendRequest>,
+    ) -> Result<Response<GetDecisionTrendResponse>, Status> {
+        get_decision_trend(self, req).await
+    }
 }
 
 /// Dry-run a candidate action policy over the namespace's past governed
