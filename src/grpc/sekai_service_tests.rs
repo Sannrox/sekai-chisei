@@ -39617,3 +39617,109 @@ fn postgres_two_planes_tick_each_due_bucket_once() {
         ));
     drop((a, b));
 }
+
+#[tokio::test]
+async fn a_failed_profile_admin_grant_reverses_the_guarded_create() {
+    let svc = service();
+    let lease = svc
+        .acquire_lease(with_named_principal(
+            AcquireLeaseRequest {
+                namespace: "default".into(),
+                key: "profiles".into(),
+                owner: "root".into(),
+                ttl_ms: 60_000,
+                request_id: "acquire".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .lease
+        .unwrap();
+    let RuntimeDb::Sqlite(sqlite) = svc.db.runtime() else {
+        unreachable!("test service is SQLite")
+    };
+    sqlite
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER refuse_grant BEFORE INSERT ON sekai_grants \
+             BEGIN SELECT RAISE(ABORT, 'grant refused'); END;
+             CREATE TRIGGER refuse_delete BEFORE DELETE ON sekai_objects \
+             WHEN OLD.id = 'principal-stuck' BEGIN SELECT RAISE(ABORT, 'delete refused'); END;",
+        )
+        .unwrap();
+    let create = |id: &str, actor: &str| {
+        let profile = Object {
+            id: id.into(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: actor.into(),
+            namespace: "default".into(),
+            external_id: markings::principal_profile_external_id(actor),
+            properties: HashMap::from([(
+                markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                "confidential".into(),
+            )]),
+            created: 1,
+            updated: 1,
+        };
+        svc.guarded_create_object(with_named_principal(
+            GuardedCreateObjectRequest {
+                object: Some(profile),
+                lease_precondition: Some(LeasePrecondition {
+                    namespace: "default".into(),
+                    key: "profiles".into(),
+                    fencing_token: lease.fencing_token.clone(),
+                    request_id: format!("create-{id}"),
+                }),
+            },
+            "root",
+        ))
+    };
+
+    let error = create("principal-a", "alice").await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error.message().contains("grant refused"),
+        "{}",
+        error.message()
+    );
+    assert!(!error.message().contains("rollback"), "{}", error.message());
+    assert!(
+        svc.db
+            .runtime()
+            .get_object("principal-a")
+            .unwrap()
+            .is_none()
+    );
+
+    let error = create("principal-stuck", "bob").await.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("rollback of principal profile principal-stuck failed"),
+        "{}",
+        error.message()
+    );
+
+    // The reversed create left no replay row, so the same request runs again.
+    sqlite
+        .conn()
+        .execute_batch("DROP TRIGGER refuse_grant;")
+        .unwrap();
+    create("principal-a", "alice").await.unwrap();
+    assert!(
+        svc.db
+            .runtime()
+            .get_object("principal-a")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        sqlite
+            .list_grants("principal-a")
+            .unwrap()
+            .iter()
+            .any(|grant| grant.principal == "root")
+    );
+}

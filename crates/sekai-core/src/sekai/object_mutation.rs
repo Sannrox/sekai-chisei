@@ -105,6 +105,13 @@ impl<'a> ObjectMutation<'a> {
         }
     }
 
+    /// Reverse a create made through this handle when a follow-up write that
+    /// belongs to it fails. Removes the object, its audit rows, and, when
+    /// guarded, the replay row so a retry of the request runs again.
+    pub fn abort_create(&self, id: &str) -> Result<(), String> {
+        self.db.abort_object_create(id, self.lease.as_ref())
+    }
+
     pub fn update(
         &self,
         object: &Object,
@@ -229,6 +236,65 @@ mod tests {
             .delete("one", db.get_object("one").unwrap().as_ref(), "actor", 3)
             .unwrap();
         assert!(db.get_object("one").unwrap().is_none());
+    }
+
+    /// A reversed guarded create leaves nothing behind, so the same request
+    /// runs again; a create that was changed afterwards is not reversed.
+    fn abort_create_reverses_a_guarded_create(db: &RuntimeDb) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let lease = db
+            .acquire_lease(
+                "default", "profiles", "actor", 60_000, "acquire", "actor", "local", now,
+            )
+            .unwrap();
+        let mutation = ObjectMutation::guarded(
+            db,
+            LeasePrecondition {
+                namespace: "default",
+                key: "profiles",
+                fencing_token: &lease.fencing_token,
+                request_id: "create",
+            },
+        );
+        let value = object("one");
+        mutation.create(&value, "actor", now).unwrap();
+        mutation.abort_create("one").unwrap();
+        assert!(db.get_object("one").unwrap().is_none());
+        assert!(mutation.replay("create", &value).unwrap().is_none());
+        mutation.create(&value, "actor", now).unwrap();
+        assert!(db.get_object("one").unwrap().is_some());
+
+        let mut touched = db.get_object("one").unwrap().unwrap();
+        touched.updated += 1;
+        ObjectMutation::direct(db)
+            .update(
+                &touched,
+                &touched,
+                db.get_object("one").unwrap().as_ref(),
+                "actor",
+                now,
+            )
+            .unwrap();
+        let error = mutation.abort_create("one").unwrap_err();
+        assert!(error.contains("one"), "{error}");
+        assert!(db.get_object("one").unwrap().is_some());
+    }
+
+    #[test]
+    fn sqlite_abort_create_reverses_a_guarded_create() {
+        abort_create_reverses_a_guarded_create(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_abort_create_reverses_a_guarded_create() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        abort_create_reverses_a_guarded_create(&RuntimeDb::Postgres(std::sync::Arc::new(
+            scratch.connect(),
+        )));
     }
 
     #[test]

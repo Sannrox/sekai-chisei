@@ -235,8 +235,8 @@ impl SekaiServiceImpl {
         let policy_generation =
             object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
+        let mutation = mutation.with_policy_generation(&policy_generation);
         let created = mutation
-            .with_policy_generation(&policy_generation)
             .create(&domain_object, actor, now_millis())
             .map_err(map_mutation_persistence_error)?;
         if created.kind == markings::PRINCIPAL_PROFILE_KIND {
@@ -255,8 +255,13 @@ impl SekaiServiceImpl {
                 ..Default::default()
             };
             if let Err(error) = self.db.runtime().create_grant(&grant) {
-                let _ = self.db.runtime().delete_object(&created.id);
-                return Err(Status::internal(error));
+                return Err(Status::internal(match mutation.abort_create(&created.id) {
+                    Ok(()) => format!("principal profile admin grant failed: {error}"),
+                    Err(rollback) => format!(
+                        "principal profile admin grant failed: {error}; rollback of principal profile {} failed: {rollback}",
+                        created.id
+                    ),
+                }));
             }
             self.security.add_grant(&grant);
         }
