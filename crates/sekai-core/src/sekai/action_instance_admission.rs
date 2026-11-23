@@ -1092,7 +1092,8 @@ impl<'a> ActionInstanceAdmission<'a> {
             return Err(error);
         }
         if let Some(applied) = &applied_object {
-            action_object_mutation::complete_object_write(self.db, &applied.object, actor, now);
+            action_object_mutation::complete_object_write(self.db, &applied.object, actor, now)
+                .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: applied_object.as_ref().map(|applied| {
@@ -1504,7 +1505,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &applied.object,
                 &instance.principal,
                 now,
-            );
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: applied_object.as_ref().map(|applied| {
@@ -1719,7 +1721,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                     &object,
                     &current.principal,
                     now,
-                );
+                )
+                .map_err(ActionInstanceAdmissionError::Internal)?;
             }
             let remembered = self
                 .db
@@ -1918,7 +1921,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &applied.object,
                 &instance.principal,
                 now,
-            );
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: present.map(|applied| {
@@ -1986,7 +1990,8 @@ impl<'a> ActionInstanceAdmission<'a> {
                 &object,
                 &existing.principal,
                 now,
-            );
+            )
+            .map_err(ActionInstanceAdmissionError::Internal)?;
         }
         Ok(ActionInstanceAdmissionOutcome {
             object_revision: None,

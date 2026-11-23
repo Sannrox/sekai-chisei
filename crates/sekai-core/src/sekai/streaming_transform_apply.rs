@@ -524,7 +524,8 @@ fn complete_receipt_writes(
 ) {
     for object in &receipt.objects {
         if let Ok(Some(current)) = db.get_object(&object.object_id) {
-            action_object_mutation::complete_object_write(db, &current, actor, now_ms);
+            // Logged by the hook; the next apply of this checkpoint retries it.
+            let _ = action_object_mutation::complete_object_write(db, &current, actor, now_ms);
         }
     }
 }
