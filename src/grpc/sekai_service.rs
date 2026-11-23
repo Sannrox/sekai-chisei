@@ -43,6 +43,8 @@ mod explain_value_rpc;
 mod graph_explore_rpc;
 #[path = "media_upload_rpc.rs"]
 mod media_upload_rpc;
+#[path = "model_stage_review_rpc.rs"]
+mod model_stage_review_rpc;
 #[path = "model_stage_rpc.rs"]
 mod model_stage_rpc;
 #[path = "model_version_rpc.rs"]
@@ -299,6 +301,8 @@ impl SekaiService for SekaiServiceImpl {
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;
         promote_model_version => promote_model_version_rpc(PromoteModelVersionRequest) -> PromoteModelVersionResponse;
+        submit_model_stage_review => submit_model_stage_review_rpc(SubmitModelStageReviewRequest) -> SubmitModelStageReviewResponse;
+        decide_model_stage_review => decide_model_stage_review_rpc(DecideModelStageReviewRequest) -> DecideModelStageReviewResponse;
         ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;
         list_site_agent_working_memory => list_site_agent_working_memory_rpc(ListSiteAgentWorkingMemoryRequest) -> ListSiteAgentWorkingMemoryResponse;
         grant_namespace_export => grant_namespace_export_rpc(GrantNamespaceExportRequest) -> GrantNamespaceExportResponse;

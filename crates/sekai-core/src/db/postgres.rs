@@ -244,6 +244,7 @@ const ACTION_BINDING_DATASET_CURSORS_SCHEMA: &str =
     include_str!("postgres/0170_action_binding_dataset_cursors.sql");
 const OPERATION_IDENTITY_COLUMNS_SCHEMA: &str =
     include_str!("postgres/0171_operation_identity_columns.sql");
+const MODEL_STAGE_REVIEWS_SCHEMA: &str = include_str!("postgres/0172_model_stage_reviews.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1240,6 +1241,12 @@ const MIGRATIONS: &[Migration] = &[
         171,
         "operation_identity_columns",
         OPERATION_IDENTITY_COLUMNS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        172,
+        "model_stage_reviews",
+        MODEL_STAGE_REVIEWS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

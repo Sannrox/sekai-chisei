@@ -1,11 +1,13 @@
 //! Experimental model stage RPCs (#3023): PutModelStage, ListModelStages and
-//! PromoteModelVersion.
+//! PromoteModelVersion, plus the review calls SubmitModelStageReview and
+//! DecideModelStageReview (#3159).
 //!
 //! Stages are read with namespace read and changed with namespace write. A
-//! promotion to a gated stage needs an evaluation run of the stage's suite
-//! against the version in which every case passed (ADR 0079). Every promotion,
-//! admitted or refused, records an operation receipt; a refusal leaves the
-//! stage on its previous version.
+//! promotion to a gated stage needs an approved review of the version for the
+//! stage, decided by someone other than its submitter, and an evaluation run
+//! of the stage's suite against the version in which every case passed (ADR
+//! 0079). Every promotion, admitted or refused, records an operation receipt;
+//! a refusal leaves the stage on its previous version.
 
 use super::model_version_rpc::{authorize_namespace_read, version_visible};
 use super::*;
@@ -18,7 +20,7 @@ use sekai_domain::receipt::{
 };
 use std::collections::BTreeMap;
 
-fn authorize_namespace_write(
+pub(super) fn authorize_namespace_write(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
@@ -34,7 +36,7 @@ fn authorize_namespace_write(
     check_team_namespace(service.db.runtime(), principals, namespace, true)
 }
 
-fn require_stage_key(model_name: &str, stage: &str) -> Result<(), Status> {
+pub(super) fn require_stage_key(model_name: &str, stage: &str) -> Result<(), Status> {
     if model_name.trim().is_empty() {
         return Err(Status::invalid_argument("model_name is required"));
     }
@@ -121,15 +123,8 @@ async fn promote_model_version(
         .get_model_stage(&inner.namespace, &inner.model_name, &inner.stage)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found(domain_stage::MODEL_STAGE_NOT_FOUND))?;
-    // A version of another model, or one the caller may not see, reads as missing.
-    let version = db
-        .get_model_version(&inner.namespace, &inner.version_id)
-        .map_err(Status::internal)?
-        .filter(|version| version.model_name == current.model_name)
-        .ok_or_else(|| Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND))?;
-    if !version_visible(db, &principals, &version)? {
-        return Err(Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND));
-    }
+    let version = visible_version(db, &principals, &current, &inner.version_id)?;
+    let reviewed_by = approved_review(db, &current, &version.version_id)?;
     let now = now_millis();
     let promotion = Promotion {
         operation_id: format!("model-promotion-{}", uuid::Uuid::new_v4()),
@@ -137,9 +132,16 @@ async fn promote_model_version(
         current: &current,
         version: &version,
         evaluation_run_id: inner.evaluation_run_id.trim(),
+        reviewed_by: reviewed_by.as_deref().unwrap_or_default(),
         at_ms: now,
     };
-    let refusal = match evaluation_gate(db, &current, &version, promotion.evaluation_run_id) {
+    // The review gate comes first, so a promotion lacking both names it.
+    let gate = if current.is_gateless() || reviewed_by.is_some() {
+        evaluation_gate(db, &current, &version, promotion.evaluation_run_id)
+    } else {
+        Err(domain_stage::REFUSAL_REVIEW_NOT_APPROVED)
+    };
+    let refusal = match gate {
         Ok(()) => {
             let promoted = domain_stage::ModelStage {
                 version_id: version.version_id.clone(),
@@ -173,6 +175,51 @@ async fn promote_model_version(
         operation_id: promotion.operation_id,
         refusal: refusal.to_string(),
     }))
+}
+
+/// `version_id` of the stage's model. A version of another model, or one the
+/// caller may not see, reads as missing.
+pub(super) fn visible_version(
+    db: &RuntimeDb,
+    principals: &[String],
+    stage: &domain_stage::ModelStage,
+    version_id: &str,
+) -> Result<domain_model::ModelVersion, Status> {
+    let version = db
+        .get_model_version(&stage.namespace, version_id)
+        .map_err(Status::internal)?
+        .filter(|version| version.model_name == stage.model_name)
+        .ok_or_else(|| Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND))?;
+    if !version_visible(db, principals, &version)? {
+        return Err(Status::not_found(domain_model::MODEL_VERSION_NOT_FOUND));
+    }
+    Ok(version)
+}
+
+pub(super) fn review_key<'a>(
+    stage: &'a domain_stage::ModelStage,
+    version_id: &'a str,
+) -> crate::db::model_stage_review_store::ReviewKey<'a> {
+    crate::db::model_stage_review_store::ReviewKey {
+        namespace: &stage.namespace,
+        model_name: &stage.model_name,
+        stage: &stage.stage,
+        version_id,
+    }
+}
+
+/// The decider of `version_id`'s approved review for `stage`, or `None` when
+/// the review is missing, pending or rejected.
+fn approved_review(
+    db: &RuntimeDb,
+    stage: &domain_stage::ModelStage,
+    version_id: &str,
+) -> Result<Option<String>, Status> {
+    Ok(db
+        .get_model_stage_review(&review_key(stage, version_id))
+        .map_err(Status::internal)?
+        .filter(|review| review.state == domain_stage::ReviewState::Approved)
+        .map(|review| review.decided_by))
 }
 
 /// Whether the stage's gate admits `version`. A gateless stage admits any
@@ -217,6 +264,9 @@ struct Promotion<'a> {
     current: &'a domain_stage::ModelStage,
     version: &'a domain_model::ModelVersion,
     evaluation_run_id: &'a str,
+    /// Decider of the approved review; empty when the stage is gateless or
+    /// the review gate refused.
+    reviewed_by: &'a str,
     at_ms: i64,
 }
 
@@ -252,6 +302,9 @@ impl Promotion<'_> {
         ]);
         if let Some(refusal) = refusal {
             attributes.insert("refusal".to_string(), refusal.to_string());
+        }
+        if !self.reviewed_by.is_empty() {
+            attributes.insert("reviewed_by".to_string(), self.reviewed_by.to_string());
         }
         let mut references = vec![GovernedReference {
             kind: "model_version".into(),
@@ -316,7 +369,7 @@ impl Promotion<'_> {
     }
 }
 
-fn to_proto_stage(stage: domain_stage::ModelStage) -> ModelStage {
+pub(super) fn to_proto_stage(stage: domain_stage::ModelStage) -> ModelStage {
     ModelStage {
         namespace: stage.namespace,
         model_name: stage.model_name,

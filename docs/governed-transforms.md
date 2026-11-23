@@ -379,15 +379,27 @@ model's gateless stages to it, as registration does.
 
 A stage such as `staging` or `production` names the version of one model
 that consumers use (#3023). `PutModelStage` creates a stage or changes its
-gate and needs namespace write; `ListModelStages` needs namespace read. All
-three stage RPCs are experimental and need `SEKAI_EXPERIMENTAL_RPCS=1`.
+gate and needs namespace write; `ListModelStages` needs namespace read. The
+stage and review RPCs are experimental and need `SEKAI_EXPERIMENTAL_RPCS=1`.
 
 - **Gated stages.** A stage with an `evaluation_suite_id` moves only through
-  `PromoteModelVersion` with an evaluation run of that suite whose
-  `config_ref` is the version id and in which every case passed. A missing,
-  dry-run or shadow run refuses with `model_stage.suite_missing`, a run of
-  another version with `model_stage.evaluation_version_mismatch`, and a failed
-  case with `model_stage.suite_failed`.
+  `PromoteModelVersion`, and only with an approved review of the version for
+  that stage and an evaluation run of that suite whose `config_ref` is the
+  version id and in which every case passed. The review is checked first: a
+  missing, pending or rejected review refuses with
+  `model_stage.review_not_approved`. A missing, dry-run or shadow run refuses
+  with `model_stage.suite_missing`, a run of another version with
+  `model_stage.evaluation_version_mismatch`, and a failed case with
+  `model_stage.suite_failed`.
+- **Reviews.** One review exists per stage and version (#3159).
+  `SubmitModelStageReview` records it as `pending`; a repeated submission
+  returns it as a replay. `DecideModelStageReview` with `approve` or `reject`
+  moves it to `approved` or `rejected`. Both need namespace write. The
+  submitter can never decide their own review, even as namespace
+  administrator, and a decision is final: a rejected version stays rejected,
+  and a fixed model is a new version. A submission and a decision each record
+  an operation receipt of class `model_stage_review`, and an admitted
+  promotion's receipt names the reviewer in `reviewed_by`.
 - **Gateless stages.** A stage without a suite follows each newly registered
   version of its model, in the registering transaction.
 - **Receipts.** Every promotion records an operation receipt of class
