@@ -335,8 +335,13 @@ impl SekaiDb {
         &self,
         policy: &sekai_types::security::NamespaceGrantPolicy,
     ) -> Result<(), String> {
-        let conn = self.conn();
-        conn.execute(
+        let mut conn = self.conn();
+        // The policy and the expiry it gives open-ended grants commit together,
+        // so a failed migration never leaves `require_terms` over open access.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
             "INSERT INTO sekai_namespace_grant_policy (namespace, max_duration_ms, require_terms)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(namespace) DO UPDATE SET
@@ -356,7 +361,7 @@ impl SekaiDb {
                 DEFAULT_OPEN_ENDED_MIGRATION_MS
             };
             let end = unix_now_ms().saturating_add(duration);
-            conn.execute(
+            tx.execute(
                 "UPDATE sekai_grants
                  SET not_after_ms = ?1
                  WHERE not_after_ms = 0
@@ -373,7 +378,7 @@ impl SekaiDb {
             )
             .map_err(|e| e.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn namespace_grant_policy(
@@ -739,6 +744,86 @@ mod tests {
         let now = unix_now_ms();
         assert!(stored.not_after_ms > now);
         assert!(stored.not_after_ms <= now + 10_000);
+    }
+
+    /// A failed expiry migration rolls back the policy with it (#2823), so
+    /// `require_terms` never stands over a grant that stayed open-ended.
+    fn policy_and_migration_commit_together(db: &crate::db::runtime_db::RuntimeDb, prefix: &str) {
+        use crate::db::runtime_db::RuntimeDb;
+        let namespace = format!("{prefix}-ops");
+        let object_id = format!("{prefix}-widget");
+        let trigger = format!("refuse_{}", prefix.replace('-', "_"));
+        db.create_object(&widget(&object_id, &namespace)).unwrap();
+        db.create_grant(&Grant {
+            id: format!("{prefix}-g1"),
+            object_id: object_id.clone(),
+            principal: "alice".into(),
+            role: Role::Viewer,
+            created: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        let before = NamespaceGrantPolicy {
+            namespace: namespace.clone(),
+            max_duration_ms: 5,
+            require_terms: false,
+        };
+        db.set_namespace_grant_policy(&before).unwrap();
+        let refuse = format!("CREATE TRIGGER {trigger} BEFORE UPDATE ON sekai_grants FOR EACH ROW");
+        match db {
+            RuntimeDb::Sqlite(sqlite) => sqlite
+                .conn()
+                .execute_batch(&format!(
+                    "{refuse} WHEN NEW.object_id = '{object_id}'
+                     BEGIN SELECT RAISE(ABORT, 'grant migration refused'); END;"
+                ))
+                .unwrap(),
+            RuntimeDb::Postgres(postgres) => postgres
+                .connection()
+                .unwrap()
+                .batch_execute(&format!(
+                    "CREATE FUNCTION {trigger}() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN RAISE EXCEPTION 'grant migration refused'; END $$;
+                     {refuse} WHEN (NEW.object_id = '{object_id}') EXECUTE FUNCTION {trigger}();"
+                ))
+                .unwrap(),
+        }
+        db.set_namespace_grant_policy(&NamespaceGrantPolicy {
+            namespace: namespace.clone(),
+            max_duration_ms: 10_000,
+            require_terms: true,
+        })
+        .expect_err("the refused migration fails the policy write");
+        assert_eq!(db.namespace_grant_policy(&namespace).unwrap(), Some(before));
+        let grant = db.get_grant(&format!("{prefix}-g1")).unwrap().unwrap();
+        assert_eq!(grant.not_after_ms, 0);
+        match db {
+            RuntimeDb::Sqlite(sqlite) => sqlite
+                .conn()
+                .execute_batch(&format!("DROP TRIGGER {trigger};"))
+                .unwrap(),
+            RuntimeDb::Postgres(postgres) => postgres
+                .connection()
+                .unwrap()
+                .batch_execute(&format!(
+                    "DROP TRIGGER {trigger} ON sekai_grants; DROP FUNCTION {trigger}();"
+                ))
+                .unwrap(),
+        }
+    }
+
+    #[test]
+    fn sqlite_policy_and_grant_migration_commit_together() {
+        policy_and_migration_commit_together(&crate::db::runtime_db::RuntimeDb::memory(), "sqlite");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+    fn postgres_policy_and_grant_migration_commit_together() {
+        policy_and_migration_commit_together(
+            &crate::sekai::work_claim_conformance::postgres(),
+            &format!("pg{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()),
+        );
     }
 
     #[test]

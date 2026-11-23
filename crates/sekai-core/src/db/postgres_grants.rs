@@ -137,16 +137,24 @@ impl PostgresDb {
 
     pub fn set_namespace_grant_policy(&self, policy: &NamespaceGrantPolicy) -> Result<(), String> {
         let mut connection = self.connection()?;
-        connection
-            .execute(
-                "INSERT INTO sekai_namespace_grant_policy (namespace, max_duration_ms, require_terms)
+        // The policy and the expiry it gives open-ended grants commit together,
+        // so a failed migration never leaves `require_terms` over open access.
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sekai_namespace_grant_policy (namespace, max_duration_ms, require_terms)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (namespace) DO UPDATE SET
                     max_duration_ms = EXCLUDED.max_duration_ms,
                     require_terms = EXCLUDED.require_terms",
-                &[&policy.namespace, &policy.max_duration_ms, &policy.require_terms],
-            )
-            .map_err(|error| error.to_string())?;
+            &[
+                &policy.namespace,
+                &policy.max_duration_ms,
+                &policy.require_terms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         if policy.require_terms {
             let now_ms = crate::sekai::security::unix_now_ms();
             let duration = if policy.max_duration_ms > 0 {
@@ -155,9 +163,8 @@ impl PostgresDb {
                 DEFAULT_OPEN_ENDED_MIGRATION_MS
             };
             let end = now_ms.saturating_add(duration);
-            connection
-                .execute(
-                    "UPDATE sekai_grants
+            tx.execute(
+                "UPDATE sekai_grants
                      SET not_after_ms = $1
                      WHERE not_after_ms = 0
                        AND exception_reason = ''
@@ -169,11 +176,11 @@ impl PostgresDb {
                                      OR external_id = $2
                                      OR name = $2))
                        )",
-                    &[&end, &policy.namespace],
-                )
-                .map_err(|error| error.to_string())?;
+                &[&end, &policy.namespace],
+            )
+            .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        tx.commit().map_err(|error| error.to_string())
     }
 
     pub fn namespace_grant_policy(
