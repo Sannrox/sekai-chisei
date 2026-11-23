@@ -193,10 +193,16 @@ fn batch_outcome_uses_shared_receipt_and_evidence_contracts() {
 #[test]
 fn batch_harness_rejects_events_after_terminal() {
     let invalid = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\nevent: response.created\ndata: {\"type\":\"response.created\"}\n\n";
-    assert!(batch::run_fixture(invalid).is_err());
+    assert_eq!(
+        refusal_of(invalid),
+        "batch harness received an event after its terminal event"
+    );
 
     let mismatched_type = b"event: response.output_text.delta\ndata: {\"type\":\"response.failed\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"corrupt\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
-    assert!(batch::run_fixture(mismatched_type).is_err());
+    assert_eq!(
+        refusal_of(mismatched_type),
+        "batch harness SSE event and payload type disagree"
+    );
 }
 
 #[test]
@@ -227,26 +233,84 @@ fn terminal_metadata_accepts_canonical_top_level_forms() {
 #[test]
 fn batch_harness_rejects_an_unterminated_final_frame() {
     let truncated = b"event: response.completed\ndata: {\"type\":\"response.completed\"}";
-    assert!(batch::run_fixture(truncated).is_err());
+    assert_eq!(
+        refusal_of(truncated),
+        "batch harness stream ended within an SSE frame"
+    );
+}
+
+/// Returns the harness refusal for a fixture that must not decode.
+fn refusal_of(bytes: &[u8]) -> String {
+    match batch::run_fixture(bytes) {
+        Ok(result) => panic!("fixture decoded to terminal {}", result.terminal),
+        Err(error) => error,
+    }
+}
+
+const TERMINAL_FRAME: &str = "event: response.completed\ndata: {\"type\":\"response.completed\"}\n";
+
+/// A valid `response.completed` frame of exactly `len` bytes, padded with an
+/// SSE comment line, followed by its blank-line separator.
+fn padded_terminal_frame(len: usize) -> Vec<u8> {
+    let mut frame = TERMINAL_FRAME.as_bytes().to_vec();
+    frame.push(b':');
+    frame.resize(len, b'x');
+    frame.extend_from_slice(b"\n\n");
+    frame
+}
+
+/// A stream of `len` bytes: fifteen full-size comment frames, then one padded
+/// terminal frame, so only the stream bound can refuse it.
+fn padded_stream(len: usize) -> Vec<u8> {
+    let mut stream = Vec::with_capacity(len);
+    for _ in 0..15 {
+        stream.push(b':');
+        stream.resize(stream.len() + batch::MAX_SSE_FRAME_BYTES - 1, b'x');
+        stream.extend_from_slice(b"\n\n");
+    }
+    let terminal_len = len - stream.len() - 2;
+    assert!(terminal_len <= batch::MAX_SSE_FRAME_BYTES);
+    stream.extend(padded_terminal_frame(terminal_len));
+    assert_eq!(stream.len(), len);
+    stream
 }
 
 #[test]
 fn batch_harness_bounds_streams_and_individual_frames() {
-    let oversized_stream = vec![b' '; batch::MAX_STREAM_BYTES + 1];
-    assert!(batch::run_fixture(&oversized_stream).is_err());
+    let at_frame_limit = padded_terminal_frame(batch::MAX_SSE_FRAME_BYTES);
+    assert_eq!(
+        batch::run_fixture(&at_frame_limit).unwrap().terminal,
+        "response.completed"
+    );
+    assert_eq!(
+        refusal_of(&padded_terminal_frame(batch::MAX_SSE_FRAME_BYTES + 1)),
+        "batch harness SSE frame exceeds the size limit"
+    );
 
-    let mut oversized_frame = vec![b'a'; batch::MAX_SSE_FRAME_BYTES + 1];
-    oversized_frame.extend_from_slice(b"\n\n");
-    assert!(batch::run_fixture(&oversized_frame).is_err());
+    let at_stream_limit = padded_stream(batch::MAX_STREAM_BYTES);
+    assert_eq!(
+        batch::run_fixture(&at_stream_limit).unwrap().terminal,
+        "response.completed"
+    );
+    assert_eq!(
+        refusal_of(&padded_stream(batch::MAX_STREAM_BYTES + 1)),
+        "batch harness stream exceeds the size limit"
+    );
 }
 
 #[test]
 fn batch_harness_requires_executable_tool_call_metadata() {
     let missing_name = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_a\",\"call_id\":\"call_a\",\"status\":\"completed\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
-    assert!(batch::run_fixture(missing_name).is_err());
+    assert_eq!(
+        refusal_of(missing_name),
+        "batch harness event requires name"
+    );
 
     let unfinished_message = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"status\":\"in_progress\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
-    assert!(batch::run_fixture(unfinished_message).is_err());
+    assert_eq!(
+        refusal_of(unfinished_message),
+        "batch harness completed output item has invalid status"
+    );
 
     let incomplete_message = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"partial\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}\n\nevent: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n";
     let incomplete = batch::run_fixture(incomplete_message).unwrap();
@@ -258,20 +322,32 @@ fn batch_harness_requires_executable_tool_call_metadata() {
             "event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"type\":\"function_call\",\"id\":\"item_a\",\"call_id\":\"call_a\",\"name\":\"tool\",\"status\":\"completed\",\"arguments\":{}}}}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\"}}\n\n",
             serde_json::to_string(arguments).unwrap()
         );
-        assert!(batch::run_fixture(fixture.as_bytes()).is_err());
+        assert_eq!(
+            refusal_of(fixture.as_bytes()),
+            "batch harness tool arguments must be a JSON object"
+        );
     }
 }
 
 #[test]
 fn batch_harness_binds_response_identity_and_assembles_canonical_text_order() {
     let spliced = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_b\",\"status\":\"completed\"}}\n\n";
-    assert!(batch::run_fixture(spliced).is_err());
+    assert_eq!(
+        refusal_of(spliced),
+        "batch harness terminal response identity changed"
+    );
 
     let unbound_terminal = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_a\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
-    assert!(batch::run_fixture(unbound_terminal).is_err());
+    assert_eq!(
+        refusal_of(unbound_terminal),
+        "batch harness terminal response identity is required"
+    );
 
     let late_created = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"spliced\"}\n\nevent: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_b\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_b\",\"status\":\"completed\"}}\n\n";
-    assert!(batch::run_fixture(late_created).is_err());
+    assert_eq!(
+        refusal_of(late_created),
+        "batch harness received response.created after response output"
+    );
 
     let interleaved = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_b\",\"output_index\":1,\"delta\":\"second-\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"first\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_b\",\"output_index\":1,\"delta\":\"item\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"id\":\"msg_b\",\"content\":[{\"type\":\"output_text\",\"text\":\"second-item\"}]}}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     assert_eq!(
@@ -289,7 +365,10 @@ fn batch_harness_binds_response_identity_and_assembles_canonical_text_order() {
     assert_eq!(batch::run_fixture(refusal).unwrap().text, "cannot comply");
 
     let corrupted = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"wrong\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"right\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
-    assert!(batch::run_fixture(corrupted).is_err());
+    assert_eq!(
+        refusal_of(corrupted),
+        "batch harness text differs from finalized output"
+    );
 
     let empty = b"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_a\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
     assert_eq!(batch::run_fixture(empty).unwrap().text, "");
@@ -301,7 +380,10 @@ fn batch_harness_binds_response_identity_and_assembles_canonical_text_order() {
     );
 
     let terminal_omits_streamed = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_a\",\"output_index\":0,\"delta\":\"partial\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n";
-    assert!(batch::run_fixture(terminal_omits_streamed).is_err());
+    assert_eq!(
+        refusal_of(terminal_omits_streamed),
+        "batch harness terminal response omitted streamed output"
+    );
 }
 
 #[test]
@@ -310,7 +392,10 @@ fn ambiguous_terminals_do_not_become_verification_results() {
         "../../../tests/fixtures/responses/interrupted.sse"
     ))
     .unwrap();
-    assert!(batch::evidence(&result, "operation-interrupted", false, 200).is_err());
+    assert_eq!(
+        batch::evidence(&result, "operation-interrupted", false, 200).unwrap_err(),
+        "batch harness cannot emit verification evidence for a non-completed response"
+    );
 
     let receipt = batch::operation_receipt(
         &result,
