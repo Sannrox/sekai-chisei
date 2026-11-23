@@ -6,7 +6,7 @@ use sekai_chisei::chisei_store::ChiseiRuntimeDb;
 use sekai_chisei::db::chisei_budget::METRIC_TOKENS;
 use sekai_chisei::db::replica_safety::ReplicaSafetyInventory;
 
-use crate::replica_safety_harness::open_replica_pair;
+use crate::replica_safety_harness::{assert_losers_are_budget_refusals, open_replica_pair};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,6 +25,7 @@ fn concurrent_replicas_cannot_overspend_shared_limit() {
     let results = pair.race_results(8, |_index, db| {
         db.budget_check_and_reserve_chain("ns", METRIC_TOKENS, 40, 1_000)
     });
+    assert_losers_are_budget_refusals(&results);
     let successes = results.iter().filter(|r| r.is_ok()).count();
     assert!(
         successes <= 2,
@@ -139,7 +140,7 @@ fn limit_written_on_one_replica_is_enforced_on_the_other() {
         .b
         .budget_check_and_reserve_chain("shared", METRIC_TOKENS, 6, 5_000)
         .unwrap_err();
-    assert!(!err.is_empty());
+    assert_eq!(err, "budget exceeded at shared: used 0 + 6 > 5");
     assert_eq!(
         pair.a
             .budget_usage("shared", METRIC_TOKENS, 5_000)
