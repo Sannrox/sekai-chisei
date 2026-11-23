@@ -258,6 +258,16 @@ fn schema_revision_and_payload_drift_do_not_mutate_the_live_object() {
     );
     let admitted = db.apply_source_batch(&first, PRODUCER, 100).unwrap();
     let object_id = upsert_id(&admitted.records[0].decision);
+    // Quarantined batches must leave every field of the live object as first
+    // admitted: payload digest, source version, display name, type digest,
+    // and updated version.
+    let live = || serde_json::to_value(db.get_object(&object_id).unwrap().unwrap()).unwrap();
+    let snapshot = live();
+    let recorded = snapshot.to_string();
+    assert!(
+        recorded.contains(PAYLOAD_A) && recorded.contains("rev-1"),
+        "{recorded}"
+    );
 
     let drift = pager_batch(
         &v1.digest,
@@ -280,6 +290,7 @@ fn schema_revision_and_payload_drift_do_not_mutate_the_live_object() {
             .cursor,
         "cursor:1"
     );
+    assert_eq!(live(), snapshot);
 
     let next_revision = pager_batch(
         &v2.digest,
@@ -304,8 +315,7 @@ fn schema_revision_and_payload_drift_do_not_mutate_the_live_object() {
         "{}",
         conflict.transaction.reason
     );
-    let live = db.get_object(&object_id).unwrap().unwrap();
-    assert_eq!(live.id, object_id);
+    assert_eq!(live(), snapshot);
 }
 
 #[test]
