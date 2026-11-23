@@ -194,18 +194,17 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Attests the final assets: record-image-digest is the last write to the
+  # manifest and SHA256SUMS, so the published files match the attested digests.
   attest:
     name: Attest artifacts
-    needs: [verify-tag, package]
+    needs: [verify-tag, record-image-digest]
     if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
       attestations: write
-    outputs:
-      attestation-url: ${{ steps.provenance.outputs.attestation-url }}
-      sbom-attestation-url: ${{ steps.sbom.outputs.attestation-url }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -223,17 +222,16 @@ jobs:
         run: bash scripts/release/github-release.sh guard "$TAG"
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: sekai-chisei-release
+          name: sekai-chisei-release-final
           path: dist
       - name: Attest provenance
-        id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/SHA256SUMS
             dist/sekai-chisei.cdx.json
+            dist/sekai-chisei-release.json
       - name: Attest SBOM
-        id: sbom
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: |
@@ -242,7 +240,7 @@ jobs:
 
   sekai-release:
     name: Draft GitHub release
-    needs: [verify-tag, package, attest]
+    needs: [verify-tag, package]
     if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
@@ -268,17 +266,10 @@ jobs:
         with:
           name: sekai-chisei-release
           path: dist
-      - name: Record attestation URLs on the manifest
-        env:
-          PROVENANCE_URL: ${{ needs.attest.outputs.attestation-url }}
-          SBOM_URL: ${{ needs.attest.outputs.sbom-attestation-url }}
-        run: python3 scripts/release/record.py attestations dist/sekai-chisei-release.json "$PROVENANCE_URL" "$SBOM_URL"
       - name: Notes from CHANGELOG
         env:
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: python3 scripts/release/notes.py "${TAG#v}" > dist/RELEASE_NOTES.md
-      - name: Refresh checksums after manifest patch
-        run: bash scripts/release/package.sh --out dist --checksums-only
       - name: Draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -329,6 +320,15 @@ jobs:
           TAG: ${{ needs.verify-tag.outputs.tag }}
           DOCKER_REGISTRY: ghcr.io/${{ github.repository }}
         run: bash scripts/release/record-image-digest.sh "$TAG"
+      # The exact bytes uploaded to the draft, for the attest job.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sekai-chisei-release-final
+          path: |
+            dist/SHA256SUMS
+            dist/sekai-chisei.cdx.json
+            dist/sekai-chisei-release.json
+          if-no-files-found: error
 
   # Publishes last, after every asset job, so a failed asset job leaves a
   # draft that a re-run for the same tag can resume.
@@ -339,6 +339,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      attestations: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -354,6 +355,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify-tag.outputs.tag }}
         run: bash scripts/release/github-release.sh guard "$TAG"
+      # Inline, not a script: retries run the tagged commit's scripts, and
+      # older tags have no verifier.
+      - name: Verify the draft's assets against their attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          bash scripts/release/github-release.sh download "$TAG" verify SHA256SUMS sekai-chisei.cdx.json sekai-chisei-release.json
+          (cd verify && sha256sum --check --strict SHA256SUMS)
+          for asset in SHA256SUMS sekai-chisei.cdx.json sekai-chisei-release.json; do gh attestation verify "verify/$asset" --repo "$GH_REPO" --signer-workflow "$GH_REPO/.github/workflows/release.yml"; done
       - name: Publish the draft
         env:
           GH_TOKEN: ${{ github.token }}

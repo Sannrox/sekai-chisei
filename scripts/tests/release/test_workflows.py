@@ -200,6 +200,51 @@ class Release(unittest.TestCase):
         self.assertEqual(upstream("publish"), set(self.jobs) - {"publish"})
         self.assertFalse(any("publish" in needs(job) for job in self.jobs.values()))
 
+    def upstream(self, name: str) -> set:
+        found = set()
+        for dep in needs(self.jobs[name]):
+            found |= {dep} | self.upstream(dep)
+        return found
+
+    def test_attestation_follows_the_last_write_to_the_attested_assets(self):
+        writers = {
+            name
+            for name, job in self.jobs.items()
+            for step in job.get("steps", [])
+            if "record-image-digest.sh" in runs(step)
+            or "--checksums-only" in runs(step)
+            or (is_mutation(step) and "SHA256SUMS" in runs(step))
+        }
+        self.assertEqual(writers, {"sekai-release", "record-image-digest"})
+        self.assertLessEqual(writers, self.upstream("attest"))
+        self.assertFalse(any("attest" in needs(job) for name, job in self.jobs.items() if name != "publish"))
+
+        steps = self.jobs["attest"]["steps"]
+        [download] = [s for s in steps if uses(s).startswith("actions/download-artifact")]
+        [upload] = [
+            s for s in self.jobs["record-image-digest"]["steps"]
+            if uses(s).startswith("actions/upload-artifact")
+        ]
+        self.assertEqual(download["with"]["name"], upload["with"]["name"])
+        attested = set()
+        for step in steps:
+            if uses(step).startswith("actions/attest"):
+                attested |= set(step["with"]["subject-path"].split())
+        final = {"dist/SHA256SUMS", "dist/sekai-chisei.cdx.json", "dist/sekai-chisei-release.json"}
+        self.assertEqual(attested, final)
+        self.assertEqual(set(upload["with"]["path"].split()), final)
+
+    def test_publish_verifies_the_drafts_attestations_before_publishing(self):
+        steps = self.jobs["publish"]["steps"]
+        guard = next(i for i, s in enumerate(steps) if is_guard(s))
+        verify = next(i for i, s in enumerate(steps) if "gh attestation verify" in runs(s))
+        publish = next(i for i, s in enumerate(steps) if "github-release.sh publish" in runs(s))
+        self.assertLess(guard, verify)
+        self.assertLess(verify, publish)
+        self.assertNotIn("if", steps[verify])
+        self.assertIn("github-release.sh download", runs(steps[verify]))
+        self.assertIn("sha256sum --check", runs(steps[verify]))
+
     def test_package_reads_pull_requests_for_gate_flags(self):
         self.assertEqual(self.jobs["package"]["permissions"], {"contents": "read", "pull-requests": "read"})
 
