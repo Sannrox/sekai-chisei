@@ -456,7 +456,12 @@ impl SekaiDb {
             return Ok(0);
         }
         let mut conn = self.conn();
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        // Immediate: the append reads before it writes, and a deferred read
+        // snapshot that another writer commits past fails without waiting
+        // (#3361). Taking the write lock first waits within the busy timeout.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         append_rows_tx(&tx, dataset_id, rows)?;
         tx.commit().map_err(|error| error.to_string())?;
         i32::try_from(rows.len()).map_err(|_| "too many dataset rows".into())
@@ -1483,6 +1488,39 @@ mod tests {
 
     fn setup() -> SekaiDb {
         SekaiDb::new(":memory:").unwrap()
+    }
+
+    /// #3361: an append that overlaps another connection's write waits for
+    /// it within the busy timeout instead of failing with "database is
+    /// locked" when its read snapshot goes stale.
+    #[test]
+    fn an_append_waits_for_another_connections_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append-wait.db");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.create_dataset(&Dataset {
+            id: "a".into(),
+            name: "a".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE; CREATE TABLE other_write (id INTEGER);")
+            .unwrap();
+        // The writer commits while the append is waiting on its lock, which
+        // leaves a deferred transaction's read snapshot stale.
+        let committer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            writer.execute_batch("COMMIT").unwrap();
+        });
+        let rows = vec![HashMap::from([("v".to_string(), "1".to_string())])];
+        let appended = db.append_rows("a", &rows);
+        committer.join().unwrap();
+        assert_eq!(appended, Ok(1));
     }
 
     #[test]
