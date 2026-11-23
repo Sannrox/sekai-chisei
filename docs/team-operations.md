@@ -65,6 +65,15 @@ instance ids of each window, and `digest` is a SHA-256 over the report with
 the digest empty, so the same instances give the same digest and a verifier
 who fetches the listed instances recomputes it.
 
+A console reads the same report from `SekaiService.GetDecisionTrend`
+(experimental, so it needs `SEKAI_EXPERIMENTAL_RPCS=1`). The request takes
+`namespace`, `window_ms`, and optional `until_ms` (default: the plane's
+time), `min_count` and `max_share_shift_bps`. The response's `report_json`
+is the document `--json` prints. The plane reads both windows through its own
+`ListActionInstances` with the caller's identity, so access, withheld counts,
+the window bound and the digest are those of the CLI. Over the window bound
+the RPC returns `FAILED_PRECONDITION`.
+
 ## Lookup-first substitution report
 
 Inspect realized lookup-first and model-path evidence from the configured local

@@ -1288,6 +1288,13 @@ impl SekaiService for SekaiServiceImpl {
         rpc_actions::list_action_instances(self, req).await
     }
 
+    async fn get_decision_trend(
+        &self,
+        req: Request<GetDecisionTrendRequest>,
+    ) -> Result<Response<GetDecisionTrendResponse>, Status> {
+        rpc_actions::get_decision_trend(self, req).await
+    }
+
     async fn list_pending_decisions(
         &self,
         req: Request<ListPendingDecisionsRequest>,

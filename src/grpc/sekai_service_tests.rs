@@ -21009,6 +21009,90 @@ async fn action_instance_list_pages_through_a_created_window() {
     );
 }
 
+/// #3090: the RPC serves the report the CLI reduces from the same listing,
+/// digest included, and refuses a caller without namespace read.
+#[tokio::test]
+async fn decision_trend_rpc_reports_what_the_cli_reduces() {
+    use sekai_admin_client::decision_trend::{DecisionTrendReport, Thresholds, decision_trend};
+    let svc = service();
+    let namespace = "trend-ns";
+    grant_source_namespace(&svc, namespace, "owner", security::Role::Viewer);
+    let instances = [
+        ("base-a", 10, "grant"),
+        ("base-b", 20, "deny"),
+        ("cur-a", 110, "grant"),
+        ("cur-b", 120, "grant"),
+        ("cur-c", 130, ""),
+    ];
+    for (id, created_at_ms, approval) in instances {
+        let mut instance = action_read_fixture(namespace);
+        instance.instance_id = id.into();
+        instance.idempotency_key = format!("key-{id}");
+        instance.operation_id = format!("op-{id}");
+        instance.created_at_ms = created_at_ms;
+        instance.approval_decision = approval.into();
+        if !approval.is_empty() {
+            instance.status = "admitted".into();
+            instance.decided_at_ms = created_at_ms + 5;
+        }
+        svc.db.runtime().put_action_instance(&instance).unwrap();
+    }
+    let request = |principal: &str, window_ms: i64| {
+        with_named_principal(
+            GetDecisionTrendRequest {
+                namespace: namespace.into(),
+                window_ms,
+                until_ms: Some(200),
+                min_count: Some(1),
+                max_share_shift_bps: None,
+            },
+            principal,
+        )
+    };
+    let served: DecisionTrendReport = serde_json::from_str(
+        &svc.get_decision_trend(request("owner", 100))
+            .await
+            .unwrap()
+            .into_inner()
+            .report_json,
+    )
+    .unwrap();
+
+    // The CLI's read: the same listing pages, reduced on the client.
+    let list = |request| {
+        let svc = &svc;
+        async move {
+            svc.list_action_instances(with_named_principal(request, "owner"))
+                .await
+                .map(tonic::Response::into_inner)
+        }
+    };
+    let thresholds = Thresholds {
+        min_count: 1,
+        ..Thresholds::default()
+    };
+    let cli = decision_trend(list, namespace, 100, 200, thresholds)
+        .await
+        .unwrap();
+    assert_eq!(served, cli);
+    assert_eq!(served.window.instance_ids, ["cur-a", "cur-b", "cur-c"]);
+    assert_eq!(served.baseline.instance_ids, ["base-a", "base-b"]);
+    let review = &served.types[0];
+    assert_eq!((review.current.parked, review.baseline.parked), (3, 2));
+    assert!(served.digest.starts_with("sha256:"));
+
+    let refused = svc
+        .get_decision_trend(request("outsider", 100))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    let empty_window = svc
+        .get_decision_trend(request("owner", 0))
+        .await
+        .unwrap_err();
+    assert_eq!(empty_window.code(), tonic::Code::InvalidArgument);
+}
+
 #[tokio::test]
 async fn action_instance_reads_require_entitlement_and_target_visibility() {
     let svc = service();

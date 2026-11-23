@@ -3942,6 +3942,33 @@ message ListActionInstancesResponse {
   uint32 withheld_count = 3;
 }
 
+// The decision trend report (#3090) for one namespace: the window
+// `[until_ms - window_ms, until_ms)` against the baseline window of the same
+// length before it. The plane reads both windows through ListActionInstances
+// with the caller's identity, so the caller needs namespace read and sees
+// only the instances it may read; the rest count as withheld.
+message GetDecisionTrendRequest {
+  string namespace = 1;
+  // Greater than zero.
+  int64 window_ms = 2;
+  // Defaults to the plane's current time.
+  optional int64 until_ms = 3;
+  // Fewest instances in each window's denominator before a series is judged.
+  // Defaults to 30.
+  optional uint32 min_count = 4;
+  // A judged series drifts when its share moves by more than this many basis
+  // points. Defaults to 1500.
+  optional uint32 max_share_shift_bps = 5;
+}
+
+message GetDecisionTrendResponse {
+  // The `decision_trend/v1` report as JSON, the same document
+  // `sekaictl report decisions --json` prints: per action type window
+  // stats and series, the drifted count, each window's instance ids and
+  // withheld count, and a `sha256:` digest over the report.
+  string report_json = 1;
+}
+
 // Experimental (#2203): what waits on the caller's decision, across the four
 // review kinds. Rows stay in each kind's own store, and deciding still goes
 // through that kind's RPC.
@@ -6380,6 +6407,8 @@ service SekaiService {
   rpc ExecuteActionPlan(ExecuteActionPlanRequest) returns (ExecuteActionPlanResponse);
   rpc GetActionInstance(GetActionInstanceRequest) returns (GetActionInstanceResponse);
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
+  // The decision trend report over governed Action instances (#3090).
+  rpc GetDecisionTrend(GetDecisionTrendRequest) returns (GetDecisionTrendResponse);
   // Experimental: decisions the caller may make across review kinds (#2203).
   rpc ListPendingDecisions(ListPendingDecisionsRequest) returns (ListPendingDecisionsResponse);
   // Typed effects on admitted ActionInstances (#398).
