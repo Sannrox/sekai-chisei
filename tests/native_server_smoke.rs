@@ -1221,6 +1221,129 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn spawned_binary_admits_one_action_per_committed_dataset_version() {
+    // #3034: a dataset-commit binding pins on its first run, admits exactly
+    // one instance for the next committed version, and a rerun admits
+    // nothing new.
+    let (_fake, server) = mocked_server().await;
+    server.grant_namespace("demo", "svc-loader", "editor").await;
+    let mut sekai = server.sekai().await;
+    sekai
+        .put_governed_action_type(PutGovernedActionTypeRequest {
+            r#type: Some(GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "dataset.refresh".into(),
+                version: "1".into(),
+                description: "Refresh a report from a dataset version".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"dataset":{"type":"string"},"version":{"type":"string"}},"required":["dataset","version"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            }),
+            request_id: String::new(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put type: {error}\n{}", server.logs()));
+    sekai
+        .create_object(CreateObjectRequest {
+            object: Some(Object {
+                id: "orders-table".into(),
+                kind: "table".into(),
+                name: "orders".into(),
+                namespace: "demo".into(),
+                external_id: String::new(),
+                properties: HashMap::new(),
+                created: 0,
+                updated: 0,
+            }),
+            lease_precondition: None,
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create object: {error}\n{}", server.logs()));
+    sekai
+        .create_dataset(CreateDatasetRequest {
+            dataset: Some(Dataset {
+                id: "orders".into(),
+                name: "orders".into(),
+                columns: vec![ColumnDef {
+                    name: "order_id".into(),
+                    r#type: "string".into(),
+                    classification: "public".into(),
+                }],
+                object_id: "orders-table".into(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create dataset: {error}\n{}", server.logs()));
+    let installed = sekai
+        .put_action_binding(PutActionBindingRequest {
+            binding_json: json!({
+                "contract_version": "sekai.action-binding/v1",
+                "binding_id": "refresh-on-commit",
+                "namespace": "demo",
+                "dataset_commit": {"dataset_id": "orders"},
+                "type_id": "dataset.refresh",
+                "version": "1",
+                "run_as": "svc-loader",
+                "parameters": {
+                    "dataset": {"source": "dataset_id"},
+                    "version": {"source": "version_id"}
+                },
+                "enabled": true
+            })
+            .to_string(),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("put binding: {error}\n{}", server.logs()))
+        .into_inner();
+    assert_eq!(installed.revision, 1);
+    let run = |sekai: &SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient>| {
+        let mut sekai = sekai.clone();
+        async move {
+            sekai
+                .run_action_binding(RunActionBindingRequest {
+                    namespace: "demo".into(),
+                    binding_id: "refresh-on-commit".into(),
+                    limit: 16,
+                })
+                .await
+                .map(|response| response.into_inner())
+        }
+    };
+    let append = |sekai: &SekaiServiceClient<sekai_chisei::grpc::client::GatewayClient>,
+                  order: &str| {
+        let mut sekai = sekai.clone();
+        let request = AppendRowsRequest {
+            dataset_id: "orders".into(),
+            rows: vec![Row {
+                values: HashMap::from([("order_id".into(), order.into())]),
+            }],
+        };
+        async move { sekai.append_rows(request).await }
+    };
+    append(&sekai, "o1")
+        .await
+        .unwrap_or_else(|error| panic!("append: {error}\n{}", server.logs()));
+    let pinned = run(&sekai).await.expect("first run pins");
+    assert!(pinned.submissions.is_empty(), "no backfill: {pinned:?}");
+
+    append(&sekai, "o2")
+        .await
+        .unwrap_or_else(|error| panic!("append: {error}\n{}", server.logs()));
+    let admitted = run(&sekai).await.expect("run after commit");
+    assert_eq!(admitted.submissions.len(), 1, "{admitted:?}");
+    let submission = &admitted.submissions[0];
+    assert_eq!(submission.dataset_id, "orders");
+    assert!(!submission.version_id.is_empty());
+    assert!(!submission.instance_id.is_empty(), "{admitted:?}");
+    assert!(!submission.replay);
+
+    let rerun = run(&sekai).await.expect("rerun");
+    assert!(rerun.submissions.is_empty(), "{rerun:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn spawned_binary_admits_one_action_per_bound_object_change() {
     // #1092: a namespace-admin-installed binding turns one object update into
     // exactly one Action instance, a rerun admits nothing new, require_approval

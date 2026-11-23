@@ -971,7 +971,8 @@ fn idle_past_retention(subscription: &EventSubscription, now_ms: i64) -> bool {
     now_ms.saturating_sub(origin) > subscription.retention_ms
 }
 
-fn page_limit(limit: i32) -> usize {
+/// A requested page size, defaulted when unset and clamped to the maximum.
+pub fn page_limit(limit: i32) -> usize {
     let requested = if limit <= 0 {
         DEFAULT_PAGE_LIMIT
     } else {

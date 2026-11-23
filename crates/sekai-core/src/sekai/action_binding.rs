@@ -11,7 +11,7 @@
 //! event, or the schedule bucket, so a redelivered page or a second tick of
 //! one bucket admits nothing new.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,22 @@ pub struct ActionBindingSchedule {
     pub every_ms: i64,
 }
 
+/// A trigger on new dataset versions (#3034): an append snapshot, a rollback,
+/// or a branch merge. Branch working copies write no version, so they do not
+/// fire. Scoped to the datasets whose binding object is in the namespace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionBindingDatasetCommit {
+    /// One dataset, or every dataset in the namespace when empty.
+    #[serde(default)]
+    pub dataset_id: String,
+}
+
+/// Recorded as the pin of a dataset-commit binding once its first run has
+/// recorded every scoped dataset's latest version.
+pub const DATASET_COMMIT_PINNED: &str = "dataset-versions";
+/// The `op` a dataset-commit submission reports.
+pub const OP_DATASET_COMMIT: &str = "dataset_commit";
+
 /// Where one Action parameter comes from. Closed: no expressions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", content = "value", rename_all = "snake_case")]
@@ -52,6 +68,10 @@ pub enum ParameterSource {
     Property(String),
     /// A fixed string.
     Constant(String),
+    /// The committed dataset's id (dataset-commit bindings only).
+    DatasetId,
+    /// The new version's id (dataset-commit bindings only).
+    VersionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +91,9 @@ pub struct ActionBinding {
     /// Fires on this interval instead of on object changes (#3033).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ActionBindingSchedule>,
+    /// Fires on new dataset versions instead of on object changes (#3034).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset_commit: Option<ActionBindingDatasetCommit>,
     pub type_id: String,
     /// Pinned `GovernedActionType` version.
     pub version: String,
@@ -121,8 +144,14 @@ impl ActionBinding {
         {
             return Err("parameter names must be non-empty without whitespace".into());
         }
+        if self.schedule.is_some() && self.dataset_commit.is_some() {
+            return Err("a binding names at most one of schedule and dataset_commit".into());
+        }
         if let Some(schedule) = self.schedule {
             return self.validate_scheduled(schedule);
+        }
+        if let Some(trigger) = &self.dataset_commit {
+            return self.validate_dataset_commit(trigger);
         }
         if self.kind.trim().is_empty() || self.kind.chars().any(char::is_whitespace) {
             return Err("kind must be non-empty without whitespace".into());
@@ -140,7 +169,15 @@ impl ActionBinding {
                 return Err(format!("unsupported op {op:?}"));
             }
         }
-        for source in self.parameters.values() {
+        for (name, source) in &self.parameters {
+            if matches!(
+                source,
+                ParameterSource::DatasetId | ParameterSource::VersionId
+            ) {
+                return Err(format!(
+                    "parameter {name:?} maps a dataset source, which only dataset_commit bindings have"
+                ));
+            }
             if let ParameterSource::Property(property) = source {
                 if property == crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY {
                     return Err("the marking property cannot be mapped into parameters".into());
@@ -177,6 +214,71 @@ impl ActionBinding {
             }
         }
         Ok(())
+    }
+
+    /// A dataset-commit binding has no object event, so it names no kind, ops
+    /// or filters and maps constants, the dataset id and the version id.
+    fn validate_dataset_commit(&self, trigger: &ActionBindingDatasetCommit) -> Result<(), String> {
+        if trigger.dataset_id.chars().any(char::is_whitespace) {
+            return Err("dataset_commit.dataset_id must not contain whitespace".into());
+        }
+        if !self.kind.is_empty() || !self.ops.is_empty() || !self.property_filters.is_empty() {
+            return Err(
+                "a dataset_commit binding must not name kind, ops or property filters".into(),
+            );
+        }
+        for (name, source) in &self.parameters {
+            if !matches!(
+                source,
+                ParameterSource::Constant(_)
+                    | ParameterSource::DatasetId
+                    | ParameterSource::VersionId
+            ) {
+                return Err(format!(
+                    "a dataset_commit binding must map parameter {name:?} from a constant, dataset_id or version_id"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable per binding revision and committed version, so a rerun, or a
+    /// rerun after a crash before the cursor moved, replays one instance.
+    pub fn dataset_idempotency_key(
+        &self,
+        dataset_id: &str,
+        version_id: &str,
+    ) -> Result<String, String> {
+        Ok(format!(
+            "binding-{}",
+            crate::shomei::digest_serializable(&(
+                &self.namespace,
+                &self.binding_id,
+                self.revision,
+                OP_DATASET_COMMIT,
+                dataset_id,
+                version_id,
+            ))?
+        ))
+    }
+
+    /// Parameters for one dataset version: validation allows constants and
+    /// the dataset and version ids only.
+    pub fn dataset_parameters(&self, dataset_id: &str, version_id: &str) -> String {
+        let parameters = self
+            .parameters
+            .iter()
+            .filter_map(|(name, source)| {
+                let value = match source {
+                    ParameterSource::Constant(value) => value.clone(),
+                    ParameterSource::DatasetId => dataset_id.to_string(),
+                    ParameterSource::VersionId => version_id.to_string(),
+                    _ => return None,
+                };
+                Some((name.clone(), serde_json::Value::String(value)))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::Value::Object(parameters).to_string()
     }
 
     /// The latest bucket start at or before `now_ms` of a scheduled binding,
@@ -253,6 +355,10 @@ impl ActionBinding {
                     .and_then(|object| object.properties.get(property))
                     .cloned()
                     .ok_or(SKIP_SOURCE_UNAVAILABLE)?,
+                // Validation keeps dataset sources off object-change bindings.
+                ParameterSource::DatasetId | ParameterSource::VersionId => {
+                    return Err(SKIP_SOURCE_UNAVAILABLE);
+                }
             };
             parameters.insert(name.clone(), serde_json::Value::String(value));
         }
@@ -364,6 +470,14 @@ impl SekaiDb {
                     read_marker_json TEXT NOT NULL DEFAULT '',
                     updated_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (namespace, binding_id)
+                );
+                CREATE TABLE IF NOT EXISTS sekai_action_binding_dataset_cursors (
+                    namespace TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    PRIMARY KEY (namespace, binding_id, dataset_id)
                 );",
             )
             .map_err(|error| error.to_string())
@@ -530,6 +644,66 @@ impl SekaiDb {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    /// The last delivered dataset version `seq` per dataset for this binding
+    /// revision. Rows of an older revision are not returned.
+    pub fn action_binding_dataset_cursors(
+        &self,
+        binding: &ActionBinding,
+    ) -> Result<HashMap<String, i64>, String> {
+        self.migrate_action_bindings()?;
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT dataset_id, seq FROM sekai_action_binding_dataset_cursors
+                 WHERE namespace = ?1 AND binding_id = ?2 AND revision = ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![
+                    binding.namespace,
+                    binding.binding_id,
+                    binding.revision as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Moves one dataset's cursor forward, only while `binding.revision` is
+    /// still installed. A row of an older revision is replaced.
+    pub fn advance_action_binding_dataset_cursor(
+        &self,
+        binding: &ActionBinding,
+        dataset_id: &str,
+        seq: i64,
+    ) -> Result<(), String> {
+        self.migrate_action_bindings()?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_action_binding_dataset_cursors
+                    (namespace, binding_id, dataset_id, revision, seq)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE EXISTS (SELECT 1 FROM sekai_action_bindings
+                               WHERE namespace = ?1 AND binding_id = ?2 AND revision = ?4)
+                 ON CONFLICT(namespace, binding_id, dataset_id) DO UPDATE SET
+                    seq = CASE WHEN revision = excluded.revision
+                               THEN max(seq, excluded.seq) ELSE excluded.seq END,
+                    revision = excluded.revision",
+                params![
+                    binding.namespace,
+                    binding.binding_id,
+                    dataset_id,
+                    binding.revision as i64,
+                    seq
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -593,6 +767,7 @@ mod tests {
             property_filters: Vec::new(),
             ops: vec![OP_UPDATE.into()],
             schedule: None,
+            dataset_commit: None,
             type_id: "incident.escalate".into(),
             version: "1".into(),
             run_as: "svc-escalator".into(),
@@ -657,6 +832,99 @@ mod tests {
         assert_eq!(
             scheduled(MIN_SCHEDULE_EVERY_MS).tick_parameters(),
             r#"{"channel":"pager"}"#
+        );
+    }
+
+    fn on_commit() -> ActionBinding {
+        ActionBinding {
+            kind: String::new(),
+            ops: Vec::new(),
+            dataset_commit: Some(ActionBindingDatasetCommit::default()),
+            parameters: BTreeMap::from([
+                ("dataset".into(), ParameterSource::DatasetId),
+                ("version".into(), ParameterSource::VersionId),
+                ("channel".into(), ParameterSource::Constant("pager".into())),
+            ]),
+            ..binding()
+        }
+    }
+
+    #[test]
+    fn dataset_sources_belong_to_dataset_commit_bindings_only() {
+        assert_eq!(on_commit().validate(), Ok(()));
+        assert_eq!(
+            on_commit().dataset_parameters("orders", "v-2"),
+            r#"{"channel":"pager","dataset":"orders","version":"v-2"}"#
+        );
+        let mut object_change = binding();
+        object_change
+            .parameters
+            .insert("dataset".into(), ParameterSource::DatasetId);
+        assert!(object_change.validate().is_err());
+        let mut scheduled = scheduled(MIN_SCHEDULE_EVERY_MS);
+        scheduled
+            .parameters
+            .insert("version".into(), ParameterSource::VersionId);
+        assert!(scheduled.validate().is_err());
+        let both = ActionBinding {
+            schedule: Some(ActionBindingSchedule {
+                every_ms: MIN_SCHEDULE_EVERY_MS,
+            }),
+            parameters: BTreeMap::new(),
+            ..on_commit()
+        };
+        assert!(both.validate().is_err());
+        let with_kind = ActionBinding {
+            kind: "incident".into(),
+            ..on_commit()
+        };
+        assert!(with_kind.validate().is_err());
+        let mut from_object = on_commit();
+        from_object
+            .parameters
+            .insert("object_id".into(), ParameterSource::ObjectId);
+        assert!(from_object.validate().is_err());
+    }
+
+    #[test]
+    fn a_dataset_key_is_stable_per_version_and_changes_with_version_or_revision() {
+        let binding = on_commit();
+        let key = binding.dataset_idempotency_key("orders", "v-1").unwrap();
+        assert_eq!(
+            key,
+            binding.dataset_idempotency_key("orders", "v-1").unwrap()
+        );
+        assert_ne!(
+            key,
+            binding.dataset_idempotency_key("orders", "v-2").unwrap()
+        );
+        let reinstalled = ActionBinding {
+            revision: binding.revision + 1,
+            ..binding.clone()
+        };
+        assert_ne!(
+            key,
+            reinstalled
+                .dataset_idempotency_key("orders", "v-1")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_binding_stored_before_dataset_triggers_decodes_as_object_change() {
+        let mut legacy = serde_json::to_value(binding()).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        fields.remove("dataset_commit");
+        fields.remove("schedule");
+        let decoded: ActionBinding = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.dataset_commit.is_none() && decoded.schedule.is_none());
+        assert_eq!(decoded.validate(), Ok(()));
+        // The field is omitted when unset, so an object-change body an older
+        // replica reads is byte-for-byte what it wrote.
+        assert!(
+            !serde_json::to_string(&binding())
+                .unwrap()
+                .contains("dataset_commit")
         );
     }
 

@@ -241,6 +241,32 @@ impl RuntimeDb {
         }
     }
 
+    pub fn action_binding_dataset_cursors(
+        &self,
+        binding: &crate::sekai::action_binding::ActionBinding,
+    ) -> Result<std::collections::HashMap<String, i64>, String> {
+        match self {
+            Self::Sqlite(db) => db.action_binding_dataset_cursors(binding),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.action_binding_dataset_cursors(binding))
+            }
+        }
+    }
+
+    pub fn advance_action_binding_dataset_cursor(
+        &self,
+        binding: &crate::sekai::action_binding::ActionBinding,
+        dataset_id: &str,
+        seq: i64,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.advance_action_binding_dataset_cursor(binding, dataset_id, seq),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_action_binding_dataset_cursor(binding, dataset_id, seq)
+            }),
+        }
+    }
+
     pub fn decide_parked_action_instance(
         &self,
         decided: &crate::sekai::action_instance::ActionInstance,

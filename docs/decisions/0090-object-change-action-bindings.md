@@ -88,3 +88,22 @@ rather than being admitted late.
   - the first run does not backfill;
   - one update admits exactly one instance, and a rerun admits nothing new;
   - `require_approval` parks.
+
+## Addendum: dataset-commit trigger (#3034)
+
+A binding may carry `dataset_commit` instead of an object-change scope. It
+fires once per new version of a dataset bound to an object in its namespace,
+with parameters from constants and the dataset and version ids. The plane
+keeps a per-dataset cursor (the last delivered version `seq`) beside the
+binding, scoped to the binding revision. The first run records every scoped
+dataset's latest version and submits nothing, as an object-change binding
+pins without backfill. A run admits each version through normal admission
+under a key from the binding revision and version id, then moves the cursor,
+so a crash in between replays instead of admitting twice. A dataset
+`run_as` cannot read is skipped without naming it. The trigger reuses the
+binding's install authority, admission path and receipts; it adds a cursor
+table (PostgreSQL migration 170) and two optional `ActionBindingSubmission`
+fields. Older planes refuse such a binding through the existing empty-`kind`
+validation. Proof: `tests/native_server_smoke.rs::spawned_binary_admits_one_action_per_committed_dataset_version`
+and the SQLite and PostgreSQL cases of
+`tests/action_binding_backend_conformance.rs`.
