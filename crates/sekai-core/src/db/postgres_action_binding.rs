@@ -6,7 +6,7 @@
 
 use crate::db::postgres::{PostgresDb, advisory_lock_key};
 use crate::sekai::action_binding::{
-    ActionBinding, ActionBindingCursor, decode_stored, encode_cursor,
+    ActionBinding, ActionBindingCursor, decode_stored, encode_cursor, scheduled_bindings,
 };
 
 impl PostgresDb {
@@ -119,6 +119,18 @@ impl PostgresDb {
             )
             .map(|_| ())
             .map_err(|error| error.to_string())
+    }
+
+    /// Enabled scheduled bindings in every namespace, for the schedule tick.
+    pub fn list_scheduled_action_bindings(&self) -> Result<Vec<ActionBinding>, String> {
+        let mut connection = self.connection()?;
+        let rows = connection
+            .query(
+                "SELECT body_json FROM sekai_action_bindings ORDER BY namespace, binding_id",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        scheduled_bindings(rows.into_iter().map(|row| row.get::<_, String>(0)))
     }
 
     pub fn list_action_bindings(&self, namespace: &str) -> Result<Vec<ActionBinding>, String> {

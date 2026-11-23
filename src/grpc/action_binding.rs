@@ -1,4 +1,5 @@
-//! Install and run object-change automation bindings (#1092, ADR 0090).
+//! Install and run object-change automation bindings (#1092, ADR 0090), and
+//! submit scheduled bindings from the plane's schedule tick (#3033).
 
 use super::*;
 use crate::sekai::action_binding::{ActionBinding, ParameterSource, ReadMarker};
@@ -140,6 +141,11 @@ impl SekaiServiceImpl {
         }
         if !binding.enabled {
             return Err(Status::failed_precondition("action binding is disabled"));
+        }
+        if binding.schedule.is_some() {
+            return Err(Status::failed_precondition(
+                "a scheduled action binding runs on the plane schedule tick",
+            ));
         }
         let run_as = vec![binding.run_as.clone()];
         let (tenant, resource_tenant) = self.prepare_bound_run(
@@ -369,6 +375,56 @@ impl SekaiServiceImpl {
             .advance_action_binding_cursor(&binding, &cursor, now_millis())
             .map_err(map_binding_store_error)?;
         Ok(Response::new(response))
+    }
+
+    /// Submits the current bucket of every enabled scheduled binding as its
+    /// service principal, through normal admission (#3033). The bucket's
+    /// idempotency key is the only fence: planes ticking at once, and a tick
+    /// rerun after a crash, replay one instance, and nothing is recorded
+    /// after the submit. A binding refused by grants, a write freeze, or
+    /// admission is logged and retried on the next tick; the others still
+    /// run. Fails with the first internal failure after every binding was
+    /// tried.
+    pub(crate) fn tick_scheduled_action_bindings(&self, now_ms: i64) -> Result<(), String> {
+        let mut internal = None;
+        for binding in self.db.runtime().list_scheduled_action_bindings()? {
+            let Some(schedule) = binding.schedule else {
+                continue;
+            };
+            let due_at_ms = binding.due_at_ms(schedule, now_ms);
+            let outcome = self
+                .prepare_bound_run(None, &binding.namespace, &binding.run_as, &binding.type_id)
+                .map_err(|status| status.message().to_string())
+                .and_then(|(tenant, resource_tenant)| {
+                    self.admit_bound_action(
+                        BoundAction {
+                            namespace: &binding.namespace,
+                            markings: &binding.markings,
+                            source_object_id: "",
+                            type_id: &binding.type_id,
+                            version: &binding.version,
+                            run_as: &binding.run_as,
+                            parameters_json: binding.tick_parameters(),
+                            idempotency_key: binding.tick_idempotency_key(due_at_ms)?,
+                        },
+                        &tenant,
+                        &resource_tenant,
+                    )
+                });
+            if let Err(reason) = outcome {
+                tracing::warn!(
+                    namespace = %binding.namespace,
+                    binding_id = %binding.binding_id,
+                    due_at_ms,
+                    reason = %reason,
+                    "scheduled action binding did not submit"
+                );
+                if is_internal_skip(&reason) {
+                    internal.get_or_insert(reason);
+                }
+            }
+        }
+        internal.map_or(Ok(()), Err)
     }
 
     /// A binding's markings must be known to the namespace lattice and
@@ -765,6 +821,7 @@ mod tests {
                     kind: "component".into(),
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
+                    schedule: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -895,6 +952,7 @@ mod tests {
                     kind: "component".into(),
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
+                    schedule: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),
@@ -1009,6 +1067,128 @@ mod tests {
         assert_eq!(still_pending[0].event_id, "evt-frozen");
     }
 
+    /// A binding that submits `component.escalate` for `billing-api` every
+    /// minute as `svc-escalator`, under `decision` as the namespace policy.
+    fn scheduled_escalator(
+        decision: crate::sekai::action_policy::ActionDecision,
+    ) -> (Arc<RuntimeDb>, SekaiServiceImpl) {
+        let db = Arc::new(RuntimeDb::memory());
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            db.clone(),
+        ));
+        let (_, grants) = db
+            .ensure_team_namespace("demo", "svc-escalator", security::Role::Editor, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        db.put_governed_action_type(
+            crate::sekai::governed_action_type::GovernedActionType {
+                namespace: "demo".into(),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                description: "Escalate a degraded component".into(),
+                parameter_schema_json: r#"{"type":"object","properties":{"component":{"type":"string"},"severity":{"type":"string"}},"required":["component","severity"],"additionalProperties":false}"#.into(),
+                allowed_effect_kinds: vec!["notify".into()],
+                enabled: true,
+                ..Default::default()
+            },
+            "local",
+            1,
+        )
+        .unwrap();
+        db.upsert_action_policy(&crate::sekai::action_policy::ActionPolicy {
+            default_decision: decision,
+            ..crate::sekai::action_policy::ActionPolicy::allow_all("demo")
+        })
+        .unwrap();
+        db.put_action_binding(
+            &ActionBinding {
+                contract_version: ACTION_BINDING_CONTRACT.into(),
+                binding_id: "escalate-hourly".into(),
+                namespace: "demo".into(),
+                kind: String::new(),
+                property_filters: Vec::new(),
+                ops: Vec::new(),
+                schedule: Some(crate::sekai::action_binding::ActionBindingSchedule {
+                    every_ms: 60_000,
+                }),
+                type_id: "component.escalate".into(),
+                version: "1".into(),
+                run_as: "svc-escalator".into(),
+                parameters: BTreeMap::from([
+                    (
+                        "component".into(),
+                        ParameterSource::Constant("billing-api".into()),
+                    ),
+                    ("severity".into(), ParameterSource::Constant("low".into())),
+                ]),
+                markings: Vec::new(),
+                enabled: true,
+                revision: 0,
+                created_by: String::new(),
+                updated_at_ms: 0,
+            },
+            "local",
+            2,
+        )
+        .unwrap();
+        (db, svc)
+    }
+
+    fn instances(db: &RuntimeDb) -> Vec<crate::sekai::action_instance::ActionInstance> {
+        db.list_action_instances("demo", Some("component.escalate"), None, 100)
+            .unwrap()
+    }
+
+    async fn tick(svc: &SekaiServiceImpl, now_ms: i64) {
+        super::super::rpc_data::run_schedule_tick(svc, now_ms, "system:transform-scheduler")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn planes_ticking_one_bucket_at_once_admit_one_scheduled_action() {
+        let (db, svc) = scheduled_escalator(crate::sekai::action_policy::ActionDecision::Allow);
+        let now = 1_000 * 60_000;
+        let (left, right) = (svc.clone(), svc.clone());
+        tokio::join!(tick(&left, now), tick(&right, now));
+        assert_eq!(instances(&db).len(), 1);
+
+        // Nothing is recorded after the submit, so a tick rerun after a crash
+        // there is this same submit again, and replays.
+        tick(&svc, now + 30_000).await;
+        assert_eq!(instances(&db).len(), 1);
+
+        // Five missed buckets collapse into the one holding the tick.
+        tick(&svc, now + 6 * 60_000).await;
+        assert_eq!(instances(&db).len(), 2);
+
+        let manual = svc
+            .run_action_binding_once(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate-hourly".into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(manual.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scheduled_action_under_require_approval_parks() {
+        let (db, svc) =
+            scheduled_escalator(crate::sekai::action_policy::ActionDecision::RequireApproval);
+        tick(&svc, 1_000 * 60_000).await;
+        let parked = instances(&db);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(
+            parked[0].status,
+            crate::sekai::action_instance::STATUS_PARKED
+        );
+        assert_eq!(parked[0].principal, "svc-escalator");
+    }
+
     fn bound_escalator() -> (Arc<RuntimeDb>, SekaiServiceImpl) {
         let db = Arc::new(RuntimeDb::memory());
         let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
@@ -1062,6 +1242,7 @@ mod tests {
                     kind: "component".into(),
                     property_filters: Vec::new(),
                     ops: vec!["update".into()],
+                    schedule: None,
                     type_id: "component.escalate".into(),
                     version: "1".into(),
                     run_as: "svc-escalator".into(),

@@ -216,6 +216,17 @@ impl RuntimeDb {
         }
     }
 
+    pub fn list_scheduled_action_bindings(
+        &self,
+    ) -> Result<Vec<crate::sekai::action_binding::ActionBinding>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_scheduled_action_bindings(),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_scheduled_action_bindings())
+            }
+        }
+    }
+
     pub fn advance_action_binding_cursor(
         &self,
         binding: &crate::sekai::action_binding::ActionBinding,
