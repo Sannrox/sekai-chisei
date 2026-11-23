@@ -45,6 +45,7 @@ reference pages.
 | [Integration-test binary consolidation](1304-integration-test-binary-consolidation.md) | Group 117 self-contained `tests/*.rs` files in [#1308](https://github.com/Sannrox/sekai-chisei/issues/1308); keep process-global and `crate::`-coupled binaries separate |
 | [Separate `chisei-plane` process](../decisions/0098-keep-chisei-plane-process.md) | Keep the bin and authenticated hop; combined remains the default local binary ([#1300](https://github.com/Sannrox/sekai-chisei/issues/1300)) |
 | [Model-call admission](2279-model-call-admission.md) | Recommendation complete; [ADR 0151](../decisions/0151-chisei-admits-every-model-call.md) names Chisei as the single admission point |
+| [Failed-case grouping](2631-failed-case-grouping.md) | Recommendation complete; deterministic grouping of a run's failed cases, suggestions stay with clients |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
