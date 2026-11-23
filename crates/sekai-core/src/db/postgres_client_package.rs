@@ -42,8 +42,26 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         for package in packages {
-            let json = serde_json::to_string(package)
-                .map_err(|error| format!("encode client package: {error}"))?;
+            // A supersede rewrites the predecessor as stored now (row locked),
+            // changing only `superseded_by`.
+            let json = if package.superseded_by.is_empty() {
+                serde_json::to_string(package)
+                    .map_err(|error| format!("encode client package: {error}"))?
+            } else {
+                let current: String = tx
+                    .query_opt(
+                        "SELECT record_json FROM sekai_client_packages
+                         WHERE namespace = $1 AND package_id = $2
+                         FOR UPDATE",
+                        &[&package.namespace, &package.package_id],
+                    )
+                    .map_err(|error| error.to_string())?
+                    .ok_or(PACKAGE_UNAVAILABLE)?
+                    .get(0);
+                let next = crate::db::client_package_store::superseded(decode(&current)?, package)?;
+                serde_json::to_string(&next)
+                    .map_err(|error| format!("encode client package: {error}"))?
+            };
             let changed = if package.superseded_by.is_empty() {
                 tx.execute(
                     "INSERT INTO sekai_client_packages

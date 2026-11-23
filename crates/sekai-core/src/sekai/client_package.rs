@@ -482,6 +482,49 @@ mod tests {
         );
     }
 
+    /// A supersede changes only the stored predecessor's `superseded_by`,
+    /// whatever else the caller's copy carries.
+    fn supersede_changes_only_superseded_by(runtime: &RuntimeDb) {
+        let original = publish(runtime, "pkg:rust-0.1.0", "0.1.0");
+        let mut stale = original.clone();
+        stale.superseded_by = "pkg:rust-0.2.0".into();
+        stale.package_name = "stale-copy".into();
+        stale.admitted_at_ms += 1;
+        let artifacts = artifacts();
+        let next = package("pkg:rust-0.2.0", "0.2.0", LANG_RUST, &artifacts);
+        let successor = validate_package(&next, &artifacts, "integrator", 2_000).unwrap();
+        runtime
+            .commit_client_packages(&[&stale, &successor])
+            .unwrap();
+        let stored = runtime
+            .get_client_package("sdk", "pkg:rust-0.1.0")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored,
+            ClientPackage {
+                superseded_by: "pkg:rust-0.2.0".into(),
+                ..original
+            }
+        );
+        // A second supersede of the same predecessor is refused.
+        assert_eq!(
+            runtime.commit_client_packages(&[&stale]).unwrap_err(),
+            PACKAGE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn sqlite_supersede_changes_only_superseded_by() {
+        supersede_changes_only_superseded_by(&db());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_supersede_changes_only_superseded_by() {
+        supersede_changes_only_superseded_by(&crate::sekai::work_claim_conformance::postgres());
+    }
+
     #[test]
     fn tamper_unknown_language_stale_protocol_and_foreign_owner_fail_unavailable() {
         let runtime = db();
