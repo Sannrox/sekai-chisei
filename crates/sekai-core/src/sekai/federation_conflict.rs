@@ -85,13 +85,27 @@ pub struct ImportCollision {
     pub now_ms: i64,
 }
 
+/// Refusal for a conflict write whose stored version changed after it was
+/// read. Nothing was written; reread and retry.
+pub const STALE_CONFLICT: &str = "federation conflict changed concurrently; retry";
+
+/// A conflict record to store and the stored version it was derived from
+/// (`None` for a first admission). Stores write it only while the stored row
+/// still equals `expected`, so a stale writer cannot roll back a newer status.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictWrite {
+    pub expected: Option<FederationConflict>,
+    pub record: FederationConflict,
+}
+
 pub fn admit_import_collision(
     db: &RuntimeDb,
     collision: &ImportCollision,
 ) -> Result<FederationConflict, String> {
-    let (record, dirty) = prepare_import_collision(db, collision)?;
+    let (write, dirty) = prepare_import_collision(db, collision)?;
+    let ConflictWrite { expected, record } = write;
     if dirty {
-        db.put_federation_conflict(&record)?;
+        db.put_federation_conflict(expected.as_ref(), &record)?;
         audit(
             db,
             &collision.actor,
@@ -104,10 +118,12 @@ pub fn admit_import_collision(
     Ok(record)
 }
 
+/// Builds the conflict write for an import collision without storing it; the
+/// flag is false when the stored record already describes both claims.
 pub fn prepare_import_collision(
     db: &RuntimeDb,
     collision: &ImportCollision,
-) -> Result<(FederationConflict, bool), String> {
+) -> Result<(ConflictWrite, bool), String> {
     let ImportCollision {
         actor,
         namespace,
@@ -150,7 +166,8 @@ pub fn prepare_import_collision(
     )?;
 
     let conflict_id = conflict_id_for(namespace, &local.id);
-    if let Some(mut existing) = db.get_federation_conflict(&conflict_id)? {
+    if let Some(stored) = db.get_federation_conflict(&conflict_id)? {
+        let mut existing = stored.clone();
         if existing.namespace != *namespace || existing.object_id != local.id {
             return Err("conflict identity does not match stored record".into());
         }
@@ -177,7 +194,11 @@ pub fn prepare_import_collision(
         if changed {
             existing.updated_at_ms = *now_ms;
         }
-        return Ok((existing, changed));
+        let write = ConflictWrite {
+            expected: Some(stored),
+            record: existing,
+        };
+        return Ok((write, changed));
     }
 
     let record = FederationConflict {
@@ -196,7 +217,11 @@ pub fn prepare_import_collision(
         updated_at_ms: *now_ms,
     };
     let _ = actor;
-    Ok((record, true))
+    let write = ConflictWrite {
+        expected: None,
+        record,
+    };
+    Ok((write, true))
 }
 
 pub fn get_conflict(
@@ -236,7 +261,8 @@ pub fn resolve_conflict(
     if now_ms < 0 {
         return Err("resolution timestamp must be non-negative".into());
     }
-    let mut record = get_conflict(db, namespace, object_id)?;
+    let stored = get_conflict(db, namespace, object_id)?;
+    let mut record = stored.clone();
     if !record.claims.iter().any(|claim| claim.claim_id == claim_id) {
         return Err("selected conflict claim is unavailable".into());
     }
@@ -258,7 +284,7 @@ pub fn resolve_conflict(
         resolved_at_ms: now_ms,
     });
     record.updated_at_ms = now_ms;
-    db.put_federation_conflict(&record)?;
+    db.put_federation_conflict(Some(&stored), &record)?;
     audit(db, actor, RESOLVE_ACTION, "resolved", &record, now_ms)?;
     Ok(record)
 }
@@ -274,7 +300,8 @@ pub fn reopen_conflict(
     if now_ms < 0 {
         return Err("reopen timestamp must be non-negative".into());
     }
-    let mut record = get_conflict(db, namespace, object_id)?;
+    let stored = get_conflict(db, namespace, object_id)?;
+    let mut record = stored.clone();
     if record.status == STATUS_OPEN && record.resolution.is_none() {
         return Ok(record);
     }
@@ -283,7 +310,7 @@ pub fn reopen_conflict(
     }
     record.status = STATUS_OPEN.into();
     record.updated_at_ms = now_ms;
-    db.put_federation_conflict(&record)?;
+    db.put_federation_conflict(Some(&stored), &record)?;
     audit(db, actor, REOPEN_ACTION, "reopened", &record, now_ms)?;
     Ok(record)
 }

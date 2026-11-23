@@ -2,13 +2,13 @@
 //! revocation, snapshot, grant, and peer-import stores (#1475, #1476).
 
 use crate::db::postgres::PostgresDb;
-use crate::sekai::federation_conflict::FederationConflict;
+use crate::sekai::federation_conflict::{ConflictWrite, FederationConflict, STALE_CONFLICT};
 use crate::sekai::federation_network::{
     NETWORK_UNAVAILABLE, NetworkContract, NetworkExchange, PEER_LOST, STATUS_ACCEPTED,
     STATUS_DISCONNECTED,
 };
 use crate::sekai::federation_profile::{FederationPeer, LocalSiteIdentity};
-use crate::sekai::federation_revocation::FederationRevocation;
+use crate::sekai::federation_revocation::{FederationRevocation, STALE_REVOCATION};
 use crate::sekai::namespace_snapshot::{
     PeerNamespaceGrant, SnapshotExportRecord, SnapshotFact, SnapshotImportRecord,
 };
@@ -125,31 +125,20 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_federation_conflict(&self, record: &FederationConflict) -> Result<(), String> {
-        let json = serde_json::to_string(record)
-            .map_err(|error| format!("encode federation conflict: {error}"))?;
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_federation_conflicts
-                    (conflict_id, namespace, object_id, status, record_json, updated_at_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (conflict_id) DO UPDATE SET
-                    namespace = EXCLUDED.namespace,
-                    object_id = EXCLUDED.object_id,
-                    status = EXCLUDED.status,
-                    record_json = EXCLUDED.record_json,
-                    updated_at_ms = EXCLUDED.updated_at_ms",
-                &[
-                    &record.conflict_id,
-                    &record.namespace,
-                    &record.object_id,
-                    &record.status,
-                    &json,
-                    &record.updated_at_ms,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    /// Stores `record` only while the stored conflict still equals `expected`
+    /// (`None`: no row yet); a stale writer gets [`STALE_CONFLICT`].
+    pub fn put_federation_conflict(
+        &self,
+        expected: Option<&FederationConflict>,
+        record: &FederationConflict,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| format!("begin federation conflict write: {error}"))?;
+        write_conflict(&mut tx, expected, record)?;
+        tx.commit()
+            .map_err(|error| format!("commit federation conflict write: {error}"))
     }
 
     pub fn get_federation_conflict(
@@ -183,31 +172,50 @@ impl PostgresDb {
             .collect()
     }
 
-    pub fn put_federation_revocation(&self, record: &FederationRevocation) -> Result<(), String> {
+    /// Stores `record` only while the stored revocation still equals
+    /// `expected` (`None`: no row yet); a stale writer gets
+    /// [`STALE_REVOCATION`].
+    pub fn put_federation_revocation(
+        &self,
+        expected: Option<&FederationRevocation>,
+        record: &FederationRevocation,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode federation revocation: {error}"))?;
-        self.connection()?
-            .execute(
-                "INSERT INTO sekai_federation_revocations
-                    (revocation_id, subject_kind, subject_id, status, record_json, updated_at_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (revocation_id) DO UPDATE SET
-                    subject_kind = EXCLUDED.subject_kind,
-                    subject_id = EXCLUDED.subject_id,
-                    status = EXCLUDED.status,
-                    record_json = EXCLUDED.record_json,
-                    updated_at_ms = EXCLUDED.updated_at_ms",
-                &[
-                    &record.revocation_id,
-                    &record.subject_kind.as_str(),
-                    &record.subject_id,
-                    &record.status,
-                    &json,
-                    &record.updated_at_ms,
-                ],
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| format!("begin federation revocation write: {error}"))?;
+        require_stored(
+            &mut tx,
+            "sekai_federation_revocations",
+            "SELECT record_json FROM sekai_federation_revocations WHERE revocation_id = $1",
+            &record.revocation_id,
+            expected,
+            STALE_REVOCATION,
+        )?;
+        tx.execute(
+            "INSERT INTO sekai_federation_revocations
+                (revocation_id, subject_kind, subject_id, status, record_json, updated_at_ms)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (revocation_id) DO UPDATE SET
+                subject_kind = EXCLUDED.subject_kind,
+                subject_id = EXCLUDED.subject_id,
+                status = EXCLUDED.status,
+                record_json = EXCLUDED.record_json,
+                updated_at_ms = EXCLUDED.updated_at_ms",
+            &[
+                &record.revocation_id,
+                &record.subject_kind.as_str(),
+                &record.subject_id,
+                &record.status,
+                &json,
+                &record.updated_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit()
+            .map_err(|error| format!("commit federation revocation write: {error}"))
     }
 
     pub fn get_federation_revocation(
@@ -571,7 +579,7 @@ impl PostgresDb {
         &self,
         record: &SnapshotImportRecord,
         facts: &[SnapshotFact],
-        conflicts: &[FederationConflict],
+        conflicts: &[ConflictWrite],
     ) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode snapshot import: {error}"))?;
@@ -606,28 +614,7 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         }
         for conflict in conflicts {
-            let conflict_json = serde_json::to_string(conflict)
-                .map_err(|error| format!("encode federation conflict: {error}"))?;
-            tx.execute(
-                "INSERT INTO sekai_federation_conflicts
-                    (conflict_id, namespace, object_id, status, record_json, updated_at_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (conflict_id) DO UPDATE SET
-                    namespace = EXCLUDED.namespace,
-                    object_id = EXCLUDED.object_id,
-                    status = EXCLUDED.status,
-                    record_json = EXCLUDED.record_json,
-                    updated_at_ms = EXCLUDED.updated_at_ms",
-                &[
-                    &conflict.conflict_id,
-                    &conflict.namespace,
-                    &conflict.object_id,
-                    &conflict.status,
-                    &conflict_json,
-                    &conflict.updated_at_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+            write_conflict(&mut tx, conflict.expected.as_ref(), &conflict.record)?;
         }
         tx.commit()
             .map_err(|error| format!("commit snapshot import: {error}"))?;
@@ -703,6 +690,73 @@ impl PostgresDb {
 
 fn decode_peer(json: &str) -> Result<FederationPeer, String> {
     serde_json::from_str(json).map_err(|error| format!("decode federation peer: {error}"))
+}
+
+/// Compare-and-set conflict write inside the caller's transaction.
+fn write_conflict(
+    tx: &mut postgres::Transaction<'_>,
+    expected: Option<&FederationConflict>,
+    record: &FederationConflict,
+) -> Result<(), String> {
+    require_stored(
+        tx,
+        "sekai_federation_conflicts",
+        "SELECT record_json FROM sekai_federation_conflicts WHERE conflict_id = $1",
+        &record.conflict_id,
+        expected,
+        STALE_CONFLICT,
+    )?;
+    let json = serde_json::to_string(record)
+        .map_err(|error| format!("encode federation conflict: {error}"))?;
+    tx.execute(
+        "INSERT INTO sekai_federation_conflicts
+            (conflict_id, namespace, object_id, status, record_json, updated_at_ms)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (conflict_id) DO UPDATE SET
+            namespace = EXCLUDED.namespace,
+            object_id = EXCLUDED.object_id,
+            status = EXCLUDED.status,
+            record_json = EXCLUDED.record_json,
+            updated_at_ms = EXCLUDED.updated_at_ms",
+        &[
+            &record.conflict_id,
+            &record.namespace,
+            &record.object_id,
+            &record.status,
+            &json,
+            &record.updated_at_ms,
+        ],
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Fails with `stale` unless the row `select_sql` reads for `id` decodes to
+/// `expected` (`None`: no row). The table lock serializes compare-and-set
+/// writers, including two first inserts that both saw no row; readers are not
+/// blocked. Compares decoded records, not JSON text.
+fn require_stored<T: serde::de::DeserializeOwned + PartialEq>(
+    tx: &mut postgres::Transaction<'_>,
+    table: &str,
+    select_sql: &str,
+    id: &str,
+    expected: Option<&T>,
+    stale: &str,
+) -> Result<(), String> {
+    tx.batch_execute(&format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE"))
+        .map_err(|error| error.to_string())?;
+    let stored = tx
+        .query_opt(select_sql, &[&id])
+        .map_err(|error| error.to_string())?
+        .map(|row| {
+            serde_json::from_str::<T>(&row.get::<_, String>(0)).map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    if stored.as_ref() == expected {
+        Ok(())
+    } else {
+        Err(stale.into())
+    }
 }
 
 fn decode_conflict(json: &str) -> Result<FederationConflict, String> {
