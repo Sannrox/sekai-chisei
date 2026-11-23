@@ -566,7 +566,7 @@ pub fn import_namespace_snapshot(
             authenticate_fact_provenance(db, fact)?;
         }
         if let Some(local) = db.get_object(&fact.object_id)? {
-            let (record, dirty) = crate::sekai::federation_conflict::prepare_import_collision(
+            let (write, dirty) = crate::sekai::federation_conflict::prepare_import_collision(
                 db,
                 &crate::sekai::federation_conflict::ImportCollision {
                     actor: actor.into(),
@@ -580,7 +580,7 @@ pub fn import_namespace_snapshot(
                 },
             )?;
             if dirty {
-                pending_conflicts.push(record);
+                pending_conflicts.push(write);
             }
             conflicts.push(fact.object_id.clone());
             continue;
@@ -614,11 +614,11 @@ pub fn import_namespace_snapshot(
         imported_by: actor.into(),
         imported_at_ms: now_ms,
     };
-    pending_conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
-    pending_conflicts.dedup_by(|left, right| left.conflict_id == right.conflict_id);
+    pending_conflicts.sort_by(|left, right| left.record.conflict_id.cmp(&right.record.conflict_id));
+    pending_conflicts.dedup_by(|left, right| left.record.conflict_id == right.record.conflict_id);
     db.put_federation_snapshot_import(&record, &stored, &pending_conflicts)?;
     for conflict in &pending_conflicts {
-        crate::sekai::federation_conflict::audit_admission(db, actor, conflict, now_ms)?;
+        crate::sekai::federation_conflict::audit_admission(db, actor, &conflict.record, now_ms)?;
     }
     audit_import(db, actor, &record, now_ms)?;
     crate::sekai::federation_revocation::reconcile_unpresented_revisions(

@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use sekai_chisei::db::runtime_db::RuntimeDb;
-use sekai_chisei::sekai::federation_conflict::{CONFLICT_CONTRACT, FederationConflict};
+use sekai_chisei::sekai::federation_conflict::{
+    CONFLICT_CONTRACT, ConflictWrite, FederationConflict, STALE_CONFLICT,
+};
 use sekai_chisei::sekai::federation_network::{
     KIND_EVIDENCE, KIND_OUTCOME, KIND_REQUEST, NETWORK_CONTRACT, NETWORK_UNAVAILABLE,
     NetworkContract, NetworkExchange, PEER_LOST, STATUS_ACCEPTED, STATUS_DISCONNECTED,
@@ -16,7 +18,7 @@ use sekai_chisei::sekai::federation_profile::{
     PolicyPackPin, get_local_site, register_local_site,
 };
 use sekai_chisei::sekai::federation_revocation::{
-    FederationRevocation, REVOCATION_CONTRACT, RevocationPropagation, SubjectKind,
+    FederationRevocation, REVOCATION_CONTRACT, RevocationPropagation, STALE_REVOCATION, SubjectKind,
 };
 use sekai_chisei::sekai::namespace_snapshot::{
     NAMESPACE_SNAPSHOT_CONTRACT, PeerNamespaceGrant, SnapshotExportRecord, SnapshotFact,
@@ -186,12 +188,12 @@ fn exercise_conflict(db: &RuntimeDb) {
         admitted_at_ms: 1,
         updated_at_ms: 1,
     };
-    db.put_federation_conflict(&sales).unwrap();
+    db.put_federation_conflict(None, &sales).unwrap();
     let mut ops = sales.clone();
     ops.conflict_id = "conflict:ops".into();
     ops.namespace = "ops".into();
     ops.object_id = "obj:2".into();
-    db.put_federation_conflict(&ops).unwrap();
+    db.put_federation_conflict(None, &ops).unwrap();
     assert_eq!(
         db.get_federation_conflict("conflict:sales")
             .unwrap()
@@ -204,6 +206,45 @@ fn exercise_conflict(db: &RuntimeDb) {
         1
     );
     assert_eq!(db.list_federation_conflicts(None).unwrap().len(), 2);
+
+    // Two writers read `sales`; the first write wins and the stale one is
+    // refused without touching the stored status.
+    let mut resolved = sales.clone();
+    resolved.status = "resolved".into();
+    resolved.updated_at_ms = 2;
+    let mut reopened = sales.clone();
+    reopened.updated_at_ms = 3;
+    db.put_federation_conflict(Some(&sales), &resolved).unwrap();
+    assert_eq!(
+        db.put_federation_conflict(Some(&sales), &reopened),
+        Err(STALE_CONFLICT.into())
+    );
+    assert_eq!(
+        db.get_federation_conflict("conflict:sales").unwrap(),
+        Some(resolved.clone())
+    );
+    // A second first admission and a write against a missing row are stale too.
+    assert_eq!(
+        db.put_federation_conflict(None, &reopened),
+        Err(STALE_CONFLICT.into())
+    );
+    let mut missing = sales.clone();
+    missing.conflict_id = "conflict:missing".into();
+    assert_eq!(
+        db.put_federation_conflict(Some(&missing), &missing),
+        Err(STALE_CONFLICT.into())
+    );
+    assert_eq!(
+        db.get_federation_conflict("conflict:missing").unwrap(),
+        None
+    );
+    // A writer that reread the current version updates as before.
+    db.put_federation_conflict(Some(&resolved), &reopened)
+        .unwrap();
+    assert_eq!(
+        db.get_federation_conflict("conflict:sales").unwrap(),
+        Some(reopened)
+    );
 }
 
 fn exercise_revocation(db: &RuntimeDb) {
@@ -227,12 +268,12 @@ fn exercise_revocation(db: &RuntimeDb) {
         revoked_at_ms: 5,
         updated_at_ms: 5,
     };
-    db.put_federation_revocation(&peer).unwrap();
+    db.put_federation_revocation(None, &peer).unwrap();
     let mut signer = peer.clone();
     signer.revocation_id = "rev:signer".into();
     signer.subject_kind = SubjectKind::Signer;
     signer.subject_id = "signer:ops".into();
-    db.put_federation_revocation(&signer).unwrap();
+    db.put_federation_revocation(None, &signer).unwrap();
     assert_eq!(
         db.get_federation_revocation("rev:peer")
             .unwrap()
@@ -245,6 +286,35 @@ fn exercise_revocation(db: &RuntimeDb) {
         1
     );
     assert_eq!(db.list_federation_revocations(None).unwrap().len(), 2);
+
+    // Two writers read `peer`; the first write wins and the stale one is
+    // refused without rolling the acknowledgement back.
+    let mut reconciled = peer.clone();
+    reconciled.propagation.acknowledgement = "reconciled".into();
+    reconciled.updated_at_ms = 6;
+    let mut denied = peer.clone();
+    denied.propagation.acknowledgement = "denied".into();
+    denied.updated_at_ms = 7;
+    db.put_federation_revocation(Some(&peer), &reconciled)
+        .unwrap();
+    assert_eq!(
+        db.put_federation_revocation(Some(&peer), &denied),
+        Err(STALE_REVOCATION.into())
+    );
+    assert_eq!(
+        db.get_federation_revocation("rev:peer").unwrap(),
+        Some(reconciled.clone())
+    );
+    assert_eq!(
+        db.put_federation_revocation(None, &denied),
+        Err(STALE_REVOCATION.into())
+    );
+    db.put_federation_revocation(Some(&reconciled), &denied)
+        .unwrap();
+    assert_eq!(
+        db.get_federation_revocation("rev:peer").unwrap(),
+        Some(denied)
+    );
 }
 
 fn exercise_grant(db: &RuntimeDb) {
@@ -401,7 +471,10 @@ fn exercise_snapshot(db: &RuntimeDb) {
         updated_at_ms: 30,
     };
     let facts = [fact];
-    let conflicts = [conflict];
+    let conflicts = [ConflictWrite {
+        expected: None,
+        record: conflict.clone(),
+    }];
     db.put_federation_snapshot_import(&import, &facts, &conflicts)
         .unwrap();
     let later = SnapshotImportRecord {
@@ -415,6 +488,31 @@ fn exercise_snapshot(db: &RuntimeDb) {
         ..import.clone()
     };
     db.put_federation_snapshot_import(&later, &[], &[]).unwrap();
+    // An import whose conflict write read a stale version stores nothing.
+    let stale = SnapshotImportRecord {
+        import_id: "import:sales:3".into(),
+        snapshot_digest: digest(11),
+        sequence: 3,
+        ..later.clone()
+    };
+    let mut reopened = conflict.clone();
+    reopened.updated_at_ms = 50;
+    let stale_write = [ConflictWrite {
+        expected: None,
+        record: reopened,
+    }];
+    assert_eq!(
+        db.put_federation_snapshot_import(&stale, &[], &stale_write),
+        Err(STALE_CONFLICT.into())
+    );
+    assert_eq!(
+        db.get_federation_snapshot_import("import:sales:3").unwrap(),
+        None
+    );
+    assert_eq!(
+        db.get_federation_conflict("conflict:snap").unwrap(),
+        Some(conflict)
+    );
     assert_eq!(
         db.get_federation_snapshot_import("import:sales:1")
             .unwrap()

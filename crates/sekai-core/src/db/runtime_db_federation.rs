@@ -164,7 +164,7 @@ impl RuntimeDb {
         &self,
         record: &crate::sekai::namespace_snapshot::SnapshotImportRecord,
         facts: &[crate::sekai::namespace_snapshot::SnapshotFact],
-        conflicts: &[crate::sekai::federation_conflict::FederationConflict],
+        conflicts: &[crate::sekai::federation_conflict::ConflictWrite],
     ) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.put_federation_snapshot_import(record, facts, conflicts),
@@ -223,14 +223,17 @@ impl RuntimeDb {
         }
     }
 
+    /// Compare-and-set: writes only while the stored conflict equals
+    /// `expected` (`None`: no row yet), else fails with `STALE_CONFLICT`.
     pub fn put_federation_conflict(
         &self,
+        expected: Option<&crate::sekai::federation_conflict::FederationConflict>,
         record: &crate::sekai::federation_conflict::FederationConflict,
     ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.put_federation_conflict(record),
+            Self::Sqlite(db) => db.put_federation_conflict(expected, record),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_federation_conflict(record))
+                crate::db::postgres::off_runtime(|| db.put_federation_conflict(expected, record))
             }
         }
     }
@@ -259,14 +262,17 @@ impl RuntimeDb {
         }
     }
 
+    /// Compare-and-set: writes only while the stored revocation equals
+    /// `expected` (`None`: no row yet), else fails with `STALE_REVOCATION`.
     pub fn put_federation_revocation(
         &self,
+        expected: Option<&crate::sekai::federation_revocation::FederationRevocation>,
         record: &crate::sekai::federation_revocation::FederationRevocation,
     ) -> Result<(), String> {
         match self {
-            Self::Sqlite(db) => db.put_federation_revocation(record),
+            Self::Sqlite(db) => db.put_federation_revocation(expected, record),
             Self::Postgres(db) => {
-                crate::db::postgres::off_runtime(|| db.put_federation_revocation(record))
+                crate::db::postgres::off_runtime(|| db.put_federation_revocation(expected, record))
             }
         }
     }

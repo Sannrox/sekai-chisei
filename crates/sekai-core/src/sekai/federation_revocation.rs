@@ -17,6 +17,9 @@ pub const POSTGRES_UNAVAILABLE: &str =
 pub const REVOKE_ACTION: &str = "federation.authority_revoke";
 pub const OBSERVE_ACTION: &str = "federation.authority_observe";
 pub const UNAVAILABLE: &str = "revoked federation authority is unavailable";
+/// Refusal for a revocation write whose stored version changed after it was
+/// read. Nothing was written; reread and retry.
+pub const STALE_REVOCATION: &str = "federation revocation changed concurrently; retry";
 
 const STATUS_ACTIVE: &str = "active";
 const ACK_UNKNOWN: &str = "unknown";
@@ -158,7 +161,7 @@ pub fn revoke_authority(
         revoked_at_ms: now_ms,
         updated_at_ms: now_ms,
     };
-    db.put_federation_revocation(&record)?;
+    db.put_federation_revocation(None, &record)?;
     audit(db, actor, REVOKE_ACTION, "revoked", &record, now_ms)?;
     Ok(record)
 }
@@ -270,11 +273,12 @@ fn push_if_active(
 
 fn observe(
     db: &RuntimeDb,
-    mut record: FederationRevocation,
+    stored: FederationRevocation,
     acknowledgement: &str,
     now_ms: i64,
     peer_asserted: bool,
 ) -> Result<FederationRevocation, String> {
+    let mut record = stored.clone();
     let mut changed = record.propagation.acknowledgement != acknowledgement;
     record.propagation.acknowledgement = acknowledgement.into();
     if peer_asserted {
@@ -289,7 +293,7 @@ fn observe(
         return Ok(record);
     }
     record.updated_at_ms = now_ms;
-    db.put_federation_revocation(&record)?;
+    db.put_federation_revocation(Some(&stored), &record)?;
     audit(
         db,
         "system",

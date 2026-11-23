@@ -1,36 +1,55 @@
 //! SQLite persistence for governed federation revocations (#703).
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+use super::federation_conflict_store::require_stored;
 use super::sekai::SekaiDb;
-use crate::sekai::federation_revocation::FederationRevocation;
+use crate::sekai::federation_revocation::{FederationRevocation, STALE_REVOCATION};
 
 impl SekaiDb {
-    pub fn put_federation_revocation(&self, record: &FederationRevocation) -> Result<(), String> {
+    /// Stores `record` only while the stored revocation still equals
+    /// `expected` (`None`: no row yet), so a writer that read an older version
+    /// gets [`STALE_REVOCATION`] instead of rolling back a newer status.
+    pub fn put_federation_revocation(
+        &self,
+        expected: Option<&FederationRevocation>,
+        record: &FederationRevocation,
+    ) -> Result<(), String> {
         let json = serde_json::to_string(record)
             .map_err(|error| format!("encode federation revocation: {error}"))?;
-        self.conn()
-            .execute(
-                "INSERT INTO sekai_federation_revocations
-                    (revocation_id, subject_kind, subject_id, status, record_json, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(revocation_id) DO UPDATE SET
-                    subject_kind = excluded.subject_kind,
-                    subject_id = excluded.subject_id,
-                    status = excluded.status,
-                    record_json = excluded.record_json,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![
-                    record.revocation_id,
-                    record.subject_kind.as_str(),
-                    record.subject_id,
-                    record.status,
-                    json,
-                    record.updated_at_ms,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin federation revocation write: {error}"))?;
+        require_stored(
+            &tx,
+            "SELECT record_json FROM sekai_federation_revocations WHERE revocation_id = ?1",
+            &record.revocation_id,
+            expected,
+            STALE_REVOCATION,
+        )?;
+        tx.execute(
+            "INSERT INTO sekai_federation_revocations
+                (revocation_id, subject_kind, subject_id, status, record_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(revocation_id) DO UPDATE SET
+                subject_kind = excluded.subject_kind,
+                subject_id = excluded.subject_id,
+                status = excluded.status,
+                record_json = excluded.record_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                record.revocation_id,
+                record.subject_kind.as_str(),
+                record.subject_id,
+                record.status,
+                json,
+                record.updated_at_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit()
+            .map_err(|error| format!("commit federation revocation write: {error}"))
     }
 
     pub fn get_federation_revocation(
