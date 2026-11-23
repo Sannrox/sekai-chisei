@@ -106,6 +106,7 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
                 field: "severity".into(),
                 committed_at_ms: 1,
                 operation_id: "op".into(),
+                ..Default::default()
             }],
             read_marker,
         };

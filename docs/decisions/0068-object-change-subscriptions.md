@@ -55,3 +55,16 @@ A snapshot followed by insert, update, and delete converges to an
 authoritative requery. Reconnect and duplicate replay preserve cursor
 identity. Expired retention, authorization change, and revocation do not
 leak hidden fields. Slow consumers disconnect explicitly.
+
+## Addendum: update values (#3037)
+
+An update event carries the changed field's old and new value, so a consumer
+need not requery to learn what changed. Values follow the `ListObjectChanges`
+redaction for the same reader and are rechecked on every page; a withheld
+update carries no values and sets `values_withheld` instead of the redaction
+sentinel, so an empty value stays distinguishable from a hidden one. Guest and
+shared-space readers, whose history is reconstructed per change against the
+collaboration ceiling, fail closed with every update withheld. The page digest
+covers values and flag. The lenient projection used by Action bindings and
+agent wakes carries no values, so no durable binding state copies property
+data.

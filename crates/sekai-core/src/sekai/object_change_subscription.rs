@@ -4,7 +4,7 @@
 //! page is never object authority. Snapshot, then stream; a gap or expiry
 //! requires resnapshot.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,7 @@ pub struct ObjectChangeReadRequest {
     pub revoke: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectChangeEvent {
     pub offset: u64,
     pub event_id: String,
@@ -76,6 +76,16 @@ pub struct ObjectChangeEvent {
     pub field: String,
     pub committed_at_ms: i64,
     pub operation_id: String,
+    /// The changed field's value before an update. Empty on other ops, on a
+    /// lenient projection, and when `values_withheld` is set.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub old_value: String,
+    /// The changed field's value after an update, empty as `old_value` is.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub new_value: String,
+    /// Set on an update whose values the strict reader may not see.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub values_withheld: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +120,15 @@ pub struct ReaderVisibility {
     pub readable_ids: BTreeSet<String>,
     /// Deleted ids whose history the reader may read.
     pub readable_deletes: BTreeSet<String>,
+    /// Per object id, the updated fields whose old and new values the reader
+    /// may see. Any other update event carries neither value and sets
+    /// `values_withheld`, so a resolver that decides nothing withholds all.
+    pub readable_values: BTreeMap<String, BTreeSet<String>>,
 }
+
+/// Per object id, the fields a page would report as updated: what a strict
+/// reader's resolver decides value visibility for.
+pub type UpdatedFields = BTreeMap<String, BTreeSet<String>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ObjectChangeStreamState {
@@ -216,14 +234,15 @@ where
         request,
         now_ms,
         resolved_visible,
-        |object_ids, _| Ok((resolve_visible(object_ids)?, None)),
+        |object_ids, _, _| Ok((resolve_visible(object_ids)?, None)),
         authorization_pin,
     )
 }
 
 /// Reads a page for a reader that may learn of no object it cannot read.
-/// `resolve` gets the live and the deleted ids a page would name and returns
-/// the visible objects plus what else the reader may read. A change to any
+/// `resolve` gets the live and the deleted ids a page would name, plus the
+/// fields it would report as updated, and returns the visible objects plus
+/// what else the reader may read, update values included. A change to any
 /// other object restarts the subscription: the page is `resnapshot_required`,
 /// names no object, and the next read with the new revision continues it.
 pub fn read_object_change_subscription_for_reader<F>(
@@ -236,7 +255,11 @@ pub fn read_object_change_subscription_for_reader<F>(
     authorization_pin: &str,
 ) -> Result<ObjectChangePage, String>
 where
-    F: FnOnce(&[String], &[String]) -> Result<(Vec<Object>, ReaderVisibility), String>,
+    F: FnOnce(
+        &[String],
+        &[String],
+        &UpdatedFields,
+    ) -> Result<(Vec<Object>, ReaderVisibility), String>,
 {
     read_object_changes(
         db,
@@ -244,8 +267,8 @@ where
         request,
         now_ms,
         resolved_visible,
-        |object_ids, deleted_ids| {
-            let (visible, reader) = resolve(object_ids, deleted_ids)?;
+        |object_ids, deleted_ids, updated_fields| {
+            let (visible, reader) = resolve(object_ids, deleted_ids, updated_fields)?;
             Ok((visible, Some(reader)))
         },
         authorization_pin,
@@ -264,7 +287,11 @@ fn read_object_changes<F>(
     authorization_pin: &str,
 ) -> Result<ObjectChangePage, String>
 where
-    F: FnOnce(&[String], &[String]) -> Result<(Vec<Object>, Option<ReaderVisibility>), String>,
+    F: FnOnce(
+        &[String],
+        &[String],
+        &UpdatedFields,
+    ) -> Result<(Vec<Object>, Option<ReaderVisibility>), String>,
 {
     resolved_visible.clear();
     required("actor", actor)?;
@@ -357,7 +384,8 @@ where
     )?;
     let object_ids = object_ids_for_projection(&scope, &raw);
     let deleted_ids = deleted_ids_for_projection(&scope, &raw);
-    let (visible, reader) = resolve(&object_ids, &deleted_ids)?;
+    let updated_fields = updated_fields_for_projection(&scope, &raw);
+    let (visible, reader) = resolve(&object_ids, &deleted_ids, &updated_fields)?;
     *resolved_visible = visible;
     let Some(events) = project(
         &scope,
@@ -673,7 +701,8 @@ pub fn project_events(
 
 /// [`project_events`]; with `reader`, a change to an object the reader may not
 /// read (or, deleted, whose history it may not read) yields `None`: the page
-/// must restart instead of naming that object.
+/// must restart instead of naming that object. Only a strict reader's update
+/// events carry values, and only those `reader.readable_values` allows.
 fn project(
     scope: &ObjectChangeScope,
     visible: &[Object],
@@ -743,6 +772,24 @@ fn project(
             OP_INVALIDATE
         };
         offset = offset.saturating_add(1);
+        let (old_value, new_value, values_withheld) = match reader {
+            Some(reader) if op == OP_UPDATE => {
+                if reader
+                    .readable_values
+                    .get(object_id)
+                    .is_some_and(|fields| fields.contains(&mutation.change.field))
+                {
+                    (
+                        mutation.change.old_value.clone(),
+                        mutation.change.new_value.clone(),
+                        false,
+                    )
+                } else {
+                    (String::new(), String::new(), true)
+                }
+            }
+            _ => (String::new(), String::new(), false),
+        };
         events.push(ObjectChangeEvent {
             offset,
             event_id: mutation.change.id.clone(),
@@ -759,6 +806,9 @@ fn project(
                 .get(&mutation.change.object_id)
                 .cloned()
                 .unwrap_or_default(),
+            old_value,
+            new_value,
+            values_withheld,
         });
     }
     Ok(Some(events))
@@ -785,6 +835,33 @@ fn object_ids_for_projection(
     object_ids.sort_unstable();
     object_ids.dedup();
     object_ids
+}
+
+/// The fields `mutations` change on the scope's live objects, by object id:
+/// a superset of what the page reports as updates.
+fn updated_fields_for_projection(
+    scope: &ObjectChangeScope,
+    mutations: &[CommittedObjectMutation],
+) -> UpdatedFields {
+    let pinned: BTreeSet<&str> = scope.object_ids.iter().map(String::as_str).collect();
+    let mut fields = UpdatedFields::new();
+    for mutation in mutations {
+        let field = mutation.change.field.as_str();
+        if mutation_kind(mutation) != scope.kind
+            || field == "_created"
+            || field == "_deleted"
+            || SKIPPED_FIELDS.contains(&field)
+            || field.starts_with("_security_property.")
+            || (!pinned.is_empty() && !pinned.contains(mutation.change.object_id.as_str()))
+        {
+            continue;
+        }
+        fields
+            .entry(mutation.change.object_id.clone())
+            .or_default()
+            .insert(field.to_string());
+    }
+    fields
 }
 
 /// Ids of the scope's objects that `mutations` delete.
@@ -1474,6 +1551,28 @@ mod tests {
         readable_deletes: &[&str],
         now: i64,
     ) -> ObjectChangePage {
+        read_strict_withholding(
+            runtime,
+            snapshot,
+            visible,
+            readable,
+            readable_deletes,
+            now,
+            &[],
+        )
+    }
+
+    /// [`read_strict`] for a reader who may see every update value but those
+    /// of the `withheld` fields.
+    fn read_strict_withholding(
+        runtime: &RuntimeDb,
+        snapshot: &str,
+        visible: &[&str],
+        readable: &[&str],
+        readable_deletes: &[&str],
+        now: i64,
+        withheld: &[&str],
+    ) -> ObjectChangePage {
         let objects = visible_customers(visible);
         let set = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect();
         read_object_change_subscription_for_reader(
@@ -1490,7 +1589,7 @@ mod tests {
             },
             now,
             &mut Vec::new(),
-            |object_ids, _| {
+            |object_ids, _, updated_fields| {
                 let object_ids = object_ids
                     .iter()
                     .map(String::as_str)
@@ -1504,6 +1603,17 @@ mod tests {
                     ReaderVisibility {
                         readable_ids: set(readable),
                         readable_deletes: set(readable_deletes),
+                        readable_values: updated_fields
+                            .iter()
+                            .map(|(id, fields)| {
+                                let fields = fields
+                                    .iter()
+                                    .filter(|field| !withheld.contains(&field.as_str()))
+                                    .cloned()
+                                    .collect();
+                                (id.clone(), fields)
+                            })
+                            .collect(),
                     },
                 ))
             },
@@ -1574,6 +1684,64 @@ mod tests {
         let refused = read_strict(&runtime, &fresh, &["c-eu"], &[], &[], 29);
         assert_eq!(refused.outcome, OUTCOME_RESNAPSHOT);
         assert!(refused.events.is_empty());
+    }
+
+    #[test]
+    fn strict_update_events_carry_only_the_values_the_reader_may_see() {
+        let runtime = db();
+        runtime
+            .create_object_with_audit(&customer("c-eu", "North", "eu", 10), "alice")
+            .unwrap();
+        let revision =
+            snapshot_revision(&scope(), runtime.object_change_watermark("sales").unwrap()).unwrap();
+        read_strict(&runtime, &revision, &["c-eu"], &[], &[], 20);
+        let mut moved = customer("c-eu", "North", "apac", 10);
+        moved.properties.insert("tier".into(), "gold".into());
+        moved.updated = 21;
+        runtime.update_object_with_audit(&moved, "alice").unwrap();
+        let page = read_strict_withholding(
+            &runtime,
+            &revision,
+            &["c-eu"],
+            &[],
+            &[],
+            22,
+            &["properties.tier"],
+        );
+        let by_field = |field: &str| {
+            page.events
+                .iter()
+                .find(|event| event.field == field)
+                .unwrap()
+                .clone()
+        };
+        let region = by_field("properties.region");
+        assert_eq!(
+            (
+                region.old_value.as_str(),
+                region.new_value.as_str(),
+                region.values_withheld
+            ),
+            ("eu", "apac", false)
+        );
+        let tier = by_field("properties.tier");
+        assert!(tier.old_value.is_empty() && tier.new_value.is_empty());
+        assert!(tier.values_withheld);
+
+        // A lenient projection carries no values and withholds nothing.
+        let lenient = project_events(
+            &scope(),
+            &visible_customers(&["c-eu"]),
+            &runtime
+                .list_committed_object_mutations_after("sales", 0, 32)
+                .unwrap(),
+            0,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(lenient.iter().all(|event| event.old_value.is_empty()
+            && event.new_value.is_empty()
+            && !event.values_withheld));
     }
 
     #[test]

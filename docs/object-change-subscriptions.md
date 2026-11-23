@@ -20,8 +20,9 @@ and does not move the cursor.
 ## Non-authority
 
 `ReadObjectChangeSubscriptionResponse.authority` is always false. Events
-name object identity, op, and changed field. They do not carry source
-credentials or newly hidden values. Visibility loss emits `invalidate`
+name object identity, op, and changed field; an update also carries the values
+the reader may see (see below). They do not carry source credentials or newly
+hidden values. Visibility loss emits `invalidate`
 without field names. A `create` is delivered only for an object the caller can
 read. Property filters pass the same restricted-property and property-grant
 query checks as a listing filter.
@@ -33,6 +34,23 @@ closed; otherwise the object ACL decides. A change to any other object returns
 `resnapshot_required` and names no object. Take a new snapshot at the returned
 revision and read again with the same subscription id. The restart says only
 that something in scope changed. Revoke with `revoke=true` to end delivery.
+
+## Update values
+
+An `update` event carries the changed field's `old_value` and `new_value`
+(#3037), decided for the reader on every page by the `ListObjectChanges` rule:
+a property the kind restricts, unless the reader and any delegated subject may
+read restricted properties, or one outside the active object security policy's
+read grant, is withheld. A withheld update carries both values empty and
+`values_withheld = true`, never the `[redacted]` sentinel. Guest and
+shared-space callers get every update withheld: their `ListObjectChanges`
+history is rebuilt per change against the collaboration ceiling, which a
+subscription page does not do. `create`, `delete`, and `invalidate` events
+carry no values. The page digest covers the values and the flag, so exact
+replay still returns `replayed`.
+
+Action bindings and agent change wakes read the lenient projection, which
+carries no values: a binding's pending events hold no copy of property data.
 
 ## Backpressure
 

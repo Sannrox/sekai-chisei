@@ -1161,6 +1161,7 @@ mod tests {
                         field: "severity".into(),
                         committed_at_ms: 3,
                         operation_id: "op-frozen".into(),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -1533,6 +1534,7 @@ mod tests {
                         field: "severity".into(),
                         committed_at_ms: 3,
                         operation_id: "op-pending".into(),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -1632,6 +1634,7 @@ mod tests {
                         field: String::new(),
                         committed_at_ms: 3,
                         operation_id: "op-create".into(),
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
