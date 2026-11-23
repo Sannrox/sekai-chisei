@@ -1210,6 +1210,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn abort_object_create(
+        &self,
+        id: &str,
+        lease: Option<&crate::sekai::object_mutation::LeasePrecondition<'_>>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.abort_object_create(id, lease),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.abort_object_create(id, lease))
+            }
+        }
+    }
+
     pub fn abort_unreceipted_object_create(&self, id: &str) -> Result<(), String> {
         match self {
             Self::Sqlite(db) => db.abort_unreceipted_object_create(id),

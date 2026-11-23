@@ -236,6 +236,50 @@ impl PostgresDb {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    /// PostgreSQL counterpart of the SQLite `abort_object_create`.
+    pub fn abort_object_create(
+        &self,
+        id: &str,
+        lease: Option<&crate::sekai::object_mutation::LeasePrecondition<'_>>,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        lock_object_lifecycle(&mut transaction, id)?;
+        if let Some(lease) = lease {
+            transaction
+                .execute(
+                    "DELETE FROM sekai_guarded_object_mutations WHERE lease_namespace = $1 AND lease_key = $2 AND request_id = $3 AND operation = 'create' AND target_id = $4",
+                    &[&lease.namespace, &lease.key, &lease.request_id, &id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let untouched = transaction
+            .query_opt(
+                "SELECT created = updated FROM sekai_objects WHERE id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| row.get::<_, bool>(0));
+        match untouched {
+            Some(false) => return Err(format!("object {id} changed after its create")),
+            None => {}
+            Some(true) => {
+                for statement in [
+                    "DELETE FROM sekai_objects WHERE id = $1",
+                    "DELETE FROM sekai_links WHERE from_id = $1 OR to_id = $1",
+                    "DELETE FROM sekai_object_changes WHERE object_id = $1",
+                ] {
+                    transaction
+                        .execute(statement, &[&id])
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn delete_object_with_audit(
         &self,
         id: &str,

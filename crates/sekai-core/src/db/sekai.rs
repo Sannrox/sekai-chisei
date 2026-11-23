@@ -1280,6 +1280,54 @@ impl SekaiDb {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// Reverse a create whose follow-up write failed: remove the object, its
+    /// links and change rows, and the guarded replay row that would otherwise
+    /// replay the create. Fails when the object changed after the create.
+    pub fn abort_object_create(
+        &self,
+        id: &str,
+        lease: Option<&crate::sekai::object_mutation::LeasePrecondition<'_>>,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if let Some(lease) = lease {
+            tx.execute(
+                "DELETE FROM sekai_guarded_object_mutations WHERE lease_namespace = ?1 AND lease_key = ?2 AND request_id = ?3 AND operation = 'create' AND target_id = ?4",
+                params![lease.namespace, lease.key, lease.request_id, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let untouched = tx
+            .query_row(
+                "SELECT created = updated FROM sekai_objects WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match untouched {
+            Some(false) => return Err(format!("object {id} changed after its create")),
+            None => {}
+            Some(true) => {
+                tx.execute("DELETE FROM sekai_objects WHERE id = ?1", params![id])
+                    .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "DELETE FROM sekai_links WHERE from_id = ?1 OR to_id = ?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "DELETE FROM sekai_object_changes WHERE object_id = ?1",
+                    params![id],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
     pub fn delete_object_with_existing(&self, id: &str) -> Result<Option<Object>, String> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
