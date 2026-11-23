@@ -1,7 +1,7 @@
 //! PostgreSQL governed Action type registry (#396).
 
 use crate::db::postgres::PostgresDb;
-use crate::sekai::governed_action_type::{GovernedActionType, body_fingerprint};
+use crate::sekai::governed_action_type::{GovernedActionType, body_fingerprint, stored_version};
 
 impl PostgresDb {
     pub fn put_governed_action_type(
@@ -16,13 +16,7 @@ impl PostgresDb {
             &type_def.type_id,
             &type_def.version,
         )? {
-            let existing_fp = body_fingerprint(&existing)?;
-            if existing_fp != fingerprint {
-                return Err(
-                    "governed action type version is immutable; register a new version".into(),
-                );
-            }
-            return Ok(existing);
+            return stored_version(existing, &fingerprint);
         }
         // Match SQLite: exact re-put is idempotent, while new rows must use
         // the closed schema contract with no legacy admission fallback.
@@ -33,12 +27,24 @@ impl PostgresDb {
         type_def.created_at_ms = now_ms;
         type_def.updated_at_ms = now_ms;
         type_def.disabled_at_ms = if type_def.enabled { 0 } else { now_ms };
+        self.insert_governed_action_type_version(type_def, &fingerprint)
+    }
+
+    /// Insert a new version. When a concurrent put stored it first, answer
+    /// with that row on a matching body and refuse a different one.
+    pub(crate) fn insert_governed_action_type_version(
+        &self,
+        type_def: GovernedActionType,
+        fingerprint: &str,
+    ) -> Result<GovernedActionType, String> {
         let body_json = serde_json::to_string(&type_def).map_err(|e| e.to_string())?;
-        self.connection()?
+        let inserted = self
+            .connection()?
             .execute(
                 "INSERT INTO sekai_governed_action_types
                  (namespace, type_id, version, body_json, enabled, created_by, created_at_ms, updated_at_ms, disabled_at_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (namespace, type_id, version) DO NOTHING",
                 &[
                     &type_def.namespace,
                     &type_def.type_id,
@@ -52,6 +58,17 @@ impl PostgresDb {
                 ],
             )
             .map_err(|e| e.to_string())?;
+        if inserted == 0 {
+            // A concurrent put stored this version after the read above.
+            let existing = self
+                .get_governed_action_type(
+                    &type_def.namespace,
+                    &type_def.type_id,
+                    &type_def.version,
+                )?
+                .ok_or("governed action type version vanished after a conflicting put")?;
+            return stored_version(existing, fingerprint);
+        }
         Ok(type_def)
     }
 

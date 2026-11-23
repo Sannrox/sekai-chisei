@@ -360,6 +360,18 @@ fn validate_object_binding(
     Ok(())
 }
 
+/// A put of a version that is already stored returns the stored row (its
+/// enabled state may differ) when the body matches, and refuses any other body.
+pub(crate) fn stored_version(
+    existing: GovernedActionType,
+    fingerprint: &str,
+) -> Result<GovernedActionType, String> {
+    if body_fingerprint(&existing)? != fingerprint {
+        return Err("governed action type version is immutable; register a new version".into());
+    }
+    Ok(existing)
+}
+
 pub fn body_fingerprint(t: &GovernedActionType) -> Result<String, String> {
     // Version immutability: identity is (namespace, type_id, version); body
     // fields other than enabled/disabled timestamps must match on re-put.
@@ -450,14 +462,7 @@ impl SekaiDb {
             &type_def.type_id,
             &type_def.version,
         )? {
-            let existing_fp = body_fingerprint(&existing)?;
-            if existing_fp != fingerprint {
-                return Err(
-                    "governed action type version is immutable; register a new version".into(),
-                );
-            }
-            // Idempotent put: return stored row (enabled state may differ).
-            return Ok(existing);
+            return stored_version(existing, &fingerprint);
         }
         // Exact re-put remains idempotent, but legacy object-only rows never
         // regain admission compatibility; only new rows are validated here.
@@ -472,26 +477,49 @@ impl SekaiDb {
         } else {
             type_def.disabled_at_ms = 0;
         }
+        self.insert_governed_action_type_version(type_def, &fingerprint)
+    }
+
+    /// Insert a new version. When a concurrent put stored it first, answer
+    /// with that row on a matching body and refuse a different one.
+    pub(crate) fn insert_governed_action_type_version(
+        &self,
+        type_def: GovernedActionType,
+        fingerprint: &str,
+    ) -> Result<GovernedActionType, String> {
         let body_json = serde_json::to_string(&type_def).map_err(|e| e.to_string())?;
-        let conn = self.conn();
-        conn.execute(
-            "INSERT INTO sekai_governed_action_types
+        let inserted = self
+            .conn()
+            .execute(
+                "INSERT INTO sekai_governed_action_types
              (namespace, type_id, version, body_json, enabled, created_by,
               created_at_ms, updated_at_ms, disabled_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                type_def.namespace,
-                type_def.type_id,
-                type_def.version,
-                body_json,
-                type_def.enabled as i32,
-                type_def.created_by,
-                type_def.created_at_ms,
-                type_def.updated_at_ms,
-                type_def.disabled_at_ms,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (namespace, type_id, version) DO NOTHING",
+                params![
+                    type_def.namespace,
+                    type_def.type_id,
+                    type_def.version,
+                    body_json,
+                    type_def.enabled as i32,
+                    type_def.created_by,
+                    type_def.created_at_ms,
+                    type_def.updated_at_ms,
+                    type_def.disabled_at_ms,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        if inserted == 0 {
+            // A concurrent put stored this version after the read above.
+            let existing = self
+                .get_governed_action_type(
+                    &type_def.namespace,
+                    &type_def.type_id,
+                    &type_def.version,
+                )?
+                .ok_or("governed action type version vanished after a conflicting put")?;
+            return stored_version(existing, fingerprint);
+        }
         Ok(type_def)
     }
 
@@ -811,6 +839,51 @@ mod tests {
             PostgresDb::connect(&url, 8).unwrap()
         };
         RuntimeDb::Postgres(Arc::new(db))
+    }
+
+    /// A put that missed the stored version on its read and then lost the
+    /// insert answers with the stored row, or refuses a different body as
+    /// immutable, never with a key error (#2822).
+    fn a_lost_insert_resolves_to_the_stored_version(db: &RuntimeDb, namespace: &str) {
+        let alice = with_approvers(namespace, &["alice"]);
+        let stored = db
+            .put_governed_action_type(alice.clone(), "operator", 10)
+            .unwrap();
+        let insert = |type_def: GovernedActionType| {
+            let fingerprint = body_fingerprint(&type_def).unwrap();
+            match db {
+                RuntimeDb::Sqlite(sqlite) => {
+                    sqlite.insert_governed_action_type_version(type_def, &fingerprint)
+                }
+                RuntimeDb::Postgres(postgres) => {
+                    postgres.insert_governed_action_type_version(type_def, &fingerprint)
+                }
+            }
+        };
+        let late = GovernedActionType {
+            created_at_ms: 20,
+            updated_at_ms: 20,
+            ..alice
+        };
+        assert_eq!(insert(late).unwrap(), stored);
+        let error = insert(with_approvers(namespace, &["bob"])).unwrap_err();
+        assert!(error.contains("immutable"), "{error}");
+        assert_eq!(
+            db.get_governed_action_type(namespace, "t", "v1").unwrap(),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn sqlite_a_lost_insert_resolves_to_the_stored_version() {
+        a_lost_insert_resolves_to_the_stored_version(&RuntimeDb::memory(), "acme");
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_a_lost_insert_resolves_to_the_stored_version() {
+        let namespace = format!("pg-{}", uuid::Uuid::new_v4().simple());
+        a_lost_insert_resolves_to_the_stored_version(&postgres_runtime(), &namespace);
     }
 
     /// Empty approvers stay out of the fingerprint so stored types keep
