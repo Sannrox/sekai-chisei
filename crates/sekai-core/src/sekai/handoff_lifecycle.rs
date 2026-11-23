@@ -66,6 +66,47 @@ pub(crate) fn resolve_create_conflict(
     ))
 }
 
+/// The state of a predecessor read inside a create transaction: the stored
+/// manifest (with `revoked` set from `revoked_at_ms`) and whether a live
+/// handoff already supersedes it.
+pub(crate) struct Predecessor {
+    pub manifest: HandoffManifest,
+    pub superseded: bool,
+}
+
+/// Refuses a create whose `supersedes_manifest_id` names a handoff it may not
+/// replace: missing, for a different creator, receiver or namespace, revoked,
+/// or already superseded by a live handoff. Both stores call it inside the
+/// create transaction, after the request replay check.
+pub(crate) fn check_predecessor(
+    manifest: &HandoffManifest,
+    predecessor: Option<Predecessor>,
+) -> Result<(), HandoffLifecycleError> {
+    let unavailable =
+        || HandoffLifecycleError::FailedPrecondition("superseded handoff is unavailable".into());
+    let Predecessor {
+        manifest: predecessor,
+        superseded,
+    } = predecessor.ok_or_else(unavailable)?;
+    if predecessor.creator_principal != manifest.creator_principal
+        || predecessor.intended_principal != manifest.intended_principal
+        || predecessor.namespace != manifest.namespace
+    {
+        return Err(unavailable());
+    }
+    if predecessor.revoked {
+        return Err(HandoffLifecycleError::FailedPrecondition(
+            "superseded handoff is revoked".into(),
+        ));
+    }
+    if superseded {
+        return Err(HandoffLifecycleError::FailedPrecondition(
+            "superseded handoff already has a live successor".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct HandoffLifecycle<'a> {
     db: &'a RuntimeDb,
 }
@@ -134,25 +175,9 @@ impl<'a> HandoffLifecycle<'a> {
                 ));
             }
         }
-        if !manifest.supersedes_manifest_id.is_empty() {
-            let predecessor = self
-                .db
-                .get_handoff(&manifest.supersedes_manifest_id)
-                .map_err(HandoffLifecycleError::Storage)?
-                .ok_or_else(|| {
-                    HandoffLifecycleError::FailedPrecondition(
-                        "superseded handoff is unavailable".into(),
-                    )
-                })?;
-            if predecessor.creator_principal != manifest.creator_principal
-                || predecessor.intended_principal != manifest.intended_principal
-                || predecessor.namespace != manifest.namespace
-            {
-                return Err(HandoffLifecycleError::FailedPrecondition(
-                    "superseded handoff is unavailable".into(),
-                ));
-            }
-        }
+        // Storage checks the predecessor inside the create transaction
+        // (`check_predecessor`), so a concurrent supersede or revoke cannot slip
+        // between the check and the insert.
         self.db.create_handoff(&manifest, command.request_id)
     }
 
@@ -354,6 +379,96 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// Replay reports revocation, and a predecessor that is revoked or already
+    /// superseded refuses another successor, even when several race (#2830).
+    /// Shared by the SQLite and PostgreSQL stores.
+    pub(crate) fn assert_supersede_rules(db: &std::sync::Arc<RuntimeDb>) {
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let id = |name: &str| format!("{name}-{run}");
+        let successor = |name: &str, predecessor: &str| {
+            let mut next = manifest(&id(name), 1_000);
+            next.supersedes_manifest_id = predecessor.into();
+            next
+        };
+
+        let revoked = manifest(&id("revoked"), 1_000);
+        db.create_handoff(&revoked, &id("create-revoked")).unwrap();
+        db.revoke_handoff(&revoked.id, "alice", "done", &id("revoke"), 2_000)
+            .unwrap();
+        let replay = db.create_handoff(&revoked, &id("create-revoked")).unwrap();
+        assert!(replay.revoked, "replay must report the revocation");
+        assert_eq!(
+            db.create_handoff(&successor("after-revoked", &revoked.id), &id("r1"))
+                .unwrap_err(),
+            HandoffLifecycleError::FailedPrecondition("superseded handoff is revoked".into())
+        );
+
+        let live = manifest(&id("live"), 1_000);
+        db.create_handoff(&live, &id("create-live")).unwrap();
+        db.create_handoff(&successor("first", &live.id), &id("r2"))
+            .unwrap();
+        assert_eq!(
+            db.create_handoff(&successor("second", &live.id), &id("r3"))
+                .unwrap_err(),
+            HandoffLifecycleError::FailedPrecondition(
+                "superseded handoff already has a live successor".into()
+            )
+        );
+
+        let contended = manifest(&id("contended"), 1_000);
+        db.create_handoff(&contended, &id("create-contended"))
+            .unwrap();
+        let racers = 4;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let outcomes: Vec<_> = (0..racers)
+            .map(|racer| {
+                let db = db.clone();
+                let barrier = barrier.clone();
+                let next = successor(&format!("racer-{racer}"), &contended.id);
+                let request = id(&format!("race-{racer}"));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.create_handoff(&next, &request)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        for refused in outcomes.iter().filter_map(|outcome| outcome.as_ref().err()) {
+            assert!(
+                matches!(refused, HandoffLifecycleError::FailedPrecondition(_)),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_create_refuses_revoked_or_superseded_predecessors() {
+        let path = std::env::temp_dir().join(format!(
+            "sekai-handoff-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+            crate::db::sekai::SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        )));
+        assert_supersede_rules(&db);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_create_refuses_revoked_or_superseded_predecessors() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = std::sync::Arc::new(RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect())));
+        assert_supersede_rules(&db);
     }
 
     #[test]
