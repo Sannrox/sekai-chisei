@@ -435,28 +435,53 @@ async fn warehouse_snapshots_hydrate_typed_objects_with_checkpoints_and_quaranti
     assert_eq!(kept.get("status").map(String::as_str), Some("shipped"));
     assert_eq!(kept.get("region").map(String::as_str), Some("eu"));
 
-    // A producer without access to the namespace cannot admit a batch.
-    let outsider = apply(
+    // A producer without access to the namespace cannot admit a batch, even a
+    // fresh one at the current cursor that the connector itself would commit.
+    let mut fresh = second.clone();
+    fresh.snapshot_id = "4083".into();
+    let latest_before = state.latest_transaction.clone();
+    let refused = apply(
         &service,
-        second.clone(),
+        fresh.clone(),
         NAMESPACE,
         OUTSIDER,
         "snapshot:4082",
     )
-    .await;
-    match outsider {
-        Err(status) => assert!(
-            matches!(
-                status.code(),
-                Code::PermissionDenied | Code::Unauthenticated
-            ),
-            "{status:?}"
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused.code(),
+            Code::PermissionDenied | Code::Unauthenticated
         ),
-        Ok(result) => assert_ne!(status(&result), "COMMITTED", "{result:?}"),
-    }
+        "{refused:?}"
+    );
+    let after = service
+        .get_source_sync_state(with_principal(
+            GetSourceSyncStateRequest {
+                namespace: NAMESPACE.into(),
+                source_instance: "lake.sales.orders".into(),
+                type_digest: descriptor.digest.clone(),
+            },
+            CONNECTOR,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .state
+        .unwrap();
+    assert_eq!(after.checkpoint.unwrap().cursor, "snapshot:4082");
+    assert_eq!(after.latest_transaction, latest_before);
+
+    // The same batch from the authorized connector commits, so the refusal
+    // above was the producer's authority and not the batch.
+    let admitted = apply(&service, fresh, NAMESPACE, CONNECTOR, "snapshot:4082")
+        .await
+        .unwrap();
+    assert_eq!(status(&admitted), "COMMITTED", "{admitted:?}");
     assert_eq!(
         checkpoint(&service, &descriptor.digest).await,
-        "snapshot:4082"
+        "snapshot:4083"
     );
 }
 
