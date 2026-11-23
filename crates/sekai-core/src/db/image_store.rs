@@ -170,26 +170,20 @@ impl SekaiDb {
         let parent =
             load_image(&tx, &rendition.namespace, &rendition.image_id)?.ok_or(IMAGE_UNAVAILABLE)?;
         require_attachable(&parent, &rendition.parent_content_digest)?;
-        let changed = tx
-            .execute(
-                "INSERT INTO sekai_governed_image_renditions
-                    (namespace, image_id, rendition_id, record_json)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(namespace, image_id, rendition_id) DO UPDATE SET
-                    record_json = excluded.record_json
-                 WHERE sekai_governed_image_renditions.namespace = excluded.namespace
-                   AND sekai_governed_image_renditions.image_id = excluded.image_id",
-                params![
-                    rendition.namespace,
-                    rendition.image_id,
-                    rendition.rendition_id,
-                    json
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(IMAGE_UNAVAILABLE.into());
-        }
+        tx.execute(
+            "INSERT INTO sekai_governed_image_renditions
+                (namespace, image_id, rendition_id, record_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace, image_id, rendition_id) DO UPDATE SET
+                record_json = excluded.record_json",
+            params![
+                rendition.namespace,
+                rendition.image_id,
+                rendition.rendition_id,
+                json
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -269,26 +263,20 @@ impl SekaiDb {
         let parent = load_image(&tx, &annotation.namespace, &annotation.image_id)?
             .ok_or(IMAGE_UNAVAILABLE)?;
         require_attachable(&parent, &annotation.parent_content_digest)?;
-        let changed = tx
-            .execute(
-                "INSERT INTO sekai_governed_image_annotations
-                    (namespace, image_id, annotation_id, record_json)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(namespace, image_id, annotation_id) DO UPDATE SET
-                    record_json = excluded.record_json
-                 WHERE sekai_governed_image_annotations.namespace = excluded.namespace
-                   AND sekai_governed_image_annotations.image_id = excluded.image_id",
-                params![
-                    annotation.namespace,
-                    annotation.image_id,
-                    annotation.annotation_id,
-                    json
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(IMAGE_UNAVAILABLE.into());
-        }
+        tx.execute(
+            "INSERT INTO sekai_governed_image_annotations
+                (namespace, image_id, annotation_id, record_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(namespace, image_id, annotation_id) DO UPDATE SET
+                record_json = excluded.record_json",
+            params![
+                annotation.namespace,
+                annotation.image_id,
+                annotation.annotation_id,
+                json
+            ],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
     }
