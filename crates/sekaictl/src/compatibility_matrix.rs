@@ -302,8 +302,21 @@ pub fn check_consumer(
             consumer.display()
         ));
     }
-    if let Some(off) = checks.iter().find(|check| !check.is_on_matrix()) {
-        return Ok(off.clone());
+    // A manifest without a Sekai pin (a tooling package.json beside a Rust
+    // crate) does not judge the consumer; only applicable manifests do.
+    let mut applies = Vec::new();
+    let mut unpinned = Vec::new();
+    for check in checks {
+        match check {
+            ManifestCheck::Applies(check) => applies.push(check),
+            ManifestCheck::NoPin(reason) => unpinned.push(reason),
+        }
+    }
+    if applies.is_empty() {
+        return Ok(off_matrix(consumer, unpinned.join("; ")));
+    }
+    if let Some(off) = applies.into_iter().find(|check| !check.is_on_matrix()) {
+        return Ok(off);
     }
     Ok(on_matrix(
         consumer,
@@ -311,11 +324,19 @@ pub fn check_consumer(
     ))
 }
 
+/// One manifest's verdict. `Applies` is a pin or vendored copy that judges the
+/// consumer; `NoPin` carries why the manifest has neither, and decides nothing
+/// unless no manifest of the consumer applies.
+enum ManifestCheck {
+    Applies(PinCheck),
+    NoPin(String),
+}
+
 fn check_rust_consumer(
     matrix: &CompatibilityMatrix,
     consumer: &Path,
     manifest: &Path,
-) -> Result<PinCheck, String> {
+) -> Result<ManifestCheck, String> {
     let body = read_text(manifest)?;
     let pins = parse_manifest_pins(&body);
     let locks = match cargo_lock_path(consumer) {
@@ -323,18 +344,15 @@ fn check_rust_consumer(
         None => Vec::new(),
     };
     if pins.is_empty() && !locks.iter().any(|lock| is_tracked_crate(&lock.name)) {
-        return Ok(off_matrix(
-            consumer,
-            format!(
-                "no sekai-client, sekai-proto, or sekai-chisei pin; expected {}",
-                matrix.expected_revision_label()
-            ),
-        ));
+        return Ok(ManifestCheck::NoPin(format!(
+            "no sekai-client, sekai-proto, or sekai-chisei pin; expected {}",
+            matrix.expected_revision_label()
+        )));
     }
     for pin in &pins {
         let pin = resolve_workspace_pin(consumer, pin)?;
         if let Some(reason) = rust_pin_mismatch(matrix, consumer, &pin, &locks)? {
-            return Ok(off_matrix(consumer, reason));
+            return Ok(ManifestCheck::Applies(off_matrix(consumer, reason)));
         }
     }
     for lock in &locks {
@@ -342,13 +360,13 @@ fn check_rust_consumer(
             continue;
         }
         if let Some(reason) = lock_only_mismatch(matrix, lock) {
-            return Ok(off_matrix(consumer, reason));
+            return Ok(ManifestCheck::Applies(off_matrix(consumer, reason)));
         }
     }
-    Ok(on_matrix(
+    Ok(ManifestCheck::Applies(on_matrix(
         consumer,
         format!("rust pins match {}", matrix.expected_revision_label()),
-    ))
+    )))
 }
 
 fn rust_pin_mismatch(
@@ -450,7 +468,7 @@ fn check_typescript_consumer(
     matrix: &CompatibilityMatrix,
     consumer: &Path,
     package_json: &Path,
-) -> Result<PinCheck, String> {
+) -> Result<ManifestCheck, String> {
     let value: serde_json::Value = serde_json::from_str(&read_text(package_json)?)
         .map_err(|error| format!("{}: {error}", package_json.display()))?;
     let name = value
@@ -458,27 +476,27 @@ fn check_typescript_consumer(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     if name == TYPESCRIPT_PACKAGE || contains_vendored_proto(consumer) {
-        return Ok(off_matrix(
+        return Ok(ManifestCheck::Applies(off_matrix(
             consumer,
             format!(
                 "vendored TypeScript copy is off-matrix until replaced by a pin of {TYPESCRIPT_PACKAGE} {}; expected {}",
                 matrix.packages.typescript,
                 matrix.expected_revision_label()
             ),
-        ));
+        )));
     }
     if let Some(found) = json_dependency_version(&value, TYPESCRIPT_PACKAGE) {
         if found == matrix.packages.typescript {
-            return Ok(on_matrix(
+            return Ok(ManifestCheck::Applies(on_matrix(
                 consumer,
                 format!(
                     "{TYPESCRIPT_PACKAGE} {} matches {}",
                     found,
                     matrix.expected_revision_label()
                 ),
-            ));
+            )));
         }
-        return Ok(off_matrix(
+        return Ok(ManifestCheck::Applies(off_matrix(
             consumer,
             off_matrix_pin(
                 TYPESCRIPT_PACKAGE,
@@ -486,58 +504,52 @@ fn check_typescript_consumer(
                 &matrix.packages.typescript,
                 matrix,
             ),
-        ));
+        )));
     }
-    Ok(off_matrix(
-        consumer,
-        format!(
-            "no {TYPESCRIPT_PACKAGE} pin; expected {}",
-            matrix.expected_revision_label()
-        ),
-    ))
+    Ok(ManifestCheck::NoPin(format!(
+        "no {TYPESCRIPT_PACKAGE} pin; expected {}",
+        matrix.expected_revision_label()
+    )))
 }
 
 fn check_python_consumer(
     matrix: &CompatibilityMatrix,
     consumer: &Path,
     pyproject: &Path,
-) -> Result<PinCheck, String> {
+) -> Result<ManifestCheck, String> {
     let body = read_text(pyproject)?;
     if pyproject_project_name(&body).as_deref() == Some(PYTHON_PACKAGE)
         || contains_vendored_proto(consumer)
     {
-        return Ok(off_matrix(
+        return Ok(ManifestCheck::Applies(off_matrix(
             consumer,
             format!(
                 "vendored Python copy is off-matrix until replaced by a pin of {PYTHON_PACKAGE} {}; expected {}",
                 matrix.packages.python,
                 matrix.expected_revision_label()
             ),
-        ));
+        )));
     }
     if let Some(found) = python_dependency_version(&body, PYTHON_PACKAGE) {
         if found == matrix.packages.python {
-            return Ok(on_matrix(
+            return Ok(ManifestCheck::Applies(on_matrix(
                 consumer,
                 format!(
                     "{PYTHON_PACKAGE} {} matches {}",
                     found,
                     matrix.expected_revision_label()
                 ),
-            ));
+            )));
         }
-        return Ok(off_matrix(
+        return Ok(ManifestCheck::Applies(off_matrix(
             consumer,
             off_matrix_pin(PYTHON_PACKAGE, &found, &matrix.packages.python, matrix),
-        ));
+        )));
     }
-    Ok(off_matrix(
-        consumer,
-        format!(
-            "no {PYTHON_PACKAGE} pin; expected {}",
-            matrix.expected_revision_label()
-        ),
-    ))
+    Ok(ManifestCheck::NoPin(format!(
+        "no {PYTHON_PACKAGE} pin; expected {}",
+        matrix.expected_revision_label()
+    )))
 }
 
 fn require_in_tree_package_pins(root: &Path, matrix: &CompatibilityMatrix) -> Result<(), String> {
@@ -1272,6 +1284,73 @@ mod tests {
         let check = check_consumer(&matrix, &consumer).unwrap();
         assert!(!check.is_on_matrix());
         assert!(check.summary.contains("0.1.0"), "{}", check.summary);
+    }
+
+    const RUST_PIN: &str = "[package]\nname = \"mixed\"\nversion = \"0.0.1\"\n\n[dependencies]\nsekai-client = \"=0.1.2\"\n";
+
+    #[test]
+    fn a_tooling_package_json_does_not_judge_a_pinned_rust_consumer() {
+        let matrix = sample_matrix();
+        let (_keep, consumer) = write_consumer(RUST_PIN);
+        fs::write(
+            consumer.join("package.json"),
+            r#"{"name":"mixed-tooling","devDependencies":{"prettier":"3.0.0"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            consumer.join("pyproject.toml"),
+            "[project]\nname = \"mixed-scripts\"\n",
+        )
+        .unwrap();
+        let check = check_consumer(&matrix, &consumer).unwrap();
+        assert!(check.is_on_matrix(), "{}", check.report());
+    }
+
+    #[test]
+    fn a_consumer_with_no_sekai_pin_in_any_manifest_is_off_matrix() {
+        let matrix = sample_matrix();
+        let (_keep, consumer) = write_consumer("[package]\nname = \"bare\"\nversion = \"0.0.1\"\n");
+        fs::write(consumer.join("package.json"), r#"{"name":"bare-tooling"}"#).unwrap();
+        let check = check_consumer(&matrix, &consumer).unwrap();
+        assert!(!check.is_on_matrix());
+        let expected = matrix.expected_revision_label();
+        assert_eq!(
+            check.summary,
+            format!(
+                "no sekai-client, sekai-proto, or sekai-chisei pin; expected {expected}; \
+                 no @sannrox/sekai-chisei-sdk pin; expected {expected}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_mismatch_or_vendored_copy_beside_a_matching_rust_pin_is_off_matrix() {
+        let matrix = sample_matrix();
+        let (_keep, consumer) = write_consumer(RUST_PIN);
+        fs::write(
+            consumer.join("package.json"),
+            r#"{"name":"mixed-ui","dependencies":{"@sannrox/sekai-chisei-sdk":"0.0.9"}}"#,
+        )
+        .unwrap();
+        let check = check_consumer(&matrix, &consumer).unwrap();
+        assert!(!check.is_on_matrix());
+        assert!(check.summary.contains("0.0.9"), "{}", check.summary);
+
+        let (_keep, consumer) = write_consumer(RUST_PIN);
+        fs::create_dir_all(consumer.join("proto")).unwrap();
+        fs::write(consumer.join("proto/sekai.proto"), "syntax = \"proto3\";\n").unwrap();
+        fs::write(
+            consumer.join("pyproject.toml"),
+            "[project]\nname = \"mixed-scripts\"\n",
+        )
+        .unwrap();
+        let check = check_consumer(&matrix, &consumer).unwrap();
+        assert!(!check.is_on_matrix());
+        assert!(
+            check.summary.contains("vendored Python copy"),
+            "{}",
+            check.summary
+        );
     }
 
     #[test]
