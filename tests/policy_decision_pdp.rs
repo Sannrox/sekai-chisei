@@ -15,8 +15,8 @@ use sekai_chisei::sekai::object_security::{
 };
 use sekai_chisei::sekai::policy_decision::{
     PolicyCompileRequest, PolicyDecisionQuery, PolicyDecisionRecord, PolicyOutcome, PolicySnapshot,
-    SimulatedPrincipal, audit_export_contains_hidden_value, compile_object_access,
-    simulate_policy_change,
+    SimulatedPrincipal, audit_export_contains_hidden_value, compile_for_snapshot,
+    compile_object_access, simulate_policy_change,
 };
 
 fn sqlite() -> RuntimeDb {
@@ -132,7 +132,7 @@ fn simulated_policy_change_matches_applied_activation() {
     let candidate = PolicySnapshot {
         namespace: "acme".into(),
         activation_digest: "candidate".into(),
-        policies: BTreeMap::from([("document".into(), candidate_policy.clone())]),
+        policies: BTreeMap::from([("document".into(), candidate_policy)]),
         lattice: None,
     };
     let objects = vec![alice_doc.clone(), bob_doc.clone()];
@@ -176,22 +176,54 @@ fn simulated_policy_change_matches_applied_activation() {
         4,
     )
     .unwrap();
+    // The live database policy, not the local candidate, must reproduce the simulation.
+    let live = db
+        .active_object_policy("acme", "document")
+        .unwrap()
+        .unwrap();
     let applied = PolicySnapshot {
         namespace: "acme".into(),
         activation_digest: "applied".into(),
-        policies: BTreeMap::from([("document".into(), candidate_policy)]),
+        policies: BTreeMap::from([("document".into(), live)]),
         lattice: None,
     };
+    for diff in report
+        .differences
+        .iter()
+        .filter(|diff| diff.property.is_empty())
+    {
+        let principal = principals
+            .iter()
+            .find(|principal| principal.principal == diff.principal)
+            .unwrap();
+        let object = objects
+            .iter()
+            .find(|object| object.id == diff.object_id)
+            .unwrap();
+        let live_decision = compile_for_snapshot(
+            &applied,
+            principal,
+            "document",
+            ObjectSecurityOperation::Read,
+            10,
+        )
+        .unwrap()
+        .decide(object);
+        assert_eq!(live_decision.outcome, diff.candidate_outcome, "{diff:?}");
+    }
     let after = simulate_policy_change(
         &objects,
         &principals,
-        &applied,
+        &candidate,
         &applied,
         ObjectSecurityOperation::Read,
         10,
     )
     .unwrap();
-    assert!(after.differences.is_empty(), "{after:?}");
+    assert!(
+        after.differences.is_empty(),
+        "live policy diverges from the simulated candidate: {after:?}"
+    );
 }
 
 #[test]
