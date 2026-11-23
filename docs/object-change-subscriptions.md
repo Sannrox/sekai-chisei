@@ -28,7 +28,8 @@ read. Property filters pass the same restricted-property and property-grant
 query checks as a listing filter.
 
 A page names only objects the caller can read, or deleted objects whose history
-the caller may read under the `ListObjectChanges` rule: in a namespace with
+the caller may read under the `ListObjectChanges` rule (that RPC itself is
+experimental, behind `SEKAI_EXPERIMENTAL_RPCS=1`): in a namespace with
 object security activated, and for tenant callers, deleted history fails
 closed; otherwise the object ACL decides. A change to any other object returns
 `resnapshot_required` and names no object. Take a new snapshot at the returned
@@ -61,13 +62,20 @@ slow_consumer`.
 ## Action bindings
 
 A namespace administrator can bind a subscription scope to one governed
-Action type with `PutActionBinding` (experimental, gated by
-`SEKAI_EXPERIMENTAL_RPCS=1`). `RunActionBinding` reads
+Action type with `PutActionBinding`. `RunActionBinding` reads
 the binding's own subscription as its `run_as` service principal and submits
 one Action per bound event, checked through normal admission. Properties are
 read as that principal sees them, so hidden fields never become parameters.
 A rerun admits nothing new, and `require_approval` parks. See
 [ADR 0090](decisions/0090-object-change-action-bindings.md).
+
+`GetActionBinding` and `ListActionBindings` read stored bindings as
+`sekai.action-binding/v1` JSON with their revision. The `run_as` principal
+and namespace administrators may read a binding; anyone else gets
+`NOT_FOUND` from get and does not see it in a list. A list pages by
+`binding_id`, at most 100 per page. All four RPCs are `stable` (#3036) and
+served over gRPC and the HTTP/JSON projection. The Rust client exposes them
+as `CoreLoopClient::action_bindings()` (`put`, `get`, `list`, `run`).
 
 A binding can fire on a fixed interval instead (#3033): it carries
 `"schedule": {"every_ms": N}` with N from 60000 (one minute) to 604800000

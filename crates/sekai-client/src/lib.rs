@@ -44,6 +44,7 @@ pub const SDK_CONTRACT_VERSION: &str = "sekai.sdk-core-loop/v1";
 pub const CONTENT_SDK_CONTRACT_VERSION: &str = "sekai.sdk-content-execution/v1";
 /// Versioned runtime-claim client contract (#1389). Additive on `1.x`.
 pub const RUNTIME_CLAIM_CONTRACT_VERSION: &str = "sekai.sdk-runtime-claim/v1";
+pub mod action_binding;
 pub mod claim;
 pub mod sync_replica;
 pub const CONTENT_CONTRACT_VERSION: &str = "chisei.content-execution/v1";

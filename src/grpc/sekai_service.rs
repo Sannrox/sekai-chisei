@@ -320,6 +320,8 @@ impl SekaiService for SekaiServiceImpl {
         generate_definition_change_bundle => generate_visible_definition_change_bundle(GenerateDefinitionChangeBundleRequest) -> GenerateDefinitionChangeBundleResponse;
         put_action_binding => put_action_binding_definition(PutActionBindingRequest) -> PutActionBindingResponse;
         run_action_binding => run_action_binding_once(RunActionBindingRequest) -> RunActionBindingResponse;
+        get_action_binding => get_action_binding_record(GetActionBindingRequest) -> GetActionBindingResponse;
+        list_action_bindings => list_action_binding_records(ListActionBindingsRequest) -> ListActionBindingsResponse;
     }
 
     async fn export_object_set(

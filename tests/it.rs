@@ -89,6 +89,7 @@ fn refused_boot_output(mut command: std::process::Command, label: &str) -> Strin
 }
 
 mod action_binding_backend_conformance;
+mod action_binding_client;
 mod action_claim_impact_backend_conformance;
 mod action_governance_backend_conformance;
 mod action_policy_dry_run_backend_conformance;

@@ -3378,6 +3378,30 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetActionBinding",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "ListActionBindings",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DecideActionInstance",
       "kind": "persistent",
       "surfaces": [

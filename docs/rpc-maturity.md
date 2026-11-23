@@ -84,8 +84,8 @@ An `experimental` RPC moves to `stable` only when it meets the
 
 Search (#2243), the governed-document RPCs (#2266), the datasource
 index RPCs (#2282), the dataset version and health RPCs (#2415),
-`GetLineage` (#2416), and the lease RPCs (#3266) met these criteria and are
-`stable`. Status of the
+`GetLineage` (#2416), the lease RPCs (#3266), and the Action binding RPCs
+(#3036) met these criteria and are `stable`. Status of the
 remaining experimental embedding-spec RPCs:
 
 | RPCs | Status | Blocked by |
@@ -355,8 +355,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
-| `SekaiService.PutActionBinding` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.RunActionBinding` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.PutActionBinding` | `sekai.audit` | yes | sdk | `stable` |
+| `SekaiService.RunActionBinding` | `sekai.audit` | yes | sdk | `stable` |
+| `SekaiService.GetActionBinding` | `sekai.audit` | yes | sdk | `stable` |
+| `SekaiService.ListActionBindings` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |

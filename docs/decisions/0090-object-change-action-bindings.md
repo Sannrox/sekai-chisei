@@ -61,8 +61,9 @@ a failed run is recorded rather than retried into duplicate effects.
   does not backfill. `resnapshot_required` re-pins. `slow_consumer`
   disconnects and clears the pin so the next run re-pins. The subscription
   and the binding never carry authority (`authority` stays false).
-- **Wire.** Both RPCs are `experimental` until a sekaictl or SDK consumer
-  ships. Community PostgreSQL answers `UNAVAILABLE`.
+- **Wire.** Both RPCs were `experimental` until an SDK consumer shipped.
+  They are `stable` since #3036, with `GetActionBinding` and
+  `ListActionBindings` beside them, on SQLite and PostgreSQL.
 
 ## Alternatives considered
 
