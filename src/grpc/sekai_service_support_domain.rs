@@ -688,7 +688,7 @@ pub(super) fn require_admitted_source_type(
             Ok(())
         }
         _ => Err(Status::failed_precondition(
-            "source type revision is not bound",
+            sekai_source_sdk::SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE,
         )),
     }
 }
@@ -708,7 +708,7 @@ pub(super) fn validate_source_sync_lookup(input: &GetSourceSyncStateRequest) -> 
         || input.type_digest.trim() != input.type_digest
     {
         return Err(Status::failed_precondition(
-            "source type revision is not bound",
+            sekai_source_sdk::SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE,
         ));
     }
     Ok(())
@@ -1663,9 +1663,11 @@ pub(super) fn map_source_sync_apply_error(error: String) -> Status {
             Status::permission_denied("source producer identity denied")
         }
         "unsupported_version" | "unsupported_adapter" => {
-            Status::failed_precondition("source sync contract version is unsupported")
+            Status::failed_precondition(sekai_source_sdk::SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE)
         }
-        "unbound_type_revision" => Status::failed_precondition("source type revision is not bound"),
+        "unbound_type_revision" => {
+            Status::failed_precondition(sekai_source_sdk::SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE)
+        }
         "source_disabled" => Status::failed_precondition("source is disabled"),
         "source_handle_mismatch" => {
             Status::failed_precondition("the named source does not own this source_instance")
@@ -1695,7 +1697,9 @@ pub(super) fn map_source_sync_apply_error(error: String) -> Status {
         | "generation_conflict"
         | "feed_epoch_conflict"
         | "phase_conflict"
-        | "recovery_required" => Status::failed_precondition("source sync state conflict"),
+        | "recovery_required" => {
+            Status::failed_precondition(sekai_source_sdk::SOURCE_SYNC_STATE_CONFLICT_MESSAGE)
+        }
         "canonicalization_failed"
         | "foreign_source"
         | "foreign_family"

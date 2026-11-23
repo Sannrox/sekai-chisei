@@ -44,6 +44,14 @@ pub const GITHUB_OBJECT_SYNC_TYPE_REVISION: SourceTypeRevisionDescriptor =
         digest: GITHUB_OBJECT_SYNC_TYPE_DIGEST,
     };
 
+/// Status messages the plane returns for source batches. Connectors match
+/// them to tell a permanent refusal from a retryable conflict, so the plane and
+/// every connector must use these constants rather than literal text.
+pub const SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE: &str =
+    "source sync contract version is unsupported";
+pub const SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE: &str = "source type revision is not bound";
+pub const SOURCE_SYNC_STATE_CONFLICT_MESSAGE: &str = "source sync state conflict";
+
 pub const MAX_SOURCE_BATCH_RECORDS: usize = 500;
 pub const MAX_SOURCE_RECORD_PROPERTIES: usize = 64;
 pub const MAX_SOURCE_CURSOR_BYTES: usize = 4 * 1024;
