@@ -154,8 +154,10 @@ fn bounded_stochastic_evaluator_records_live_variance_evidence() {
         raw_response_retention: STOCHASTIC_RAW_RETENTION_NONE.into(),
     };
     let node = ResolvedEvaluationNode {
+        metric_objectives: Vec::new(),
         node_id: "live-model-review".into(),
         evaluator: ResolvedEvaluatorBinding {
+            declared_metrics: Vec::new(),
             definition_id: "evaluator:live-model-review".into(),
             definition_digest: digest('a'),
             implementation_digest: BOUNDED_RUBRIC_IMPLEMENTATION_DIGEST.into(),

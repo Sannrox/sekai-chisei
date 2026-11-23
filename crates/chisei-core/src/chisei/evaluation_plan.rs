@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::chisei::builtin_evaluators::{builtin_parameter_schema, validate_builtin_parameters};
+use crate::chisei::evaluation_metrics::{
+    self, METRICS_RESULT_SCHEMA, MetricDeclaration, MetricObjective,
+};
 use sekai_core::sekai::parameter_schema::parse_parameter_schema;
 pub use sekai_core::sekai::parameter_schema::{validate_parameter_schema, validate_parameters};
 
@@ -115,6 +118,10 @@ pub struct EvaluatorDefinition {
     pub adapter_endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stochastic_policy: Option<StochasticEvaluatorPolicy>,
+    /// Metrics a `chisei.evaluation-metrics/v1` evaluator reports (ADR 0154).
+    /// Empty for single-status evaluators.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_metrics: Vec<MetricDeclaration>,
     pub source_ref: String,
     pub content_digest: String,
     pub created_by: String,
@@ -149,6 +156,9 @@ pub struct EvaluationPlanNode {
     pub parameters_json: String,
     pub invariant_version_ids: Vec<String>,
     pub classification: String,
+    /// Plan-owned objectives over the evaluator's declared metrics (ADR 0154).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_objectives: Vec<MetricObjective>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +193,8 @@ struct CanonicalDefinition<'a> {
     resource_limits: &'a EvaluatorResourceLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     stochastic_policy: Option<&'a StochasticEvaluatorPolicy>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    declared_metrics: &'a [MetricDeclaration],
     source_ref: &'a str,
 }
 
@@ -201,6 +213,8 @@ struct CanonicalExternalDefinition<'a> {
     parameter_schema: Value,
     evidence_classifications: &'a [String],
     resource_limits: &'a EvaluatorResourceLimits,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    declared_metrics: &'a [MetricDeclaration],
     source_ref: &'a str,
 }
 
@@ -270,6 +284,7 @@ pub fn prepare_definition(
     )?;
     normalize_classifications(&mut definition.evidence_classifications)?;
     validate_resource_limits(&definition.resource_limits)?;
+    validate_declared_metrics(&mut definition)?;
     if definition.execution_class == DETERMINISTIC_EXECUTION_CLASS
         && !definition.adapter_endpoint.is_empty()
     {
@@ -319,6 +334,7 @@ pub fn prepare_definition(
             parameter_schema,
             evidence_classifications: &definition.evidence_classifications,
             resource_limits: &definition.resource_limits,
+            declared_metrics: &definition.declared_metrics,
             source_ref: &definition.source_ref,
         })?
     } else {
@@ -338,6 +354,7 @@ pub fn prepare_definition(
             evidence_classifications: &definition.evidence_classifications,
             resource_limits: &definition.resource_limits,
             stochastic_policy: definition.stochastic_policy.as_ref(),
+            declared_metrics: &definition.declared_metrics,
             source_ref: &definition.source_ref,
         })?
     };
@@ -356,6 +373,36 @@ pub fn validate_node_parameters(
 ) -> Result<(), String> {
     validate_parameters(&definition.parameter_schema_json, parameters_json)?;
     validate_builtin_parameters(&definition.implementation_digest, parameters_json)
+}
+
+/// Plan-time check of one node against its exact evaluator definition:
+/// parameters, then metric objectives against the declared metrics.
+pub fn validate_node_for_definition(
+    definition: &EvaluatorDefinition,
+    node: &EvaluationPlanNode,
+) -> Result<(), String> {
+    validate_node_parameters(definition, &node.parameters_json)?;
+    evaluation_metrics::check_objectives(&definition.declared_metrics, &node.metric_objectives)
+}
+
+/// Metric declarations and the closed metrics result schema come together,
+/// and only for deterministic or external evaluators: multi-metric stochastic
+/// aggregation is not part of ADR 0154.
+fn validate_declared_metrics(definition: &mut EvaluatorDefinition) -> Result<(), String> {
+    evaluation_metrics::normalize_declarations(&mut definition.declared_metrics)?;
+    let lists_schema = definition
+        .supported_result_schemas
+        .iter()
+        .any(|schema| schema == METRICS_RESULT_SCHEMA);
+    if lists_schema != !definition.declared_metrics.is_empty() {
+        return Err(format!(
+            "declared_metrics and the {METRICS_RESULT_SCHEMA} result schema require each other"
+        ));
+    }
+    if lists_schema && definition.execution_class == STOCHASTIC_EXECUTION_CLASS {
+        return Err("stochastic evaluators cannot declare metrics".into());
+    }
+    Ok(())
 }
 
 /// Schema equality ignores the order of `required` names.
@@ -672,6 +719,7 @@ fn normalize_and_validate_nodes(nodes: &mut [EvaluationPlanNode]) -> Result<(), 
         }
         node.parameters_json =
             serde_json::to_string(&parameters).map_err(|error| error.to_string())?;
+        evaluation_metrics::normalize_objectives(&mut node.metric_objectives)?;
     }
     let all_ids = nodes
         .iter()
@@ -896,6 +944,7 @@ mod tests {
 
     fn definition() -> EvaluatorDefinition {
         EvaluatorDefinition {
+            declared_metrics: Vec::new(),
             contract_version: String::new(),
             definition_id: String::new(),
             namespace: "acme".into(),
@@ -932,6 +981,7 @@ mod tests {
             version: "1.0.0".into(),
             accepted_subject_profiles: vec!["document/v1".into()],
             nodes: vec![EvaluationPlanNode {
+                metric_objectives: Vec::new(),
                 node_id: "schema".into(),
                 evaluator_definition_id: definition_id.into(),
                 depends_on_node_ids: vec![],
@@ -975,6 +1025,54 @@ mod tests {
             egress_policy: STOCHASTIC_EGRESS_ALLOWLISTED_EXTERNAL.into(),
             raw_response_retention: STOCHASTIC_RAW_RETENTION_NONE.into(),
         }
+    }
+
+    #[test]
+    fn metric_declarations_travel_with_their_result_schema() {
+        use crate::chisei::evaluation_metrics::MetricKind;
+        let mut metrics = definition();
+        metrics.declared_metrics = vec![MetricDeclaration {
+            name: "accuracy".into(),
+            kind: MetricKind::IntegerMicros,
+        }];
+        assert!(
+            prepare_definition(metrics.clone(), "operator", 10)
+                .unwrap_err()
+                .contains("require each other")
+        );
+        let mut schema_only = definition();
+        schema_only
+            .supported_result_schemas
+            .push(METRICS_RESULT_SCHEMA.into());
+        assert!(prepare_definition(schema_only, "operator", 10).is_err());
+        metrics
+            .supported_result_schemas
+            .push(METRICS_RESULT_SCHEMA.into());
+        let prepared = prepare_definition(metrics, "operator", 10).unwrap();
+        assert_ne!(
+            prepared.content_digest,
+            prepare_definition(definition(), "operator", 10)
+                .unwrap()
+                .content_digest
+        );
+    }
+
+    /// Definitions and plans stored before ADR 0154 keep their digests: the
+    /// metric fields are absent from canonical JSON when empty.
+    #[test]
+    fn single_status_digests_predate_metric_fields() {
+        let definition = prepare_definition(definition(), "operator", 10).unwrap();
+        let plan = prepare_plan(plan(&definition.definition_id), "operator", 10).unwrap();
+        assert_eq!(
+            (
+                definition.content_digest.as_str(),
+                plan.content_digest.as_str()
+            ),
+            (
+                "sha256:56b65804c2a28464126259efa081345f20884875a14039706a4d167a697b16fe",
+                "sha256:5eeb55b6c066129d093771d84955d288517dac3fefd0d49952c1e2fb3f0adc41"
+            )
+        );
     }
 
     #[test]

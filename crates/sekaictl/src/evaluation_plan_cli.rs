@@ -17,6 +17,7 @@ use chisei_core::chisei::evaluation_manifest::{
     RESOLUTION_RESOLVED, RESOLUTION_UNAVAILABLE, RESOLUTION_UNKNOWN, RESOLVER_VERSION,
     prepare_resolution_request,
 };
+use chisei_core::chisei::evaluation_metrics::{MetricObjective, Objective};
 use chisei_core::chisei::evaluation_plan::{
     EvaluationInputBinding as DomainInputBinding, EvaluationPlan as DomainPlan,
     EvaluationPlanNode as DomainPlanNode, prepare_plan,
@@ -26,7 +27,7 @@ use sekai_admin_client::client::{GatewayClient, connect_sekai};
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_proto::chisei::{
     EvaluationExecutionProjection, EvaluationExecutionRequest, EvaluationInputBinding,
-    EvaluationPlan, EvaluationPlanNode, EvaluationResolutionRequest,
+    EvaluationMetricObjective, EvaluationPlan, EvaluationPlanNode, EvaluationResolutionRequest,
     ExecuteEvaluationManifestRequest, GetOperationReceiptRequest, PutEvaluationPlanRequest,
     ResolveEvaluationPlanRequest, ResolvedEvaluationManifest,
 };
@@ -234,6 +235,8 @@ struct PlanNodeDocument {
     parameters_json: Option<String>,
     invariant_version_ids: Vec<String>,
     classification: String,
+    #[serde(default)]
+    metric_objectives: Vec<MetricObjective>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,7 +320,7 @@ async fn apply_command(args: ParsedArgs) -> Result<(), EvaluationCliError> {
     print_plan_output(
         "apply",
         "stored",
-        &from_proto_plan(response),
+        &from_proto_plan(response)?,
         None,
         args.json(),
     )
@@ -638,6 +641,7 @@ impl PlanDocument {
                 }
             };
             nodes.push(DomainPlanNode {
+                metric_objectives: node.metric_objectives,
                 node_id: node.node_id,
                 evaluator_definition_id: node.evaluator_definition_id,
                 depends_on_node_ids: node.depends_on_node_ids,
@@ -842,6 +846,19 @@ fn to_proto_plan(plan: &DomainPlan) -> EvaluationPlan {
                 parameters_json: node.parameters_json.clone(),
                 invariant_version_ids: node.invariant_version_ids.clone(),
                 classification: node.classification.clone(),
+                metric_objectives: node
+                    .metric_objectives
+                    .iter()
+                    .map(|value| {
+                        let (objective, expected, threshold_micros) = value.objective.parts();
+                        EvaluationMetricObjective {
+                            metric: value.metric.clone(),
+                            objective: objective.into(),
+                            expected,
+                            threshold_micros,
+                        }
+                    })
+                    .collect(),
             })
             .collect(),
         reducer: plan.reducer.clone(),
@@ -852,41 +869,54 @@ fn to_proto_plan(plan: &DomainPlan) -> EvaluationPlan {
     }
 }
 
-fn from_proto_plan(plan: EvaluationPlan) -> DomainPlan {
-    DomainPlan {
+fn from_proto_plan(plan: EvaluationPlan) -> Result<DomainPlan, EvaluationCliError> {
+    let mut nodes = Vec::with_capacity(plan.nodes.len());
+    for node in plan.nodes {
+        let metric_objectives = node
+            .metric_objectives
+            .into_iter()
+            .map(|value| {
+                Objective::from_parts(&value.objective, value.expected, value.threshold_micros)
+                    .map(|objective| MetricObjective {
+                        metric: value.metric,
+                        objective,
+                    })
+                    .map_err(compatibility_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        nodes.push(DomainPlanNode {
+            metric_objectives,
+            node_id: node.node_id,
+            evaluator_definition_id: node.evaluator_definition_id,
+            depends_on_node_ids: node.depends_on_node_ids,
+            input_bindings: node
+                .input_bindings
+                .into_iter()
+                .map(|binding| DomainInputBinding {
+                    name: binding.name,
+                    source_kind: binding.source_kind,
+                    schema_id: binding.schema_id,
+                })
+                .collect(),
+            parameters_json: node.parameters_json,
+            invariant_version_ids: node.invariant_version_ids,
+            classification: node.classification,
+        });
+    }
+    Ok(DomainPlan {
         contract_version: plan.contract_version,
         plan_version_id: plan.plan_version_id,
         namespace: plan.namespace,
         plan_id: plan.plan_id,
         version: plan.version,
         accepted_subject_profiles: plan.accepted_subject_profiles,
-        nodes: plan
-            .nodes
-            .into_iter()
-            .map(|node| DomainPlanNode {
-                node_id: node.node_id,
-                evaluator_definition_id: node.evaluator_definition_id,
-                depends_on_node_ids: node.depends_on_node_ids,
-                input_bindings: node
-                    .input_bindings
-                    .into_iter()
-                    .map(|binding| DomainInputBinding {
-                        name: binding.name,
-                        source_kind: binding.source_kind,
-                        schema_id: binding.schema_id,
-                    })
-                    .collect(),
-                parameters_json: node.parameters_json,
-                invariant_version_ids: node.invariant_version_ids,
-                classification: node.classification,
-            })
-            .collect(),
+        nodes,
         reducer: plan.reducer,
         source_ref: plan.source_ref,
         content_digest: plan.content_digest,
         created_by: plan.created_by,
         created_at_ms: plan.created_at_ms,
-    }
+    })
 }
 
 fn to_proto_resolution(resolution: DomainResolution) -> EvaluationResolutionRequest {
@@ -1333,6 +1363,7 @@ mod tests {
 
     fn node(id: &str, depends_on_node_ids: Vec<String>, classification: &str) -> PlanNodeDocument {
         PlanNodeDocument {
+            metric_objectives: Vec::new(),
             node_id: id.into(),
             evaluator_definition_id: exact("evaluator-definition:", 'a'),
             depends_on_node_ids,

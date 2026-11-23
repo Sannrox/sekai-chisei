@@ -14,6 +14,7 @@ use crate::chisei::evaluation_execution::{
     REASON_EXECUTION_CANCELLED, STATUS_PASS, VERDICT_ALLOW, execution_operation_id,
     step_and_gate_evidence,
 };
+use crate::chisei::evaluation_metrics::{MetricVerdict, Verdict};
 use crate::chisei::evaluation_plan::NODE_REQUIRED;
 use crate::chisei::receipt::OperationReceipt;
 use serde::Serialize;
@@ -155,6 +156,20 @@ pub struct NodeComparison {
     pub change: Change,
     /// Which receipt digests differ, when the node exists on both sides.
     pub differs_in: Vec<&'static str>,
+    /// Per-metric verdicts of a multi-metric evaluator (ADR 0154), by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<MetricComparison>,
+}
+
+/// One metric across both sides. `Improved` and `Regressed` follow the
+/// verdict (`unmet` to `met` and back); a different value or objective under
+/// the same verdict is `Changed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MetricComparison {
+    pub name: String,
+    pub baseline: Option<MetricVerdict>,
+    pub candidate: Option<MetricVerdict>,
+    pub change: Change,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -281,6 +296,7 @@ pub fn compare(
                 (Some(before), Some(after)) => differing_digests(before, after),
                 _ => Vec::new(),
             },
+            metrics: compare_metrics(before, after),
         });
     }
 
@@ -340,10 +356,59 @@ fn step_change(before: &EvaluationStepReceipt, after: &EvaluationStepReceipt) ->
     match (before.status == STATUS_PASS, after.status == STATUS_PASS) {
         (false, true) => Change::Improved,
         (true, false) => Change::Regressed,
-        _ if before.status != after.status || before.reason_code != after.reason_code => {
+        _ if before.status != after.status
+            || before.reason_code != after.reason_code
+            || before.metric_verdicts != after.metric_verdicts =>
+        {
             Change::Changed
         }
         _ => Change::Unchanged,
+    }
+}
+
+fn compare_metrics(
+    before: Option<&EvaluationStepReceipt>,
+    after: Option<&EvaluationStepReceipt>,
+) -> Vec<MetricComparison> {
+    let (before, after) = (metric_side(before), metric_side(after));
+    let names = before
+        .keys()
+        .chain(after.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .map(|name| {
+            let baseline = before.get(name).copied();
+            let candidate = after.get(name).copied();
+            MetricComparison {
+                name: name.into(),
+                change: metric_change(baseline, candidate),
+                baseline: baseline.cloned(),
+                candidate: candidate.cloned(),
+            }
+        })
+        .collect()
+}
+
+fn metric_side(step: Option<&EvaluationStepReceipt>) -> BTreeMap<&str, &MetricVerdict> {
+    step.map(|step| step.metric_verdicts.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|verdict| (verdict.name.as_str(), verdict))
+        .collect()
+}
+
+fn metric_change(before: Option<&MetricVerdict>, after: Option<&MetricVerdict>) -> Change {
+    match (before, after) {
+        (None, _) => Change::Added,
+        (_, None) => Change::Removed,
+        (Some(before), Some(after)) => match (before.verdict, after.verdict) {
+            (Verdict::Unmet, Verdict::Met) => Change::Improved,
+            (Verdict::Met, Verdict::Unmet) => Change::Regressed,
+            _ if before != after => Change::Changed,
+            _ => Change::Unchanged,
+        },
     }
 }
 
@@ -405,6 +470,7 @@ mod tests {
 
     fn step(node_id: &str, classification: &str, status: &str) -> EvaluationStepReceipt {
         EvaluationStepReceipt {
+            metric_verdicts: Vec::new(),
             contract_version: "chisei.evaluation-step-receipt/v1".into(),
             manifest_digest: digest('a'),
             node_id: node_id.into(),

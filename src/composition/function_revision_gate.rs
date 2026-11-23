@@ -366,8 +366,10 @@ fn function_revision_manifest(
         .map(|item| item.evidence_object_id.clone())
         .collect();
     let node = ResolvedEvaluationNode {
+        metric_objectives: Vec::new(),
         node_id: "function-revision-rubric".into(),
         evaluator: ResolvedEvaluatorBinding {
+            declared_metrics: Vec::new(),
             definition_id: "definition:bounded-rubric-score".into(),
             definition_digest: BOUNDED_RUBRIC_PROFILE_DIGEST.into(),
             implementation_digest: BOUNDED_RUBRIC_IMPLEMENTATION_DIGEST.into(),

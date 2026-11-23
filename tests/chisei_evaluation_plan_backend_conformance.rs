@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 fn definition(namespace: &str, suffix: &str) -> EvaluatorDefinition {
     EvaluatorDefinition {
+        declared_metrics: Vec::new(),
         contract_version: EVALUATOR_DEFINITION_CONTRACT.into(),
         definition_id: String::new(),
         namespace: namespace.into(),
@@ -83,6 +84,7 @@ fn plan(namespace: &str, suffix: &str, definition_id: &str) -> EvaluationPlan {
         version: "1.0.0".into(),
         accepted_subject_profiles: vec!["document/v1".into()],
         nodes: vec![EvaluationPlanNode {
+            metric_objectives: Vec::new(),
             node_id: "schema".into(),
             evaluator_definition_id: definition_id.into(),
             depends_on_node_ids: vec![],
@@ -208,7 +210,60 @@ fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
         110,
     )
     .unwrap();
+    exercise_metric_objectives(db, namespace, suffix);
     (stored_definition.definition_id, stored_plan.plan_version_id)
+}
+
+/// ADR 0154: declared metrics and bound objectives persist exactly, and an
+/// objective on an undeclared metric is refused at the store.
+fn exercise_metric_objectives(db: &RuntimeDb, namespace: &str, suffix: &str) {
+    use sekai_chisei::chisei::evaluation_metrics::{
+        METRICS_RESULT_SCHEMA, MetricDeclaration, MetricKind, MetricObjective, Objective,
+    };
+    let mut metrics = definition(namespace, &format!("{suffix}-metrics"));
+    metrics
+        .supported_result_schemas
+        .push(METRICS_RESULT_SCHEMA.into());
+    metrics.declared_metrics = vec![MetricDeclaration {
+        name: "accuracy".into(),
+        kind: MetricKind::IntegerMicros,
+    }];
+    let stored = db
+        .put_evaluator_definition(metrics, "operator", 120)
+        .unwrap();
+    assert_eq!(stored.declared_metrics.len(), 1);
+    let objective = |metric: &str| MetricObjective {
+        metric: metric.into(),
+        objective: Objective::Maximize {
+            threshold_micros: Some(900_000),
+        },
+    };
+    let mut bound = plan(
+        namespace,
+        &format!("{suffix}-metrics"),
+        &stored.definition_id,
+    );
+    bound.nodes[0].metric_objectives = vec![objective("accuracy")];
+    let stored_plan = db.put_evaluation_plan(bound, "operator", 130).unwrap();
+    assert_eq!(
+        db.get_evaluation_plan(&stored_plan.plan_version_id)
+            .unwrap()
+            .unwrap()
+            .nodes[0]
+            .metric_objectives,
+        vec![objective("accuracy")]
+    );
+    let mut undeclared = plan(
+        namespace,
+        &format!("{suffix}-undeclared"),
+        &stored.definition_id,
+    );
+    undeclared.nodes[0].metric_objectives = vec![objective("cost")];
+    assert!(
+        db.put_evaluation_plan(undeclared, "operator", 140)
+            .unwrap_err()
+            .contains("does not declare")
+    );
 }
 
 #[test]

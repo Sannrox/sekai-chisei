@@ -11,6 +11,7 @@ use crate::chisei::budget::BudgetTracker;
 use crate::chisei::evaluation_manifest::{
     ResolvedEvaluationManifest, ResolvedEvaluationNode, ResolvedInvariantBinding,
 };
+use crate::chisei::evaluation_metrics::{self, MetricVerdict};
 #[cfg(test)]
 use crate::chisei::evaluation_plan::validate_adapter_endpoint;
 use crate::chisei::evaluation_plan::{
@@ -1007,6 +1008,9 @@ pub struct EvaluationStepReceipt {
     pub result_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stochastic_evidence: Option<StochasticStepEvidence>,
+    /// One verdict per reported metric of a multi-metric evaluator (ADR 0154).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_verdicts: Vec<MetricVerdict>,
     pub step_receipt_digest: String,
 }
 
@@ -1743,18 +1747,61 @@ pub fn execute_registered_node(
                     );
                 }
             };
-            make_framework_step(
+            // A metrics evaluator measures; the frozen plan objectives judge.
+            // `unknown` still means the evaluator could not measure.
+            if node.evaluator.declared_metrics.is_empty() || output.status == STATUS_UNKNOWN {
+                return make_framework_step(
+                    manifest,
+                    node,
+                    &output.status,
+                    &output.reason_code,
+                    input_digest,
+                    parameters_digest,
+                    evidence_digests,
+                    dependency_result_digests,
+                    output.result,
+                    elapsed,
+                );
+            }
+            let Ok(verdicts) = evaluation_metrics::judge(
+                &node.evaluator.declared_metrics,
+                &node.metric_objectives,
+                &output.result,
+            ) else {
+                return make_framework_step(
+                    manifest,
+                    node,
+                    STATUS_ERROR,
+                    REASON_INVALID_RESULT,
+                    input_digest,
+                    parameters_digest,
+                    evidence_digests,
+                    dependency_result_digests,
+                    Value::Null,
+                    elapsed,
+                );
+            };
+            let (status, reason_code) = evaluation_metrics::derived_status(&verdicts);
+            let mut execution = make_framework_step(
                 manifest,
                 node,
-                &output.status,
-                &output.reason_code,
+                status,
+                reason_code,
                 input_digest,
                 parameters_digest,
                 evidence_digests,
                 dependency_result_digests,
                 output.result,
                 elapsed,
-            )
+            )?;
+            execution.receipt.metric_verdicts = verdicts;
+            execution.receipt.step_receipt_digest = step_receipt_digest(&execution.receipt)?;
+            ensure_document_size(
+                &execution.receipt,
+                "evaluation step receipt",
+                MAX_EXECUTION_DOCUMENT_BYTES,
+            )?;
+            Ok(execution)
         }
     }
 }
@@ -2595,6 +2642,7 @@ pub fn make_framework_step(
         dependency_result_digests,
         result_digest,
         stochastic_evidence: None,
+        metric_verdicts: Vec::new(),
         step_receipt_digest: String::new(),
     };
     receipt.step_receipt_digest = step_receipt_digest(&receipt)?;
@@ -2627,6 +2675,23 @@ fn step_receipt_digest(receipt: &EvaluationStepReceipt) -> Result<String, String
             receipt.dependency_result_digests.as_slice(),
             receipt.result_digest.as_str(),
             stochastic,
+        ))
+    } else if !receipt.metric_verdicts.is_empty() {
+        digest_json(&(
+            receipt.contract_version.as_str(),
+            receipt.manifest_digest.as_str(),
+            receipt.node_id.as_str(),
+            receipt.classification.as_str(),
+            receipt.status.as_str(),
+            receipt.reason_code.as_str(),
+            receipt.input_digest.as_str(),
+            receipt.parameters_digest.as_str(),
+            receipt.evaluator_definition_digest.as_str(),
+            receipt.implementation_digest.as_str(),
+            receipt.evidence_digests.as_slice(),
+            receipt.dependency_result_digests.as_slice(),
+            receipt.result_digest.as_str(),
+            receipt.metric_verdicts.as_slice(),
         ))
     } else {
         // Preserve the shipped deterministic v1 digest contract exactly.
@@ -2938,6 +3003,22 @@ fn validate_step_for_node(
     if node.evaluator.stochastic_policy.is_none() && step.stochastic_evidence.is_some() {
         return Err("deterministic step cannot contain stochastic evidence".into());
     }
+    if !step.metric_verdicts.is_empty() {
+        if step.stochastic_evidence.is_some() {
+            return Err("stochastic step cannot contain metric verdicts".into());
+        }
+        evaluation_metrics::verify_verdicts(
+            &node.evaluator.declared_metrics,
+            &node.metric_objectives,
+            &step.metric_verdicts,
+            &step.status,
+            &step.reason_code,
+        )?;
+    } else if !node.evaluator.declared_metrics.is_empty()
+        && matches!(step.status.as_str(), STATUS_PASS | STATUS_FAIL)
+    {
+        return Err("completed metrics step lacks metric verdicts".into());
+    }
     if let Some(evidence) = &step.stochastic_evidence {
         validate_stochastic_step_evidence(
             node,
@@ -3102,8 +3183,10 @@ mod tests {
 
     fn node(id: &str, classification: &str, dependencies: &[&str]) -> ResolvedEvaluationNode {
         ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: id.into(),
             evaluator: ResolvedEvaluatorBinding {
+                declared_metrics: Vec::new(),
                 definition_id: format!("definition:{id}"),
                 definition_digest: digest('d'),
                 implementation_digest: digest('e'),

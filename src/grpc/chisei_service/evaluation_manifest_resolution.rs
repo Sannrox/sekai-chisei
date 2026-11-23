@@ -288,7 +288,7 @@ pub(super) fn validate_evaluation_plan_references(
                 "evaluator definition is unavailable for new plans",
             ));
         }
-        evaluation_plan_domain::validate_node_parameters(&definition, &node.parameters_json)
+        evaluation_plan_domain::validate_node_for_definition(&definition, node)
             .map_err(Status::invalid_argument)?;
         for binding in &node.input_bindings {
             if !definition
@@ -806,7 +806,7 @@ fn resolve_evaluation_manifest_live(
                 "required stochastic plan node lacks explicit gate eligibility",
             ));
         }
-        evaluation_plan_domain::validate_node_parameters(&definition, &node.parameters_json)
+        evaluation_plan_domain::validate_node_for_definition(&definition, node)
             .map_err(Status::data_loss)?;
         let evidence_binding_schemas = node
             .input_bindings
@@ -871,8 +871,10 @@ fn resolve_evaluation_manifest_live(
             ));
         }
         resolved_nodes.push(evaluation_manifest_domain::ResolvedEvaluationNode {
+            metric_objectives: node.metric_objectives.clone(),
             node_id: node.node_id.clone(),
             evaluator: evaluation_manifest_domain::ResolvedEvaluatorBinding {
+                declared_metrics: definition.declared_metrics,
                 definition_id: definition.definition_id,
                 definition_digest: definition.content_digest,
                 implementation_digest: definition.implementation_digest,

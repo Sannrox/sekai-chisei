@@ -882,12 +882,14 @@ impl EvalCaseExecutor for DefinitionCaseExecutor<'_> {
             spec.tool_version
         );
         let node = ResolvedEvaluationNode {
+            metric_objectives: Vec::new(),
             node_id: "eval-case".into(),
             evaluator: ResolvedEvaluatorBinding {
                 definition_id: definition.definition_id.clone(),
                 definition_digest: definition.content_digest.clone(),
                 implementation_digest: definition.implementation_digest.clone(),
                 stochastic_policy: definition.stochastic_policy.clone(),
+                declared_metrics: definition.declared_metrics.clone(),
             },
             depends_on_node_ids: Vec::new(),
             input_bindings: Vec::new(),

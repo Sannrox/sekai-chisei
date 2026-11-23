@@ -50,6 +50,9 @@ pub struct ResolvedEvaluatorBinding {
     pub implementation_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stochastic_policy: Option<super::evaluation_plan::StochasticEvaluatorPolicy>,
+    /// The definition's declared metrics, frozen with the manifest (ADR 0154).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_metrics: Vec<super::evaluation_metrics::MetricDeclaration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +113,9 @@ pub struct ResolvedEvaluationNode {
     pub invariants: Vec<ResolvedInvariantBinding>,
     pub evidence_object_ids: Vec<String>,
     pub classification: String,
+    /// The plan node's metric objectives, frozen with the manifest (ADR 0154).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metric_objectives: Vec<super::evaluation_metrics::MetricObjective>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +406,12 @@ fn normalize_manifest(manifest: &mut ResolvedEvaluationManifest) -> Result<(), S
                 std::slice::from_ref(&policy.result_schema),
             )?;
         }
+        super::evaluation_metrics::normalize_declarations(&mut node.evaluator.declared_metrics)?;
+        super::evaluation_metrics::normalize_objectives(&mut node.metric_objectives)?;
+        super::evaluation_metrics::check_objectives(
+            &node.evaluator.declared_metrics,
+            &node.metric_objectives,
+        )?;
         if !matches!(
             node.classification.as_str(),
             super::evaluation_plan::NODE_REQUIRED | super::evaluation_plan::NODE_ADVISORY
@@ -776,8 +788,10 @@ mod tests {
             resolved_by: "local".into(),
             requirements: vec![],
             nodes: vec![ResolvedEvaluationNode {
+                metric_objectives: Vec::new(),
                 node_id: "schema".into(),
                 evaluator: ResolvedEvaluatorBinding {
+                    declared_metrics: Vec::new(),
                     definition_id: "definition:1".into(),
                     definition_digest: format!("sha256:{}", "e".repeat(64)),
                     implementation_digest: format!("sha256:{}", "f".repeat(64)),

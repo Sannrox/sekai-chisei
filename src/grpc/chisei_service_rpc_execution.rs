@@ -621,7 +621,7 @@ pub(super) async fn put_evaluation_plan(
         req.into_inner()
             .plan
             .ok_or_else(|| Status::invalid_argument("evaluation plan required"))?,
-    );
+    )?;
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &plan.namespace)?;
     let facts =
         evaluation_manifest_resolution::in_process_facts_runtime(service.sekai_facts.reader())?;

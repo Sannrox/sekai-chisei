@@ -863,8 +863,10 @@ mod tests {
             resolved_by: "resolver".into(),
             requirements: vec![],
             nodes: vec![ResolvedEvaluationNode {
+                metric_objectives: Vec::new(),
                 node_id: "quality".into(),
                 evaluator: ResolvedEvaluatorBinding {
+                    declared_metrics: Vec::new(),
                     definition_id: "definition-v1".into(),
                     definition_digest: digest('d'),
                     implementation_digest: digest('m'),
@@ -885,6 +887,7 @@ mod tests {
 
     fn step(manifest_digest: &str, status: &str) -> EvaluationStepReceipt {
         EvaluationStepReceipt {
+            metric_verdicts: Vec::new(),
             contract_version: "chisei.evaluation-step-receipt/v1".into(),
             manifest_digest: manifest_digest.into(),
             node_id: "quality".into(),

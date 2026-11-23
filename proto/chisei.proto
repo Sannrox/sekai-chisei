@@ -425,6 +425,32 @@ message EvaluatorDefinition {
   // HTTPS endpoint for an operator-deployed external_adapter/v1 evaluator.
   // This never uploads executable code and is empty for built-in/stochastic definitions.
   string adapter_endpoint = 19;
+  // Metrics a chisei.evaluation-metrics/v1 evaluator reports (ADR 0154).
+  // Empty for single-status evaluators.
+  repeated EvaluationMetricDeclaration declared_metrics = 20;
+}
+// One metric an evaluator definition reports.
+message EvaluationMetricDeclaration {
+  string name = 1;
+  string kind = 2; // bool | integer_micros
+}
+// A plan-owned objective over one declared metric. Thresholds are inclusive:
+// maximize passes at value >= threshold, minimize at value <= threshold. A
+// direction without a threshold keeps the metric advisory.
+message EvaluationMetricObjective {
+  string metric = 1;
+  string objective = 2; // equals | maximize | minimize
+  bool expected = 3; // equals only
+  optional int64 threshold_micros = 4; // maximize | minimize only
+}
+// One reported metric value, its objective, and the executor's verdict.
+message EvaluationMetricVerdict {
+  string name = 1;
+  string kind = 2; // bool | integer_micros
+  bool bool_value = 3;
+  int64 integer_micros_value = 4;
+  optional EvaluationMetricObjective objective = 5;
+  string verdict = 6; // met | unmet | advisory
 }
 message EvaluatorAvailability {
   string definition_id = 1;
@@ -471,6 +497,7 @@ message EvaluationPlanNode {
   string parameters_json = 5;
   repeated string invariant_version_ids = 6;
   string classification = 7; // required | advisory
+  repeated EvaluationMetricObjective metric_objectives = 8;
 }
 message EvaluationPlan {
   string contract_version = 1; // chisei.evaluation-plan/v1
@@ -509,6 +536,7 @@ message ResolvedEvaluatorBinding {
   string definition_digest = 2;
   string implementation_digest = 3;
   optional StochasticEvaluatorPolicy stochastic_policy = 4;
+  repeated EvaluationMetricDeclaration declared_metrics = 5;
 }
 message ResolvedEvidenceBinding {
   string evidence_object_id = 1;
@@ -557,6 +585,7 @@ message ResolvedEvaluationNode {
   repeated ResolvedInvariantBinding invariants = 6;
   repeated string evidence_object_ids = 7;
   string classification = 8;
+  repeated EvaluationMetricObjective metric_objectives = 9;
 }
 message ResolvedEvaluationManifest {
   string contract_version = 1; // chisei.resolved-evaluation-manifest/v1
@@ -662,6 +691,9 @@ message EvaluationStepReceipt {
   string result_digest = 14;
   string step_receipt_digest = 15;
   optional StochasticStepEvidence stochastic_evidence = 16;
+  // Metric values and verdicts of a multi-metric evaluator (ADR 0154). These
+  // are the bounded declared metrics, not the evaluator output content.
+  repeated EvaluationMetricVerdict metric_verdicts = 17;
 }
 message InvariantCoverageDecision {
   string invariant_version_id = 1;
