@@ -362,15 +362,15 @@ impl SekaiDb {
 
     pub fn contention_scope_chain(&self, scope_id: &str) -> Result<Vec<ContentionScope>, String> {
         let conn = self.conn();
-        scope_chain_locked(&conn, scope_id)
+        scope_chain_locked(&conn, scope_id).map_err(String::from)
     }
 
     pub fn create_work_unit(&self, work_unit: &WorkUnit) -> Result<(), String> {
-        Self::insert_work_unit(&self.conn(), work_unit)
+        Self::insert_work_unit(&self.conn(), work_unit).map_err(String::from)
     }
 
-    fn insert_work_unit(conn: &Connection, work_unit: &WorkUnit) -> Result<(), String> {
-        validate_work_unit(work_unit)?;
+    fn insert_work_unit(conn: &Connection, work_unit: &WorkUnit) -> Result<(), WorkUnitStoreError> {
+        validate_work_unit(work_unit).map_err(WorkUnitStoreError::Rejected)?;
         conn.execute(
             "INSERT INTO sekai_work_units
              (id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at)
@@ -399,7 +399,13 @@ impl SekaiDb {
                 work_unit.updated_at,
             ],
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                WorkUnitStoreError::Rejected(error.to_string())
+            } else {
+                WorkUnitStoreError::Backend(error.to_string())
+            }
+        })?;
         Ok(())
     }
 
@@ -787,6 +793,7 @@ impl SekaiDb {
         now_ms: i64,
     ) -> Result<AdmissionResult, String> {
         Self::admit_work_unit_on(&self.conn(), work_unit_id, lease_owner, now_ms)
+            .map_err(String::from)
     }
 
     fn admit_work_unit_on(
@@ -794,7 +801,7 @@ impl SekaiDb {
         work_unit_id: &str,
         lease_owner: &str,
         now_ms: i64,
-    ) -> Result<AdmissionResult, String> {
+    ) -> Result<AdmissionResult, WorkUnitStoreError> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -804,7 +811,7 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "work unit not found".to_string())?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected("work unit not found".into()))?;
         if work_unit.status != WORK_UNIT_STATUS_PENDING {
             return Ok(AdmissionResult {
                 admitted: false,
@@ -902,7 +909,8 @@ impl SekaiDb {
             .map_err(|e| e.to_string())?;
             reservations.push(reservation);
         }
-        ensure_transition(&work_unit.status, WORK_UNIT_STATUS_RUNNING)?;
+        ensure_transition(&work_unit.status, WORK_UNIT_STATUS_RUNNING)
+            .map_err(WorkUnitStoreError::Rejected)?;
         work_unit.status = WORK_UNIT_STATUS_RUNNING.into();
         work_unit.admitted_at = now_ms;
         work_unit.started_at = now_ms;
@@ -937,14 +945,14 @@ impl SekaiDb {
     }
 
     pub fn heartbeat_work_unit(&self, work_unit_id: &str, now_ms: i64) -> Result<WorkUnit, String> {
-        Self::heartbeat_work_unit_on(&self.conn(), work_unit_id, now_ms)
+        Self::heartbeat_work_unit_on(&self.conn(), work_unit_id, now_ms).map_err(String::from)
     }
 
     fn heartbeat_work_unit_on(
         conn: &Connection,
         work_unit_id: &str,
         now_ms: i64,
-    ) -> Result<WorkUnit, String> {
+    ) -> Result<WorkUnit, WorkUnitStoreError> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -954,15 +962,15 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "work unit not found".to_string())?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected("work unit not found".into()))?;
         if !matches!(
             work_unit.status.as_str(),
             WORK_UNIT_STATUS_RUNNING | WORK_UNIT_STATUS_ADMITTED
         ) {
-            return Err(format!(
+            return Err(WorkUnitStoreError::Rejected(format!(
                 "cannot heartbeat work unit in status {}",
                 work_unit.status
-            ));
+            )));
         }
         let chain = scope_chain_locked(conn, &work_unit.scope_id)?;
         for scope in &chain {
@@ -1213,7 +1221,7 @@ impl SekaiDb {
         work_unit: &WorkUnit,
         created_event: &RunEvent,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<()>, String> {
+    ) -> Result<RequestOutcome<()>, WorkUnitStoreError> {
         self.apply_for_request(request, |conn, row| {
             Self::insert_work_unit(conn, work_unit)?;
             Self::insert_run_event(conn, created_event)?;
@@ -1231,7 +1239,7 @@ impl SekaiDb {
         lease_owner: &str,
         now_ms: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<AdmissionResult>, String> {
+    ) -> Result<RequestOutcome<AdmissionResult>, WorkUnitStoreError> {
         self.apply_for_request(request, |conn, row| {
             let result = Self::admit_work_unit_on(conn, work_unit_id, lease_owner, now_ms)?;
             fill_admission_row(row, &result);
@@ -1247,7 +1255,7 @@ impl SekaiDb {
         transition: &WorkUnitTransition<'_>,
         now_ms: i64,
         request: &RequestDedup,
-    ) -> Result<RequestOutcome<WorkUnit>, String> {
+    ) -> Result<RequestOutcome<WorkUnit>, WorkUnitStoreError> {
         self.apply_for_request(request, |conn, row| {
             let work_unit = match transition {
                 WorkUnitTransition::Heartbeat => {
@@ -1290,8 +1298,8 @@ impl SekaiDb {
     fn apply_for_request<T>(
         &self,
         request: &RequestDedup,
-        apply: impl FnOnce(&Connection, &mut RequestDedup) -> Result<T, String>,
-    ) -> Result<RequestOutcome<T>, String> {
+        apply: impl FnOnce(&Connection, &mut RequestDedup) -> Result<T, WorkUnitStoreError>,
+    ) -> Result<RequestOutcome<T>, WorkUnitStoreError> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1300,7 +1308,9 @@ impl SekaiDb {
         if tracked && !Self::insert_dedup_request(&tx, request)? {
             return Self::select_dedup_request(&tx, &request.request_id, &request.operation)?
                 .map(RequestOutcome::Replayed)
-                .ok_or_else(|| "request dedup row missing after conflict".into());
+                .ok_or_else(|| {
+                    WorkUnitStoreError::Backend("request dedup row missing after conflict".into())
+                });
         }
         let mut row = request.clone();
         let value = apply(&tx, &mut row)?;
@@ -1341,6 +1351,7 @@ impl SekaiDb {
             cancel_reason,
             now_ms,
         )
+        .map_err(String::from)
     }
 
     fn finish_work_unit_on(
@@ -1350,7 +1361,7 @@ impl SekaiDb {
         failure_reason: &str,
         cancel_reason: &str,
         now_ms: i64,
-    ) -> Result<WorkUnit, String> {
+    ) -> Result<WorkUnit, WorkUnitStoreError> {
         let mut work_unit = conn
             .query_row(
                 "SELECT id,kind,actor,target_object_id,status,requested_spec,scope_id,priority,timeout_seconds,heartbeat_ttl_seconds,created_at,admitted_at,started_at,finished_at,last_heartbeat_at,failure_reason,cancel_reason,owner_principal,creator_principal,idempotency_key,updated_at
@@ -1360,11 +1371,11 @@ impl SekaiDb {
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| "work unit not found".to_string())?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected("work unit not found".into()))?;
         if is_terminal_status(&work_unit.status) {
             return Ok(work_unit);
         }
-        ensure_transition(&work_unit.status, status)?;
+        ensure_transition(&work_unit.status, status).map_err(WorkUnitStoreError::Rejected)?;
         conn.execute(
             "UPDATE sekai_reservations
              SET status = ?2, released_at = ?3
@@ -1417,6 +1428,37 @@ impl SekaiDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(work_unit)
+    }
+}
+
+/// Why a Work Unit store mutation failed. `Rejected` is the request's fault
+/// (invalid input, missing row, illegal transition, constraint); `Backend` is
+/// the store's (lock, I/O, connection), so the caller may retry it. A plain
+/// `String` converts to `Backend`: a refusal must be marked where it is made.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkUnitStoreError {
+    Rejected(String),
+    Backend(String),
+}
+
+impl std::fmt::Display for WorkUnitStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Backend(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for WorkUnitStoreError {
+    fn from(message: String) -> Self {
+        Self::Backend(message)
+    }
+}
+
+impl From<WorkUnitStoreError> for String {
+    fn from(error: WorkUnitStoreError) -> Self {
+        error.to_string()
     }
 }
 
@@ -1522,13 +1564,15 @@ fn parse_page_token(page_token: &str) -> Option<(i64, String)> {
 fn scope_chain_locked(
     conn: &rusqlite::Connection,
     scope_id: &str,
-) -> Result<Vec<ContentionScope>, String> {
+) -> Result<Vec<ContentionScope>, WorkUnitStoreError> {
     let mut chain = Vec::new();
     let mut current_id = scope_id.to_string();
     let mut seen = HashSet::new();
     while !current_id.is_empty() {
         if !seen.insert(current_id.clone()) {
-            return Err(format!("scope cycle detected at {}", current_id));
+            return Err(WorkUnitStoreError::Rejected(format!(
+                "scope cycle detected at {current_id}"
+            )));
         }
         let scope = conn
             .query_row(
@@ -1539,7 +1583,7 @@ fn scope_chain_locked(
             )
             .optional()
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("scope not found: {}", scope_id))?;
+            .ok_or_else(|| WorkUnitStoreError::Rejected(format!("scope not found: {scope_id}")))?;
         current_id = scope.parent_scope_id.clone();
         chain.push(scope);
     }

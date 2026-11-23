@@ -10,7 +10,7 @@ use crate::db::runtime_db::RuntimeDb;
 use crate::sekai::coordination::{
     AdmissionResult, RESERVATION_STATUS_ACTIVE, ReconcileFilter, ReconcileSummary, RequestDedup,
     RequestOutcome, ReservationFilter, RunEvent, WORK_UNIT_STATUS_PENDING,
-    WORK_UNIT_STATUS_RUNNING, WorkUnit,
+    WORK_UNIT_STATUS_RUNNING, WorkUnit, WorkUnitStoreError,
 };
 
 pub struct CreateWorkUnit<'a> {
@@ -76,6 +76,18 @@ pub enum WorkUnitLifecycleError {
     FailedPrecondition(String),
     AlreadyExists(String),
     Storage(String),
+}
+
+/// A refusal keeps the class the call reports (`rejected`); a backend
+/// failure is always `Storage`, so the client retries it.
+fn store_error(
+    error: WorkUnitStoreError,
+    rejected: fn(String) -> WorkUnitLifecycleError,
+) -> WorkUnitLifecycleError {
+    match error {
+        WorkUnitStoreError::Rejected(message) => rejected(message),
+        WorkUnitStoreError::Backend(message) => WorkUnitLifecycleError::Storage(message),
+    }
 }
 
 #[derive(Debug)]
@@ -149,7 +161,10 @@ impl<'a> WorkUnitLifecycle<'a> {
             .db
             .create_work_unit_for_request(&work_unit, &created_event, &request)
             .map_err(|error| {
-                CreateWorkUnitError::Lifecycle(WorkUnitLifecycleError::InvalidArgument(error))
+                CreateWorkUnitError::Lifecycle(store_error(
+                    error,
+                    WorkUnitLifecycleError::InvalidArgument,
+                ))
             })? {
             RequestOutcome::Applied(()) => Ok(work_unit),
             RequestOutcome::Replayed(record) => self
@@ -179,7 +194,7 @@ impl<'a> WorkUnitLifecycle<'a> {
                 command.now_ms,
                 &request,
             )
-            .map_err(WorkUnitLifecycleError::FailedPrecondition)?
+            .map_err(|error| store_error(error, WorkUnitLifecycleError::FailedPrecondition))?
         {
             RequestOutcome::Applied(result) => Ok(result),
             RequestOutcome::Replayed(record) => self.replay_admission(&command, record),
@@ -207,7 +222,7 @@ impl<'a> WorkUnitLifecycle<'a> {
                 command.now_ms,
                 &request,
             )
-            .map_err(WorkUnitLifecycleError::FailedPrecondition)?
+            .map_err(|error| store_error(error, WorkUnitLifecycleError::FailedPrecondition))?
         {
             RequestOutcome::Applied(work_unit) => Ok(work_unit),
             RequestOutcome::Replayed(record) => {
@@ -456,7 +471,10 @@ mod tests {
     }
 
     fn empty_database() -> RuntimeDb {
-        let db = RuntimeDb::memory();
+        with_scope(RuntimeDb::memory())
+    }
+
+    fn with_scope(db: RuntimeDb) -> RuntimeDb {
         db.create_contention_scope(&ContentionScope {
             id: "scope-1".into(),
             name: "scope".into(),
@@ -477,6 +495,131 @@ mod tests {
         let db = empty_database();
         db.create_work_unit(&work_unit()).unwrap();
         db
+    }
+
+    /// Drops the run event table, so every mutation fails in the store rather
+    /// than on the request.
+    fn break_store(db: &RuntimeDb) {
+        const DROP: &str = "DROP TABLE sekai_run_events";
+        match db {
+            RuntimeDb::Sqlite(_) => db.conn().execute_batch(DROP).unwrap(),
+            RuntimeDb::Postgres(pg) => pg.connection().unwrap().batch_execute(DROP).unwrap(),
+        }
+    }
+
+    fn create(db: &RuntimeDb, work_unit: WorkUnit) -> Result<WorkUnit, WorkUnitLifecycleError> {
+        WorkUnitLifecycle::new(db)
+            .create(
+                CreateWorkUnit {
+                    work_unit,
+                    request_id: "create-1",
+                    principal: "alice",
+                    now_ms: 10,
+                },
+                |_| Ok::<_, ()>(()),
+            )
+            .map_err(|error| match error {
+                CreateWorkUnitError::Lifecycle(error) => error,
+                CreateWorkUnitError::Authorization(()) => panic!("authorized"),
+            })
+    }
+
+    fn admit(
+        db: &RuntimeDb,
+        work_unit_id: &str,
+    ) -> Result<AdmissionResult, WorkUnitLifecycleError> {
+        WorkUnitLifecycle::new(db).admit(AdmitWorkUnit {
+            work_unit_id,
+            request_id: "admit-1",
+            principal: "alice",
+            lease_owner: "worker",
+            now_ms: 10,
+        })
+    }
+
+    fn transition(
+        db: &RuntimeDb,
+        transition: WorkUnitTransition<'_>,
+    ) -> Result<WorkUnit, WorkUnitLifecycleError> {
+        WorkUnitLifecycle::new(db).transition(TransitionWorkUnit {
+            work_unit_id: "work-1",
+            request_id: "transition-1",
+            principal: "alice",
+            transition,
+            now_ms: 20,
+        })
+    }
+
+    fn storage(outcome: Result<impl std::fmt::Debug, WorkUnitLifecycleError>) {
+        assert!(
+            matches!(outcome, Err(WorkUnitLifecycleError::Storage(_))),
+            "expected Storage, got {outcome:?}"
+        );
+    }
+
+    /// `empty` opens a fresh store holding only the contention scope.
+    fn store_failures_are_storage_and_refusals_keep_their_class(empty: &dyn Fn() -> RuntimeDb) {
+        let seeded = || {
+            let db = empty();
+            db.create_work_unit(&work_unit()).unwrap();
+            db
+        };
+        let mut nameless = work_unit();
+        nameless.kind.clear();
+        assert_eq!(
+            create(&empty(), nameless).unwrap_err(),
+            WorkUnitLifecycleError::InvalidArgument("work unit kind required".into())
+        );
+        let db = empty();
+        break_store(&db);
+        storage(create(&db, work_unit()));
+
+        assert_eq!(
+            admit(&seeded(), "absent").unwrap_err(),
+            WorkUnitLifecycleError::FailedPrecondition("work unit not found".into())
+        );
+        let db = seeded();
+        break_store(&db);
+        storage(admit(&db, "work-1"));
+
+        assert_eq!(
+            transition(&seeded(), WorkUnitTransition::Complete).unwrap_err(),
+            WorkUnitLifecycleError::FailedPrecondition(
+                "invalid work unit transition: pending -> completed".into()
+            )
+        );
+        assert!(matches!(
+            transition(&seeded(), WorkUnitTransition::Heartbeat),
+            Err(WorkUnitLifecycleError::FailedPrecondition(_))
+        ));
+        for step in [
+            WorkUnitTransition::Heartbeat,
+            WorkUnitTransition::Complete,
+            WorkUnitTransition::Fail("crashed"),
+            WorkUnitTransition::Cancel("stop"),
+        ] {
+            let db = seeded();
+            admit(&db, "work-1").unwrap();
+            break_store(&db);
+            storage(transition(&db, step));
+        }
+    }
+
+    #[test]
+    fn sqlite_store_failures_are_storage_and_refusals_keep_their_class() {
+        store_failures_are_storage_and_refusals_keep_their_class(&empty_database);
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_store_failures_are_storage_and_refusals_keep_their_class() {
+        let scratches = std::cell::RefCell::new(Vec::new());
+        store_failures_are_storage_and_refusals_keep_their_class(&|| {
+            let scratch = crate::db::postgres::ScratchDatabase::create();
+            let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+            scratches.borrow_mut().push(scratch);
+            with_scope(db)
+        });
     }
 
     #[test]
