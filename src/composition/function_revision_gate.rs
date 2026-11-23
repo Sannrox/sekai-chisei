@@ -81,6 +81,7 @@ pub fn function_revision_rubric_policy(
     minimum_mean_score_micros: u32,
 ) -> StochasticEvaluatorPolicy {
     StochasticEvaluatorPolicy {
+        rubric: None,
         provider: "openai".into(),
         model: "openai/function-revision-rubric".into(),
         prompt_profile: BOUNDED_RUBRIC_PROFILE.into(),

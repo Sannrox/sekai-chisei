@@ -3212,6 +3212,7 @@ mod tests {
 
     fn stochastic_policy() -> StochasticEvaluatorPolicy {
         StochasticEvaluatorPolicy {
+            rubric: None,
             provider: "openai".into(),
             model: "openai/fixture-model".into(),
             prompt_profile: "fixture.rubric/v1".into(),

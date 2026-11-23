@@ -1408,6 +1408,13 @@ pub(super) fn from_proto_stochastic_evaluator_policy(
     value: StochasticEvaluatorPolicy,
 ) -> evaluation_plan_domain::StochasticEvaluatorPolicy {
     evaluation_plan_domain::StochasticEvaluatorPolicy {
+        rubric: value
+            .rubric
+            .map(|rubric| evaluation_plan_domain::EvaluationRubric {
+                text: rubric.text,
+                digest: rubric.digest,
+                scale_max_points: (rubric.scale_max_points != 0).then_some(rubric.scale_max_points),
+            }),
         provider: value.provider,
         model: value.model,
         prompt_profile: value.prompt_profile,
@@ -1454,6 +1461,11 @@ pub(super) fn to_proto_stochastic_evaluator_policy(
         max_total_tokens: value.max_total_tokens,
         egress_policy: value.egress_policy.clone(),
         raw_response_retention: value.raw_response_retention.clone(),
+        rubric: value.rubric.as_ref().map(|rubric| EvaluationRubric {
+            text: rubric.text.clone(),
+            digest: rubric.digest.clone(),
+            scale_max_points: rubric.scale_max_points.unwrap_or(0),
+        }),
     }
 }
 pub(super) fn to_proto_evaluator_availability(

@@ -401,6 +401,16 @@ message StochasticEvaluatorPolicy {
   uint32 max_total_tokens = 18;
   string egress_policy = 19; // local_only/v1 | allowlisted_external/v1
   string raw_response_retention = 20; // none/v1
+  // Criteria for prompt_profile chisei.custom-rubric/v1; unset otherwise.
+  EvaluationRubric rubric = 21;
+}
+// Namespace-authored judge criteria (ADR 0155). Changing any field is a new
+// evaluator definition version.
+message EvaluationRubric {
+  string text = 1; // plain text, at most 4096 UTF-8 bytes
+  string digest = 2; // sha256:<hex> of the UTF-8 bytes of text
+  // 0 judges pass or fail (score 0 or 1); 2 to 10 grades on 0..n.
+  uint32 scale_max_points = 3;
 }
 message EvaluatorDefinition {
   string contract_version = 1; // chisei.evaluator-definition/v1

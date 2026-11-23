@@ -1074,6 +1074,7 @@ fn stochastic_admission_manifest(
                 definition_digest: digest('f'),
                 implementation_digest: digest('1'),
                 stochastic_policy: Some(evaluation_plan_domain::StochasticEvaluatorPolicy {
+                    rubric: None,
                     provider: provider.into(),
                     model: format!("{provider}/fixture"),
                     prompt_profile: "chisei.fixture/v1".into(),
@@ -15616,5 +15617,7 @@ async fn tenant_assertion_reads_its_namespaces_eval_datasets() {
     }
 }
 
+#[path = "chisei_custom_rubric_tests.rs"]
+mod chisei_custom_rubric_tests;
 #[path = "chisei_evaluation_metrics_tests.rs"]
 mod chisei_evaluation_metrics_tests;

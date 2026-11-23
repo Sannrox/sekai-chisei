@@ -114,6 +114,19 @@ rationale for each completed trial for 30 days when the evaluator uses the
 [evaluation execution](evaluation-execution.md#retained-judge-rationale).
 Publishing any other retention value fails closed.
 
+A `chisei.custom-rubric/v1` policy must carry a `rubric`, and no other profile
+may carry one. The rubric needs:
+
+- `text`: at most 4,096 bytes, with no control characters other than newline
+  and tab, and no `<criteria` or `</criteria`;
+- `digest`: the `sha256:` digest of `text`;
+- `scale_max_points`: optional, from 2 to 10.
+
+Its retention must be `none/v1`. Publication refuses a rubric whose digest does
+not match its text. The rubric and scale are part of the definition content,
+so changing either needs a new definition version
+([ADR 0155](decisions/0155-custom-rubric-judges-pin-their-criteria.md)).
+
 The fixed reducer is fail closed: required failures deny; required
 unavailability or execution errors are unavailable; insufficient, stale,
 hidden, invalid-waiver, or uncovered inputs are unknown; advisory results are

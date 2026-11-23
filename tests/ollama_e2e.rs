@@ -132,6 +132,7 @@ fn bounded_stochastic_evaluator_records_live_variance_evidence() {
     .expect("create stochastic registry");
     let model = e2e_model();
     let policy = StochasticEvaluatorPolicy {
+        rubric: None,
         provider: "ollama".into(),
         model,
         prompt_profile: BOUNDED_RUBRIC_PROFILE.into(),
