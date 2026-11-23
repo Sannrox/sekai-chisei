@@ -111,6 +111,18 @@ token caller, and the `action_policy.dry_run` decision names the assertion's
 subject. `action_policy_dry_run_rpc_admits_a_granted_tenant_assertion` covers
 it.
 
+## Added in #3271
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `GetObjectSourceRecord` | stored object | read |
+
+The handler reads the object through `GetObject`, so the tenant check,
+markings and refusal codes are the same. A kind with restricted properties
+withholds the payload from an assertion that may not read them.
+`object_source_record_admits_a_tenant_assertion_under_get_object_rules` covers
+it.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

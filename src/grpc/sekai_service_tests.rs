@@ -39542,6 +39542,109 @@ async fn object_source_record_returns_the_retained_payload_under_get_object_rule
     );
 }
 
+/// #3271: a tenant assertion reads a source record under GetObject's rules
+/// for its own principal: the retained payload while the kind restricts
+/// nothing, withheld once it does, and GetObject's refusal for another
+/// tenant's object.
+#[tokio::test]
+async fn object_source_record_admits_a_tenant_assertion_under_get_object_rules() {
+    use sha2::{Digest, Sha256};
+    let svc = enterprise_service();
+    let namespace = "allowed";
+    let producer = "subject-a";
+    grant_source_namespace(&svc, namespace, producer, security::Role::Editor);
+    let payload = r#"{"state":"open","title":"Tenant sync"}"#;
+    let mut batch = source_batch(namespace, producer, "", "cursor:1", "batch-v3");
+    batch.contract_version = source_sync_domain::SOURCE_BATCH_V3_VERSION.into();
+    batch.records[0].payload = Some(payload.into());
+    batch.delivery = Some(SourceDeliveryWindow {
+        mode: SourceDeliveryMode::Snapshot as i32,
+        sync_generation: 1,
+        source_feed_epoch: Some("epoch-1".into()),
+        offset_start: None,
+        offset_end: Some(40),
+        snapshot_complete: true,
+    });
+    batch.records[0].payload_digest = format!("sha256:{:x}", Sha256::digest(payload.as_bytes()));
+    redigest_source_batch(&mut batch);
+    // The connector writes with the write scope; the reads below use the
+    // read-only assertion.
+    let mut apply = with_tenant_context(ApplySourceBatchRequest { batch: Some(batch) });
+    apply
+        .extensions_mut()
+        .insert(crate::enterprise::AuthenticatedContext {
+            scopes: vec!["sekai.read".into(), "sekai.write".into()],
+            ..test_tenant_context()
+        });
+    svc.apply_source_batch(apply).await.unwrap();
+    let object_id = svc
+        .db
+        .runtime()
+        .list_all_objects(&crate::domain::ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|object| object.namespace == namespace && object.kind == "Issue")
+        .expect("synced issue")
+        .id;
+    let read = |id: String| {
+        svc.get_object_source_record(with_tenant_context(GetObjectSourceRecordRequest { id }))
+    };
+
+    let record = read(object_id.clone()).await.unwrap().into_inner();
+    assert!(record.source_bound);
+    assert_eq!(record.source_instance, "acme/ops");
+    assert_eq!(record.payload_state, "retained");
+    assert_eq!(record.payload, payload);
+
+    svc.create_schema_type(with_named_principal(
+        CreateSchemaTypeRequest {
+            r#type: Some(ObjectType {
+                kind: "Issue".into(),
+                description: "An issue".into(),
+                properties: vec![PropertyDef {
+                    name: "ssn".into(),
+                    r#type: "string".into(),
+                    classification: "sensitive".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let withheld = read(object_id).await.unwrap().into_inner();
+    assert!(withheld.source_bound);
+    assert_eq!(withheld.payload_state, "withheld");
+    assert!(withheld.payload.is_empty());
+
+    // Another tenant's object, readable to the subject by grant: the source
+    // record refuses it with GetObject's code.
+    grant_source_namespace(&svc, "denied", producer, security::Role::Editor);
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: "other-tenant-issue".into(),
+            kind: "Issue".into(),
+            name: "other".into(),
+            namespace: "denied".into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    let get_object = svc
+        .get_object(with_tenant_context(GetObjectRequest {
+            id: "other-tenant-issue".into(),
+        }))
+        .await
+        .unwrap_err();
+    let refused = read("other-tenant-issue".into()).await.unwrap_err();
+    assert_eq!(refused.code(), get_object.code());
+}
+
 /// A plane over a shared runtime, as each replica opens one.
 fn plane_over(db: Arc<RuntimeDb>) -> Arc<SekaiServiceImpl> {
     crate::chisei_store::apply_chisei_schema(&db);
