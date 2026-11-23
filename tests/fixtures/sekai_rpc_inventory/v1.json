@@ -3481,6 +3481,19 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetDecisionTrend",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-admin-client/src/decision_trend.rs",
+        "src/grpc/sekai_service_rpc_actions.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ListPendingDecisions",
       "kind": "persistent",
       "surfaces": [

@@ -764,6 +764,68 @@ pub(super) async fn get_action_instance(
         decision_precedents,
     }))
 }
+/// The decision trend report (#3090): the shared reduction `sekaictl report
+/// decisions` runs, reading both windows through [`list_action_instances`]
+/// with the caller's metadata and extensions, so access, tenant scoping and
+/// withheld counts are exactly those of the listing.
+pub(super) async fn get_decision_trend(
+    service: &SekaiServiceImpl,
+    req: Request<GetDecisionTrendRequest>,
+) -> Result<Response<GetDecisionTrendResponse>, Status> {
+    use sekai_admin_client::decision_trend::{DecisionTrendError, Thresholds, decision_trend};
+    let (metadata, extensions, input) = req.into_parts();
+    if input.namespace.trim().is_empty() {
+        return Err(Status::invalid_argument("namespace required"));
+    }
+    if input.window_ms <= 0 {
+        return Err(Status::invalid_argument(
+            "window_ms must be greater than zero",
+        ));
+    }
+    let until_ms = input.until_ms.unwrap_or_else(now_millis);
+    if input
+        .window_ms
+        .checked_mul(2)
+        .and_then(|span| until_ms.checked_sub(span))
+        .is_none()
+    {
+        return Err(Status::invalid_argument(
+            "window_ms reaches before the first instant",
+        ));
+    }
+    let defaults = Thresholds::default();
+    let thresholds = Thresholds {
+        min_count: input.min_count.unwrap_or(defaults.min_count),
+        max_share_shift_bps: input
+            .max_share_shift_bps
+            .unwrap_or(defaults.max_share_shift_bps),
+    };
+    let list = |request| {
+        let request = Request::from_parts(metadata.clone(), extensions.clone(), request);
+        async move {
+            list_action_instances(service, request)
+                .await
+                .map(Response::into_inner)
+        }
+    };
+    let report = decision_trend(
+        list,
+        &input.namespace,
+        input.window_ms,
+        until_ms,
+        thresholds,
+    )
+    .await
+    .map_err(|error| match error {
+        DecisionTrendError::Read(status) => status,
+        DecisionTrendError::WindowTooLarge { .. } => Status::failed_precondition(error.to_string()),
+        _ => Status::internal(error.to_string()),
+    })?;
+    let report_json = serde_json::to_string(&report)
+        .map_err(|error| Status::internal(format!("decision trend report: {error}")))?;
+    Ok(Response::new(GetDecisionTrendResponse { report_json }))
+}
+
 pub(super) async fn list_action_instances(
     service: &SekaiServiceImpl,
     req: Request<ListActionInstancesRequest>,
@@ -1849,6 +1911,20 @@ impl SekaiServiceImpl {
         req: Request<DryRunActionPolicyRequest>,
     ) -> Result<Response<DryRunActionPolicyResponse>, Status> {
         dry_run_action_policy(self, req)
+    }
+
+    pub(super) async fn list_action_instances_rpc(
+        &self,
+        req: Request<ListActionInstancesRequest>,
+    ) -> Result<Response<ListActionInstancesResponse>, Status> {
+        list_action_instances(self, req).await
+    }
+
+    pub(super) async fn get_decision_trend_rpc(
+        &self,
+        req: Request<GetDecisionTrendRequest>,
+    ) -> Result<Response<GetDecisionTrendResponse>, Status> {
+        get_decision_trend(self, req).await
     }
 }
 

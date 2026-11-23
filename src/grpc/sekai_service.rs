@@ -280,6 +280,8 @@ impl SekaiService for SekaiServiceImpl {
         set_definition_branch_archived => set_definition_branch_archived_rpc(SetDefinitionBranchArchivedRequest) -> SetDefinitionBranchArchivedResponse;
         export_namespace_audit => export_namespace_audit_rpc(ExportNamespaceAuditRequest) -> ExportNamespaceAuditResponse;
         dry_run_action_policy => dry_run_action_policy_rpc(DryRunActionPolicyRequest) -> DryRunActionPolicyResponse;
+        list_action_instances => list_action_instances_rpc(ListActionInstancesRequest) -> ListActionInstancesResponse;
+        get_decision_trend => get_decision_trend_rpc(GetDecisionTrendRequest) -> GetDecisionTrendResponse;
         get_object_source_record => get_object_source_record_rpc(GetObjectSourceRecordRequest) -> GetObjectSourceRecordResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
@@ -1279,13 +1281,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<GetActionInstanceRequest>,
     ) -> Result<Response<GetActionInstanceResponse>, Status> {
         rpc_actions::get_action_instance(self, req).await
-    }
-
-    async fn list_action_instances(
-        &self,
-        req: Request<ListActionInstancesRequest>,
-    ) -> Result<Response<ListActionInstancesResponse>, Status> {
-        rpc_actions::list_action_instances(self, req).await
     }
 
     async fn list_pending_decisions(
