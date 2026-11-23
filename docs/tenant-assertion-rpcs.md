@@ -100,6 +100,17 @@ missing id. `tenant_assertion_reads_only_its_own_receipts_and_quality_trend` and
 `service_principal_reads_follow_its_live_registration_scope` cover both RPCs
 through the token interceptor.
 
+## Added in #3262
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `DryRunActionPolicy` | request | read (it writes only its audit decision) |
+
+The handler's namespace grant decides access within the tenant, as for a
+token caller, and the `action_policy.dry_run` decision names the assertion's
+subject. `action_policy_dry_run_rpc_admits_a_granted_tenant_assertion` covers
+it.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

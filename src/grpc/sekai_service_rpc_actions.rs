@@ -1855,7 +1855,7 @@ impl SekaiServiceImpl {
 /// Dry-run a candidate action policy over the namespace's past governed
 /// action submits (#3059): the same engine as the console form. The candidate
 /// is read like a `SetActionPolicy` policy, so a malformed one is refused the
-/// same way.
+/// same way. A tenant assertion is held to its tenant's namespaces (#3262).
 fn dry_run_action_policy(
     service: &SekaiServiceImpl,
     req: Request<DryRunActionPolicyRequest>,
@@ -1869,7 +1869,14 @@ fn dry_run_action_policy(
         .first()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("principal required"))?;
+    let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let request = req.into_inner();
+    enforce_namespace_tenant_context(
+        service.db.runtime(),
+        tenant_context.as_ref(),
+        &request.namespace,
+        false,
+    )?;
     let candidate = request
         .candidate
         .as_ref()

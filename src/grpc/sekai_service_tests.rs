@@ -36772,6 +36772,19 @@ async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
             ..Default::default()
         }))
     );
+    probe!(
+        "DryRunActionPolicy",
+        svc.dry_run_action_policy(with_tenant_context(DryRunActionPolicyRequest {
+            namespace: ns(),
+            candidate: Some(ActionPolicy {
+                scope: ns(),
+                default_decision: "deny".into(),
+                ..Default::default()
+            }),
+            start_timestamp_ms: 100,
+            end_timestamp_ms: 200,
+        }))
+    );
     for (name, code) in codes {
         assert_eq!(code, Some(tonic::Code::PermissionDenied), "{name}");
     }
@@ -39306,6 +39319,88 @@ async fn action_policy_dry_run_rpc_reports_like_the_console_and_mutates_nothing(
         .await
         .unwrap_err();
     assert_eq!(ungranted.code(), tonic::Code::PermissionDenied);
+}
+
+/// #3262: a tenant assertion dry-runs a policy on its tenant's namespace
+/// under the same grant check as a token caller, the audit decision names the
+/// assertion's principal, and a grant in another tenant's namespace is refused.
+#[tokio::test]
+async fn action_policy_dry_run_rpc_admits_a_granted_tenant_assertion() {
+    let svc = enterprise_service();
+    let namespace = "allowed";
+    let db = svc.db.runtime();
+    db.put_operation_receipt(&action_admission_receipt(
+        "op-allowed",
+        namespace,
+        Some(("allow", namespace, "v1")),
+    ))
+    .unwrap();
+    let request = || DryRunActionPolicyRequest {
+        namespace: namespace.into(),
+        candidate: Some(ActionPolicy {
+            scope: namespace.into(),
+            default_decision: "deny".into(),
+            ..Default::default()
+        }),
+        start_timestamp_ms: 100,
+        end_timestamp_ms: 200,
+    };
+    let ungranted = svc
+        .dry_run_action_policy(with_tenant_context(request()))
+        .await
+        .unwrap_err();
+    assert_eq!(ungranted.code(), tonic::Code::PermissionDenied);
+
+    grant_source_namespace(&svc, namespace, "subject-a", security::Role::Viewer);
+    let tenant = svc
+        .dry_run_action_policy(with_tenant_context(request()))
+        .await
+        .unwrap()
+        .into_inner();
+    // The engine a token caller reaches returns the same report.
+    let engine = crate::composition::action_policy_dry_run::run_action_policy_dry_run(
+        db,
+        "subject-a",
+        namespace,
+        100,
+        200,
+        &from_proto_action_policy(request().candidate.as_ref().unwrap()).unwrap(),
+        "grpc",
+    )
+    .unwrap();
+    assert_eq!(
+        engine.candidate_policy_version,
+        tenant.candidate_policy_version
+    );
+    let counts = tenant.counts.unwrap();
+    assert_eq!(
+        (engine.counts.evaluated, engine.counts.would_deny),
+        (counts.evaluated, counts.would_deny)
+    );
+    assert_eq!(counts.would_deny, 1);
+
+    let actors: Vec<_> = db
+        .list_decisions(&crate::sekai::audit::DecisionFilter {
+            action: Some("action_policy.dry_run".into()),
+            target_id: Some(namespace.into()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|decision| decision.actor)
+        .collect();
+    assert_eq!(actors, ["subject-a", "subject-a"]);
+
+    // A grant in another tenant's namespace does not reach it.
+    grant_source_namespace(&svc, "denied", "subject-a", security::Role::Viewer);
+    let other_tenant = svc
+        .dry_run_action_policy(with_tenant_context(DryRunActionPolicyRequest {
+            namespace: "denied".into(),
+            ..request()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(other_tenant.code(), tonic::Code::PermissionDenied);
 }
 
 #[tokio::test]
