@@ -95,6 +95,37 @@ impl Criticality {
             EvidenceClassification::Restricted => Some(Self::Critical),
         }
     }
+
+    /// Built-in tokens map as [`from_marking`]. A custom lattice token maps
+    /// to the highest built-in classification it dominates; a token the
+    /// lattice cannot place is Critical.
+    pub(crate) fn from_reachable_marking(
+        marking: &str,
+        lattice: Option<&crate::sekai::classification_lattice::ClassificationLattice>,
+    ) -> Self {
+        use crate::sekai::evidence_vocabulary::EvidenceClassification;
+        if let Some(level) = Self::from_marking(marking) {
+            return level;
+        }
+        let Some(lattice) = lattice else {
+            return Self::Critical;
+        };
+        let builtins = [
+            (EvidenceClassification::Restricted, Self::Critical),
+            (EvidenceClassification::Confidential, Self::High),
+            (EvidenceClassification::Internal, Self::Medium),
+            (EvidenceClassification::Public, Self::Low),
+        ];
+        builtins
+            .into_iter()
+            .find_map(
+                |(class, level)| match lattice.dominates(marking, class.as_str()) {
+                    Ok(true) => Some(level),
+                    _ => None,
+                },
+            )
+            .unwrap_or(Self::Critical)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,19 +191,16 @@ pub fn apply_derived(db: &RuntimeDb, entry: &mut Object) -> Result<(), CatalogEr
     if !kind.carries_derived_criticality() {
         return Ok(());
     }
+    let lattice = db
+        .get_classification_lattice(&entry.namespace)
+        .map_err(CatalogError::Storage)?;
     let mut derived = None;
     for marking in crate::sekai::catalog_lineage::reachable_data_markings(db, entry)? {
-        match Criticality::from_marking(&marking) {
-            Some(level) => {
-                derived = Some(derived.map_or(level, |current: Criticality| current.max(level)));
-            }
-            None if marking.is_empty() => {}
-            None => {
-                return Err(CatalogError::Invalid(format!(
-                    "reachable marking {marking:?} has no criticality mapping"
-                )));
-            }
+        if marking.is_empty() {
+            continue;
         }
+        let level = Criticality::from_reachable_marking(&marking, lattice.as_ref());
+        derived = Some(derived.map_or(level, |current: Criticality| current.max(level)));
     }
     let declared = property_criticality(entry, DECLARED_PROPERTY);
     write_levels(entry, declared, derived);
@@ -834,5 +862,102 @@ mod tests {
         assert_eq!(entry.properties[DECLARED_PROPERTY], "low");
         assert_eq!(entry.properties[DERIVED_PROPERTY], "high");
         assert_eq!(entry.properties[EFFECTIVE_PROPERTY], "high");
+    }
+
+    fn secret_eu_lattice() -> crate::sekai::classification_lattice::ClassificationLattice {
+        use crate::sekai::classification_lattice::{
+            CLASSIFICATION_LATTICE_VERSION, ClassificationLattice,
+        };
+        use crate::sekai::evidence_vocabulary::EvidenceClassification;
+        ClassificationLattice {
+            contract_version: CLASSIFICATION_LATTICE_VERSION.into(),
+            namespace: "acme".into(),
+            tokens: vec![
+                EvidenceClassification::Public.as_str().into(),
+                EvidenceClassification::Internal.as_str().into(),
+                EvidenceClassification::Confidential.as_str().into(),
+                EvidenceClassification::Restricted.as_str().into(),
+                "secret-eu".into(),
+            ],
+            parents: std::collections::BTreeMap::from([
+                (
+                    EvidenceClassification::Public.as_str().into(),
+                    vec![EvidenceClassification::Internal.as_str().into()],
+                ),
+                (
+                    EvidenceClassification::Internal.as_str().into(),
+                    vec![EvidenceClassification::Confidential.as_str().into()],
+                ),
+                (
+                    EvidenceClassification::Confidential.as_str().into(),
+                    vec!["secret-eu".into()],
+                ),
+            ]),
+            incomparable: Vec::new(),
+        }
+        .prepare()
+        .unwrap()
+    }
+
+    fn catalog_bound(id: &str, entry_kind: &str, target_id: &str, marking: &str) -> Object {
+        use crate::sekai::catalog::{BINDING_KIND_DATASET, CATALOG_ENTRY_KIND};
+        use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+        let mut properties = std::collections::HashMap::from([
+            ("entry_kind".into(), entry_kind.into()),
+            ("binding_kind".into(), BINDING_KIND_DATASET.into()),
+            ("binding_id".into(), target_id.into()),
+        ]);
+        if !marking.is_empty() {
+            properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), marking.into());
+        }
+        Object {
+            id: id.into(),
+            kind: CATALOG_ENTRY_KIND.into(),
+            name: id.into(),
+            namespace: "acme".into(),
+            external_id: id.into(),
+            properties,
+            created: 1,
+            updated: 1,
+        }
+    }
+
+    #[test]
+    fn custom_lattice_marking_maps_to_the_highest_builtin_it_dominates() {
+        let lattice = secret_eu_lattice();
+        assert_eq!(
+            Criticality::from_reachable_marking("secret-eu", Some(&lattice)),
+            Criticality::High
+        );
+        assert_eq!(
+            Criticality::from_reachable_marking("confidential", Some(&lattice)),
+            Criticality::High
+        );
+        assert_eq!(
+            Criticality::from_reachable_marking("unknown-token", Some(&lattice)),
+            Criticality::Critical
+        );
+        assert_eq!(
+            Criticality::from_reachable_marking("unknown-token", None),
+            Criticality::Critical
+        );
+    }
+
+    #[test]
+    fn apply_derived_maps_a_reachable_custom_marking_instead_of_failing() {
+        let db = sqlite();
+        db.put_classification_lattice(&secret_eu_lattice(), "root", 1)
+            .unwrap();
+        db.create_object(&catalog_bound(
+            "catalog:orders",
+            "dataset",
+            "orders",
+            "secret-eu",
+        ))
+        .unwrap();
+        let mut service = catalog_bound("catalog:billing", "service", "orders", "");
+        apply_derived(&db, &mut service).unwrap();
+        assert_eq!(service.properties[DERIVED_PROPERTY], "high");
+        assert_eq!(service.properties[EFFECTIVE_PROPERTY], "high");
     }
 }
