@@ -2,8 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::db::store::SekaiStore;
@@ -43,7 +43,8 @@ fn issue_record(number: u64, version: &str, payload: &str, hidden: bool) -> Sour
         external_id: number.to_string(),
         source_version: version.into(),
         type_name: "Issue".into(),
-        display_name: format!("synthetic issue {number}"),
+        // Zero-padded so name order is issue-number order (see `page_visible`).
+        display_name: format!("synthetic issue {number:06}"),
         payload_digest: payload.into(),
         properties: BTreeMap::from([
             ("state".into(), "open".into()),
@@ -125,12 +126,6 @@ fn seed_graph(db: &RuntimeDb, size: usize) -> String {
     "cursor:1".into()
 }
 
-fn resident_memory_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages = status.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    Some(pages.saturating_mul(4096))
-}
-
 fn retry_locked<T>(mut operation: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     const MAX_ATTEMPTS: usize = 20;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -151,6 +146,7 @@ fn page_visible(db: &RuntimeDb, offset: i32, limit: i32) -> Result<(Vec<String>,
         kind: Some("Issue".into()),
         limit,
         offset,
+        order_by: "name".into(),
         ..Default::default()
     };
     let context = PrincipalPolicyContext {
@@ -185,43 +181,44 @@ fn exercise_size(size: usize) {
             .all(|id| id.starts_with("github:acme/ops#"))
     );
 
+    // Refresh `k` hides issue 2k-1 and shows issue 2k in one batch. The two
+    // are adjacent in name order, so the visible total stays `visible` and
+    // every other visible issue keeps its slot: a full offset pass must see
+    // exactly `visible` distinct issues however refreshes interleave.
     let stop = Arc::new(AtomicBool::new(false));
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_count = Arc::new(AtomicU64::new(0));
-    let listed_hidden = Arc::new(AtomicU64::new(0));
-    let barrier = Arc::new(Barrier::new(2));
-    let started = Instant::now();
+    let passes = Arc::new(AtomicU64::new(0));
+    let overlapped_passes = Arc::new(AtomicU64::new(0));
+    // The first pass reads one page, then waits for the first refresh to
+    // commit, so at least one pass overlaps a refresh on every run.
+    let (mid_pass_tx, mid_pass_rx) = mpsc::channel::<()>();
+    let (refreshed_tx, refreshed_rx) = mpsc::channel::<()>();
 
     let refresher = {
         let db = Arc::clone(&db);
         let errors = Arc::clone(&errors);
         let refresh_count = Arc::clone(&refresh_count);
-        let barrier = Arc::clone(&barrier);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            barrier.wait();
+            mid_pass_rx.recv().expect("pager reached its first page");
             let mut current = cursor;
-            for step in 1..=visible {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let number = (step as u64 * 2) - 1;
+            for step in 1..=visible as u64 {
                 let next = format!("cursor:{}", step + 1);
+                let version = format!("issue-v{}", step + 1);
                 let batch = github_batch(
                     &current,
                     &next,
                     &format!("refresh-{step}"),
-                    vec![issue_record(
-                        number,
-                        &format!("issue-v{}", step + 1),
-                        PAYLOAD_B,
-                        false,
-                    )],
+                    vec![
+                        issue_record(step * 2 - 1, &version, PAYLOAD_B, true),
+                        issue_record(step * 2, &version, PAYLOAD_B, false),
+                    ],
                 );
                 match retry_locked(|| db.apply_source_batch(&batch, PRODUCER, 200 + step as i64)) {
                     Ok(result) if result.transaction.status == SourceBatchStatus::Committed => {
                         current = next;
-                        refresh_count.fetch_add(1, Ordering::Relaxed);
+                        refresh_count.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(result) => errors.lock().unwrap().push(format!(
                         "refresh did not commit: {}",
@@ -229,23 +226,29 @@ fn exercise_size(size: usize) {
                     )),
                     Err(error) => errors.lock().unwrap().push(error),
                 }
+                if step == 1 {
+                    let _ = refreshed_tx.send(());
+                }
             }
-            stop.store(true, Ordering::Relaxed);
+            stop.store(true, Ordering::SeqCst);
         })
     };
 
     let pager = {
         let db = Arc::clone(&db);
         let errors = Arc::clone(&errors);
-        let listed_hidden = Arc::clone(&listed_hidden);
-        let barrier = Arc::clone(&barrier);
+        let refresh_count = Arc::clone(&refresh_count);
+        let passes = Arc::clone(&passes);
+        let overlapped_passes = Arc::clone(&overlapped_passes);
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            barrier.wait();
-            while !stop.load(Ordering::Relaxed) {
+            let mut mid_pass = Some((mid_pass_tx, refreshed_rx));
+            loop {
+                let finished = stop.load(Ordering::SeqCst);
+                let refreshes_before = refresh_count.load(Ordering::SeqCst);
                 let mut offset = 0;
                 let mut seen = BTreeSet::new();
-                loop {
+                let complete = loop {
                     match retry_locked(|| page_visible(&db, offset, 4)) {
                         Ok((ids, total)) => {
                             if total != visible as i32 {
@@ -261,24 +264,37 @@ fn exercise_size(size: usize) {
                                         .push(format!("silent cursor mismatch duplicated {id}"));
                                 }
                             }
-                            if ids.is_empty() {
-                                break;
+                            if let Some((tx, rx)) = mid_pass.take() {
+                                tx.send(()).expect("refresher waits for the first page");
+                                rx.recv().expect("refresher commits its first refresh");
                             }
                             offset += ids.len() as i32;
-                            if offset >= total {
-                                break;
+                            if ids.is_empty() || offset >= total {
+                                break true;
                             }
-                        }
-                        Err(error) if error.starts_with("unauthorized disclosure") => {
-                            listed_hidden.fetch_add(1, Ordering::Relaxed);
-                            errors.lock().unwrap().push(error);
-                            break;
                         }
                         Err(error) => {
                             errors.lock().unwrap().push(error);
-                            break;
+                            break false;
                         }
                     }
+                };
+                if !complete {
+                    break;
+                }
+                if seen.len() != visible {
+                    errors.lock().unwrap().push(format!(
+                        "a full pass saw {} of {visible} visible issues",
+                        seen.len()
+                    ));
+                }
+                passes.fetch_add(1, Ordering::SeqCst);
+                if refresh_count.load(Ordering::SeqCst) > refreshes_before {
+                    overlapped_passes.fetch_add(1, Ordering::SeqCst);
+                }
+                // One last pass after the refresher stops reads the final state.
+                if finished {
+                    break;
                 }
             }
         })
@@ -286,11 +302,6 @@ fn exercise_size(size: usize) {
 
     refresher.join().expect("refresh worker panicked");
     pager.join().expect("pagination worker panicked");
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed.as_secs_f64() > 0.0,
-        "incomplete run produced no elapsed time"
-    );
 
     let errors = errors.lock().unwrap().clone();
     assert!(
@@ -298,13 +309,31 @@ fn exercise_size(size: usize) {
         "concurrent ingestion/query failed: {}",
         errors.join("; ")
     );
-    assert_eq!(listed_hidden.load(Ordering::Relaxed), 0);
-    assert!(refresh_count.load(Ordering::Relaxed) > 0);
-    let memory = resident_memory_bytes();
+    assert_eq!(refresh_count.load(Ordering::SeqCst), visible as u64);
     assert!(
-        memory.is_none() || memory.unwrap() > 0,
-        "memory observation must be unavailable or a positive RSS"
+        passes.load(Ordering::SeqCst) >= 2,
+        "first pass plus the final pass"
     );
+    assert!(
+        overlapped_passes.load(Ordering::SeqCst) >= 1,
+        "no pagination pass overlapped a refresh"
+    );
+    // Every refresh committed, so exactly the even issues are visible now.
+    let mut final_ids = BTreeSet::new();
+    let mut offset = 0;
+    loop {
+        let (ids, total) = page_visible(&db, offset, 4).unwrap();
+        assert_eq!(total, visible as i32);
+        if ids.is_empty() {
+            break;
+        }
+        offset += ids.len() as i32;
+        final_ids.extend(ids);
+    }
+    let even: BTreeSet<String> = (1..=visible)
+        .map(|k| format!("github:acme/ops#{}", k * 2))
+        .collect();
+    assert_eq!(final_ids, even);
 
     let state = db
         .get_source_sync_state(NAMESPACE, SOURCE_INSTANCE, GITHUB_OBJECT_SYNC_TYPE_DIGEST)
