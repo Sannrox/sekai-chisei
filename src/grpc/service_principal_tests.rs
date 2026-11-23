@@ -241,6 +241,66 @@ async fn registration_outside_the_caller_tenant_is_refused() {
 }
 
 #[tokio::test]
+async fn delete_and_read_are_refused_for_another_tenant_and_for_non_admins() {
+    let service = service(true);
+    service
+        .put_service_principal(request(
+            put("tenant-a", &["ns-a"]),
+            "tenant-admin",
+            Some("tenant-a"),
+        ))
+        .await
+        .unwrap();
+    let delete = || DeleteServicePrincipalRequest {
+        principal: "worker-a".into(),
+    };
+    let still_registered = || async {
+        service
+            .get_service_principal(request(get(), "tenant-admin", Some("tenant-a")))
+            .await
+            .unwrap()
+            .into_inner()
+            .service_principal
+            .unwrap()
+    };
+
+    // Another tenant's administrator gets the answer for an absent principal:
+    // nothing deleted, and nothing revealed about the other tenant.
+    let cross_tenant = service
+        .delete_service_principal(request(delete(), "tenant-admin", Some("tenant-b")))
+        .await
+        .unwrap()
+        .into_inner();
+    let absent = service
+        .delete_service_principal(request(
+            DeleteServicePrincipalRequest {
+                principal: "worker-absent".into(),
+            },
+            "tenant-admin",
+            Some("tenant-b"),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!cross_tenant.deleted);
+    assert_eq!(cross_tenant, absent);
+    assert_eq!(still_registered().await.tenant_id, "tenant-a");
+
+    // A non-administrator in the owning tenant.
+    let status = service
+        .delete_service_principal(request(delete(), "alice", Some("tenant-a")))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(still_registered().await.tenant_id, "tenant-a");
+    let status = service
+        .get_service_principal(request(get(), "alice", Some("tenant-a")))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
 async fn a_turn_worker_registers_with_its_capability_and_no_action_types() {
     let service = service(false);
     let mut registration = put("", &["ns-a"]);
