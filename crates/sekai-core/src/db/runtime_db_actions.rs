@@ -813,7 +813,7 @@ impl RuntimeDb {
         outcome: &str,
         reason: &str,
         now_ms: i64,
-    ) -> Result<crate::sekai::action_effect::ActionEffect, String> {
+    ) -> Result<crate::sekai::action_effect::AckResult, String> {
         match self {
             Self::Sqlite(db) => db.ack_action_work(
                 effect_id,

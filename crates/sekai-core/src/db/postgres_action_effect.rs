@@ -2,7 +2,7 @@
 
 use crate::db::postgres::PostgresDb;
 use crate::sekai::action_effect::{
-    AckStep, ClaimStep, normalize_ttl_ms, validate_ack_outcome, validate_claim_request,
+    AckResult, AckStep, ClaimStep, normalize_ttl_ms, validate_ack_outcome, validate_claim_request,
 };
 use crate::sekai::action_effect::{
     ActionEffect, EFFECT_STATUS_CLAIMED, EFFECT_STATUS_PENDING, runtime_id_is_blank,
@@ -1093,24 +1093,27 @@ impl PostgresDb {
         outcome: &str,
         reason: &str,
         now_ms: i64,
-    ) -> Result<ActionEffect, String> {
+    ) -> Result<AckResult, String> {
         validate_ack_outcome(outcome, reason)?;
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         let mut effect = pg_load_effect(&mut tx, effect_id, true)?;
-        if effect.ack_claim(
+        let step = effect.ack_claim(
             runtime_id,
             generation,
             fencing_token_in,
             outcome,
             reason,
             now_ms,
-        )? == AckStep::Apply
-        {
+        )?;
+        if step == AckStep::Apply {
             pg_update_effect(&mut tx, &effect)?;
             tx.commit().map_err(|error| error.to_string())?;
         }
-        Ok(effect)
+        Ok(AckResult {
+            effect,
+            replay: step == AckStep::Replay,
+        })
     }
 }
 

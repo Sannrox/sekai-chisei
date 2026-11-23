@@ -12,7 +12,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::sekai::action_effect::{EFFECT_STATUS_DEAD_LETTERED, plan_effects_for_admit};
+use crate::sekai::action_effect::{
+    EFFECT_STATUS_COMPLETED, EFFECT_STATUS_DEAD_LETTERED, plan_effects_for_admit,
+};
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
 use crate::sekai::data_export::export_receipt;
 use crate::sekai::dataset::{ColumnDef, Dataset};
@@ -600,6 +602,39 @@ fn postgres_transform_claim_conformance() {
         WorkKind::Transform,
         &format!("pg{}", std::process::id()),
     );
+}
+
+/// A completed Action ack applies once; the same outcome again is a replay.
+fn action_ack_replay_contract(db: &RuntimeDb, prefix: &str) {
+    let work = admit(db, WorkKind::Action, prefix);
+    let held = work.claim("a", 1_000).expect("open work is claimable");
+    let ack = || {
+        db.ack_action_work(
+            &work.id,
+            &held.owner,
+            u64::try_from(held.generation).unwrap(),
+            &held.token,
+            "completed",
+            "",
+            1_100,
+        )
+        .unwrap()
+    };
+    assert!(!ack().replay, "the first ack applies");
+    let replayed = ack();
+    assert!(replayed.replay, "the same outcome again is a replay");
+    assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
+}
+
+#[test]
+fn sqlite_action_ack_replay_conformance() {
+    action_ack_replay_contract(&RuntimeDb::memory(), "sqlite-ack");
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_action_ack_replay_conformance() {
+    action_ack_replay_contract(&postgres(), &format!("pg-ack{}", std::process::id()));
 }
 
 #[test]

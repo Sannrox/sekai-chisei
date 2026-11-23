@@ -723,6 +723,14 @@ pub enum ClaimStep {
     DeadLettered(String),
 }
 
+/// A completed or failed acknowledgement. `replay` is true when the effect
+/// already held this terminal outcome and nothing was written.
+#[derive(Debug, Clone)]
+pub struct AckResult {
+    pub effect: ActionEffect,
+    pub replay: bool,
+}
+
 /// What [`ActionEffect::ack_claim`] decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1638,7 +1646,7 @@ impl SekaiDb {
         outcome: &str,
         reason: &str,
         now_ms: i64,
-    ) -> Result<ActionEffect, String> {
+    ) -> Result<AckResult, String> {
         validate_ack_outcome(outcome, reason)?;
         let mut effect = self
             .get_action_effect(effect_id)?
@@ -1651,8 +1659,14 @@ impl SekaiDb {
             reason,
             now_ms,
         )? {
-            AckStep::Replay => Ok(effect),
-            AckStep::Apply => self.update_action_effect_lifecycle(&effect),
+            AckStep::Replay => Ok(AckResult {
+                effect,
+                replay: true,
+            }),
+            AckStep::Apply => Ok(AckResult {
+                effect: self.update_action_effect_lifecycle(&effect)?,
+                replay: false,
+            }),
         }
     }
 
@@ -2926,7 +2940,7 @@ mod tests {
                 200,
             )
             .unwrap();
-        assert_eq!(completed.status, EFFECT_STATUS_COMPLETED);
+        assert_eq!(completed.effect.status, EFFECT_STATUS_COMPLETED);
         let replayed = db
             .ack_action_work(
                 &acknowledged.effect_id,
@@ -2938,7 +2952,8 @@ mod tests {
                 201,
             )
             .unwrap();
-        assert_eq!(replayed.status, EFFECT_STATUS_COMPLETED);
+        assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
+        assert!(replayed.replay);
 
         let mut parked = plan_effects_for_admit(
             "legacy-owner-park",
@@ -3131,7 +3146,7 @@ mod tests {
                 10_100,
             )
             .unwrap();
-        assert_eq!(done.status, EFFECT_STATUS_COMPLETED);
+        assert_eq!(done.effect.status, EFFECT_STATUS_COMPLETED);
     }
 
     #[test]
