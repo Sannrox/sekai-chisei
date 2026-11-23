@@ -363,6 +363,8 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 | "ExplainDerivation"
                 | "CompareDefinitionRevisions"
                 | "QueryObjectPolicyAudit"
+                // The policy dry-run (#3262) writes only its audit decision.
+                | "DryRunActionPolicy"
                 // Offline sync (#1836) needs namespace read: a scope is the
                 // caller's own definition, not namespace data.
                 | "PutSyncScope"
@@ -1002,6 +1004,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ResolveInvariantSet"
             | "SubmitActionInstance"
             | "DecideActionInstance"
+            // The policy dry-run (#3262) checks the namespace grant and the
+            // tenant's namespace in its handler.
+            | "DryRunActionPolicy"
             // Offline sync (#1836): each call enforces the caller's tenant on
             // the scope's namespace, and a device-bound context still needs
             // its device's proof (ADR 0126).
@@ -3568,9 +3573,14 @@ mod tests {
             "ReadObjectChangeSubscription",
             "CompareDefinitionRevisions",
             "QueryObjectPolicyAudit",
+            "DryRunActionPolicy",
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
+        assert_eq!(
+            rpc_namespace_action("DryRunActionPolicy"),
+            crate::enterprise::NamespaceAction::Read
+        );
         // #2203: the decision inbox is a read on the request's namespace.
         assert!(enterprise_namespace_rpc(
             "sekai.SekaiService",
