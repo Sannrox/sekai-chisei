@@ -3405,7 +3405,7 @@ fn transform_chain_from_proto(
     }
 }
 
-fn to_proto_transform_chain(
+pub(super) fn to_proto_transform_chain(
     chain: &crate::sekai::transform_chain::TransformChain,
 ) -> TransformChain {
     TransformChain {
@@ -3444,7 +3444,7 @@ fn to_proto_transform_chain(
     }
 }
 
-fn to_proto_transform_chain_run(
+pub(super) fn to_proto_transform_chain_run(
     service: &SekaiServiceImpl,
     principals: &[String],
     run: &crate::sekai::transform_chain::TransformChainRun,

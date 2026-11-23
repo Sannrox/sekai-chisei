@@ -1069,4 +1069,44 @@ impl RuntimeDb {
             }
         }
     }
+
+    pub fn get_transform_chain(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+    ) -> Result<Option<crate::sekai::transform_chain::TransformChain>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_transform_chain(namespace, chain_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.get_transform_chain(namespace, chain_id))
+            }
+        }
+    }
+
+    pub fn list_transform_chains(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::sekai::transform_chain::TransformChain>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_transform_chains(namespace),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.list_transform_chains(namespace))
+            }
+        }
+    }
+
+    pub fn list_transform_chain_runs(
+        &self,
+        namespace: &str,
+        chain_id: &str,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::transform_chain::TransformChainRun>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_transform_chain_runs(namespace, chain_id, after, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_transform_chain_runs(namespace, chain_id, after, limit)
+            }),
+        }
+    }
 }
