@@ -324,6 +324,21 @@ class CiPathScope(unittest.TestCase):
         self.assertIn("scripts/ci/path-scope.sh run", runs(template))
 
 
+class PostgresConformance(unittest.TestCase):
+    """PostgreSQL conformance runs on every non-docs pull request (#1316, #2571)."""
+
+    DOCS_ONLY = {"docs/**", "*.md"}
+
+    def setUp(self):
+        self.wf = load("postgres-conformance.yml")
+
+    def test_runs_on_every_pull_request_that_changes_a_non_docs_path(self):
+        self.assertIn("pull_request", self.wf["on"])
+        trigger = self.wf["on"]["pull_request"] or {}
+        self.assertNotIn("paths", trigger)
+        self.assertLessEqual(set(trigger.get("paths-ignore", [])), self.DOCS_ONLY)
+
+
 class N1Upgrade(unittest.TestCase):
     """A failed or empty N-1 resolve must fail the step, not write tag=."""
 
