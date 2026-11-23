@@ -342,9 +342,10 @@ impl<'a> ActionWorkLifecycle<'a> {
                         reason.as_str(),
                         now_ms,
                     )
-                    .map_err(classify_ack_error)?;
+                    .map_err(classify_ack_error)?
+                    .effect;
                 self.record_delegator_refusal_receipt(&stored, command.runtime_id, reason, now_ms)?;
-                self.record_ack_audit(&stored, actor, command.runtime_id, now_ms);
+                self.record_ack_audit(&stored, actor);
                 return Err(ActionWorkLifecycleError::FailedPrecondition(
                     reason.as_str().into(),
                 ));
@@ -369,7 +370,7 @@ impl<'a> ActionWorkLifecycle<'a> {
             ));
         }
 
-        let stored = self
+        let acked = self
             .db
             .ack_action_work(
                 command.effect_id,
@@ -381,6 +382,7 @@ impl<'a> ActionWorkLifecycle<'a> {
                 now_ms,
             )
             .map_err(classify_ack_error)?;
+        let stored = acked.effect;
         // Terminal same-outcome replay skips claim fencing. Bind a new artifact
         // only when this request still presents the live claim fence.
         let allow_artifact_bind = stored.fence_matches(
@@ -395,11 +397,11 @@ impl<'a> ActionWorkLifecycle<'a> {
             allow_artifact_bind,
             now_ms,
         )?;
-        self.record_ack_audit(&stored, actor, command.runtime_id, now_ms);
+        self.record_ack_audit(&stored, actor);
         Ok(AckedActionWork {
             effect: stored,
             park: None,
-            replay: false,
+            replay: acked.replay,
         })
     }
 
@@ -499,9 +501,10 @@ impl<'a> ActionWorkLifecycle<'a> {
                 reason.as_str(),
                 now_ms,
             )
-            .map_err(classify_ack_error)?;
+            .map_err(classify_ack_error)?
+            .effect;
         self.record_delegator_refusal_receipt(&failed, command.runtime_id, reason, now_ms)?;
-        self.record_ack_audit(&failed, actor, command.runtime_id, now_ms);
+        self.record_ack_audit(&failed, actor);
         Err(ActionWorkLifecycleError::FailedPrecondition(
             reason.as_str().into(),
         ))
@@ -732,23 +735,28 @@ impl<'a> ActionWorkLifecycle<'a> {
         });
     }
 
-    fn record_ack_audit(&self, effect: &ActionEffect, actor: &str, runtime_id: &str, now_ms: i64) {
-        let _ = self.db.record_decision(&audit::Decision {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: now_ms,
+    /// Record the terminal ack once. Every field comes from the stored effect,
+    /// so a same-outcome replay presents the same decision and writes nothing.
+    fn record_ack_audit(&self, effect: &ActionEffect, actor: &str) {
+        let _ = self.db.record_decisions_idempotently(&[audit::Decision {
+            id: format!(
+                "ack_action_work:{}:{}:{}",
+                effect.effect_id, effect.claim_generation, effect.status
+            ),
+            timestamp: effect.updated_at_ms,
             actor: actor.to_string(),
             action: "ack_action_work".into(),
             reason: format!("action_effect_{}", effect.status),
             evidence: HashMap::from([
                 ("effect_id".into(), effect.effect_id.clone()),
-                ("runtime_id".into(), runtime_id.to_string()),
+                ("runtime_id".into(), effect.claim_owner.clone()),
                 ("outcome".into(), effect.status.clone()),
                 ("instance_id".into(), effect.instance_id.clone()),
                 ("operation_id".into(), effect.operation_id.clone()),
             ]),
             target_id: effect.effect_id.clone(),
             outcome: effect.status.clone(),
-        });
+        }]);
     }
 }
 
@@ -2498,6 +2506,25 @@ mod tests {
         db.revoke_principal_credential(DELEGATOR).unwrap();
         let replayed = apply_completed(&db, &effect, &claimed).unwrap();
         assert_eq!(replayed.effect.status, EFFECT_STATUS_COMPLETED);
+    }
+
+    #[test]
+    fn a_replayed_completed_ack_reports_replay_and_writes_one_decision() {
+        let (db, effect, _) = seed_delegated_apply_path();
+        let claimed = claim_effect(&db, &effect);
+        assert!(!apply_completed(&db, &effect, &claimed).unwrap().replay);
+        for _ in 0..2 {
+            assert!(apply_completed(&db, &effect, &claimed).unwrap().replay);
+        }
+        let decisions = db
+            .list_decisions(&crate::sekai::audit::DecisionFilter {
+                action: Some("ack_action_work".into()),
+                target_id: Some(effect.effect_id.clone()),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
     }
 
     fn claim_refused(db: &RuntimeDb, effect: &ActionEffect) -> ActionWorkLifecycleError {
