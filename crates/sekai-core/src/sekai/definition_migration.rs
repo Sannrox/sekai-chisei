@@ -145,6 +145,33 @@ pub fn require_published_candidate(
     Ok(())
 }
 
+/// Most parent hops an ancestor walk follows before refusing the chain.
+pub const MAX_ANCESTOR_HOPS: usize = 4_096;
+
+/// Every ancestor of `to`, nearest first, read through `load` until a revision
+/// with an empty parent digest. A failed load fails the walk instead of
+/// returning a shorter list, and a chain longer than `MAX_ANCESTOR_HOPS` is
+/// refused, so planning never works from a truncated history. Both stores call
+/// it with their in-transaction revision loader.
+pub fn load_ancestors(
+    to: &DefinitionRevision,
+    mut load: impl FnMut(&str) -> Result<DefinitionRevision, String>,
+) -> Result<Vec<DefinitionRevision>, String> {
+    let mut ancestors = Vec::new();
+    let mut current = to.parent_revision_digest.clone();
+    while !current.is_empty() {
+        if ancestors.len() == MAX_ANCESTOR_HOPS {
+            return Err(format!(
+                "fact_migration_limit: ancestor chain exceeds {MAX_ANCESTOR_HOPS} revisions"
+            ));
+        }
+        let revision = load(&current)?;
+        current = revision.parent_revision_digest.clone();
+        ancestors.push(revision);
+    }
+    Ok(ancestors)
+}
+
 pub fn require_ancestor(
     from: &DefinitionRevision,
     to: &DefinitionRevision,
@@ -632,6 +659,70 @@ mod tests {
             error.contains("unknown")
                 || error.contains("unknown_definition_construct")
                 || error.contains("fact_migration_unknown")
+        );
+    }
+
+    /// A loader over a synthetic chain `d1 -> d2 -> ... -> d{length}`, where
+    /// `d{length}` has no parent; `fail_at` makes that hop's load fail.
+    fn chain_loader(
+        base: &DefinitionRevision,
+        length: usize,
+        fail_at: Option<usize>,
+    ) -> impl FnMut(&str) -> Result<DefinitionRevision, String> {
+        let base = base.clone();
+        move |digest| {
+            let hop: usize = digest.trim_start_matches('d').parse().unwrap();
+            if fail_at == Some(hop) {
+                return Err("database is locked".into());
+            }
+            let mut revision = base.clone();
+            revision.revision_digest = digest.into();
+            revision.parent_revision_digest = if hop == length {
+                String::new()
+            } else {
+                format!("d{}", hop + 1)
+            };
+            Ok(revision)
+        }
+    }
+
+    #[test]
+    fn ancestor_walk_fails_instead_of_truncating() {
+        let member = prepared("object_type", "Ticket", r#"{"name":"Ticket"}"#);
+        let mut to = revision(&[member], "", true);
+        to.parent_revision_digest = "d1".into();
+
+        let complete = load_ancestors(&to, chain_loader(&to, 3, None)).unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|revision| revision.revision_digest.as_str())
+                .collect::<Vec<_>>(),
+            ["d1", "d2", "d3"]
+        );
+
+        assert_eq!(
+            load_ancestors(&to, chain_loader(&to, 3, Some(2))).unwrap_err(),
+            "database is locked"
+        );
+
+        assert_eq!(
+            load_ancestors(&to, chain_loader(&to, MAX_ANCESTOR_HOPS, None))
+                .unwrap()
+                .len(),
+            MAX_ANCESTOR_HOPS
+        );
+        assert_eq!(
+            load_ancestors(&to, chain_loader(&to, MAX_ANCESTOR_HOPS + 1, None)).unwrap_err(),
+            "fact_migration_limit: ancestor chain exceeds 4096 revisions"
+        );
+
+        let mut root = to.clone();
+        root.parent_revision_digest = String::new();
+        assert!(
+            load_ancestors(&root, |_| panic!("a root has no ancestors to load"))
+                .unwrap()
+                .is_empty()
         );
     }
 
