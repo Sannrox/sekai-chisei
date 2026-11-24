@@ -48,6 +48,7 @@ mod postgres_portfolio;
 mod postgres_receipt_chain;
 mod postgres_routing_profile;
 mod postgres_usage_ledger;
+pub use postgres_usage_ledger::append_usage_event_in;
 pub mod receipt_chain;
 pub mod runtime;
 mod sqlite_migrations;

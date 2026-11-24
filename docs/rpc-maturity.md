@@ -444,6 +444,7 @@ Edit the fixture, then regenerate with
 | `ChiseiService.RedeemExternalActionPermit` | `chisei.approvals` | yes | example | `stable` |
 | `ChiseiService.SetExternalActionPolicy` | `chisei.approvals` | yes | none | `experimental` |
 | `ChiseiService.RecordUsage` | `chisei.budget` | yes | host | `stable` |
+| `ChiseiService.AppendUsageEvents` | `chisei.budget` | yes | none | `experimental` |
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
 | `ChiseiService.GetBudgetUsage` | `chisei.budget` | yes | cli | `experimental` |
 | `ChiseiService.SetBudgetWorkUnitDefault` | `chisei.budget` | yes | cli | `experimental` |

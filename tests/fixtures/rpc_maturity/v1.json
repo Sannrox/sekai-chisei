@@ -2985,6 +2985,15 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "AppendUsageEvents",
+      "storage_path": "chisei.budget",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "SetBudgetLimit",
       "storage_path": "chisei.budget",
       "real_backend": "yes",

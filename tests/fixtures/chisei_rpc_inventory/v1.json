@@ -627,6 +627,19 @@
       "product_tier": "core"
     },
     {
+      "rpc": "AppendUsageEvents",
+      "kind": "persistent",
+      "surfaces": [
+        "chisei.budget"
+      ],
+      "evidence": [
+        "crates/chisei-core/src/chisei/usage_ledger.rs",
+        "crates/chisei-core/src/chisei_store/postgres_usage_ledger.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RedeemExternalActionPermit",
       "kind": "persistent",
       "surfaces": [
