@@ -262,7 +262,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.GetClassificationLattice` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryCounterfactualView` | `sekai.object-security` | yes | none | `experimental` |
-| `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
+| `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | cli | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.ExportNamespaceAudit` | `sekai.audit` | yes | cli | `experimental` |
 | `SekaiService.ExportComplianceBundle` | `sekai.audit` | yes | none | `experimental` |

@@ -55,6 +55,16 @@ on the same object and principal, as `CreateGrant` does.
 - Nothing is changed. Each call records a `simulate_object_policy_change`
   decision naming the principals and the candidate grants.
 
+At the terminal, `sekaictl admin access simulate --namespace <name>
+--principal <name> (--add-grant <file> | --remove-grant <id>)... [--json]`
+sends one simulation to the plane at `CHISEI_GRPC_URL` or `SEKAI_SOCKET` and
+prints the kind summaries; `--json` prints the whole response. An
+`--add-grant` file holds one grant as JSON (`object_id`, `principal`, `role`,
+optional `not_after_ms`). The command refuses to print a summary, and exits
+non-zero, unless the plane echoes exactly the requested grant changes, so a
+plane without grant simulation never yields a summary that ignored them. It
+creates and removes no grant.
+
 `CheckAccess` still answers from per-object grants only.
 
 ## Counterfactual views

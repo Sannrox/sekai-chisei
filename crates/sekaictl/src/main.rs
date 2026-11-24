@@ -104,6 +104,7 @@ async fn run() -> Result<(), BoxError> {
         "unmarked" => {
             sekaictl::unmarked_cli::run_unmarked_command(args.into_iter().skip(1).collect())
         }
+        "access-simulate" => sekaictl::access_simulate_cli::run(&args[1..]).await,
         "gateway" => run_gateway_command(args.into_iter().skip(1).collect()).await,
         "action" => {
             sekaictl::action_cli::run_action_command(args.into_iter().skip(1).collect()).await
@@ -421,6 +422,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("access"), Some("credential")) => ("credential", 3),
         (Some("access"), Some("unmarked")) => ("unmarked", 3),
         (Some("access"), Some("team")) => ("team", 3),
+        (Some("access"), Some("simulate")) => ("access-simulate", 3),
         (Some("gateway"), _) => ("gateway", 2),
         (Some("governance"), Some("action")) => ("action", 3),
         (Some("governance"), Some("budget")) => ("budget", 3),
@@ -609,6 +611,7 @@ fn print_admin_usage() {
            sekaictl admin access credential ...\n\
            sekaictl admin access unmarked ...\n\
            sekaictl admin access team ...\n\
+           sekaictl admin access simulate ...\n\
          \n\
          Gateway:\n\
            sekaictl admin gateway ...\n\
@@ -722,6 +725,7 @@ fn expert_usage(command: &str) -> Option<String> {
     match command {
         "credential" => Some(credential_usage().to_string()),
         "unmarked" => Some(sekaictl::unmarked_cli::usage().to_string()),
+        "access-simulate" => Some(sekaictl::access_simulate_cli::usage().to_string()),
         "gateway" => Some(gateway_usage()),
         "action" => Some(sekaictl::action_cli::usage().to_string()),
         "budget" => Some(sekaictl::budget_cli::usage().to_string()),
@@ -886,6 +890,7 @@ mod tests {
             (vec!["access", "credential"], "credential"),
             (vec!["access", "unmarked"], "unmarked"),
             (vec!["access", "team"], "team"),
+            (vec!["access", "simulate"], "access-simulate"),
             (vec!["gateway"], "gateway"),
             (vec!["governance", "action"], "action"),
             (vec!["governance", "budget"], "budget"),
@@ -949,6 +954,7 @@ mod tests {
             "credential",
             "unmarked",
             "team",
+            "access-simulate",
             "gateway",
             "action",
             "budget",

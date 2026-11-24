@@ -1350,7 +1350,7 @@
       "rpc": "SimulateObjectPolicyChange",
       "storage_path": "sekai.object-security",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "cli",
       "classification": "experimental",
       "product_tier": "core"
     },
