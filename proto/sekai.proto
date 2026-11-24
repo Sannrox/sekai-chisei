@@ -1584,6 +1584,63 @@ message AgentTurn {
   string parked_action_instance_id = 17;
   // How often the turn parked; a turn parks at most three times.
   int64 park_count = 18;
+  // Experimental (ADR 0157). What the turn's worker reported it did. Set by
+  // ListSiteAgentInstanceTurns; unset when the worker recorded nothing.
+  AgentTurnTranscript transcript = 19;
+}
+// Experimental (ADR 0157). The model route and token counts the turn's
+// worker last reported; a later report replaces an earlier one.
+message AgentTurnUsage {
+  string model_route = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+}
+// Experimental (ADR 0157). The prompt the turn ran, recorded once per turn.
+message AgentTurnPrompt {
+  // Where the prompt came from, for example a template id and version.
+  string reference = 1;
+  // public, internal, confidential or restricted. Required. The turn's
+  // instance principal must be cleared for it.
+  string marking = 2;
+  // Optional; at most 64 KiB. Readers see it only when cleared for marking.
+  string text = 3;
+}
+// Experimental (ADR 0157). One tool call or Action the turn made.
+message AgentTurnStep {
+  // Idempotency key within the turn: a retried step with the same id and
+  // content is one step; other content under the same id is refused.
+  string step_id = 1;
+  // tool_call or action.
+  string kind = 2;
+  string name = 3;
+  string target = 4;
+  // Required for kind action, empty for tool_call. The Action's decision
+  // and receipt below are read from the Action, never stored here.
+  string action_instance_id = 5;
+  // Order of recording within the turn, from 0. Set by the server.
+  int64 sequence = 6;
+  int64 recorded_at_ms = 7;
+  // For kind action: the Action's status, approval decision and receipt
+  // (operation_id) now. Set by the server.
+  string action_status = 8;
+  string action_approval_decision = 9;
+  string action_receipt = 10;
+}
+// Experimental (ADR 0157). A turn's transcript: usage, prompt and steps.
+message AgentTurnTranscript {
+  AgentTurnUsage usage = 1;
+  string prompt_reference = 2;
+  string prompt_marking = 3;
+  // The prompt text is stored. False when none was given or it was erased.
+  bool prompt_text_stored = 4;
+  // Set only when the request asked for it and the caller is cleared.
+  string prompt_text = 5;
+  // The text is stored but this caller did not get it.
+  bool prompt_text_withheld = 6;
+  // Set when a subject erasure removed the prompt text; the transcript
+  // then refuses further appends.
+  int64 erased_at_ms = 7;
+  repeated AgentTurnStep steps = 8;
 }
 // What a reclaimed parked turn resumes from (ADR 0142): the Action it
 // parked on, as decided. A granted Action was applied, once, by its grant;
@@ -1620,6 +1677,9 @@ message ListSiteAgentInstanceTurnsRequest {
   int32 limit = 3;
   // Empty for the newest page; otherwise the previous next_page_token.
   string page_token = 4;
+  // Experimental (ADR 0157). Return each transcript's prompt text when the
+  // caller is cleared for its marking; otherwise it is withheld.
+  bool include_prompt_text = 5;
 }
 message ListSiteAgentInstanceTurnsResponse {
   // Newest first. A refused admission has status "refused" and no claim;
@@ -1681,6 +1741,21 @@ message AckAgentTurnRequest {
 }
 message AckAgentTurnResponse {
   AgentTurn turn = 1;
+}
+// Experimental (ADR 0157). Records part of a claimed turn's transcript under
+// the live claim's fence. Set at least one of usage, prompt and step.
+message AppendAgentTurnTranscriptRequest {
+  string turn_id = 1;
+  string runtime_id = 2;
+  int64 claim_generation = 3;
+  string fencing_token = 4;
+  AgentTurnUsage usage = 5;
+  AgentTurnPrompt prompt = 6;
+  AgentTurnStep step = 7;
+}
+message AppendAgentTurnTranscriptResponse {
+  // The prompt text is never echoed.
+  AgentTurnTranscript transcript = 1;
 }
 // Experimental (ADR 0149). A kind of claimable work. Every kind follows the
 // ADR 0129 claim contract; the old per-kind RPCs and these see the same
@@ -6412,6 +6487,8 @@ service SekaiService {
   rpc AckAgentTurn(AckAgentTurnRequest) returns (AckAgentTurnResponse) {
     option deprecated = true;
   }
+  // Experimental (ADR 0157). Requires the turn's claim, like AckWork.
+  rpc AppendAgentTurnTranscript(AppendAgentTurnTranscriptRequest) returns (AppendAgentTurnTranscriptResponse);
   // Stable (ADR 0149, #2286). One claim family over every work kind; each
   // call runs the kind's own claim path, so both families see one claim.
   // Export delivery has no claim RPCs of its own; its old delivery RPCs

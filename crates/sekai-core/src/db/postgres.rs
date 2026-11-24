@@ -247,6 +247,8 @@ const OPERATION_IDENTITY_COLUMNS_SCHEMA: &str =
 const MODEL_STAGE_REVIEWS_SCHEMA: &str = include_str!("postgres/0172_model_stage_reviews.sql");
 const DATASET_ROLLBACK_PROPOSALS_SCHEMA: &str =
     include_str!("postgres/0173_dataset_rollback_proposals.sql");
+const AGENT_TURN_TRANSCRIPTS_SCHEMA: &str =
+    include_str!("postgres/0174_agent_turn_transcripts.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1255,6 +1257,12 @@ const MIGRATIONS: &[Migration] = &[
         173,
         "dataset_rollback_proposals",
         DATASET_ROLLBACK_PROPOSALS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        174,
+        "agent_turn_transcripts",
+        AGENT_TURN_TRANSCRIPTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

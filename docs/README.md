@@ -86,6 +86,8 @@ If you want to deploy or operate the control plane:
   receipt-authoritative deterministic and stochastic execution.
 - [Evaluation quality trends](evaluation-quality-trends.md) — authorized,
   receipt-reconciled quality, variance, regression, and baseline projections.
+- [Agent-turn transcripts](agent-turn-transcripts.md) — what a claimed turn
+  did, with marked prompt text and erasure.
 - [Execution telemetry](execution-telemetry.md) — bounded, digest-bound
   aggregates over operation receipts for improvement evidence.
 - [Evaluation gate evidence](evaluation-gate-evidence.md) — server-owned,

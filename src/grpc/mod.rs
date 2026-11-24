@@ -1048,6 +1048,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "ClaimAgentTurn"
             | "HeartbeatAgentTurnClaim"
             | "AckAgentTurn"
+            | "AppendAgentTurnTranscript"
             // The claim family over every kind (ADR 0149) runs the kind's
             // own handler; transform work stays refused to these credentials.
             | "ListClaimableWork"

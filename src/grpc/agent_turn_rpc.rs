@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
+use crate::sekai::agent_turn::transcript;
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
 use std::collections::HashSet;
 
@@ -51,7 +52,108 @@ fn to_proto(turn: agent_turn::AgentTurn) -> AgentTurn {
         reason: turn.reason,
         parked_action_instance_id: turn.parked_action_id,
         park_count: turn.park_count,
+        transcript: None,
     }
+}
+
+/// Whether `principals` are cleared for a transcript prompt `marking` under
+/// the namespace's lattice (ADR 0157). An unknown marking is not cleared.
+fn prompt_marking_cleared(
+    db: &RuntimeDb,
+    namespace: &str,
+    marking: &str,
+    principals: &[String],
+) -> Result<bool, Status> {
+    let lattice = load_classification_lattice(db, namespace)?;
+    let authority = resolve_principal_authority(db, principals)?;
+    let result = crate::sekai::classification_lattice::evaluate_lattice_access(
+        "agent_turn.prompt",
+        Some(marking),
+        &authority,
+        lattice.as_ref(),
+    );
+    Ok(result.decision != markings::MarkingDecision::Deny)
+}
+
+/// A transcript on the wire, without prompt text. Action steps carry their
+/// Action's status, decision and receipt as they stand now.
+fn transcript_to_proto(
+    db: &RuntimeDb,
+    stored: transcript::TurnTranscript,
+) -> Result<AgentTurnTranscript, Status> {
+    let mut steps = Vec::with_capacity(stored.steps.len());
+    for step in stored.steps {
+        let record = step.record;
+        let action = if record.action_instance_id.is_empty() {
+            None
+        } else {
+            db.get_action_instance(&record.action_instance_id)
+                .map_err(Status::internal)?
+        };
+        steps.push(AgentTurnStep {
+            step_id: record.step_id,
+            kind: record.kind.as_str().into(),
+            name: record.name,
+            target: record.target,
+            action_instance_id: record.action_instance_id,
+            sequence: step.sequence,
+            recorded_at_ms: step.recorded_at_ms,
+            action_status: action
+                .as_ref()
+                .map(|action| action.status.clone())
+                .unwrap_or_default(),
+            action_approval_decision: action
+                .as_ref()
+                .map(|action| action.approval_decision.clone())
+                .unwrap_or_default(),
+            action_receipt: action.map(|action| action.operation_id).unwrap_or_default(),
+        });
+    }
+    Ok(AgentTurnTranscript {
+        usage: stored.usage.map(|usage| AgentTurnUsage {
+            model_route: usage.model_route,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+        }),
+        prompt_reference: stored.prompt_reference,
+        prompt_marking: stored.prompt_marking,
+        prompt_text_stored: stored.prompt_text_stored,
+        prompt_text: String::new(),
+        prompt_text_withheld: false,
+        erased_at_ms: stored.erased_at_ms,
+        steps,
+    })
+}
+
+/// The transcript a list returns for one turn, or `None` when the worker
+/// recorded nothing. Prompt text is attached only when asked for and the
+/// reader is cleared; otherwise a stored text is marked withheld.
+fn listed_transcript(
+    db: &RuntimeDb,
+    namespace: &str,
+    turn_id: &str,
+    include_prompt_text: bool,
+    reader: &[String],
+) -> Result<Option<AgentTurnTranscript>, Status> {
+    let stored = transcript::get(db, turn_id).map_err(turn_status)?;
+    if stored == transcript::TurnTranscript::default() {
+        return Ok(None);
+    }
+    let mut listed = transcript_to_proto(db, stored)?;
+    if listed.prompt_text_stored {
+        let cleared = include_prompt_text
+            && prompt_marking_cleared(db, namespace, &listed.prompt_marking, reader)?;
+        match cleared
+            .then(|| transcript::prompt_text(db, turn_id))
+            .transpose()
+            .map_err(turn_status)?
+            .flatten()
+        {
+            Some(text) => listed.prompt_text = text,
+            None => listed.prompt_text_withheld = true,
+        }
+    }
+    Ok(Some(listed))
 }
 
 /// What a claim of a turn that parked resumes from: its Action as decided
@@ -116,6 +218,7 @@ fn entry_to_proto(entry: agent_turn::InstanceEntry) -> AgentTurn {
             reason,
             parked_action_instance_id: String::new(),
             park_count: 0,
+            transcript: None,
         },
     }
 }
@@ -377,6 +480,7 @@ impl SekaiServiceImpl {
         &self,
         req: Request<ListSiteAgentInstanceTurnsRequest>,
     ) -> Result<Response<ListSiteAgentInstanceTurnsResponse>, Status> {
+        let reader = caller_principals(&req);
         let (metadata, extensions, inner) = req.into_parts();
         let visible = self
             .get_visible_object(Request::from_parts(
@@ -423,9 +527,105 @@ impl SekaiServiceImpl {
         } else {
             String::new()
         };
+        let runtime = self.db.runtime();
+        let mut listed = Vec::with_capacity(turns.len());
+        for entry in turns {
+            let mut turn = entry_to_proto(entry);
+            turn.transcript = listed_transcript(
+                runtime,
+                &inner.namespace,
+                &turn.turn_id,
+                inner.include_prompt_text,
+                &reader,
+            )?;
+            listed.push(turn);
+        }
         Ok(Response::new(ListSiteAgentInstanceTurnsResponse {
-            turns: turns.into_iter().map(entry_to_proto).collect(),
+            turns: listed,
             next_page_token,
+        }))
+    }
+
+    /// Records part of a claimed turn's transcript under its claim's fence
+    /// (ADR 0157). The prompt marking must be one the turn's instance
+    /// principal is cleared for; an action step must name an Action in the
+    /// turn's namespace.
+    pub(super) async fn append_agent_turn_transcript_rpc(
+        &self,
+        req: Request<AppendAgentTurnTranscriptRequest>,
+    ) -> Result<Response<AppendAgentTurnTranscriptResponse>, Status> {
+        self.authorize_turn_worker(&req, Scope::Turn(&req.get_ref().turn_id))?;
+        let inner = req.into_inner();
+        let runtime = self.db.runtime();
+        let turn = agent_turn::get(runtime, &inner.turn_id)
+            .map_err(turn_status)?
+            .ok_or_else(|| Status::not_found("turn not found"))?;
+        let prompt = match inner.prompt {
+            Some(prompt) => {
+                if !prompt.marking.is_empty()
+                    && !prompt_marking_cleared(
+                        runtime,
+                        &turn.namespace,
+                        &prompt.marking,
+                        std::slice::from_ref(&turn.principal_id),
+                    )?
+                {
+                    return Err(Status::permission_denied(
+                        "the turn's principal is not cleared for the prompt marking",
+                    ));
+                }
+                Some(transcript::PromptRecord {
+                    reference: prompt.reference,
+                    marking: prompt.marking,
+                    text: (!prompt.text.is_empty()).then_some(prompt.text),
+                })
+            }
+            None => None,
+        };
+        let step = match inner.step {
+            Some(step) => {
+                let kind = transcript::StepKind::parse(&step.kind).ok_or_else(|| {
+                    Status::invalid_argument("step kind must be tool_call or action")
+                })?;
+                if !step.action_instance_id.is_empty() {
+                    let action = runtime
+                        .get_action_instance(&step.action_instance_id)
+                        .map_err(Status::internal)?;
+                    if action.is_none_or(|action| action.namespace != turn.namespace) {
+                        return Err(Status::not_found("action instance not found"));
+                    }
+                }
+                Some(transcript::StepRecord {
+                    step_id: step.step_id,
+                    kind,
+                    name: step.name,
+                    target: step.target,
+                    action_instance_id: step.action_instance_id,
+                })
+            }
+            None => None,
+        };
+        let append = transcript::TranscriptAppend {
+            usage: inner.usage.map(|usage| transcript::TurnUsage {
+                model_route: usage.model_route,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            }),
+            prompt,
+            step,
+        };
+        let stored = transcript::append(
+            runtime,
+            &inner.turn_id,
+            &inner.runtime_id,
+            inner.claim_generation,
+            &inner.fencing_token,
+            append,
+            now_millis(),
+        )
+        .map_err(turn_status)?;
+        Ok(Response::new(AppendAgentTurnTranscriptResponse {
+            transcript: Some(transcript_to_proto(runtime, stored)?),
         }))
     }
 

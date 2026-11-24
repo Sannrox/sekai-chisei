@@ -216,6 +216,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ClaimAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.HeartbeatAgentTurnClaim` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
 | `SekaiService.AckAgentTurn` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.AppendAgentTurnTranscript` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ListClaimableWork` | `sekai.datasets, sekai.graph, sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.ClaimWork` | `sekai.datasets, sekai.graph, sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.HeartbeatWorkClaim` | `sekai.datasets, sekai.graph, sekai.audit` | yes | sdk | `stable` |

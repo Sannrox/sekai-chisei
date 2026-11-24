@@ -153,6 +153,22 @@ impl PostgresDb {
             request.timestamp,
         )?;
         erase_supported_subject_data(&mut tx, request, &subject_hash, &mut result)?;
+        // Agent-turn prompt text the subject reaches (#3045); the transcript
+        // stays, marked erased, and refuses later appends. Before the residue
+        // scan, so prompt text never blocks an erasure.
+        crate::sekai::agent_turn::transcript::erase_subject_pg(
+            &mut tx,
+            &request.subject_kind,
+            &request.subject,
+            |text| {
+                crate::sekai::retention::contains_subject_reference(
+                    text,
+                    &request.subject_kind,
+                    &request.subject,
+                )
+            },
+            request.timestamp,
+        )?;
         if result.llm_calls_deleted > 0 {
             match crate::db::postgres_dataset::snapshot_dataset_version_pg(
                 &mut tx,
