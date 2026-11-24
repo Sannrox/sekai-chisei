@@ -2,9 +2,11 @@
 //!
 //! Generates a typed client from a **selected** subset of one published
 //! definition revision. The package embeds the revision digest and selected
-//! member identities. It never embeds credentials. Live gRPC invocation
-//! reauthorizes; discovery and generation are not grants.
+//! member identities. It never embeds credentials. Clients target native gRPC
+//! or the HTTP projection (#3228, ADR 0160); live invocation reauthorizes on
+//! either. Discovery and generation are not grants.
 
+use crate::http_projection::HTTP_PROJECTION_CONTRACT;
 use crate::sekai::definition_branch::{DefinitionMember, DefinitionRevision};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,10 +21,12 @@ const RESERVED_TS_NAMES: &[&str] = &[
     "GENERATED_CONTRACT_VERSION",
     "GENERATED_NAMESPACE",
     "GENERATED_REVISION_DIGEST",
+    "GENERATED_TRANSPORT",
     "OntologyInvocation",
     "OntologyType",
     "ScopedOntologyClient",
     "bindLiveRevision",
+    "httpHeaders",
     "invoke",
     "nativeMetadata",
     "scopeAllows",
@@ -33,6 +37,7 @@ const RESERVED_PY_NAMES: &[&str] = &[
     "GENERATED_CONTRACT_VERSION",
     "GENERATED_NAMESPACE",
     "GENERATED_REVISION_DIGEST",
+    "GENERATED_TRANSPORT",
     "NotRequired",
     "OntologyInvocation",
     "OntologyType",
@@ -40,6 +45,7 @@ const RESERVED_PY_NAMES: &[&str] = &[
     "TypedDict",
     "ValueError",
     "bind_live_revision",
+    "http_headers",
     "invoke",
     "native_metadata",
     "scope_allows",
@@ -51,6 +57,16 @@ const PYTHON_KEYWORDS: &[&str] = &[
     "import", "in", "is", "lambda", "match", "nonlocal", "not", "or", "pass", "raise", "return",
     "try", "type", "while", "with", "yield",
 ];
+
+/// Where a generated client sends its calls. Both targets share one typed
+/// surface, selection, and fail-closed rules; only the request metadata helper
+/// differs (`nativeMetadata` for gRPC, `httpHeaders` for the ADR 0075 HTTP
+/// projection, ADR 0160).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    NativeGrpc,
+    HttpProjection,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OntologyClientMemberRef {
@@ -191,9 +207,30 @@ pub fn generate_ontology_typescript_client(
     members: &[DefinitionMember],
     selection: &OntologyClientSelection,
 ) -> Result<GeneratedOntologyClient, OntologyCodegenError> {
+    typescript_client(revision, members, selection, Transport::NativeGrpc)
+}
+
+/// Generate a TypeScript ontology client whose calls target the plane's
+/// `sekai.http-projection/v1` listener (ADR 0160). Same selection, typed
+/// surface, and failures as the native target; `httpHeaders` carries the
+/// revision pin and the application supplies the bearer at call time.
+pub fn generate_ontology_typescript_http_client(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+) -> Result<GeneratedOntologyClient, OntologyCodegenError> {
+    typescript_client(revision, members, selection, Transport::HttpProjection)
+}
+
+fn typescript_client(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+    transport: Transport,
+) -> Result<GeneratedOntologyClient, OntologyCodegenError> {
     let (selected, scope) =
         select_rendered_members(revision, members, selection, RESERVED_TS_NAMES, false)?;
-    let typescript = render_typescript(&selected, &scope);
+    let typescript = render_typescript(&selected, &scope, transport);
     let digest = package_digest(&typescript, &scope)?;
     Ok(GeneratedOntologyClient {
         typescript,
@@ -209,9 +246,28 @@ pub fn generate_ontology_python_client(
     members: &[DefinitionMember],
     selection: &OntologyClientSelection,
 ) -> Result<GeneratedOntologyPythonClient, OntologyCodegenError> {
+    python_client(revision, members, selection, Transport::NativeGrpc)
+}
+
+/// Generate a Python ontology client for the HTTP projection, the Python
+/// counterpart of [`generate_ontology_typescript_http_client`].
+pub fn generate_ontology_python_http_client(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+) -> Result<GeneratedOntologyPythonClient, OntologyCodegenError> {
+    python_client(revision, members, selection, Transport::HttpProjection)
+}
+
+fn python_client(
+    revision: &DefinitionRevision,
+    members: &[DefinitionMember],
+    selection: &OntologyClientSelection,
+    transport: Transport,
+) -> Result<GeneratedOntologyPythonClient, OntologyCodegenError> {
     let (selected, scope) =
         select_rendered_members(revision, members, selection, RESERVED_PY_NAMES, true)?;
-    let python = render_python(&selected, &scope)?;
+    let python = render_python(&selected, &scope, transport)?;
     let digest = python_package_digest(&python, &scope)?;
     Ok(GeneratedOntologyPythonClient {
         python,
@@ -467,7 +523,11 @@ fn map_json_schema_type(value: &str) -> Result<String, OntologyCodegenError> {
     })
 }
 
-fn render_typescript(selected: &[RenderedMember], scope: &OntologyClientScope) -> String {
+fn render_typescript(
+    selected: &[RenderedMember],
+    scope: &OntologyClientScope,
+    transport: Transport,
+) -> String {
     let mut interfaces = String::new();
     let mut methods = String::new();
     for member in selected {
@@ -504,7 +564,7 @@ fn render_typescript(selected: &[RenderedMember], scope: &OntologyClientScope) -
 export const GENERATED_CONTRACT_VERSION = {contract_version};
 export const GENERATED_NAMESPACE = {namespace};
 export const GENERATED_REVISION_DIGEST = {revision_digest};
-export const ALLOWED_MEMBERS = [{allowed}] as const;
+{transport_constant}export const ALLOWED_MEMBERS = [{allowed}] as const;
 
 {interfaces}export interface OntologyInvocation {{
   contract_version: string;
@@ -547,25 +607,7 @@ export function invoke<T extends object>(
   }};
 }}
 
-export function nativeMetadata(call: OntologyInvocation): Record<string, string> {{
-  if (!scopeAllows(call.member_kind, call.member_id)) {{
-    throw new Error("member is not in generated scope");
-  }}
-  if (call.namespace !== GENERATED_NAMESPACE
-      || call.revision_digest !== GENERATED_REVISION_DIGEST
-      || call.contract_version !== GENERATED_CONTRACT_VERSION) {{
-    throw new Error("invocation context does not match generated scope");
-  }}
-  if (!call.operation_id.trim()) throw new Error("operation_id required");
-  return {{
-    "x-sekai-namespace": call.namespace,
-    "x-sekai-definition-revision": call.revision_digest,
-    "x-sekai-member-kind": call.member_kind,
-    "x-sekai-member-id": call.member_id,
-    "x-sekai-operation-id": call.operation_id,
-  }};
-}}
-
+{metadata}
 export class ScopedOntologyClient {{
 {methods}}}
 "#,
@@ -575,7 +617,66 @@ export class ScopedOntologyClient {{
         allowed = allowed,
         interfaces = interfaces,
         methods = methods,
+        transport_constant = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => format!(
+                "export const GENERATED_TRANSPORT = {};\n",
+                js_string(HTTP_PROJECTION_CONTRACT)
+            ),
+        },
+        metadata = typescript_metadata(transport),
     )
+}
+
+/// The request metadata helper for one transport. Both validate the call
+/// against the generated scope first and carry the revision pin.
+fn typescript_metadata(transport: Transport) -> &'static str {
+    match transport {
+        Transport::NativeGrpc => {
+            r#"export function nativeMetadata(call: OntologyInvocation): Record<string, string> {
+  if (!scopeAllows(call.member_kind, call.member_id)) {
+    throw new Error("member is not in generated scope");
+  }
+  if (call.namespace !== GENERATED_NAMESPACE
+      || call.revision_digest !== GENERATED_REVISION_DIGEST
+      || call.contract_version !== GENERATED_CONTRACT_VERSION) {
+    throw new Error("invocation context does not match generated scope");
+  }
+  if (!call.operation_id.trim()) throw new Error("operation_id required");
+  return {
+    "x-sekai-namespace": call.namespace,
+    "x-sekai-definition-revision": call.revision_digest,
+    "x-sekai-member-kind": call.member_kind,
+    "x-sekai-member-id": call.member_id,
+    "x-sekai-operation-id": call.operation_id,
+  };
+}
+"#
+        }
+        Transport::HttpProjection => {
+            r#"// Headers for a POST to the HTTP projection. The application adds its own
+// `authorization` header at call time; this package carries none.
+// EvaluateObjectSet pins in the body: set the descriptor's
+// definition_digest to GENERATED_REVISION_DIGEST.
+export function httpHeaders(call: OntologyInvocation): Record<string, string> {
+  if (!scopeAllows(call.member_kind, call.member_id)) {
+    throw new Error("member is not in generated scope");
+  }
+  if (call.namespace !== GENERATED_NAMESPACE
+      || call.revision_digest !== GENERATED_REVISION_DIGEST
+      || call.contract_version !== GENERATED_CONTRACT_VERSION) {
+    throw new Error("invocation context does not match generated scope");
+  }
+  if (!call.operation_id.trim()) throw new Error("operation_id required");
+  return {
+    "x-sekai-namespace": call.namespace,
+    "x-sekai-definition-revision": call.revision_digest,
+    "x-sekai-operation-id": call.operation_id,
+  };
+}
+"#
+        }
+    }
 }
 
 fn render_interface(member: &RenderedMember) -> String {
@@ -598,6 +699,7 @@ fn render_interface(member: &RenderedMember) -> String {
 fn render_python(
     selected: &[RenderedMember],
     scope: &OntologyClientScope,
+    transport: Transport,
 ) -> Result<String, OntologyCodegenError> {
     let mut classes = String::new();
     let mut methods = String::new();
@@ -638,7 +740,7 @@ from typing import NotRequired, TypedDict
 GENERATED_CONTRACT_VERSION = {contract_version}
 GENERATED_NAMESPACE = {namespace}
 GENERATED_REVISION_DIGEST = {revision_digest}
-ALLOWED_MEMBERS = [{allowed}]
+{transport_constant}ALLOWED_MEMBERS = [{allowed}]
 
 {classes}class OntologyInvocation(TypedDict):
     contract_version: str
@@ -676,7 +778,33 @@ def invoke(member_kind: str, member_id: str, operation_id: str, input: object) -
     }}
 
 
-def native_metadata(call: OntologyInvocation) -> dict[str, str]:
+{metadata}
+
+class ScopedOntologyClient:
+{methods}"#,
+        contract_version = js_string(&scope.contract_version),
+        namespace = js_string(&scope.namespace),
+        revision_digest = js_string(&scope.revision_digest),
+        allowed = allowed,
+        classes = classes,
+        methods = methods,
+        transport_constant = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => format!(
+                "GENERATED_TRANSPORT = {}\n",
+                js_string(HTTP_PROJECTION_CONTRACT)
+            ),
+        },
+        metadata = python_metadata(transport),
+    );
+    Ok(rendered)
+}
+
+/// Python counterpart of [`typescript_metadata`].
+fn python_metadata(transport: Transport) -> &'static str {
+    match transport {
+        Transport::NativeGrpc => {
+            r#"def native_metadata(call: OntologyInvocation) -> dict[str, str]:
     if not scope_allows(call["member_kind"], call["member_id"]):
         raise ValueError("member is not in generated scope")
     if (
@@ -687,25 +815,39 @@ def native_metadata(call: OntologyInvocation) -> dict[str, str]:
         raise ValueError("invocation context does not match generated scope")
     if not call["operation_id"].strip():
         raise ValueError("operation_id required")
-    return {{
+    return {
         "x-sekai-namespace": call["namespace"],
         "x-sekai-definition-revision": call["revision_digest"],
         "x-sekai-member-kind": call["member_kind"],
         "x-sekai-member-id": call["member_id"],
         "x-sekai-operation-id": call["operation_id"],
-    }}
-
-
-class ScopedOntologyClient:
-{methods}"#,
-        contract_version = js_string(&scope.contract_version),
-        namespace = js_string(&scope.namespace),
-        revision_digest = js_string(&scope.revision_digest),
-        allowed = allowed,
-        classes = classes,
-        methods = methods,
-    );
-    Ok(rendered)
+    }
+"#
+        }
+        Transport::HttpProjection => {
+            r#"# Headers for a POST to the HTTP projection. The application adds its own
+# `authorization` header at call time; this package carries none.
+# EvaluateObjectSet pins in the body: set the descriptor's
+# definition_digest to GENERATED_REVISION_DIGEST.
+def http_headers(call: OntologyInvocation) -> dict[str, str]:
+    if not scope_allows(call["member_kind"], call["member_id"]):
+        raise ValueError("member is not in generated scope")
+    if (
+        call["namespace"] != GENERATED_NAMESPACE
+        or call["revision_digest"] != GENERATED_REVISION_DIGEST
+        or call["contract_version"] != GENERATED_CONTRACT_VERSION
+    ):
+        raise ValueError("invocation context does not match generated scope")
+    if not call["operation_id"].strip():
+        raise ValueError("operation_id required")
+    return {
+        "x-sekai-namespace": call["namespace"],
+        "x-sekai-definition-revision": call["revision_digest"],
+        "x-sekai-operation-id": call["operation_id"],
+    }
+"#
+        }
+    }
 }
 
 fn render_typed_dict(member: &RenderedMember) -> Result<String, OntologyCodegenError> {
@@ -1129,6 +1271,78 @@ mod tests {
         );
     }
 
+    /// The HTTP target (ADR 0160) keeps the native typed surface: removing
+    /// each target's metadata helper and transport constant leaves the same
+    /// source. Goldens pin the HTTP output.
+    #[test]
+    fn http_target_keeps_the_native_typed_surface() {
+        let (revision, members) = fixture_catalog();
+        let selection = selected(
+            &revision,
+            [
+                OntologyClientMemberRef::new("object_type", "Ticket"),
+                OntologyClientMemberRef::new("link_type", "AssignedTo"),
+                OntologyClientMemberRef::new("action_type", "Assign"),
+                OntologyClientMemberRef::new("function", "CountOpen"),
+            ],
+        );
+        let native_ts =
+            generate_ontology_typescript_client(&revision, &members, &selection).unwrap();
+        let http_ts =
+            generate_ontology_typescript_http_client(&revision, &members, &selection).unwrap();
+        let native_py = generate_ontology_python_client(&revision, &members, &selection).unwrap();
+        let http_py =
+            generate_ontology_python_http_client(&revision, &members, &selection).unwrap();
+        verify_ontology_client_package(&http_ts, &http_ts.package_digest).unwrap();
+        verify_ontology_python_client_package(&http_py, &http_py.package_digest).unwrap();
+        assert_eq!(http_ts.scope, native_ts.scope);
+        assert_eq!(http_py.scope, native_py.scope);
+        assert_ne!(http_ts.package_digest, native_ts.package_digest);
+
+        let ts_transport = format!(
+            "export const GENERATED_TRANSPORT = {};\n",
+            js_string(HTTP_PROJECTION_CONTRACT)
+        );
+        assert_eq!(
+            http_ts
+                .typescript
+                .replace(typescript_metadata(Transport::HttpProjection), "")
+                .replace(&ts_transport, ""),
+            native_ts
+                .typescript
+                .replace(typescript_metadata(Transport::NativeGrpc), ""),
+        );
+        let py_transport = format!(
+            "GENERATED_TRANSPORT = {}\n",
+            js_string(HTTP_PROJECTION_CONTRACT)
+        );
+        assert_eq!(
+            http_py
+                .python
+                .replace(python_metadata(Transport::HttpProjection), "")
+                .replace(&py_transport, ""),
+            native_py
+                .python
+                .replace(python_metadata(Transport::NativeGrpc), ""),
+        );
+        for source in [&http_ts.typescript, &http_py.python] {
+            assert!(!source.contains("credential"));
+            assert!(!source.contains("token"));
+        }
+        assert!(!http_ts.typescript.contains("nativeMetadata"));
+        assert!(!http_py.python.contains("native_metadata"));
+
+        let fixtures =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ontology_codegen");
+        for (generated, golden) in [
+            (&http_ts.typescript, "scoped_http_client.v1.ts"),
+            (&http_py.python, "scoped_http_client.v1.py"),
+        ] {
+            let expected = std::fs::read_to_string(fixtures.join(golden)).expect(golden);
+            assert_eq!(generated, &expected, "{golden} drifted");
+        }
+    }
+
     #[test]
     fn python_shares_typescript_fail_closed_errors() {
         let (revision, members) = fixture_catalog();
@@ -1148,29 +1362,32 @@ mod tests {
 
     #[test]
     fn golden_python_package_compiles_when_python_is_available() {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/ontology_codegen/scoped_client.v1.py");
-        let checked = Command::new("python3")
+        let fixture =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ontology_codegen");
+        for golden in ["scoped_client.v1.py", "scoped_http_client.v1.py"] {
+            let fixture = fixture.join(golden);
+            let checked = Command::new("python3")
             .args([
                 "-c",
                 "import pathlib,sys; p=pathlib.Path(sys.argv[1]); compile(p.read_text(), str(p), 'exec')",
                 fixture.to_str().expect("utf-8 fixture path"),
             ])
             .output();
-        let Ok(checked) = checked else {
-            return;
-        };
-        if !checked.status.success()
-            && String::from_utf8_lossy(&checked.stderr).contains("No such file")
-        {
-            return;
+            let Ok(checked) = checked else {
+                return;
+            };
+            if !checked.status.success()
+                && String::from_utf8_lossy(&checked.stderr).contains("No such file")
+            {
+                return;
+            }
+            assert!(
+                checked.status.success(),
+                "golden Python package {golden} failed to compile: {}\n{}",
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr)
+            );
         }
-        assert!(
-            checked.status.success(),
-            "golden Python package failed to compile: {}\n{}",
-            String::from_utf8_lossy(&checked.stdout),
-            String::from_utf8_lossy(&checked.stderr)
-        );
     }
 
     #[test]
@@ -1236,6 +1453,8 @@ mod tests {
         for err in [
             generate_ontology_typescript_client(&revision, &members, &selection).unwrap_err(),
             generate_ontology_python_client(&revision, &members, &selection).unwrap_err(),
+            generate_ontology_typescript_http_client(&revision, &members, &selection).unwrap_err(),
+            generate_ontology_python_http_client(&revision, &members, &selection).unwrap_err(),
         ] {
             assert!(matches!(err, OntologyCodegenError::UnknownMember));
             let message = err.to_string();

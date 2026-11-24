@@ -163,6 +163,7 @@ pub(super) async fn submit_action_instance(
     );
     let catalog_capability = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-capability");
     let catalog_namespace = SekaiServiceImpl::catalog_metadata_value(&req, "x-sekai-namespace");
+    let revision_pin = ontology_revision_pin(&req);
     // A device-bound credential proves possession of its device key on
     // every submit; an offline submission requires one (#1580, ADR 0126).
     crate::grpc::require_device_proof(
@@ -233,6 +234,14 @@ pub(super) async fn submit_action_instance(
             service.db.runtime(),
             tenant_context.as_ref(),
             &inner.type_id,
+        )?;
+        // A generated ontology client pins its revision on every call; a
+        // present pin that is not the live published revision fails closed
+        // (ADR 0160). Without the header, admission is unchanged.
+        enforce_optional_ontology_revision_pin(
+            service.db.runtime(),
+            revision_pin.as_deref(),
+            &namespace,
         )?;
         Ok(actor)
     });

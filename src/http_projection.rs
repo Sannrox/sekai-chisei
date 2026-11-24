@@ -44,6 +44,7 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-sekai-purpose",
     "x-chisei-work-unit",
     "x-sekai-catalog-version",
+    "x-sekai-definition-revision",
     "x-chisei-request-id",
     "x-principal",
 ];
@@ -1221,9 +1222,23 @@ mod tests {
         TokenAuthInterceptor,
         String,
     ) {
+        token_world_seeded(|_| {})
+    }
+
+    /// [`token_world`] with `seed` run against the store before the services
+    /// start.
+    fn token_world_seeded(
+        seed: impl FnOnce(&RuntimeDb),
+    ) -> (
+        Arc<SekaiServiceImpl>,
+        Arc<ChiseiServiceImpl>,
+        TokenAuthInterceptor,
+        String,
+    ) {
         let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
             SekaiDb::new(":memory:").unwrap(),
         )));
+        seed(&db);
         db.ensure_team_namespace("acme", "alice", Role::Admin, "local")
             .unwrap();
         db.create_grant(&Grant {
@@ -1298,10 +1313,23 @@ mod tests {
         token: Option<&str>,
         body: Value,
     ) -> (StatusCode, Value) {
+        http_json_with(app, path, token, &[], body).await
+    }
+
+    async fn http_json_with(
+        app: Router,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Value,
+    ) -> (StatusCode, Value) {
         let mut request = axum::http::Request::builder()
             .method("POST")
             .uri(path)
             .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         if let Some(token) = token {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
@@ -1619,6 +1647,150 @@ mod tests {
                 other => panic!("unexpected hidden-row code {other:?}"),
             }
         );
+    }
+
+    /// ADR 0160: a generated HTTP ontology client's revision pin reaches every
+    /// pinned call, so object reads, object writes, object-set evaluation, and
+    /// Action submission refuse a pin that is not the live revision.
+    #[tokio::test]
+    async fn revision_pinned_http_calls_fail_closed_on_a_stale_revision() {
+        use crate::sekai::definition_branch::{
+            DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
+        };
+        let mut live = String::new();
+        let (sekai, chisei, interceptor, token) = token_world_seeded(|db| {
+            let member = DefinitionMemberInput {
+                member_kind: "object_type".into(),
+                member_id: "Customer".into(),
+                definition_json: r#"{"properties":["name"]}"#.into(),
+                member_digest: String::new(),
+            }
+            .prepare("acme")
+            .unwrap();
+            let revision = prepare_revision(
+                "acme",
+                "",
+                [DefinitionRevisionMember {
+                    member_kind: member.member_kind.clone(),
+                    member_id: member.member_id.clone(),
+                    member_digest: member.member_digest.clone(),
+                }],
+                true,
+                "root",
+                1,
+            )
+            .unwrap();
+            db.seed_published_definition_revision(&revision, &[member])
+                .unwrap();
+            live = revision.revision_digest;
+        });
+        let app = router_for(sekai, chisei, interceptor);
+        let stale = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        use crate::grpc::pb::sekai::{
+            CreateObjectRequest, ListFilter, ListObjectsRequest, Object,
+            SubmitActionInstanceRequest,
+        };
+        let header_pinned = [
+            (
+                "/sekai.SekaiService/ListObjects",
+                serde_json::to_value(ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        namespace: "acme".into(),
+                        kind: "Customer".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            (
+                "/sekai.SekaiService/CreateObject",
+                serde_json::to_value(CreateObjectRequest {
+                    object: Some(Object {
+                        id: "c-1".into(),
+                        kind: "Customer".into(),
+                        namespace: "acme".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+            (
+                "/sekai.SekaiService/SubmitActionInstance",
+                serde_json::to_value(SubmitActionInstanceRequest {
+                    namespace: "acme".into(),
+                    type_id: "Approve".into(),
+                    version: "1".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        ];
+        for (path, body) in &header_pinned {
+            let (status, payload) = http_json_with(
+                app.clone(),
+                path,
+                Some(&token),
+                &[("x-sekai-definition-revision", stale)],
+                body.clone(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {payload}");
+            assert_eq!(
+                payload["message"], "ontology client revision pin is stale",
+                "{path}"
+            );
+        }
+        for (path, body) in &header_pinned {
+            let (_, payload) = http_json_with(
+                app.clone(),
+                path,
+                Some(&token),
+                &[("x-sekai-definition-revision", live.as_str())],
+                body.clone(),
+            )
+            .await;
+            assert_ne!(
+                payload["message"], "ontology client revision pin is stale",
+                "{path}"
+            );
+        }
+
+        let evaluate = |digest: &str| {
+            serde_json::to_value(EvaluateObjectSetRequest {
+                descriptor: Some(ObjectSetDescriptor {
+                    contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                    namespace: "acme".into(),
+                    kind: "Customer".into(),
+                    definition_digest: digest.into(),
+                    ..Default::default()
+                }),
+                page_token: String::new(),
+                required_freshness_ms: 0,
+            })
+            .unwrap()
+        };
+        let (status, payload) = http_json(
+            app.clone(),
+            "/sekai.SekaiService/EvaluateObjectSet",
+            Some(&token),
+            evaluate(stale),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        assert_eq!(
+            payload["message"],
+            "object set definition revision is stale"
+        );
+        let (status, payload) = http_json(
+            app,
+            "/sekai.SekaiService/EvaluateObjectSet",
+            Some(&token),
+            evaluate(&live),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
     }
 
     #[tokio::test]
