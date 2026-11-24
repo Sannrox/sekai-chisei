@@ -5,7 +5,9 @@
 //! instance is one deployment environment. Identity is provider, model, and
 //! artifact digest when present (#1352). Family enablement is per namespace
 //! and per `ResidencyPolicy` region label; a per-model row overrides its
-//! family in the same namespace. A named namespace is resolved (model, then
+//! family in the same namespace, except that an `enabled` model row never
+//! widens residency: when the family is enabled only for other regions, the
+//! model is refused in this one (#2469). A named namespace is resolved (model, then
 //! family) before the instance default. Default is `disallowed`. Route
 //! admission (#1494) refuses any model that is not `enabled` for the
 //! namespace, identity, and residency region before a provider call.
@@ -294,21 +296,58 @@ pub fn effective_review_status(
     region: &str,
 ) -> ModelReviewStatus {
     let digest = identity.artifact_digest.clone().unwrap_or_default();
-    if let Some(status) = model_status(models, namespace, identity, &digest) {
-        return status;
-    }
-    if let Some(status) = family_status(families, namespace, identity, region) {
-        return status;
-    }
-    if !namespace.is_empty() {
-        if let Some(status) = model_status(models, "", identity, &digest) {
-            return status;
+    // A named namespace (model, then family) before the instance default.
+    let levels: &[&str] = if namespace.is_empty() {
+        &[""]
+    } else {
+        &[namespace, ""]
+    };
+    for level in levels {
+        if let Some(status) = model_status(models, level, identity, &digest) {
+            return residency_bound(status, families, namespace, identity, region);
         }
-        if let Some(status) = family_status(families, "", identity, region) {
+        if let Some(status) = family_status(families, level, identity, region) {
             return status;
         }
     }
     ModelReviewStatus::Disallowed
+}
+
+/// Residency is a constraint, not a preference (#2469): an `enabled` model
+/// row enables only where its family's regions allow it. Once the family has
+/// any region-scoped row, enabled or not, the family's status for `region`
+/// stands unless it is `enabled`, `disallowed` when it has none. Revoking the
+/// family's last enabled region therefore narrows the model too.
+fn residency_bound(
+    model: ModelReviewStatus,
+    families: &[FamilyEnablementRecord],
+    namespace: &str,
+    identity: &ModelIdentity,
+    region: &str,
+) -> ModelReviewStatus {
+    let family = resolved_family_status(families, namespace, identity, region);
+    if model == ModelReviewStatus::Enabled
+        && family != Some(ModelReviewStatus::Enabled)
+        && family_declares_residency(families, namespace, identity)
+    {
+        return family.unwrap_or(ModelReviewStatus::Disallowed);
+    }
+    model
+}
+
+/// The family status for `region`, the named namespace before the instance
+/// default.
+fn resolved_family_status(
+    families: &[FamilyEnablementRecord],
+    namespace: &str,
+    identity: &ModelIdentity,
+    region: &str,
+) -> Option<ModelReviewStatus> {
+    family_status(families, namespace, identity, region).or_else(|| {
+        (!namespace.is_empty())
+            .then(|| family_status(families, "", identity, region))
+            .flatten()
+    })
 }
 
 /// Stable admission refusal. `reason` is the public code; `status` is the
@@ -411,6 +450,20 @@ fn load_review_state(
         families.extend(list_family_enablement(db, "")?);
     }
     Ok((models, families))
+}
+
+/// Whether a region-scoped family row of any status covers `identity` in
+/// `namespace` or the instance default.
+fn family_declares_residency(
+    families: &[FamilyEnablementRecord],
+    namespace: &str,
+    identity: &ModelIdentity,
+) -> bool {
+    families.iter().any(|record| {
+        !record.region_label.is_empty()
+            && (record.namespace == namespace || record.namespace.is_empty())
+            && family_specificity(identity, &record.family_id).is_some()
+    })
 }
 
 fn family_enabled_in_other_region(
@@ -2035,6 +2088,51 @@ mod tests {
             })
             .unwrap();
         assert_eq!(decisions[0].reason, REFUSAL_RESIDENCY_MISMATCH);
+    }
+
+    /// #2469: a region-blind model row may not admit a region its family is
+    /// not enabled for; inside the family's region it still overrides.
+    #[test]
+    fn an_enabled_model_row_does_not_widen_family_residency() {
+        let db = ChiseiStore::memory();
+        set_family_enablement(
+            &db,
+            family_row("sales", "openai", "eu", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        set_model_review(
+            &db,
+            model_row("sales", "gpt-4", "", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        let error =
+            admit_enabled_route(&db, "sales", &identity("gpt-4", None), "us", "alice").unwrap_err();
+        assert_eq!(error.reason, REFUSAL_RESIDENCY_MISMATCH);
+        admit_enabled_route(&db, "sales", &identity("gpt-4", None), "eu", "alice").unwrap();
+        // Revoking the family's only region narrows the model too; it never
+        // frees the model row to admit every region.
+        revoke_family_enablement(
+            &db,
+            family_row("sales", "openai", "eu", ModelReviewStatus::Revoked),
+        )
+        .unwrap();
+        for region in ["us", "eu"] {
+            admit_enabled_route(&db, "sales", &identity("gpt-4", None), region, "alice")
+                .unwrap_err();
+        }
+        // A model row still overrides a family that names no region.
+        let db = ChiseiStore::memory();
+        set_family_enablement(
+            &db,
+            family_row("sales", "openai", "", ModelReviewStatus::Disallowed),
+        )
+        .unwrap();
+        set_model_review(
+            &db,
+            model_row("sales", "gpt-4", "", ModelReviewStatus::Enabled),
+        )
+        .unwrap();
+        admit_enabled_route(&db, "sales", &identity("gpt-4", None), "us", "alice").unwrap();
     }
 
     #[test]

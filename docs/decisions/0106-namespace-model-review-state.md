@@ -26,6 +26,17 @@ concept: policies are namespace-scoped and residency uses region labels.
 3. Family enablement is per namespace and per `ResidencyPolicy` region label.
    A model belongs to the family named by its provider. A per-model row
    overrides the family in the same namespace. Missing state is `disallowed`.
+   Amended 2026-11-24 (#2469): residency is a constraint, not a preference.
+   An `enabled` per-model row overrides its family only inside the regions
+   the family is enabled for. Once the family has any region-scoped row,
+   enabled or not, the model is admitted only where the family is enabled;
+   a family that names no region leaves the model row's override as before.
+   A route the family enables elsewhere is refused as
+   `model_review.residency_mismatch`, and revoking the family's last enabled
+   region narrows the model too.
+   Model review rows stay region-blind; an operator who enabled a model
+   through its row in a region outside its family's residency adds a
+   region-scoped family row instead.
 4. Set, revoke, and list require namespace-admin on a named namespace and
    credential admin (`root` / `local`) on the empty namespace.
 5. Every mutation writes a decision-ledger row with actor and reason.
