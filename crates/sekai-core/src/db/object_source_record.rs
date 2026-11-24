@@ -10,10 +10,7 @@ use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
 use crate::db::runtime_db::RuntimeDb;
-use crate::db::source_batch_dataset::{
-    HIDDEN_COLUMN, KEY_COLUMN, PAYLOAD_COLUMN, binding_dataset_id,
-};
-use crate::sekai::dataset::{RowFilter, RowQuery};
+use crate::db::source_batch_dataset::{HIDDEN_COLUMN, PAYLOAD_COLUMN, binding_dataset_id};
 use crate::sekai::object_sync::object_id_for;
 
 /// Source identity and revision of one object, with its retained payload.
@@ -60,22 +57,10 @@ pub fn object_source_record(
     let Some(state) = db.get_source_sync_state(namespace, &source_instance, &type_digest)? else {
         return Ok(None);
     };
-    // Dataset row queries scan the binding's rows and filter in memory on
-    // both backends; only matching rows are kept. A keyed newest-first
-    // lookup needs an index migration (#3259).
-    let row = db
-        .query_rows(
-            &binding_dataset_id(&state.binding.binding_id, kind),
-            &RowQuery {
-                filters: vec![RowFilter {
-                    column: KEY_COLUMN.into(),
-                    op: "eq".into(),
-                    value: source_id.clone(),
-                }],
-                ..Default::default()
-            },
-        )?
-        .pop();
+    let row = db.latest_source_batch_row(
+        &binding_dataset_id(&state.binding.binding_id, kind),
+        &source_id,
+    )?;
     let row_hidden = row
         .as_ref()
         .is_some_and(|row| row.get(HIDDEN_COLUMN).is_some_and(|value| value == "1"));

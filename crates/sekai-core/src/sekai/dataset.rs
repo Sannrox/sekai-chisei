@@ -210,6 +210,19 @@ pub fn reindex_dataset_partition_keys(
     Ok(())
 }
 
+/// Newest live row of one source key; `LIKE 'srcds:%'` matches the partial
+/// index `idx_dataset_rows_source_key`.
+pub(crate) const LATEST_SOURCE_ROW_SQL: &str = "SELECT data FROM sekai_dataset_rows
+     WHERE dataset_id LIKE 'srcds:%' AND dataset_id = ?1
+       AND json_extract(data, '$.source_id') = ?2
+     ORDER BY id DESC LIMIT 1";
+/// Newest row of one source key in one retained version, over
+/// `idx_dataset_version_rows_source_key`.
+pub(crate) const LATEST_SOURCE_VERSION_ROW_SQL: &str = "SELECT data FROM sekai_dataset_version_rows
+     WHERE dataset_id LIKE 'srcds:%' AND dataset_id = ?1 AND version_id = ?2
+       AND json_extract(data, '$.source_id') = ?3
+     ORDER BY row_id DESC LIMIT 1";
+
 impl SekaiDb {
     pub fn migrate_datasets(&self) -> Result<(), String> {
         let conn = self.conn();
@@ -275,6 +288,19 @@ impl SekaiDb {
             "CREATE INDEX IF NOT EXISTS idx_dataset_rows_partition
              ON sekai_dataset_rows(dataset_id, partition_key)",
             [],
+        )
+        .map_err(|e| e.to_string())?;
+        // Keyed newest-first lookup of a source batch row (#3259). Partial, so
+        // only `srcds:` rows pay for the expression.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_rows_source_key
+                 ON sekai_dataset_rows(dataset_id, json_extract(data, '$.source_id'), id)
+                 WHERE dataset_id LIKE 'srcds:%';
+             CREATE INDEX IF NOT EXISTS idx_dataset_version_rows_source_key
+                 ON sekai_dataset_version_rows(
+                     dataset_id, version_id, json_extract(data, '$.source_id'), row_id
+                 )
+                 WHERE dataset_id LIKE 'srcds:%';",
         )
         .map_err(|e| e.to_string())?;
         let stored: Option<String> = conn
@@ -760,6 +786,46 @@ impl SekaiDb {
             }
         }
         Ok(results)
+    }
+
+    /// The newest row whose `source_id` is `source_id` in source batch
+    /// dataset `dataset_id`, under the same health rules as [`Self::query_rows`]:
+    /// a quarantined dataset serves its last healthy version, or nothing. One
+    /// index seek over `idx_dataset_rows_source_key` (#3259); the literal
+    /// `srcds:` predicate lets the partial index apply.
+    pub fn latest_source_batch_row(
+        &self,
+        dataset_id: &str,
+        source_id: &str,
+    ) -> Result<Option<HashMap<String, String>>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let state = crate::sekai::dataset_health::load_state_conn(&tx, dataset_id)?;
+        let data: Option<String> = if state.quarantined && !state.last_healthy_version_id.is_empty()
+        {
+            tx.query_row(
+                LATEST_SOURCE_VERSION_ROW_SQL,
+                params![dataset_id, state.last_healthy_version_id, source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        } else if state.quarantined {
+            None
+        } else {
+            tx.query_row(
+                LATEST_SOURCE_ROW_SQL,
+                params![dataset_id, source_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        };
+        data.map(|data| {
+            serde_json::from_str(&data)
+                .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))
+        })
+        .transpose()
     }
 
     pub fn redact_dataset_fields(
