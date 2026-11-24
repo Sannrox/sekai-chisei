@@ -78,6 +78,13 @@ CREATE TABLE IF NOT EXISTS sekai_export_schedule_cursor (
 );
 ";
 
+/// Open exports to finish, oldest lease first. `closed = 0` matches the
+/// partial index `idx_sekai_export_receipts_recoverable` (#2865).
+const SQLITE_RECOVERABLE_EXPORTS: &str =
+    "SELECT operation_id, closing_json IS NOT NULL FROM sekai_export_receipts
+     WHERE closed = 0 AND (closing_json IS NOT NULL OR lease_until_ms < ?1)
+     ORDER BY lease_until_ms LIMIT ?2";
+
 /// One dataset version row with its row id.
 pub type VersionRow = (i64, std::collections::HashMap<String, String>);
 
@@ -109,9 +116,13 @@ impl SekaiDb {
                 [],
             );
         }
+        // Recovery seeks open receipts by lease expiry (#2865); partial, so
+        // closed receipts cost nothing. Fresh and upgraded stores both get it.
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_sekai_export_artifacts_deliverable
-             ON sekai_export_artifacts (namespace, acked_at_ms, expires_at_ms)",
+             ON sekai_export_artifacts (namespace, acked_at_ms, expires_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_sekai_export_receipts_recoverable
+             ON sekai_export_receipts (lease_until_ms) WHERE closed = 0",
         )
         .map_err(|error| error.to_string())?;
         Ok(())
@@ -291,11 +302,7 @@ impl SekaiDb {
     ) -> Result<Vec<(String, bool)>, String> {
         let conn = self.conn();
         let mut statement = conn
-            .prepare(
-                "SELECT operation_id, closing_json IS NOT NULL FROM sekai_export_receipts
-                 WHERE closed = 0 AND (closing_json IS NOT NULL OR lease_until_ms < ?1)
-                 ORDER BY lease_until_ms LIMIT ?2",
-            )
+            .prepare(SQLITE_RECOVERABLE_EXPORTS)
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map(rusqlite::params![now_ms, limit as i64], |row| {
@@ -866,5 +873,56 @@ impl crate::db::runtime_db::RuntimeDb {
         namespace: &str,
     ) -> Result<Vec<ExportFingerprintRecord>, String> {
         dispatch!(self, db => db.list_export_fingerprints(namespace))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexes(db: &SekaiDb) -> Vec<String> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'sekai_export_receipts'",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn export_recovery_seeks_the_open_receipt_index() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SQLITE_RECOVERABLE_EXPORTS}"))
+            .unwrap();
+        let plan = stmt
+            .query_map(rusqlite::params![1_i64, 10_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("idx_sekai_export_receipts_recoverable"),
+            "recovery scans receipts: {plan}"
+        );
+    }
+
+    #[test]
+    fn an_upgraded_store_gains_the_open_receipt_index() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute_batch("DROP INDEX idx_sekai_export_receipts_recoverable")
+            .unwrap();
+        assert!(!indexes(&db).contains(&"idx_sekai_export_receipts_recoverable".to_string()));
+        db.migrate_export_grants().unwrap();
+        assert!(indexes(&db).contains(&"idx_sekai_export_receipts_recoverable".to_string()));
     }
 }
