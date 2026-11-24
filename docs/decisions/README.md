@@ -185,4 +185,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0157: An agent turn records its transcript](0157-an-agent-turn-records-its-transcript.md)
 - [ADR 0158: Reported usage enters the tenant ledger](0158-reported-usage-enters-the-tenant-ledger.md)
 - [ADR 0159: A governed document may hold its bytes as plane media](0159-a-governed-document-may-hold-its-bytes-as-plane-media.md)
+- [ADR 0160: Generated ontology clients target the HTTP projection with a forwarded revision pin](0160-generated-ontology-clients-target-the-http-projection.md)
 <!-- adr-index:end -->
