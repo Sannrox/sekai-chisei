@@ -91,6 +91,7 @@ PROFILE_RATIO_SCALE
 PositionFamily
 PropertyValue
 RELATIONAL_CONNECTOR
+REST_CONNECTOR
 RecordChange
 ReferenceBasis
 ReferenceCandidate
@@ -342,6 +343,7 @@ connector::Operation::ReadPage
 connector::Operation::from_wire_name(&str) -> Option<Self>
 connector::Operation::wire_name(self) -> &str
 connector::RELATIONAL_CONNECTOR: ConnectorType
+connector::REST_CONNECTOR: ConnectorType
 connector::RecordChange
 connector::RecordChange.change: BTreeMap<String,String>
 connector::RecordChange.expected_version: String
@@ -835,3 +837,4 @@ source_batch_uses_delivery
 source_id
 sync_github_record
 translate_github_fixture
+

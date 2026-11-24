@@ -12,8 +12,9 @@
 //! names a Source of a type it implements ([`delivery`]), and applies
 //! admitted Actions' external changes to a Source's records ([`effect`]),
 //! and runs requested discoveries of a Source ([`discovery`]).
-//! The connector types are [`github`] (sync and apply) and [`relational`]
-//! (snapshot pages, delivery and apply). Given a gateway route, it also runs
+//! The connector types are [`github`] (sync and apply), [`relational`]
+//! (snapshot pages, delivery and apply) and [`rest`] (paged JSON over HTTP:
+//! sync and apply). Given a gateway route, it also runs
 //! the row-wise model steps of `llm-rows` transforms ([`llm_rows`]).
 
 pub mod credentials;
@@ -24,6 +25,7 @@ pub mod github;
 pub mod llm_rows;
 pub mod pages;
 pub mod relational;
+pub mod rest;
 pub mod runtime;
 pub mod sync;
 

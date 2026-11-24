@@ -45,12 +45,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
 
-const NS: &str = "ops";
+pub(crate) const NS: &str = "ops";
 /// The operator, and the principal the runtime authenticates as: the
 /// permits' bound executor.
-const PRINCIPAL: &str = "local";
-const LEASE: Duration = Duration::from_millis(300);
-const RESOURCE: &str = "orders-db:orders#1";
+pub(crate) const PRINCIPAL: &str = "local";
+pub(crate) const LEASE: Duration = Duration::from_millis(300);
+pub(crate) const RESOURCE: &str = "orders-db:orders#1";
 const ACTION_TYPE: &str = "orders.row.write";
 /// The kind the Source projects order rows as.
 const KIND: &str = "Order";
@@ -122,13 +122,12 @@ fn with_principal<T>(payload: T) -> Request<T> {
     request
 }
 
-/// Sekai and Chisei on one ephemeral port, with a relational Source
-/// `orders` placed in `zone=eu`.
-struct Plane {
-    db: Arc<RuntimeDb>,
+/// Sekai and Chisei on one ephemeral port, with the Source `orders`.
+pub(crate) struct Plane {
+    pub(crate) db: Arc<RuntimeDb>,
     sekai: SekaiServiceImpl,
     chisei: Arc<ChiseiServiceImpl>,
-    endpoint: String,
+    pub(crate) endpoint: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -141,6 +140,35 @@ impl Drop for Plane {
 }
 
 async fn plane() -> Plane {
+    plane_with(relational_spec()).await
+}
+
+/// The relational Source `orders`, placed in `zone=eu`.
+fn relational_spec() -> SourceSpec {
+    SourceSpec {
+        connector_type: "relational".into(),
+        connector_version: "1".into(),
+        config: SourceConfig::from([
+            (
+                "endpoint".into(),
+                ConfigValue::Text("db.internal:5432".into()),
+            ),
+            ("database".into(), ConfigValue::Text("orders".into())),
+            ("user".into(), ConfigValue::Text("writer".into())),
+        ]),
+        credential_ref: "ops/db".into(),
+        egress: vec!["db.internal:5432".into()],
+        placement: BTreeMap::from([("zone".into(), "eu".into())]),
+        every_ms: 60_000,
+        owner: "team".into(),
+        markings: Vec::new(),
+        certification_id: String::new(),
+    }
+}
+
+/// The plane with `spec` as the Source `orders` (source token
+/// `orders-db`), which owns the record [`RESOURCE`].
+pub(crate) async fn plane_with(spec: SourceSpec) -> Plane {
     let db = Arc::new(RuntimeDb::memory());
     db.ensure_team_namespace(NS, PRINCIPAL, Role::Admin, PRINCIPAL)
         .unwrap();
@@ -188,25 +216,7 @@ async fn plane() -> Plane {
             source_id: "orders".into(),
             source: "orders-db".into(),
             source_instance: "orders".into(),
-            spec: SourceSpec {
-                connector_type: "relational".into(),
-                connector_version: "1".into(),
-                config: SourceConfig::from([
-                    (
-                        "endpoint".into(),
-                        ConfigValue::Text("db.internal:5432".into()),
-                    ),
-                    ("database".into(), ConfigValue::Text("orders".into())),
-                    ("user".into(), ConfigValue::Text("writer".into())),
-                ]),
-                credential_ref: "ops/db".into(),
-                egress: vec!["db.internal:5432".into()],
-                placement: BTreeMap::from([("zone".into(), "eu".into())]),
-                every_ms: 60_000,
-                owner: "team".into(),
-                markings: Vec::new(),
-                certification_id: String::new(),
-            },
+            spec,
             expected_revision: 0,
             now_ms: 1,
         },
@@ -281,7 +291,7 @@ impl Plane {
     /// Authorizes setting order 1's status, decided at version `10`, for
     /// `invocations` invocations, and admits the Action that carries the
     /// permit. Returns the effect id.
-    async fn admit(&self, invocations: u32) -> String {
+    pub(crate) async fn admit(&self, invocations: u32) -> String {
         let change = RecordChange {
             idempotency_key: String::new(),
             key: "1".into(),
@@ -366,7 +376,7 @@ impl Plane {
         effects[0].effect_id.clone()
     }
 
-    async fn status_of(&self, effect_id: &str) -> String {
+    pub(crate) async fn status_of(&self, effect_id: &str) -> String {
         self.sekai
             .get_action_effect(with_principal(GetActionEffectRequest {
                 effect_id: effect_id.into(),

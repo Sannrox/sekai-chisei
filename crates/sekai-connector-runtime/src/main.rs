@@ -18,9 +18,9 @@ use std::path::PathBuf;
 
 use sekai_connector_runtime::{
     Connectors, CredentialBindings, Runtime, RuntimeOptions, github, llm_rows::GatewayRoute,
-    relational,
+    relational, rest,
 };
-use sekai_source_sdk::{GITHUB_CONNECTOR, RELATIONAL_CONNECTOR};
+use sekai_source_sdk::{GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -118,7 +118,8 @@ async fn serve() -> Result<(), String> {
         .with(&GITHUB_CONNECTOR, github::open)
         .with(&RELATIONAL_CONNECTOR, move |prepared| {
             relational::open(prepared, &tls)
-        });
+        })
+        .with(&REST_CONNECTOR, rest::open);
     let runtime = Runtime::connect(
         plane,
         &config.namespaces,

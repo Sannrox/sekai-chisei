@@ -272,6 +272,31 @@ row twice. A short page completes the scan; later syncs read rows whose
 monotonic value is greater, including updates. Credentials stay on the
 Source and never appear in a batch, receipt, or log. Connection always
 verifies TLS.
+A `rest` Source (#3082) pages one record kind from an HTTP API that returns
+paged JSON. Its configuration names the `base_url` (a destination the egress
+allowlist and the credential handle must both admit), the `list_path` of the
+first page, JSON Pointers to the records array (`records_path`), each record's
+id (`id_path`), version (`version_path`) and display name (`display_path`),
+and how a response names the next page: a link at `next_link_path`, or a
+token at `next_cursor_path` sent as the `next_cursor_param` query parameter.
+The credential slot `token` is sent as the `auth_header` request header
+(default `authorization`), after `auth_scheme` when set. Each response is one
+batch under the plane-owned cursor, so a runtime that dies mid-scan resumes
+from the committed page. A response without a next page ends the scan; the
+next sync starts a new pass from the first page, and re-read records change
+nothing. A next link off the origin of `base_url` fails the page; the runtime
+follows no redirect or proxy. A response over 8 MiB, or with more records
+than a batch holds, fails the page as `invalid` instead of being cut short.
+Top-level scalar fields become properties, except fields whose names suggest
+credentials or personal data and values that look like a credential. Records
+are synced under the registered type named by `type_digest` and the kind in
+`record_kind`. An admitted `external_mutate` effect sets `writable_fields` of
+the record at `item_path` (`{id}` is the record id) with `PATCH`. With
+`conditional_write` the write carries the decided version as `If-Match`;
+otherwise the runtime reads the record's version just before writing. A moved
+record is a `conflict` and nothing is written. Failures are typed
+(`auth_failed`, `permission_missing`, `unreachable`, `conflict`, `invalid`)
+and never carry a response body or credential.
 
 The GitHub object-sync profile admits exactly one code-owned type revision:
 
