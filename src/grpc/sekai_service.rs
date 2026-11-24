@@ -284,6 +284,7 @@ impl SekaiService for SekaiServiceImpl {
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
+        append_agent_turn_transcript => append_agent_turn_transcript_rpc(AppendAgentTurnTranscriptRequest) -> AppendAgentTurnTranscriptResponse;
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
         heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
@@ -1976,3 +1977,7 @@ mod tests;
 #[cfg(test)]
 #[path = "source_rpc_tests.rs"]
 mod source_rpc_tests;
+
+#[cfg(test)]
+#[path = "agent_turn_transcript_rpc_tests.rs"]
+mod agent_turn_transcript_rpc_tests;

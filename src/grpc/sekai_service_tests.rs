@@ -37451,6 +37451,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                 instance_id: "line-7".into(),
                 limit: 10,
                 page_token: String::new(),
+                include_prompt_text: false,
             },
             "root",
         ))
@@ -37500,6 +37501,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                     instance_id: "line-7".into(),
                     limit: 1,
                     page_token,
+                    include_prompt_text: false,
                 },
                 "root",
             ))
@@ -37518,6 +37520,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                 instance_id: "line-7".into(),
                 limit: 1,
                 page_token,
+                include_prompt_text: false,
             },
             "root",
         ))
@@ -37552,6 +37555,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                 instance_id: "line-hidden".into(),
                 limit: 10,
                 page_token: String::new(),
+                include_prompt_text: false,
             },
             "bob",
         ))

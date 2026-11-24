@@ -41,6 +41,7 @@ pub const RUNTIME_TOKEN_METHODS: &[&str] = &[
 pub const TURN_TOKEN_METHODS: &[&str] = &[
     "HeartbeatAgentTurnClaim",
     "AckAgentTurn",
+    "AppendAgentTurnTranscript",
     "HeartbeatWorkClaim",
     "AckWork",
     "SubmitActionInstance",

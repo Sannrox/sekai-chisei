@@ -1503,6 +1503,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "AppendAgentTurnTranscript",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_turn_transcript.rs",
+        "docs/decisions/0157-an-agent-turn-records-its-transcript.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListClaimableWork",
       "kind": "persistent",
       "surfaces": [

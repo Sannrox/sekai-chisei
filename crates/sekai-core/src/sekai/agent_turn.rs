@@ -33,6 +33,9 @@ use crate::sekai::governed_transform::{
 use crate::sekai::site_agent_instance;
 use crate::sekai::work_claim::{ClaimError, ClaimRecord, Fence, Hold};
 
+#[path = "agent_turn_transcript.rs"]
+pub mod transcript;
+
 /// Execution profile of agent-turn queue gauges (ADR 0129, 0137).
 pub const PROFILE: &str = "agent-turn";
 /// Decision ledger action of a refused turn.

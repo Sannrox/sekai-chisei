@@ -3237,6 +3237,15 @@ impl SekaiDb {
             ],
         )
         .map_err(|e| e.to_string())?;
+        // Agent-turn prompt text the subject reaches (#3045); the transcript
+        // stays, marked erased, and refuses later appends.
+        crate::sekai::agent_turn::transcript::erase_subject_sqlite(
+            &tx,
+            &request.subject_kind,
+            &request.subject,
+            |text| contains_subject_reference(text, &request.subject_kind, &request.subject),
+            request.timestamp,
+        )?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }

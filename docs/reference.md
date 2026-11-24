@@ -64,6 +64,8 @@ lives in the separate [research index](research/README.md).
   authoring, publication, inspection, dry-run resolution, and execution.
 - [Evaluation quality trends](evaluation-quality-trends.md) — authorized,
   receipt-reconciled quality, variance, regression, and baseline reporting.
+- [Agent-turn transcripts](agent-turn-transcripts.md) — what a claimed turn
+  did, with marked prompt text and erasure.
 - [Execution telemetry](execution-telemetry.md) — bounded, digest-bound
   aggregates over operation receipts for improvement evidence.
 - [Lookup-first promotion gate](lookup-first-promotion-gate.md) — deterministic

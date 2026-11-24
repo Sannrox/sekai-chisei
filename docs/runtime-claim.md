@@ -194,8 +194,8 @@ and change-driven turns; the claiming worker is a distinct `worker` claim.
 Follow-up checks that bind agent and requester use `act`, never the worker. The
 claiming worker's subject must not be the instance `principal_id` (ADR 0146).
 It authenticates only `HeartbeatAgentTurnClaim`, `AckAgentTurn`,
-`HeartbeatWorkClaim` and `AckWork` for agent turns, `SubmitActionInstance`
-and `ListSiteAgentWorkingMemory`, and only while the
+`AppendAgentTurnTranscript`, `HeartbeatWorkClaim` and `AckWork` for agent
+turns, `SubmitActionInstance` and `ListSiteAgentWorkingMemory`, and only while the
 turn is claimed at that generation and its lease holds. `GetObject` and
 `GetOperationReceipt` stay off the token; the worker reads those with its own
 credential. A submission with it must name the turn's namespace and is
