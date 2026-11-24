@@ -51,6 +51,7 @@ fn stochastic_definition(
     definition.execution_class = STOCHASTIC_EXECUTION_CLASS.into();
     definition.supported_result_schemas = vec![STOCHASTIC_RESULT_SCHEMA.into()];
     definition.stochastic_policy = Some(StochasticEvaluatorPolicy {
+        rubric: None,
         provider: "openai".into(),
         model: "openai/gpt-fixture".into(),
         prompt_profile: "chisei.fixture-rubric/v1".into(),
@@ -211,11 +212,45 @@ fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
     )
     .unwrap();
     exercise_metric_objectives(db, namespace, suffix);
+    exercise_custom_rubric(db, namespace, suffix);
     (stored_definition.definition_id, stored_plan.plan_version_id)
 }
 
 /// ADR 0154: declared metrics and bound objectives persist exactly, and an
 /// objective on an undeclared metric is refused at the store.
+/// A custom-rubric definition stores and reads back its rubric unchanged
+/// (ADR 0155).
+fn exercise_custom_rubric(db: &RuntimeDb, namespace: &str, suffix: &str) {
+    use sekai_chisei::chisei::evaluation_plan::{
+        CUSTOM_RUBRIC_PROFILE, EvaluationRubric, rubric_digest,
+    };
+    let text = "The answer cites the source record it relies on.";
+    let mut custom = stochastic_definition(namespace, &format!("{suffix}-rubric"), false);
+    let policy = custom.stochastic_policy.as_mut().unwrap();
+    policy.prompt_profile = CUSTOM_RUBRIC_PROFILE.into();
+    policy.rubric = Some(EvaluationRubric {
+        text: text.into(),
+        digest: rubric_digest(text),
+        scale_max_points: Some(4),
+    });
+    let stored = db
+        .put_evaluator_definition(custom, "operator", 150)
+        .unwrap();
+    let read = db
+        .get_evaluator_definition(&stored.definition_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, stored);
+    assert_eq!(
+        read.stochastic_policy
+            .unwrap()
+            .rubric
+            .unwrap()
+            .scale_max_points,
+        Some(4)
+    );
+}
+
 fn exercise_metric_objectives(db: &RuntimeDb, namespace: &str, suffix: &str) {
     use sekai_chisei::chisei::evaluation_metrics::{
         METRICS_RESULT_SCHEMA, MetricDeclaration, MetricKind, MetricObjective, Objective,

@@ -55,6 +55,15 @@ provider/model route, requests one normalized `passed`, `score_micros`, and
 bounded `reason_code` result per trial, and has no tools other than that
 structured return. It never falls back to another route.
 
+The same implementation also accepts the `chisei.custom-rubric/v1` profile
+([ADR 0155](decisions/0155-custom-rubric-judges-pin-their-criteria.md)). Its
+policy carries a namespace-authored `rubric`, which is appended to the fixed
+system prompt between `<criteria>` delimiters. Without `scale_max_points`, the
+judge returns pass or fail and each trial records 0 or 1,000,000 micros. With
+`scale_max_points = n` (2 to 10), it returns an integer `score` in `0..=n`,
+recorded as `score * 1,000,000 / n` micros. Before each trial the judge
+re-checks the rubric's digest and bounds.
+
 Each implementation receives one canonical input document containing:
 
 - the exact manifest and node identity;
