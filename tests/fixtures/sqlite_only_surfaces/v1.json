@@ -1,7 +1,7 @@
 {
   "version": "sekai.sqlite-only-surfaces/v1",
   "issue": 1316,
-  "limit": 8,
+  "limit": 10,
   "surfaces": [
     {
       "id": "SekaiService.DeleteOntologyClass",
@@ -12,6 +12,16 @@
       "id": "SekaiService.DeleteOntologyRelation",
       "kind": "rpc",
       "methods": ["delete_ontology_relation_with_audit"]
+    },
+    {
+      "id": "SekaiService.GetAgentAutonomy",
+      "kind": "rpc",
+      "methods": ["get_agent_autonomy"]
+    },
+    {
+      "id": "SekaiService.SetAgentAutonomy",
+      "kind": "rpc",
+      "methods": ["get_agent_autonomy"]
     },
     {
       "id": "admin.warehouse-projection",

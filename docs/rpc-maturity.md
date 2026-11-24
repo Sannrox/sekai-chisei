@@ -381,6 +381,8 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetActionInstance` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionInstances` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.GetDecisionTrend` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.GetAgentAutonomy` | `sekai.audit` | sqlite only | none | `experimental` |
+| `SekaiService.SetAgentAutonomy` | `sekai.audit` | sqlite only | none | `experimental` |
 | `SekaiService.ListPendingDecisions` | `sekai.audit` | yes | cli | `experimental` |
 | `SekaiService.GetActionEffect` | `sekai.audit` | yes | example | `stable` |
 | `SekaiService.ListActionEffects` | `sekai.audit` | yes | example | `stable` |

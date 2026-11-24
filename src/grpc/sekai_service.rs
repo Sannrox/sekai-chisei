@@ -1,6 +1,8 @@
 #![allow(clippy::result_large_err, clippy::collapsible_if, clippy::manual_clamp)]
 #[path = "action_binding.rs"]
 mod action_binding;
+#[path = "agent_autonomy_rpc.rs"]
+mod agent_autonomy_rpc;
 #[path = "agent_change_wake.rs"]
 mod agent_change_wake;
 #[path = "agent_turn_rpc.rs"]
@@ -299,6 +301,8 @@ impl SekaiService for SekaiServiceImpl {
         dry_run_action_policy => dry_run_action_policy_rpc(DryRunActionPolicyRequest) -> DryRunActionPolicyResponse;
         list_action_instances => list_action_instances_rpc(ListActionInstancesRequest) -> ListActionInstancesResponse;
         get_decision_trend => get_decision_trend_rpc(GetDecisionTrendRequest) -> GetDecisionTrendResponse;
+        get_agent_autonomy => get_agent_autonomy_rpc(GetAgentAutonomyRequest) -> GetAgentAutonomyResponse;
+        set_agent_autonomy => set_agent_autonomy_rpc(SetAgentAutonomyRequest) -> SetAgentAutonomyResponse;
         get_object_source_record => get_object_source_record_rpc(GetObjectSourceRecordRequest) -> GetObjectSourceRecordResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         get_transform_chain_run => get_transform_chain_run_rpc(GetTransformChainRunRequest) -> GetTransformChainRunResponse;
@@ -1986,14 +1990,3 @@ impl SekaiService for SekaiServiceImpl {
 #[cfg(test)]
 #[path = "sekai_service_tests.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "source_discovery_rpc_tests.rs"]
-mod source_discovery_rpc_tests;
-#[cfg(test)]
-#[path = "source_rpc_tests.rs"]
-mod source_rpc_tests;
-
-#[cfg(test)]
-#[path = "agent_turn_transcript_rpc_tests.rs"]
-mod agent_turn_transcript_rpc_tests;

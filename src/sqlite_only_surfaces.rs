@@ -54,7 +54,7 @@ pub const RUNTIME_DB_SRC: &str = concat!(
         "/crates/chisei-core/src/chisei_store/runtime.rs"
     ))
 );
-pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 8;
+pub const SQLITE_ONLY_SURFACE_LIMIT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +306,9 @@ pub const RPC_HANDLER_EVIDENCE_METHODS: &[(&str, &str, &[&str])] = &[
         "RunActionBinding",
         &["get_action_binding", "advance_action_binding_cursor"],
     ),
+    // Agent autonomy grants live only on SQLite (#3086 non-goal); the read
+    // the handler starts with fails closed on PostgreSQL.
+    ("SekaiService", "SetAgentAutonomy", &["get_agent_autonomy"]),
     (
         "SekaiService",
         "DeleteOntologyClass",

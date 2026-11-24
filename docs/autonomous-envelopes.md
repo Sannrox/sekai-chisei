@@ -38,6 +38,20 @@ changed model pin revokes the grant and returns the agent to
 propose-only. Amount, scope, and time-of-day limits are not in this
 slice. PostgreSQL surfaces stay unavailable.
 
+The same per-type autonomy is readable and changeable over the API (#3086).
+`SekaiService.GetAgentAutonomy(namespace, principal, type_id)` returns the
+mode, `propose` or `apply`, with the live grant's envelope and the measured
+offer: reviews, approved unchanged, incidents, and whether the agent is
+eligible. `SetAgentAutonomy` with `mode: "apply"` and a live `envelope_id`
+runs the same grant as `grant-auto-apply`; an agent below the threshold is
+refused `FAILED_PRECONDITION` with its offer numbers. `mode: "propose"` runs
+`revoke-auto-apply` with `reason` (default `admin`). Each change writes the
+existing grant or revoke Decision receipt naming the caller. Reading needs
+namespace read and changing needs namespace admin (root and the local operator
+pass); a caller who cannot read the namespace gets `NOT_FOUND`. Both RPCs are
+experimental and served only with `SEKAI_EXPERIMENTAL_RPCS`; on PostgreSQL
+they answer `UNAVAILABLE`, so both are on the SQLite-only list.
+
 ## Operator workflow
 
 ```text
