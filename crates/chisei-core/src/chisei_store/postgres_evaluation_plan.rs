@@ -57,9 +57,34 @@ pub trait PostgresEvaluationPlanPostgresDbExt {
         namespace: &str,
         plan_id: Option<&str>,
     ) -> Result<Vec<EvaluationPlan>, String>;
+
+    /// The plan version in `namespace` whose content digest is
+    /// `content_digest`. The digest covers the namespace, plan id and
+    /// version, so at most one matches.
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<EvaluationPlan>, String>;
 }
 
 impl PostgresEvaluationPlanPostgresDbExt for PostgresDb {
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<EvaluationPlan>, String> {
+        self.connection()?
+            .query_opt(
+                "SELECT body_json FROM chisei_evaluation_plans
+                 WHERE namespace=$1 AND content_digest=$2",
+                &[&namespace, &content_digest],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| decode_plan(row.get(0)))
+            .transpose()
+    }
+
     fn put_evaluator_definition(
         &self,
         definition: EvaluatorDefinition,

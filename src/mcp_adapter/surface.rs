@@ -16,15 +16,16 @@ use crate::grpc::client::connect_sekai_with_token;
 use crate::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use crate::grpc::pb::chisei::chisei_service_server::ChiseiService;
 use crate::grpc::pb::chisei::{
-    ExecuteEvaluationManifestRequest, GetOperationReceiptRequest, GetOperationReceiptResponse,
-    ResolveEvaluationPlanRequest,
+    ExecuteEvaluationManifestRequest, GetEvaluationPlanRequest, GetOperationReceiptRequest,
+    GetOperationReceiptResponse, PutEvaluationPlanRequest, ResolveEvaluationPlanRequest,
 };
 use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
 use crate::grpc::pb::sekai::{
-    CreateLinkRequest, DescribeObjectActionRequest, DiscoverCapabilitiesRequest,
-    EvaluateObjectSetRequest, GetLinksRequest, GetObjectRequest, Link, PreviewObjectActionRequest,
-    SearchRequest, SearchResponse, SubmitActionInstanceRequest, SubmitActionInstanceResponse,
+    CreateDefinitionProposalRequest, CreateLinkRequest, DescribeObjectActionRequest,
+    DiscoverCapabilitiesRequest, EvaluateObjectSetRequest, GetLinksRequest, GetObjectRequest, Link,
+    PreviewObjectActionRequest, SearchRequest, SearchResponse, SubmitActionInstanceRequest,
+    SubmitActionInstanceResponse,
 };
 use crate::grpc::sekai_service::SekaiServiceImpl;
 use crate::sekai::capability::CONTRACT_VERSION;
@@ -44,6 +45,7 @@ pub enum NativeRpc {
     GetOperationReceipt,
     GetLinks,
     CreateLink,
+    PutEvaluationPlan,
     ResolveEvaluationPlan,
     ExecuteEvaluationManifest,
     CreateDefinitionBranch,
@@ -72,6 +74,7 @@ impl NativeRpc {
             Self::GetOperationReceipt => "GetOperationReceipt",
             Self::GetLinks => "GetLinks",
             Self::CreateLink => "CreateLink",
+            Self::PutEvaluationPlan => "PutEvaluationPlan",
             Self::ResolveEvaluationPlan => "ResolveEvaluationPlan",
             Self::ExecuteEvaluationManifest => "ExecuteEvaluationManifest",
             Self::CreateDefinitionBranch => "CreateDefinitionBranch",
@@ -198,6 +201,21 @@ pub async fn dispatch_native(
                 .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
             Ok(json!({"link": link_json(&link)}))
         }
+        NativeRpc::PutEvaluationPlan => {
+            let payload =
+                serde_json::from_value::<PutEvaluationPlanRequest>(invocation.input.clone())
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let request = invocation
+                .bind(payload)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+            let response = chisei
+                .put_evaluation_plan(request)
+                .await
+                .map_err(status_error)?
+                .into_inner();
+            serde_json::to_value(response)
+                .map_err(|error| AdapterError::Protocol(error.to_string()))
+        }
         NativeRpc::ResolveEvaluationPlan => {
             let payload =
                 serde_json::from_value::<ResolveEvaluationPlanRequest>(invocation.input.clone())
@@ -322,11 +340,18 @@ pub async fn dispatch_native(
                 .report_definition_consumer_impact(bind_json(&invocation)?)
                 .await,
         ),
-        NativeRpc::CreateDefinitionProposal => dispatch_sekai_json(
-            sekai
-                .create_definition_proposal(bind_json(&invocation)?)
-                .await,
-        ),
+        NativeRpc::CreateDefinitionProposal => {
+            require_stored_plans(&invocation, |request| async {
+                crate::rpc_maturity::require_invokable("GetEvaluationPlan", experimental_rpcs)?;
+                chisei.get_evaluation_plan(request).await.map(drop)
+            })
+            .await?;
+            dispatch_sekai_json(
+                sekai
+                    .create_definition_proposal(bind_json(&invocation)?)
+                    .await,
+            )
+        }
         NativeRpc::Search => Ok(search_references(
             sekai
                 .search(bind_json::<SearchRequest>(&invocation)?)
@@ -394,6 +419,48 @@ fn bind_json<T: serde::de::DeserializeOwned + prost::Message + Default>(
     invocation
         .bind(payload)
         .map_err(|error| AdapterError::Protocol(error.to_string()))
+}
+
+/// A definition proposal may name only evaluation plans the caller can see
+/// (#3174). Each `eval_plan_digests` entry is looked up through
+/// `GetEvaluationPlan` before the proposal is created: an absent plan refuses
+/// the proposal, and any other lookup failure, including the RPC being off
+/// while experimental RPCs are disabled, fails closed. A list longer than the
+/// server accepts is left for the server to refuse.
+async fn require_stored_plans<F, Fut>(
+    invocation: &SdkInvocation,
+    lookup: F,
+) -> Result<(), AdapterError>
+where
+    F: Fn(tonic::Request<GetEvaluationPlanRequest>) -> Fut,
+    Fut: Future<Output = Result<(), tonic::Status>>,
+{
+    let proposal =
+        serde_json::from_value::<CreateDefinitionProposalRequest>(invocation.input.clone())
+            .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+    if proposal.eval_plan_digests.len()
+        > crate::sekai::definition_proposal::MAX_PROPOSAL_DIGEST_REFS
+    {
+        return Ok(());
+    }
+    for digest in &proposal.eval_plan_digests {
+        let request = invocation
+            .bind(GetEvaluationPlanRequest {
+                namespace: proposal.namespace.clone(),
+                content_digest: digest.clone(),
+            })
+            .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+        match lookup(request).await {
+            Ok(()) => {}
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                return Err(status_error(tonic::Status::failed_precondition(
+                    "an eval_plan_digest names no evaluation plan the caller can see",
+                )));
+            }
+            Err(status) => return Err(status_error(status)),
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_sekai_json<T: serde::Serialize>(
@@ -597,6 +664,7 @@ impl NativeSurface for FixtureSurface {
                     "created": 0,
                 }
             })),
+            NativeRpc::PutEvaluationPlan => Ok(json!({"plan": invocation.input.get("plan")})),
             NativeRpc::ResolveEvaluationPlan => Ok(json!({"status": "unknown"})),
             NativeRpc::ExecuteEvaluationManifest => Err(projected(
                 "not_found",
@@ -848,6 +916,20 @@ impl NativeSurface for SdkSurface {
                     .ok_or_else(|| AdapterError::Protocol("link missing from CreateLink".into()))?;
                 Ok(json!({"link": link_json(&link)}))
             }
+            NativeRpc::PutEvaluationPlan => {
+                let payload =
+                    serde_json::from_value::<PutEvaluationPlanRequest>(invocation.input.clone())
+                        .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let request = invocation
+                    .bind(payload)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))?;
+                let channel = self.channel().await?;
+                let mut client = ChiseiServiceClient::new(channel);
+                let response =
+                    with_timeout(self.config.timeout, client.put_evaluation_plan(request)).await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
             NativeRpc::ResolveEvaluationPlan => {
                 let payload = serde_json::from_value::<ResolveEvaluationPlanRequest>(
                     invocation.input.clone(),
@@ -974,6 +1056,17 @@ impl NativeSurface for SdkSurface {
             }
             NativeRpc::CreateDefinitionProposal => {
                 let channel = self.channel().await?;
+                let timeout = self.config.timeout;
+                require_stored_plans(&invocation, |request| {
+                    let mut chisei = ChiseiServiceClient::new(channel.clone());
+                    async move {
+                        tokio::time::timeout(timeout, chisei.get_evaluation_plan(request))
+                            .await
+                            .map_err(|_| tonic::Status::deadline_exceeded("deadline exceeded"))?
+                            .map(drop)
+                    }
+                })
+                .await?;
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,

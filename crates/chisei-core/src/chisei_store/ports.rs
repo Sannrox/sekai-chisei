@@ -724,6 +724,7 @@ chisei_store_trait! {
         fn put_evaluator_definition(&self, definition: crate::chisei::evaluation_plan::EvaluatorDefinition, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorDefinition, String>;
         fn set_evaluator_availability(&self, definition_id: &str, state: &str, superseded_by_definition_id: &str, reason: &str, request_id: &str, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluatorAvailability, String>;
         fn get_evaluation_plan(&self, plan_version_id: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+        fn find_evaluation_plan_by_digest(&self, namespace: &str, content_digest: &str) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
         fn put_evaluation_plan(&self, plan: crate::chisei::evaluation_plan::EvaluationPlan, actor: &str, now_ms: i64) -> Result<crate::chisei::evaluation_plan::EvaluationPlan, String>;
         fn get_evaluation_execution_index(&self, manifest_digest: &str) -> Result<Option<EvaluationExecutionIndex>, String>;
         fn create_evaluation_execution(&self, index: &EvaluationExecutionIndex, receipt: &OperationReceipt) -> Result<EvaluationExecutionIndex, String>;

@@ -349,6 +349,117 @@ impl InProcessSurface {
         Ok(())
     }
 
+    /// Store one evaluator definition and one evaluation plan in `namespace`
+    /// directly, as an operator would, and return the plan's content digest.
+    /// The plan cites one unmarked invariant, so every caller with namespace
+    /// access can see it.
+    pub fn seed_evaluation_plan(&self, namespace: &str) -> Result<String, String> {
+        use crate::chisei::evaluation_plan::*;
+        use crate::ext::*;
+        use crate::sekai::governed_facts as facts;
+        // A plan node must cite a governed invariant; install one first.
+        facts::apply_profile(
+            &self.db,
+            namespace,
+            facts::PROFILE_CONTRACT_VERSION,
+            "root",
+            1,
+        )?;
+        let invariant = facts::put_fact(
+            &self.db,
+            facts::GovernedFactInput {
+                contract_version: facts::PROFILE_CONTRACT_VERSION.into(),
+                namespace: namespace.into(),
+                fact_id: "document-schema".into(),
+                version: "1.0.0".into(),
+                fact_type: facts::GovernedFactType::Invariant,
+                status: "active".into(),
+                statement: "The document conforms to the declared schema.".into(),
+                applicability: facts::FactApplicability {
+                    subject_profiles: vec!["document/v1".into()],
+                    subject_refs: Vec::new(),
+                },
+                verification: facts::VerificationContract {
+                    predicate_kind: "schema_conforms".into(),
+                    input_schema: "schema://document/v1".into(),
+                    result_schema: "schema://pass-fail/v1".into(),
+                    evidence_types: Vec::new(),
+                },
+                requirement_version_ids: Vec::new(),
+                evidence_refs: Vec::new(),
+                source_ref: "repo://requirements/document-schema@1".into(),
+                effective_from_ms: 1,
+                supersedes_object_id: String::new(),
+                access_marking: String::new(),
+            },
+            "root",
+            2,
+        )?;
+        let definition = self.db.put_evaluator_definition(
+            EvaluatorDefinition {
+                declared_metrics: Vec::new(),
+                contract_version: EVALUATOR_DEFINITION_CONTRACT.into(),
+                definition_id: String::new(),
+                namespace: namespace.into(),
+                evaluator_id: "schema-check".into(),
+                version: "1.0.0".into(),
+                implementation_digest: format!("sha256:{}", "a".repeat(64)),
+                execution_class: DETERMINISTIC_EXECUTION_CLASS.into(),
+                supported_predicate_kinds: vec!["schema_conforms".into()],
+                supported_input_schemas: vec!["schema://document/v1".into()],
+                supported_result_schemas: vec!["schema://pass-fail/v1".into()],
+                parameter_schema_json: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#.into(),
+                evidence_classifications: vec!["internal".into()],
+                resource_limits: EvaluatorResourceLimits {
+                    timeout_ms: 1_000,
+                    max_input_bytes: 4_096,
+                    max_output_bytes: 1_024,
+                    max_evidence_items: 8,
+                },
+                adapter_endpoint: String::new(),
+                stochastic_policy: None,
+                source_ref: "repo://evaluators/schema-check@1".into(),
+                content_digest: String::new(),
+                created_by: String::new(),
+                created_at_ms: 0,
+            },
+            "root",
+            10,
+        )?;
+        let plan = self.db.put_evaluation_plan(
+            EvaluationPlan {
+                contract_version: EVALUATION_PLAN_CONTRACT.into(),
+                plan_version_id: String::new(),
+                namespace: namespace.into(),
+                plan_id: "document-review".into(),
+                version: "1.0.0".into(),
+                accepted_subject_profiles: vec!["document/v1".into()],
+                nodes: vec![EvaluationPlanNode {
+                    metric_objectives: Vec::new(),
+                    node_id: "schema".into(),
+                    evaluator_definition_id: definition.definition_id,
+                    depends_on_node_ids: Vec::new(),
+                    input_bindings: vec![EvaluationInputBinding {
+                        name: "document".into(),
+                        source_kind: INPUT_INVARIANT.into(),
+                        schema_id: "schema://document/v1".into(),
+                    }],
+                    parameters_json: "{}".into(),
+                    invariant_version_ids: vec![invariant.object_id],
+                    classification: NODE_REQUIRED.into(),
+                }],
+                reducer: FIXED_REDUCER.into(),
+                source_ref: "repo://plans/document-review@1".into(),
+                content_digest: String::new(),
+                created_by: String::new(),
+                created_at_ms: 0,
+            },
+            "root",
+            20,
+        )?;
+        Ok(plan.content_digest)
+    }
+
     /// Change one object's color after a query so receipt replay can be checked.
     pub fn mutate_object_color(&self, id: &str, color: &str) -> Result<(), String> {
         let mut object = self

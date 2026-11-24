@@ -163,27 +163,53 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
     .unwrap();
     assert_eq!(output(&impact)["completeness"], "complete", "{impact}");
 
-    let proposed = handle_message(
-        &surface,
+    let plan_digest = surface.seed_evaluation_plan(&surface.namespace).unwrap();
+    let propose = |id: i64, eval_plan_digest: String| {
         call(
-            6,
+            id,
             "sekai.definitions.proposal.create",
             json!({
                 "branchId": "feature",
                 "proposalId": "cs-1",
                 "baseDigest": parent,
                 "candidateDigest": candidate,
-                "evalPlanDigests": [format!("sha256:{}", "e".repeat(64))],
+                "evalPlanDigests": [eval_plan_digest],
                 "namedForeignDigests": [format!("sha256:{}", "f".repeat(64))],
                 "idempotencyKey": "propose-1"
             }),
-        ),
-    )
-    .await
-    .unwrap();
+        )
+    };
+
+    // Plan digests are checked through an experimental lookup, so naming one
+    // fails closed while experimental RPCs are off (#3174).
+    let gated = handle_message(&surface, propose(60, plan_digest.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        gated["result"]["structuredContent"]["code"], "failed_precondition",
+        "{gated}"
+    );
+    surface.experimental_rpcs = true;
+
+    let unknown = handle_message(&surface, propose(61, format!("sha256:{}", "e".repeat(64))))
+        .await
+        .unwrap();
+    assert_eq!(
+        unknown["result"]["structuredContent"]["code"], "failed_precondition",
+        "{unknown}"
+    );
+
+    let proposed = handle_message(&surface, propose(6, plan_digest.clone()))
+        .await
+        .unwrap();
     assert_eq!(
         output(&proposed)["proposal"]["status"],
         "open",
+        "{proposed}"
+    );
+    assert_eq!(
+        output(&proposed)["proposal"]["evalPlanDigests"],
+        json!([plan_digest]),
         "{proposed}"
     );
     assert_eq!(

@@ -173,6 +173,21 @@ fn exercise(db: &RuntimeDb, namespace: &str, suffix: &str) -> (String, String) {
         .unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].plan_version_id, stored_plan.plan_version_id);
+    assert_eq!(
+        db.find_evaluation_plan_by_digest(namespace, &stored_plan.content_digest)
+            .unwrap(),
+        Some(stored_plan.clone())
+    );
+    assert_eq!(
+        db.find_evaluation_plan_by_digest("elsewhere", &stored_plan.content_digest)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        db.find_evaluation_plan_by_digest(namespace, &format!("sha256:{}", "e".repeat(64)))
+            .unwrap(),
+        None
+    );
 
     let advisory_definition = db
         .put_evaluator_definition(

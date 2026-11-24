@@ -231,6 +231,12 @@ pub trait ChiseiRuntimeDb {
         plan_id: Option<&str>,
     ) -> Result<Vec<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
 
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String>;
+
     fn list_external_action_authorizations(&self) -> Result<Vec<AuthorizationRecord>, String>;
 
     fn list_expired_reserved_external_action_authorizations(
@@ -1603,6 +1609,19 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Sqlite(db) => db.list_evaluation_plans(namespace, plan_id),
             Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
                 db.list_evaluation_plans(namespace, plan_id)
+            }),
+        }
+    }
+
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<crate::chisei::evaluation_plan::EvaluationPlan>, String> {
+        match self {
+            Self::Sqlite(db) => db.find_evaluation_plan_by_digest(namespace, content_digest),
+            Self::Postgres(db) => sekai_core::db::postgres::off_runtime(|| {
+                db.find_evaluation_plan_by_digest(namespace, content_digest)
             }),
         }
     }

@@ -20,6 +20,9 @@ pub const CREATE_LINK_TOOL: &str = "sekai.links.create";
 /// (#1090). Compare is a CLI projection with no wire RPC, so it has no tool.
 pub const RESOLVE_EVALUATION_TOOL: &str = "chisei.evaluation.resolve";
 pub const EXECUTE_EVALUATION_TOOL: &str = "chisei.evaluation.execute";
+/// Store an immutable evaluation plan (#3174) so a definition proposal can
+/// name its digest in `eval_plan_digests`. The backing RPC is stable.
+pub const PUT_EVALUATION_PLAN_TOOL: &str = "chisei.evaluation.plan.put";
 /// Definition-branch tools (#1311). Backing RPCs are stable (#2095).
 pub const CREATE_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.create";
 pub const EDIT_DEFINITION_BRANCH_TOOL: &str = "sekai.definitions.branch.edit";
@@ -58,7 +61,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 17] {
+pub fn well_known_tools() -> [&'static str; 18] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -68,6 +71,7 @@ pub fn well_known_tools() -> [&'static str; 17] {
         GET_RECEIPT_TOOL,
         GET_LINKS_TOOL,
         CREATE_LINK_TOOL,
+        PUT_EVALUATION_PLAN_TOOL,
         RESOLVE_EVALUATION_TOOL,
         EXECUTE_EVALUATION_TOOL,
         CREATE_DEFINITION_BRANCH_TOOL,
@@ -90,6 +94,7 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         GET_RECEIPT_TOOL => Some(NativeRpc::GetOperationReceipt),
         GET_LINKS_TOOL => Some(NativeRpc::GetLinks),
         CREATE_LINK_TOOL => Some(NativeRpc::CreateLink),
+        PUT_EVALUATION_PLAN_TOOL => Some(NativeRpc::PutEvaluationPlan),
         RESOLVE_EVALUATION_TOOL => Some(NativeRpc::ResolveEvaluationPlan),
         EXECUTE_EVALUATION_TOOL => Some(NativeRpc::ExecuteEvaluationManifest),
         CREATE_DEFINITION_BRANCH_TOOL => Some(NativeRpc::CreateDefinitionBranch),
@@ -155,7 +160,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -446,6 +451,9 @@ fn bind_session_input(
             }
             *object = bound;
         }
+        NativeRpc::PutEvaluationPlan => {
+            bind_nested_namespace(object, "plan", context)?;
+        }
         NativeRpc::ResolveEvaluationPlan => {
             bind_nested_namespace(object, "resolution", context)?;
         }
@@ -660,6 +668,14 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "action",
             "sekai.CreateLinkRequest",
             "sekai.CreateLinkResponse",
+            "write",
+        ),
+        capability_entry(
+            PUT_EVALUATION_PLAN_TOOL,
+            "Store one immutable evaluation plan and return its content digest.",
+            "action",
+            "chisei.PutEvaluationPlanRequest",
+            "chisei.PutEvaluationPlanResponse",
             "write",
         ),
         capability_entry(
@@ -1004,6 +1020,7 @@ mod tests {
                 GET_RECEIPT_TOOL,
                 GET_LINKS_TOOL,
                 CREATE_LINK_TOOL,
+                PUT_EVALUATION_PLAN_TOOL,
                 RESOLVE_EVALUATION_TOOL,
                 EXECUTE_EVALUATION_TOOL,
                 CREATE_DEFINITION_BRANCH_TOOL,

@@ -442,6 +442,7 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 `sekai.actions.preview` → `PreviewObjectAction`, `sekai.actions.submit` →
 `SubmitActionInstance`, `chisei.receipt.read` → `GetOperationReceipt`,
 `sekai.links.get` → `GetLinks`, `sekai.links.create` → `CreateLink`,
+`chisei.evaluation.plan.put` → `PutEvaluationPlan`,
 `chisei.evaluation.resolve` → `ResolveEvaluationPlan`,
 `chisei.evaluation.execute` → `ExecuteEvaluationManifest`,
 `sekai.definitions.branch.create` → `CreateDefinitionBranch`,
@@ -452,9 +453,12 @@ bearer and `x-sekai-namespace`. `tools/list` requires a live
 evaluation, and definition-branch tools are listed because their RPCs are
 `stable` (#1093, #1090, #2095). Evaluation
 compare is a CLI projection over existing evidence with no wire RPC, so it has
-no tool. The evaluation tools bind `input.resolution.namespace` or
-`input.execution.namespace` to the session namespace and refuse a different
-one.
+no tool. The evaluation tools bind `input.plan.namespace`,
+`input.resolution.namespace`, or `input.execution.namespace` to the session
+namespace and refuse a different one. `chisei.evaluation.plan.put` stores one
+immutable plan and returns its content digest; a replay returns the same
+digest, a changed plan under a stored version is refused, and the server
+admits only an evaluation administrator (#3174).
 `SubmitActionInstance` uses the caller `operation_id` as `request_id`.
 `sekai.links.get` requires `object_id` and accepts `relation` and `direction`.
 `sekai.links.create` passes only `from_id`, `to_id`, and `relation`; the server
@@ -476,7 +480,12 @@ effects reconcile through `GetOperationReceipt`.
 `sekai.definitions.impact` → `ReportDefinitionConsumerImpact`, and
 `sekai.definitions.proposal.create` → `CreateDefinitionProposal`.
 Each call binds `input.namespace` to the session namespace and refuses a
-different one. Approve and merge stay off MCP. The server still refuses
+different one. Before `sekai.definitions.proposal.create` runs, the adapter
+looks up every `eval_plan_digests` entry through the experimental
+`GetEvaluationPlan` and refuses the proposal when a digest names no plan the
+caller can see (#3174). A proposal that names plan digests therefore needs
+`SEKAI_EXPERIMENTAL_RPCS`; any lookup failure refuses it. Approve and merge stay
+off MCP. The server still refuses
 `ApproveDefinitionProposal` and `MergeDefinitionProposal` from the agent
 principal that created the proposal, including when that principal holds
 changed-member admin.

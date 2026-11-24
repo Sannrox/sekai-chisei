@@ -67,7 +67,10 @@ The server does not automatically merge it.
 
 `CreateDefinitionProposal` pins the current published head as `base_digest`
 and the branch head as `candidate_digest`. Optional `eval_plan_digests` are
-frozen Chisei dependencies; `named_foreign_digests` may be recorded but never
+frozen Chisei dependencies covered by the proposal digest. The server does not
+read Chisei, so the MCP proposal tool checks each one against a stored plan
+before creating ([capability catalog](capability-catalog.md#definition-branch-tools));
+no gate runs a plan at proposal time. `named_foreign_digests` may be recorded but never
 enter the published member map. Optional `migration_plan_digest` names the
 [change bundle](definition-change-bundles.md#apply) the proposal migrates by;
 it is part of the approved proposal digest, so `ApplyDefinitionChangeBundle`

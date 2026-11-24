@@ -3267,9 +3267,18 @@
       "rpc": "PutEvaluationPlan",
       "storage_path": "chisei.evaluation",
       "real_backend": "yes",
-      "consumer": "cli",
+      "consumer": "cli, mcp",
       "classification": "stable",
       "product_tier": "advanced"
+    },
+    {
+      "service": "ChiseiService",
+      "rpc": "GetEvaluationPlan",
+      "storage_path": "chisei.evaluation",
+      "real_backend": "yes",
+      "consumer": "mcp",
+      "classification": "experimental",
+      "product_tier": "experimental"
     },
     {
       "service": "ChiseiService",

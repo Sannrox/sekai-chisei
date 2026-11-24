@@ -3357,6 +3357,69 @@ async fn resolved_execution_fixture(
     .unwrap()
 }
 
+/// GetEvaluationPlan finds a stored plan by its content digest only in its
+/// own namespace and only for a caller with namespace write access (#3174).
+#[tokio::test]
+async fn evaluation_plans_are_found_by_digest_in_their_namespace() {
+    let svc = memory_service();
+    let invariant_id = install_invariant(&svc, "acme");
+    let definition = svc
+        .put_evaluator_definition(Request::new(evaluator_definition_request("acme")))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap()
+        .definition
+        .unwrap();
+    let stored = svc
+        .put_evaluation_plan(Request::new(evaluation_plan_request(
+            "acme",
+            &definition.definition_id,
+            &invariant_id,
+            "1.0.0",
+        )))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    let lookup = |namespace: &str, content_digest: &str| {
+        Request::new(GetEvaluationPlanRequest {
+            namespace: namespace.into(),
+            content_digest: content_digest.into(),
+        })
+    };
+
+    let found = svc
+        .get_evaluation_plan(lookup("acme", &stored.content_digest))
+        .await
+        .unwrap()
+        .into_inner()
+        .plan
+        .unwrap();
+    assert_eq!(found, stored);
+
+    let unknown = format!("sha256:{}", "e".repeat(64));
+    for (namespace, digest) in [
+        ("acme", unknown.as_str()),
+        ("other", &stored.content_digest),
+    ] {
+        let missing = svc
+            .get_evaluation_plan(lookup(namespace, digest))
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound, "{namespace}");
+    }
+
+    let mut outsider = lookup("acme", &stored.content_digest);
+    outsider
+        .metadata_mut()
+        .insert("x-principal", "outsider".parse().unwrap());
+    let denied = svc.get_evaluation_plan(outsider).await.unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+}
+
 #[tokio::test]
 async fn evaluation_plans_bind_exact_compatible_resources_and_preserve_history() {
     let svc = memory_service();

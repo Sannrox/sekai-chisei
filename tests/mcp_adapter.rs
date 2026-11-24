@@ -25,6 +25,7 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "chisei.receipt.read",
             "sekai.links.get",
             "sekai.links.create",
+            "chisei.evaluation.plan.put",
             "chisei.evaluation.resolve",
             "chisei.evaluation.execute",
             "sekai.definitions.branch.create",

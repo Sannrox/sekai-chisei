@@ -525,6 +525,14 @@ message EvaluationPlan {
 }
 message PutEvaluationPlanRequest { EvaluationPlan plan = 1; }
 message PutEvaluationPlanResponse { EvaluationPlan plan = 1; }
+// Look up one stored plan version by its content digest (#3174), so a
+// definition proposal can name only plans that exist. A plan in another
+// namespace, or one the caller cannot see, reads as not found.
+message GetEvaluationPlanRequest {
+  string namespace = 1;
+  string content_digest = 2;
+}
+message GetEvaluationPlanResponse { EvaluationPlan plan = 1; }
 
 // Resolves immutable plan, subject, invariant, waiver, evaluator, and evidence
 // inputs into durable content-bound execution evidence. Resolution performs no
@@ -2146,6 +2154,8 @@ service ChiseiService {
   // Eval
   rpc PutEvaluatorDefinition(PutEvaluatorDefinitionRequest) returns (PutEvaluatorDefinitionResponse);
   rpc PutEvaluationPlan(PutEvaluationPlanRequest) returns (PutEvaluationPlanResponse);
+  // Experimental (#3174): served only with SEKAI_EXPERIMENTAL_RPCS.
+  rpc GetEvaluationPlan(GetEvaluationPlanRequest) returns (GetEvaluationPlanResponse);
   rpc ResolveEvaluationPlan(ResolveEvaluationPlanRequest) returns (ResolveEvaluationPlanResponse);
   rpc GetEvaluationGateEvidence(GetEvaluationGateEvidenceRequest) returns (GetEvaluationGateEvidenceResponse);
 
