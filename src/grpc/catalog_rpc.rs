@@ -532,15 +532,16 @@ impl SekaiServiceImpl {
     }
 
     /// The namespace an MCP session binds object ids to. The MCP link, lineage,
-    /// and neighborhood tools send their name as `x-sekai-capability`; direct
-    /// gRPC and the HTTP gateway also carry `x-sekai-namespace`, but only these
-    /// tools are confined to it.
+    /// neighborhood, and transform preview tools send their name as
+    /// `x-sekai-capability`; direct gRPC and the HTTP gateway also carry
+    /// `x-sekai-namespace`, but only these tools are confined to it.
     pub(super) fn mcp_session_namespace<T>(req: &Request<T>) -> Option<String> {
         match Self::catalog_metadata_value(req, "x-sekai-capability").as_deref() {
             Some(
                 "sekai.links.get"
                 | "sekai.links.create"
                 | "sekai.lineage.get"
+                | "sekai.transforms.preview"
                 | super::graph_explore_rpc::NEIGHBORHOOD_CAPABILITY,
             ) => Self::catalog_metadata_value(req, "x-sekai-namespace"),
             _ => None,

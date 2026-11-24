@@ -312,6 +312,10 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.definitions.proposal.create" => Some("CreateDefinitionProposal"),
         "sekai.transforms.chain" | "sekai.transforms.chain.run" => Some("RunTransformChain"),
         "sekai.transforms.chain.status" => Some("GetTransformChainRun"),
+        "sekai.agents.dry_run" => Some("DryRunAgent"),
+        "sekai.plans.simulate" => Some("SimulatePlan"),
+        "sekai.transforms.preview" => Some("PreviewGovernedTransform"),
+        "sekai.definitions.change_bundle.dry_run" => Some("DryRunDefinitionChangeBundle"),
         other if other.starts_with("sekai.objects.query.") => Some("ListObjects"),
         other if other.starts_with("sekai.actions.") || other.starts_with("sekai.action.") => {
             Some("SubmitActionInstance")

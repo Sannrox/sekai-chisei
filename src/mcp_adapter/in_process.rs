@@ -1217,12 +1217,209 @@ mod tests {
         use crate::mcp_adapter::protocol::{GET_LINEAGE_TOOL, LIST_CLASSES_TOOL};
         let mut surface = discovery_surface().await;
         surface.experimental_rpcs = false;
-        let lineage = call(&surface, GET_LINEAGE_TOOL, json!({"object_id": OBJECT_ID})).await;
+        let lineage = call(&surface, GET_LINEAGE_TOOL, json!({"id": OBJECT_ID})).await;
         assert!(call_output(lineage.clone()).is_ok(), "{lineage}");
         let listed = call(&surface, LIST_CLASSES_TOOL, json!({})).await;
         assert!(
             listed.get("error").is_some() || call_output(listed.clone()).is_err(),
             "{listed}"
         );
+    }
+
+    /// Opens branch `feature` on the namespace head and stores one edit,
+    /// over MCP, returning the parent and the edited head digests.
+    async fn edit_branch(surface: &InProcessSurface, member: Value) -> (String, String) {
+        use crate::mcp_adapter::protocol::{
+            CREATE_DEFINITION_BRANCH_TOOL as BRANCH_CREATE_TOOL,
+            EDIT_DEFINITION_BRANCH_TOOL as BRANCH_EDIT_TOOL,
+        };
+        let created = call(
+            surface,
+            BRANCH_CREATE_TOOL,
+            json!({
+                "branchId": "feature",
+                "parentRevisionDigest": "",
+                "idempotencyKey": "create-feature"
+            }),
+        )
+        .await;
+        let parent =
+            call_output(created.clone()).unwrap()["output"]["branch"]["headRevisionDigest"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{created}"))
+                .to_string();
+        let edited = call(
+            surface,
+            BRANCH_EDIT_TOOL,
+            json!({
+                "branchId": "feature",
+                "expectedHeadDigest": parent,
+                "upserts": [member],
+                "removals": [],
+                "idempotencyKey": "edit-feature"
+            }),
+        )
+        .await;
+        let head = call_output(edited.clone()).unwrap()["output"]["revision"]["revisionDigest"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{edited}"))
+            .to_string();
+        (parent, head)
+    }
+
+    #[tokio::test]
+    async fn rehearsal_tools_are_listed_read_only() {
+        use crate::mcp_adapter::protocol::{
+            DRY_RUN_AGENT_TOOL, DRY_RUN_CHANGE_BUNDLE_TOOL, PREVIEW_TRANSFORM_TOOL,
+            SIMULATE_PLAN_TOOL,
+        };
+        let surface = InProcessSurface::synthetic().await.unwrap();
+        let listed = handle_message(
+            &surface,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await
+        .unwrap();
+        let tools = listed["result"]["tools"].as_array().expect("tools");
+        for name in [
+            DRY_RUN_AGENT_TOOL,
+            SIMULATE_PLAN_TOOL,
+            PREVIEW_TRANSFORM_TOOL,
+            DRY_RUN_CHANGE_BUNDLE_TOOL,
+        ] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap_or_else(|| panic!("{name} not listed"));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{tool}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_agent_edits_a_branch_and_dry_runs_its_change_bundle_without_writing_facts() {
+        use crate::mcp_adapter::protocol::{DRY_RUN_CHANGE_BUNDLE_TOOL, GET_OBJECT_TOOL};
+        let surface = InProcessSurface::synthetic().await.unwrap();
+        let before = call(&surface, GET_OBJECT_TOOL, json!({"id": OBJECT_ID})).await;
+        let before = call_output(before).unwrap()["output"].clone();
+        let (parent, head) = edit_branch(
+            &surface,
+            json!({
+                "memberKind": "object_type",
+                "memberId": "Ticket",
+                "definitionJson": "{\"name\":\"Ticket\",\"properties\":[\"title\"]}",
+                "memberDigest": ""
+            }),
+        )
+        .await;
+        let report = call(
+            &surface,
+            DRY_RUN_CHANGE_BUNDLE_TOOL,
+            json!({"fromRevisionDigest": parent, "toRevisionDigest": head}),
+        )
+        .await;
+        let report = call_output(report.clone()).unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            report["output"]["bundleDigest"]
+                .as_str()
+                .is_some_and(|digest| digest.starts_with("sha256:")),
+            "{report}"
+        );
+        let after = call(&surface, GET_OBJECT_TOOL, json!({"id": OBJECT_ID})).await;
+        assert_eq!(call_output(after).unwrap()["output"], before);
+    }
+
+    #[tokio::test]
+    async fn an_agent_dry_run_returns_a_trace_and_submits_no_action() {
+        use crate::grpc::pb::sekai::ListActionInstancesRequest;
+        use crate::mcp_adapter::protocol::DRY_RUN_AGENT_TOOL;
+        use crate::sekai::agent_dry_run::{ProposedAction, ScriptedHost};
+        let mut surface = InProcessSurface::synthetic().await.unwrap();
+        surface.sekai =
+            surface
+                .sekai
+                .clone()
+                .with_dry_run_host(Some(Arc::new(ScriptedHost::proposing(vec![
+                    ProposedAction {
+                        action_type: ACTION_TYPE.into(),
+                        parameters_json: "{}".into(),
+                    },
+                ]))));
+        let definition = json!({
+            "contract_version": "sekai.agent-definition/v1",
+            "name": "Triage",
+            "task_class": "lookup",
+            "instructions": "Inspect records.",
+            "allowed_action_types": [ACTION_TYPE]
+        });
+        let (_, head) = edit_branch(
+            &surface,
+            json!({
+                "memberKind": "agent",
+                "memberId": "triage",
+                "definitionJson": definition.to_string(),
+                "memberDigest": ""
+            }),
+        )
+        .await;
+        let traced = call(
+            &surface,
+            DRY_RUN_AGENT_TOOL,
+            json!({"revisionDigest": head, "memberId": "triage", "input": "inspect"}),
+        )
+        .await;
+        let trace = call_output(traced.clone()).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(trace["output"]["modelSteps"][0]["route"], "native/scripted");
+        assert_eq!(trace["output"]["actions"][0]["actionType"], ACTION_TYPE);
+        let instances = surface
+            .sekai
+            .list_action_instances(with_identity(
+                ListActionInstancesRequest {
+                    namespace: NAMESPACE.into(),
+                    ..Default::default()
+                },
+                "local",
+                NAMESPACE,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(instances.instances.is_empty(), "{instances:?}");
+    }
+
+    #[tokio::test]
+    async fn a_simulation_the_rpc_refuses_is_refused_the_same_way() {
+        use crate::grpc::pb::sekai::SimulatePlanRequest;
+        use crate::mcp_adapter::protocol::SIMULATE_PLAN_TOOL;
+        let surface = InProcessSurface::synthetic().await.unwrap();
+        let rpc = surface
+            .sekai
+            .simulate_plan(with_identity(
+                SimulatePlanRequest {
+                    namespace: NAMESPACE.into(),
+                    plan_id: "missing".into(),
+                    simulation_id: format!("op-{SIMULATE_PLAN_TOOL}"),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap_err();
+        let called = call(&surface, SIMULATE_PLAN_TOOL, json!({"planId": "missing"})).await;
+        let refused = call_output(called.clone()).unwrap_err();
+        let AdapterError::Projected(expected) = status_error(rpc) else {
+            unreachable!()
+        };
+        assert!(
+            refused.contains(&format!("\"{}\"", expected.code)),
+            "{called}"
+        );
+        // The simulation id is the poll handle, so it cannot drift from the call.
+        let drifted = call(
+            &surface,
+            SIMULATE_PLAN_TOOL,
+            json!({"planId": "missing", "simulationId": "other"}),
+        )
+        .await;
+        assert_eq!(drifted["error"]["code"], -32602, "{drifted}");
     }
 }

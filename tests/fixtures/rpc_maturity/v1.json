@@ -207,7 +207,7 @@
       "rpc": "DryRunAgent",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -450,7 +450,7 @@
       "rpc": "DryRunDefinitionChangeBundle",
       "storage_path": "sekai.definition-branch, sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "advanced"
     },
@@ -846,7 +846,7 @@
       "rpc": "PreviewGovernedTransform",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -2349,7 +2349,7 @@
       "rpc": "SimulatePlan",
       "storage_path": "sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "advanced"
     },
