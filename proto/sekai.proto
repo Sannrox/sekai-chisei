@@ -2534,6 +2534,21 @@ message SimulateObjectPolicyChangeResponse {
   repeated string applied_remove_grant_ids = 7;
   // True when more differences exist than `limit` returned.
   bool differences_truncated = 8;
+  // Per named principal, the enabled governed Action types it may propose
+  // and decide now and under the candidate grants (#2708). Empty when the
+  // caller may not list the namespace's Action types.
+  repeated PolicySimulationActionSummary action_summaries = 9;
+}
+// The Action types one principal may propose (submit) and run (decide a
+// parked instance of) before and after a candidate grant change. Only the
+// grant gates are simulated: submission criteria over the bound object,
+// action policy and review-queue placement still apply on a real call.
+message PolicySimulationActionSummary {
+  string principal = 1;
+  repeated string current_proposable_type_ids = 2;
+  repeated string candidate_proposable_type_ids = 3;
+  repeated string current_runnable_type_ids = 4;
+  repeated string candidate_runnable_type_ids = 5;
 }
 // Candidate marking rule for a counterfactual view: objects of `kind` whose
 // properties equal every `property_equals` entry carry `marking` instead.

@@ -1723,7 +1723,7 @@ pub(super) fn team_namespace_memberships(
 }
 
 /// [`team_namespace_memberships`] with namespace grants from `grants`.
-fn team_namespace_memberships_in(
+pub(super) fn team_namespace_memberships_in(
     db: &RuntimeDb,
     grants: ReadGrants<'_>,
     principals: &[String],

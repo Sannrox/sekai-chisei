@@ -39219,6 +39219,8 @@ mod object_type_index_rpc_tests;
 #[path = "dataset_rpc_tests.rs"]
 mod dataset_rpc_tests;
 
+#[path = "policy_simulation_action_tests.rs"]
+mod policy_simulation_action_tests;
 #[path = "policy_simulation_rpc_tests.rs"]
 mod policy_simulation_rpc_tests;
 

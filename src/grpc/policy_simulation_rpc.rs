@@ -181,6 +181,8 @@ fn simulate_blocking(
             push_differences(&mut differences, principal, object, &now, &then);
         }
     }
+    let action_summaries =
+        action_summaries(service, principals, namespace, &named, candidate_grants)?;
     differences.sort_by(|left: &PolicySimulationDifference, right| {
         (&left.principal, &left.object_id, &left.property).cmp(&(
             &right.principal,
@@ -250,7 +252,96 @@ fn simulate_blocking(
         applied_add_grants,
         applied_remove_grant_ids,
         differences_truncated,
+        action_summaries,
     })
+}
+
+/// Per named principal, the enabled Action types its grants let it propose
+/// and decide, over the stored grants and over `candidate`. The same gates
+/// real submission and decision call decide each answer. Nothing is
+/// reported when the caller may not list the namespace's Action types.
+fn action_summaries(
+    service: &SekaiServiceImpl,
+    caller: &[String],
+    namespace: &str,
+    named: &[String],
+    candidate: ReadGrants<'_>,
+) -> Result<Vec<PolicySimulationActionSummary>, Status> {
+    let db = service.db.runtime();
+    // As `ListGovernedActionTypes` authorizes its caller.
+    let caller_lists_types = check_team_namespace(db, caller, namespace, true).is_ok()
+        && check_action_admin(
+            &service.security,
+            &format!("governed_action:{namespace}"),
+            caller,
+        )
+        .is_ok();
+    if !caller_lists_types {
+        return Ok(Vec::new());
+    }
+    let types = db
+        .list_governed_action_types(namespace, None, true)
+        .map_err(Status::internal)?;
+    let allowed = |grants: ReadGrants<'_>, principal: &String| -> Result<_, Status> {
+        let subject = std::slice::from_ref(principal);
+        let proposes = granted(authorize_action_instance_submit_in(
+            service, grants, subject, namespace,
+        ))?;
+        let admin = granted(authorize_source_type_namespace_admin_in(
+            service, grants, subject, namespace,
+        ))?;
+        let mut proposable = BTreeSet::new();
+        let mut runnable = BTreeSet::new();
+        for type_def in &types {
+            if proposes {
+                proposable.insert(type_def.type_id.clone());
+            }
+            if crate::sekai::action_instance_admission::entitled_to_decide(
+                type_def,
+                std::iter::once(principal.as_str()),
+                admin,
+            ) {
+                runnable.insert(type_def.type_id.clone());
+            }
+        }
+        Ok((
+            proposable.into_iter().collect::<Vec<_>>(),
+            runnable.into_iter().collect::<Vec<_>>(),
+        ))
+    };
+    named
+        .iter()
+        .map(|principal| {
+            let (current_proposable_type_ids, current_runnable_type_ids) =
+                allowed(ReadGrants::Stored, principal)?;
+            let (candidate_proposable_type_ids, candidate_runnable_type_ids) =
+                allowed(candidate, principal)?;
+            Ok(PolicySimulationActionSummary {
+                principal: principal.clone(),
+                current_proposable_type_ids,
+                candidate_proposable_type_ids,
+                current_runnable_type_ids,
+                candidate_runnable_type_ids,
+            })
+        })
+        .collect()
+}
+
+/// A refusal is `false`; a check that could not complete fails the
+/// simulation instead of reporting a guess.
+fn granted<T>(decision: Result<T, Status>) -> Result<bool, Status> {
+    match decision {
+        Ok(_) => Ok(true),
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(status) => Err(status),
+    }
 }
 
 /// One side of a simulated read: the visible property names when readable.

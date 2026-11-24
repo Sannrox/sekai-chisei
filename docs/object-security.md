@@ -47,6 +47,13 @@ on the same object and principal, as `CreateGrant` does.
   `object_grant`, `marking`, `object_row`, `purpose`), and the properties the
   candidate still hides.
 - Only objects the caller may read itself are counted or listed.
+- `action_summaries` lists, per principal, the enabled governed Action types it
+  may propose (`SubmitActionInstance`'s namespace write gate) and run (decide a
+  parked instance: a named approver, or a namespace Admin when the type names
+  none), now and under the candidate grants. Real submission and decision call
+  the same gates. Submission criteria over the bound object, action policy,
+  the submitter rule and review-queue placement are not simulated. It is empty
+  when the caller may not list the namespace's Action types.
 - `limit` caps `differences` (default and maximum 10000);
   `differences_truncated` says rows were cut. Counts stay exact: a namespace
   with more than 10000 objects is refused.
