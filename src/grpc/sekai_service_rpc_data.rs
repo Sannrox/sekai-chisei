@@ -5796,6 +5796,7 @@ fn from_proto_content_ref(proto: ContentReference) -> crate::sekai::document::Co
         digest: proto.digest,
         media_type: proto.media_type,
         byte_length: proto.byte_length,
+        media_reference: proto.media_reference,
     }
 }
 
@@ -5805,6 +5806,7 @@ fn to_proto_content_ref(reference: &crate::sekai::document::ContentReference) ->
         digest: reference.digest.clone(),
         media_type: reference.media_type.clone(),
         byte_length: reference.byte_length,
+        media_reference: reference.media_reference.clone(),
     }
 }
 
@@ -5947,11 +5949,33 @@ pub(super) async fn admit_governed_document(
         .namespace
         .clone();
     authorize_document_namespace(service, &req, &principals, &namespace, true)?;
-    let proto = req
-        .into_inner()
-        .document
-        .ok_or_else(|| Status::invalid_argument("document required"))?;
-    let admission = from_proto_admission(proto)?;
+    let admission = from_proto_admission(
+        req.get_ref()
+            .document
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("document required"))?,
+    )?;
+    if admission.content_ref.bound_media().is_some() {
+        let prepared = crate::sekai::document::prepare_admission(
+            service.db.runtime(),
+            actor,
+            &admission,
+            now_millis(),
+        )
+        .map_err(map_document_error)?;
+        super::media_upload_rpc::bind_document_media(
+            service,
+            &req,
+            &prepared.namespace,
+            &prepared.content_ref,
+            &prepared.classification,
+            &crate::sekai::media_upload::MediaBinding {
+                document_id: prepared.document_id,
+                rendition_id: String::new(),
+                bound_at_ms: 0,
+            },
+        )?;
+    }
     let admitted = crate::sekai::document::admit_document(
         service.db.runtime(),
         actor,
@@ -5978,11 +6002,33 @@ pub(super) async fn attach_governed_document_rendition(
         .namespace
         .clone();
     authorize_document_namespace(service, &req, &principals, &namespace, true)?;
-    let proto = req
-        .into_inner()
-        .rendition
-        .ok_or_else(|| Status::invalid_argument("rendition required"))?;
-    let attachment = from_proto_attachment(proto)?;
+    let attachment = from_proto_attachment(
+        req.get_ref()
+            .rendition
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("rendition required"))?,
+    )?;
+    if attachment.content_ref.bound_media().is_some() {
+        let (document, prepared) = crate::sekai::document::prepare_rendition(
+            service.db.runtime(),
+            actor,
+            &attachment,
+            now_millis(),
+        )
+        .map_err(map_document_error)?;
+        super::media_upload_rpc::bind_document_media(
+            service,
+            &req,
+            &document.namespace,
+            &prepared.content_ref,
+            &document.classification,
+            &crate::sekai::media_upload::MediaBinding {
+                document_id: prepared.document_id,
+                rendition_id: prepared.rendition_id,
+                bound_at_ms: 0,
+            },
+        )?;
+    }
     let attached = crate::sekai::document::attach_rendition(
         service.db.runtime(),
         actor,

@@ -33,6 +33,61 @@ pub const PROPERTY_SHA256: &str = "sha256";
 pub const PROPERTY_SIZE_BYTES: &str = "size_bytes";
 pub const PROPERTY_MEDIA_TYPE: &str = "media_type";
 pub const PROPERTY_FILE_NAME: &str = "file_name";
+/// Set when a governed document binds the attachment (ADR 0159).
+pub const PROPERTY_BOUND_DOCUMENT: &str = "bound_document_id";
+/// Set with [`PROPERTY_BOUND_DOCUMENT`] when a rendition of it binds it.
+pub const PROPERTY_BOUND_RENDITION: &str = "bound_rendition_id";
+/// When the binding was last written, in epoch milliseconds.
+pub const PROPERTY_BOUND_AT: &str = "bound_at_ms";
+/// How long a binding no stored document or rendition names yet stays
+/// protected from removal: admission binds first and stores the record after.
+pub const PENDING_BINDING_MS: i64 = 10 * 60 * 1000;
+
+/// The governed document, or one of its renditions, that owns an
+/// attachment's bytes. It lives in the attachment's namespace. Once set its
+/// target never changes: an attachment is bound at most once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaBinding {
+    pub document_id: String,
+    /// Empty when the document itself binds the attachment.
+    pub rendition_id: String,
+    /// When the binding was last written; a retry writes it again.
+    pub bound_at_ms: i64,
+}
+
+impl MediaBinding {
+    /// The binding an attachment's properties record, none when unbound.
+    pub fn of(properties: &std::collections::HashMap<String, String>) -> Option<Self> {
+        let document_id = properties.get(PROPERTY_BOUND_DOCUMENT)?;
+        Some(Self {
+            document_id: document_id.clone(),
+            rendition_id: properties
+                .get(PROPERTY_BOUND_RENDITION)
+                .cloned()
+                .unwrap_or_default(),
+            bound_at_ms: properties
+                .get(PROPERTY_BOUND_AT)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Whether `other` binds the same document or rendition.
+    pub fn same_target(&self, other: &Self) -> bool {
+        self.document_id == other.document_id && self.rendition_id == other.rendition_id
+    }
+
+    /// Records the binding on an attachment's properties.
+    pub fn record(&self, properties: &mut std::collections::HashMap<String, String>) {
+        properties.insert(PROPERTY_BOUND_DOCUMENT.into(), self.document_id.clone());
+        properties.insert(PROPERTY_BOUND_AT.into(), self.bound_at_ms.to_string());
+        if self.rendition_id.is_empty() {
+            properties.remove(PROPERTY_BOUND_RENDITION);
+        } else {
+            properties.insert(PROPERTY_BOUND_RENDITION.into(), self.rendition_id.clone());
+        }
+    }
+}
 
 /// What a client declares when it begins an upload. Everything here is
 /// fixed for the session.

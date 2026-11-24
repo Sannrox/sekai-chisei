@@ -50,3 +50,15 @@ file again from offset 0. Every plane instance runs the expiry every ten
 minutes as the `media_upload_expiry` background job. A completion that
 races it is refused with `FAILED_PRECONDITION` and can be sent again; a
 completed file is never expired.
+
+## Attachments a document binds
+
+A governed document or rendition can take an attachment as its content
+([governed documents](documents.md#media-backed-content), ADR 0159). Binding
+sets the attachment's marking to the document classification and records
+`bound_document_id` (plus `bound_rendition_id` for a rendition). After that:
+
+- `ReadMedia` also requires reading the document, otherwise it returns
+  `NOT_FOUND`;
+- `DeleteMedia` fails with `FAILED_PRECONDITION` until the document is deleted
+  or expired and not held.

@@ -1,9 +1,12 @@
 # Governed documents and renditions
 
-Bind document metadata, digest-addressed content references, renditions,
-extraction provenance, retention, hold, and deletion. The plane does not store
-bytes, open external storage, or run an extractor. See
-[ADR 0039](decisions/0039-governed-documents.md) and
+Bind document metadata, content references, renditions, extraction
+provenance, retention, hold, and deletion. The plane does not open external
+storage or run an extractor. It holds bytes only for a `media` content
+reference, as an uploaded media attachment the document governs (see
+[Media-backed content](#media-backed-content)). See
+[ADR 0039](decisions/0039-governed-documents.md),
+[ADR 0159](decisions/0159-a-governed-document-may-hold-its-bytes-as-plane-media.md) and
 [Discussion 771](https://github.com/Sannrox/sekai-chisei/discussions/771).
 
 ## Contract
@@ -12,8 +15,9 @@ bytes, open external storage, or run an extractor. See
 
 - identity `(namespace, document_id)`, owner, and type revision `v1`
 - purpose and classification
-- a content reference with `scheme=digest`, media type, byte length, and
-  `sha256` digest
+- a content reference with `scheme=digest` or `scheme=media`, media type,
+  byte length, and `sha256` digest; a `media` reference also names its
+  `media_reference`
 - optional expiry, hold identity, and bounded metadata
 
 Document content types are `text/plain`, `application/pdf`,
@@ -34,6 +38,42 @@ lineage to the document id, parent content digest, and rendition digest. A
 score below the function's `minimum_confidence_micros` parks a
 `require_approval` Action instead of writing the object. Scores and
 thresholds above `1_000_000` fail closed.
+
+## Media-backed content
+
+The media RPCs are experimental (`SEKAI_EXPERIMENTAL_RPCS=1`). Upload the
+file with them ([media uploads](media-uploads.md)), then
+admit the document or attach the rendition with `scheme=media` and the
+upload's `sekai-media:` reference in `media_reference`. The document limit of
+32 MiB applies.
+
+Admission checks four things before anything is stored:
+
+- the attachment is a complete upload in the document's namespace;
+- the caller may read and update it;
+- its SHA-256, length, and media type equal `digest`, `byte_length`, and
+  `media_type`;
+- the document id is free or holds this same definition.
+
+It then binds the attachment: its marking becomes the document
+classification, and the binding is recorded. An attachment binds to one
+document or rendition. Binding it elsewhere fails with `FAILED_PRECONDITION`;
+re-admitting the same document succeeds.
+
+From then on:
+
+- `ReadMedia` returns the bytes only to a caller who may read the document.
+  That means its owner, presenting the document purpose in `x-sekai-purpose`,
+  while the document is live. Everyone else gets `NOT_FOUND`.
+- `DeleteMedia` fails with `FAILED_PRECONDITION` while the document is live or
+  held. After the document is deleted or expired it removes the bytes. If an
+  admission binds an attachment but never stores its record, the bytes become
+  removable 10 minutes after the last attempt.
+- A rendition's bytes follow its parent document.
+
+Upgrade every instance before admitting media-backed documents. An older
+instance checks only the attachment, which carries the document
+classification but not the owner and purpose rule.
 
 ## Operator workflow
 

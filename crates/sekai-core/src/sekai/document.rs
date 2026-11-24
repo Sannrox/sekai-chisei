@@ -2,7 +2,10 @@
 //!
 //! A document is an object that binds metadata, a content reference, purpose,
 //! classification, retention, and hold. Renditions are derived children. The
-//! plane does not store bytes or run extractors.
+//! plane runs no extractors. A `digest` content reference names bytes held
+//! outside the plane; a `media` one names a plane media attachment the
+//! document then governs (ADR 0159): reading the bytes is reading the
+//! document, and its deletion or expiry ends that read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,6 +19,7 @@ use crate::sekai::markings::{
     parse_classification, principal_authority_from_profile, principal_profile_external_id,
     trusted_service_authority,
 };
+use crate::sekai::media_upload::{MediaBinding, PENDING_BINDING_MS};
 #[cfg(test)]
 use crate::sekai::security::Role;
 use crate::shomei;
@@ -23,6 +27,9 @@ use crate::shomei;
 pub const DOCUMENT_CONTRACT: &str = "sekai.governed-document/v1";
 pub const TYPE_REVISION_V1: &str = "v1";
 pub const CONTENT_SCHEME_DIGEST: &str = "digest";
+pub const CONTENT_SCHEME_MEDIA: &str = "media";
+/// Largest content a document or rendition may declare, media-backed too.
+pub const MAX_CONTENT_BYTES: u64 = 32 * 1024 * 1024;
 pub const FIELD_IDENTITY: &str = "identity";
 pub const FIELD_CONTENT_REF: &str = "content_ref";
 pub const FIELD_METADATA: &str = "metadata";
@@ -53,6 +60,18 @@ pub struct ContentReference {
     pub digest: String,
     pub media_type: String,
     pub byte_length: u64,
+    /// The `sekai-media:` attachment of a `media` reference. Left out of
+    /// the stored record when empty, so a `digest` reference and its
+    /// content digest are unchanged.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub media_reference: String,
+}
+
+impl ContentReference {
+    /// The attachment a `media` reference binds; none for `digest`.
+    pub fn bound_media(&self) -> Option<&str> {
+        (self.scheme == CONTENT_SCHEME_MEDIA).then_some(self.media_reference.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +203,8 @@ struct ContentPin<'a> {
     digest: &'a str,
     media_type: &'a str,
     byte_length: u64,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    media_reference: &'a str,
 }
 
 #[derive(Serialize)]
@@ -208,6 +229,7 @@ pub fn content_digest_for(reference: &ContentReference) -> Result<String, String
             digest: &reference.digest,
             media_type: &reference.media_type,
             byte_length: reference.byte_length,
+            media_reference: &reference.media_reference,
         })?
     ))
 }
@@ -220,17 +242,7 @@ pub fn admit_document(
     admission: &DocumentAdmission,
     now_ms: i64,
 ) -> Result<GovernedDocument, String> {
-    required("actor", actor)?;
-    if now_ms < 0 {
-        return Err("admit timestamp must be non-negative".into());
-    }
-    // Admitting on behalf of someone else is refused, not rewritten.
-    if !admission.owner.is_empty() && admission.owner != actor {
-        return Err(DOCUMENT_UNAVAILABLE.into());
-    }
-    let validated = validate_document(admission, actor, now_ms)?;
-    let lattice = db.get_classification_lattice(&validated.namespace)?;
-    check_marking(lattice.as_ref(), &validated.classification)?;
+    let validated = prepare_admission(db, actor, admission, now_ms)?;
     // Insert-or-read in one step: under concurrency the first definition wins
     // and every other admission is compared against it (#1776).
     let Some(existing) = db.insert_governed_document(&validated)? else {
@@ -247,15 +259,44 @@ pub fn admit_document(
     Err(DOCUMENT_UNAVAILABLE.into())
 }
 
-/// Attaches a rendition to a live document owned by `actor`. Attaching the
-/// same rendition again returns the stored one, so a retry is idempotent; a
-/// different rendition under the same id is refused.
-pub fn attach_rendition(
+/// The document `admission` would store, or why it is refused, without
+/// storing anything. An id already holding another definition is refused
+/// here too, so a caller can bind media (ADR 0159) only for an admission that
+/// can still succeed.
+pub fn prepare_admission(
+    db: &RuntimeDb,
+    actor: &str,
+    admission: &DocumentAdmission,
+    now_ms: i64,
+) -> Result<GovernedDocument, String> {
+    required("actor", actor)?;
+    if now_ms < 0 {
+        return Err("admit timestamp must be non-negative".into());
+    }
+    // Admitting on behalf of someone else is refused, not rewritten.
+    if !admission.owner.is_empty() && admission.owner != actor {
+        return Err(DOCUMENT_UNAVAILABLE.into());
+    }
+    let validated = validate_document(admission, actor, now_ms)?;
+    let lattice = db.get_classification_lattice(&validated.namespace)?;
+    check_marking(lattice.as_ref(), &validated.classification)?;
+    if let Some(existing) =
+        db.get_governed_document(&validated.namespace, &validated.document_id)?
+        && definition_digest(&existing)? != definition_digest(&validated)?
+    {
+        return Err(DOCUMENT_UNAVAILABLE.into());
+    }
+    Ok(validated)
+}
+
+/// The rendition `attachment` would store and its live parent document, or
+/// why it is refused, without storing anything.
+pub fn prepare_rendition(
     db: &RuntimeDb,
     actor: &str,
     attachment: &RenditionAttachment,
     now_ms: i64,
-) -> Result<DocumentRendition, String> {
+) -> Result<(GovernedDocument, DocumentRendition), String> {
     required("actor", actor)?;
     if now_ms < 0 {
         return Err("attach timestamp must be non-negative".into());
@@ -268,6 +309,19 @@ pub fn attach_rendition(
         now_ms,
     )?;
     let validated = validate_rendition(&document, attachment, actor, now_ms)?;
+    Ok((document, validated))
+}
+
+/// Attaches a rendition to a live document owned by `actor`. Attaching the
+/// same rendition again returns the stored one, so a retry is idempotent; a
+/// different rendition under the same id is refused.
+pub fn attach_rendition(
+    db: &RuntimeDb,
+    actor: &str,
+    attachment: &RenditionAttachment,
+    now_ms: i64,
+) -> Result<DocumentRendition, String> {
+    let (_, validated) = prepare_rendition(db, actor, attachment, now_ms)?;
     // Insert-or-read in one step: under concurrency the first attachment
     // wins and every other one is compared against it.
     let Some(prior) = db.insert_governed_rendition(&validated, MAX_RENDITIONS)? else {
@@ -349,6 +403,86 @@ pub fn retrieve_document(
         hold_id: wants_metadata.then(|| document.hold_id.clone()),
         renditions,
     })
+}
+
+/// Whether `actor` may read the bytes of the attachment `media_reference`
+/// that `binding` names in `namespace`: the document read (owner, live,
+/// classification, purpose), and the document or its rendition still names
+/// that attachment. A rendition's bytes follow its parent.
+pub fn bound_media_readable(
+    db: &RuntimeDb,
+    actor: &str,
+    namespace: &str,
+    binding: &MediaBinding,
+    media_reference: &str,
+    purpose: Option<&str>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let mut fields = vec![FIELD_CONTENT_REF.to_string()];
+    if !binding.rendition_id.is_empty() {
+        fields.push(FIELD_RENDITIONS.into());
+    }
+    let view = retrieve_document(
+        db,
+        actor,
+        &DocumentRetrieve {
+            namespace: namespace.into(),
+            document_id: binding.document_id.clone(),
+            purpose: purpose.map(str::to_string),
+            fields,
+            classification_ceiling: None,
+        },
+        now_ms,
+    )?;
+    let named = if binding.rendition_id.is_empty() {
+        view.content_ref
+            .is_some_and(|content| content.bound_media() == Some(media_reference))
+    } else {
+        view.renditions.unwrap_or_default().iter().any(|rendition| {
+            rendition.rendition_id == binding.rendition_id
+                && rendition.content_ref.bound_media() == Some(media_reference)
+        })
+    };
+    if named {
+        Ok(())
+    } else {
+        Err(DOCUMENT_UNAVAILABLE.into())
+    }
+}
+
+/// Whether bound media may be removed: its document is deleted or expired,
+/// or neither it nor the binding rendition names the attachment once the
+/// binding is older than [`PENDING_BINDING_MS`] (an admission that failed or
+/// stopped after binding). Until then the admission that bound it may still
+/// store its record. A hold keeps named media.
+pub fn bound_media_removable(
+    db: &RuntimeDb,
+    namespace: &str,
+    binding: &MediaBinding,
+    media_reference: &str,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let abandoned = now_ms >= binding.bound_at_ms.saturating_add(PENDING_BINDING_MS);
+    let Some(document) = db.get_governed_document(namespace, &binding.document_id)? else {
+        return Ok(abandoned);
+    };
+    // Deleted or expired (never while held) ends the document's claim and
+    // its renditions'.
+    if document.deleted_at_ms != 0 || is_expired(&document, now_ms) {
+        return Ok(true);
+    }
+    let named = if binding.rendition_id.is_empty() {
+        document.content_ref.bound_media() == Some(media_reference)
+    } else {
+        db.list_governed_renditions(namespace, &binding.document_id)?
+            .iter()
+            .any(|rendition| {
+                rendition.rendition_id == binding.rendition_id
+                    && rendition.content_ref.bound_media() == Some(media_reference)
+            })
+    };
+    // A live or held document keeps what it names.
+    Ok(!named && abandoned)
 }
 
 pub fn place_hold(
@@ -606,13 +740,19 @@ fn validate_rendition(
 }
 
 fn validate_content_ref(reference: &ContentReference, class: Option<&str>) -> Result<(), String> {
-    if reference.scheme != CONTENT_SCHEME_DIGEST {
-        return Err(REVISION_UNSUPPORTED.into());
+    match reference.scheme.as_str() {
+        CONTENT_SCHEME_DIGEST if reference.media_reference.is_empty() => {}
+        CONTENT_SCHEME_MEDIA
+            if crate::sekai::media_upload::parse_reference(&reference.media_reference).is_ok() => {}
+        CONTENT_SCHEME_DIGEST | CONTENT_SCHEME_MEDIA => {
+            return Err("governed document media reference is invalid".into());
+        }
+        _ => return Err(REVISION_UNSUPPORTED.into()),
     }
     if !digest_token(&reference.digest) {
         return Err(DOCUMENT_UNAVAILABLE.into());
     }
-    if reference.byte_length == 0 || reference.byte_length > 32 * 1024 * 1024 {
+    if reference.byte_length == 0 || reference.byte_length > MAX_CONTENT_BYTES {
         return Err("governed document content length is invalid".into());
     }
     if !supported_media_type(&reference.media_type, class) {
@@ -850,6 +990,7 @@ mod tests {
             digest: digest(1),
             media_type: media.into(),
             byte_length: 128,
+            media_reference: String::new(),
         }
     }
 
@@ -906,6 +1047,7 @@ mod tests {
                 digest: digest(2),
                 media_type: MEDIA_TEXT_PLAIN.into(),
                 byte_length: 32,
+                media_reference: String::new(),
             },
             extractor_id: "extractor:text".into(),
             extractor_profile_digest: digest(3),
@@ -1155,6 +1297,66 @@ mod tests {
             retrieve(&runtime, &["secret"], "case-review", Some("internal")).unwrap_err(),
             DOCUMENT_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn a_media_reference_needs_the_media_scheme_and_leaves_digest_records_alone() {
+        let media = ContentReference {
+            scheme: CONTENT_SCHEME_MEDIA.into(),
+            media_reference: "sekai-media:media-abc".into(),
+            ..content_ref(MEDIA_PDF)
+        };
+        assert!(validate_content_ref(&media, None).is_ok());
+        assert_eq!(media.bound_media(), Some("sekai-media:media-abc"));
+        for refused in [
+            ContentReference {
+                media_reference: "https://example.invalid/x".into(),
+                ..media.clone()
+            },
+            ContentReference {
+                media_reference: String::new(),
+                ..media.clone()
+            },
+            ContentReference {
+                scheme: CONTENT_SCHEME_DIGEST.into(),
+                ..media.clone()
+            },
+        ] {
+            assert!(validate_content_ref(&refused, None).is_err(), "{refused:?}");
+        }
+        // A digest reference stores and pins exactly the fields it did before
+        // media references existed.
+        let digest_only = content_ref(MEDIA_PDF);
+        assert_eq!(digest_only.bound_media(), None);
+        let stored = serde_json::to_value(&digest_only).unwrap();
+        assert_eq!(
+            stored.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["byte_length", "digest", "media_type", "scheme"]
+        );
+        assert_ne!(
+            content_digest_for(&digest_only).unwrap(),
+            content_digest_for(&media).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_binding_no_record_names_yet_stays_protected_while_pending() {
+        let runtime = db();
+        let binding = MediaBinding {
+            document_id: "doc:pending".into(),
+            rendition_id: String::new(),
+            bound_at_ms: 1_000,
+        };
+        let removable = |now_ms| {
+            bound_media_removable(&runtime, "records", &binding, "sekai-media:media-x", now_ms)
+                .unwrap()
+        };
+        // Admission binds before it stores the document: a delete in between
+        // must not take the bytes.
+        assert!(!removable(1_000));
+        assert!(!removable(1_000 + PENDING_BINDING_MS - 1));
+        // An admission that never stored its record frees them.
+        assert!(removable(1_000 + PENDING_BINDING_MS));
     }
 
     #[test]

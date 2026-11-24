@@ -9,10 +9,15 @@
 //! any of them gets `NOT_FOUND`. `DeleteMedia` (#3042) applies the object
 //! delete checks and removes the object and its bytes; the session row stays
 //! as a deleted marker so its idempotency key cannot bring the file back.
+//!
+//! A governed document can bind an attachment as its content (ADR 0159).
+//! Binding sets the attachment's marking to the document classification, once.
+//! From then on `ReadMedia` also requires reading the document, and
+//! `DeleteMedia` waits until the document is deleted or expired and unheld.
 
 use super::*;
 use crate::sekai::media_upload::{
-    self, MAX_CHUNK_BYTES, MEDIA_KIND, MediaError, MediaUpload, MediaUploadRequest,
+    self, MAX_CHUNK_BYTES, MEDIA_KIND, MediaBinding, MediaError, MediaUpload, MediaUploadRequest,
 };
 use crate::sekai::object_security::ObjectSecurityOperation;
 use crate::sekai::purpose_authorization::PurposePresentation;
@@ -121,6 +126,23 @@ impl<'a> Caller<'a> {
     /// The caller may write the namespace, no freeze stops it, and it could
     /// create `object` there and still read it under its marking.
     fn authorize_write(&self, object: &domain::Object) -> Result<(), Status> {
+        self.authorize_change(
+            None,
+            object,
+            ObjectSecurityOperation::Create,
+            "media_upload",
+        )
+    }
+
+    /// As [`Self::authorize_write`], for `operation` turning `existing`
+    /// (none on a create) into `object`.
+    fn authorize_change(
+        &self,
+        existing: Option<&domain::Object>,
+        object: &domain::Object,
+        operation: ObjectSecurityOperation,
+        label: &str,
+    ) -> Result<(), Status> {
         let db = self.db();
         let tenant = self.tenant_context.as_ref();
         enforce_collaboration_namespace(db, tenant, &object.namespace, true)?;
@@ -147,11 +169,11 @@ impl<'a> Caller<'a> {
         {
             return Err(Status::permission_denied("access denied"));
         }
-        // Property and value-instance write grants apply as on any create.
-        // The properties are the upload's own, so any it could not keep is a
+        // Property and value-instance write grants apply as on any write.
+        // The properties are the server's own, so any it could not keep is a
         // refusal rather than a silent drop.
         let mut granted = object.clone();
-        enforce_property_grant_mutation(db, None, &mut granted)?;
+        enforce_property_grant_mutation(db, existing, &mut granted)?;
         if granted.properties != object.properties {
             return Err(Status::permission_denied("access denied"));
         }
@@ -161,15 +183,15 @@ impl<'a> Caller<'a> {
             &object.id,
             &self.principals,
             tenant,
-            ObjectSecurityOperation::Create,
+            operation,
         )?;
         enforce_object_operation_access(
             db,
             object,
             &self.principals,
             tenant,
-            ObjectSecurityOperation::Create,
-            "media_upload",
+            operation,
+            label,
             self.purpose.as_ref(),
         )?;
         Ok(())
@@ -236,7 +258,8 @@ impl<'a> Caller<'a> {
 
     /// Whether the caller may read a stored media object: the object read
     /// checks, without the reserved-kind exclusion that hides it from
-    /// generic object RPCs.
+    /// generic object RPCs. A bound attachment's bytes also need the
+    /// document read.
     fn may_read(&self, object: &domain::Object) -> bool {
         let db = self.db();
         let tenant = self.tenant_context.as_ref();
@@ -479,6 +502,22 @@ fn read_media_blocking(
     if !caller.may_read(&object) {
         return Err(hidden());
     }
+    // Bound bytes are the document's: reading them is reading it.
+    if let Some(binding) = MediaBinding::of(&object.properties) {
+        crate::sekai::document::bound_media_readable(
+            db,
+            &caller.actor(),
+            &object.namespace,
+            &binding,
+            &input.media_reference,
+            caller
+                .purpose
+                .as_ref()
+                .map(|presented| presented.purpose.as_str()),
+            now_millis(),
+        )
+        .map_err(|_| hidden())?;
+    }
     let upload_id = object
         .properties
         .get(media_upload::PROPERTY_UPLOAD_ID)
@@ -547,6 +586,20 @@ fn delete_media_blocking(
     };
     let generation = object_security_generation(db, &object.namespace)?;
     caller.authorize_delete(&object)?;
+    if let Some(binding) = MediaBinding::of(&object.properties)
+        && !crate::sekai::document::bound_media_removable(
+            db,
+            &object.namespace,
+            &binding,
+            &input.media_reference,
+            now_millis(),
+        )
+        .map_err(Status::internal)?
+    {
+        return Err(Status::failed_precondition(
+            "the media belongs to a governed document; delete or expire the document first",
+        ));
+    }
     let upload_id = object.properties.get(media_upload::PROPERTY_UPLOAD_ID);
     // Recorded before anything is removed, so every delete that removed
     // something has a decision; a retry after a crash adds another.
@@ -577,4 +630,101 @@ fn delete_media_blocking(
             error => Err(map_mutation_persistence_error(error)),
         })?;
     Ok(Response::new(DeleteMediaResponse {}))
+}
+
+/// Binds the attachment a `media` content reference names to the governed
+/// document or rendition `binding` (ADR 0159). Runs before the document or
+/// rendition is stored, so a stored record never names an attachment that is
+/// still governed by its own marking alone.
+///
+/// The attachment must be a complete upload in `namespace` the caller may
+/// read, holding exactly the declared digest, length and media type. Binding
+/// sets its marking to `classification` and records `binding` with the
+/// current time, compared and written against the attachment as read, so it
+/// binds at most once. Binding it again to the same target is a retry: it
+/// succeeds and renews the time, which keeps the attachment from removal
+/// while the record is stored.
+pub(super) fn bind_document_media<T: 'static>(
+    service: &SekaiServiceImpl,
+    req: &Request<T>,
+    namespace: &str,
+    content: &crate::sekai::document::ContentReference,
+    classification: &str,
+    binding: &MediaBinding,
+) -> Result<(), Status> {
+    let Some(reference) = content.bound_media() else {
+        return Ok(());
+    };
+    let caller = Caller::new(service, req)?;
+    let unavailable = || {
+        Status::failed_precondition(
+            "the media reference does not name a complete upload in the document's namespace",
+        )
+    };
+    let object_id = media_upload::parse_reference(reference).map_err(media_status)?;
+    let db = caller.db();
+    let object = db
+        .get_object(object_id)
+        .map_err(Status::internal)?
+        .filter(|object| {
+            object.kind == MEDIA_KIND && object.namespace == namespace && caller.may_read(object)
+        })
+        .ok_or_else(unavailable)?;
+    let stored = |name: &str| {
+        object
+            .properties
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or_default()
+    };
+    let upload_id = stored(media_upload::PROPERTY_UPLOAD_ID);
+    db.get_media_upload(upload_id)
+        .map_err(media_status)?
+        .filter(|upload| upload.object_id.as_deref() == Some(object_id) && !upload.is_deleted())
+        .ok_or_else(unavailable)?;
+    if content.digest != format!("sha256:{}", stored(media_upload::PROPERTY_SHA256))
+        || content.byte_length.to_string() != stored(media_upload::PROPERTY_SIZE_BYTES)
+        || content.media_type != stored(media_upload::PROPERTY_MEDIA_TYPE)
+    {
+        return Err(Status::invalid_argument(
+            "the declared digest, length or media type does not match the media attachment",
+        ));
+    }
+    if MediaBinding::of(&object.properties).is_some_and(|existing| !existing.same_target(binding)) {
+        return Err(Status::failed_precondition(
+            "the media attachment is bound to another document",
+        ));
+    }
+    // Written on a retry too: the fresh time keeps the attachment from
+    // removal until the record that names it is stored.
+    let now = now_millis();
+    let mut bound = object.clone();
+    MediaBinding {
+        bound_at_ms: now,
+        ..binding.clone()
+    }
+    .record(&mut bound.properties);
+    bound.properties.insert(
+        markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+        classification.trim().into(),
+    );
+    bound.updated = now;
+    // The update below must be fenced on the policy this authorization saw.
+    let generation = object_security_generation(db, namespace)?;
+    caller.authorize_change(
+        Some(&object),
+        &bound,
+        ObjectSecurityOperation::Update,
+        "bind_media",
+    )?;
+    ObjectMutation::direct(db)
+        .with_policy_generation(&generation)
+        .update(&bound, &bound, Some(&object), &caller.actor(), now)
+        .map_err(|error| match error {
+            crate::sekai::object_mutation::MutationPersistenceError::ChangedSinceAuthorization => {
+                Status::failed_precondition("the media attachment changed; submit again")
+            }
+            error => map_mutation_persistence_error(error),
+        })?;
+    Ok(())
 }

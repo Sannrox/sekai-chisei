@@ -75,3 +75,11 @@ an Action parameter or a media property can hold.
   attempt and idle time and bumps the attempt, like a checksum reset, so a
   completion that hashed the old bytes is refused at the finish and a chunk
   that arrived first spares the session.
+
+## Amendment 2026-11-24: attachments bound by a document
+
+[ADR 0159](0159-a-governed-document-may-hold-its-bytes-as-plane-media.md):
+a governed document may bind an attachment as its content. Binding sets the
+attachment's marking from the document classification, once. `ReadMedia` then
+also requires reading the document, and `DeleteMedia` waits until the
+document is deleted or expired and not held.

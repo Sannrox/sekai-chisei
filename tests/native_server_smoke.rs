@@ -2160,6 +2160,7 @@ fn smoke_content_ref(tag: u8, media: &str, bytes: u64) -> ContentReference {
         digest: document_digest(tag),
         media_type: media.into(),
         byte_length: bytes,
+        media_reference: String::new(),
     }
 }
 

@@ -747,6 +747,7 @@ mod tests {
             digest: digest.into(),
             media_type: media.into(),
             byte_length: len,
+            media_reference: String::new(),
         }
     }
 

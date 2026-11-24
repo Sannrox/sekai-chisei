@@ -2148,11 +2148,18 @@ message StreamingTransformApplyReceipt {
 message ApplyStreamingTransformBatchResponse {
   StreamingTransformApplyReceipt receipt = 1;
 }
+// A governed document's bytes. `scheme` is `digest` (bytes held outside the
+// plane) or `media` (bytes held as a plane media attachment, ADR 0159).
 message ContentReference {
   string scheme = 1;
+  // `sha256:<hex>` of the bytes.
   string digest = 2;
   string media_type = 3;
   uint64 byte_length = 4;
+  // With scheme `media`: the `sekai-media:` reference of a completed upload
+  // in the document's namespace. Admission binds it to the document, which
+  // then governs reading and removing its bytes. Empty otherwise.
+  string media_reference = 5;
 }
 message GovernedDocument {
   string contract_version = 1;
