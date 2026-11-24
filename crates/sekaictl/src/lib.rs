@@ -4,6 +4,7 @@
 //! authenticated gRPC and opens local stores through `chisei-core` and
 //! `sekai-core`. It does not depend on the server library.
 
+pub mod access_simulate_cli;
 pub mod action_cli;
 mod artifact_output;
 pub mod attest_cli;
