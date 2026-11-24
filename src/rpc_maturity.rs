@@ -669,7 +669,7 @@ mod tests {
             tonic::Code::FailedPrecondition
         );
         assert_eq!(
-            require_invokable("GetDefinitionMember", false)
+            require_invokable("CloseDefinitionProposal", false)
                 .unwrap_err()
                 .code(),
             tonic::Code::FailedPrecondition
@@ -687,7 +687,8 @@ mod tests {
         );
         assert!(require_invokable("RunAgentShadow", true).is_ok());
         assert!(require_invokable("GetAgentShadowReport", true).is_ok());
-        assert!(require_invokable("GetDefinitionMember", true).is_ok());
+        assert!(require_invokable("GetDefinitionMember", false).is_ok());
+        assert!(require_invokable("CloseDefinitionProposal", true).is_ok());
         assert!(require_invokable("CreateFunction", true).is_ok());
     }
 

@@ -374,6 +374,48 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "GetDefinitionBranch") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_definition_branch(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetDefinitionProposal") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_definition_proposal(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ApproveDefinitionProposal") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::approve_definition_proposal(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "MergeDefinitionProposal") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::merge_definition_proposal(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetDefinitionCertificationGate") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_definition_certification_gate(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListPublishedDefinitionRevisions") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_published_definition_revisions(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetDefinitionMember") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_definition_member(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "CreateObject") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_object(&*svc, req).await

@@ -125,21 +125,21 @@ Edit the fixture, then regenerate with
 | `SekaiService.InspectSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RetireSourceTypeDescriptor` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.CreateDefinitionBranch` | `sekai.definition-branch` | yes | mcp, example | `stable` |
-| `SekaiService.GetDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionBranch` | `sekai.definition-branch` | yes | host | `stable` |
 | `SekaiService.ApplyDefinitionBranchEdit` | `sekai.definition-branch` | yes | mcp, example | `stable` |
 | `SekaiService.CreateDefinitionProposal` | `sekai.definition-branch` | yes | mcp, example | `stable` |
-| `SekaiService.GetDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.ApproveDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.MergeDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionProposal` | `sekai.definition-branch` | yes | host | `stable` |
+| `SekaiService.ApproveDefinitionProposal` | `sekai.definition-branch` | yes | host | `stable` |
+| `SekaiService.MergeDefinitionProposal` | `sekai.definition-branch` | yes | host | `stable` |
 | `SekaiService.CloseDefinitionProposal` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.GetDefinitionMember` | `sekai.definition-branch` | yes | generated gRPC client | `experimental` |
+| `SekaiService.GetDefinitionMember` | `sekai.definition-branch` | yes | host | `stable` |
 | `SekaiService.PutDefinitionCertification` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.GetDefinitionCertificationGate` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.GetDefinitionCertificationGate` | `sekai.definition-branch` | yes | host | `stable` |
 | `SekaiService.DryRunAgent` | `sekai.definition-branch` | yes | mcp | `experimental` |
 | `SekaiService.RunAgentShadow` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetAgentShadowReport` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
-| `SekaiService.ListPublishedDefinitionRevisions` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.ListPublishedDefinitionRevisions` | `sekai.definition-branch` | yes | host | `stable` |
 | `SekaiService.ProposeDefinitionRollback` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.RebaseDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.SetDefinitionBranchArchived` | `sekai.definition-branch` | yes | none | `experimental` |

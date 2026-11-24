@@ -1,13 +1,23 @@
-//! MCP definition-branch tools: agent drafts, human approves (#1311, #2095).
+//! MCP definition-branch tools: agent drafts, human reviews and publishes over
+//! default-build gRPC (#1311, #2095, #2407).
 
-use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
+use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
 use sekai_chisei::grpc::pb::sekai::{
-    ApproveDefinitionProposalRequest, MergeDefinitionProposalRequest,
+    ApproveDefinitionProposalRequest, CloseDefinitionProposalRequest, GetDefinitionBranchRequest,
+    GetDefinitionCertificationGateRequest, GetDefinitionMemberRequest,
+    GetDefinitionProposalRequest, ListPublishedDefinitionRevisionsRequest,
+    MergeDefinitionProposalRequest,
 };
+use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::mcp_adapter::{InProcessSurface, handle_message, well_known_tools};
+use sekai_chisei::rpc_maturity::RpcMaturityLayer;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
 use tonic::metadata::MetadataValue;
+use tower::Layer;
 
 fn call(id: i64, name: &str, input: Value) -> Value {
     json!({
@@ -237,11 +247,32 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
         "{merge_over_mcp}"
     );
 
-    let agent_approve = surface
-        .sekai
+    // The human half runs on a served plane with experimental RPCs off, the
+    // gate a default build applies (#2407).
+    let human = default_plane(surface.sekai.clone()).await;
+    let mut grpc = SekaiServiceClient::connect(human.endpoint.clone())
+        .await
+        .unwrap();
+    let namespace = surface.namespace.clone();
+
+    // Close stays experimental, so the gate is live on this plane.
+    let close = grpc
+        .close_definition_proposal(with_principal(
+            CloseDefinitionProposalRequest {
+                namespace: namespace.clone(),
+                proposal_id: "cs-1".into(),
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(close.code(), tonic::Code::FailedPrecondition);
+
+    let agent_approve = grpc
         .approve_definition_proposal(with_principal(
             ApproveDefinitionProposalRequest {
-                namespace: surface.namespace.clone(),
+                namespace: namespace.clone(),
                 proposal_id: "cs-1".into(),
                 idempotency_key: "approve-agent".into(),
             },
@@ -252,11 +283,10 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
     assert_eq!(agent_approve.code(), tonic::Code::PermissionDenied);
     assert_eq!(agent_approve.message(), "proposal creator cannot approve");
 
-    let agent_merge = surface
-        .sekai
+    let agent_merge = grpc
         .merge_definition_proposal(with_principal(
             MergeDefinitionProposalRequest {
-                namespace: surface.namespace.clone(),
+                namespace: namespace.clone(),
                 proposal_id: "cs-1".into(),
                 expected_published_digest: parent.clone(),
                 idempotency_key: "merge-agent".into(),
@@ -268,11 +298,10 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
     assert_eq!(agent_merge.code(), tonic::Code::PermissionDenied);
     assert_eq!(agent_merge.message(), "proposal creator cannot merge");
 
-    let guest_approve = surface
-        .sekai
+    let guest_approve = grpc
         .approve_definition_proposal(with_principal(
             ApproveDefinitionProposalRequest {
-                namespace: surface.namespace.clone(),
+                namespace: namespace.clone(),
                 proposal_id: "cs-1".into(),
                 idempotency_key: "approve-guest".into(),
             },
@@ -282,25 +311,85 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
         .unwrap_err();
     assert_eq!(guest_approve.code(), tonic::Code::PermissionDenied);
 
-    surface
-        .sekai
-        .approve_definition_proposal(with_principal(
-            ApproveDefinitionProposalRequest {
-                namespace: surface.namespace.clone(),
-                proposal_id: "cs-1".into(),
-                idempotency_key: "approve-human".into(),
+    let branch = grpc
+        .get_definition_branch(with_principal(
+            GetDefinitionBranchRequest {
+                namespace: namespace.clone(),
+                branch_id: "feature".into(),
             },
             "root",
         ))
         .await
+        .unwrap()
+        .into_inner()
+        .branch
         .unwrap();
-    let merged = surface
-        .sekai
+    assert_eq!(branch.head_revision_digest, candidate);
+
+    let proposal = grpc
+        .get_definition_proposal(with_principal(
+            GetDefinitionProposalRequest {
+                namespace: namespace.clone(),
+                proposal_id: "cs-1".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .proposal
+        .unwrap();
+    assert_eq!(proposal.status, "open");
+    assert_eq!(proposal.created_by, surface.principal);
+
+    let member = grpc
+        .get_definition_member(with_principal(
+            GetDefinitionMemberRequest {
+                namespace: namespace.clone(),
+                revision_digest: candidate.clone(),
+                member_kind: "object_type".into(),
+                member_id: "Ticket".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .member
+        .unwrap();
+    assert!(member.definition_json.contains("priority"), "{member:?}");
+
+    let gate = grpc
+        .get_definition_certification_gate(with_principal(
+            GetDefinitionCertificationGateRequest {
+                namespace: namespace.clone(),
+                revision_digest: candidate.clone(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .gate
+        .unwrap();
+    assert_eq!(gate.revision_digest, candidate);
+
+    grpc.approve_definition_proposal(with_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: namespace.clone(),
+            proposal_id: "cs-1".into(),
+            idempotency_key: "approve-human".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = grpc
         .merge_definition_proposal(with_principal(
             MergeDefinitionProposalRequest {
-                namespace: surface.namespace.clone(),
+                namespace: namespace.clone(),
                 proposal_id: "cs-1".into(),
-                expected_published_digest: parent,
+                expected_published_digest: parent.clone(),
                 idempotency_key: "merge-human".into(),
             },
             "root",
@@ -308,5 +397,59 @@ async fn mcp_definition_branch_opens_a_proposal_for_human_review() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(merged.proposal.unwrap().status, "merged");
+    let merged = merged.proposal.unwrap();
+    assert_eq!(merged.status, "merged");
+
+    let history = grpc
+        .list_published_definition_revisions(with_principal(
+            ListPublishedDefinitionRevisionsRequest {
+                namespace,
+                ..Default::default()
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let newest = history.entries.first().expect("published revision");
+    assert_eq!(newest.revision_digest, candidate);
+    assert_eq!(newest.proposal_id, "cs-1");
+    assert_eq!(newest.previous_published_digest, parent);
+    human.stop().await;
+}
+
+/// A plane serving `sekai` on an ephemeral port behind the maturity gate with
+/// experimental RPCs off.
+struct DefaultPlane {
+    endpoint: String,
+    stop: tokio::sync::oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl DefaultPlane {
+    async fn stop(self) {
+        let _ = self.stop.send(());
+        self.server.await.unwrap();
+    }
+}
+
+async fn default_plane(sekai: SekaiServiceImpl) -> DefaultPlane {
+    let service = RpcMaturityLayer::new(false).layer(SekaiServiceServer::new(sekai));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    DefaultPlane {
+        endpoint,
+        stop,
+        server,
+    }
 }
