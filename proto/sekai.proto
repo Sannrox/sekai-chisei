@@ -1342,6 +1342,54 @@ message PromoteModelVersionResponse {
   // Empty when promoted; otherwise a `model_stage.*` refusal code.
   string refusal = 4;
 }
+// Experimental (#3159). A second principal's review of one model version for
+// one stage. A promotion to a gated stage needs an approved review of the
+// version. A decision is final; a fixed model is a new version.
+message ModelStageReview {
+  string namespace = 1;
+  string model_name = 2;
+  string stage = 3;
+  string version_id = 4;
+  // pending | approved | rejected
+  string state = 5;
+  string submitted_by = 6;
+  int64 submitted_at_ms = 7;
+  // Empty while pending.
+  string decided_by = 8;
+  string reason = 9;
+  int64 decided_at_ms = 10;
+}
+// Submits a version for review at a stage. Needs namespace write. A second
+// submission of the same version returns the existing review as a replay.
+message SubmitModelStageReviewRequest {
+  string namespace = 1;
+  string model_name = 2;
+  string stage = 3;
+  string version_id = 4;
+}
+message SubmitModelStageReviewResponse {
+  ModelStageReview review = 1;
+  // Receipt of the submission (GetOperationReceipt); empty on a replay.
+  string operation_id = 2;
+  bool replay = 3;
+}
+// Decides a pending review. Needs namespace write, and the decider is never
+// the submitter, even as namespace administrator.
+message DecideModelStageReviewRequest {
+  string namespace = 1;
+  string model_name = 2;
+  string stage = 3;
+  string version_id = 4;
+  // approve | reject
+  string decision = 5;
+  string reason = 6;
+}
+message DecideModelStageReviewResponse {
+  ModelStageReview review = 1;
+  // Receipt of the decision; empty on a replay of the caller's own decision.
+  string operation_id = 2;
+  bool replay = 3;
+}
 message TransformChainAssertion {
   string kind = 1;
   string column = 2;
@@ -6332,6 +6380,9 @@ service SekaiService {
   rpc PutModelStage(PutModelStageRequest) returns (PutModelStageResponse);
   rpc ListModelStages(ListModelStagesRequest) returns (ListModelStagesResponse);
   rpc PromoteModelVersion(PromoteModelVersionRequest) returns (PromoteModelVersionResponse);
+  // Experimental (#3159): a second principal's review gates promotion.
+  rpc SubmitModelStageReview(SubmitModelStageReviewRequest) returns (SubmitModelStageReviewResponse);
+  rpc DecideModelStageReview(DecideModelStageReviewRequest) returns (DecideModelStageReviewResponse);
   rpc AdmitGovernedDocument(AdmitGovernedDocumentRequest) returns (AdmitGovernedDocumentResponse);
   rpc AttachGovernedDocumentRendition(AttachGovernedDocumentRenditionRequest) returns (AttachGovernedDocumentRenditionResponse);
   rpc GetGovernedDocument(GetGovernedDocumentRequest) returns (GetGovernedDocumentResponse);

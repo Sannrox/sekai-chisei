@@ -3,7 +3,8 @@
 //! A stage (for example `staging` or `production`) names the version of one
 //! model that consumers should use. A stage with an evaluation suite moves only
 //! through a promotion whose evaluation run passed that suite for the version
-//! (ADR 0079). A stage without one follows each newly registered version.
+//! (ADR 0079) and whose version a second principal approved for the stage
+//! (#3159). A stage without one follows each newly registered version.
 //! Transform inputs may pin a stage instead of a version; the pin resolves to
 //! the stage's version when a run is admitted.
 
@@ -22,6 +23,12 @@ pub const REFUSAL_SUITE_MISSING: &str = "model_stage.suite_missing";
 pub const REFUSAL_SUITE_FAILED: &str = "model_stage.suite_failed";
 pub const REFUSAL_VERSION_MISMATCH: &str = "model_stage.evaluation_version_mismatch";
 pub const REFUSAL_STAGE_MOVED: &str = "model_stage.stage_moved";
+pub const REFUSAL_REVIEW_NOT_APPROVED: &str = "model_stage.review_not_approved";
+
+/// Operation class of a review submission or decision receipt (#3159).
+pub const REVIEW_OPERATION_CLASS: &str = "model_stage_review";
+
+pub const MODEL_STAGE_REVIEW_NOT_FOUND: &str = "model stage review not found";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelStage {
@@ -39,6 +46,60 @@ impl ModelStage {
     pub fn is_gateless(&self) -> bool {
         self.evaluation_suite_id.is_empty()
     }
+}
+
+/// Where one review of a version for a stage stands. A decision is final: a
+/// rejected version is not resubmitted, a fixed model is a new version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReviewState {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+impl ReviewState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "pending" => Self::Pending,
+            "approved" => Self::Approved,
+            "rejected" => Self::Rejected,
+            _ => return None,
+        })
+    }
+}
+
+/// A second principal's review of one model version for one stage (#3159).
+/// A promotion to a gated stage needs an approved review of that version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelStageReview {
+    pub namespace: String,
+    pub model_name: String,
+    pub stage: String,
+    pub version_id: String,
+    pub state: ReviewState,
+    pub submitted_by: String,
+    pub submitted_at_ms: i64,
+    /// Empty while pending.
+    pub decided_by: String,
+    pub reason: String,
+    pub decided_at_ms: i64,
+}
+
+/// Whether a caller presenting `principals` may decide a review `submitter`
+/// submitted: none of the caller's identities is the submitter, even for a
+/// namespace administrator. The rule parked Actions apply (`may_decide`).
+pub fn may_decide_review(submitter: &str, principals: &[String]) -> bool {
+    !principals.is_empty() && principals.iter().all(|principal| principal != submitter)
 }
 
 /// A stage name is a short lowercase token, so a stage pin parses unambiguously
@@ -89,6 +150,19 @@ pub fn evaluation_admits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_submitter_never_decides_their_own_review() {
+        let caller = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(may_decide_review("alice", &caller(&["bob"])));
+        assert!(!may_decide_review("alice", &caller(&["bob", "alice"])));
+        assert!(!may_decide_review("alice", &caller(&[])));
+    }
 
     #[test]
     fn stage_pins_parse_after_the_last_slash() {

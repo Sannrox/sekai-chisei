@@ -527,6 +527,7 @@ impl SekaiDb {
         self.migrate_model_versions()?;
         self.migrate_gateway_log_cursors()?;
         self.migrate_model_stages()?;
+        self.migrate_model_stage_reviews()?;
         Ok(())
     }
 

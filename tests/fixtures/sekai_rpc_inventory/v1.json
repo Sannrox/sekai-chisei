@@ -1856,6 +1856,34 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "SubmitModelStageReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/model_stage_review_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "DecideModelStageReview",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/db/model_stage_review_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ClaimTransformWork",
       "kind": "persistent",
       "surfaces": [
