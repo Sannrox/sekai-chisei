@@ -6,6 +6,17 @@ pub(super) fn authorize_source_type_namespace_admin(
     principals: &[String],
     namespace: &str,
 ) -> Result<String, Status> {
+    authorize_source_type_namespace_admin_in(service, ReadGrants::Stored, principals, namespace)
+}
+
+/// [`authorize_source_type_namespace_admin`] with namespace memberships from
+/// `grants`, so a grant simulation (#2708) decides as the real check does.
+pub(super) fn authorize_source_type_namespace_admin_in(
+    service: &SekaiServiceImpl,
+    grants: ReadGrants<'_>,
+    principals: &[String],
+    namespace: &str,
+) -> Result<String, Status> {
     require_authenticated(principals)?;
     if principals
         .iter()
@@ -20,7 +31,7 @@ pub(super) fn authorize_source_type_namespace_admin(
     if canonical.is_empty() || canonical != namespace {
         return Err(Status::permission_denied("namespace access denied"));
     }
-    check_team_namespace(service.db.runtime(), principals, canonical, true)?;
+    check_team_namespace_in(service.db.runtime(), grants, principals, canonical, true)?;
     let boundary = service
         .db
         .runtime()
@@ -35,7 +46,7 @@ pub(super) fn authorize_source_type_namespace_admin(
     if !team_managed {
         return Err(Status::permission_denied("namespace access denied"));
     }
-    let memberships = team_namespace_memberships(service.db.runtime(), principals)?;
+    let memberships = team_namespace_memberships_in(service.db.runtime(), grants, principals)?;
     let is_admin = memberships.iter().any(|(member_namespace, role)| {
         member_namespace == canonical && matches!(role, security::Role::Admin)
     });
@@ -1893,8 +1904,20 @@ pub(super) fn authorize_action_instance_submit(
     principals: &[String],
     namespace: &str,
 ) -> Result<String, Status> {
+    authorize_action_instance_submit_in(service, ReadGrants::Stored, principals, namespace)
+}
+
+/// [`authorize_action_instance_submit`] with namespace memberships from
+/// `grants`: the grant gate on proposing an Action, which a grant simulation
+/// (#2708) evaluates over a candidate overlay.
+pub(super) fn authorize_action_instance_submit_in(
+    service: &SekaiServiceImpl,
+    grants: ReadGrants<'_>,
+    principals: &[String],
+    namespace: &str,
+) -> Result<String, Status> {
     require_authenticated(principals)?;
-    check_team_namespace(service.db.runtime(), principals, namespace, true)?;
+    check_team_namespace_in(service.db.runtime(), grants, principals, namespace, true)?;
     principals
         .first()
         .cloned()

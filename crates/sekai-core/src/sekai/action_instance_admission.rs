@@ -3027,12 +3027,26 @@ pub fn may_decide(
     principals: &[String],
     decider_is_namespace_admin: bool,
 ) -> bool {
-    let mut presented = principals
+    let presented = principals
         .iter()
         .map(String::as_str)
         .chain(std::iter::once(decider));
     let is_submitter = presented.clone().any(|principal| principal == submitter);
-    let entitled = if type_def.approvers.is_empty() {
+    !is_submitter
+        && entitled_to_decide(type_def, presented, decider_is_namespace_admin)
+        && crate::sekai::review_queue::reviewer_may_decide(&type_def.review_queue, review, decider)
+}
+
+/// Whether `presented` principals are entitled to decide parked instances of
+/// `type_def`: one of its approvers, or a namespace administrator when it
+/// names none. [`may_decide`] adds the submitter and review-queue rules; a
+/// grant simulation (#2708) reports this part, the only one grants change.
+pub fn entitled_to_decide<'a>(
+    type_def: &crate::sekai::governed_action_type::GovernedActionType,
+    mut presented: impl Iterator<Item = &'a str>,
+    decider_is_namespace_admin: bool,
+) -> bool {
+    if type_def.approvers.is_empty() {
         decider_is_namespace_admin
     } else {
         presented.any(|principal| {
@@ -3041,10 +3055,7 @@ pub fn may_decide(
                 .iter()
                 .any(|approver| approver == principal)
         })
-    };
-    !is_submitter
-        && entitled
-        && crate::sekai::review_queue::reviewer_may_decide(&type_def.review_queue, review, decider)
+    }
 }
 
 fn object_changed() -> ActionInstanceAdmissionError {
