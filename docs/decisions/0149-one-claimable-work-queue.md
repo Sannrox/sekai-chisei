@@ -48,7 +48,8 @@ writeback effects.
    loader.
 2. **Work kinds are typed.** A kind is a closed enum value with a stable
    wire name: `transform`, `action`, `agent_turn`. ADR 0148 adds
-   `source_sync`, `export_delivery` and `external_effect`. A kind owns its
+   `source_sync`, `export_delivery` and `external_effect`; source discovery
+   (#3091) adds `source_discovery`. A kind owns its
    payload, its admission rules and its write-back. The engine owns
    everything about who holds the work.
 

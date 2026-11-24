@@ -627,6 +627,36 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "RequestSourceDiscovery",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source_discovery.rs",
+        "src/grpc/source_discovery_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "GetSourceDiscovery",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source_discovery.rs",
+        "src/grpc/source_discovery_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "GenerateDefinitionChangeBundle",
       "kind": "query",
       "surfaces": [],

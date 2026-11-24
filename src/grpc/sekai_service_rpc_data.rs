@@ -5656,6 +5656,14 @@ pub(crate) async fn run_schedule_tick(
             .await
             .map_err(|_| Status::internal("source sync tick failed"))?
             .map_err(Status::internal);
+    // Expired discovery requests and their samples leave too (#3091).
+    let discovery_runtime = runtime.clone();
+    let discoveries = tokio::task::spawn_blocking(move || {
+        crate::sekai::source_discovery::sweep(&discovery_runtime, now_ms)
+    })
+    .await
+    .map_err(|_| Status::internal("source discovery sweep failed"))?
+    .map_err(Status::internal);
     let ontology =
         super::ontology_health_rpc::tick_ontology_health_schedules(service, now_ms).await;
     // Scheduled Action bindings (#3033).
@@ -5667,6 +5675,7 @@ pub(crate) async fn run_schedule_tick(
             .map_err(Status::internal);
     datasets?;
     sources?;
+    discoveries?;
     ontology?;
     bindings?;
     Ok(runs)

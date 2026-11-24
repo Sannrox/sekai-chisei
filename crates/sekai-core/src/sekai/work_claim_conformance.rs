@@ -5,7 +5,8 @@
 //! Export delivery has no lease-expiry limit: retention bounds it, and an
 //! external effect needs none, since a reclaim cannot redeem its permit
 //! again.
-//! Source sync fails the due bucket at the limit.
+//! Source sync fails the due bucket at the limit, and source discovery the
+//! request.
 //! Every kind also survives a killed worker and plane: the claim lives only
 //! in the store, and a second worker takes it over at a higher generation.
 
@@ -25,7 +26,8 @@ use crate::sekai::governed_transform::{
     TRANSFORM_WORK_FAILED, WriteTransformRunCommand,
 };
 use crate::sekai::site_agent_instance;
-use crate::sekai::source_sync::{self, SyncError, SyncOutcome};
+use crate::sekai::source_discovery::{self, DiscoveryError, DiscoveryOutcome};
+use crate::sekai::source_sync::{self, SyncError, SyncFailure, SyncOutcome};
 use crate::sekai::work_claim::{ClaimError, Fence, WorkKind};
 
 /// The claim a test holds.
@@ -148,6 +150,25 @@ impl Subject<'_> {
                 Err(EffectError::Claim(ClaimError::Held)) => None,
                 Err(error) => panic!("external effect claim failed: {error}"),
             },
+            WorkKind::SourceDiscovery => match source_discovery::claim(
+                self.db,
+                &self.namespace,
+                &self.id,
+                owner,
+                &source_labels(),
+                TTL_MS,
+                now_ms,
+            ) {
+                Ok((request, _)) => Some(Held {
+                    owner: request.claim.owner,
+                    generation: request.claim.generation,
+                    token: request.claim.fencing_token,
+                }),
+                Err(DiscoveryError::Claim(
+                    ClaimError::Held | ClaimError::LeaseLimit | ClaimError::Closed,
+                )) => None,
+                Err(error) => panic!("source discovery claim failed: {error}"),
+            },
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -216,6 +237,15 @@ impl Subject<'_> {
                 &self.id,
                 held.fence(),
                 &source_labels(),
+                TTL_MS,
+                now_ms,
+            )
+            .is_ok(),
+            WorkKind::SourceDiscovery => source_discovery::heartbeat(
+                self.db,
+                &self.namespace,
+                &self.id,
+                held.fence(),
                 TTL_MS,
                 now_ms,
             )
@@ -315,6 +345,18 @@ impl Subject<'_> {
                 .unwrap_err()
                     == EffectError::Claim(ClaimError::FenceLost)
             }
+            WorkKind::SourceDiscovery => {
+                source_discovery::acknowledge(
+                    self.db,
+                    &self.namespace,
+                    &self.id,
+                    held.fence(),
+                    DiscoveryOutcome::Failed(SyncFailure::Unreachable),
+                    now_ms,
+                )
+                .unwrap_err()
+                    == DiscoveryError::Claim(ClaimError::FenceLost)
+            }
             _ => unreachable!("not a kind under test"),
         }
     }
@@ -345,6 +387,15 @@ impl Subject<'_> {
                     .unwrap()
                     .sync;
                 sync.last_failure == "lease_expired" && sync.done_bucket == sync.due_bucket
+            }
+            WorkKind::SourceDiscovery => {
+                let request = self
+                    .db
+                    .get_source_discovery(&self.namespace, &self.id)
+                    .unwrap()
+                    .unwrap();
+                request.status == source_discovery::STATUS_FAILED
+                    && request.failure == "lease_expired"
             }
             _ => unreachable!("not a kind under test"),
         }
@@ -391,6 +442,16 @@ fn admit<'a>(db: &'a RuntimeDb, kind: WorkKind, prefix: &str) -> Subject<'a> {
             "repo".into()
         }
         WorkKind::ExternalEffect => external_effect::tests::admit_effect(db, &namespace),
+        WorkKind::SourceDiscovery => {
+            crate::sekai::source::put(
+                db,
+                &crate::sekai::source::tests::github(&namespace, "repo", "acme/repo"),
+            )
+            .unwrap();
+            source_discovery::request(db, &namespace, "repo", "admin", 0)
+                .unwrap()
+                .discovery_id
+        }
         _ => unreachable!("not a kind under test"),
     };
     Subject {
@@ -595,6 +656,11 @@ fn sqlite_external_effect_claim_conformance() {
 }
 
 #[test]
+fn sqlite_source_discovery_claim_conformance() {
+    claim_contract(&RuntimeDb::memory(), WorkKind::SourceDiscovery, "sqlite");
+}
+
+#[test]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
 fn postgres_transform_claim_conformance() {
     claim_contract(
@@ -683,6 +749,16 @@ fn postgres_external_effect_claim_conformance() {
     claim_contract(
         &postgres(),
         WorkKind::ExternalEffect,
+        &format!("pg{}", std::process::id()),
+    );
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL"]
+fn postgres_source_discovery_claim_conformance() {
+    claim_contract(
+        &postgres(),
+        WorkKind::SourceDiscovery,
         &format!("pg{}", std::process::id()),
     );
 }

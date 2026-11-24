@@ -1784,6 +1784,13 @@ enum WorkKind {
   // claim_generation and acknowledges outcome_unknown when a reclaimed
   // effect cannot redeem.
   WORK_KIND_EXTERNAL_EFFECT = 6;
+  // A requested discovery of a registered Source (#3091). Its work_id is
+  // the discovery_id; the request's namespace names the Source's
+  // namespace. Listing and claiming offer it only while the Source is
+  // active, to a runtime whose registered labels satisfy the Source's
+  // placement. A completed acknowledge carries the result in
+  // SourceDiscoveryAckOptions.
+  WORK_KIND_SOURCE_DISCOVERY = 7;
 }
 // A claimed Source sync: the Source as the claim granted it.
 message SourceSyncWork {
@@ -1792,6 +1799,16 @@ message SourceSyncWork {
   int64 claim_generation = 3;
   string fencing_token = 4;
   int64 claim_expires_at_ms = 5;
+}
+// A claimable or claimed Source discovery: the request with its claim and
+// the Source as the claim granted it.
+message SourceDiscoveryWork {
+  string discovery_id = 1;
+  ConnectorSource source = 2;
+  string claim_owner = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  int64 claim_expires_at_ms = 6;
 }
 // A claimed saved-export artifact: a reference, not bytes. Fetch them with
 // FetchExportArtifact under this claim, then acknowledge with AckWork.
@@ -1827,6 +1844,11 @@ message SourceSyncWorkOptions {
   // Sources of other types never fill its page. Empty lists every type.
   repeated ConnectorTypeRef connector_types = 1;
 }
+// Options of a list of Source discovery work.
+message SourceDiscoveryWorkOptions {
+  // Lists only requests for Sources of these types (empty means any type).
+  repeated ConnectorTypeRef connector_types = 1;
+}
 // Options of a list of external-effect work.
 message ExternalEffectWorkOptions {
   // Lists only effects a Source of these types applies (empty means any
@@ -1852,6 +1874,7 @@ message ListClaimableWorkRequest {
     SourceSyncWorkOptions source_sync = 11;
     ExportDeliveryWorkOptions export_delivery = 12;
     ExternalEffectWorkOptions external_effect = 13;
+    SourceDiscoveryWorkOptions source_discovery = 14;
   }
 }
 // One claimable item; the set field names its kind.
@@ -1863,6 +1886,7 @@ message ClaimableWork {
     DeliverableExportArtifact export_delivery = 4;
     ConnectorSource source_sync = 5;
     ExternalEffectWork external_effect = 6;
+    SourceDiscoveryWork source_discovery = 7;
   }
 }
 message ListClaimableWorkResponse {
@@ -1892,6 +1916,7 @@ message ClaimWorkResponse {
     ExportDeliveryWork export_delivery = 4;
     SourceSyncWork source_sync = 5;
     ExternalEffectWork external_effect = 6;
+    SourceDiscoveryWork source_discovery = 7;
   }
 }
 message HeartbeatWorkClaimRequest {
@@ -1913,6 +1938,7 @@ message HeartbeatWorkClaimResponse {
     ExportDeliveryWork export_delivery = 4;
     SourceSyncWork source_sync = 5;
     ExternalEffectWork external_effect = 6;
+    SourceDiscoveryWork source_discovery = 7;
   }
 }
 // Action-work fields of an acknowledge; see AckActionWorkRequest.
@@ -1931,6 +1957,24 @@ message AgentTurnAckOptions {
 message ExportDeliveryAckOptions {
   // The digest the runtime verified over the fetched bytes.
   string content_digest = 1;
+}
+// The bounded sample of one discovered record kind. Cells are source data.
+message SourceDiscoverySample {
+  string record_kind = 1;
+  // The connector cannot sample this record kind; rows is empty.
+  bool unsupported = 2;
+  repeated SourceDiscoverySampleRow rows = 3;
+}
+message SourceDiscoverySampleRow {
+  map<string, string> cells = 1;
+}
+// Source-discovery fields of a completed acknowledge; required for it.
+message SourceDiscoveryAckOptions {
+  // The discovery in the sekai.source-discovery/v1 JSON shape, at most
+  // 2 MiB, with reference candidates and value-shape findings attached.
+  string discovery_json = 1;
+  // At most one sample per discovered record kind, each at most 8 rows.
+  repeated SourceDiscoverySample samples = 2;
 }
 // Transform work is acknowledged by WriteTransformRunResult, which carries
 // its output.
@@ -1953,7 +1997,10 @@ message AckWorkRequest {
   // work completes by WriteTransformRunResult; here it takes only failed,
   // with a reason code of lowercase letters, digits and _, which ends the
   // run as refused with that code and no output (#3075). The response then
-  // carries no payload.
+  // carries no payload. Source discovery takes completed with
+  // SourceDiscoveryAckOptions, or failed with a Source sync failure class
+  // as reason; either is final, and a retry under the same claim is
+  // answered without writing again.
   string outcome = 6;
   string reason = 7;
   // Source sync and external effects: the work's namespace.
@@ -1962,6 +2009,7 @@ message AckWorkRequest {
     ActionAckOptions action = 10;
     AgentTurnAckOptions agent_turn = 11;
     ExportDeliveryAckOptions export_delivery = 12;
+    SourceDiscoveryAckOptions source_discovery = 13;
   }
 }
 message AckWorkResponse {
@@ -1971,6 +2019,7 @@ message AckWorkResponse {
     AcknowledgeExportDeliveryResponse export_delivery = 3;
     ConnectorSource source_sync = 4;
     ActionEffect external_effect = 5;
+    SourceDiscoveryWork source_discovery = 6;
   }
 }
 // Experimental (#1968). Live (not forgotten) working memory of one site
@@ -6054,6 +6103,44 @@ message DisableSourceRequest {
 message DisableSourceResponse {
   ConnectorSource source = 1;
 }
+// A discovery request and, once finished, its result (#3091).
+message SourceDiscoveryResult {
+  string discovery_id = 1;
+  string namespace = 2;
+  string source_id = 3;
+  string requested_by = 4;
+  // pending, running, completed or failed.
+  string status = 5;
+  // A failed request's class: unavailable (no admitted runtime took it in
+  // time, or the runtime could not resolve the credential), unreachable,
+  // auth_failed, permission_missing, invalid, unsupported or lease_expired.
+  string failure = 6;
+  // A completed request's discovery in the sekai.source-discovery/v1 JSON
+  // shape. It carries no sample values.
+  string discovery_json = 7;
+  // Empty when withheld; see samples_withheld_reason.
+  repeated SourceDiscoverySample samples = 8;
+  // Set when a completed request's samples are withheld from this caller.
+  string samples_withheld_reason = 9;
+  int64 created_at_ms = 10;
+  int64 finished_at_ms = 11;
+  // When the plane deletes the request and its result.
+  int64 expires_at_ms = 12;
+}
+message RequestSourceDiscoveryRequest {
+  string namespace = 1;
+  string source_id = 2;
+}
+message RequestSourceDiscoveryResponse {
+  SourceDiscoveryResult discovery = 1;
+}
+message GetSourceDiscoveryRequest {
+  string namespace = 1;
+  string discovery_id = 2;
+}
+message GetSourceDiscoveryResponse {
+  SourceDiscoveryResult discovery = 1;
+}
 message DefinitionPropertyRef {
   string object_type = 1;
   string property = 2;
@@ -6400,6 +6487,16 @@ service SekaiService {
   rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc DisableSource(DisableSourceRequest) returns (DisableSourceResponse);
+  // Experimental (#3091): discover a registered Source where its credential
+  // lives. Both need a namespace administrator. A connector runtime claims
+  // the request as WORK_KIND_SOURCE_DISCOVERY work. Asking again while the
+  // caller's request for the Source is open returns it. Get answers only
+  // the requester; reading a finished request deletes it, and unread
+  // results expire. Sample cells are returned only to a caller cleared for
+  // every marking on the Source.
+  rpc RequestSourceDiscovery(RequestSourceDiscoveryRequest)
+      returns (RequestSourceDiscoveryResponse);
+  rpc GetSourceDiscovery(GetSourceDiscoveryRequest) returns (GetSourceDiscoveryResponse);
   rpc GenerateDefinitionChangeBundle(GenerateDefinitionChangeBundleRequest) returns (GenerateDefinitionChangeBundleResponse);
   rpc DryRunDefinitionChangeBundle(DryRunDefinitionChangeBundleRequest) returns (DryRunDefinitionChangeBundleResponse);
   // Experimental: apply an approved proposal's change bundle, resumably (#1693).

@@ -233,6 +233,18 @@ impl Connectors {
         Ok(())
     }
 
+    /// Discovers a prepared Source with references, findings and samples
+    /// ([`crate::discovery`]). Blocking.
+    pub fn discover(
+        &self,
+        prepared: &Prepared,
+    ) -> Result<crate::discovery::Discovered, SyncFailure> {
+        if !prepared.connector.supports(Operation::Discover) {
+            return Err(SyncFailure::Unsupported);
+        }
+        crate::discovery::discover(self.open(prepared)?.as_mut())
+    }
+
     /// Applies one permit-bound change to a record of a prepared Source and
     /// returns the record's new version. Blocking.
     pub fn apply(&self, prepared: &Prepared, change: &RecordChange) -> Result<String, SyncFailure> {

@@ -197,6 +197,35 @@ ways.
   write, so a write racing that read is not detected. The parameter
   contract is in [external-action-execution.md](../external-action-execution.md).
 
+## Amendment 2026-11-24
+
+Source discovery (#3091) runs `discover` for a registered Source through
+the claimable-work queue as `source_discovery` work. Its two RPCs,
+`RequestSourceDiscovery` and `GetSourceDiscovery`, are experimental and
+served only with `SEKAI_EXPERIMENTAL_RPCS` set.
+
+- **Request.** A namespace administrator requests discovery of an active
+  Source. A repeated request from the same requester returns the one still
+  open. Each request is its own row with its own claim record.
+- **Run.** A runtime claims the request under the Source's placement, as
+  it claims Source sync work, and resolves the credential locally. It sends
+  the `sekai.source-discovery/v1` document with reference candidates and
+  value-shape findings attached, plus at most one sample per record kind.
+  The runtime drops secret-like cells and bounds the samples before they
+  leave it; the plane validates the document and the bounds again.
+- **Audit.** The plane records each sample's row count, never its cells,
+  under the requester, before it accepts the result. An audit failure
+  refuses the acknowledge.
+- **Read.** Only the requester reads the result, once: reading a finished
+  request deletes it. Sample cells are returned only to a caller cleared
+  for every marking on the Source, judged at read time, and are withheld
+  with a reason otherwise.
+- **Expiry.** A request no runtime finishes within two minutes reads as
+  failed `unavailable`. A result lives ten minutes; the schedule tick
+  removes expired rows. Failure classes are the Source sync classes.
+- **Scope.** The relational type discovers its configured table.
+  Enterprise-scoped credentials cannot claim the kind.
+
 ## Alternatives considered
 
 - **Keep one process per integration.** Each new integration keeps paying
