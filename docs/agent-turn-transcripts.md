@@ -42,5 +42,7 @@ otherwise `prompt_text_withheld` is true.
 Subject erasure clears prompt text for turns whose prompt names the subject,
 whose instance principal is an erased `agent`, or whose manual requester is an
 erased `user`. The turn and its steps remain, `erased_at_ms` is set, and later
-appends are refused. On PostgreSQL an erasure of an `agent` or `user` still
-named in a turn's identity columns is refused, as before.
+appends are refused. The turn's identity columns (its agent principal and a
+manual turn's requester) are a retained identity, like audit actors, and keep
+the subject on SQLite and PostgreSQL alike; see
+[ADR 0157](decisions/0157-an-agent-turn-records-its-transcript.md#addendum-turn-identity-is-a-retained-identity-3444).

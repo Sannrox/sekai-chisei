@@ -53,12 +53,24 @@ the plane's markings and subject erasure, and could disagree with the turn.
 ## Consequences
 
 - A console reads run history from the plane, under the plane's markings.
-- PostgreSQL erasure still refuses an `agent` or `user` subject named in a
-  turn's identity columns, as before this change; the transcript is cleared
-  first, inside the same transaction, so a refusal leaves nothing half-erased.
-  Lifting that refusal is #3444.
+- Erasing an `agent` or `user` subject named in a turn's identity columns
+  clears the prompt text it reaches and keeps the identity columns, on both
+  stores; see the addendum below (#3444).
 - Listing a page of turns reads one transcript per turn, plus one Action per
   action step. Pages are capped at 500 turns.
 - Stored data: two tables on both stores (SQLite migration, PostgreSQL
   migration 0174). Rolling back to a plane without them leaves the tables
   unread.
+
+## Addendum: turn identity is a retained identity (#3444)
+
+A turn's `principal_id` (the instance's agent) and `admitted_by` (a manual
+turn's requester) are a retained identity under a documented basis, as audit
+actors are. They link the turn to its receipts, runtime tokens, and Action
+instances, which a governed run must keep accountable. Erasing such a subject
+clears the prompt text the turn holds and marks the transcript erased; the two
+columns keep the subject. The PostgreSQL residue scan skips exactly those two
+columns, so PostgreSQL no longer refuses the erasure and matches SQLite.
+
+Pseudonymizing the columns was rejected: de-identification is not deletion,
+and a pseudonym would break the turn's link to its receipts and tokens.
