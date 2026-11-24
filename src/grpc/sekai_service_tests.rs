@@ -27499,6 +27499,27 @@ async fn preview_isolated_process_is_claimed_without_commit() {
         .into_inner();
     assert_eq!(retrieved.preview_id, preview.preview_id);
     assert_eq!(retrieved.rows.len(), 1);
+    // The MCP preview tool reads back only its session namespace's previews.
+    for (session, found) in [("ops", true), ("other", false)] {
+        let mut request = with_named_principal(
+            PreviewGovernedTransformRequest {
+                preview_id: preview.preview_id.clone(),
+                ..Default::default()
+            },
+            "local",
+        );
+        let metadata = request.metadata_mut();
+        metadata.insert(
+            "x-sekai-capability",
+            "sekai.transforms.preview".parse().unwrap(),
+        );
+        metadata.insert("x-sekai-namespace", session.parse().unwrap());
+        let read = svc.preview_governed_transform(request).await;
+        match found {
+            true => assert_eq!(read.unwrap().into_inner().rows.len(), 1),
+            false => assert_eq!(read.unwrap_err().code(), tonic::Code::NotFound),
+        }
+    }
     assert_eq!(
         retrieved.rows[0].values.get("id").map(String::as_str),
         Some("1")

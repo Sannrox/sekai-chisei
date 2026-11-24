@@ -523,6 +523,33 @@ neighborhood walks to the session namespace: a start object outside it is not
 found, and objects outside it are left out as if unreadable, even when the
 principal may read them over direct gRPC.
 
+### Rehearsal tools
+
+Read-only tools let an agent see what a change or a run would do before it
+asks for one (#2432). Each runs the no-effect form of its RPC under the same
+principal and binds the session namespace, so a call the principal could not
+make over gRPC is refused the same way. None submits an Action, applies a
+backfill, or writes an object; a trace is evidence, not certification
+(ADR 0109).
+
+- `sekai.agents.dry_run` → `DryRunAgent` requires `revisionDigest` and
+  `memberId` and accepts `input`. It returns the model steps, tool calls, and
+  proposed Actions with the eval-run `recordId` that stores the trace.
+- `sekai.plans.simulate` → `SimulatePlan` requires `planId`. The adapter uses
+  the call's `operation_id` as `simulationId`, so calling again with the same
+  `operation_id` returns the stored simulation instead of running it again.
+- `sekai.transforms.preview` → `PreviewGovernedTransform` takes `transform`
+  and `rowCap`, or only `previewId`. A preview that runs isolated returns a
+  `previewId`; calling again with it reads the stored rows. A preview from
+  another namespace reads as not found, even when the principal may read it
+  over direct gRPC.
+- `sekai.definitions.change_bundle.dry_run` → `DryRunDefinitionChangeBundle`
+  requires `fromRevisionDigest` and `toRevisionDigest`, accepts `hints` and
+  `bundleDigest`, and reports the rows each backfill would change.
+
+All four RPCs are `experimental`, so these tools are listed and run only when
+experimental RPCs are enabled (`SEKAI_EXPERIMENTAL_RPCS=1`).
+
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and
 call `GetQualityTrend`; they do not reimplement the reducer. Every binding fails

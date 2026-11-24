@@ -45,6 +45,16 @@ pub const GET_LINEAGE_TOOL: &str = "sekai.lineage.get";
 /// Upper bound on `max_nodes` for the lineage tool. The RPC clamps larger
 /// values to the same cap; the tool refuses them instead of truncating.
 pub const MAX_LINEAGE_NODES: i64 = 500;
+/// Rehearsal tools (#2432): each runs the no-effect form of its RPC and
+/// submits nothing; ADR 0109 holds, a trace is never certification. All four
+/// RPCs are experimental, so the tools are listed only when experimental RPCs
+/// are enabled. A plan simulation is keyed by the call's `operation_id`, so
+/// calling again with it returns the stored simulation; a transform preview
+/// that runs isolated returns a `previewId` to read back the same way.
+pub const DRY_RUN_AGENT_TOOL: &str = "sekai.agents.dry_run";
+pub const SIMULATE_PLAN_TOOL: &str = "sekai.plans.simulate";
+pub const PREVIEW_TRANSFORM_TOOL: &str = "sekai.transforms.preview";
+pub const DRY_RUN_CHANGE_BUNDLE_TOOL: &str = "sekai.definitions.change_bundle.dry_run";
 /// Experimental (#2119). Listed only when experimental RPCs are enabled.
 pub const RUN_TRANSFORM_CHAIN_TOOL: &str = "sekai.transforms.chain.run";
 pub const GET_TRANSFORM_CHAIN_RUN_TOOL: &str = "sekai.transforms.chain.status";
@@ -107,6 +117,10 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         GET_CLASS_TOOL => Some(NativeRpc::GetOntologyClass),
         NEIGHBORHOOD_TOOL => Some(NativeRpc::ExpandNeighborhood),
         GET_LINEAGE_TOOL => Some(NativeRpc::GetLineage),
+        DRY_RUN_AGENT_TOOL => Some(NativeRpc::DryRunAgent),
+        SIMULATE_PLAN_TOOL => Some(NativeRpc::SimulatePlan),
+        PREVIEW_TRANSFORM_TOOL => Some(NativeRpc::PreviewGovernedTransform),
+        DRY_RUN_CHANGE_BUNDLE_TOOL => Some(NativeRpc::DryRunDefinitionChangeBundle),
         RUN_TRANSFORM_CHAIN_TOOL => Some(NativeRpc::RunTransformChain),
         GET_TRANSFORM_CHAIN_RUN_TOOL => Some(NativeRpc::GetTransformChainRun),
         _ => None,
@@ -160,7 +174,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, rehearsal (dry-run, simulate, preview), and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -475,7 +489,18 @@ fn bind_session_input(
         | NativeRpc::ApplyDefinitionBranchEdit
         | NativeRpc::CompareDefinitionRevisions
         | NativeRpc::ReportDefinitionConsumerImpact
-        | NativeRpc::CreateDefinitionProposal => {
+        | NativeRpc::CreateDefinitionProposal
+        | NativeRpc::DryRunDefinitionChangeBundle
+        | NativeRpc::DryRunAgent => {
+            // Proto JSON wants every scalar; the optional ones default empty.
+            let optional = match rpc {
+                NativeRpc::DryRunDefinitionChangeBundle => Some("bundleDigest"),
+                NativeRpc::DryRunAgent => Some("input"),
+                _ => None,
+            };
+            if let Some(field) = optional {
+                object.entry(field).or_insert_with(|| json!(""));
+            }
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
                 && namespace != context.namespace
             {
@@ -485,6 +510,54 @@ fn bind_session_input(
                 }));
             }
             object.insert("namespace".into(), json!(context.namespace));
+        }
+        NativeRpc::SimulatePlan => {
+            if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"plan namespace must match the authenticated adapter session"
+                }));
+            }
+            // The simulation is keyed by the call, so the same operation_id
+            // reads the stored simulation back instead of running it again.
+            let supplied = session_string(object, "simulation_id")?
+                .or(session_string(object, "simulationId")?);
+            if let Some(id) = supplied
+                && id != operation_id
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"SimulatePlan simulation_id must equal operation_id"
+                }));
+            }
+            object.remove("simulation_id");
+            object.insert("namespace".into(), json!(context.namespace));
+            object.insert("simulationId".into(), json!(operation_id));
+        }
+        NativeRpc::PreviewGovernedTransform => {
+            // A stored preview is read back by id alone; a new one runs the
+            // given transform inside the session namespace.
+            let preview_id =
+                session_string(object, "preview_id")?.or(session_string(object, "previewId")?);
+            if object.contains_key("transform") {
+                if preview_id.is_some() {
+                    return Err(json!({
+                        "code":-32602,
+                        "message":"pass input.transform or input.preview_id, not both"
+                    }));
+                }
+                bind_nested_namespace(object, "transform", context)?;
+            } else if preview_id.is_none() {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"preview requires input.transform or input.preview_id"
+                }));
+            }
+            object.remove("preview_id");
+            object.insert("previewId".into(), json!(preview_id.unwrap_or_default()));
+            object.entry("rowCap").or_insert_with(|| json!(0));
         }
         NativeRpc::RunTransformChain => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
@@ -535,7 +608,7 @@ fn bind_nested_namespace(
     {
         return Err(json!({
             "code":-32602,
-            "message":"evaluation namespace must match the authenticated adapter session"
+            "message": format!("input.{field}.namespace must match the authenticated adapter session")
         }));
     }
     nested.insert("namespace".into(), json!(context.namespace));
@@ -755,6 +828,38 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
 
 fn experimental_entries() -> Vec<CapabilityEntry> {
     vec![
+        capability_entry(
+            DRY_RUN_AGENT_TOOL,
+            "Dry-run an agent definition revision: its model steps, tool calls, and the Actions it would propose, none submitted.",
+            "query",
+            "sekai.DryRunAgentRequest",
+            "sekai.DryRunAgentResponse",
+            "read",
+        ),
+        capability_entry(
+            SIMULATE_PLAN_TOOL,
+            "Simulate a proposed plan step by step without submitting it; the same operation_id reads the stored simulation.",
+            "query",
+            "sekai.SimulatePlanRequest",
+            "sekai.SimulatePlanResponse",
+            "read",
+        ),
+        capability_entry(
+            PREVIEW_TRANSFORM_TOOL,
+            "Preview a governed transform's output rows without running or storing it, or read back a preview by preview_id.",
+            "query",
+            "sekai.PreviewGovernedTransformRequest",
+            "sekai.PreviewGovernedTransformResponse",
+            "read",
+        ),
+        capability_entry(
+            DRY_RUN_CHANGE_BUNDLE_TOOL,
+            "Dry-run the backfills a definition change would need between two revisions and report the rows they would change.",
+            "query",
+            "sekai.DryRunDefinitionChangeBundleRequest",
+            "sekai.DryRunDefinitionChangeBundleResponse",
+            "read",
+        ),
         capability_entry(
             LIST_CLASSES_TOOL,
             "List the ontology classes the caller may read.",

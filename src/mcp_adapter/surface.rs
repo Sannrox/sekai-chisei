@@ -58,6 +58,10 @@ pub enum NativeRpc {
     GetOntologyClass,
     ExpandNeighborhood,
     GetLineage,
+    DryRunAgent,
+    SimulatePlan,
+    PreviewGovernedTransform,
+    DryRunDefinitionChangeBundle,
     RunTransformChain,
     GetTransformChainRun,
 }
@@ -87,6 +91,10 @@ impl NativeRpc {
             Self::GetOntologyClass => "GetOntologyClass",
             Self::ExpandNeighborhood => "ExpandNeighborhood",
             Self::GetLineage => "GetLineage",
+            Self::DryRunAgent => "DryRunAgent",
+            Self::SimulatePlan => "SimulatePlan",
+            Self::PreviewGovernedTransform => "PreviewGovernedTransform",
+            Self::DryRunDefinitionChangeBundle => "DryRunDefinitionChangeBundle",
             Self::RunTransformChain => "RunTransformChain",
             Self::GetTransformChainRun => "GetTransformChainRun",
         }
@@ -371,6 +379,22 @@ pub async fn dispatch_native(
         NativeRpc::GetLineage => {
             dispatch_sekai_json(sekai.get_lineage(bind_json(&invocation)?).await)
         }
+        NativeRpc::DryRunAgent => {
+            dispatch_sekai_json(sekai.dry_run_agent(bind_json(&invocation)?).await)
+        }
+        NativeRpc::SimulatePlan => {
+            dispatch_sekai_json(sekai.simulate_plan(bind_json(&invocation)?).await)
+        }
+        NativeRpc::PreviewGovernedTransform => dispatch_sekai_json(
+            sekai
+                .preview_governed_transform(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::DryRunDefinitionChangeBundle => dispatch_sekai_json(
+            sekai
+                .dry_run_definition_change_bundle(bind_json(&invocation)?)
+                .await,
+        ),
         NativeRpc::RunTransformChain => {
             dispatch_sekai_json(sekai.run_transform_chain(bind_json(&invocation)?).await)
         }
@@ -742,6 +766,15 @@ impl NativeSurface for FixtureSurface {
             | NativeRpc::GetLineage => Err(projected(
                 "unimplemented",
                 "the fixture surface holds no ontology or graph",
+                &invocation.capability,
+                &invocation.operation_id,
+            )),
+            NativeRpc::DryRunAgent
+            | NativeRpc::SimulatePlan
+            | NativeRpc::PreviewGovernedTransform
+            | NativeRpc::DryRunDefinitionChangeBundle => Err(projected(
+                "unimplemented",
+                "the fixture surface holds no definitions, plans, or transforms",
                 &invocation.capability,
                 &invocation.operation_id,
             )),
@@ -1125,6 +1158,50 @@ impl NativeSurface for SdkSurface {
                 let response = with_timeout(
                     self.config.timeout,
                     client.get_lineage(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::DryRunAgent => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.dry_run_agent(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::SimulatePlan => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.simulate_plan(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::PreviewGovernedTransform => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.preview_governed_transform(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::DryRunDefinitionChangeBundle => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.dry_run_definition_change_bundle(bind_json(&invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)

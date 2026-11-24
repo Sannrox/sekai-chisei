@@ -2894,6 +2894,7 @@ fn retrieve_preview_governed_transform(
     principals: &[String],
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
     preview_id: &str,
+    session_namespace: Option<&str>,
 ) -> Result<Response<PreviewGovernedTransformResponse>, Status> {
     if !crate::sekai::governed_transform::is_preview_id(preview_id) {
         return Err(Status::invalid_argument(
@@ -2906,6 +2907,11 @@ fn retrieve_preview_governed_transform(
         .admitted_isolated_transform(preview_id)
         .map_err(transform_work_status)?
         .ok_or_else(|| Status::not_found("preview not found"))?;
+    // An MCP session reads only its own namespace's previews; another one
+    // looks absent rather than refused.
+    if session_namespace.is_some_and(|namespace| namespace != transform.namespace) {
+        return Err(Status::not_found("preview not found"));
+    }
     if let Some(context) = tenant_context {
         enforce_namespace_tenant_context(
             service.db.runtime(),
@@ -2954,6 +2960,7 @@ pub(super) async fn preview_governed_transform(
     let principals = caller_principals(&req);
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
+    let session_namespace = SekaiServiceImpl::mcp_session_namespace(&req);
     let input = req.into_inner();
     if !input.preview_id.is_empty() {
         return retrieve_preview_governed_transform(
@@ -2961,6 +2968,7 @@ pub(super) async fn preview_governed_transform(
             &principals,
             tenant_context.as_ref(),
             &input.preview_id,
+            session_namespace.as_deref(),
         );
     }
     let proto = input

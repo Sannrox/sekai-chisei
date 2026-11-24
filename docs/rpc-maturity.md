@@ -135,7 +135,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetDefinitionMember` | `sekai.definition-branch` | yes | generated gRPC client | `experimental` |
 | `SekaiService.PutDefinitionCertification` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionCertificationGate` | `sekai.definition-branch` | yes | none | `experimental` |
-| `SekaiService.DryRunAgent` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.DryRunAgent` | `sekai.definition-branch` | yes | mcp | `experimental` |
 | `SekaiService.RunAgentShadow` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetAgentShadowReport` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.GetPublishedDefinitionRevision` | `sekai.definition-branch` | yes | none | `stable` |
@@ -162,7 +162,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.RequestSourceDiscovery` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GetSourceDiscovery` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |
-| `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.DryRunDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | mcp | `experimental` |
 | `SekaiService.ApplyDefinitionChangeBundle` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetDefinitionBundleApply` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ClassifyDefinitionRevisionCompatibility` | `sekai.definition-branch` | yes | none | `experimental` |
@@ -206,7 +206,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.RunAdHocGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.PreviewGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.PreviewGovernedTransform` | `sekai.datasets` | yes | mcp | `experimental` |
 | `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
 | `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
@@ -373,7 +373,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.ProposePlan` | `sekai.audit` | yes | none | `experimental` |
-| `SekaiService.SimulatePlan` | `sekai.audit` | yes | none | `experimental` |
+| `SekaiService.SimulatePlan` | `sekai.audit` | yes | mcp | `experimental` |
 | `SekaiService.GetPlan` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitPlanReview` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.DecidePlanReview` | `sekai.audit` | yes | none | `experimental` |
