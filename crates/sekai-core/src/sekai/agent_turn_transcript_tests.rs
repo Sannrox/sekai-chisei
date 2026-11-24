@@ -20,6 +20,17 @@ fn seed(db: &RuntimeDb, ns: &str, name: &str) -> String {
 }
 
 fn claimed(db: &RuntimeDb, ns: &str, instance: &str, cause: Cause, cause_ref: &str) -> AgentTurn {
+    claimed_by(db, ns, instance, cause, cause_ref, "alice")
+}
+
+fn claimed_by(
+    db: &RuntimeDb,
+    ns: &str,
+    instance: &str,
+    cause: Cause,
+    cause_ref: &str,
+    requester: &str,
+) -> AgentTurn {
     let wake = Wake {
         namespace: ns.into(),
         instance_id: instance.into(),
@@ -27,7 +38,7 @@ fn claimed(db: &RuntimeDb, ns: &str, instance: &str, cause: Cause, cause_ref: &s
         cause_ref: cause_ref.into(),
         due_at_ms: 100,
     };
-    let turn = admit(db, wake, "alice", 1).unwrap();
+    let turn = admit(db, wake, requester, 1).unwrap();
     claim(db, ns, "worker", &turn.turn_id, 60_000, 200).unwrap()
 }
 
@@ -210,20 +221,24 @@ fn bounds_refuse_instead_of_truncating() {
     ));
 }
 
-/// On SQLite, erasing the instance's agent or a manual turn's requester
-/// reaches the turn by identity. PostgreSQL refuses such an erasure while
-/// the turn row names the subject, as it did before transcripts.
+/// Erasing the instance's agent or a manual turn's requester reaches the
+/// turn by identity on both stores. The identity columns are a retained
+/// identity (#3444), so they keep the subject and never block the erasure.
+fn turn_identity_erasure_contract(db: &RuntimeDb, ns: &str) {
+    let instance = seed(db, ns, "line");
+    let requester = format!("carol-{ns}");
+    let manual = claimed_by(db, ns, &instance, Cause::Manual, "req-1", &requester);
+    let scheduled = claimed_by(db, ns, &instance, Cause::Schedule, "100", &requester);
+    erase(db, "user", &requester);
+    assert!(get(db, &manual.turn_id).unwrap().erased_at_ms > 0);
+    assert_eq!(get(db, &scheduled.turn_id).unwrap().erased_at_ms, 0);
+    erase(db, "agent", &scheduled.principal_id);
+    assert!(get(db, &scheduled.turn_id).unwrap().erased_at_ms > 0);
+}
+
 #[test]
 fn erasure_reaches_turns_by_their_agent_and_requester() {
-    let db = RuntimeDb::memory();
-    let instance = seed(&db, "site", "line");
-    let manual = claimed(&db, "site", &instance, Cause::Manual, "req-1");
-    let scheduled = claimed(&db, "site", &instance, Cause::Schedule, "100");
-    erase(&db, "user", "alice");
-    assert!(get(&db, &manual.turn_id).unwrap().erased_at_ms > 0);
-    assert_eq!(get(&db, &scheduled.turn_id).unwrap().erased_at_ms, 0);
-    erase(&db, "agent", &scheduled.principal_id);
-    assert!(get(&db, &scheduled.turn_id).unwrap().erased_at_ms > 0);
+    turn_identity_erasure_contract(&RuntimeDb::memory(), "site");
 }
 
 #[test]
@@ -247,4 +262,10 @@ fn postgres_transcripts_follow_the_contract() {
     let db = RuntimeDb::Postgres(std::sync::Arc::new(db.unwrap()));
     let ns = format!("transcript-{}-{}", std::process::id(), uuid::Uuid::new_v4());
     transcript_contract(&db, &ns);
+    let ns = format!(
+        "turn-identity-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    turn_identity_erasure_contract(&db, &ns);
 }

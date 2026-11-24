@@ -1463,6 +1463,15 @@ fn append_subject_erasure_decision(
         .map_err(err)
 }
 
+/// Columns that keep a subject as a retained identity under a documented
+/// basis, like audit actors (ADR 0157, #3444): a turn's agent principal and
+/// its requester. Erasure leaves them and the residue scan skips them, as
+/// SQLite does.
+const RETAINED_IDENTITY_COLUMNS: &[(&str, &str)] = &[
+    ("sekai_agent_turn", "principal_id"),
+    ("sekai_agent_turn", "admitted_by"),
+];
+
 fn unsupported_subject_location(
     client: &mut impl GenericClient,
     subject_kind: &str,
@@ -1482,6 +1491,14 @@ fn unsupported_subject_location(
     for row in columns {
         let table: String = row.get(0);
         let column: String = row.get(1);
+        if RETAINED_IDENTITY_COLUMNS
+            .iter()
+            .any(|(retained_table, retained_column)| {
+                table == *retained_table && column == *retained_column
+            })
+        {
+            continue;
+        }
         let quoted_table = quote_identifier(&table);
         let quoted_column = quote_identifier(&column);
         let query = format!(
