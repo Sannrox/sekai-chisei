@@ -1017,6 +1017,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // The policy dry-run (#3262) checks the namespace grant and the
             // tenant's namespace in its handler.
             | "DryRunActionPolicy"
+            // Compliance bundles (#3047) need the compliance_export
+            // capability and the tenant's namespace, checked in the handler.
+            | "ExportComplianceBundle"
             // Offline sync (#1836): each call enforces the caller's tenant on
             // the scope's namespace, and a device-bound context still needs
             // its device's proof (ADR 0126).

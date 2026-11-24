@@ -61,7 +61,7 @@ async fn export(config: ExportConfig) -> Result<(), BoxErr> {
     // Local sekaictl export uses the host database configuration as the trust
     // boundary, matching receipt/report CLIs. Callers who can open the runtime
     // store can already read the underlying tables. Networked multi-tenant
-    // export must go through an authorized gRPC surface (follow-up).
+    // export goes through `SekaiService.ExportComplianceBundle` (#3047).
     chisei_core::combined_stores::refuse_split_single_store_cli(
         "ChiseiService.GetOperationReceipt",
     )

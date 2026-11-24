@@ -2223,6 +2223,22 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ExportComplianceBundle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/compliance_export.rs",
+        "src/grpc/compliance_export_rpc.rs",
+        "docs/compliance-export.md"
+      ],
+      "durable_dependencies": [
+        "sekai.audit"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "FindByExternalId",
       "kind": "persistent",
       "surfaces": [

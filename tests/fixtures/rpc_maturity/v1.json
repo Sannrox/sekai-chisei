@@ -1374,6 +1374,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExportComplianceBundle",
+      "storage_path": "sekai.audit",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "FindByExternalId",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

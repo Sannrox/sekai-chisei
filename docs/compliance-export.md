@@ -77,8 +77,35 @@ prompts, PII, or free-form error text under unexpected field names.
   retired shared store (`DB_PATH` / `DATABASE_URL` / `SEKAI_SHARED_STORE`)
   refuses with guidance.
 - Host filesystem/DB credentials are the trust boundary for this CLI, as with
-  other offline `sekaictl` report tools. A future gRPC export will enforce
-  namespace authorization for networked multi-tenant access.
+  other offline `sekaictl` report tools. Tooling without database
+  credentials uses the RPC below.
+
+## Export over gRPC (#3047)
+
+`SekaiService.ExportComplianceBundle` is experimental: a plane serves it only
+with `SEKAI_EXPERIMENTAL_RPCS=1` or a build with the `experimental-rpcs`
+feature. It returns the same unsigned `sekai.compliance-export/v1` bytes the
+CLI writes for the same request and export time, streamed in chunks of at most
+1 MiB. The last chunk carries `done`, the manifest's `content_digest` and
+`exported_at_ms`.
+
+- Caller: a service principal registered with the `compliance_export`
+  capability, for a namespace in its registration, or credential admin
+  (`root`, `local`). Namespace admins and members do not get it.
+- A namespace outside the caller's tenant or registration is `NOT_FOUND`.
+- `full` keeps receipt attributes; the default is redacted.
+- `request_id` is required. The export is recorded as a `compliance.export`
+  decision naming the caller when the bundle is served; a retry with the same
+  `request_id` records once, and the same `request_id` for another window or
+  redaction is refused.
+- A window over the receipt or decision limit is refused with "narrow the
+  time window"; nothing is truncated.
+- The plane never signs. Sign the reassembled bundle with
+  `sign_compliance_export` or your own key custody, then verify offline as
+  above.
+- Receipts live on the Chisei store. The combined server serves the RPC in
+  both owned and split layouts; a Sekai-only process refuses it with
+  `FAILED_PRECONDITION`.
 
 ## Compliance packs (#1468)
 
@@ -91,7 +118,7 @@ and verification stay offline; they do not open the control-plane database.
 - Console download UI
 - Cross-tenant / org-wide export
 - Continuous SIEM streaming
-- gRPC transport (library + sekaictl; RPC can follow once consumers need it)
+- Server-side signing or key custody
 
 ## Peer import (#290)
 

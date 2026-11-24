@@ -691,3 +691,52 @@ fn verified_token(plane: &Plane, token: &str) -> crate::runtime_token::RuntimeTo
     )
     .unwrap()
 }
+
+/// #3047: the compliance_export capability admits a compliance bundle for a
+/// registered namespace; any other namespace hides like a missing one.
+#[tokio::test]
+async fn compliance_export_stays_inside_the_registered_namespaces() {
+    let plane = plane();
+    let export = |namespace: &str| {
+        let request = authenticated(
+            &plane,
+            &service_token(&plane),
+            "ExportComplianceBundle",
+            crate::grpc::pb::sekai::ExportComplianceBundleRequest {
+                namespace: namespace.into(),
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 1_000,
+                full: false,
+                request_id: format!("export-{namespace}"),
+            },
+        )
+        .unwrap();
+        plane.service.export_compliance_bundle(request)
+    };
+    assert_eq!(
+        export(IN_SCOPE).await.err().unwrap().code(),
+        tonic::Code::PermissionDenied
+    );
+    plane
+        .service
+        .db
+        .runtime()
+        .put_service_principal(&ServicePrincipalRegistration {
+            capabilities: vec![crate::sekai::service_principal::COMPLIANCE_EXPORT.into()],
+            ..registration()
+        })
+        .unwrap()
+        .unwrap();
+    // Admitted: this plane holds no receipt store, so the export stops there.
+    assert_eq!(
+        export(IN_SCOPE).await.err().unwrap().code(),
+        tonic::Code::FailedPrecondition
+    );
+    for hidden in [OUT_OF_SCOPE, "b-other-tenant"] {
+        assert_eq!(
+            export(hidden).await.err().unwrap().code(),
+            tonic::Code::NotFound,
+            "{hidden}"
+        );
+    }
+}
