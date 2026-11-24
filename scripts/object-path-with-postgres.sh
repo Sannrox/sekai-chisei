@@ -3,7 +3,7 @@
 # and the matching CA, then runs the remaining command. The scheduled
 # object-path matrix uses this so postgres workloads are not filtered.
 #
-#   bash scripts/object-path-with-postgres.sh cargo bench --bench control_plane
+#   bash scripts/object-path-with-postgres.sh cargo bench -p sekai-harness --bench control_plane
 #   SEKAI_CONTAINER_CLI=container bash scripts/object-path-with-postgres.sh ...
 #
 # Overrides: SEKAI_TEST_POSTGRES_PORT, SEKAI_TEST_POSTGRES_IMAGE.

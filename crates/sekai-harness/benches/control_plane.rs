@@ -7,8 +7,6 @@ use sekai_chisei::chisei::receipt::{
 };
 use sekai_chisei::db::sekai::SekaiDb;
 use sekai_chisei::domain::{ListFilter, Object};
-use sekai_chisei::harness::{HarnessEvent, RetrySafety, StreamAssembly, retry_disposition};
-use sekai_chisei::perf_signals::{SignalDirection, SignalRecorder, plane_signal_direction};
 use sekai_chisei::sekai::attestation::{PolicyAttestation, attestation_content_hash};
 use sekai_chisei::sekai::evidence::{
     EVIDENCE_ENVELOPE_VERSION, EvidenceClassification, EvidenceEnvelope, EvidenceIntent,
@@ -26,6 +24,8 @@ use sekai_chisei::sekai::object_sync::{
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_VERSION, SOURCE_GITHUB, SourceBatch,
     SourceBatchStatus, SourceRecord,
 };
+use sekai_harness::harness::{HarnessEvent, RetrySafety, StreamAssembly, retry_disposition};
+use sekai_harness::perf_signals::{SignalDirection, SignalRecorder, plane_signal_direction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -117,6 +117,10 @@ struct ResultRow<'a> {
 }
 
 fn main() -> Result<(), String> {
+    // `cargo bench` runs from this crate's directory; manifests and report
+    // paths are workspace-relative, so resolve them from the workspace root.
+    env::set_current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+        .map_err(|error| format!("enter workspace root: {error}"))?;
     // Cargo passes `--bench` to the harness, so positional detection must skip
     // flags rather than trusting argv[1].
     let manifest_path = env::args()
@@ -159,7 +163,7 @@ fn main() -> Result<(), String> {
         serde_json::to_string_pretty(&report)
             .map_err(|error| format!("serialize benchmark report: {error}"))?
     );
-    sekai_chisei::perf_object_path::release_cached_graphs();
+    sekai_harness::perf_object_path::release_cached_graphs();
     Ok(())
 }
 
@@ -199,14 +203,14 @@ fn selected_workloads(manifest: &Manifest) -> Result<Vec<&Workload>, String> {
 }
 
 fn filter_runnable_object_path(workloads: Vec<&Workload>) -> Result<Vec<&Workload>, String> {
-    let postgres = sekai_chisei::perf_object_path::postgres_url_configured();
+    let postgres = sekai_harness::perf_object_path::postgres_url_configured();
     let selected = workloads
         .into_iter()
         .filter(
-            |workload| match sekai_chisei::perf_object_path::parse_workload_id(&workload.id) {
+            |workload| match sekai_harness::perf_object_path::parse_workload_id(&workload.id) {
                 Some(parsed)
                     if parsed.backend
-                        == sekai_chisei::perf_object_path::ObjectPathBackend::Postgres =>
+                        == sekai_harness::perf_object_path::ObjectPathBackend::Postgres =>
                 {
                     postgres
                 }
@@ -379,7 +383,7 @@ fn workload_factory(workload: &Workload) -> Result<Benchmark, String> {
         }
         "provider_failure_fallback" => retry_benchmark(workload.dataset_size),
         "report_attestation_export" => attestation_benchmark(workload.dataset_size),
-        id => match sekai_chisei::perf_object_path::benchmark_for(
+        id => match sekai_harness::perf_object_path::benchmark_for(
             id,
             workload.dataset_size,
             workload.operations_per_iteration,

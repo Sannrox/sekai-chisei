@@ -481,27 +481,27 @@ mod tests {
     const CONFORMANCE_FIXTURES: [(&str, &[u8]); 6] = [
         (
             "cancelled.sse",
-            include_bytes!("../tests/fixtures/responses/cancelled.sse"),
+            include_bytes!("../../../tests/fixtures/responses/cancelled.sse"),
         ),
         (
             "failed-partial.sse",
-            include_bytes!("../tests/fixtures/responses/failed-partial.sse"),
+            include_bytes!("../../../tests/fixtures/responses/failed-partial.sse"),
         ),
         (
             "fragmented-and-unknown.sse",
-            include_bytes!("../tests/fixtures/responses/fragmented-and-unknown.sse"),
+            include_bytes!("../../../tests/fixtures/responses/fragmented-and-unknown.sse"),
         ),
         (
             "incomplete.sse",
-            include_bytes!("../tests/fixtures/responses/incomplete.sse"),
+            include_bytes!("../../../tests/fixtures/responses/incomplete.sse"),
         ),
         (
             "interrupted.sse",
-            include_bytes!("../tests/fixtures/responses/interrupted.sse"),
+            include_bytes!("../../../tests/fixtures/responses/interrupted.sse"),
         ),
         (
             "multiple-tools.sse",
-            include_bytes!("../tests/fixtures/responses/multiple-tools.sse"),
+            include_bytes!("../../../tests/fixtures/responses/multiple-tools.sse"),
         ),
     ];
 
@@ -513,7 +513,8 @@ mod tests {
 
     #[test]
     fn decodes_fragmented_frames_and_preserves_unknown_events() {
-        let fixture = include_bytes!("../tests/fixtures/responses/fragmented-and-unknown.sse");
+        let fixture =
+            include_bytes!("../../../tests/fixtures/responses/fragmented-and-unknown.sse");
         let mut decoder = SseDecoder::default();
         let mut events = Vec::new();
         for chunk in fixture.chunks(7) {
@@ -564,9 +565,10 @@ mod tests {
 
     #[test]
     fn conformance_fixture_manifest_detects_corpus_drift() {
-        let manifest: FixtureManifest =
-            serde_json::from_slice(include_bytes!("../tests/fixtures/responses/manifest.json"))
-                .unwrap();
+        let manifest: FixtureManifest = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/responses/manifest.json"
+        ))
+        .unwrap();
         assert_eq!(manifest.profile, RESPONSES_HARNESS_PROFILE_VERSION);
         assert_eq!(manifest.fixtures.len(), CONFORMANCE_FIXTURES.len());
         for (name, fixture) in CONFORMANCE_FIXTURES {
@@ -580,7 +582,7 @@ mod tests {
 
     #[test]
     fn assembles_interleaved_tools_for_portable_continuation() {
-        let fixture = include_bytes!("../tests/fixtures/responses/multiple-tools.sse");
+        let fixture = include_bytes!("../../../tests/fixtures/responses/multiple-tools.sse");
         let mut decoder = SseDecoder::default();
         let mut events = decoder.push(fixture).unwrap();
         events.extend(decoder.finish().unwrap());
@@ -633,8 +635,8 @@ mod tests {
     #[test]
     fn failed_and_cancelled_usage_remains_partial() {
         for fixture in [
-            include_bytes!("../tests/fixtures/responses/failed-partial.sse").as_slice(),
-            include_bytes!("../tests/fixtures/responses/cancelled.sse").as_slice(),
+            include_bytes!("../../../tests/fixtures/responses/failed-partial.sse").as_slice(),
+            include_bytes!("../../../tests/fixtures/responses/cancelled.sse").as_slice(),
         ] {
             let events = SseDecoder::default().push(fixture).unwrap();
             let usage = StreamAssembly::from_events(&events).unwrap().usage.unwrap();

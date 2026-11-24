@@ -72,6 +72,32 @@ class Parsing(unittest.TestCase):
         self.assertEqual(semver.new_enums_missing_non_exhaustive(base, head), [])
 
 
+class LibraryPackages(unittest.TestCase):
+    def test_skips_publish_false_and_binary_only_packages(self):
+        root = pathlib.Path("/w")
+
+        def package(name, publish, kinds):
+            return {
+                "name": name,
+                "publish": publish,
+                "manifest_path": f"/w/crates/{name}/Cargo.toml",
+                "targets": [{"kind": kinds, "src_path": f"/w/crates/{name}/src/lib.rs"}],
+            }
+
+        metadata = {
+            "packages": [
+                package("published", None, ["lib"]),
+                package("internal", [], ["lib"]),
+                package("registry-only", ["internal-registry"], ["lib"]),
+                package("tool", None, ["bin"]),
+            ]
+        }
+        self.assertEqual(
+            [name for name, _, _ in semver.library_packages(metadata, root)],
+            ["published", "registry-only"],
+        )
+
+
 class Gates(unittest.TestCase):
     def test_pull_request_gate(self):
         for result, waived, missing, rc in (

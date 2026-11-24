@@ -14,7 +14,7 @@ SEKAI_BENCH_OS="$(sw_vers -productName) $(sw_vers -productVersion)" \
 SEKAI_BENCH_RUSTC="$(rustc --version)" \
 SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 SEKAI_BENCH_PROFILE=release \
-cargo bench --bench control_plane -- benchmarks/manifest-v1.json \
+cargo bench -p sekai-harness --bench control_plane -- benchmarks/manifest-v1.json \
   > benchmarks/baseline-apple-m2-pro.json
 ```
 
@@ -66,7 +66,7 @@ SEKAI_BENCH_OS="$(sw_vers -productName) $(sw_vers -productVersion)" \
 SEKAI_BENCH_RUSTC="$(rustc --version)" \
 SEKAI_BENCH_RECORDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 SEKAI_BENCH_PROFILE=release \
-cargo bench --bench control_plane -- benchmarks/manifest-source-ingestion-v1.json \
+cargo bench -p sekai-harness --bench control_plane -- benchmarks/manifest-source-ingestion-v1.json \
   > benchmarks/baseline-source-ingestion.json
 ```
 
@@ -104,7 +104,7 @@ regression. Check in the first three runner-class reports before the floor
 has a measured reference:
 
 ```bash
-cargo run --release --bin perf-gate -- \
+cargo run --release -p sekai-harness --bin perf-gate -- \
   --enforce --regression-threshold-percent 20 \
   --manifest benchmarks/manifest-object-path-v1.json \
   --baseline benchmarks/baseline-github-ubuntu-latest-object-path.json \
@@ -162,7 +162,7 @@ against its Unix socket. Setup uses the local operator socket and creates
 per-bot and intake credentials through gRPC:
 
 ```bash
-cargo build --release --bin sekai-chisei --bin game-soak
+cargo build --release -p sekai-chisei -p sekai-harness --bin sekai-chisei --bin game-soak
 SEKAI_SOCKET=/tmp/soak/sekai.sock SEKAI_DB_PATH=/tmp/soak/sekai.db \
 CHISEI_DB_PATH=/tmp/soak/chisei.db SEKAI_EXPERIMENTAL_RPCS=1 GRPC_PORT=0 \
   ./target/release/sekai-chisei &
@@ -194,7 +194,7 @@ A single run cannot separate a regression from noise, so `perf-gate` refuses
 fewer than three reports:
 
 ```bash
-cargo run --release --bin perf-gate -- \
+cargo run --release -p sekai-harness --bin perf-gate -- \
   --manifest benchmarks/manifest-v1.json \
   --baseline benchmarks/baseline-apple-m2-pro.json \
   run-1.json run-2.json run-3.json

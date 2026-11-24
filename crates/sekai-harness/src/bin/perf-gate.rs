@@ -17,11 +17,11 @@
 //! the manifest's `signal_budgets` and the baseline the same way; a baseline
 //! without signals skips the signal comparison.
 
-use sekai_chisei::perf_regression::{
+use sekai_harness::perf_regression::{
     BaselineVerdict, GateOutcome, Ineligibility, MIN_DETECTABLE_REGRESSION_PERCENT,
     MIN_REPETITIONS, WorkloadBudget, WorkloadSample, compare_to_baseline_with_threshold, evaluate,
 };
-use sekai_chisei::perf_signals::{
+use sekai_harness::perf_signals::{
     SignalOutcome, SignalVerdict, WorkloadSignals, compare_signals_to_baseline, evaluate_signals,
 };
 use serde::Deserialize;

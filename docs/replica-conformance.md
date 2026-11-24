@@ -6,7 +6,7 @@ one isolated temporary SQLite authority and exercises the real shared-state
 implementation.
 
 ```bash
-cargo run --locked --bin replica-conformance
+cargo run --locked -p sekai-harness --bin replica-conformance
 ```
 
 The command emits one compact JSON object using

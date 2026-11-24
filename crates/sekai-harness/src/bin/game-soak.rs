@@ -14,8 +14,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sekai_chisei::game_soak::{HardwareProfile, SoakSpec, run, script};
 use sekai_chisei::sekai::synthetic::SizePreset;
+use sekai_harness::game_soak::{HardwareProfile, SoakSpec, run, script};
 
 const USAGE: &str = "game-soak --target <socket> --seed <n> --out <dir> [--bots <n>] \
     [--rounds <n>] [--batch-records <n>] [--preset demo|onboarding|load_test] [--namespace <ns>]";
