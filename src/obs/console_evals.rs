@@ -775,6 +775,8 @@ mod tests {
                 outcome: CaseOutcome {
                     passed,
                     reason: reason.into(),
+                    trial_code: None,
+                    unmet_metrics: Vec::new(),
                     input_tokens: 10,
                     output_tokens: 5,
                     cost_micros: 4_000,

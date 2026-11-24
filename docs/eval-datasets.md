@@ -164,6 +164,27 @@ version. Only the outcome is stored with the result, never the receipts.
 An evaluator definition judges a case's evidence. It calls no tool, writes
 no output, and applies no Action, so its cases report empty receipts.
 
+## Failure groups
+
+`RunEvalDatasetResponse.failure_groups` groups the run's failed cases by
+cause (#3438). Each group has a dimension, a key, a count, and the sorted
+case ids. A failed case is in one group of every dimension it has a key in.
+
+| Dimension | Key |
+| --- | --- |
+| `template` | the `case_id` up to its first `:` |
+| `tag` | one dataset tag of the case |
+| `reason` | the reason code; for a failed stochastic step also `trial_code`, the most frequent failing trial code (`criteria_not_met`, `insufficient_evidence`) |
+| `metric` | one unmet metric name ([ADR 0154](decisions/0154-evaluators-report-metrics-plans-own-objectives.md)) |
+| `policy` | one policy violation kind the case had |
+
+Groups come in that dimension order, then largest first, then by key.
+Each ledger line also carries its `trial_code` and `unmet_metrics`. Lines
+recorded before these fields existed have neither and group by reason code
+alone. Grouping reads only what the run already stored: it makes no model
+call and suggests no fix. See
+[the research note](research/2631-failed-case-grouping.md).
+
 
 ## Baseline comparison
 

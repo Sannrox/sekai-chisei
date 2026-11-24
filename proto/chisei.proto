@@ -771,6 +771,25 @@ message EvalRunCaseLine {
   uint64 input_tokens = 4;
   uint64 output_tokens = 5;
   int64 cost_micros = 6;
+  // On a failed stochastic step: the most frequent failing trial code (#3438).
+  // Empty otherwise and on lines recorded before it.
+  string trial_code = 7;
+  // On a failed step: its unmet metric names, sorted (ADR 0154). Empty
+  // otherwise and on lines recorded before it.
+  repeated string unmet_metrics = 8;
+}
+// Failed cases sharing one deterministic cause (#3438). A failed case
+// appears once in every dimension it has a key in.
+message EvalFailureGroup {
+  // template (case_id up to its first ':'), tag, reason, metric, or policy.
+  string dimension = 1;
+  string key = 2;
+  // For reason groups of stochastic failures: the trial code, part of the
+  // group key. Empty otherwise.
+  string trial_code = 3;
+  uint32 count = 4;
+  // Sorted.
+  repeated string case_ids = 5;
 }
 message RunEvalDatasetResponse {
   // completed, budget_exhausted, or incomplete (some cases failed to run).
@@ -790,6 +809,10 @@ message RunEvalDatasetResponse {
   string policy_scorer_version = 7;
   repeated EvalPolicyCount policy_counts = 8;
   repeated EvalPolicyViolation policy_violations = 9;
+  // The failed cases in the ledger grouped by template, tag, reason, unmet
+  // metric, and policy violation kind (#3438): by dimension in that order,
+  // then largest first, then by key. No model call derives them.
+  repeated EvalFailureGroup failure_groups = 10;
 }
 // A candidate eval run compared with a baseline run of the same dataset
 // version (#1677): paired per case, an exact one-sided McNemar test on the

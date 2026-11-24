@@ -1056,6 +1056,8 @@ mod tests {
             Ok(CaseOutcome {
                 passed: true,
                 reason: "fixture".into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 3,
                 output_tokens: 2,
                 cost_micros: 5,
@@ -1136,6 +1138,8 @@ mod tests {
             outcome: CaseOutcome {
                 passed: true,
                 reason: "first".into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 cost_micros: cost,
@@ -1233,6 +1237,8 @@ mod tests {
             let outcome = CaseOutcome {
                 passed,
                 reason: reason.into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 cost_micros: 5,
