@@ -19,16 +19,37 @@ ontology members from `sekai.definition-revision/v1`.
 3. Generate TypeScript via
    `sekai_chisei::ontology_codegen::generate_ontology_typescript_client` or
    Python via
-   `sekai_chisei::ontology_codegen::generate_ontology_python_client`. Both
-   functions share the same selection, scope, and fail-closed errors.
+   `sekai_chisei::ontology_codegen::generate_ontology_python_client`. For an
+   application that reaches the plane over HTTP, generate the HTTP target with
+   `generate_ontology_typescript_http_client` or
+   `generate_ontology_python_http_client`. All four share the same selection,
+   scope, typed surface, and fail-closed errors.
 4. Authenticate with a principal credential held by the host. Do not copy
    secrets into the generated package.
 5. Invoke through native gRPC and attach `nativeMetadata` /
    `native_metadata`. When `x-sekai-definition-revision` is present, object
-   query and mutation RPCs compare it to the live published digest and fail
-   closed on mismatch. Requests that omit the header keep current behavior.
-   `bindLiveRevision` / `bind_live_revision` is the matching client-side
-   check.
+   query and mutation RPCs and `SubmitActionInstance` compare it to the live
+   published digest and fail closed on mismatch. Requests that omit the header
+   keep current behavior. `bindLiveRevision` / `bind_live_revision` is the
+   matching client-side check.
+
+### HTTP target
+
+The HTTP target ([ADR 0160](decisions/0160-generated-ontology-clients-target-the-http-projection.md))
+calls the plane's `sekai.http-projection/v1` listener (`SEKAI_HTTP_PORT`,
+[ADR 0075](decisions/0075-http-ontology-projection.md)); there is no separate
+route contract. It exports `GENERATED_TRANSPORT` and replaces the native
+metadata helper with `httpHeaders` / `http_headers`, which returns the
+namespace, revision pin, and operation id headers for a
+`POST /{service}/{method}` request. The projection forwards the pin, so the
+same stale-pin failure applies on HTTP as on gRPC.
+
+- The application adds `authorization: Bearer <token>` at call time. The
+  generated HTTP projection client (`sdk/typescript/http.ts`,
+  `sdk/python/sekai_http.py`) takes it as an argument.
+- `EvaluateObjectSet` pins in the request body: set the descriptor's
+  `definition_digest` to `GENERATED_REVISION_DIGEST`.
+- Only stable calls are hosted on HTTP; experimental calls are refused.
 
 ## Fail-closed rules
 
@@ -57,6 +78,8 @@ ontology members from `sekai.definition-revision/v1`.
 `tests/fixtures/ontology_codegen/scoped_client.v1.ts` and
 `tests/fixtures/ontology_codegen/scoped_client.v1.py` are the CI goldens for
 the same published revision and explicit four-kind selection.
+`scoped_http_client.v1.ts` and `scoped_http_client.v1.py` are the HTTP-target
+goldens for that selection.
 
 ## Non-goals
 

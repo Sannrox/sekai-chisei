@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true
   },
-  "include": ["./scoped_client.v1.ts", "./compile_check.ts"]
+  "include": ["./scoped_client.v1.ts", "./scoped_http_client.v1.ts", "./compile_check.ts"]
 }
