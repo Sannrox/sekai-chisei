@@ -261,6 +261,8 @@ impl SekaiDb {
         crate::sekai::dataset_health::migrate_dataset_health(&conn)?;
         crate::sekai::consumer_violation::migrate_consumer_violations(&conn)?;
         crate::db::dataset_branch::migrate_dataset_branches(&conn)?;
+        conn.execute_batch(crate::db::dataset_rollback_proposal::SQLITE_SCHEMA)
+            .map_err(|error| error.to_string())?;
         crate::db::add_sqlite_column(
             &conn,
             "ALTER TABLE sekai_datasets ADD COLUMN partition_keys TEXT NOT NULL DEFAULT '[]'",
@@ -667,71 +669,7 @@ impl SekaiDb {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let restored = get_dataset_version_tx(
-            &tx,
-            &request.dataset_id,
-            &request.restore_from_version_id,
-            0,
-        )?;
-        if restored.purged {
-            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
-        }
-        // Checked inside the rollback transaction, so it holds for the write.
-        let backing_index: Option<(String, String)> = tx
-            .query_row(
-                "SELECT namespace, kind FROM sekai_object_type_datasource
-                 WHERE dataset_id = ?1 AND edits_only = 0
-                 ORDER BY namespace, kind LIMIT 1",
-                params![request.dataset_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some((namespace, kind)) = backing_index {
-            return Err(dataset_version::rollback_backs_index_error(
-                &namespace, &kind,
-            ));
-        }
-        tx.execute(
-            "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
-            params![request.dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
-             SELECT dataset_id, data, partition_key FROM sekai_dataset_version_rows
-             WHERE dataset_id = ?1 AND version_id = ?2
-             ORDER BY row_id",
-            params![request.dataset_id, restored.version_id],
-        )
-        .map_err(|error| error.to_string())?;
-        let keys_json: String = tx
-            .query_row(
-                "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
-                params![request.dataset_id],
-                |row| row.get(0),
-            )
-            .map_err(|error| error.to_string())?;
-        reindex_dataset_partition_keys(
-            &tx,
-            &request.dataset_id,
-            &parse_partition_keys(&keys_json)?,
-        )?;
-        mark_consuming_transform_outputs_stale_tx(
-            &tx,
-            &request.dataset_id,
-            &restored.version_id,
-            dataset_version::now_ms(),
-        )?;
-        let version = snapshot_dataset_version_tx(
-            &tx,
-            &request.dataset_id,
-            &request.actor,
-            &request.tenant,
-            &request.reason,
-            &restored.version_id,
-            dataset_version::now_ms(),
-        )?;
+        let version = rollback_dataset_tx(&tx, request)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(version)
     }
@@ -1214,7 +1152,7 @@ pub fn erase_matching_dataset_version_rows_tx(
     Ok(())
 }
 
-fn get_dataset_version_tx(
+pub(crate) fn get_dataset_version_tx(
     tx: &Transaction<'_>,
     dataset_id: &str,
     version_id: &str,
@@ -1480,6 +1418,73 @@ pub fn mark_consuming_transform_outputs_stale_tx(
         .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+/// The rollback of [`SekaiDb::rollback_dataset`] inside the caller's
+/// immediate transaction, so it commits together with other writes. The
+/// caller commits on success and rolls back on any error.
+pub(crate) fn rollback_dataset_tx(
+    tx: &rusqlite::Transaction<'_>,
+    request: &DatasetRollback,
+) -> Result<DatasetVersion, String> {
+    let restored =
+        get_dataset_version_tx(tx, &request.dataset_id, &request.restore_from_version_id, 0)?;
+    if restored.purged {
+        return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+    }
+    // Checked inside the rollback transaction, so it holds for the write.
+    let backing_index: Option<(String, String)> = tx
+        .query_row(
+            "SELECT namespace, kind FROM sekai_object_type_datasource
+             WHERE dataset_id = ?1 AND edits_only = 0
+             ORDER BY namespace, kind LIMIT 1",
+            params![request.dataset_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    if let Some((namespace, kind)) = backing_index {
+        return Err(dataset_version::rollback_backs_index_error(
+            &namespace, &kind,
+        ));
+    }
+    tx.execute(
+        "DELETE FROM sekai_dataset_rows WHERE dataset_id = ?1",
+        params![request.dataset_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_dataset_rows (dataset_id, data, partition_key)
+         SELECT dataset_id, data, partition_key FROM sekai_dataset_version_rows
+         WHERE dataset_id = ?1 AND version_id = ?2
+         ORDER BY row_id",
+        params![request.dataset_id, restored.version_id],
+    )
+    .map_err(|error| error.to_string())?;
+    let keys_json: String = tx
+        .query_row(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = ?1",
+            params![request.dataset_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    reindex_dataset_partition_keys(tx, &request.dataset_id, &parse_partition_keys(&keys_json)?)?;
+    mark_consuming_transform_outputs_stale_tx(
+        tx,
+        &request.dataset_id,
+        &restored.version_id,
+        dataset_version::now_ms(),
+    )?;
+    let version = snapshot_dataset_version_tx(
+        tx,
+        &request.dataset_id,
+        &request.actor,
+        &request.tenant,
+        &request.reason,
+        &restored.version_id,
+        dataset_version::now_ms(),
+    )?;
+    Ok(version)
 }
 
 #[cfg(test)]

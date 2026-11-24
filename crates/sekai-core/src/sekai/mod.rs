@@ -45,6 +45,7 @@ pub mod export_delivery;
 pub mod export_fingerprint;
 pub mod external_effect;
 pub use sekai_types::dataset_branch;
+pub use sekai_types::dataset_rollback;
 pub use sekai_types::dataset_version;
 pub use sekai_types::model_stage;
 pub use sekai_types::model_version;

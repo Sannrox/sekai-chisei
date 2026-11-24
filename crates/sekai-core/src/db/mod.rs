@@ -15,6 +15,7 @@ pub mod coordination;
 pub mod credential;
 pub mod dataset;
 pub mod dataset_branch;
+pub mod dataset_rollback_proposal;
 pub mod decision;
 pub mod deduplication;
 pub mod definition_branch;

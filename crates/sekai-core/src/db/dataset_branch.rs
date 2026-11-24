@@ -1103,7 +1103,7 @@ fn dataset_exists(tx: &Transaction<'_>, dataset_id: &str) -> Result<(), String> 
     .ok_or_else(|| dataset_version::DATASET_NOT_FOUND.to_string())
 }
 
-fn latest_version_id(tx: &Transaction<'_>, dataset_id: &str) -> Result<String, String> {
+pub(crate) fn latest_version_id(tx: &Transaction<'_>, dataset_id: &str) -> Result<String, String> {
     tx.query_row(
         "SELECT version_id FROM sekai_dataset_versions
          WHERE dataset_id = ?1 ORDER BY seq DESC LIMIT 1",

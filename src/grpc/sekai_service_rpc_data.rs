@@ -519,6 +519,23 @@ fn readable_columns(
     }
 }
 
+/// The access a dataset rollback proposal RPC (#3186) needs: `RollbackDataset`'s
+/// write access and readable columns when `write`, else read access. Returns
+/// the namespace of the dataset's binding object, if it has one.
+pub(super) fn authorize_dataset_rollback(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset: &dataset::Dataset,
+    write: bool,
+) -> Result<Option<String>, Status> {
+    let access = authorize_dataset_access(service, principals, tenant_context, dataset, write)?;
+    if write {
+        readable_columns(service, dataset, &access)?;
+    }
+    Ok(access.binding.map(|binding| binding.namespace))
+}
+
 /// Drops the columns of snapshot rows outside `readable` (see [`readable_columns`]).
 fn hold_rows_to(rows: &mut [HashMap<String, String>], readable: Option<&[String]>) {
     if let Some(readable) = readable {
