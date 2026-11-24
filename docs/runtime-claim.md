@@ -240,8 +240,9 @@ namespace must pass the caller's tenant check. The marking ceiling is the
 principal profile's `classification_ceiling`, reported read-only. Built-in
 principals cannot be registered, and registrations never hold a secret: the
 identity extension issues credentials. A registration may also list `capabilities`
-beyond Actions; `agent_turn_worker` is the only one, and with it
-`action_types` may be empty.
+beyond Actions: `agent_turn_worker` and `compliance_export`
+(`ExportComplianceBundle`, #3047). With a capability, `action_types` may be
+empty.
 
 `IssueServicePrincipalToken` (#1510) is the client-credentials call: the
 identity-extension issuance hook verifies the secret for a registered

@@ -263,6 +263,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SimulateObjectPolicyChange` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.QueryObjectPolicyAudit` | `sekai.object-security` | yes | none | `experimental` |
 | `SekaiService.ExportNamespaceAudit` | `sekai.audit` | yes | cli | `experimental` |
+| `SekaiService.ExportComplianceBundle` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.FindByExternalId` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.FindByProperty` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.CreateLink` | `sekai.graph` | yes | sdk, cli | `stable` |

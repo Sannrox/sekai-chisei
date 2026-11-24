@@ -68,8 +68,12 @@ impl ServicePrincipalRegistration {
 /// heartbeats and acknowledges them (ADR 0142).
 pub const AGENT_TURN_WORKER: &str = "agent_turn_worker";
 
+/// Builds compliance bundles for the principal's namespaces through
+/// `ExportComplianceBundle` (#3047). Namespace roles never imply it.
+pub const COMPLIANCE_EXPORT: &str = "compliance_export";
+
 /// Capabilities a registration may hold.
-pub const CAPABILITIES: &[&str] = &[AGENT_TURN_WORKER];
+pub const CAPABILITIES: &[&str] = &[AGENT_TURN_WORKER, COMPLIANCE_EXPORT];
 
 /// Built-in principals with trusted authority are never service principals.
 const RESERVED_PRINCIPALS: &[&str] = &["root", "local", "anonymous", "chisei-gateway"];

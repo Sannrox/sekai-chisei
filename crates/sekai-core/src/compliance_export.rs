@@ -608,9 +608,21 @@ pub fn export_compliance_from_db(
     request: &ComplianceExportRequest,
     exported_at_ms: i64,
 ) -> Result<ComplianceExportBundle, String> {
+    export_compliance_from_stores(db, db, request, exported_at_ms)
+}
+
+/// [`export_compliance_from_db`] when receipts and decisions live in
+/// different stores: a split layout keeps receipts on the Chisei store and
+/// every decision on the Sekai store.
+pub fn export_compliance_from_stores(
+    receipts_db: &crate::db::runtime_db::RuntimeDb,
+    decisions_db: &crate::db::runtime_db::RuntimeDb,
+    request: &ComplianceExportRequest,
+    exported_at_ms: i64,
+) -> Result<ComplianceExportBundle, String> {
     validate_request(request)?;
     // Fetch limit+1 so silent truncation is impossible.
-    let receipts = db.list_operation_receipts_in_window(
+    let receipts = receipts_db.list_operation_receipts_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
@@ -621,7 +633,7 @@ pub fn export_compliance_from_db(
             "compliance export receipt limit exceeded ({MAX_COMPLIANCE_RECEIPTS}); narrow the time window"
         ));
     }
-    let decisions = db.list_compliance_decisions_in_window(
+    let decisions = decisions_db.list_compliance_decisions_in_window(
         &request.namespace,
         request.start_timestamp_ms,
         request.end_timestamp_ms,
@@ -636,6 +648,10 @@ pub fn export_compliance_from_db(
 }
 
 /// Record a successful compliance export after the bundle is durable.
+///
+/// The decision id derives from namespace, actor and request id, so a retry
+/// of the same request records once. Reusing a request id for a different
+/// window or redaction is refused.
 pub fn record_compliance_export_success(
     db: &crate::db::runtime_db::RuntimeDb,
     request: &ComplianceExportRequest,
@@ -659,7 +675,24 @@ pub fn record_compliance_export_success(
         target_id: format!("compliance-export:{}", request.namespace),
         outcome: "succeeded".into(),
     };
+    let recorded = |db: &crate::db::runtime_db::RuntimeDb| -> Result<bool, String> {
+        match db.get_decision(&decision.id)? {
+            None => Ok(false),
+            Some(existing)
+                if existing.evidence.get("request_digest")
+                    == decision.evidence.get("request_digest") =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err("request_id was already used for a different compliance export".into()),
+        }
+    };
+    if recorded(db)? {
+        return Ok(());
+    }
+    // A concurrent retry may record between the check and the write.
     db.record_decision(&decision)
+        .or_else(|error| if recorded(db)? { Ok(()) } else { Err(error) })
 }
 
 /// Hash used for export audit request digests.

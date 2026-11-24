@@ -2818,6 +2818,31 @@ message ExportNamespaceAuditResponse {
   // The page reached the ledger head; a later call returns newer decisions.
   bool caught_up = 8;
 }
+// Experimental (#3047): one namespace's sekai.compliance-export/v1 bundle,
+// as `sekaictl admin assurance compliance export` writes it, unsigned.
+// Needs a service principal registered with the compliance_export
+// capability for the namespace, or credential admin; namespace admins do
+// not get it by default. The export is recorded on the namespace's
+// decision ledger once per request_id, naming the caller.
+message ExportComplianceBundleRequest {
+  string namespace = 1;
+  // Half-open window [start, end), at most 366 days.
+  int64 start_timestamp_ms = 2;
+  int64 end_timestamp_ms = 3;
+  // false (default) redacts; true keeps receipt attributes as stored.
+  bool full = 4;
+  // Required idempotency key for the recorded export decision.
+  string request_id = 5;
+}
+// The bundle's canonical JSON bytes, in order. The last chunk has done set
+// and carries the manifest's content digest and export time. Sign the
+// reassembled bundle with your own key; the plane never signs it.
+message ComplianceBundleChunk {
+  bytes data = 1;
+  bool done = 2;
+  string content_digest = 3;
+  int64 exported_at_ms = 4;
+}
 message FindByExternalIdRequest { string external_id = 1; }
 message FindByPropertyRequest { string kind = 1; string key = 2; string value = 3; }
 
@@ -4408,7 +4433,9 @@ message ServicePrincipal {
   int64 updated_at_ms = 8;
   // Capabilities beyond Actions, sorted and unique. `agent_turn_worker`
   // lists, claims, heartbeats and acks agent turns in the namespaces above
-  // (ADR 0142). With a capability, action_types may be empty.
+  // (ADR 0142); `compliance_export` builds their compliance bundles through
+  // ExportComplianceBundle (#3047). With a capability, action_types may be
+  // empty.
   repeated string capabilities = 9;
 }
 message PutServicePrincipalRequest { ServicePrincipal service_principal = 1; }
@@ -6548,6 +6575,8 @@ service SekaiService {
   rpc QueryCounterfactualView(QueryCounterfactualViewRequest) returns (QueryCounterfactualViewResponse);
   rpc QueryObjectPolicyAudit(QueryObjectPolicyAuditRequest) returns (QueryObjectPolicyAuditResponse);
   rpc ExportNamespaceAudit(ExportNamespaceAuditRequest) returns (ExportNamespaceAuditResponse);
+  // Experimental (#3047).
+  rpc ExportComplianceBundle(ExportComplianceBundleRequest) returns (stream ComplianceBundleChunk);
   rpc RegisterCatalogEntry(RegisterCatalogEntryRequest) returns (RegisterCatalogEntryResponse);
   rpc GetCatalogEntryLineage(GetCatalogEntryLineageRequest) returns (GetCatalogEntryLineageResponse);
   rpc ListCatalogCriticalityOutbox(ListCatalogCriticalityOutboxRequest) returns (ListCatalogCriticalityOutboxResponse);

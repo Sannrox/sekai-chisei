@@ -115,6 +115,8 @@ mod support_credentials;
 use support_credentials::*;
 // Chisei reads authorize a tenant context the same way (#1770).
 pub(in crate::grpc) use support_credentials::enforce_namespace_tenant_context_for;
+#[path = "compliance_export_rpc.rs"]
+mod compliance_export_rpc;
 #[path = "sekai_service_rpc_actions.rs"]
 mod rpc_actions;
 #[path = "sekai_service_rpc_audit_export.rs"]
@@ -347,6 +349,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ExportDatasetVersionRequest>,
     ) -> Result<Response<ExportStream>, Status> {
         self.export_dataset_version_rpc(req).await
+    }
+
+    async fn export_compliance_bundle(
+        &self,
+        req: Request<ExportComplianceBundleRequest>,
+    ) -> Result<Response<compliance_export_rpc::ComplianceBundleStream>, Status> {
+        self.export_compliance_bundle_rpc(req)
     }
 
     async fn fetch_export_artifact(
