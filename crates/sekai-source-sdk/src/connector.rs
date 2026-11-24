@@ -206,8 +206,56 @@ pub const RELATIONAL_CONNECTOR: ConnectorType = ConnectorType {
     }],
 };
 
+/// One record kind from an HTTP API that returns paged JSON. Paths into a
+/// response body are JSON Pointers; request paths are appended to
+/// `base_url`. A page names the next one by a link (`next_link_path`) or
+/// by an opaque page cursor sent as the `next_cursor_param` query parameter
+/// (`next_cursor_path`). The one credential is sent as the `auth_header`
+/// request header, after `auth_scheme` when set. `apply` writes the
+/// `writable_fields` of the record at `item_path` (`{id}` is the record's
+/// id) with a conditional write when `conditional_write` is set, and
+/// otherwise reads the record's version just before the write.
+pub const REST_CONNECTOR: ConnectorType = ConnectorType {
+    name: "rest",
+    version: "1",
+    fixed_source: None,
+    operations: &[Operation::Check, Operation::ReadPage, Operation::Apply],
+    config: &[
+        field("base_url", ConfigFieldKind::Destination, true),
+        field("list_path", ConfigFieldKind::Text, true),
+        field("check_path", ConfigFieldKind::Text, false),
+        field("records_path", ConfigFieldKind::Text, false),
+        field("next_link_path", ConfigFieldKind::Text, false),
+        field("next_cursor_path", ConfigFieldKind::Text, false),
+        field("next_cursor_param", ConfigFieldKind::Text, false),
+        field("id_path", ConfigFieldKind::Text, true),
+        field("version_path", ConfigFieldKind::Text, true),
+        field("display_path", ConfigFieldKind::Text, false),
+        field("record_kind", ConfigFieldKind::Text, true),
+        field("type_digest", ConfigFieldKind::Text, true),
+        field("item_path", ConfigFieldKind::Text, false),
+        field("writable_fields", ConfigFieldKind::Text, false),
+        field("conditional_write", ConfigFieldKind::Boolean, false),
+        field("auth_header", ConfigFieldKind::Text, false),
+        field("auth_scheme", ConfigFieldKind::Text, false),
+    ],
+    credential_slots: &[CredentialSlot {
+        name: "token",
+        required: true,
+    }],
+};
+
+const fn field(name: &'static str, kind: ConfigFieldKind, required: bool) -> ConfigField {
+    ConfigField {
+        name,
+        kind,
+        required,
+    }
+}
+
 /// Every connector type this SDK version defines.
-pub const CONNECTOR_TYPES: &[ConnectorType] = &[GITHUB_CONNECTOR, RELATIONAL_CONNECTOR];
+pub const CONNECTOR_TYPES: &[ConnectorType] =
+    &[GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR];
 
 /// The connector type with this name and version, if this SDK defines it.
 pub fn connector_type(name: &str, version: &str) -> Option<&'static ConnectorType> {
