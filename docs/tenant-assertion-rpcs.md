@@ -138,10 +138,27 @@ it.
 Admitted on `ChiseiService` only, like the #1770 reads, and authorized on
 the same tenant path: an assertion reads only its tenant's namespaces, even
 where its subject holds a grant elsewhere. Token callers keep the namespace
-grant check. They stay experimental. `RunEvalDataset` and
-`PutEvalDatasetDefinition` are not admitted.
-`tenant_assertion_reads_its_namespaces_eval_datasets` covers all five
-through the token interceptor.
+grant check. They stay experimental. `PutEvalDatasetDefinition` is not
+admitted. `tenant_assertion_reads_its_namespaces_eval_datasets` covers all
+five through the token interceptor.
+
+## Added in #3089
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `ChiseiService.RunEvalDataset` | request | write |
+
+Admitted on `ChiseiService` only and authorized on the same tenant path as
+a namespace write: the assertion needs the `sekai.write` scope, writes only
+its tenant's namespaces, and without an enterprise extension its subject
+needs an editor or admin grant there. Token callers keep the editor or admin
+grant check. There is no tenant-specific spend ceiling: `budget_micros`
+bounds the run for every caller, and a stochastic case reserves its tokens
+from the namespace's project budget (`project:<namespace>`). An assertion
+cannot bind a run to an `artifact_digest`; that stays with credential
+administration. It stays
+experimental. `tenant_assertion_runs_an_eval_dataset_in_its_namespace`
+covers it through the token interceptor.
 
 ## Not available to tenant credentials
 

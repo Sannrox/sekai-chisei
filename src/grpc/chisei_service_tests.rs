@@ -15243,9 +15243,20 @@ impl TenantReadFixture {
         )));
         let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
         let facts = crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&chisei));
-        let svc = ChiseiServiceImpl::new(chisei, config(":memory:"))
-            .with_sekai_facts(facts)
+        // The evaluator `evaluator_definition_request` names, so a tenant can
+        // run an eval dataset (#3089).
+        let registry =
+            Arc::new(evaluation_execution_domain::DeterministicEvaluatorRegistry::default());
+        registry
+            .register(
+                &format!("sha256:{}", "a".repeat(64)),
+                Arc::new(SchemaFixtureEvaluator { delay_ms: 0 }),
+            )
             .unwrap();
+        let svc =
+            ChiseiServiceImpl::new_with_evaluator_registry(chisei, config(":memory:"), registry)
+                .with_sekai_facts(facts)
+                .unwrap();
         for &(operation_id, namespace) in receipts {
             svc.db
                 .put_operation_receipt(&OperationReceipt {
@@ -15686,3 +15697,174 @@ mod chisei_custom_rubric_tests;
 mod chisei_evaluation_metrics_tests;
 #[path = "chisei_execution_telemetry_tests.rs"]
 mod chisei_execution_telemetry_tests;
+
+/// #3089: through the real token interceptor, a tenant assertion with write
+/// scope runs an eval dataset in its own namespace. A run in another
+/// tenant's namespace, where its subject holds an editor grant, is refused
+/// before any case runs, and a read-only assertion is refused at admission.
+#[tokio::test]
+async fn tenant_assertion_runs_an_eval_dataset_in_its_namespace() {
+    let mut fixture = TenantReadFixture::new("subject-a", &[]);
+    let mut definitions = HashMap::new();
+    for namespace in ["ns-a", "ns-b"] {
+        let dataset = fixture
+            .svc
+            .put_eval_dataset_definition(Request::new(PutEvalDatasetDefinitionRequest {
+                namespace: namespace.into(),
+                definition_json: format!(
+                    r#"{{
+                    "contract_version": "chisei.eval-dataset-definition/v1",
+                    "name": "shipments",
+                    "generator": "supply_chain",
+                    "namespace": "{namespace}",
+                    "seed": 7,
+                    "preset": "demo",
+                    "templates": [{{
+                        "id": "shipment-status",
+                        "kind": "synthetic_shipment",
+                        "input_properties": ["tracking"],
+                        "expected_property": "status"
+                    }}]
+                }}"#
+                ),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        let mut evaluator = evaluator_definition_request(namespace);
+        evaluator
+            .definition
+            .as_mut()
+            .unwrap()
+            .supported_input_schemas
+            .push(crate::chisei::eval_dataset::EVAL_CASE_SCHEMA.into());
+        let evaluator = fixture
+            .svc
+            .put_evaluator_definition(Request::new(evaluator))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap()
+            .definition
+            .unwrap()
+            .definition_id;
+        definitions.insert(namespace, (dataset.version, evaluator));
+    }
+    // subject-a holds an editor grant in ns-b, so only the tenant check keeps
+    // the assertion out of it.
+    let runtime = fixture.svc.db.runtime_arc();
+    runtime
+        .create_object(&Object {
+            id: "eval-run-tenant-ns-b".into(),
+            kind: "namespace".into(),
+            name: "ns-b".into(),
+            namespace: String::new(),
+            external_id: "namespace:ns-b".into(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+    runtime
+        .create_grant(&Grant {
+            id: "eval-run-tenant-subject-a".into(),
+            object_id: "eval-run-tenant-ns-b".into(),
+            principal: "subject-a".into(),
+            role: Role::Editor,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let token = |scope: &str| {
+        let (authority, scope) = (fixture.authority.clone(), scope.to_string());
+        move || {
+            authority
+                .sign(&crate::identity_assertion::IdentityAssertion {
+                    contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+                    issuer: "https://issuer.test".into(),
+                    audience: "https://sekai.test".into(),
+                    subject: "subject-a".into(),
+                    credential_id: "credential-a".into(),
+                    credential_kind: "human_session".into(),
+                    space: None,
+                    space_role: None,
+                    act: None,
+                    tenant_id: Some("tenant-a".into()),
+                    scopes: vec![scope.clone()],
+                    expires_at: chrono::Utc::now().timestamp() + 60,
+                    nonce: uuid::Uuid::new_v4().to_string(),
+                    device: None,
+                })
+                .unwrap()
+        }
+    };
+    let (write, read) = (token("sekai.write"), token("sekai.read"));
+    let run = |namespace: &str, run_id: &str| {
+        let (version, evaluator) = &definitions[namespace];
+        RunEvalDatasetRequest {
+            namespace: namespace.into(),
+            run_id: run_id.into(),
+            dataset: "shipments".into(),
+            dataset_version: version.clone(),
+            agent: "triage@1".into(),
+            model: "deterministic".into(),
+            tool_version: "tools@1".into(),
+            evaluator_definition_id: evaluator.clone(),
+            concurrency: 2,
+            budget_micros: 1_000,
+            max_case_cost_micros: 10,
+            artifact_digest: String::new(),
+        }
+    };
+    let (metadata, extensions) = fixture.admit(&write, "RunEvalDataset");
+    let completed = fixture
+        .svc
+        .run_eval_dataset(Request::from_parts(
+            metadata,
+            extensions,
+            run("ns-a", "tenant"),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(completed.status, "completed", "{completed:?}");
+    assert!(completed.cases_total > 0);
+    assert_eq!(completed.ledger.len() as u32, completed.cases_total);
+    // Another tenant's namespace is refused before any case runs.
+    let (metadata, extensions) = fixture.admit(&write, "RunEvalDataset");
+    let refused = fixture
+        .svc
+        .run_eval_dataset(Request::from_parts(
+            metadata,
+            extensions,
+            run("ns-b", "foreign"),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert!(
+        crate::chisei::eval_run::EvalRunStore::list_dataset_run_cases(
+            runtime.as_ref(),
+            "ns-b",
+            "foreign"
+        )
+        .unwrap()
+        .is_empty()
+    );
+    // A read-only assertion is refused at admission: a run is a write.
+    use tonic::service::Interceptor;
+    let mut request = Request::new(());
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", read()).parse().unwrap(),
+    );
+    request.extensions_mut().insert(tonic::GrpcMethod::new(
+        "chisei.ChiseiService",
+        "RunEvalDataset",
+    ));
+    let refused = fixture.interceptor.call(request).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+}
