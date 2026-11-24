@@ -51,11 +51,12 @@ use crate::protocol::sekai::{
     ListClaimableWorkRequest, ListClaimableWorkResponse, ModelVersion,
     ReadTransformRunInputsRequest, ReadTransformRunInputsResponse, RegisterTransformRuntimeRequest,
     RegisterTransformRuntimeResponse, ReportActionClaimEventRequest,
-    ReportActionClaimEventResponse, SourceSyncWorkOptions, StreamingTransformInputPosition,
-    StreamingTransformObjectEdit, TransformLabel, TransformRunInputRow,
-    WriteTransformRunResultRequest, WriteTransformRunResultResponse, ack_work_request,
-    ack_work_response, claim_work_request, claim_work_response, claimable_work,
-    heartbeat_work_claim_response, list_claimable_work_request,
+    ReportActionClaimEventResponse, SourceDiscoveryWork, SourceDiscoveryWorkOptions,
+    SourceSyncWorkOptions, StreamingTransformInputPosition, StreamingTransformObjectEdit,
+    TransformLabel, TransformRunInputRow, WriteTransformRunResultRequest,
+    WriteTransformRunResultResponse, ack_work_request, ack_work_response, claim_work_request,
+    claim_work_response, claimable_work, heartbeat_work_claim_response,
+    list_claimable_work_request,
 };
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -631,6 +632,45 @@ impl<'a> RuntimeClaimClient<'a> {
             .collect())
     }
 
+    /// Lists Source discovery requests this runtime may take, for Sources
+    /// of the connector types it implements (`(name, version)` pairs).
+    pub async fn list_source_discovery_work<'t>(
+        &self,
+        runtime_id: impl Into<String>,
+        limit: i32,
+        connector_types: impl IntoIterator<Item = (&'t str, &'t str)>,
+    ) -> Result<Vec<SourceDiscoveryWork>, RuntimeClaimError> {
+        let request = ListClaimableWorkRequest {
+            kind: WorkKind::SourceDiscovery.into(),
+            namespace: self.namespace()?.to_string(),
+            runtime_id: runtime_id.into(),
+            limit,
+            options: Some(list_claimable_work_request::Options::SourceDiscovery(
+                SourceDiscoveryWorkOptions {
+                    connector_types: connector_types
+                        .into_iter()
+                        .map(|(name, version)| ConnectorTypeRef {
+                            name: name.into(),
+                            version: version.into(),
+                        })
+                        .collect(),
+                },
+            )),
+        };
+        let listed: ListClaimableWorkResponse = self
+            .call(LIST_WORK, request, true)
+            .await
+            .map_err(RuntimeClaimError::from_list)?;
+        Ok(listed
+            .work
+            .into_iter()
+            .filter_map(|work| match work.payload {
+                Some(claimable_work::Payload::SourceDiscovery(work)) => Some(work),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Lists export-delivery work a Source of one of `connector_types`
     /// delivers (`(name, version)` pairs) and this runtime may take, so
     /// artifacts left to other deliverers never fill its page. A plane
@@ -764,6 +804,7 @@ impl<'a> RuntimeClaimClient<'a> {
                 | WorkKind::ExportDelivery
                 | WorkKind::SourceSync
                 | WorkKind::ExternalEffect
+                | WorkKind::SourceDiscovery
         );
         match self.call(ACK_WORK, request.clone(), retryable).await {
             Ok(AckWorkResponse { payload }) => payload.ok_or_else(missing_payload),
@@ -844,7 +885,8 @@ impl<'a> RuntimeClaimClient<'a> {
             WorkKind::Unspecified
             | WorkKind::ExportDelivery
             | WorkKind::SourceSync
-            | WorkKind::ExternalEffect => {
+            | WorkKind::ExternalEffect
+            | WorkKind::SourceDiscovery => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -913,7 +955,8 @@ impl<'a> RuntimeClaimClient<'a> {
             WorkKind::Unspecified
             | WorkKind::ExportDelivery
             | WorkKind::SourceSync
-            | WorkKind::ExternalEffect => {
+            | WorkKind::ExternalEffect
+            | WorkKind::SourceDiscovery => {
                 return Err(SdkError::invalid_argument());
             }
         })
@@ -979,7 +1022,8 @@ impl<'a> RuntimeClaimClient<'a> {
             WorkKind::Unspecified
             | WorkKind::ExportDelivery
             | WorkKind::SourceSync
-            | WorkKind::ExternalEffect => {
+            | WorkKind::ExternalEffect
+            | WorkKind::SourceDiscovery => {
                 return Err(SdkError::invalid_argument());
             }
         })

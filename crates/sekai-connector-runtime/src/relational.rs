@@ -50,9 +50,10 @@ use postgres::error::SqlState;
 use postgres::types::{IsNull, ToSql, Type, to_sql_checked};
 use postgres_native_tls::MakeTlsConnector;
 use sekai_source_sdk::{
-    ConfigValue, Connector, ConnectorFailure, Destination, DiscoverySample, ExportArtifact,
-    MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES, PropertyValue, RecordChange,
-    SnapshotPage, SnapshotRead, SourceRecord, cap_discovery_sample, column_name_suggests_sensitive,
+    ConfigValue, Connector, ConnectorFailure, Destination, DiscoveredColumn, DiscoveredRecordKind,
+    DiscoverySample, ExportArtifact, MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES,
+    PropertyValue, RecordChange, SOURCE_DISCOVERY_VERSION, SnapshotPage, SnapshotRead,
+    SourceDiscovery, SourceRecord, cap_discovery_sample, column_name_suggests_sensitive,
     contains_secret_like_text,
 };
 use sha2::{Digest, Sha256};
@@ -149,6 +150,53 @@ impl Connector for Relational {
     fn check(&mut self) -> Result<(), ConnectorFailure> {
         self.connect()?.simple_query("SELECT 1").map_err(failure)?;
         Ok(())
+    }
+
+    /// The configured table as one record kind: its columns in source
+    /// order, its primary key as the key candidate, and a schema revision
+    /// that changes with any column's name, type or nullability.
+    fn discover(&mut self) -> Result<SourceDiscovery, ConnectorFailure> {
+        let spec = ReadSpec::parse(&self.fields)?;
+        let mut client = self.connect()?;
+        let rows = client
+            .query(
+                "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                 ORDER BY a.attnum",
+                &[&relation_name(&spec.table)],
+            )
+            .map_err(failure)?;
+        let columns: Vec<DiscoveredColumn> = rows
+            .iter()
+            .map(|row| DiscoveredColumn {
+                name: row.get::<_, String>(0).to_ascii_lowercase(),
+                data_type: row.get(1),
+                nullable: !row.get::<_, bool>(2),
+                profile: None,
+            })
+            .collect();
+        let mut revision = Sha256::new();
+        for column in &columns {
+            revision.update(format!(
+                "{}\u{1f}{}\u{1f}{}\u{1e}",
+                column.name, column.data_type, column.nullable
+            ));
+        }
+        let key = relation_pk(&mut client, &spec.table)?;
+        Ok(SourceDiscovery {
+            contract_version: SOURCE_DISCOVERY_VERSION.into(),
+            source: self.source.clone(),
+            record_kinds: vec![DiscoveredRecordKind {
+                record_kind: spec.record_kind,
+                schema_revision: format!("sha256-{:x}", revision.finalize()),
+                columns,
+                key_candidates: vec![key],
+                references: Vec::new(),
+                value_findings: Vec::new(),
+            }],
+        })
     }
 
     fn sample_rows(&mut self, record_kind: &str) -> Result<DiscoverySample, ConnectorFailure> {
@@ -1591,6 +1639,86 @@ mod tests {
         }
         assert!(changed.contains(&"1".to_string()), "{changed:?}");
         assert!(changed.contains(&"6".to_string()), "{changed:?}");
+        admin.batch_execute(&format!("DROP TABLE {table}")).unwrap();
+    }
+
+    /// Discovers a real PostgreSQL table over TLS, then runs the runtime's
+    /// full discovery over it. Run through `scripts/postgres-conformance.sh`.
+    #[test]
+    #[ignore = "requires PostgreSQL; run scripts/postgres-conformance.sh"]
+    fn postgres_discovery_lists_the_table_and_samples_without_secrets() {
+        let url = std::env::var("SEKAI_TEST_POSTGRES_URL").expect("SEKAI_TEST_POSTGRES_URL");
+        let ca = std::env::var("SEKAI_TEST_POSTGRES_CA_CERT")
+            .map(|path| std::fs::read(path).expect("read CA certificate"))
+            .ok();
+        let tls = tls(ca.as_deref()).unwrap();
+        let target: postgres::Config = url.parse().unwrap();
+        let host = match &target.get_hosts()[0] {
+            postgres::config::Host::Tcp(host) => host.clone(),
+            #[cfg(unix)]
+            postgres::config::Host::Unix(_) => panic!("a TCP URL"),
+        };
+        let host = if host == "localhost" {
+            "127.0.0.1".to_string()
+        } else {
+            host
+        };
+        let password = String::from_utf8(target.get_password().unwrap().to_vec()).unwrap();
+        let table = format!(
+            "discover_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut admin = target.connect(tls.clone()).unwrap();
+        admin
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int PRIMARY KEY, name text, \
+                 updated_at bigint NOT NULL, password text NOT NULL); \
+                 INSERT INTO {table} (id, name, updated_at, password) \
+                 SELECT n, 'n' || n, n * 10, 'secret' FROM generate_series(1, 12) AS n"
+            ))
+            .unwrap();
+        let endpoint = format!("{host}:{}", target.get_ports()[0]);
+        let config = [
+            ("endpoint", endpoint.as_str()),
+            ("database", target.get_dbname().unwrap()),
+            ("user", target.get_user().unwrap()),
+            ("table", table.as_str()),
+            ("record_kind", "Order"),
+            ("pk_columns", "id"),
+            ("monotonic_column", "updated_at"),
+            ("display_column", "name"),
+        ];
+        let mut relational = open(&prepared(&config, Some(&password)), &tls).unwrap();
+        let found = crate::discovery::discover(relational.as_mut()).unwrap();
+        let kind = &found.discovery.record_kinds[0];
+        assert_eq!(kind.record_kind, "Order");
+        assert_eq!(
+            kind.columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.nullable))
+                .collect::<Vec<_>>(),
+            [
+                ("id", false),
+                ("name", true),
+                ("updated_at", false),
+                ("password", false)
+            ]
+        );
+        assert_eq!(kind.key_candidates, [vec!["id".to_string()]]);
+        let sample = &found.samples[0];
+        assert_eq!(sample.rows.len(), MAX_DISCOVERY_SAMPLE_ROWS);
+        assert!(
+            sample
+                .rows
+                .iter()
+                .all(|row| !row.cells.contains_key("password"))
+        );
+        let json = serde_json::to_string(&found.discovery).unwrap();
+        assert!(!json.contains("secret") && !json.contains(&password));
         admin.batch_execute(&format!("DROP TABLE {table}")).unwrap();
     }
 

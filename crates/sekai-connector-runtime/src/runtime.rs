@@ -60,6 +60,15 @@ pub enum Ran {
         effect_id: String,
         outcome: crate::Effected,
     },
+    /// A Source discovery, acknowledged; `Err` is the failure class the
+    /// request recorded.
+    Discovered {
+        discovery_id: String,
+        outcome: Result<(), SyncFailure>,
+    },
+    /// The discovery's claim was lost; nothing was acknowledged, and
+    /// another runtime may run it.
+    DiscoveryLost { discovery_id: String },
     /// The effect's claim was lost, or Chisei could not be reached to
     /// redeem; nothing was acknowledged. The next holder cannot redeem a
     /// permit this one redeemed, so it records `outcome_unknown`.
@@ -230,10 +239,11 @@ impl Runtime {
 
     /// One pass: claims and runs every due Source sync, then every
     /// deliverable artifact and every pending external effect of a Source
-    /// this runtime can run, then every model step run it may claim, in each
-    /// namespace in turn. A namespace that fails to claim or run is logged
-    /// and skipped; later namespaces still run. The first such error is
-    /// returned after the pass.
+    /// this runtime can run, then every model step run it may claim, then
+    /// every requested Source discovery, in each namespace in turn. A
+    /// namespace that fails to claim or run is logged and skipped; later
+    /// namespaces still run. The first such error is returned after the
+    /// pass.
     pub async fn pass(&self) -> Result<Vec<Ran>, RuntimeClaimError> {
         let mut ran = Vec::new();
         let mut first_error = None;
@@ -267,6 +277,9 @@ impl Runtime {
         }
         while let Some(work) = self.claim_llm_rows(index).await? {
             ran.push(self.run_llm_rows(index, work).await?);
+        }
+        while let Some(work) = self.claim_discovery(index).await? {
+            ran.push(self.run_discovery(index, work).await?);
         }
         Ok(())
     }

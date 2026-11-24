@@ -95,6 +95,8 @@ mod ontology_health_rpc;
 mod policy_simulation_rpc;
 #[path = "semantic_retrieval_lifecycle.rs"]
 mod semantic_retrieval_lifecycle;
+#[path = "source_discovery_rpc.rs"]
+mod source_discovery_rpc;
 #[path = "source_rpc.rs"]
 mod source_rpc;
 use effective_read::*;
@@ -308,6 +310,8 @@ impl SekaiService for SekaiServiceImpl {
         decide_dataset_rollback => decide_dataset_rollback_rpc(DecideDatasetRollbackRequest) -> DecideDatasetRollbackResponse;
         get_dataset_rollback_proposal => get_dataset_rollback_proposal_rpc(GetDatasetRollbackProposalRequest) -> GetDatasetRollbackProposalResponse;
         list_dataset_rollback_proposals => list_dataset_rollback_proposals_rpc(ListDatasetRollbackProposalsRequest) -> ListDatasetRollbackProposalsResponse;
+        request_source_discovery => request_source_discovery_rpc(RequestSourceDiscoveryRequest) -> RequestSourceDiscoveryResponse;
+        get_source_discovery => get_source_discovery_rpc(GetSourceDiscoveryRequest) -> GetSourceDiscoveryResponse;
         submit_model_stage_review => submit_model_stage_review_rpc(SubmitModelStageReviewRequest) -> SubmitModelStageReviewResponse;
         decide_model_stage_review => decide_model_stage_review_rpc(DecideModelStageReviewRequest) -> DecideModelStageReviewResponse;
         ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;
@@ -1974,6 +1978,9 @@ impl SekaiService for SekaiServiceImpl {
 #[path = "sekai_service_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "source_discovery_rpc_tests.rs"]
+mod source_discovery_rpc_tests;
 #[cfg(test)]
 #[path = "source_rpc_tests.rs"]
 mod source_rpc_tests;

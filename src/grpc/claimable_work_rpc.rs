@@ -23,6 +23,7 @@ impl SekaiServiceImpl {
         let mismatched = || Status::invalid_argument("options do not match the work kind");
         let (mut turn, mut source_sync, mut export_delivery, mut external_effect) =
             (None, None, None, None);
+        let mut source_discovery = None;
         match inner.options {
             Some(list_claimable_work_request::Options::AgentTurn(options)) => turn = Some(options),
             Some(list_claimable_work_request::Options::SourceSync(options)) => {
@@ -42,6 +43,12 @@ impl SekaiServiceImpl {
                     return Err(mismatched());
                 }
                 external_effect = Some(options);
+            }
+            Some(list_claimable_work_request::Options::SourceDiscovery(options)) => {
+                if !matches!(kind, Kind::SourceDiscovery) {
+                    return Err(mismatched());
+                }
+                source_discovery = Some(options);
             }
             None => {}
         }
@@ -137,6 +144,20 @@ impl SekaiServiceImpl {
                 )?
                 .into_iter()
                 .map(claimable_work::Payload::ExternalEffect)
+                .collect()
+            }
+            Kind::SourceDiscovery => {
+                refuse_turn_options(turn)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                self.list_claimable_source_discoveries(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    inner.limit,
+                    source_discovery.unwrap_or_default(),
+                )?
+                .into_iter()
+                .map(claimable_work::Payload::SourceDiscovery)
                 .collect()
             }
             _ => return Err(unserved(kind)),
@@ -247,6 +268,18 @@ impl SekaiServiceImpl {
                     inner.ttl_ms,
                 )?)
             }
+            Kind::SourceDiscovery => {
+                refuse_turn_options(turn)?;
+                refuse_request_id(&inner.request_id)?;
+                let req = Request::from_parts(metadata, extensions, ());
+                claim_work_response::Payload::SourceDiscovery(self.claim_source_discovery(
+                    &req,
+                    &inner.namespace,
+                    &inner.runtime_id,
+                    &inner.work_id,
+                    inner.ttl_ms,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(ClaimWorkResponse {
@@ -346,6 +379,23 @@ impl SekaiServiceImpl {
                 };
                 heartbeat_work_claim_response::Payload::ExternalEffect(
                     self.heartbeat_external_effect(
+                        &req,
+                        &inner.namespace,
+                        &inner.work_id,
+                        fence,
+                        inner.ttl_ms,
+                    )?,
+                )
+            }
+            Kind::SourceDiscovery => {
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                heartbeat_work_claim_response::Payload::SourceDiscovery(
+                    self.heartbeat_source_discovery(
                         &req,
                         &inner.namespace,
                         &inner.work_id,
@@ -504,6 +554,28 @@ impl SekaiServiceImpl {
                     &inner.reason,
                 )?)
             }
+            Kind::SourceDiscovery => {
+                let result = match inner.options {
+                    None => None,
+                    Some(ack_work_request::Options::SourceDiscovery(result)) => Some(result),
+                    Some(_) => return Err(mismatched()),
+                };
+                let req = Request::from_parts(metadata, extensions, ());
+                let fence = Fence {
+                    owner: &inner.runtime_id,
+                    generation: inner.claim_generation,
+                    token: &inner.fencing_token,
+                };
+                ack_work_response::Payload::SourceDiscovery(self.ack_source_discovery(
+                    &req,
+                    &inner.namespace,
+                    &inner.work_id,
+                    fence,
+                    &inner.outcome,
+                    &inner.reason,
+                    result,
+                )?)
+            }
             _ => return Err(unserved(kind)),
         };
         Ok(Response::new(AckWorkResponse {
@@ -523,9 +595,10 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         Ok(WorkKind::ExportDelivery) => Kind::ExportDelivery,
         Ok(WorkKind::SourceSync) => Kind::SourceSync,
         Ok(WorkKind::ExternalEffect) => Kind::ExternalEffect,
+        Ok(WorkKind::SourceDiscovery) => Kind::SourceDiscovery,
         Ok(WorkKind::Unspecified) | Err(_) => {
             return Err(Status::invalid_argument(
-                "kind must be transform, action, agent_turn, export_delivery, source_sync or external_effect",
+                "kind must be transform, action, agent_turn, export_delivery, source_sync, external_effect or source_discovery",
             ));
         }
     };
@@ -547,7 +620,7 @@ fn admitted_kind<T>(req: &Request<T>, raw: i32) -> Result<Kind, Status> {
         .is_some_and(|source| source == "enterprise");
     if matches!(
         kind,
-        Kind::Transform | Kind::SourceSync | Kind::ExternalEffect
+        Kind::Transform | Kind::SourceSync | Kind::ExternalEffect | Kind::SourceDiscovery
     ) && enterprise_scoped
     {
         return Err(Status::permission_denied(

@@ -524,6 +524,7 @@ impl SekaiDb {
         self.migrate_ontology_health_trends()?;
         self.migrate_ontology_health_schedules()?;
         self.migrate_sources()?;
+        self.migrate_source_discoveries()?;
         self.migrate_catalog_criticality_outbox()?;
         self.migrate_model_versions()?;
         self.migrate_gateway_log_cursors()?;

@@ -10,13 +10,15 @@
 //! A sync applies the Source's snapshot pages as source batches
 //! ([`pages`]). The runtime also delivers saved exports whose definition
 //! names a Source of a type it implements ([`delivery`]), and applies
-//! admitted Actions' external changes to a Source's records ([`effect`]).
+//! admitted Actions' external changes to a Source's records ([`effect`]),
+//! and runs requested discoveries of a Source ([`discovery`]).
 //! The connector types are [`github`] (sync and apply) and [`relational`]
 //! (snapshot pages, delivery and apply). Given a gateway route, it also runs
 //! the row-wise model steps of `llm-rows` transforms ([`llm_rows`]).
 
 pub mod credentials;
 pub mod delivery;
+pub mod discovery;
 pub mod effect;
 pub mod github;
 pub mod llm_rows;

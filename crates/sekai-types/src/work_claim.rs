@@ -23,16 +23,20 @@ pub enum WorkKind {
     /// An admitted `external_mutate` effect, applied through the Source
     /// that owns its record (ADR 0148).
     ExternalEffect,
+    /// A caller's request to discover a registered Source, run where its
+    /// credential lives (ADR 0148).
+    SourceDiscovery,
 }
 
 impl WorkKind {
-    pub const ALL: [WorkKind; 6] = [
+    pub const ALL: [WorkKind; 7] = [
         WorkKind::Transform,
         WorkKind::Action,
         WorkKind::AgentTurn,
         WorkKind::ExportDelivery,
         WorkKind::SourceSync,
         WorkKind::ExternalEffect,
+        WorkKind::SourceDiscovery,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -43,6 +47,7 @@ impl WorkKind {
             WorkKind::ExportDelivery => "export_delivery",
             WorkKind::SourceSync => "source_sync",
             WorkKind::ExternalEffect => "external_effect",
+            WorkKind::SourceDiscovery => "source_discovery",
         }
     }
 

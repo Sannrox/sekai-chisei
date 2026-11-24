@@ -16,7 +16,7 @@ use crate::sekai::work_claim::{ClaimError, Fence};
 use sekai_source_sdk::{ConfigValue, SourceConfig};
 
 /// The caller, once it may administer Sources in `namespace`.
-fn source_admin<T: std::any::Any>(
+pub(super) fn source_admin<T: std::any::Any>(
     service: &SekaiServiceImpl,
     req: &Request<T>,
     namespace: &str,
