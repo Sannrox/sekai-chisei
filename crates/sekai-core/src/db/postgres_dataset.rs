@@ -6,6 +6,19 @@ use crate::sekai::dataset_version::{self, DatasetRollback, DatasetVersion};
 use postgres::IsolationLevel;
 use std::collections::HashMap;
 
+/// Newest live row of one source key; `LIKE 'srcds:%'` matches the partial
+/// index `idx_dataset_rows_source_key` (migration 0176).
+pub(crate) const LATEST_SOURCE_ROW_SQL: &str = "SELECT data FROM sekai_dataset_rows
+     WHERE dataset_id LIKE 'srcds:%' AND dataset_id=$1
+       AND (data::jsonb)->>'source_id' = $2
+     ORDER BY id DESC LIMIT 1";
+/// Newest row of one source key in one retained version, over
+/// `idx_dataset_version_rows_source_key`.
+pub(crate) const LATEST_SOURCE_VERSION_ROW_SQL: &str = "SELECT data FROM sekai_dataset_version_rows
+     WHERE dataset_id LIKE 'srcds:%' AND dataset_id=$1 AND version_id=$2
+       AND (data::jsonb)->>'source_id' = $3
+     ORDER BY row_id DESC LIMIT 1";
+
 impl PostgresDb {
     pub fn create_dataset(&self, dataset: &Dataset) -> Result<(), String> {
         validate_columns(&dataset.columns)?;
@@ -233,6 +246,41 @@ impl PostgresDb {
             }
         }
         Ok(result)
+    }
+
+    /// PostgreSQL twin of the SQLite `latest_source_batch_row`: one seek over
+    /// `idx_dataset_rows_source_key` (migration 0176, #3259).
+    pub fn latest_source_batch_row(
+        &self,
+        dataset_id: &str,
+        source_id: &str,
+    ) -> Result<Option<HashMap<String, String>>, String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .build_transaction()
+            .isolation_level(IsolationLevel::RepeatableRead)
+            .read_only(true)
+            .start()
+            .map_err(|error| error.to_string())?;
+        let state = crate::db::postgres_dataset_health::load_state_pg(&mut tx, dataset_id)?;
+        let row = if state.quarantined && !state.last_healthy_version_id.is_empty() {
+            tx.query_opt(
+                LATEST_SOURCE_VERSION_ROW_SQL,
+                &[&dataset_id, &state.last_healthy_version_id, &source_id],
+            )
+            .map_err(|error| error.to_string())?
+        } else if state.quarantined {
+            None
+        } else {
+            tx.query_opt(LATEST_SOURCE_ROW_SQL, &[&dataset_id, &source_id])
+                .map_err(|error| error.to_string())?
+        };
+        row.map(|row| {
+            let data: String = row.get(0);
+            serde_json::from_str(&data)
+                .map_err(|error| format!("corrupt dataset row for {dataset_id:?}: {error}"))
+        })
+        .transpose()
     }
 
     pub fn redact_dataset_fields(

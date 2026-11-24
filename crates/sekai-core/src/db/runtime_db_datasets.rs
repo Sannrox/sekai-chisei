@@ -65,6 +65,21 @@ impl RuntimeDb {
         }
     }
 
+    /// The newest row keyed `source_id` in source batch dataset `dataset_id`,
+    /// honoring quarantine as `query_rows` does, without scanning (#3259).
+    pub fn latest_source_batch_row(
+        &self,
+        dataset_id: &str,
+        source_id: &str,
+    ) -> Result<Option<HashMap<String, String>>, String> {
+        match self {
+            Self::Sqlite(db) => db.latest_source_batch_row(dataset_id, source_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.latest_source_batch_row(dataset_id, source_id)
+            }),
+        }
+    }
+
     /// The dataset's newest version id; empty when it has none.
     pub fn latest_dataset_version_id(&self, dataset_id: &str) -> Result<String, String> {
         Ok(self

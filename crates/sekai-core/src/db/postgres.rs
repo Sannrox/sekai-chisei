@@ -250,6 +250,8 @@ const DATASET_ROLLBACK_PROPOSALS_SCHEMA: &str =
 const AGENT_TURN_TRANSCRIPTS_SCHEMA: &str =
     include_str!("postgres/0174_agent_turn_transcripts.sql");
 const SOURCE_DISCOVERIES_SCHEMA: &str = include_str!("postgres/0175_source_discoveries.sql");
+const DATASET_SOURCE_KEY_INDEX_SCHEMA: &str =
+    include_str!("postgres/0176_dataset_source_key_index.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1270,6 +1272,12 @@ const MIGRATIONS: &[Migration] = &[
         175,
         "source_discoveries",
         SOURCE_DISCOVERIES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        176,
+        "dataset_source_key_index",
+        DATASET_SOURCE_KEY_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

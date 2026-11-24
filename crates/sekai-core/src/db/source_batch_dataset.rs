@@ -11,6 +11,8 @@ use crate::sekai::object_type_index::{
 };
 use crate::sekai::schema::default_property_classification;
 
+/// The row key. The `idx_*_source_key` indexes and `latest_source_batch_row`
+/// spell it as `$.source_id` / `->>'source_id'`; keep them in step.
 pub const KEY_COLUMN: &str = "source_id";
 pub const HIDDEN_COLUMN: &str = "hidden";
 pub const PAYLOAD_COLUMN: &str = SOURCE_PAYLOAD_COLUMN;

@@ -67,6 +67,8 @@ pub mod transform_shadow;
 #[cfg(any(test, feature = "gateway-test-support"))]
 pub use postgres::ScratchDatabase;
 pub use postgres::off_runtime;
+#[cfg(test)]
+mod latest_source_batch_row_tests;
 pub mod postgres_action_binding;
 pub mod postgres_action_effect;
 pub mod postgres_action_governance;
