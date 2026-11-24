@@ -48,6 +48,24 @@ namespace reads ([tenant assertion RPCs](tenant-assertion-rpcs.md)). A
 receipt whose stored namespace the context may not read answers `NOT_FOUND`,
 as a missing id does.
 
+### Reserved principal names
+
+`root`, `local`, `anonymous` and `chisei-gateway` are built-in identities, and
+authorization treats `root` and `local` as the local administrator. Among
+authenticated callers, only operator-issued local principal credentials may
+carry these names. If the subject of any of the following is one of
+these names, authentication refuses it as `UNAUTHENTICATED` ("invalid
+principal identity") and never maps it to admin:
+
+- an enterprise extension context;
+- a signed identity assertion;
+- a runtime token;
+- a service token.
+
+An enterprise deployment that needs global administration grants it to a
+named principal explicitly. Trust is a property of the authentication source,
+not of the subject's name (#2491, #2584).
+
 ## Space roles and delegation
 
 A signed assertion may carry `space`, `space_role`, and `act`. Absent space
