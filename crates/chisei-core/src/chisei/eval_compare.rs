@@ -360,6 +360,8 @@ mod tests {
                 outcome: CaseOutcome {
                     passed: passed(index),
                     reason: "fixture".into(),
+                    trial_code: None,
+                    unmet_metrics: Vec::new(),
                     input_tokens: 1,
                     output_tokens: 1,
                     cost_micros: 1,

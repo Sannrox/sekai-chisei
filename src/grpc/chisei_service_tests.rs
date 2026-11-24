@@ -15490,6 +15490,8 @@ async fn tenant_assertion_reads_its_namespaces_eval_datasets() {
             Ok(CaseOutcome {
                 passed,
                 reason: if passed { "match" } else { "expected_mismatch" }.into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 cost_micros: 1,
@@ -15833,6 +15835,22 @@ async fn tenant_assertion_runs_an_eval_dataset_in_its_namespace() {
     assert_eq!(completed.status, "completed", "{completed:?}");
     assert!(completed.cases_total > 0);
     assert_eq!(completed.ledger.len() as u32, completed.cases_total);
+    // Every failed ledger line is in exactly one reason group (#3438).
+    let mut failed: Vec<&str> = completed
+        .ledger
+        .iter()
+        .filter(|line| !line.passed)
+        .map(|line| line.case_id.as_str())
+        .collect();
+    let mut grouped: Vec<&str> = completed
+        .failure_groups
+        .iter()
+        .filter(|group| group.dimension == "reason")
+        .flat_map(|group| group.case_ids.iter().map(String::as_str))
+        .collect();
+    failed.sort_unstable();
+    grouped.sort_unstable();
+    assert_eq!(grouped, failed);
     // Another tenant's namespace is refused before any case runs.
     let (metadata, extensions) = fixture.admit(&write, "RunEvalDataset");
     let refused = fixture

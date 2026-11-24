@@ -1102,6 +1102,17 @@ pub(super) async fn run_eval_dataset(
     .await
     .map_err(|_| Status::internal("eval run task failed"))??;
     Ok(Response::new(RunEvalDatasetResponse {
+        failure_groups: report
+            .failure_groups
+            .into_iter()
+            .map(|group| EvalFailureGroup {
+                dimension: group.dimension.as_str().into(),
+                key: group.key,
+                trial_code: group.trial_code.unwrap_or_default(),
+                count: u32::try_from(group.case_ids.len()).unwrap_or(u32::MAX),
+                case_ids: group.case_ids,
+            })
+            .collect(),
         status: report.status,
         cases_total: report.cases_total as u32,
         spent_micros: report.spent_micros,
@@ -1112,6 +1123,8 @@ pub(super) async fn run_eval_dataset(
                 case_id: result.case_id,
                 passed: result.outcome.passed,
                 reason: result.outcome.reason,
+                trial_code: result.outcome.trial_code.unwrap_or_default(),
+                unmet_metrics: result.outcome.unmet_metrics,
                 input_tokens: result.outcome.input_tokens,
                 output_tokens: result.outcome.output_tokens,
                 cost_micros: result.outcome.cost_micros,

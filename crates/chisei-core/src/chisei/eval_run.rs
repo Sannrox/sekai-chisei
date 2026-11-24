@@ -101,6 +101,15 @@ impl EvalRunSpec {
 pub struct CaseOutcome {
     pub passed: bool,
     pub reason: String,
+    /// On a failed stochastic step: the most frequent trial reason code
+    /// among its failing trials, ties to the smallest (#3438). Absent
+    /// otherwise and on results recorded before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_code: Option<String>,
+    /// On a failed step: the names of its unmet metric objectives, sorted
+    /// (ADR 0154, #3438). Empty otherwise and on results recorded before it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_metrics: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micros: i64,
@@ -224,6 +233,140 @@ pub struct EvalRunReport {
     pub uncertain_micros: i64,
     /// Policy violations over every recorded case, by kind (#1676).
     pub policy: RunPolicyReport,
+    /// The failed cases grouped by deterministic cause (#3438).
+    pub failure_groups: Vec<FailureGroup>,
+}
+
+/// What a [`FailureGroup`] groups failed cases by, in report order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum FailureDimension {
+    /// The case template: `case_id` up to its first `:`.
+    Template,
+    /// One dataset tag of the case.
+    Tag,
+    /// The reason code, with the trial code on stochastic steps.
+    Reason,
+    /// One unmet metric name.
+    Metric,
+    /// One policy violation kind the case had.
+    Policy,
+}
+
+impl FailureDimension {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Tag => "tag",
+            Self::Reason => "reason",
+            Self::Metric => "metric",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+/// Failed cases sharing one key of one dimension. A failed case appears
+/// once per dimension it has a key in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureGroup {
+    pub dimension: FailureDimension,
+    pub key: String,
+    /// Set only for [`FailureDimension::Reason`] groups of stochastic
+    /// failures; part of the group key.
+    pub trial_code: Option<String>,
+    /// Sorted.
+    pub case_ids: Vec<String>,
+}
+
+/// Groups the failed `results` by template, dataset tag, reason (with trial
+/// code), unmet metric, and policy violation kind. Pure over what the run
+/// recorded: no model call. Groups come by dimension, then largest first,
+/// then by key. A case missing from `dataset` has no tags.
+pub fn group_failures(results: &[EvalCaseResult], dataset: &EvalDataset) -> Vec<FailureGroup> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let tags: BTreeMap<&str, &[String]> = dataset
+        .cases
+        .iter()
+        .map(|case| (case.case_id.as_str(), case.tags.as_slice()))
+        .collect();
+    let mut groups: BTreeMap<(FailureDimension, String, Option<String>), BTreeSet<String>> =
+        BTreeMap::new();
+    let mut add = |dimension, key: &str, trial_code: Option<&String>, case_id: &str| {
+        groups
+            .entry((dimension, key.to_string(), trial_code.cloned()))
+            .or_default()
+            .insert(case_id.to_string());
+    };
+    for result in results.iter().filter(|result| !result.outcome.passed) {
+        let case_id = result.case_id.as_str();
+        let outcome = &result.outcome;
+        let template = case_id.split_once(':').map_or(case_id, |(head, _)| head);
+        add(FailureDimension::Template, template, None, case_id);
+        for tag in tags.get(case_id).copied().unwrap_or_default() {
+            add(FailureDimension::Tag, tag, None, case_id);
+        }
+        add(
+            FailureDimension::Reason,
+            &outcome.reason,
+            outcome.trial_code.as_ref(),
+            case_id,
+        );
+        for metric in &outcome.unmet_metrics {
+            add(FailureDimension::Metric, metric, None, case_id);
+        }
+        for violation in outcome.policy.iter().flat_map(|policy| &policy.violations) {
+            add(
+                FailureDimension::Policy,
+                violation.kind.as_str(),
+                None,
+                case_id,
+            );
+        }
+    }
+    let mut groups: Vec<FailureGroup> = groups
+        .into_iter()
+        .map(|((dimension, key, trial_code), case_ids)| FailureGroup {
+            dimension,
+            key,
+            trial_code,
+            case_ids: case_ids.into_iter().collect(),
+        })
+        .collect();
+    groups.sort_by(|a, b| {
+        (
+            a.dimension,
+            std::cmp::Reverse(a.case_ids.len()),
+            &a.key,
+            &a.trial_code,
+        )
+            .cmp(&(
+                b.dimension,
+                std::cmp::Reverse(b.case_ids.len()),
+                &b.key,
+                &b.trial_code,
+            ))
+    });
+    groups
+}
+
+/// The most frequent reason code among the failing `(status, reason_code)`
+/// trials of a stochastic step, ties to the smallest; `None` when no trial
+/// failed with a code.
+fn dominant_trial_code<'a>(trials: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (status, code) in trials {
+        if status != crate::chisei::evaluation_execution::STATUS_PASS && !code.is_empty() {
+            *counts.entry(code).or_default() += 1;
+        }
+    }
+    // max_by_key keeps the last maximum; iterate in reverse so the smallest
+    // code wins a tie.
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|(_, count)| *count)
+        .map(|(code, _)| code.to_string())
 }
 
 /// Durable per-run state. Implementations make each write idempotent: the
@@ -704,6 +847,7 @@ fn run_leased(
             .map(|result| (result.case_id.as_str(), result.outcome.policy.as_ref())),
     );
     Ok(EvalRunReport {
+        failure_groups: group_failures(&results, dataset),
         policy,
         uncertain_micros: store.dataset_run_uncertain_micros(&spec.namespace, &spec.run_id)?,
         status: status.into(),
@@ -1010,6 +1154,29 @@ impl EvalCaseExecutor for DefinitionCaseExecutor<'_> {
             .map_err(after)?
         };
         let receipt = execution.receipt;
+        let failed = receipt.status == STATUS_FAIL;
+        let trial_code = receipt
+            .stochastic_evidence
+            .as_ref()
+            .filter(|_| failed)
+            .and_then(|evidence| {
+                dominant_trial_code(
+                    evidence
+                        .trials
+                        .iter()
+                        .map(|trial| (trial.status.as_str(), trial.reason_code.as_str())),
+                )
+            });
+        let mut unmet_metrics: Vec<String> = receipt
+            .metric_verdicts
+            .iter()
+            .filter(|verdict| {
+                failed && verdict.verdict == crate::chisei::evaluation_metrics::Verdict::Unmet
+            })
+            .map(|verdict| verdict.name.clone())
+            .collect();
+        unmet_metrics.sort();
+        unmet_metrics.dedup();
         let (input_tokens, output_tokens, retry_tokens) = receipt
             .stochastic_evidence
             .as_ref()
@@ -1069,6 +1236,8 @@ impl EvalCaseExecutor for DefinitionCaseExecutor<'_> {
         Ok(CaseOutcome {
             passed: receipt.status == STATUS_PASS,
             reason: receipt.reason_code,
+            trial_code,
+            unmet_metrics,
             input_tokens,
             output_tokens,
             cost_micros,
@@ -1283,6 +1452,8 @@ pub(crate) mod tests {
             Ok(CaseOutcome {
                 passed: !case.case_id.ends_with('7'),
                 reason: "fixture".into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 10,
                 output_tokens: 5,
                 cost_micros: self.cost,
@@ -1586,6 +1757,8 @@ pub(crate) mod tests {
                 // Policy is scored apart from the verdict.
                 passed: true,
                 reason: "fixture".into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
                 input_tokens: 1,
                 output_tokens: 1,
                 cost_micros: 1,
@@ -1709,5 +1882,184 @@ pub(crate) mod tests {
         let mut bad = spec(0, 1_000);
         bad.run_id = "release-3".into();
         assert!(run(&store, &fake, &bad, &dataset(2), || 1).is_err());
+    }
+
+    fn failed(case_id: &str, reason: &str) -> EvalCaseResult {
+        EvalCaseResult {
+            case_id: case_id.into(),
+            outcome: CaseOutcome {
+                passed: false,
+                reason: reason.into(),
+                trial_code: None,
+                unmet_metrics: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_micros: 0,
+                receipts: None,
+                policy: None,
+            },
+            recorded_at_ms: 1,
+            operation_id: None,
+        }
+    }
+
+    fn groups_of(
+        groups: &[FailureGroup],
+        dimension: FailureDimension,
+    ) -> Vec<(String, Option<String>, Vec<String>)> {
+        groups
+            .iter()
+            .filter(|group| group.dimension == dimension)
+            .map(|group| {
+                (
+                    group.key.clone(),
+                    group.trial_code.clone(),
+                    group.case_ids.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_cases_group_by_template_tag_reason_metric_and_policy() {
+        use crate::chisei::eval_policy::{CasePolicyOutcome, Violation, ViolationKind};
+        let mut dataset = dataset(0);
+        for (case_id, tags) in [
+            ("price:a", vec!["numeric"]),
+            ("price:b", vec!["numeric"]),
+            ("triage:a", vec!["judge"]),
+            ("triage:b", vec!["judge"]),
+            ("triage:c", vec!["judge"]),
+            ("route:a", vec![]),
+        ] {
+            dataset.cases.push(EvalCase {
+                case_id: case_id.into(),
+                input: BTreeMap::new(),
+                expected: String::new(),
+                tags: tags.into_iter().map(String::from).collect(),
+            });
+        }
+        let mut passing = failed("price:b", "value_match");
+        passing.outcome.passed = true;
+        let stochastic = |case_id: &str, trial_code: &str| {
+            let mut result = failed(case_id, "stochastic_acceptance_rule_not_satisfied");
+            result.outcome.trial_code = Some(trial_code.into());
+            result
+        };
+        let mut metric = failed("route:a", "metric_objective_unmet");
+        metric.outcome.unmet_metrics = vec!["latency_ms".into(), "recall".into()];
+        metric.outcome.policy = Some(CasePolicyOutcome {
+            scorer_version: "v1".into(),
+            violations: vec![Violation {
+                kind: ViolationKind::MarkingLeak,
+                case_id: "route:a".into(),
+                receipt_id: "r-1".into(),
+            }],
+        });
+        let results = vec![
+            failed("price:a", "value_mismatch"),
+            passing,
+            stochastic("triage:a", "criteria_not_met"),
+            stochastic("triage:b", "criteria_not_met"),
+            stochastic("triage:c", "insufficient_evidence"),
+            metric,
+        ];
+
+        let groups = group_failures(&results, &dataset);
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Template),
+            vec![
+                (
+                    "triage".into(),
+                    None,
+                    ids(&["triage:a", "triage:b", "triage:c"])
+                ),
+                ("price".into(), None, ids(&["price:a"])),
+                ("route".into(), None, ids(&["route:a"])),
+            ]
+        );
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Tag),
+            vec![
+                (
+                    "judge".into(),
+                    None,
+                    ids(&["triage:a", "triage:b", "triage:c"])
+                ),
+                ("numeric".into(), None, ids(&["price:a"])),
+            ]
+        );
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Reason),
+            vec![
+                (
+                    "stochastic_acceptance_rule_not_satisfied".into(),
+                    Some("criteria_not_met".into()),
+                    ids(&["triage:a", "triage:b"])
+                ),
+                ("metric_objective_unmet".into(), None, ids(&["route:a"])),
+                (
+                    "stochastic_acceptance_rule_not_satisfied".into(),
+                    Some("insufficient_evidence".into()),
+                    ids(&["triage:c"])
+                ),
+                ("value_mismatch".into(), None, ids(&["price:a"])),
+            ]
+        );
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Metric),
+            vec![
+                ("latency_ms".into(), None, ids(&["route:a"])),
+                ("recall".into(), None, ids(&["route:a"])),
+            ]
+        );
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Policy),
+            vec![("marking_leak".into(), None, ids(&["route:a"]))]
+        );
+        // Dimensions come in report order.
+        let order: Vec<_> = groups.iter().map(|group| group.dimension).collect();
+        assert!(order.is_sorted());
+    }
+
+    #[test]
+    fn lines_recorded_before_trial_codes_still_group_by_reason() {
+        let old = r#"{"case_id":"triage:a","outcome":{"passed":false,"reason":"stochastic_acceptance_rule_not_satisfied","input_tokens":1,"output_tokens":1,"cost_micros":1},"recorded_at_ms":1}"#;
+        let old: EvalCaseResult = serde_json::from_str(old).unwrap();
+        assert_eq!(old.outcome.trial_code, None);
+        assert!(old.outcome.unmet_metrics.is_empty());
+        let groups = group_failures(&[old], &dataset(0));
+        assert_eq!(
+            groups_of(&groups, FailureDimension::Reason),
+            vec![(
+                "stochastic_acceptance_rule_not_satisfied".into(),
+                None,
+                vec!["triage:a".to_string()]
+            )]
+        );
+        assert!(groups_of(&groups, FailureDimension::Metric).is_empty());
+        assert!(groups_of(&groups, FailureDimension::Tag).is_empty());
+    }
+
+    #[test]
+    fn the_trial_code_is_the_most_frequent_failing_code_ties_to_the_smallest() {
+        assert_eq!(
+            dominant_trial_code([
+                ("pass", "criteria_met"),
+                ("fail", "insufficient_evidence"),
+                ("fail", "criteria_not_met"),
+                ("fail", "insufficient_evidence"),
+            ]),
+            Some("insufficient_evidence".into())
+        );
+        assert_eq!(
+            dominant_trial_code([
+                ("fail", "insufficient_evidence"),
+                ("fail", "criteria_not_met")
+            ]),
+            Some("criteria_not_met".into())
+        );
+        assert_eq!(dominant_trial_code([("pass", "criteria_met")]), None);
     }
 }
