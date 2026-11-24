@@ -441,10 +441,11 @@ pub(super) async fn get_operation_receipt(
             .ok()
             .filter(|receipt| {
                 receipt.initiating_actor == actor
-                    && require_enterprise_namespace_read(
+                    && require_enterprise_namespace(
                         service.sekai_facts.reader(),
                         context,
                         &receipt.namespace,
+                        crate::enterprise::NamespaceAction::Read,
                     )
                     .is_ok()
             })
@@ -982,7 +983,21 @@ pub(super) async fn run_eval_dataset(
     let actor = authenticated_actor(&req);
     let context = enterprise_authenticated_context(&req)?.cloned();
     let request = req.into_inner();
-    require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    // A tenant context (#3089) writes only its tenant's namespaces; any other
+    // caller needs an editor or admin grant.
+    match context.as_ref() {
+        Some(context) => require_enterprise_namespace(
+            service.sekai_facts.reader(),
+            context,
+            &request.namespace,
+            crate::enterprise::NamespaceAction::Write,
+        )?,
+        None => require_namespace_write_access(
+            service.sekai_facts.reader(),
+            &actor,
+            &request.namespace,
+        )?,
+    }
     // Binding a run to a release artifact attests that its results are that
     // release's evaluation, so it takes the authority that exports them.
     if !request.artifact_digest.is_empty() {

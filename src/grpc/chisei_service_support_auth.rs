@@ -731,12 +731,6 @@ fn execution_namespace_access(
     }
     require_execution_namespace_access(facts, config, actor, namespace)
 }
-/// Authorize an enterprise context to read `namespace` on the Sekai store
-/// through the tenant path the Sekai namespace RPCs use: space role and
-/// credential scope, a service principal's live registration scope, guest
-/// and shared-space grants, and the extension's decision, with their audit.
-/// Without an in-process Sekai store the read is refused; without an
-/// extension the principal's namespace grant is required too.
 /// Namespace read for `req`'s caller: a tenant context reads only its
 /// tenant's namespaces (#1770); any other caller needs a live grant.
 pub(super) fn require_request_namespace_read<T>(
@@ -745,14 +739,27 @@ pub(super) fn require_request_namespace_read<T>(
     namespace: &str,
 ) -> Result<(), Status> {
     match enterprise_authenticated_context(req)? {
-        Some(context) => require_enterprise_namespace_read(facts, context, namespace),
+        Some(context) => require_enterprise_namespace(
+            facts,
+            context,
+            namespace,
+            crate::enterprise::NamespaceAction::Read,
+        ),
         None => require_namespace_access(facts, &authenticated_actor(req), namespace),
     }
 }
-pub(super) fn require_enterprise_namespace_read(
+/// Authorize an enterprise context for `action` on `namespace` through the
+/// tenant path the Sekai namespace RPCs use: space role and credential
+/// scope, a service principal's live registration scope, guest and
+/// shared-space grants, and the extension's decision, with their audit.
+/// Without an in-process Sekai store the call is refused; without an
+/// extension the principal's namespace grant is required too, an editor or
+/// admin grant for a write.
+pub(super) fn require_enterprise_namespace(
     facts: &dyn SekaiFactReader,
     context: &crate::enterprise::AuthenticatedContext,
     namespace: &str,
+    action: crate::enterprise::NamespaceAction,
 ) -> Result<(), Status> {
     let namespace = canonical_namespace(namespace)?;
     let store = facts
@@ -763,10 +770,15 @@ pub(super) fn require_enterprise_namespace_read(
         db,
         Some(context),
         namespace,
-        crate::enterprise::NamespaceAction::Read,
+        action,
     )?;
     if db.enterprise_extension().is_none() {
-        require_namespace_access(facts, &context.principal.subject, namespace)?;
+        let subject = &context.principal.subject;
+        if action == crate::enterprise::NamespaceAction::Write {
+            require_namespace_write_access(facts, subject, namespace)?;
+        } else {
+            require_namespace_access(facts, subject, namespace)?;
+        }
     }
     Ok(())
 }
