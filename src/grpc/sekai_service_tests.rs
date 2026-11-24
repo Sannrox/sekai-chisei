@@ -39198,6 +39198,8 @@ mod pending_decisions_tests;
 #[path = "export_delivery_source_tests.rs"]
 mod export_delivery_source_tests;
 
+#[path = "dataset_rollback_rpc_tests.rs"]
+mod dataset_rollback_rpc_tests;
 #[path = "governed_document_rpc_tests.rs"]
 mod governed_document_rpc_tests;
 #[path = "media_upload_rpc_tests.rs"]

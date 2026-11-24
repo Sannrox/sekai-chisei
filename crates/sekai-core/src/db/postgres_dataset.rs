@@ -585,85 +585,93 @@ impl PostgresDb {
             .transaction()
             .map_err(|error| error.to_string())?;
         crate::db::postgres::lock_dataset_rows(&mut tx, &request.dataset_id)?;
-        let restored = get_dataset_version_pg(
-            &mut tx,
-            &request.dataset_id,
-            &request.restore_from_version_id,
-            0,
-        )?;
-        if restored.purged {
-            return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
-        }
-        // Checked inside the rollback transaction, as on SQLite.
-        if let Some(row) = tx
-            .query_opt(
-                "SELECT namespace, kind FROM sekai_object_type_datasource
-                 WHERE dataset_id = $1 AND NOT edits_only
-                 ORDER BY namespace, kind LIMIT 1",
-                &[&request.dataset_id],
-            )
-            .map_err(|error| error.to_string())?
-        {
-            return Err(dataset_version::rollback_backs_index_error(
-                &row.get::<_, String>(0),
-                &row.get::<_, String>(1),
-            ));
-        }
-        tx.execute(
-            "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
-            &[&request.dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-        tx.execute(
-            "INSERT INTO sekai_dataset_rows (dataset_id, data)
-             SELECT dataset_id, data FROM sekai_dataset_version_rows
-             WHERE dataset_id = $1 AND version_id = $2
-             ORDER BY row_id",
-            &[&request.dataset_id, &restored.version_id],
-        )
-        .map_err(|error| error.to_string())?;
-        let keys_json: String = tx
-            .query_one(
-                "SELECT partition_keys FROM sekai_datasets WHERE id = $1",
-                &[&request.dataset_id],
-            )
-            .map_err(|error| error.to_string())?
-            .get(0);
-        let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
-        let live = tx
-            .query(
-                "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = $1",
-                &[&request.dataset_id],
-            )
-            .map_err(|error| error.to_string())?;
-        for row in live {
-            let id: i64 = row.get(0);
-            let data: String = row.get(1);
-            let partition_key = crate::sekai::dataset::partition_key_for_row_json(&keys, &data)?;
-            tx.execute(
-                "UPDATE sekai_dataset_rows SET partition_key = $1 WHERE id = $2",
-                &[&partition_key, &id],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        mark_consuming_transform_outputs_stale_pg(
-            &mut tx,
-            &request.dataset_id,
-            &restored.version_id,
-            dataset_version::now_ms(),
-        )?;
-        let version = snapshot_dataset_version_pg(
-            &mut tx,
-            &request.dataset_id,
-            &request.actor,
-            &request.tenant,
-            &request.reason,
-            &restored.version_id,
-            dataset_version::now_ms(),
-        )?;
+        let version = rollback_dataset_pg(&mut tx, request)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(version)
     }
+}
+
+/// The rollback of [`PostgresDb::rollback_dataset`] inside the caller's
+/// transaction, which must already hold
+/// [`crate::db::postgres::lock_dataset_rows`] for the dataset. The caller
+/// commits on success and rolls back on any error.
+pub(crate) fn rollback_dataset_pg(
+    tx: &mut postgres::Transaction<'_>,
+    request: &DatasetRollback,
+) -> Result<DatasetVersion, String> {
+    let restored =
+        get_dataset_version_pg(tx, &request.dataset_id, &request.restore_from_version_id, 0)?;
+    if restored.purged {
+        return Err(dataset_version::DATASET_VERSION_PAST_RETENTION.into());
+    }
+    // Checked inside the rollback transaction, as on SQLite.
+    if let Some(row) = tx
+        .query_opt(
+            "SELECT namespace, kind FROM sekai_object_type_datasource
+             WHERE dataset_id = $1 AND NOT edits_only
+             ORDER BY namespace, kind LIMIT 1",
+            &[&request.dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Err(dataset_version::rollback_backs_index_error(
+            &row.get::<_, String>(0),
+            &row.get::<_, String>(1),
+        ));
+    }
+    tx.execute(
+        "DELETE FROM sekai_dataset_rows WHERE dataset_id = $1",
+        &[&request.dataset_id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.execute(
+        "INSERT INTO sekai_dataset_rows (dataset_id, data)
+         SELECT dataset_id, data FROM sekai_dataset_version_rows
+         WHERE dataset_id = $1 AND version_id = $2
+         ORDER BY row_id",
+        &[&request.dataset_id, &restored.version_id],
+    )
+    .map_err(|error| error.to_string())?;
+    let keys_json: String = tx
+        .query_one(
+            "SELECT partition_keys FROM sekai_datasets WHERE id = $1",
+            &[&request.dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0);
+    let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
+    let live = tx
+        .query(
+            "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id = $1",
+            &[&request.dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in live {
+        let id: i64 = row.get(0);
+        let data: String = row.get(1);
+        let partition_key = crate::sekai::dataset::partition_key_for_row_json(&keys, &data)?;
+        tx.execute(
+            "UPDATE sekai_dataset_rows SET partition_key = $1 WHERE id = $2",
+            &[&partition_key, &id],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    mark_consuming_transform_outputs_stale_pg(
+        tx,
+        &request.dataset_id,
+        &restored.version_id,
+        dataset_version::now_ms(),
+    )?;
+    let version = snapshot_dataset_version_pg(
+        tx,
+        &request.dataset_id,
+        &request.actor,
+        &request.tenant,
+        &request.reason,
+        &restored.version_id,
+        dataset_version::now_ms(),
+    )?;
+    Ok(version)
 }
 
 fn validate_columns(columns: &[ColumnDef]) -> Result<(), String> {
@@ -836,7 +844,7 @@ fn row_to_dataset_version(row: postgres::Row) -> Result<DatasetVersion, String> 
     })
 }
 
-fn get_dataset_version_pg(
+pub(crate) fn get_dataset_version_pg(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
     version_id: &str,

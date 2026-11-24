@@ -29,6 +29,8 @@ use data_export_rpc::{
     EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
     run_export,
 };
+#[path = "dataset_rollback_rpc.rs"]
+mod dataset_rollback_rpc;
 #[path = "definition_bundle_apply_rpc.rs"]
 mod definition_bundle_apply_rpc;
 #[path = "definition_change_bundle_rpc.rs"]
@@ -301,6 +303,10 @@ impl SekaiService for SekaiServiceImpl {
         put_model_stage => put_model_stage_rpc(PutModelStageRequest) -> PutModelStageResponse;
         list_model_stages => list_model_stages_rpc(ListModelStagesRequest) -> ListModelStagesResponse;
         promote_model_version => promote_model_version_rpc(PromoteModelVersionRequest) -> PromoteModelVersionResponse;
+        propose_dataset_rollback => propose_dataset_rollback_rpc(ProposeDatasetRollbackRequest) -> ProposeDatasetRollbackResponse;
+        decide_dataset_rollback => decide_dataset_rollback_rpc(DecideDatasetRollbackRequest) -> DecideDatasetRollbackResponse;
+        get_dataset_rollback_proposal => get_dataset_rollback_proposal_rpc(GetDatasetRollbackProposalRequest) -> GetDatasetRollbackProposalResponse;
+        list_dataset_rollback_proposals => list_dataset_rollback_proposals_rpc(ListDatasetRollbackProposalsRequest) -> ListDatasetRollbackProposalsResponse;
         submit_model_stage_review => submit_model_stage_review_rpc(SubmitModelStageReviewRequest) -> SubmitModelStageReviewResponse;
         decide_model_stage_review => decide_model_stage_review_rpc(DecideModelStageReviewRequest) -> DecideModelStageReviewResponse;
         ack_work => ack_work_rpc(AckWorkRequest) -> AckWorkResponse;

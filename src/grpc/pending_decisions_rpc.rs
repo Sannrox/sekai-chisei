@@ -1,5 +1,5 @@
 //! `ListPendingDecisions` (#2203): what waits on the caller's decision across
-//! the four review kinds. Rows stay in each kind's store. Each kind is
+//! the review kinds. Rows stay in each kind's store. Each kind is
 //! filtered by the check its decide RPC applies, reused rather than
 //! restated, so the list is exactly what that RPC would accept from this
 //! caller:
@@ -13,13 +13,16 @@
 //!   [`authorize_definition_proposal_approval`]), less those the caller
 //!   already approved;
 //! - dataset branch proposals: `MergeDatasetBranch`
-//!   ([`may_merge_dataset_proposal`]).
+//!   ([`may_merge_dataset_proposal`]);
+//! - dataset rollback proposals (#3186): `DecideDatasetRollback`
+//!   ([`may_decide_dataset_rollback`]).
 //!
 //! Every kind also passes the space role and credential scope of its decide
 //! RPC ([`crate::grpc::authorize_rpc_space`]). A kind the caller may not
 //! decide in contributes nothing, so a refusal and an empty queue look the
 //! same. Freshness preconditions are left to the decide RPC.
 
+use super::dataset_rollback_rpc::may_decide_dataset_rollback;
 use super::rpc_actions::{
     namespace_decider, plan_review_step_decider, visit_decidable_action_instances,
 };
@@ -170,6 +173,7 @@ pub(super) async fn list_pending_decisions(
             PendingDecisionKind::PlanReview,
             PendingDecisionKind::DefinitionProposal,
             PendingDecisionKind::DatasetBranchProposal,
+            PendingDecisionKind::DatasetRollbackProposal,
         ];
     }
     kinds.sort();
@@ -242,6 +246,11 @@ pub(super) async fn list_pending_decisions(
             PendingDecisionKind::DatasetBranchProposal => {
                 if space_allows("MergeDatasetBranch") {
                     list_dataset_proposals(service, &principals, context, namespace, &mut page)?;
+                }
+            }
+            PendingDecisionKind::DatasetRollbackProposal => {
+                if space_allows("DecideDatasetRollback") {
+                    list_dataset_rollbacks(service, &principals, context, namespace, &mut page)?;
                 }
             }
             PendingDecisionKind::Unspecified => {}
@@ -425,6 +434,52 @@ fn list_dataset_proposals(
             if may_merge_dataset_proposal(
                 service, principals, context, namespace, proposal, *attached,
             )? && !page.push(decision)
+            {
+                return Ok(());
+            }
+        }
+        if proposals.len() < SCAN_PAGE {
+            return Ok(());
+        }
+    }
+}
+
+fn list_dataset_rollbacks(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    page: &mut Page,
+) -> Result<(), Status> {
+    let db = service.db.runtime();
+    let tenant = context_tenant(context);
+    let mut position = page.start(PendingDecisionKind::DatasetRollbackProposal);
+    loop {
+        let proposals = db
+            .list_open_dataset_rollback_proposals(
+                &tenant,
+                namespace,
+                SCAN_PAGE,
+                position.older_than(),
+            )
+            .map_err(Status::internal)?;
+        if let Some(last) = proposals.last() {
+            position.advance(last.created_at_ms, &last.id);
+        }
+        for proposal in &proposals {
+            let decision = PendingDecision {
+                kind: PendingDecisionKind::DatasetRollbackProposal.into(),
+                namespace: namespace.to_string(),
+                subject_id: proposal.id.clone(),
+                subject_digest: proposal.base_version_id.clone(),
+                requested_by: proposal.proposer.clone(),
+                requested_at_ms: proposal.created_at_ms,
+                deadline_ms: 0,
+                queue_id: String::new(),
+                dataset_id: proposal.dataset_id.clone(),
+            };
+            if may_decide_dataset_rollback(service, principals, context, namespace, proposal)?
+                && !page.push(decision)
             {
                 return Ok(());
             }

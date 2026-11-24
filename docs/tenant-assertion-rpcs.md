@@ -17,6 +17,8 @@ applies the RPC's read or write action.
 | `CreateDataset`, `AppendRows`, `UpdateDataset` (#2105) | the dataset's binding object | write |
 | `ListDatasetVersions`, `GetDatasetVersion` | the dataset's binding object | read |
 | `RollbackDataset` | the dataset's binding object | write |
+| `ProposeDatasetRollback`, `DecideDatasetRollback` (#3186) | the dataset's binding object | write |
+| `GetDatasetRollbackProposal`, `ListDatasetRollbackProposals` (#3186) | the dataset's binding object | read |
 | `ListDatasetHealthChecks`, `ListDatasetHealthResults`, `ListDatasetAlerts` | the dataset's binding object | read |
 | `PutDatasetHealthCheck`, `RunDatasetHealthChecks` | the dataset's binding object | write |
 | `ListDatasetBranches`, `CompareDatasetBranch` (#2104) | the dataset's binding object | read |

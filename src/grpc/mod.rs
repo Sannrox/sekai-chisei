@@ -1121,6 +1121,11 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "CompareDatasetBranch"
             | "ProposeDatasetBranchMerge"
             | "MergeDatasetBranch"
+            // Rollback proposals (#3186) authorize like RollbackDataset.
+            | "ProposeDatasetRollback"
+            | "DecideDatasetRollback"
+            | "GetDatasetRollbackProposal"
+            | "ListDatasetRollbackProposals"
             | "PutDatasetHealthCheck"
             | "ListDatasetHealthChecks"
             | "ListDatasetHealthResults"
@@ -3142,7 +3147,12 @@ mod tests {
             rpc_namespace_action("RollbackDataset"),
             NamespaceAction::Write
         );
-        for method in ["ListDatasetBranches", "CompareDatasetBranch"] {
+        for method in [
+            "ListDatasetBranches",
+            "CompareDatasetBranch",
+            "GetDatasetRollbackProposal",
+            "ListDatasetRollbackProposals",
+        ] {
             assert_eq!(rpc_namespace_action(method), NamespaceAction::Read);
         }
         for method in [
@@ -3150,6 +3160,8 @@ mod tests {
             "DeleteDatasetBranch",
             "ProposeDatasetBranchMerge",
             "MergeDatasetBranch",
+            "ProposeDatasetRollback",
+            "DecideDatasetRollback",
         ] {
             assert_eq!(rpc_namespace_action(method), NamespaceAction::Write);
             assert!(enterprise_namespace_rpc("sekai.SekaiService", method));

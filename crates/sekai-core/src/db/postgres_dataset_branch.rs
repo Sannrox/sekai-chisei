@@ -20,7 +20,7 @@ type Rows = Vec<HashMap<String, String>>;
 
 /// One read-only snapshot, so branch metadata, its rows and the parent are
 /// read as of the same moment.
-fn read_snapshot(connection: &mut postgres::Client) -> Result<Transaction<'_>, String> {
+pub(crate) fn read_snapshot(connection: &mut postgres::Client) -> Result<Transaction<'_>, String> {
     connection
         .build_transaction()
         .isolation_level(postgres::IsolationLevel::RepeatableRead)
@@ -976,7 +976,10 @@ fn branch_records_budgeted(
     Ok(records)
 }
 
-fn latest_version_id(tx: &mut Transaction<'_>, dataset_id: &str) -> Result<String, String> {
+pub(crate) fn latest_version_id(
+    tx: &mut Transaction<'_>,
+    dataset_id: &str,
+) -> Result<String, String> {
     Ok(tx
         .query_opt(
             "SELECT version_id FROM sekai_dataset_versions

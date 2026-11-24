@@ -3103,6 +3103,67 @@ message MergeDatasetBranchRequest {
   string reason = 3;
 }
 message MergeDatasetBranchResponse { DatasetBranchProposal proposal = 1; }
+// Experimental (#3186). A dataset rollback proposed by one principal and
+// decided by another of the same tenant with write access, as a branch merge
+// proposal is (ADR 0119). status is open, approved or denied.
+message DatasetRollbackProposal {
+  string id = 1;
+  string dataset_id = 2;
+  string restore_from_version_id = 3;
+  // The dataset's newest version when proposed. An approval needs it to
+  // still be the newest.
+  string base_version_id = 4;
+  string proposer = 5;
+  string reason = 6;
+  string status = 7;
+  // Empty while open.
+  string decided_by = 8;
+  // The version an approval wrote, whose restored_from_version_id is
+  // restore_from_version_id; empty otherwise.
+  string restored_version_id = 9;
+  string receipt_id = 10;
+  int64 created_at_ms = 11;
+  int64 decided_at_ms = 12;
+  string decision_reason = 13;
+}
+// Needs write access to the dataset. The same open rollback (same restore
+// source and base) returns the open proposal.
+message ProposeDatasetRollbackRequest {
+  string dataset_id = 1;
+  string restore_from_version_id = 2;
+  string reason = 3;
+}
+message ProposeDatasetRollbackResponse { DatasetRollbackProposal proposal = 1; }
+// An approval restores the source version as one new dataset version and
+// records the decision in the same transaction; a denial records the
+// decision only. Deciding again the same way returns the proposal unchanged.
+// A moved base or a source past retention refuses with FAILED_PRECONDITION
+// naming which.
+message DecideDatasetRollbackRequest {
+  string dataset_id = 1;
+  string proposal_id = 2;
+  bool approve = 3;
+  string reason = 4;
+}
+message DecideDatasetRollbackResponse { DatasetRollbackProposal proposal = 1; }
+message GetDatasetRollbackProposalRequest {
+  string dataset_id = 1;
+  string proposal_id = 2;
+}
+message GetDatasetRollbackProposalResponse { DatasetRollbackProposal proposal = 1; }
+// Newest first.
+message ListDatasetRollbackProposalsRequest {
+  string dataset_id = 1;
+  // Default 100, at most 500.
+  uint32 limit = 2;
+  // next_page_token of the previous page.
+  string page_token = 3;
+}
+message ListDatasetRollbackProposalsResponse {
+  repeated DatasetRollbackProposal proposals = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+}
 message RunGovernedTransformOnBranchRequest {
   string namespace = 1;
   string transform_id = 2;
@@ -4084,7 +4145,7 @@ message GetDecisionTrendResponse {
   string report_json = 1;
 }
 
-// Experimental (#2203): what waits on the caller's decision, across the four
+// Experimental (#2203): what waits on the caller's decision, across the
 // review kinds. Rows stay in each kind's own store, and deciding still goes
 // through that kind's RPC.
 enum PendingDecisionKind {
@@ -4097,6 +4158,9 @@ enum PendingDecisionKind {
   PENDING_DECISION_KIND_DEFINITION_PROPOSAL = 3;
   // An open dataset branch proposal, merged with MergeDatasetBranch.
   PENDING_DECISION_KIND_DATASET_BRANCH_PROPOSAL = 4;
+  // An open dataset rollback proposal, decided with DecideDatasetRollback
+  // (#3186).
+  PENDING_DECISION_KIND_DATASET_ROLLBACK_PROPOSAL = 5;
 }
 // Each kind is filtered by the check its decide RPC applies, so the caller
 // sees only what that RPC would accept from them and nothing else; a caller
@@ -4115,11 +4179,12 @@ message ListPendingDecisionsRequest {
 message PendingDecision {
   PendingDecisionKind kind = 1;
   string namespace = 2;
-  // Action instance id, plan id, definition proposal id, or dataset branch
-  // proposal id.
+  // Action instance id, plan id, definition proposal id, dataset branch
+  // proposal id, or dataset rollback proposal id.
   string subject_id = 3;
   // What the decision binds: the instance request digest, the plan's
-  // simulation digest, the proposal digest, or the branch digest.
+  // simulation digest, the proposal digest, the branch digest, or a
+  // rollback proposal's base version id.
   string subject_digest = 4;
   string requested_by = 5;
   int64 requested_at_ms = 6;
@@ -4128,7 +4193,7 @@ message PendingDecision {
   // Review queue of a parked Action, or the first of a plan's step queues;
   // empty when none.
   string queue_id = 8;
-  // Set for a dataset branch proposal: MergeDatasetBranch names it.
+  // Set for a dataset branch or rollback proposal: its decide RPC names it.
   string dataset_id = 9;
 }
 // Kinds in enum order, newest first within a kind.
@@ -6486,6 +6551,11 @@ service SekaiService {
   rpc CompareDatasetBranch(CompareDatasetBranchRequest) returns (CompareDatasetBranchResponse);
   rpc ProposeDatasetBranchMerge(ProposeDatasetBranchMergeRequest) returns (ProposeDatasetBranchMergeResponse);
   rpc MergeDatasetBranch(MergeDatasetBranchRequest) returns (MergeDatasetBranchResponse);
+  // Experimental (#3186): a dataset rollback decided by a second principal.
+  rpc ProposeDatasetRollback(ProposeDatasetRollbackRequest) returns (ProposeDatasetRollbackResponse);
+  rpc DecideDatasetRollback(DecideDatasetRollbackRequest) returns (DecideDatasetRollbackResponse);
+  rpc GetDatasetRollbackProposal(GetDatasetRollbackProposalRequest) returns (GetDatasetRollbackProposalResponse);
+  rpc ListDatasetRollbackProposals(ListDatasetRollbackProposalsRequest) returns (ListDatasetRollbackProposalsResponse);
   rpc RunGovernedTransformOnBranch(RunGovernedTransformOnBranchRequest) returns (RunGovernedTransformOnBranchResponse);
   rpc ReplayGovernedTransform(ReplayGovernedTransformRequest) returns (ReplayGovernedTransformResponse);
   rpc GetTransformReplay(GetTransformReplayRequest) returns (GetTransformReplayResponse);

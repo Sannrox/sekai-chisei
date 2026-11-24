@@ -124,6 +124,7 @@ fn decision_json(decision: &PendingDecision) -> Value {
         PendingDecisionKind::PlanReview => "plan_review",
         PendingDecisionKind::DefinitionProposal => "definition_proposal",
         PendingDecisionKind::DatasetBranchProposal => "dataset_branch_proposal",
+        PendingDecisionKind::DatasetRollbackProposal => "dataset_rollback_proposal",
         PendingDecisionKind::Unspecified => "unspecified",
     };
     json!({

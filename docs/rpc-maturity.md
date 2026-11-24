@@ -324,6 +324,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.CompareDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ProposeDatasetBranchMerge` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.MergeDatasetBranch` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ProposeDatasetRollback` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.DecideDatasetRollback` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.GetDatasetRollbackProposal` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.ListDatasetRollbackProposals` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.RunGovernedTransformOnBranch` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ReplayGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformReplay` | `sekai.datasets` | yes | none | `experimental` |

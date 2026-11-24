@@ -65,3 +65,23 @@ admin, namespace tenant, and the transform quota gate. Abandoned open
 branches do not expire;
 an operator deletes them. Row-level merge conflicts are out of scope: a moved
 parent means proposing again.
+
+## Amendment: rollback proposals (#3186)
+
+A dataset rollback can go through the same second-principal review as a
+branch merge. `ProposeDatasetRollback` pins the source version and the
+dataset's latest version as its base; proposing the same pair again in the
+same tenant returns the open proposal. `DecideDatasetRollback` approves or
+denies it. The proposer cannot decide it, and the decider needs the write
+access and readable columns `RollbackDataset` needs. An approval is refused
+when a newer version than the base exists or retention purged the source.
+It writes exactly one version, attributed to the decider and marked as
+restored from the source, and records a receipt id: a digest over the
+proposal and the new version. The decision and the version commit in one
+transaction. Repeating a decision returns it and writes nothing; the
+opposite decision is refused. A denial changes no rows. Open proposals
+appear in `ListPendingDecisions` as `DATASET_ROLLBACK_PROPOSAL`.
+Proposals live in `sekai_dataset_rollback_proposals` on both stores
+(`0173_dataset_rollback_proposals` on PostgreSQL), and PostgreSQL decides
+under the dataset rows lock. The RPCs are experimental and need
+`SEKAI_EXPERIMENTAL_RPCS=1`. `RollbackDataset` keeps applying directly.
