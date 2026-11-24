@@ -160,6 +160,21 @@ administration. It stays
 experimental. `tenant_assertion_runs_an_eval_dataset_in_its_namespace`
 covers it through the token interceptor.
 
+## Added in #3043
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `ChiseiService.AppendUsageEvents` | each event | write |
+
+Admitted on `ChiseiService` only, and it requires a tenant assertion: a
+caller without one is refused, because there is no tenant to bill. Each
+event's namespace is authorized as a namespace write. The tenant is the
+assertion's tenant, the principal is the assertion's `act` (else its
+subject), and the subject is recorded as the reporter
+([ADR 0158](decisions/0158-reported-usage-enters-the-tenant-ledger.md)). It
+stays experimental. `tenant_assertion_appends_reported_usage_for_its_principal`
+covers it through the token interceptor.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

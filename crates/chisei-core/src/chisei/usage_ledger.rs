@@ -12,28 +12,71 @@ use sekai_core::db::sekai::SekaiDb;
 
 pub const USAGE_EVENT_VERSION: &str = "chisei.usage-event/v1";
 
+/// What a usage event counts. Readers skip stored units they do not know, so a
+/// later release can add a unit without breaking this release's list or export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum UsageUnit {
+    /// Model tokens in total; the sum of input and output unless a receipt
+    /// reports an explicit total.
     Tokens,
     Requests,
+    InputTokens,
+    OutputTokens,
+    /// Wall-clock seconds of an isolated job, reported by the service that ran it.
+    ComputeSeconds,
+    /// Retained bytes, reported by the service that stores them.
+    StorageBytes,
 }
 
 impl UsageUnit {
+    pub const ALL: [Self; 6] = [
+        Self::Tokens,
+        Self::Requests,
+        Self::InputTokens,
+        Self::OutputTokens,
+        Self::ComputeSeconds,
+        Self::StorageBytes,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tokens => "tokens",
             Self::Requests => "requests",
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::ComputeSeconds => "compute_seconds",
+            Self::StorageBytes => "storage_bytes",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "tokens" => Some(Self::Tokens),
-            "requests" => Some(Self::Requests),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|unit| unit.as_str() == value)
     }
+}
+
+/// SQL list of the units this release reads, e.g. `'tokens','requests'`. Readers
+/// filter on it so a row written by a newer release is skipped, not an error.
+/// Built only from `UsageUnit::ALL`, never from input.
+pub(crate) fn known_units_sql() -> String {
+    UsageUnit::ALL
+        .map(|unit| format!("'{}'", unit.as_str()))
+        .join(",")
+}
+
+/// The resource that consumed the usage, for example a transform or a dataset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageResource {
+    pub kind: String,
+    pub id: String,
+}
+
+/// Narrows an aggregate below the tenant. `None` means every value.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UsageScope<'a> {
+    pub namespace: Option<&'a str>,
+    pub principal_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +127,16 @@ pub struct UsageEvent {
     pub dedupe_key: String,
     pub event_time_ms: i64,
     pub corrects_event_id: Option<String>,
+    /// The principal that caused the work, from verified context only: the
+    /// receipt's initiating actor, or the tenant assertion's subject on append.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<UsageResource>,
+    /// The service that reported `provider_reported` usage on the principal's
+    /// behalf (the delegating caller of the append call).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -97,12 +150,106 @@ pub struct UsageAggregate {
     pub net: i64,
 }
 
+impl UsageAggregate {
+    /// Fold one `(source, quantity)` sum into the aggregate.
+    pub(crate) fn add(&mut self, source_raw: &str, quantity: i64) {
+        match UsageSource::parse(source_raw) {
+            Some(UsageSource::Measured) => self.measured += quantity,
+            Some(UsageSource::ProviderReported) => self.provider_reported += quantity,
+            Some(UsageSource::Estimated) => self.estimated += quantity,
+            Some(UsageSource::Correction) => self.corrections += quantity,
+            None => {}
+        }
+        self.net += quantity;
+    }
+}
+
+/// Units a service may report through the append call. Tokens and requests are
+/// measured by the plane itself from receipts.
+pub const REPORTABLE_UNITS: [UsageUnit; 2] = [UsageUnit::ComputeSeconds, UsageUnit::StorageBytes];
+
+const MAX_DEDUPE_KEY_LEN: usize = 256;
+
+/// Usage a service measured outside the plane. `tenant_id` and `principal_id`
+/// come from the verified tenant assertion, never from the request body.
+#[derive(Debug, Clone)]
+pub struct ReportedUsage<'a> {
+    pub tenant_id: &'a str,
+    pub principal_id: &'a str,
+    /// The authenticated caller that reports on the principal's behalf.
+    pub reported_by: &'a str,
+    pub namespace: &'a str,
+    pub unit: UsageUnit,
+    pub quantity: i64,
+    /// Caller key, unique per tenant; a replay with the same key is a no-op.
+    pub dedupe_key: &'a str,
+    /// The job or operation that consumed the usage; defaults to the dedupe key.
+    pub operation_id: Option<&'a str>,
+    pub resource: Option<UsageResource>,
+    pub event_time_ms: i64,
+}
+
+/// Build the `provider_reported` ledger event for reported usage, or say why it
+/// is not accepted.
+pub fn reported_usage_event(report: ReportedUsage<'_>) -> Result<UsageEvent, String> {
+    if !REPORTABLE_UNITS.contains(&report.unit) {
+        return Err(format!(
+            "unit {} is measured by the plane and cannot be reported",
+            report.unit.as_str()
+        ));
+    }
+    if report.quantity <= 0 {
+        return Err("quantity must be positive".into());
+    }
+    let key = report.dedupe_key.trim();
+    if key.is_empty() || key.len() > MAX_DEDUPE_KEY_LEN {
+        return Err(format!(
+            "dedupe_key required, at most {MAX_DEDUPE_KEY_LEN} bytes"
+        ));
+    }
+    if report.principal_id.trim().is_empty() {
+        return Err("principal required from authenticated context".into());
+    }
+    if let Some(resource) = &report.resource
+        && (resource.kind.trim().is_empty() || resource.id.trim().is_empty())
+    {
+        return Err("resource needs both kind and id".into());
+    }
+    let tenant_id = report.tenant_id;
+    let operation_id = report
+        .operation_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(key);
+    Ok(UsageEvent {
+        version: USAGE_EVENT_VERSION.into(),
+        event_id: stable_event_id(tenant_id, key, "reported", "provider_reported"),
+        tenant_id: tenant_id.into(),
+        namespace: report.namespace.into(),
+        unit: report.unit,
+        quantity: report.quantity,
+        source: UsageSource::ProviderReported,
+        receipt_operation_id: operation_id.into(),
+        dedupe_key: format!("usage:v1:{tenant_id}:reported:{key}"),
+        event_time_ms: report.event_time_ms,
+        corrects_event_id: None,
+        principal_id: Some(report.principal_id.into()),
+        resource: report.resource,
+        reported_by: Some(report.reported_by.into()),
+    })
+}
+
+const EVENT_COLUMNS: &str = "event_id, version, tenant_id, namespace, unit, quantity, source,
+    receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id,
+    principal_id, resource_kind, resource_id, reported_by";
+
 pub trait UsageLedgerSekaiDbExt {
     /// Append a usage event. Identical `dedupe_key` is a no-op success (replay-safe).
     fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String>;
 
+    /// One event by id; `None` when absent or in a unit this release does not know.
     fn get_usage_event(&self, event_id: &str) -> Result<Option<UsageEvent>, String>;
 
+    /// Events of a period in known units, oldest first.
     fn list_usage_events_for_tenant(
         &self,
         tenant_id: &str,
@@ -111,13 +258,25 @@ pub trait UsageLedgerSekaiDbExt {
         limit: i64,
     ) -> Result<Vec<UsageEvent>, String>;
 
+    /// Sum one unit for a tenant and period, optionally per namespace or principal.
+    fn aggregate_usage(
+        &self,
+        tenant_id: &str,
+        unit: UsageUnit,
+        scope: UsageScope<'_>,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<UsageAggregate, String>;
+
     fn aggregate_usage_for_tenant(
         &self,
         tenant_id: &str,
         unit: UsageUnit,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<UsageAggregate, String>;
+    ) -> Result<UsageAggregate, String> {
+        self.aggregate_usage(tenant_id, unit, UsageScope::default(), start_ms, end_ms)
+    }
 
     /// Project measured usage from a completed receipt into the ledger.
     /// `tenant_id` must come from verified enterprise context, not the receipt alone.
@@ -135,7 +294,7 @@ pub trait UsageLedgerSekaiDbExt {
         actor_note: &str,
     ) -> Result<UsageEvent, String>;
 
-    /// Export events for a closed period as versioned JSON lines payload.
+    /// Export known-unit events for a closed period as versioned JSON lines.
     fn export_usage_period(
         &self,
         tenant_id: &str,
@@ -145,16 +304,20 @@ pub trait UsageLedgerSekaiDbExt {
 }
 
 impl UsageLedgerSekaiDbExt for SekaiDb {
-    /// Append a usage event. Identical `dedupe_key` is a no-op success (replay-safe).
     fn append_usage_event(&self, event: &UsageEvent) -> Result<bool, String> {
         validate_event(event)?;
-        let conn = self.conn();
-        let inserted = conn
+        let (resource_kind, resource_id) = event
+            .resource
+            .as_ref()
+            .map(|resource| (resource.kind.as_str(), resource.id.as_str()))
+            .unzip();
+        let inserted = self
+            .conn()
             .execute(
-                "INSERT OR IGNORE INTO chisei_usage_events
-                 (event_id, version, tenant_id, namespace, unit, quantity, source,
-                  receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                &format!(
+                    "INSERT OR IGNORE INTO chisei_usage_events ({EVENT_COLUMNS})
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)"
+                ),
                 params![
                     event.event_id,
                     event.version,
@@ -167,6 +330,10 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
                     event.dedupe_key,
                     event.event_time_ms,
                     event.corrects_event_id,
+                    event.principal_id,
+                    resource_kind,
+                    resource_id,
+                    event.reported_by,
                 ],
             )
             .map_err(|e| e.to_string())?;
@@ -176,9 +343,11 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
     fn get_usage_event(&self, event_id: &str) -> Result<Option<UsageEvent>, String> {
         self.conn()
             .query_row(
-                "SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
-                        receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id
-                 FROM chisei_usage_events WHERE event_id = ?1",
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM chisei_usage_events
+                     WHERE event_id = ?1 AND unit IN ({})",
+                    known_units_sql()
+                ),
                 params![event_id],
                 row_to_event,
             )
@@ -199,14 +368,14 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
         let limit = if limit <= 0 { 100 } else { limit.min(5_000) };
         let conn = self.conn();
         let mut stmt = conn
-            .prepare(
-                "SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
-                        receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id
-                 FROM chisei_usage_events
+            .prepare(&format!(
+                "SELECT {EVENT_COLUMNS} FROM chisei_usage_events
                  WHERE tenant_id = ?1 AND event_time_ms >= ?2 AND event_time_ms < ?3
+                   AND unit IN ({})
                  ORDER BY event_time_ms ASC, event_id ASC
                  LIMIT ?4",
-            )
+                known_units_sql()
+            ))
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![tenant_id, start_ms, end_ms, limit], row_to_event)
@@ -215,10 +384,11 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
             .map_err(|e| e.to_string())
     }
 
-    fn aggregate_usage_for_tenant(
+    fn aggregate_usage(
         &self,
         tenant_id: &str,
         unit: UsageUnit,
+        scope: UsageScope<'_>,
         start_ms: i64,
         end_ms: i64,
     ) -> Result<UsageAggregate, String> {
@@ -236,30 +406,31 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
             .prepare(
                 "SELECT source, SUM(quantity) FROM chisei_usage_events
                  WHERE tenant_id = ?1 AND unit = ?2 AND event_time_ms >= ?3 AND event_time_ms < ?4
+                   AND (?5 IS NULL OR namespace = ?5)
+                   AND (?6 IS NULL OR principal_id = ?6)
                  GROUP BY source",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![tenant_id, unit.as_str(), start_ms, end_ms], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
+            .query_map(
+                params![
+                    tenant_id,
+                    unit.as_str(),
+                    start_ms,
+                    end_ms,
+                    scope.namespace,
+                    scope.principal_id
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
             .map_err(|e| e.to_string())?;
         for row in rows {
             let (source_raw, quantity) = row.map_err(|e| e.to_string())?;
-            match UsageSource::parse(&source_raw) {
-                Some(UsageSource::Measured) => agg.measured += quantity,
-                Some(UsageSource::ProviderReported) => agg.provider_reported += quantity,
-                Some(UsageSource::Estimated) => agg.estimated += quantity,
-                Some(UsageSource::Correction) => agg.corrections += quantity,
-                None => {}
-            }
-            agg.net += quantity;
+            agg.add(&source_raw, quantity);
         }
         Ok(agg)
     }
 
-    /// Project measured usage from a completed receipt into the ledger.
-    /// `tenant_id` must come from verified enterprise context, not the receipt alone.
     fn project_usage_from_receipt(
         &self,
         tenant_id: &str,
@@ -272,7 +443,6 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
         Ok(events)
     }
 
-    /// Append-only correction (never mutates prior rows).
     fn correct_usage_event(
         &self,
         prior_event_id: &str,
@@ -295,12 +465,14 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
             dedupe_key: format!("usage:v1:corr:{}:{delta}", prior.event_id),
             event_time_ms: chrono::Utc::now().timestamp_millis(),
             corrects_event_id: Some(prior.event_id),
+            principal_id: prior.principal_id,
+            resource: prior.resource,
+            reported_by: None,
         };
         self.append_usage_event(&event)?;
         Ok(event)
     }
 
-    /// Export events for a closed period as versioned JSON lines payload.
     fn export_usage_period(
         &self,
         tenant_id: &str,
@@ -310,22 +482,21 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
         // Page through the whole period in (event_time_ms, event_id) order so a large
         // tenant is never truncated at the per-call cap.
         const PAGE: i64 = 5_000;
+        let sql = format!(
+            "SELECT {EVENT_COLUMNS} FROM chisei_usage_events
+             WHERE tenant_id = ?1 AND event_time_ms >= ?2 AND event_time_ms < ?3
+               AND (event_time_ms, event_id) > (?4, ?5)
+               AND unit IN ({})
+             ORDER BY event_time_ms ASC, event_id ASC
+             LIMIT ?6",
+            known_units_sql()
+        );
         let mut lines = Vec::new();
         let mut cursor = (i64::MIN, String::new());
         loop {
             let page = {
                 let conn = self.conn();
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
-                                receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id
-                         FROM chisei_usage_events
-                         WHERE tenant_id = ?1 AND event_time_ms >= ?2 AND event_time_ms < ?3
-                           AND (event_time_ms, event_id) > (?4, ?5)
-                         ORDER BY event_time_ms ASC, event_id ASC
-                         LIMIT ?6",
-                    )
-                    .map_err(|e| e.to_string())?;
+                let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
                 let rows = stmt
                     .query_map(
                         params![tenant_id, start_ms, end_ms, cursor.0, cursor.1, PAGE],
@@ -349,6 +520,9 @@ impl UsageLedgerSekaiDbExt for SekaiDb {
     }
 }
 
+/// Measured events for a receipt: one request, and the token total plus its
+/// input and output parts when nonzero. Each carries the receipt's initiating
+/// actor as principal.
 pub(crate) fn measured_usage_events(
     tenant_id: &str,
     receipt: &OperationReceipt,
@@ -357,43 +531,40 @@ pub(crate) fn measured_usage_events(
         return Err("tenant_id required from authenticated context".into());
     }
     let tokens = measured_tokens_from_receipt(receipt);
+    let principal_id = Some(receipt.initiating_actor.trim())
+        .filter(|actor| !actor.is_empty())
+        .map(str::to_owned);
     let event_time = receipt.completed_at_ms.unwrap_or(receipt.started_at_ms);
-    let mut out = Vec::new();
-    out.push(UsageEvent {
+    let measured = |unit: UsageUnit, quantity: i64| UsageEvent {
         version: USAGE_EVENT_VERSION.into(),
-        event_id: stable_event_id(tenant_id, &receipt.operation_id, "requests", "measured"),
+        event_id: stable_event_id(tenant_id, &receipt.operation_id, unit.as_str(), "measured"),
         tenant_id: tenant_id.into(),
         namespace: receipt.namespace.clone(),
-        unit: UsageUnit::Requests,
-        quantity: 1,
+        unit,
+        quantity,
         source: UsageSource::Measured,
         receipt_operation_id: receipt.operation_id.clone(),
         dedupe_key: format!(
-            "usage:v1:{tenant_id}:{}:requests:measured",
-            receipt.operation_id
+            "usage:v1:{tenant_id}:{}:{}:measured",
+            receipt.operation_id,
+            unit.as_str()
         ),
         event_time_ms: event_time,
         corrects_event_id: None,
-    });
-    if tokens != 0 {
-        out.push(UsageEvent {
-            version: USAGE_EVENT_VERSION.into(),
-            event_id: stable_event_id(tenant_id, &receipt.operation_id, "tokens", "measured"),
-            tenant_id: tenant_id.into(),
-            namespace: receipt.namespace.clone(),
-            unit: UsageUnit::Tokens,
-            quantity: tokens,
-            source: UsageSource::Measured,
-            receipt_operation_id: receipt.operation_id.clone(),
-            dedupe_key: format!(
-                "usage:v1:{tenant_id}:{}:tokens:measured",
-                receipt.operation_id
-            ),
-            event_time_ms: event_time,
-            corrects_event_id: None,
-        });
-    }
-    Ok(out)
+        principal_id: principal_id.clone(),
+        resource: None,
+        reported_by: None,
+    };
+    Ok([
+        (UsageUnit::Requests, 1),
+        (UsageUnit::Tokens, tokens.total),
+        (UsageUnit::InputTokens, tokens.input),
+        (UsageUnit::OutputTokens, tokens.output),
+    ]
+    .into_iter()
+    .filter(|(_, quantity)| *quantity != 0)
+    .map(|(unit, quantity)| measured(unit, quantity))
+    .collect())
 }
 
 pub(crate) fn validate_event(event: &UsageEvent) -> Result<(), String> {
@@ -417,32 +588,43 @@ pub(crate) fn validate_event(event: &UsageEvent) -> Result<(), String> {
     Ok(())
 }
 
-fn measured_tokens_from_receipt(receipt: &OperationReceipt) -> i64 {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MeasuredTokens {
+    total: i64,
+    input: i64,
+    output: i64,
+}
+
+fn measured_tokens_from_receipt(receipt: &OperationReceipt) -> MeasuredTokens {
     // Per event: an explicit total wins over its parts. Across events: totals add up,
     // so a receipt with several model calls is not under-counted.
-    receipt.events.iter().fold(0i64, |total, event| {
-        let attr = |key: &str| {
-            event
-                .attributes
-                .get(key)
-                .and_then(|value| value.parse::<i64>().ok())
-        };
-        let measured = ["total_tokens", "tokens"]
-            .into_iter()
-            .find_map(attr)
-            .unwrap_or_else(|| {
-                [
-                    "input_tokens",
-                    "output_tokens",
-                    "prompt_tokens",
-                    "completion_tokens",
-                ]
+    receipt
+        .events
+        .iter()
+        .fold(MeasuredTokens::default(), |sum, event| {
+            let attr = |key: &str| {
+                event
+                    .attributes
+                    .get(key)
+                    .and_then(|value| value.parse::<i64>().ok())
+            };
+            let parts = |keys: [&str; 2]| {
+                keys.into_iter()
+                    .filter_map(attr)
+                    .fold(0i64, i64::saturating_add)
+            };
+            let input = parts(["input_tokens", "prompt_tokens"]);
+            let output = parts(["output_tokens", "completion_tokens"]);
+            let total = ["total_tokens", "tokens"]
                 .into_iter()
-                .filter_map(attr)
-                .fold(0i64, i64::saturating_add)
-            });
-        total.saturating_add(measured)
-    })
+                .find_map(attr)
+                .unwrap_or(input.saturating_add(output));
+            MeasuredTokens {
+                total: sum.total.saturating_add(total),
+                input: sum.input.saturating_add(input),
+                output: sum.output.saturating_add(output),
+            }
+        })
 }
 
 fn stable_event_id(tenant_id: &str, operation_id: &str, unit: &str, source: &str) -> String {
@@ -460,6 +642,8 @@ fn stable_event_id(tenant_id: &str, operation_id: &str, unit: &str, source: &str
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageEvent> {
     let unit_raw: String = row.get(4)?;
     let source_raw: String = row.get(6)?;
+    let resource_kind: Option<String> = row.get(12)?;
+    let resource_id: Option<String> = row.get(13)?;
     Ok(UsageEvent {
         event_id: row.get(0)?,
         version: row.get(1)?,
@@ -484,6 +668,11 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageEvent> {
         dedupe_key: row.get(8)?,
         event_time_ms: row.get(9)?,
         corrects_event_id: row.get(10)?,
+        principal_id: row.get(11)?,
+        resource: resource_kind
+            .zip(resource_id)
+            .map(|(kind, id)| UsageResource { kind, id }),
+        reported_by: row.get(14)?,
     })
 }
 
@@ -565,7 +754,14 @@ mod tests {
         third.attributes.insert("input_tokens".into(), "7".into());
         receipt.events.extend([second, third]);
         // 100 (total wins over parts) + 50 (30 + 20) + 100 (total wins over input).
-        assert_eq!(measured_tokens_from_receipt(&receipt), 250);
+        assert_eq!(
+            measured_tokens_from_receipt(&receipt),
+            MeasuredTokens {
+                total: 250,
+                input: 37,
+                output: 20
+            }
+        );
     }
 
     #[test]
@@ -586,6 +782,9 @@ mod tests {
                 // Shared timestamps exercise the event_id tiebreak in paging.
                 event_time_ms: 1_000 + i / 3,
                 corrects_event_id: None,
+                principal_id: None,
+                resource: None,
+                reported_by: None,
             };
             assert!(db.append_usage_event(&event).unwrap());
         }
@@ -650,5 +849,202 @@ mod tests {
         assert!(export.contains("\"unit\":\"requests\""));
         assert!(export.contains("\"unit\":\"tokens\""));
         assert!(export.lines().count() >= 2);
+    }
+
+    fn split_receipt(op: &str, actor: &str, input: i64, output: i64) -> OperationReceipt {
+        let mut receipt = sample_receipt(op, 0);
+        receipt.initiating_actor = actor.into();
+        let attributes = &mut receipt.events[0].attributes;
+        attributes.clear();
+        attributes.insert("input_tokens".into(), input.to_string());
+        attributes.insert("output_tokens".into(), output.to_string());
+        receipt
+    }
+
+    fn total(db: &SekaiDb, unit: UsageUnit, scope: UsageScope<'_>) -> i64 {
+        db.aggregate_usage("tenant-a", unit, scope, 0, i64::MAX)
+            .unwrap()
+            .net
+    }
+
+    fn reported(key: &str, principal: &str, namespace: &str, quantity: i64) -> UsageEvent {
+        reported_usage_event(ReportedUsage {
+            tenant_id: "tenant-a",
+            principal_id: principal,
+            reported_by: "svc-jobs",
+            namespace,
+            unit: UsageUnit::ComputeSeconds,
+            quantity,
+            dedupe_key: key,
+            operation_id: Some("job-1"),
+            resource: Some(UsageResource {
+                kind: "transform".into(),
+                id: "t-1".into(),
+            }),
+            event_time_ms: 3_000,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn receipt_projects_split_tokens_with_the_initiating_principal() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        let events = db
+            .project_usage_from_receipt("tenant-a", &split_receipt("op-s", "alice", 30, 20))
+            .unwrap();
+        let quantity = |unit| events.iter().find(|e| e.unit == unit).map(|e| e.quantity);
+        assert_eq!(quantity(UsageUnit::Tokens), Some(50));
+        assert_eq!(quantity(UsageUnit::InputTokens), Some(30));
+        assert_eq!(quantity(UsageUnit::OutputTokens), Some(20));
+        assert!(
+            events
+                .iter()
+                .all(|e| e.principal_id.as_deref() == Some("alice"))
+        );
+        db.project_usage_from_receipt("tenant-a", &split_receipt("op-t", "bob", 5, 1))
+            .unwrap();
+        let alice = UsageScope {
+            principal_id: Some("alice"),
+            ..Default::default()
+        };
+        assert_eq!(total(&db, UsageUnit::InputTokens, alice), 30);
+        assert_eq!(total(&db, UsageUnit::OutputTokens, alice), 20);
+        assert_eq!(total(&db, UsageUnit::Tokens, UsageScope::default()), 56);
+    }
+
+    #[test]
+    fn reported_usage_aggregates_per_namespace_and_principal_and_replays_once() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        assert!(
+            db.append_usage_event(&reported("k1", "alice", "ns", 40))
+                .unwrap()
+        );
+        // Same key, different body: a no-op, never a second charge.
+        assert!(
+            !db.append_usage_event(&reported("k1", "alice", "ns", 99))
+                .unwrap()
+        );
+        assert!(
+            db.append_usage_event(&reported("k2", "bob", "other", 7))
+                .unwrap()
+        );
+        let ns = UsageScope {
+            namespace: Some("ns"),
+            ..Default::default()
+        };
+        let bob = UsageScope {
+            principal_id: Some("bob"),
+            ..Default::default()
+        };
+        assert_eq!(total(&db, UsageUnit::ComputeSeconds, ns), 40);
+        assert_eq!(total(&db, UsageUnit::ComputeSeconds, bob), 7);
+        let all = db
+            .aggregate_usage_for_tenant("tenant-a", UsageUnit::ComputeSeconds, 0, i64::MAX)
+            .unwrap();
+        assert_eq!((all.provider_reported, all.net), (47, 47));
+        let listed = db
+            .list_usage_events_for_tenant("tenant-a", 0, i64::MAX, 10)
+            .unwrap();
+        assert_eq!(
+            listed[0].resource.as_ref().map(|r| r.id.as_str()),
+            Some("t-1")
+        );
+    }
+
+    #[test]
+    fn reported_usage_rejects_measured_units_and_empty_keys() {
+        let base = ReportedUsage {
+            tenant_id: "tenant-a",
+            principal_id: "alice",
+            reported_by: "svc-jobs",
+            namespace: "ns",
+            unit: UsageUnit::Tokens,
+            quantity: 1,
+            dedupe_key: "k",
+            operation_id: None,
+            resource: None,
+            event_time_ms: 1,
+        };
+        assert!(reported_usage_event(base.clone()).is_err());
+        assert!(
+            reported_usage_event(ReportedUsage {
+                unit: UsageUnit::StorageBytes,
+                dedupe_key: " ",
+                ..base.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            reported_usage_event(ReportedUsage {
+                unit: UsageUnit::StorageBytes,
+                quantity: 0,
+                ..base
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn readers_skip_units_written_by_a_newer_release() {
+        let db = crate::chisei_store::memory_sekai_with_chisei_schema();
+        db.project_usage_from_receipt("tenant-a", &sample_receipt("op-k", 12))
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chisei_usage_events
+                    (event_id, version, tenant_id, namespace, unit, quantity, source,
+                     receipt_operation_id, dedupe_key, event_time_ms)
+                 VALUES ('future', ?1, 'tenant-a', 'ns', 'gpu_hours', 5, 'measured',
+                         'op-f', 'future-key', 1500)",
+                params![USAGE_EVENT_VERSION],
+            )
+            .unwrap();
+        let listed = db
+            .list_usage_events_for_tenant("tenant-a", 0, i64::MAX, 100)
+            .unwrap();
+        assert_eq!(listed.len(), 2);
+        let exported = db.export_usage_period("tenant-a", 0, i64::MAX).unwrap();
+        assert_eq!(exported.lines().count(), 2);
+        assert!(!exported.contains("gpu_hours"));
+        assert!(db.get_usage_event("future").unwrap().is_none());
+        assert_eq!(total(&db, UsageUnit::Tokens, UsageScope::default()), 12);
+        assert_eq!(total(&db, UsageUnit::Requests, UsageScope::default()), 1);
+    }
+
+    #[test]
+    fn upgraded_table_keeps_events_and_accepts_new_units() {
+        use crate::chisei_store::ChiseiSqliteSchema;
+        let db = SekaiDb::new(":memory:").unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE chisei_usage_events (
+                    event_id TEXT PRIMARY KEY, version TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, unit TEXT NOT NULL,
+                    quantity INTEGER NOT NULL, source TEXT NOT NULL,
+                    receipt_operation_id TEXT NOT NULL, dedupe_key TEXT NOT NULL UNIQUE,
+                    event_time_ms INTEGER NOT NULL, corrects_event_id TEXT,
+                    CHECK (unit IN ('tokens', 'requests')),
+                    CHECK (source IN ('measured', 'provider_reported', 'estimated', 'correction'))
+                );
+                INSERT INTO chisei_usage_events VALUES
+                    ('old', 'chisei.usage-event/v1', 'tenant-a', 'ns', 'tokens', 9,
+                     'measured', 'op-old', 'old-key', 1000, NULL);",
+            )
+            .unwrap();
+        db.migrate_usage_ledger().unwrap();
+        db.migrate_usage_ledger().unwrap();
+        let old = db.get_usage_event("old").unwrap().unwrap();
+        assert_eq!(
+            (old.unit, old.quantity, old.principal_id),
+            (UsageUnit::Tokens, 9, None)
+        );
+        assert!(
+            db.append_usage_event(&reported("k1", "alice", "ns", 3))
+                .unwrap()
+        );
+        assert_eq!(
+            total(&db, UsageUnit::ComputeSeconds, UsageScope::default()),
+            3
+        );
     }
 }

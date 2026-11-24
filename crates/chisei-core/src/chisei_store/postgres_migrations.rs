@@ -176,6 +176,12 @@ pub const CHISEI_PLANE_SQL: &[PlaneSql] = &[
         include_str!("postgres/0169_chisei_tenant_concurrency_holds.sql"),
         None,
     ),
+    plane(
+        177,
+        "chisei_usage_attribution",
+        include_str!("postgres/0177_chisei_usage_attribution.sql"),
+        None,
+    ),
 ];
 
 pub fn apply_chisei_postgres_schema(db: &PostgresDb) -> Result<(), String> {
@@ -266,6 +272,9 @@ mod tests {
         assert!(
             sql("chisei_usage_events").contains("CREATE TABLE IF NOT EXISTS chisei_usage_events")
         );
+        let attribution = sql("chisei_usage_attribution");
+        assert!(attribution.contains("DROP CONSTRAINT IF EXISTS chisei_usage_events_unit_check"));
+        assert!(attribution.contains("principal_id"));
 
         let reclaim = sql("external_action_reclaim_index");
         assert!(reclaim.contains("idx_chisei_ext_auth_reclaim"));

@@ -1101,6 +1101,43 @@ message RecordUsageResponse {
   BudgetUsage usage = 1;
   bool sample_recorded = 2;
 }
+
+// At most 500 events. Every event is checked before any is written; a retry
+// of the whole request is safe because each event is keyed.
+message AppendUsageEventsRequest {
+  repeated ReportedUsageEvent events = 1;
+}
+
+message ReportedUsageEvent {
+  // The caller needs namespace write here.
+  string namespace = 1;
+  // `compute_seconds` or `storage_bytes`.
+  string unit = 2;
+  // Positive.
+  int64 quantity = 3;
+  // Unique per tenant, at most 256 bytes; a replay is a no-op success.
+  string dedupe_key = 4;
+  // The job or operation that consumed the usage; defaults to dedupe_key.
+  string operation_id = 5;
+  // Optional: what consumed the usage, inside `namespace`.
+  UsageResourceRef resource = 6;
+}
+
+message UsageResourceRef {
+  string kind = 1;
+  string id = 2;
+}
+
+message AppendUsageEventsResponse {
+  // In request order.
+  repeated AppendedUsageEvent events = 1;
+}
+
+message AppendedUsageEvent {
+  string event_id = 1;
+  // False when the dedupe key was already recorded.
+  bool recorded = 2;
+}
 message SetBudgetLimitRequest {
   string user_id = 1;
   int32 max_tokens = 2;
@@ -2098,6 +2135,10 @@ service ChiseiService {
   rpc SetExternalActionPolicy(SetExternalActionPolicyRequest) returns (SetExternalActionPolicyResponse);
   // Budget
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
+  // Experimental. Appends usage a service measured outside the plane (compute
+  // seconds, storage bytes) to the tenant usage ledger. Requires an enterprise
+  // tenant assertion; tenant and principal come from it, never from the body.
+  rpc AppendUsageEvents(AppendUsageEventsRequest) returns (AppendUsageEventsResponse);
   rpc SetBudgetLimit(SetBudgetLimitRequest) returns (SetBudgetLimitResponse);
   // Read-only usage, limit and remainder per scope level; same authorization
   // as SetBudgetLimit.

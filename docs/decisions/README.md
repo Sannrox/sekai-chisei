@@ -183,4 +183,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0155: Custom-rubric judges pin their criteria in the evaluator definition](0155-custom-rubric-judges-pin-their-criteria.md)
 - [ADR 0156: Improvement reads execution telemetry from the plane](0156-improvement-reads-execution-telemetry-from-the-plane.md)
 - [ADR 0157: An agent turn records its transcript](0157-an-agent-turn-records-its-transcript.md)
+- [ADR 0158: Reported usage enters the tenant ledger](0158-reported-usage-enters-the-tenant-ledger.md)
 <!-- adr-index:end -->

@@ -1280,6 +1280,7 @@ const MIGRATIONS: &[Migration] = &[
         DATASET_SOURCE_KEY_INDEX_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(177, "chisei_usage_attribution", "", MigrationOwner::Chisei),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
@@ -3276,6 +3277,18 @@ mod tests {
         assert!(migration.statements(SchemaPlane::Sekai).is_empty());
         assert!(migration.statements(SchemaPlane::Chisei).is_empty());
         assert!(migration.statements(SchemaPlane::Shared).is_empty());
+    }
+
+    #[test]
+    fn usage_attribution_migration_is_chisei_owned() {
+        let migration = MIGRATIONS
+            .iter()
+            .copied()
+            .find(|migration| migration.name == "chisei_usage_attribution")
+            .expect("chisei_usage_attribution");
+        assert_eq!(migration.version, 177);
+        assert!(matches!(migration.owner, MigrationOwner::Chisei));
+        assert!(migration.sql.is_empty());
     }
 
     #[test]

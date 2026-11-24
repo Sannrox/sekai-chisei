@@ -913,6 +913,7 @@ fn enterprise_namespace_rpc(service: &str, method: &str) -> bool {
             | "ListEvalDatasetRunTrend"
             | "CompareEvalDatasetRuns"
             | "RunEvalDataset"
+            | "AppendUsageEvents"
     );
     let expected = if chisei {
         "chisei.ChiseiService"
@@ -1085,6 +1086,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // A run (#3089) writes the request's namespace under the tenant
             // check; its model spend is charged to the namespace budget.
             | "RunEvalDataset"
+            // Reported usage (#3043) writes each event's namespace under the
+            // tenant check; tenant and principal come from the assertion.
+            | "AppendUsageEvents"
             | "ListSchemaTypes"
             | "ListGovernedTransforms"
             | "ListGovernedTransformRuns"

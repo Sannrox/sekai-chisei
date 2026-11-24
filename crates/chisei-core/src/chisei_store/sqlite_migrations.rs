@@ -1063,29 +1063,65 @@ impl ChiseiSqliteSchema for SekaiDb {
     }
 
     fn migrate_usage_ledger(&self) -> Result<(), String> {
-        self.conn()
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS chisei_usage_events (
-                    event_id TEXT PRIMARY KEY,
-                    version TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    namespace TEXT NOT NULL,
-                    unit TEXT NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    source TEXT NOT NULL,
-                    receipt_operation_id TEXT NOT NULL,
-                    dedupe_key TEXT NOT NULL UNIQUE,
-                    event_time_ms INTEGER NOT NULL,
-                    corrects_event_id TEXT,
-                    CHECK (unit IN ('tokens', 'requests')),
-                    CHECK (source IN ('measured', 'provider_reported', 'estimated', 'correction'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_time
-                    ON chisei_usage_events(tenant_id, event_time_ms, event_id);
-                CREATE INDEX IF NOT EXISTS idx_usage_events_receipt
-                    ON chisei_usage_events(receipt_operation_id);",
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // Tables from before #3043 restrict `unit` with a CHECK, which SQLite can
+        // only drop by rebuilding the table. The typed ledger validates units
+        // instead, so a later release can add one without another rebuild.
+        let restricts_unit: bool = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sql LIKE '%unit IN (%'), 0) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'chisei_usage_events'",
+                [],
+                |row| row.get(0),
             )
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if restricts_unit {
+            tx.execute_batch(
+                "ALTER TABLE chisei_usage_events RENAME TO chisei_usage_events_pre_3043;
+                 DROP INDEX IF EXISTS idx_usage_events_tenant_time;
+                 DROP INDEX IF EXISTS idx_usage_events_receipt;",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS chisei_usage_events (
+                event_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                receipt_operation_id TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                event_time_ms INTEGER NOT NULL,
+                corrects_event_id TEXT,
+                principal_id TEXT,
+                resource_kind TEXT,
+                resource_id TEXT,
+                reported_by TEXT,
+                CHECK (source IN ('measured', 'provider_reported', 'estimated', 'correction'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_events_tenant_time
+                ON chisei_usage_events(tenant_id, event_time_ms, event_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_events_receipt
+                ON chisei_usage_events(receipt_operation_id);",
+        )
+        .map_err(|e| e.to_string())?;
+        if restricts_unit {
+            tx.execute_batch(
+                "INSERT INTO chisei_usage_events
+                    (event_id, version, tenant_id, namespace, unit, quantity, source,
+                     receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id)
+                 SELECT event_id, version, tenant_id, namespace, unit, quantity, source,
+                        receipt_operation_id, dedupe_key, event_time_ms, corrects_event_id
+                 FROM chisei_usage_events_pre_3043;
+                 DROP TABLE chisei_usage_events_pre_3043;",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
 
     fn ensure_external_permit_tables(&self) -> Result<(), String> {

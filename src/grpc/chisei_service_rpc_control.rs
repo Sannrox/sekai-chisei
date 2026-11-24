@@ -580,3 +580,94 @@ pub(super) async fn get_effective_policy_summary(
         models,
     }))
 }
+
+const MAX_APPENDED_USAGE_EVENTS: usize = 500;
+
+/// Appends usage a service measured outside the plane (#3043, ADR 0158). The
+/// tenant and the principal come from the verified tenant assertion: the
+/// principal is the person the caller acts for (`act`), else the caller, and
+/// the caller is recorded as `reported_by`. Every event is checked before any
+/// is written; each is keyed, so a retried request records nothing twice.
+pub(super) async fn append_usage_events(
+    service: &ChiseiServiceImpl,
+    req: Request<AppendUsageEventsRequest>,
+) -> Result<Response<AppendUsageEventsResponse>, Status> {
+    use crate::chisei::usage_ledger::{
+        ReportedUsage, UsageResource, UsageUnit, reported_usage_event,
+    };
+    let context = enterprise_authenticated_context(&req)?
+        .cloned()
+        .ok_or_else(|| Status::permission_denied("usage append requires a tenant assertion"))?;
+    let tenant_id = context
+        .tenant
+        .as_ref()
+        .map(|tenant| tenant.tenant_id.clone())
+        .filter(|tenant| !tenant.trim().is_empty())
+        .ok_or_else(|| Status::permission_denied("usage append requires a tenant assertion"))?;
+    let reported_by = context.principal.subject.clone();
+    let principal_id = context
+        .act
+        .as_deref()
+        .map(str::trim)
+        .filter(|act| !act.is_empty())
+        .unwrap_or(&reported_by)
+        .to_string();
+    let request = req.into_inner();
+    if request.events.is_empty() || request.events.len() > MAX_APPENDED_USAGE_EVENTS {
+        return Err(Status::invalid_argument(format!(
+            "between 1 and {MAX_APPENDED_USAGE_EVENTS} events required"
+        )));
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut events = Vec::with_capacity(request.events.len());
+    for (index, event) in request.events.iter().enumerate() {
+        let invalid = |reason: String| Status::invalid_argument(format!("event {index}: {reason}"));
+        let unit = UsageUnit::parse(&event.unit)
+            .ok_or_else(|| invalid(format!("unknown unit {:?}", event.unit)))?;
+        let namespace = canonical_namespace(&event.namespace)?;
+        require_enterprise_namespace(
+            service.sekai_facts.reader(),
+            &context,
+            namespace,
+            crate::enterprise::NamespaceAction::Write,
+        )?;
+        events.push(
+            reported_usage_event(ReportedUsage {
+                tenant_id: &tenant_id,
+                principal_id: &principal_id,
+                reported_by: &reported_by,
+                namespace,
+                unit,
+                quantity: event.quantity,
+                dedupe_key: &event.dedupe_key,
+                operation_id: Some(event.operation_id.as_str()),
+                resource: event.resource.as_ref().map(|resource| UsageResource {
+                    kind: resource.kind.clone(),
+                    id: resource.id.clone(),
+                }),
+                event_time_ms: now_ms,
+            })
+            .map_err(invalid)?,
+        );
+    }
+    let store = service.db.runtime_arc();
+    let appended = tokio::task::spawn_blocking(move || {
+        events
+            .into_iter()
+            .map(|event| {
+                crate::chisei_store::append_usage_event_in(store.as_ref(), &event).map(|recorded| {
+                    AppendedUsageEvent {
+                        event_id: event.event_id,
+                        recorded,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .await
+    .map_err(|_| Status::internal("usage append task failed"))?
+    .map_err(Status::internal)?;
+    Ok(Response::new(AppendUsageEventsResponse {
+        events: appended,
+    }))
+}

@@ -15868,3 +15868,105 @@ async fn tenant_assertion_runs_an_eval_dataset_in_its_namespace() {
     let refused = fixture.interceptor.call(request).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::PermissionDenied);
 }
+
+/// #3043: through the real token interceptor, a service holding a tenant
+/// assertion appends compute seconds and storage bytes for the person it acts
+/// for. Tenant and principal come from the assertion, a replay records
+/// nothing, and a batch with one event outside the tenant writes nothing.
+#[tokio::test]
+async fn tenant_assertion_appends_reported_usage_for_its_principal() {
+    use crate::chisei::usage_ledger::{UsageLedgerSekaiDbExt, UsageScope, UsageUnit};
+    let mut fixture = TenantReadFixture::new("svc-jobs", &[]);
+    let authority = fixture.authority.clone();
+    let token = move || {
+        authority
+            .sign(&crate::identity_assertion::IdentityAssertion {
+                contract_version: crate::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
+                issuer: "https://issuer.test".into(),
+                audience: "https://sekai.test".into(),
+                subject: "svc-jobs".into(),
+                credential_id: "credential-jobs".into(),
+                credential_kind: "machine".into(),
+                space: None,
+                space_role: None,
+                act: Some("alice".into()),
+                tenant_id: Some("tenant-a".into()),
+                scopes: vec!["sekai.write".into()],
+                expires_at: chrono::Utc::now().timestamp() + 60,
+                nonce: uuid::Uuid::new_v4().to_string(),
+                device: None,
+            })
+            .unwrap()
+    };
+    let event = |namespace: &str, unit: &str, quantity: i64, key: &str| ReportedUsageEvent {
+        namespace: namespace.into(),
+        unit: unit.into(),
+        quantity,
+        dedupe_key: key.into(),
+        operation_id: "job-1".into(),
+        resource: Some(UsageResourceRef {
+            kind: "transform".into(),
+            id: "t-1".into(),
+        }),
+    };
+    let mut append = async |events: Vec<ReportedUsageEvent>| {
+        let (metadata, extensions) = fixture.admit(&token, "AppendUsageEvents");
+        fixture
+            .svc
+            .append_usage_events(Request::from_parts(
+                metadata,
+                extensions,
+                AppendUsageEventsRequest { events },
+            ))
+            .await
+    };
+    let batch = vec![
+        event("ns-a", "compute_seconds", 40, "job-1:cpu"),
+        event("ns-a", "storage_bytes", 1_000, "job-1:disk"),
+    ];
+    let first = append(batch.clone()).await.unwrap().into_inner();
+    assert!(first.events.iter().all(|event| event.recorded));
+    let replay = append(batch).await.unwrap().into_inner();
+    assert!(replay.events.iter().all(|event| !event.recorded));
+    let foreign = append(vec![
+        event("ns-a", "compute_seconds", 5, "job-2:cpu"),
+        event("ns-b", "compute_seconds", 5, "job-2:cpu-b"),
+    ])
+    .await
+    .unwrap_err();
+    assert_eq!(foreign.code(), tonic::Code::PermissionDenied);
+    let measured = append(vec![event("ns-a", "tokens", 5, "job-3")])
+        .await
+        .unwrap_err();
+    assert_eq!(measured.code(), tonic::Code::InvalidArgument);
+
+    let RuntimeDb::Sqlite(db) = fixture.svc.db.runtime_arc().as_ref().clone() else {
+        unreachable!("fixture is SQLite")
+    };
+    let alice = UsageScope {
+        principal_id: Some("alice"),
+        namespace: Some("ns-a"),
+    };
+    let seconds = db
+        .aggregate_usage("tenant-a", UsageUnit::ComputeSeconds, alice, 0, i64::MAX)
+        .unwrap();
+    assert_eq!((seconds.provider_reported, seconds.net), (40, 40));
+    let events = db
+        .list_usage_events_for_tenant("tenant-a", 0, i64::MAX, 10)
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| {
+        event.reported_by.as_deref() == Some("svc-jobs")
+            && event.resource.as_ref().is_some_and(|r| r.id == "t-1")
+    }));
+
+    // Without a tenant assertion there is no tenant to bill.
+    let unscoped = fixture
+        .svc
+        .append_usage_events(Request::new(AppendUsageEventsRequest {
+            events: vec![event("ns-a", "compute_seconds", 1, "k")],
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(unscoped.code(), tonic::Code::PermissionDenied);
+}

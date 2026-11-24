@@ -672,6 +672,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_control::record_usage(self, req).await
     }
 
+    async fn append_usage_events(
+        &self,
+        req: Request<AppendUsageEventsRequest>,
+    ) -> Result<Response<AppendUsageEventsResponse>, Status> {
+        rpc_control::append_usage_events(self, req).await
+    }
+
     async fn set_budget_limit(
         &self,
         req: Request<SetBudgetLimitRequest>,
