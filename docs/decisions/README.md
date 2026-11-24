@@ -187,4 +187,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0159: A governed document may hold its bytes as plane media](0159-a-governed-document-may-hold-its-bytes-as-plane-media.md)
 - [ADR 0160: Generated ontology clients target the HTTP projection with a forwarded revision pin](0160-generated-ontology-clients-target-the-http-projection.md)
 - [ADR 0161: Series samples as datasets with a governed series read](0161-series-samples-as-datasets-with-a-governed-series-read.md)
+- [ADR 0162: Landed source records stay in the SQL store](0162-landed-source-records-stay-in-the-sql-store.md) (proposed)
 <!-- adr-index:end -->

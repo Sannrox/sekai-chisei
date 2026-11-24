@@ -47,6 +47,7 @@ reference pages.
 | [Model-call admission](2279-model-call-admission.md) | Recommendation complete; [ADR 0151](../decisions/0151-chisei-admits-every-model-call.md) names Chisei as the single admission point |
 | [Failed-case grouping](2631-failed-case-grouping.md) | Recommendation complete; deterministic grouping of a run's failed cases, suggestions stay with clients |
 | [Foresight claims](2155-foresight-claims.md) | No native claim kind; scheduled bindings, ObjectSets, governed write-back and the change log cover projections |
+| [Landed records in open tables](2411-landed-records-open-tables.md) | Recommendation complete; [ADR 0162](../decisions/0162-landed-source-records-stay-in-the-sql-store.md) (proposed) keeps landed records in the SQL store; the measured limit is full-copy dataset versions (#3475) |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
