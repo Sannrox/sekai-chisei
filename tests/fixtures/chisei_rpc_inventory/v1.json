@@ -334,6 +334,20 @@
       "product_tier": "core"
     },
     {
+      "rpc": "GetExecutionTelemetry",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/execution_telemetry.rs",
+        "src/grpc/chisei_service.rs",
+        "docs/execution-telemetry.md"
+      ],
+      "durable_dependencies": [
+        "chisei.execution"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PlanContentExecution",
       "kind": "computed",
       "surfaces": [],

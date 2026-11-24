@@ -468,6 +468,7 @@ Edit the fixture, then regenerate with
 | `ChiseiService.ReportOperationEvent` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host, cli | `stable` |
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
+| `ChiseiService.GetExecutionTelemetry` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |

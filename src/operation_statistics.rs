@@ -9,7 +9,7 @@ use crate::db::sekai::SekaiDb;
 use crate::ext::*;
 
 pub const MAX_STATISTICS_WINDOW_MS: i64 = 366 * 24 * 60 * 60 * 1000;
-const MAX_STATISTICS_RECEIPTS: usize = 4096;
+pub const MAX_STATISTICS_RECEIPTS: usize = 4096;
 const MAX_EPISTEMIC_OBSERVATIONS: usize = 4096;
 const EPISTEMIC_ACCOUNTING_VERSION: &str = "chisei.epistemic-context-operations/v1";
 
@@ -139,7 +139,7 @@ fn zero_buckets(buckets: &[&str]) -> BTreeMap<String, i64> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutcomeClass {
+pub(crate) enum OutcomeClass {
     Verified,
     Failed,
     Parked,
@@ -149,7 +149,7 @@ enum OutcomeClass {
 }
 
 impl OutcomeClass {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             OutcomeClass::Verified => "verified",
             OutcomeClass::Failed => "failed",
@@ -371,7 +371,7 @@ fn receipt_capability(receipt: &OperationReceipt) -> String {
     }
 }
 
-fn list_receipts_in_window(
+pub(crate) fn list_receipts_in_window(
     db: &RuntimeDb,
     namespaces: &[String],
     start_timestamp_ms: i64,
@@ -700,7 +700,7 @@ fn logical_operation_id(receipt: &OperationReceipt) -> String {
         .to_string()
 }
 
-fn event_model(event: &OperationReceiptEvent) -> Option<String> {
+pub(crate) fn event_model(event: &OperationReceiptEvent) -> Option<String> {
     ["model", "resolved_model"]
         .into_iter()
         .find_map(|key| event.attributes.get(key))
@@ -724,7 +724,7 @@ fn normalized_status(event: &OperationReceiptEvent) -> &str {
         .unwrap_or_default()
 }
 
-fn classify_receipt(receipt: &OperationReceipt, window_end_ms: i64) -> OutcomeClass {
+pub(crate) fn classify_receipt(receipt: &OperationReceipt, window_end_ms: i64) -> OutcomeClass {
     let verification_passed = receipt.events.iter().any(|event| {
         event.timestamp_ms < window_end_ms
             && event.kind == ReceiptEventKind::VerificationRecorded

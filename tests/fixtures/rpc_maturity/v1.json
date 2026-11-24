@@ -3201,6 +3201,15 @@
     },
     {
       "service": "ChiseiService",
+      "rpc": "GetExecutionTelemetry",
+      "storage_path": "chisei.execution",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "ChiseiService",
       "rpc": "ClaimGatewayDispatch",
       "storage_path": "gateway.governance, chisei.execution",
       "real_backend": "yes",
