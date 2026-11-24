@@ -42,6 +42,7 @@ fn admission(document_id: &str) -> GovernedDocumentAdmission {
             digest: format!("sha256:01{}", "ab".repeat(31)),
             media_type: "application/pdf".into(),
             byte_length: 128,
+            media_reference: String::new(),
         }),
         ..Default::default()
     }
@@ -59,6 +60,7 @@ fn attachment(parent_content_digest: &str) -> DocumentRenditionAttachment {
             digest: format!("sha256:02{}", "cd".repeat(31)),
             media_type: "text/plain".into(),
             byte_length: 32,
+            media_reference: String::new(),
         }),
         extractor_id: "extractor:text".into(),
         extractor_profile_digest: format!("sha256:03{}", "ef".repeat(31)),

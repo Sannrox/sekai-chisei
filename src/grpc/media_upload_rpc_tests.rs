@@ -232,3 +232,279 @@ async fn idle_unfinished_uploads_lose_their_bytes() {
 fn postgres_idle_unfinished_uploads_lose_their_bytes() {
     on_postgres(exercise_expiry);
 }
+
+const PURPOSE: &str = "case-review";
+
+/// A `media` content reference over a completed upload of [`FILE`].
+fn media_content(reference: &str) -> ContentReference {
+    ContentReference {
+        scheme: "media".into(),
+        digest: format!("sha256:{}", hex(&Sha256::digest(FILE))),
+        media_type: "image/jpeg".into(),
+        byte_length: FILE.len() as u64,
+        media_reference: reference.into(),
+    }
+}
+
+async fn admit_media(
+    svc: &SekaiServiceImpl,
+    document_id: &str,
+    content: ContentReference,
+) -> Result<GovernedDocument, Status> {
+    svc.admit_governed_document(with_named_principal(
+        AdmitGovernedDocumentRequest {
+            document: Some(GovernedDocumentAdmission {
+                contract_version: "sekai.governed-document/v1".into(),
+                document_id: document_id.into(),
+                namespace: NAMESPACE.into(),
+                type_revision: "v1".into(),
+                purpose: PURPOSE.into(),
+                classification: "public".into(),
+                title: "Site photo".into(),
+                content_ref: Some(content),
+                ..Default::default()
+            }),
+        },
+        "alice",
+    ))
+    .await
+    .map(|response| response.into_inner().document.unwrap())
+}
+
+/// Read as `as_principal`, presenting the document purpose.
+async fn read_for_purpose(
+    svc: &SekaiServiceImpl,
+    reference: &str,
+    as_principal: &str,
+) -> Result<Vec<u8>, Status> {
+    let mut request = with_named_principal(
+        ReadMediaRequest {
+            media_reference: reference.into(),
+            offset: 0,
+            limit: 0,
+        },
+        as_principal,
+    );
+    request
+        .metadata_mut()
+        .insert("x-sekai-purpose", PURPOSE.parse().unwrap());
+    svc.read_media(request)
+        .await
+        .map(|response| response.into_inner().data)
+}
+
+async fn completed(svc: &SekaiServiceImpl, key: &str) -> String {
+    let upload_id = upload(svc, key).await;
+    complete(svc, &upload_id).await.unwrap().media_reference
+}
+
+fn code<T: std::fmt::Debug>(result: Result<T, Status>) -> tonic::Code {
+    result.unwrap_err().code()
+}
+
+/// Give `principal` a sealed profile cleared up to `ceiling`.
+fn clear(svc: &SekaiServiceImpl, principal: &str, ceiling: &str) {
+    let id = format!("profile-{principal}");
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: id.clone(),
+            kind: markings::PRINCIPAL_PROFILE_KIND.into(),
+            name: principal.into(),
+            namespace: NAMESPACE.into(),
+            external_id: markings::principal_profile_external_id(principal),
+            properties: HashMap::from([
+                (
+                    markings::PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY.into(),
+                    ceiling.into(),
+                ),
+                (
+                    markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                    "true".into(),
+                ),
+            ]),
+            created: 0,
+            updated: 0,
+        })
+        .unwrap();
+    let grant = crate::sekai::security::Grant {
+        id: format!("grant-{id}"),
+        object_id: id,
+        principal: "root".into(),
+        role: security::Role::Admin,
+        created: 0,
+        ..Default::default()
+    };
+    svc.db.runtime().create_grant(&grant).unwrap();
+    svc.security.add_grant(&grant);
+}
+
+/// ADR 0159: a document that binds media governs reading and removing it.
+async fn exercise_document_media(db: RuntimeDb) {
+    let svc = service_on(db);
+    // Both may read the attachment under the document's marking; only alice
+    // may read the document.
+    clear(&svc, "alice", "internal");
+    clear(&svc, "carol", "confidential");
+    let reference = completed(&svc, "doc-photo").await;
+    assert_eq!(read(&svc, &reference, "carol").await.unwrap(), FILE);
+
+    // Declared content must be the attachment's.
+    let mismatched = [
+        ContentReference {
+            digest: format!("sha256:{}", "0".repeat(64)),
+            ..media_content(&reference)
+        },
+        ContentReference {
+            byte_length: FILE.len() as u64 + 1,
+            ..media_content(&reference)
+        },
+        ContentReference {
+            media_type: "image/png".into(),
+            ..media_content(&reference)
+        },
+    ];
+    for content in mismatched {
+        let refused = admit_media(&svc, "doc:photo", content).await;
+        assert_eq!(code(refused), tonic::Code::InvalidArgument);
+    }
+    // Refusals bind nothing: the attachment still reads as before.
+    assert_eq!(read(&svc, &reference, "carol").await.unwrap(), FILE);
+
+    let admitted = admit_media(&svc, "doc:photo", media_content(&reference))
+        .await
+        .unwrap();
+    // Re-admission is idempotent; a second document cannot bind it again.
+    assert_eq!(
+        admit_media(&svc, "doc:photo", media_content(&reference))
+            .await
+            .unwrap(),
+        admitted
+    );
+    let second = admit_media(&svc, "doc:other", media_content(&reference)).await;
+    assert_eq!(code(second), tonic::Code::FailedPrecondition);
+
+    // Reading the bytes is reading the document: carol may read the
+    // attachment's namespace but not the document, and alice must present
+    // its purpose.
+    assert_eq!(
+        code(read(&svc, &reference, "carol").await),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        code(read_for_purpose(&svc, &reference, "carol").await),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        code(read(&svc, &reference, "alice").await),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        read_for_purpose(&svc, &reference, "alice").await.unwrap(),
+        FILE
+    );
+
+    // A rendition's bytes follow the parent.
+    let thumb = completed(&svc, "doc-thumb").await;
+    svc.attach_governed_document_rendition(with_named_principal(
+        AttachGovernedDocumentRenditionRequest {
+            rendition: Some(DocumentRenditionAttachment {
+                namespace: NAMESPACE.into(),
+                document_id: "doc:photo".into(),
+                rendition_id: "rend:thumb".into(),
+                class: "thumbnail".into(),
+                parent_content_digest: admitted.content_digest.clone(),
+                content_ref: Some(media_content(&thumb)),
+                extractor_id: "extractor:thumb".into(),
+                extractor_profile_digest: format!("sha256:{}", "e".repeat(64)),
+            }),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        code(read(&svc, &thumb, "carol").await),
+        tonic::Code::NotFound
+    );
+    assert_eq!(read_for_purpose(&svc, &thumb, "alice").await.unwrap(), FILE);
+
+    // Live or held, the bytes stay.
+    assert_eq!(
+        code(delete(&svc, &reference, "alice").await),
+        tonic::Code::FailedPrecondition
+    );
+    let hold = |hold_id: &str| HoldGovernedDocumentRequest {
+        namespace: NAMESPACE.into(),
+        document_id: "doc:photo".into(),
+        hold_id: hold_id.into(),
+        reason: "litigation".into(),
+    };
+    svc.hold_governed_document(with_named_principal(hold("hold-1"), "alice"))
+        .await
+        .unwrap();
+    assert_eq!(
+        code(delete(&svc, &thumb, "alice").await),
+        tonic::Code::FailedPrecondition
+    );
+    svc.release_governed_document_hold(with_named_principal(
+        ReleaseGovernedDocumentHoldRequest {
+            namespace: NAMESPACE.into(),
+            document_id: "doc:photo".into(),
+            hold_id: "hold-1".into(),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+
+    // Deleting the document hides the bytes through the attachment too, and
+    // makes them removable.
+    svc.delete_governed_document(with_named_principal(
+        DeleteGovernedDocumentRequest {
+            namespace: NAMESPACE.into(),
+            document_id: "doc:photo".into(),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    for bytes in [&reference, &thumb] {
+        assert_eq!(
+            code(read_for_purpose(&svc, bytes, "alice").await),
+            tonic::Code::NotFound
+        );
+        delete(&svc, bytes, "alice").await.unwrap();
+    }
+
+    // Expiry ends the read the same way.
+    let expiring = completed(&svc, "doc-expiring").await;
+    admit_media(&svc, "doc:expiring", media_content(&expiring))
+        .await
+        .unwrap();
+    svc.expire_governed_document(with_named_principal(
+        ExpireGovernedDocumentRequest {
+            namespace: NAMESPACE.into(),
+            document_id: "doc:expiring".into(),
+        },
+        "alice",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        code(read_for_purpose(&svc, &expiring, "alice").await),
+        tonic::Code::NotFound
+    );
+    delete(&svc, &expiring, "alice").await.unwrap();
+}
+
+#[tokio::test]
+async fn a_document_governs_the_media_it_binds() {
+    exercise_document_media(RuntimeDb::memory()).await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_a_document_governs_the_media_it_binds() {
+    on_postgres(exercise_document_media);
+}

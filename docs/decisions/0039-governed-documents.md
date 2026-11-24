@@ -113,3 +113,10 @@ Deterministic fixtures cover authorized admit, extraction, bounded retrieval,
 hold, expiry, deletion, idempotent replay, hidden-field denial, mismatched
 purpose, foreign ownership, unknown formats, unsupported revisions, and
 corrupt digests.
+
+## Amendment 2026-11-24: media-backed content
+
+[ADR 0159](0159-a-governed-document-may-hold-its-bytes-as-plane-media.md)
+adds a `media` content reference scheme. A document or rendition may bind a
+plane media attachment, and the document then governs reading and removing
+those bytes. `digest` references are unchanged and still store no bytes.

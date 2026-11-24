@@ -184,4 +184,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0156: Improvement reads execution telemetry from the plane](0156-improvement-reads-execution-telemetry-from-the-plane.md)
 - [ADR 0157: An agent turn records its transcript](0157-an-agent-turn-records-its-transcript.md)
 - [ADR 0158: Reported usage enters the tenant ledger](0158-reported-usage-enters-the-tenant-ledger.md)
+- [ADR 0159: A governed document may hold its bytes as plane media](0159-a-governed-document-may-hold-its-bytes-as-plane-media.md)
 <!-- adr-index:end -->
