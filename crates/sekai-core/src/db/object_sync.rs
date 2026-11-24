@@ -824,6 +824,14 @@ impl SekaiDb {
                     record_json TEXT NOT NULL,
                     PRIMARY KEY(namespace, subscription_id)
                 );
+                CREATE TABLE IF NOT EXISTS sekai_object_set_memberships (
+                    namespace TEXT NOT NULL,
+                    subscription_id TEXT NOT NULL,
+                    epoch TEXT NOT NULL,
+                    member_ids_json TEXT NOT NULL,
+                    pending_ids_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, subscription_id)
+                );
                 DELETE FROM sekai_event_stream_checkpoints
                 WHERE stream_id NOT IN (
                     SELECT DISTINCT stream_id FROM sekai_event_stream_admitted_events

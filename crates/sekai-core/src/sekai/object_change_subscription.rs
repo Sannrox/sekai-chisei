@@ -32,6 +32,10 @@ pub const OP_CREATE: &str = "create";
 pub const OP_UPDATE: &str = "update";
 pub const OP_DELETE: &str = "delete";
 pub const OP_INVALIDATE: &str = "invalidate";
+/// An object joined an ObjectSet subscription's membership (#3038).
+pub const OP_ENTER: &str = "enter";
+/// An object left it: deleted, changed out, or no longer visible.
+pub const OP_LEAVE: &str = "leave";
 pub const MAX_PROPERTY_FILTERS: usize = 4;
 pub const MAX_PAGE: u32 = 64;
 pub const MAX_BACKLOG: u32 = 256;
@@ -294,77 +298,15 @@ where
     ) -> Result<(Vec<Object>, Option<ReaderVisibility>), String>,
 {
     resolved_visible.clear();
-    required("actor", actor)?;
-    if now_ms < 0 {
-        return Err("read timestamp must be non-negative".into());
-    }
-    let scope = validate_scope(&request.scope)?;
-    required("subscription id", &request.subscription_id)?;
-    let retention_ms = normalize_retention(request.retention_ms)?;
-    let live_watermark = db.object_change_watermark(&scope.namespace)?;
-    let live_revision = snapshot_revision(&scope, live_watermark)?;
-
-    if request.revoke {
-        return revoke_page(db, actor, &scope, &request.subscription_id, now_ms);
-    }
-    if request.snapshot_revision.trim().is_empty() {
-        return Ok(resnapshot_page(
-            &request.subscription_id,
-            &stream_id(&scope.namespace, &request.subscription_id),
-            live_revision,
-        ));
-    }
-    let admitted_watermark = parse_snapshot_revision(&scope, &request.snapshot_revision)?;
-    let oldest = db.object_change_oldest_seq(&scope.namespace)?;
-    if admitted_watermark > 0 && oldest > 0 && admitted_watermark < oldest.saturating_sub(1) {
-        return Ok(resnapshot_page(
-            &request.subscription_id,
-            &stream_id(&scope.namespace, &request.subscription_id),
-            live_revision,
-        ));
-    }
-
-    let stream = ensure_object_change_stream(
-        db,
-        actor,
-        &scope,
-        &request.subscription_id,
-        authorization_pin,
-        now_ms,
-    )?;
-    ensure_object_change_checkpoint(
-        db,
-        &stream,
-        &request.snapshot_revision,
-        live_watermark.max(admitted_watermark),
-    )?;
-    if let Ok(existing) = event_subscription::inspect_event_subscription(
-        db,
-        actor,
-        &scope.namespace,
-        &request.subscription_id,
-    ) && existing.status == STATUS_ACTIVE
-        && idle_past_retention(&existing, now_ms)
-    {
-        return restart_for_resnapshot(db, &existing, now_ms, live_revision);
-    }
-    let subscription = ensure_subscription(db, actor, request, &stream, retention_ms, now_ms)?;
-    if subscription.status != STATUS_ACTIVE {
-        return Ok(revoked_page(&subscription, &request.snapshot_revision));
-    }
-    if idle_past_retention(&subscription, now_ms) {
-        return restart_for_resnapshot(db, &subscription, now_ms, live_revision);
-    }
-    let state = parse_stream_state(&stream)?;
-    if !stream_state_matches(&state, &scope, authorization_pin) {
-        bind_object_change_stream_state(db, &stream, &scope, authorization_pin)?;
-        return restart_for_resnapshot(db, &subscription, now_ms, live_revision);
-    }
-    if !request.last_page_digest.is_empty()
-        && request.last_page_digest == subscription.cursor.last_page_digest
-    {
-        return Ok(replayed_page(&subscription, &request.snapshot_revision));
-    }
+    let Admitted {
+        scope,
+        subscription,
+        admitted_watermark,
+        live_revision,
+    } = match admit(db, actor, request, now_ms, authorization_pin)? {
+        Admission::Page(page) => return Ok(page),
+        Admission::Ready(admitted) => admitted,
+    };
 
     let after_seq = if subscription.cursor.committed_offset > 0 {
         subscription.cursor.committed_offset
@@ -463,6 +405,121 @@ where
         authority: false,
         disconnect_reason: String::new(),
     })
+}
+
+/// A read admitted past revoke, resnapshot, retention, pin, and replay
+/// checks: what the page itself is computed from.
+pub(super) struct Admitted {
+    pub(super) scope: ObjectChangeScope,
+    pub(super) subscription: EventSubscription,
+    pub(super) admitted_watermark: u64,
+    pub(super) live_revision: String,
+}
+
+// Built once per read and matched at once; boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum Admission {
+    /// The read ends here with this page.
+    Page(ObjectChangePage),
+    Ready(Admitted),
+}
+
+/// The checks every subscription read runs before scanning history, shared
+/// by object-change scopes and ObjectSet membership (#3038).
+pub(super) fn admit(
+    db: &RuntimeDb,
+    actor: &str,
+    request: &ObjectChangeReadRequest,
+    now_ms: i64,
+    authorization_pin: &str,
+) -> Result<Admission, String> {
+    required("actor", actor)?;
+    if now_ms < 0 {
+        return Err("read timestamp must be non-negative".into());
+    }
+    let scope = validate_scope(&request.scope)?;
+    required("subscription id", &request.subscription_id)?;
+    let retention_ms = normalize_retention(request.retention_ms)?;
+    let live_watermark = db.object_change_watermark(&scope.namespace)?;
+    let live_revision = snapshot_revision(&scope, live_watermark)?;
+
+    if request.revoke {
+        return revoke_page(db, actor, &scope, &request.subscription_id, now_ms)
+            .map(Admission::Page);
+    }
+    if request.snapshot_revision.trim().is_empty() {
+        return Ok(Admission::Page(resnapshot_page(
+            &request.subscription_id,
+            &stream_id(&scope.namespace, &request.subscription_id),
+            live_revision,
+        )));
+    }
+    let admitted_watermark = parse_snapshot_revision(&scope, &request.snapshot_revision)?;
+    let oldest = db.object_change_oldest_seq(&scope.namespace)?;
+    if admitted_watermark > 0 && oldest > 0 && admitted_watermark < oldest.saturating_sub(1) {
+        return Ok(Admission::Page(resnapshot_page(
+            &request.subscription_id,
+            &stream_id(&scope.namespace, &request.subscription_id),
+            live_revision,
+        )));
+    }
+
+    let stream = ensure_object_change_stream(
+        db,
+        actor,
+        &scope,
+        &request.subscription_id,
+        authorization_pin,
+        now_ms,
+    )?;
+    ensure_object_change_checkpoint(
+        db,
+        &stream,
+        &request.snapshot_revision,
+        live_watermark.max(admitted_watermark),
+    )?;
+    if let Ok(existing) = event_subscription::inspect_event_subscription(
+        db,
+        actor,
+        &scope.namespace,
+        &request.subscription_id,
+    ) && existing.status == STATUS_ACTIVE
+        && idle_past_retention(&existing, now_ms)
+    {
+        return restart_for_resnapshot(db, &existing, now_ms, live_revision).map(Admission::Page);
+    }
+    let subscription = ensure_subscription(db, actor, request, &stream, retention_ms, now_ms)?;
+    if subscription.status != STATUS_ACTIVE {
+        return Ok(Admission::Page(revoked_page(
+            &subscription,
+            &request.snapshot_revision,
+        )));
+    }
+    if idle_past_retention(&subscription, now_ms) {
+        return restart_for_resnapshot(db, &subscription, now_ms, live_revision)
+            .map(Admission::Page);
+    }
+    let state = parse_stream_state(&stream)?;
+    if !stream_state_matches(&state, &scope, authorization_pin) {
+        bind_object_change_stream_state(db, &stream, &scope, authorization_pin)?;
+        return restart_for_resnapshot(db, &subscription, now_ms, live_revision)
+            .map(Admission::Page);
+    }
+    if !request.last_page_digest.is_empty()
+        && request.last_page_digest == subscription.cursor.last_page_digest
+    {
+        return Ok(Admission::Page(replayed_page(
+            &subscription,
+            &request.snapshot_revision,
+        )));
+    }
+
+    Ok(Admission::Ready(Admitted {
+        scope,
+        subscription,
+        admitted_watermark,
+        live_revision,
+    }))
 }
 
 fn validate_scope(scope: &ObjectChangeScope) -> Result<ObjectChangeScope, String> {
@@ -886,7 +943,7 @@ fn deleted_ids_for_projection(
 
 /// Clears the subscription's revision and cursor so the next read pins the
 /// revision the client resnapshots at; a retry of this read restarts again.
-fn restart_for_resnapshot(
+pub(super) fn restart_for_resnapshot(
     db: &RuntimeDb,
     subscription: &EventSubscription,
     now_ms: i64,
@@ -941,7 +998,7 @@ fn bind_object_change_stream_state(
     db.put_event_stream_binding(&binding)
 }
 
-fn mutation_kind(mutation: &CommittedObjectMutation) -> String {
+pub(super) fn mutation_kind(mutation: &CommittedObjectMutation) -> String {
     if !mutation.object_kind.is_empty() {
         return mutation.object_kind.clone();
     }
@@ -1013,7 +1070,7 @@ fn object_change_columns() -> Vec<EventStreamColumn> {
     .collect()
 }
 
-fn stream_id(namespace: &str, subscription_id: &str) -> String {
+pub(super) fn stream_id(namespace: &str, subscription_id: &str) -> String {
     format!("object-change:{namespace}/{subscription_id}")
 }
 
@@ -1058,7 +1115,7 @@ pub fn page_limit(limit: i32) -> usize {
     requested.clamp(1, MAX_PAGE as i32) as usize
 }
 
-fn page_digest(
+pub(super) fn page_digest(
     subscription_id: &str,
     stream_id: &str,
     generation: u64,
@@ -1081,7 +1138,7 @@ fn page_digest(
     ))
 }
 
-fn resnapshot_page(
+pub(super) fn resnapshot_page(
     subscription_id: &str,
     stream_id: &str,
     snapshot_revision: String,
@@ -1136,7 +1193,10 @@ fn replayed_page(subscription: &EventSubscription, snapshot_revision: &str) -> O
     }
 }
 
-fn empty_page(subscription: &EventSubscription, snapshot_revision: &str) -> ObjectChangePage {
+pub(super) fn empty_page(
+    subscription: &EventSubscription,
+    snapshot_revision: &str,
+) -> ObjectChangePage {
     ObjectChangePage {
         contract_version: EVENT_SUBSCRIPTION_CONTRACT.into(),
         subscription_id: subscription.subscription_id.clone(),

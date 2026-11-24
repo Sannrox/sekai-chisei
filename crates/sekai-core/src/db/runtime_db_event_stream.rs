@@ -137,4 +137,49 @@ impl RuntimeDb {
             }),
         }
     }
+
+    pub fn advance_event_subscription_cursor_with_membership(
+        &self,
+        next: &crate::sekai::event_subscription::EventSubscription,
+        expected: &crate::sekai::event_subscription::EventSubscription,
+        membership: &crate::sekai::object_set_membership::ObjectSetMembership,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.advance_event_subscription_cursor_with_membership(next, expected, membership)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.advance_event_subscription_cursor_with_membership(next, expected, membership)
+            }),
+        }
+    }
+
+    pub fn put_object_set_membership(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+        membership: &crate::sekai::object_set_membership::ObjectSetMembership,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.put_object_set_membership(namespace, subscription_id, membership)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_object_set_membership(namespace, subscription_id, membership)
+            }),
+        }
+    }
+
+    pub fn get_object_set_membership(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+    ) -> Result<Option<crate::sekai::object_set_membership::ObjectSetMembership>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_object_set_membership(namespace, subscription_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_object_set_membership(namespace, subscription_id)
+            }),
+        }
+    }
 }

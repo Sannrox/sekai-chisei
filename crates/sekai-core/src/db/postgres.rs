@@ -252,6 +252,8 @@ const AGENT_TURN_TRANSCRIPTS_SCHEMA: &str =
 const SOURCE_DISCOVERIES_SCHEMA: &str = include_str!("postgres/0175_source_discoveries.sql");
 const DATASET_SOURCE_KEY_INDEX_SCHEMA: &str =
     include_str!("postgres/0176_dataset_source_key_index.sql");
+const OBJECT_SET_MEMBERSHIPS_SCHEMA: &str =
+    include_str!("postgres/0178_object_set_memberships.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1281,6 +1283,12 @@ const MIGRATIONS: &[Migration] = &[
         MigrationOwner::Sekai,
     ),
     mig(177, "chisei_usage_attribution", "", MigrationOwner::Chisei),
+    mig(
+        178,
+        "object_set_memberships",
+        OBJECT_SET_MEMBERSHIPS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

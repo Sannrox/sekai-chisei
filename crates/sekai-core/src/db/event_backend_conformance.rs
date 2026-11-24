@@ -24,6 +24,7 @@ use crate::sekai::markings::{
     PRINCIPAL_CLASSIFICATION_CEILING_PROPERTY, PRINCIPAL_PROFILE_KIND,
     PRINCIPAL_PROFILE_SEALED_PROPERTY, principal_profile_external_id,
 };
+use crate::sekai::object_set_membership::ObjectSetMembership;
 use crate::sekai::security::{Grant, Role};
 
 struct Case {
@@ -348,6 +349,65 @@ fn assert_subscription_matrix(runtime: &RuntimeDb, case: &Case) {
     );
 }
 
+/// ObjectSet membership (#3038) commits with the cursor or not at all, and a
+/// revoke drops it.
+fn assert_membership_matrix(runtime: &RuntimeDb, case: &Case) {
+    setup_subscription(runtime, case);
+    deliver_subscription_page(runtime, &case.principal, &page(case, 1, 1), 4_000).unwrap();
+    let membership = |members: &[&str]| ObjectSetMembership {
+        epoch: "v1:0:sha256:set".into(),
+        member_ids: members.iter().map(|id| (*id).to_string()).collect(),
+        pending_ids: vec!["later".to_string()],
+    };
+    let stored = || {
+        runtime
+            .get_object_set_membership(&case.namespace, &case.subscription_id)
+            .unwrap()
+    };
+    assert_eq!(stored(), None);
+    runtime
+        .put_object_set_membership(&case.namespace, &case.subscription_id, &membership(&["a"]))
+        .unwrap();
+    assert_eq!(stored(), Some(membership(&["a"])));
+
+    let current = inspect_event_subscription(
+        runtime,
+        &case.principal,
+        &case.namespace,
+        &case.subscription_id,
+    )
+    .unwrap();
+    let mut next = current.clone();
+    next.cursor.last_page_digest = "sha256:members".into();
+    let mut stale = current.clone();
+    stale.cursor.last_page_digest = "sha256:stale".into();
+    assert_eq!(
+        runtime
+            .advance_event_subscription_cursor_with_membership(&next, &stale, &membership(&["b"]))
+            .unwrap_err(),
+        CURSOR_CONFLICT
+    );
+    assert_eq!(stored(), Some(membership(&["a"])));
+    runtime
+        .advance_event_subscription_cursor_with_membership(
+            &next,
+            &current,
+            &membership(&["a", "b"]),
+        )
+        .unwrap();
+    assert_eq!(stored(), Some(membership(&["a", "b"])));
+
+    revoke_event_subscription(
+        runtime,
+        &case.principal,
+        &case.namespace,
+        &case.subscription_id,
+        5_000,
+    )
+    .unwrap();
+    assert_eq!(stored(), None);
+}
+
 fn postgres_runtime() -> RuntimeDb {
     let database_url = std::env::var("SEKAI_TEST_POSTGRES_URL").unwrap_or_else(|_| {
         panic!("SEKAI_TEST_POSTGRES_URL must point to an isolated PostgreSQL test database")
@@ -369,6 +429,8 @@ fn sqlite_event_projection_and_subscription_matrix() {
     assert_projection_matrix(&projection, &Case::new("sqlite-proj"));
     let subscription = RuntimeDb::memory();
     assert_subscription_matrix(&subscription, &Case::new("sqlite-sub"));
+    let membership = RuntimeDb::memory();
+    assert_membership_matrix(&membership, &Case::new("sqlite-members"));
 }
 
 #[test]
@@ -383,6 +445,7 @@ fn postgres_event_projection_and_subscription_matrix() {
 fn postgres_event_subscription_matrix() {
     let runtime = postgres_runtime();
     assert_subscription_matrix(&runtime, &Case::new("pg-sub"));
+    assert_membership_matrix(&runtime, &Case::new("pg-members"));
 }
 
 #[test]

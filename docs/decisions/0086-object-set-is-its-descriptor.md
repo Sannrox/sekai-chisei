@@ -80,3 +80,12 @@ storage, or in the RPC maturity ledger.
 Documentation-only decision. The existing `EvaluateObjectSet` fixtures
 already prove the stale-pin, hidden-member, and continuation fences that
 make re-evaluation from a stored descriptor safe.
+
+## Addendum: subscription delivery state (#3038)
+
+An ObjectSet membership subscription stores the member ids one reader last
+received, keyed by subscription and pinned to its snapshot revision. That
+list is delivery state for one cursor, not a stored set: it is never read as
+membership or authority, every page re-evaluates the touched objects as the
+reader, and a revoke deletes it. The descriptor stays the only saved form of
+a set.

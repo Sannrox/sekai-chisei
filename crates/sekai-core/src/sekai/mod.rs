@@ -123,6 +123,7 @@ pub mod object_log_host;
 pub mod object_log_ingest;
 pub mod object_mutation;
 pub mod object_schema;
+pub mod object_set_membership;
 pub mod offline_action;
 pub mod ontology_health;
 pub mod ontology_health_schedule;

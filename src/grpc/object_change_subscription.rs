@@ -6,6 +6,9 @@ use crate::sekai::object_change_subscription::{
     ObjectChangeReadRequest, ObjectChangeScope, ReaderVisibility, authorization_pin,
     object_matches_filters, read_object_change_subscription_for_reader,
 };
+use crate::sekai::object_set_membership::{
+    MAX_MEMBERS, MEMBERSHIP_TOO_LARGE, read_object_set_membership,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl SekaiServiceImpl {
@@ -22,6 +25,32 @@ impl SekaiServiceImpl {
         &self,
         req: Request<ReadObjectChangeSubscriptionRequest>,
     ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
+        self.read_gated_object_change_subscription(
+            req,
+            crate::rpc_maturity::experimental_rpcs_enabled(),
+        )
+    }
+
+    /// The read, with the experimental `object_set` field (#3038) admitted
+    /// only when `experimental` is set.
+    pub(super) fn read_gated_object_change_subscription(
+        &self,
+        req: Request<ReadObjectChangeSubscriptionRequest>,
+        experimental: bool,
+    ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
+        if req.get_ref().object_set.is_some() {
+            if !experimental {
+                return Err(Status::unimplemented(
+                    "object-set subscriptions are experimental and disabled",
+                ));
+            }
+            if req.get_ref().scope.is_some() {
+                return Err(Status::invalid_argument(
+                    "set either an object-change scope or an object set, not both",
+                ));
+            }
+            return self.read_object_set_subscription(req);
+        }
         let principals = caller_principals(&req);
         require_authenticated(&principals)?;
         let policy_context = principal_policy_context(&req);
@@ -206,7 +235,180 @@ impl SekaiServiceImpl {
             return Err(status);
         }
         let page = page.map_err(map_object_change_error)?;
-        Ok(Response::new(ReadObjectChangeSubscriptionResponse {
+        Ok(Response::new(change_page_response(page)))
+    }
+
+    /// An ObjectSet membership subscription (#3038): `enter` and `leave` per
+    /// object, the set evaluated as the reader on every page. Property-filter
+    /// and spatial descriptors only; the rest are refused.
+    fn read_object_set_subscription(
+        &self,
+        req: Request<ReadObjectChangeSubscriptionRequest>,
+    ) -> Result<Response<ReadObjectChangeSubscriptionResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let policy_context = principal_policy_context(&req);
+        let purpose = request_purpose_presentation(&req, &principals);
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let actor = principals
+            .first()
+            .cloned()
+            .ok_or_else(|| Status::unauthenticated("authentication required"))?;
+        let input = req.into_inner();
+        let bound =
+            self.authorize_object_set_read(&principals, tenant_context.as_ref(), input.object_set)?;
+        let descriptor = &bound.descriptor;
+        if descriptor.traversal.is_some()
+            || !descriptor.hops.is_empty()
+            || descriptor.aggregation.is_some()
+        {
+            return Err(Status::failed_precondition(
+                "object-set subscriptions support property-filter and spatial descriptors only",
+            ));
+        }
+        let runtime = self.db.runtime();
+        if runtime
+            .get_object_type_datasource(&descriptor.namespace, &descriptor.kind)
+            .map_err(Status::internal)?
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "object-set subscriptions do not support dataset-indexed kinds",
+            ));
+        }
+        if super::object_set_query::object_set_type_denied(
+            runtime,
+            &descriptor.namespace,
+            &descriptor.kind,
+        )? {
+            return Err(Status::not_found("object change subscription unavailable"));
+        }
+        let activation_id = runtime
+            .get_object_security_activation(&descriptor.namespace)
+            .map_err(|_| Status::unavailable("object authorization unavailable"))?
+            .map(|activation| activation.activation_id)
+            .unwrap_or_else(|| "legacy".into());
+        // The bound query rides in the pin, so a changed descriptor or
+        // definition restarts the subscription as a changed reader does.
+        let mut pinned = principals.clone();
+        pinned.push(format!("object-set:{}", bound.query_digest));
+        let pin = authorization_pin(&activation_id, &pinned)
+            .map_err(|_| Status::internal("object-change authorization pin unavailable"))?;
+        let mut evaluate_error = None;
+        let page = read_object_set_membership(
+            runtime,
+            &actor,
+            &ObjectChangeReadRequest {
+                subscription_id: input.subscription_id,
+                scope: ObjectChangeScope {
+                    namespace: descriptor.namespace.clone(),
+                    kind: bound.member_kind.clone(),
+                    object_ids: Vec::new(),
+                    property_filters: Vec::new(),
+                },
+                snapshot_revision: input.snapshot_revision,
+                limit: input.limit,
+                retention_ms: input.retention_ms,
+                last_page_digest: input.last_page_digest,
+                revoke: input.revoke,
+            },
+            now_millis(),
+            &pin,
+            |candidates| {
+                visible_set_members(
+                    runtime,
+                    &bound,
+                    candidates,
+                    &principals,
+                    &policy_context,
+                    purpose.as_ref(),
+                    tenant_context.as_ref(),
+                )
+                .map_err(|status| {
+                    evaluate_error = Some(status);
+                    "object set members unavailable".to_string()
+                })
+            },
+        );
+        if let Some(status) = evaluate_error {
+            return Err(status);
+        }
+        let page = page.map_err(map_object_change_error)?;
+        Ok(Response::new(change_page_response(page)))
+    }
+}
+
+/// The ids of `bound`'s members the reader may read: all of them, or only
+/// those among `candidates`. More than [`MAX_MEMBERS`] is refused.
+fn visible_set_members(
+    db: &RuntimeDb,
+    bound: &crate::sekai::object_set::BoundObjectSet,
+    candidates: Option<&[String]>,
+    principals: &[String],
+    policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
+    purpose: Option<&crate::sekai::purpose_authorization::PurposePresentation>,
+    tenant_context: Option<&RequestEnterpriseContext>,
+) -> Result<Vec<String>, Status> {
+    let mut filter = bound.filter.clone();
+    filter.offset = 0;
+    filter.order_by = String::new();
+    if let Some(candidates) = candidates {
+        // Intersect with an id filter the descriptor already carries.
+        let mut ids = candidates.to_vec();
+        if let Some(index) = filter
+            .property_filters
+            .iter()
+            .position(|filter| filter.key == domain::OBJECT_ID_FILTER_KEY)
+        {
+            let existing = filter.property_filters.remove(index);
+            let allowed =
+                domain::object_id_filter_ids(&existing.key, &existing.op, &existing.value)
+                    .unwrap_or_else(|| Ok(Vec::new()))
+                    .map_err(Status::internal)?;
+            ids.retain(|id| allowed.contains(id));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        filter.property_filters.push(domain::PropertyFilter {
+            key: domain::OBJECT_ID_FILTER_KEY.into(),
+            op: "in".into(),
+            value: serde_json::to_string(&ids)
+                .map_err(|error| Status::internal(error.to_string()))?,
+        });
+    }
+    let mut members = Vec::new();
+    let mut too_large = false;
+    for_each_visible_object(
+        db,
+        &filter,
+        principals,
+        policy_context,
+        purpose,
+        tenant_context,
+        &mut |object| {
+            if bound.spatial_matches(&object) {
+                if members.len() == MAX_MEMBERS {
+                    too_large = true;
+                    return Ok(false);
+                }
+                members.push(object.id);
+            }
+            Ok(true)
+        },
+        &mut || true,
+    )?;
+    if too_large {
+        return Err(Status::failed_precondition(MEMBERSHIP_TOO_LARGE));
+    }
+    Ok(members)
+}
+
+fn change_page_response(
+    page: crate::sekai::object_change_subscription::ObjectChangePage,
+) -> ReadObjectChangeSubscriptionResponse {
+    {
+        ReadObjectChangeSubscriptionResponse {
             contract_version: page.contract_version,
             subscription_id: page.subscription_id,
             stream_id: page.stream_id,
@@ -235,7 +437,7 @@ impl SekaiServiceImpl {
                 .collect(),
             authority: false,
             disconnect_reason: page.disconnect_reason,
-        }))
+        }
     }
 }
 
@@ -384,6 +586,7 @@ mod tests {
                 retention_ms: 0,
                 last_page_digest: last_digest.into(),
                 revoke,
+                object_set: None,
             },
             "alice",
         ))
@@ -643,6 +846,7 @@ mod tests {
                 retention_ms: 0,
                 last_page_digest: last_digest.into(),
                 revoke: false,
+                object_set: None,
             },
             principal,
         ))

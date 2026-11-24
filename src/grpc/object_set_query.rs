@@ -423,7 +423,11 @@ impl SekaiServiceImpl {
     }
 }
 
-fn object_set_type_denied(db: &RuntimeDb, namespace: &str, kind: &str) -> Result<bool, Status> {
+pub(super) fn object_set_type_denied(
+    db: &RuntimeDb,
+    namespace: &str,
+    kind: &str,
+) -> Result<bool, Status> {
     match db.active_object_policy(namespace, kind) {
         Ok(_) => Ok(false),
         Err(error) if error.starts_with("object_security_denied") => Ok(true),
@@ -6120,5 +6124,176 @@ mod tests {
                 tonic::Code::InvalidArgument
             );
         }
+    }
+
+    fn set_read(
+        svc: &SekaiServiceImpl,
+        object_set: ObjectSetDescriptor,
+        snapshot: &str,
+        last_digest: &str,
+        experimental: bool,
+    ) -> Result<ReadObjectChangeSubscriptionResponse, Status> {
+        svc.read_gated_object_change_subscription(
+            with_named_principal(
+                ReadObjectChangeSubscriptionRequest {
+                    subscription_id: "eu-customers".into(),
+                    scope: None,
+                    snapshot_revision: snapshot.into(),
+                    limit: 32,
+                    retention_ms: 0,
+                    last_page_digest: last_digest.into(),
+                    revoke: false,
+                    object_set: Some(object_set),
+                },
+                "alice",
+            ),
+            experimental,
+        )
+        .map(Response::into_inner)
+    }
+
+    fn set_ops(page: &ReadObjectChangeSubscriptionResponse) -> Vec<(&str, &str)> {
+        page.events
+            .iter()
+            .map(|event| (event.object_id.as_str(), event.op.as_str()))
+            .collect()
+    }
+
+    fn retier(svc: &SekaiServiceImpl, id: &str, key: &str, value: &str, actor: &str) {
+        let mut object = svc.db.runtime().get_object(id).unwrap().unwrap();
+        object.properties.insert(key.into(), value.into());
+        svc.db
+            .runtime()
+            .update_object_with_audit(&object, actor)
+            .unwrap();
+    }
+
+    /// #3038: a membership subscription delivers its snapshot as enters,
+    /// then reports each enter and leave once; a replica continues from the
+    /// stored cursor, and a member the reader can no longer see leaves with
+    /// nothing but its id.
+    #[tokio::test]
+    async fn object_set_subscription_reports_enter_and_leave_as_the_reader() {
+        use crate::sekai::object_change_subscription::{
+            OP_ENTER, OP_LEAVE, OUTCOME_PAGE, OUTCOME_REPLAYED, OUTCOME_RESNAPSHOT,
+        };
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new(":memory:").unwrap(),
+        )));
+        let svc = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(
+            db.clone(),
+        ));
+        grant_namespace(&svc, "sales", "alice");
+        let digest = seed_sales_definition(&svc);
+        seed_customers_and_orders(&svc);
+        let set = ObjectSetDescriptor {
+            traversal: None,
+            order_by: String::new(),
+            ..descriptor(&digest, 0)
+        };
+
+        let first = set_read(&svc, set.clone(), "", "", true).unwrap();
+        assert_eq!(first.outcome, OUTCOME_RESNAPSHOT);
+        let revision = first.snapshot_revision;
+        // A write between the resnapshot and the first page: the snapshot is
+        // delivered as enters, and the history scan after it reconciles the
+        // write, so the client never holds a set the subscription missed.
+        retier(&svc, "c-eu-1", "tier", "2", "alice");
+        let snapshot = set_read(&svc, set.clone(), &revision, "", true).unwrap();
+        assert_eq!(snapshot.outcome, OUTCOME_PAGE);
+        assert_eq!(
+            set_ops(&snapshot),
+            [("c-eu-2", OP_ENTER), ("c-eu-3", OP_ENTER)]
+        );
+        let reconciled = set_read(&svc, set.clone(), &revision, "", true).unwrap();
+        assert_eq!(set_ops(&reconciled), [("c-eu-1", OP_ENTER)]);
+        let settled = set_read(&svc, set.clone(), &revision, "", true).unwrap();
+        assert!(settled.events.is_empty());
+
+        retier(&svc, "c-us-2", "region", "eu", "alice");
+        retier(&svc, "c-eu-3", "tier", "1", "alice");
+        retier(&svc, "c-eu-1", "region", "us", "alice");
+        let page = set_read(&svc, set.clone(), &revision, "", true).unwrap();
+        assert_eq!(page.outcome, OUTCOME_PAGE);
+        assert_eq!(
+            set_ops(&page),
+            [
+                ("c-us-2", OP_ENTER),
+                ("c-eu-3", OP_LEAVE),
+                ("c-eu-1", OP_LEAVE)
+            ]
+        );
+        let replay = set_read(&svc, set.clone(), &revision, &page.page_digest, true).unwrap();
+        assert_eq!(replay.outcome, OUTCOME_REPLAYED);
+
+        // A replica on the same store continues from the committed cursor.
+        let replica = SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(db));
+        grant_namespace(&replica, "sales", "alice");
+        assert!(
+            set_read(&replica, set.clone(), &revision, "", true)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        svc.db
+            .runtime()
+            .delete_object_with_audit("c-us-2", "alice")
+            .unwrap();
+        let deleted = set_read(&replica, set.clone(), &revision, "", true).unwrap();
+        assert_eq!(set_ops(&deleted), [("c-us-2", OP_LEAVE)]);
+
+        // Another principal's grant hides the member from alice; its next
+        // change makes it leave, naming no field or operation.
+        let grant = security::Grant {
+            id: "c-eu-2-bob".into(),
+            object_id: "c-eu-2".into(),
+            principal: "bob".into(),
+            role: security::Role::Admin,
+            created: 0,
+            ..Default::default()
+        };
+        svc.db.runtime().create_grant(&grant).unwrap();
+        svc.security.add_grant(&grant);
+        retier(&svc, "c-eu-2", "tier", "3", "bob");
+        let hidden = set_read(&svc, set, &revision, "", true).unwrap();
+        assert_eq!(set_ops(&hidden), [("c-eu-2", OP_LEAVE)]);
+        assert!(hidden.events[0].field.is_empty());
+        assert!(hidden.events[0].operation_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_set_subscription_refuses_unsupported_descriptors() {
+        let svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        let digest = seed_sales_definition(&svc);
+        let filtered = ObjectSetDescriptor {
+            traversal: None,
+            ..descriptor(&digest, 0)
+        };
+        let disabled = set_read(&svc, filtered.clone(), "", "", false).unwrap_err();
+        assert_eq!(disabled.code(), tonic::Code::Unimplemented);
+        let traversal = set_read(&svc, descriptor(&digest, 0), "", "", true).unwrap_err();
+        assert_eq!(traversal.code(), tonic::Code::FailedPrecondition);
+
+        // Another principal reusing alice's subscription id writes no baseline.
+        let revision = set_read(&svc, filtered.clone(), "", "", true)
+            .unwrap()
+            .snapshot_revision;
+        set_read(&svc, filtered.clone(), &revision, "", true).unwrap();
+        grant_namespace(&svc, "sales", "mallory");
+        let intruder = svc
+            .read_gated_object_change_subscription(
+                with_named_principal(
+                    ReadObjectChangeSubscriptionRequest {
+                        subscription_id: "eu-customers".into(),
+                        object_set: Some(filtered),
+                        ..Default::default()
+                    },
+                    "mallory",
+                ),
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(intruder.code(), tonic::Code::NotFound);
     }
 }
