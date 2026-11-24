@@ -297,7 +297,11 @@ See [policy-dry-run.md](policy-dry-run.md#live-shadow).
 under contract `chisei.model-review/v1`. The empty namespace is the instance
 default; a named namespace overrides it. Identity is provider, canonical model,
 and optional artifact digest. Family enablement is per namespace and
-`ResidencyPolicy` region label; a per-model row overrides the family. Named
+`ResidencyPolicy` region label; a per-model row overrides the family, but an
+`enabled` model row never widens residency: once the family has a
+region-scoped row, the model is admitted only where the family is enabled,
+and a route the family enables elsewhere is refused with
+`model_review.residency_mismatch` (#2469). Named
 namespaces require namespace administration; the empty namespace requires
 credential admin (`root` / `local`). Route admission (#1494) default-denies
 any model that is not `enabled` for the namespace, identity, and residency
