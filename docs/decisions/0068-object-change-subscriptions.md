@@ -68,3 +68,25 @@ collaboration ceiling, fail closed with every update withheld. The page digest
 covers values and flag. The lenient projection used by Action bindings and
 agent wakes carries no values, so no durable binding state copies property
 data.
+
+## Addendum: ObjectSet membership (#3038)
+
+`ReadObjectChangeSubscriptionRequest.object_set` (experimental, behind the
+experimental RPC gate) subscribes to an ObjectSet descriptor instead of a
+scope. Each page re-evaluates, as the reader, the objects the scanned history
+touched and reports `enter` when one joins the set and `leave` when one
+drops out: changed out, deleted, or no longer visible. A `leave` names only
+the object id, with no field, value, or operation. The member ids the reader
+last received are stored per subscription and committed in the cursor's
+transaction, so a crash or another replica replays or continues the same
+page; a revoke drops them. A resnapshot evaluates the whole set as the
+reader and the following pages deliver it as `enter` events to a client that
+starts empty, so the client's set and the stored ids never diverge through a
+separately taken snapshot. The stored ids are bound to the revision and the
+reader's authorization pin; a read with no matching ids restarts. The bound query digest is part of the authorization pin,
+so a changed descriptor or definition restarts the subscription.
+
+This slice covers property-filter and spatial descriptors. Traversal (one
+hop or more), aggregation, and dataset-indexed kinds are refused with
+`FAILED_PRECONDITION`, as is a set larger than 1,000 members. Join-property
+hops follow once relation and join writes are re-evaluated on both ends.

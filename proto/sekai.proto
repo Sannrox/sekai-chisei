@@ -2351,6 +2351,13 @@ message ReadObjectChangeSubscriptionRequest {
   int64 retention_ms = 5;
   string last_page_digest = 6;
   bool revoke = 7;
+  // Experimental (#3038, ADR 0068 and ADR 0086 addenda). Set instead of
+  // `scope` to subscribe to an ObjectSet's membership: each page carries
+  // `enter` and `leave` events per object, evaluated as the reader. A leave
+  // names only the object id. Property-filter and spatial descriptors only;
+  // traversal, aggregation and dataset-indexed kinds are refused, as is a
+  // set larger than 1,000 members at snapshot.
+  ObjectSetDescriptor object_set = 8;
 }
 message ReadObjectChangeSubscriptionResponse {
   string contract_version = 1;

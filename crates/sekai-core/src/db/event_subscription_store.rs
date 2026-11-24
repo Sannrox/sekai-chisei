@@ -7,6 +7,7 @@ use crate::sekai::event_stream::{EventStreamBinding, EventStreamCheckpoint};
 use crate::sekai::event_subscription::{
     CURSOR_CONFLICT, EventSubscription, STATUS_REVOKED, SUBSCRIBE_UNAVAILABLE,
 };
+use crate::sekai::object_set_membership::ObjectSetMembership;
 
 impl SekaiDb {
     pub fn put_event_subscription(&self, subscription: &EventSubscription) -> Result<(), String> {
@@ -71,6 +72,12 @@ impl SekaiDb {
             )
             .map_err(|error| error.to_string())?;
         }
+        tx.execute(
+            "DELETE FROM sekai_object_set_memberships
+             WHERE namespace = ?1 AND subscription_id = ?2",
+            params![namespace, subscription_id],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
     }
@@ -80,58 +87,154 @@ impl SekaiDb {
         next: &EventSubscription,
         expected: &EventSubscription,
     ) -> Result<(), String> {
-        let json = serde_json::to_string(next)
-            .map_err(|error| format!("encode event subscription: {error}"))?;
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let current = load_subscription(&tx, &next.namespace, &next.subscription_id)?
-            .ok_or(CURSOR_CONFLICT)?;
-        if current != *expected {
-            return Err(CURSOR_CONFLICT.into());
-        }
-        let binding = load_stream_binding(&tx, &next.stream_id)?;
-        if binding.is_none_or(|stream| stream.definition_digest != next.definition_digest) {
-            return Err(CURSOR_CONFLICT.into());
-        }
-        let checkpoint = load_stream_checkpoint(&tx, &next.stream_id)?;
-        if checkpoint.is_none_or(|current| {
-            current.generation != next.cursor.generation
-                || current.feed_epoch != next.cursor.feed_epoch
-                || current.committed_offset < next.cursor.committed_offset
-        }) {
-            return Err(CURSOR_CONFLICT.into());
-        }
-        let changed = tx
-            .execute(
-                "UPDATE sekai_event_subscriptions
-                 SET record_json = ?1
-                 WHERE namespace = ?2
-                   AND subscription_id = ?3
-                   AND owner = ?4
-                   AND ifnull(json_extract(record_json, '$.status'), '') = ?5
-                   AND json_extract(record_json, '$.cursor.committed_offset') = ?6
-                   AND ifnull(json_extract(record_json, '$.cursor.last_page_digest'), '') = ?7
-                   AND json_extract(record_json, '$.cursor.generation') = ?8
-                   AND ifnull(json_extract(record_json, '$.cursor.feed_epoch'), '') = ?9",
-                params![
-                    json,
-                    next.namespace,
-                    next.subscription_id,
-                    next.owner,
-                    expected.status,
-                    expected.cursor.committed_offset as i64,
-                    expected.cursor.last_page_digest,
-                    expected.cursor.generation as i64,
-                    expected.cursor.feed_epoch,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        if changed == 0 {
-            return Err(CURSOR_CONFLICT.into());
-        }
-        tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        advance_cursor(&tx, next, expected)?;
+        tx.commit().map_err(|error| error.to_string())
     }
+
+    /// The cursor advance plus the subscription's ObjectSet membership
+    /// (#3038), in one transaction: a crash keeps both or neither.
+    pub fn advance_event_subscription_cursor_with_membership(
+        &self,
+        next: &EventSubscription,
+        expected: &EventSubscription,
+        membership: &ObjectSetMembership,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        advance_cursor(&tx, next, expected)?;
+        upsert_membership(&tx, &next.namespace, &next.subscription_id, membership)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Replaces the subscription's ObjectSet membership outside a cursor
+    /// advance: the baseline a resnapshot pairs with (#3038).
+    pub fn put_object_set_membership(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+        membership: &ObjectSetMembership,
+    ) -> Result<(), String> {
+        upsert_membership(&self.conn(), namespace, subscription_id, membership)
+    }
+
+    /// The ObjectSet membership last committed with the subscription's
+    /// cursor, if any.
+    pub fn get_object_set_membership(
+        &self,
+        namespace: &str,
+        subscription_id: &str,
+    ) -> Result<Option<ObjectSetMembership>, String> {
+        let row: Option<(String, String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT epoch, member_ids_json, pending_ids_json
+                 FROM sekai_object_set_memberships
+                 WHERE namespace = ?1 AND subscription_id = ?2",
+                params![namespace, subscription_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        row.map(|(epoch, members, pending)| {
+            let decode = |json: &str| {
+                serde_json::from_str(json)
+                    .map_err(|error| format!("decode object-set membership: {error}"))
+            };
+            Ok(ObjectSetMembership {
+                epoch,
+                member_ids: decode(&members)?,
+                pending_ids: decode(&pending)?,
+            })
+        })
+        .transpose()
+    }
+}
+
+fn upsert_membership(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    subscription_id: &str,
+    membership: &ObjectSetMembership,
+) -> Result<(), String> {
+    let members = serde_json::to_string(&membership.member_ids)
+        .map_err(|error| format!("encode object-set membership: {error}"))?;
+    let pending = serde_json::to_string(&membership.pending_ids)
+        .map_err(|error| format!("encode object-set membership: {error}"))?;
+    conn.execute(
+        "INSERT INTO sekai_object_set_memberships
+            (namespace, subscription_id, epoch, member_ids_json, pending_ids_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(namespace, subscription_id) DO UPDATE SET
+            epoch = excluded.epoch,
+            member_ids_json = excluded.member_ids_json,
+            pending_ids_json = excluded.pending_ids_json",
+        params![
+            namespace,
+            subscription_id,
+            membership.epoch,
+            members,
+            pending
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn advance_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    next: &EventSubscription,
+    expected: &EventSubscription,
+) -> Result<(), String> {
+    let json = serde_json::to_string(next)
+        .map_err(|error| format!("encode event subscription: {error}"))?;
+    let current =
+        load_subscription(tx, &next.namespace, &next.subscription_id)?.ok_or(CURSOR_CONFLICT)?;
+    if current != *expected {
+        return Err(CURSOR_CONFLICT.into());
+    }
+    let binding = load_stream_binding(tx, &next.stream_id)?;
+    if binding.is_none_or(|stream| stream.definition_digest != next.definition_digest) {
+        return Err(CURSOR_CONFLICT.into());
+    }
+    let checkpoint = load_stream_checkpoint(tx, &next.stream_id)?;
+    if checkpoint.is_none_or(|current| {
+        current.generation != next.cursor.generation
+            || current.feed_epoch != next.cursor.feed_epoch
+            || current.committed_offset < next.cursor.committed_offset
+    }) {
+        return Err(CURSOR_CONFLICT.into());
+    }
+    let changed = tx
+        .execute(
+            "UPDATE sekai_event_subscriptions
+             SET record_json = ?1
+             WHERE namespace = ?2
+               AND subscription_id = ?3
+               AND owner = ?4
+               AND ifnull(json_extract(record_json, '$.status'), '') = ?5
+               AND json_extract(record_json, '$.cursor.committed_offset') = ?6
+               AND ifnull(json_extract(record_json, '$.cursor.last_page_digest'), '') = ?7
+               AND json_extract(record_json, '$.cursor.generation') = ?8
+               AND ifnull(json_extract(record_json, '$.cursor.feed_epoch'), '') = ?9",
+            params![
+                json,
+                next.namespace,
+                next.subscription_id,
+                next.owner,
+                expected.status,
+                expected.cursor.committed_offset as i64,
+                expected.cursor.last_page_digest,
+                expected.cursor.generation as i64,
+                expected.cursor.feed_epoch,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 0 {
+        return Err(CURSOR_CONFLICT.into());
+    }
+    Ok(())
 }
 
 fn load_subscription(

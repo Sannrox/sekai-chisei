@@ -53,6 +53,27 @@ replay still returns `replayed`.
 Action bindings and agent change wakes read the lenient projection, which
 carries no values: a binding's pending events hold no copy of property data.
 
+## ObjectSet membership
+
+Experimental, behind the experimental RPC gate (#3038). Set
+`object_set` to an `ObjectSetDescriptor` instead of `scope` to follow a
+set's membership. The first read with no revision answers
+`resnapshot_required`: drop any held members and read with the returned
+revision. The subscription delivers the snapshot itself: the first pages
+carry an `enter` per member, then pages carry `enter` and `leave` events
+offset by the committed change that touched the object. Apply them as set
+operations to the emptied set; no separate `EvaluateObjectSet` snapshot is
+paired with the stream.
+
+Members are evaluated as the reader on every page. A member the reader can
+no longer see leaves on its next change, and its `leave` names only the
+object id. Property-filter and spatial descriptors are supported; traversal,
+aggregation, dataset-indexed kinds, and sets larger than 1,000 members are
+refused with `FAILED_PRECONDITION`. A changed descriptor or definition
+restarts the subscription. A membership page scans a bounded prefix of the
+history, so it never disconnects as a slow consumer. See
+[ADR 0068](decisions/0068-object-change-subscriptions.md#addendum-objectset-membership-3038).
+
 ## Backpressure
 
 A page is bounded. A consumer that falls more than the documented backlog
