@@ -404,8 +404,7 @@ before any decision or provider contact, in policy mode and on the
 `gateway.decide/v2` path alike. Object references in the request text are
 forwarded as written; the gateway no longer looks them up. Select context
 through native planning (`PlanExecution`), or read it with the MCP read tools
-(`Search`, `GetObject`, and `ExpandNeighborhood`, which is
-experimental and needs `SEKAI_EXPERIMENTAL_RPCS`).
+(`Search`, `GetObject`, and `ExpandNeighborhood`).
 
 ## Usage and smoke tests
 

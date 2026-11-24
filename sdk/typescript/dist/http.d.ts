@@ -160,6 +160,9 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "Traverse";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "ExpandNeighborhood";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "RetrieveContext";
 }, {
     readonly service: "sekai.SekaiService";
@@ -176,6 +179,9 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateSchemaType";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetOntologyClass";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateOntologyClass";

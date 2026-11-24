@@ -1213,12 +1213,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lineage_runs_while_experimental_rpcs_are_disabled_and_discovery_does_not() {
-        use crate::mcp_adapter::protocol::{GET_LINEAGE_TOOL, LIST_CLASSES_TOOL};
+    async fn stable_discovery_runs_while_experimental_rpcs_are_disabled_and_class_listing_does_not()
+    {
+        use crate::mcp_adapter::protocol::{
+            GET_CLASS_TOOL, GET_LINEAGE_TOOL, LIST_CLASSES_TOOL, NEIGHBORHOOD_TOOL,
+        };
         let mut surface = discovery_surface().await;
         surface.experimental_rpcs = false;
         let lineage = call(&surface, GET_LINEAGE_TOOL, json!({"id": OBJECT_ID})).await;
         assert!(call_output(lineage.clone()).is_ok(), "{lineage}");
+        // Promoted to stable (#2666); listing waits for paging.
+        let class = call(&surface, GET_CLASS_TOOL, json!({"name": "Visible"})).await;
+        assert!(call_output(class.clone()).is_ok(), "{class}");
+        let neighborhood = call(
+            &surface,
+            NEIGHBORHOOD_TOOL,
+            json!({"seed_ids": [OBJECT_ID]}),
+        )
+        .await;
+        assert!(call_output(neighborhood.clone()).is_ok(), "{neighborhood}");
         let listed = call(&surface, LIST_CLASSES_TOOL, json!({})).await;
         assert!(
             listed.get("error").is_some() || call_output(listed.clone()).is_err(),

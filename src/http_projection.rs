@@ -416,6 +416,18 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "GetOntologyClass") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_ontology_class(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ExpandNeighborhood") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::expand_neighborhood(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "CreateObject") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_object(&*svc, req).await

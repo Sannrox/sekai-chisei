@@ -208,3 +208,14 @@ the shrink-only SQLite-only list.
   still refused. Wire, authorization, and `product_tier` are unchanged. The
   HTTP/JSON projection and generated stable SDKs pick the seven up as unary
   stables.
+- 2026-11-24, Issue [#2666](https://github.com/Sannrox/sekai-chisei/issues/2666):
+  `GetOntologyClass` and `ExpandNeighborhood` become `stable`, with the MCP
+  discovery tools `sekai.ontology.classes.get` and
+  `sekai.relations.neighborhood` as consumer. Both meet the #2089 criteria:
+  a real backend on both stores, a bounded request, and reads under the live
+  read policy. The MCP host lists both tools with experimental RPCs off, and
+  the HTTP/JSON projection and generated stable SDKs pick them up as unary
+  stables. `ListOntologyClasses` stays `experimental` until it takes
+  `page_size` and `page_token`. `GetProvenanceReport` stays off MCP: it is
+  keyed by a work unit with no namespace. Wire, authorization, and
+  `product_tier` are unchanged.

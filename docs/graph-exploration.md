@@ -1,10 +1,11 @@
 # Neighborhood and path queries
 
-`ExpandNeighborhood` and `FindPaths` are experimental RPCs for exploring how
-objects are linked. They are classified `experimental`
-([rpc-maturity.md](rpc-maturity.md)) and are rejected unless
-`SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
-enabled. Capability discovery lists them as `sekai.relations.neighborhood` and
+`ExpandNeighborhood` and `FindPaths` explore how objects are linked.
+`ExpandNeighborhood` is `stable` ([rpc-maturity.md](rpc-maturity.md)) and is
+served on the default build, over gRPC, the HTTP/JSON projection and the MCP
+`sekai.relations.neighborhood` tool. `FindPaths` is `experimental` and is
+rejected unless `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo
+feature is enabled. Capability discovery lists them as `sekai.relations.neighborhood` and
 `sekai.relations.paths` with their limits; discovery is not a grant.
 
 ## Read policy at every hop

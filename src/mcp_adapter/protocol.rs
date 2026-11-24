@@ -85,7 +85,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 18] {
+pub fn well_known_tools() -> [&'static str; 20] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -105,6 +105,8 @@ pub fn well_known_tools() -> [&'static str; 18] {
         CREATE_DEFINITION_PROPOSAL_TOOL,
         SEARCH_TOOL,
         GET_LINEAGE_TOOL,
+        GET_CLASS_TOOL,
+        NEIGHBORHOOD_TOOL,
     ]
 }
 
@@ -902,6 +904,22 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "sekai.GetLineageResponse",
             "read",
         ),
+        capability_entry(
+            GET_CLASS_TOOL,
+            "Read one ontology class with its properties.",
+            "query",
+            "sekai.GetOntologyClassRequest",
+            "sekai.GetOntologyClassResponse",
+            "read",
+        ),
+        capability_entry(
+            NEIGHBORHOOD_TOOL,
+            "Expand the authorized neighborhood of objects, bounded in depth, fan-out, and size.",
+            "query",
+            "sekai.ExpandNeighborhoodRequest",
+            "sekai.ExpandNeighborhoodResponse",
+            "read",
+        ),
     ]
 }
 
@@ -985,22 +1003,6 @@ fn experimental_entries() -> Vec<CapabilityEntry> {
             "query",
             "sekai.ListOntologyClassesRequest",
             "sekai.ListOntologyClassesResponse",
-            "read",
-        ),
-        capability_entry(
-            GET_CLASS_TOOL,
-            "Read one ontology class with its properties.",
-            "query",
-            "sekai.GetOntologyClassRequest",
-            "sekai.GetOntologyClassResponse",
-            "read",
-        ),
-        capability_entry(
-            NEIGHBORHOOD_TOOL,
-            "Expand the authorized neighborhood of objects, bounded in depth, fan-out, and size.",
-            "query",
-            "sekai.ExpandNeighborhoodRequest",
-            "sekai.ExpandNeighborhoodResponse",
             "read",
         ),
         capability_entry(
@@ -1254,6 +1256,8 @@ mod tests {
                 CREATE_DEFINITION_PROPOSAL_TOOL,
                 SEARCH_TOOL,
                 GET_LINEAGE_TOOL,
+                GET_CLASS_TOOL,
+                NEIGHBORHOOD_TOOL,
             ]
         );
         assert_eq!(
