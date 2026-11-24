@@ -523,6 +523,19 @@ neighborhood walks to the session namespace: a start object outside it is not
 found, and objects outside it are left out as if unreadable, even when the
 principal may read them over direct gRPC.
 
+### Working memory tool
+
+An agent instance that reaches the plane over MCP can read back the working
+memory it wrote through the `site_agent.memory.*` Actions (#2436).
+`sekai.agents.memory.list` → `ListSiteAgentWorkingMemory` requires
+`instance_id` and accepts `turn_id`, `limit`, and `page_token`. The session
+principal must be the instance's principal, as over gRPC; another instance's
+memory reads as not found. Items are redacted exactly as the RPC redacts them
+for the same caller. `limit` 0 takes the server default page, and a limit
+above 1000 is refused rather than truncated; page on with `next_page_token`.
+The RPC is `experimental`, so the tool is listed and runs only when
+experimental RPCs are enabled (`SEKAI_EXPERIMENTAL_RPCS=1`).
+
 ### Dataset branch tools
 
 An agent can develop a transform against an isolated copy of a dataset and

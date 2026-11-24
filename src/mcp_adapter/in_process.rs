@@ -1630,4 +1630,108 @@ mod tests {
             "{called}"
         );
     }
+
+    /// The synthetic plane with memory installed and instances `line-7`
+    /// (the session principal's) and `line-8` (another principal's) in the
+    /// session namespace.
+    async fn memory_surface() -> InProcessSurface {
+        use crate::sekai::site_agent_memory as memory;
+        let surface = InProcessSurface::synthetic().await.unwrap();
+        memory::install(&surface.db, NAMESPACE, "root", 1).unwrap();
+        for (id, principal) in [("line-7", PRINCIPAL), ("line-8", "svc-line-8")] {
+            surface
+                .db
+                .create_object(&domain::Object {
+                    id: id.into(),
+                    kind: crate::sekai::site_agent_instance::KIND.into(),
+                    name: id.into(),
+                    namespace: NAMESPACE.into(),
+                    external_id: String::new(),
+                    properties: HashMap::from([("principal_id".into(), principal.into())]),
+                    created: 1,
+                    updated: 1,
+                })
+                .unwrap();
+        }
+        surface
+    }
+
+    #[tokio::test]
+    async fn an_instance_writes_memory_through_the_action_and_reads_it_back() {
+        use crate::grpc::pb::sekai::ListSiteAgentWorkingMemoryRequest;
+        use crate::mcp_adapter::protocol::LIST_WORKING_MEMORY_TOOL;
+        use crate::sekai::site_agent_memory as memory;
+        let surface = memory_surface().await;
+        let submitted = call(
+            &surface,
+            "sekai.actions.submit",
+            json!({
+                "type_id": memory::ACTION_CREATE,
+                "version": memory::ACTION_VERSION,
+                "parameters_json": {
+                    "object_id": "note-1",
+                    "instance_id": "line-7",
+                    "content": "the press on line 7 runs hot"
+                },
+                "idempotency_key": "memory-1"
+            }),
+        )
+        .await;
+        assert!(submitted.get("error").is_none(), "{submitted}");
+        call_output(submitted).unwrap_or_else(|error| panic!("{error}"));
+        let read = call(
+            &surface,
+            LIST_WORKING_MEMORY_TOOL,
+            json!({"instance_id": "line-7", "limit": 10}),
+        )
+        .await;
+        assert!(read.get("error").is_none(), "{read}");
+        let read = call_output(read).unwrap_or_else(|error| panic!("{error}"));
+        let items = read["output"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{read}"));
+        assert_eq!(items.len(), 1, "{read}");
+        assert_eq!(items[0]["id"], "note-1");
+        // The tool returns exactly what the RPC returns to the same caller,
+        // so redaction cannot differ.
+        let rpc = surface
+            .sekai
+            .list_site_agent_working_memory(with_identity(
+                ListSiteAgentWorkingMemoryRequest {
+                    namespace: NAMESPACE.into(),
+                    instance_id: "line-7".into(),
+                    turn_id: String::new(),
+                    limit: 10,
+                    page_token: String::new(),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(read["output"], serde_json::to_value(rpc).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_instance_cannot_read_another_instances_memory_or_an_unbounded_page() {
+        use crate::mcp_adapter::protocol::{LIST_WORKING_MEMORY_TOOL, MAX_WORKING_MEMORY_PAGE};
+        let surface = memory_surface().await;
+        let other = call(
+            &surface,
+            LIST_WORKING_MEMORY_TOOL,
+            json!({"instance_id": "line-8"}),
+        )
+        .await;
+        assert!(other.get("error").is_none(), "{other}");
+        let refused = call_output(other.clone()).unwrap_err();
+        assert!(refused.contains("\"not_found\""), "{other}");
+        let unbounded = call(
+            &surface,
+            LIST_WORKING_MEMORY_TOOL,
+            json!({"instance_id": "line-7", "limit": MAX_WORKING_MEMORY_PAGE + 1}),
+        )
+        .await;
+        assert_eq!(unbounded["error"]["code"], -32602, "{unbounded}");
+    }
 }

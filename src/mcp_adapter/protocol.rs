@@ -45,6 +45,12 @@ pub const GET_LINEAGE_TOOL: &str = "sekai.lineage.get";
 /// Upper bound on `max_nodes` for the lineage tool. The RPC clamps larger
 /// values to the same cap; the tool refuses them instead of truncating.
 pub const MAX_LINEAGE_NODES: i64 = 500;
+/// Working memory read (#2436): the calling instance pages through its own
+/// live working memory, redacted as over gRPC. Experimental.
+pub const LIST_WORKING_MEMORY_TOOL: &str = "sekai.agents.memory.list";
+/// Upper bound on `limit` for the working memory tool. The RPC clamps larger
+/// values to the same cap; the tool refuses them instead of truncating.
+pub const MAX_WORKING_MEMORY_PAGE: i64 = crate::domain::MAX_LIST_LIMIT as i64;
 /// Rehearsal tools (#2432): each runs the no-effect form of its RPC and
 /// submits nothing; ADR 0109 holds, a trace is never certification. All four
 /// RPCs are experimental, so the tools are listed only when experimental RPCs
@@ -125,6 +131,7 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         GET_CLASS_TOOL => Some(NativeRpc::GetOntologyClass),
         NEIGHBORHOOD_TOOL => Some(NativeRpc::ExpandNeighborhood),
         GET_LINEAGE_TOOL => Some(NativeRpc::GetLineage),
+        LIST_WORKING_MEMORY_TOOL => Some(NativeRpc::ListSiteAgentWorkingMemory),
         CREATE_DATASET_BRANCH_TOOL => Some(NativeRpc::CreateDatasetBranch),
         RUN_TRANSFORM_ON_BRANCH_TOOL => Some(NativeRpc::RunGovernedTransformOnBranch),
         COMPARE_DATASET_BRANCH_TOOL => Some(NativeRpc::CompareDatasetBranch),
@@ -186,7 +193,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, rehearsal (dry-run, simulate, preview), dataset-branch, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, rehearsal (dry-run, simulate, preview), working-memory, dataset-branch, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -379,6 +386,40 @@ fn bind_session_input(
                     "limit".into(),
                     json!(session_int(object, "limit", "limit")?),
                 ),
+            ]);
+        }
+        NativeRpc::ListSiteAgentWorkingMemory => {
+            if let Some(namespace) = session_string(object, "namespace")?
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"memory namespace must match the authenticated adapter session"
+                }));
+            }
+            let instance_id = session_string(object, "instance_id")?
+                .or(session_string(object, "instanceId")?)
+                .ok_or_else(
+                    || json!({"code":-32602,"message":"memory read requires input.instance_id"}),
+                )?;
+            let turn_id = session_string(object, "turn_id")?.or(session_string(object, "turnId")?);
+            let page_token =
+                session_string(object, "page_token")?.or(session_string(object, "pageToken")?);
+            // 0 takes the server default page; a larger page is refused, so
+            // every read is bounded and pages on with next_page_token.
+            let limit = session_int(object, "limit", "limit")?;
+            if !(0..=MAX_WORKING_MEMORY_PAGE).contains(&limit) {
+                return Err(json!({
+                    "code":-32602,
+                    "message": format!("input.limit must be 0 to {MAX_WORKING_MEMORY_PAGE}")
+                }));
+            }
+            *object = serde_json::Map::from_iter([
+                ("namespace".into(), json!(context.namespace)),
+                ("instanceId".into(), json!(instance_id)),
+                ("turnId".into(), json!(turn_id.unwrap_or_default())),
+                ("limit".into(), json!(limit)),
+                ("pageToken".into(), json!(page_token.unwrap_or_default())),
             ]);
         }
         NativeRpc::GetLineage => {
@@ -866,6 +907,14 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
 
 fn experimental_entries() -> Vec<CapabilityEntry> {
     vec![
+        capability_entry(
+            LIST_WORKING_MEMORY_TOOL,
+            "Page through the calling agent instance's live working memory, redacted as over gRPC.",
+            "query",
+            "sekai.ListSiteAgentWorkingMemoryRequest",
+            "sekai.ListSiteAgentWorkingMemoryResponse",
+            "read",
+        ),
         capability_entry(
             CREATE_DATASET_BRANCH_TOOL,
             "Create a named branch of a dataset, forked from its latest or a given version; the live dataset is untouched.",
