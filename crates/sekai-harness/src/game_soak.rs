@@ -27,9 +27,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tonic::{Code, Request, Status};
 
-use crate::grpc::client::{GatewayClient, connect_sekai};
-use crate::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
-use crate::grpc::pb::sekai::{
+use sekai_chisei::grpc::client::{GatewayClient, connect_sekai};
+use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
+use sekai_chisei::grpc::pb::sekai::{
     AppendRowsRequest, ApplySourceBatchRequest, ColumnDef, CreateCredentialRequest,
     CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest, CreateSchemaTypeRequest, Dataset,
     EnsureTeamNamespaceRequest, GovernedActionType, GovernedTransform, Link, Object, ObjectType,
@@ -37,10 +37,10 @@ use crate::grpc::pb::sekai::{
     RegisterSourceTypeDescriptorRequest, RotateCredentialRequest, Row, RunGovernedTransformRequest,
     SourceBatch, SourceRecord, SubmitActionInstanceRequest,
 };
-use crate::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
-use crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
-use crate::sekai::synthetic::{Rng, SizePreset, Spec, SyntheticPlan, generate};
-use crate::sekai::synthetic_game::GameWorkload;
+use sekai_chisei::sekai::governed_transform::{ANALYTICAL_CLASS, CONTRACT_VERSION};
+use sekai_chisei::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY;
+use sekai_chisei::sekai::synthetic::{Rng, SizePreset, Spec, SyntheticPlan, generate};
+use sekai_chisei::sekai::synthetic_game::GameWorkload;
 use sekai_source_sdk::{
     ADAPTER_REGISTERED_OBJECT_SYNC, ADAPTER_REGISTERED_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
     MAX_SOURCE_BATCH_RECORDS, SOURCE_BATCH_VERSION,
@@ -474,7 +474,7 @@ fn ensured<T>(result: Result<T, Status>, step: &'static str) -> Result<(), SoakE
     }
 }
 
-fn schema_type(object_type: &crate::sekai::schema::ObjectType) -> ObjectType {
+fn schema_type(object_type: &sekai_chisei::sekai::schema::ObjectType) -> ObjectType {
     ObjectType {
         kind: object_type.kind.clone(),
         description: object_type.description.clone(),
@@ -497,7 +497,7 @@ fn schema_type(object_type: &crate::sekai::schema::ObjectType) -> ObjectType {
 }
 
 fn action_type(
-    action_type: &crate::sekai::governed_action_type::GovernedActionType,
+    action_type: &sekai_chisei::sekai::governed_action_type::GovernedActionType,
 ) -> GovernedActionType {
     GovernedActionType {
         namespace: action_type.namespace.clone(),
@@ -782,7 +782,7 @@ fn source_batch(
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: crate::grpc::property_map_to_proto(record.properties),
+                properties: sekai_chisei::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,

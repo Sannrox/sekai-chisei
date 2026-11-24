@@ -1,4 +1,4 @@
-use sekai_chisei::perf_object_path::{
+use sekai_harness::perf_object_path::{
     ACTION_APPLY_P99_US, APPLY_SOURCE_BATCH_MIN_RECORDS_PER_SEC, GET_OBJECT_P99_US,
     LIST_PAGE_P95_US, ObjectPathBackend, ObjectPathHarness, ObjectPathId, ObjectPathKind,
     ObjectPathScale, POLICY_OVERHEAD_FRACTION, benchmark_for, parse_workload_id,
@@ -8,9 +8,9 @@ use sekai_chisei::perf_object_path::{
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-const MANIFEST: &str = include_str!("../benchmarks/manifest-object-path-v1.json");
-const SMOKE: &str = include_str!("../benchmarks/manifest-object-path-smoke-v1.json");
-const POSTGRES_WRAPPER: &str = include_str!("../scripts/object-path-with-postgres.sh");
+const MANIFEST: &str = include_str!("../../../benchmarks/manifest-object-path-v1.json");
+const SMOKE: &str = include_str!("../../../benchmarks/manifest-object-path-smoke-v1.json");
+const POSTGRES_WRAPPER: &str = include_str!("../../../scripts/object-path-with-postgres.sh");
 
 #[test]
 fn object_path_manifest_covers_required_workloads_and_published_budgets() {

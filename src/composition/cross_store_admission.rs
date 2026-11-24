@@ -39,11 +39,10 @@ pub struct CrossStoreAdmission {
 }
 
 impl CrossStoreAdmission {
-    pub(crate) fn new(
-        chisei: ChiseiStore,
-        sekai: SekaiStore,
-        budget: Option<Arc<BudgetTracker>>,
-    ) -> Self {
+    /// Admission clerk over the two stores, reserving against `budget` when
+    /// set. Public so out-of-crate drivers (the object-path benchmark) can
+    /// assemble the same governed write path the server uses.
+    pub fn new(chisei: ChiseiStore, sekai: SekaiStore, budget: Option<Arc<BudgetTracker>>) -> Self {
         let distinct_stores = !chisei.shares_physical_store_with(&sekai);
         Self {
             chisei,

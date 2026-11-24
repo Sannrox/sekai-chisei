@@ -4,37 +4,37 @@
 //! The `control_plane` bench and focused tests share these runners so the
 //! measured path is the gRPC service implementation, not a parallel copy.
 
-use crate::chisei::budget::{BudgetTracker, PeriodType};
-use crate::chisei_store::ChiseiStore;
-use crate::composition::cross_store_admission::CrossStoreAdmission;
-use crate::db::postgres::PostgresDb;
-use crate::db::runtime_db::RuntimeDb;
-use crate::db::store::SekaiStore;
-use crate::domain::{Link, Object};
-use crate::grpc::pb::sekai::sekai_service_server::SekaiService;
-use crate::grpc::pb::sekai::{
+use sekai_chisei::chisei::budget::{BudgetTracker, PeriodType};
+use sekai_chisei::chisei_store::ChiseiStore;
+use sekai_chisei::composition::cross_store_admission::CrossStoreAdmission;
+use sekai_chisei::db::postgres::PostgresDb;
+use sekai_chisei::db::runtime_db::RuntimeDb;
+use sekai_chisei::db::store::SekaiStore;
+use sekai_chisei::domain::{Link, Object};
+use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiService;
+use sekai_chisei::grpc::pb::sekai::{
     ApplySourceBatchRequest, CreateObjectRequest, EvaluateObjectSetRequest, GetObjectRequest,
     ListFilter, ListObjectsRequest, ObjectSetAggregation, ObjectSetCostLimit, ObjectSetDescriptor,
     ObjectSetTraversal, PropertyFilter, SourceBatch, SourceRecord, SubmitActionInstanceRequest,
     UpdateObjectRequest,
 };
-use crate::grpc::sekai_service::SekaiServiceImpl;
-use crate::sekai::definition_branch::{
+use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
+use sekai_chisei::sekai::definition_branch::{
     DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
 };
-use crate::sekai::governed_action_type::GovernedActionType;
-use crate::sekai::object_security::{
+use sekai_chisei::sekai::governed_action_type::GovernedActionType;
+use sekai_chisei::sekai::object_security::{
     OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
     ObjectSecurityPredicate, ObjectSecurityRule,
 };
-use crate::sekai::object_sync::{
+use sekai_chisei::sekai::object_sync::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, FAMILY_OBJECT_SYNC,
     GITHUB_OBJECT_SYNC_TYPE_DIGEST, SOURCE_BATCH_VERSION, SOURCE_GITHUB,
     SourceBatch as DomainBatch, SourceRecord as DomainRecord,
 };
-use crate::sekai::object_type_index::{ObjectTypeDatasource, ObjectTypeIndexEdit};
-use crate::sekai::schema::ObjectType;
-use crate::sekai::security::{Grant, Role};
+use sekai_chisei::sekai::object_type_index::{ObjectTypeDatasource, ObjectTypeIndexEdit};
+use sekai_chisei::sekai::schema::ObjectType;
+use sekai_chisei::sekai::security::{Grant, Role};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -348,7 +348,7 @@ impl ObjectPathHarness {
                 let directory = ScratchDir::create()?;
                 let path = directory.path.join("sekai.db");
                 let path = path.to_str().ok_or("object-path path is not UTF-8")?;
-                let db = RuntimeDb::Sqlite(Arc::new(crate::db::sekai::SekaiDb::new(path)?));
+                let db = RuntimeDb::Sqlite(Arc::new(sekai_chisei::db::sekai::SekaiDb::new(path)?));
                 (
                     SekaiStore::from_shared_runtime(Arc::new(db)),
                     Some(directory),
@@ -433,11 +433,11 @@ impl ObjectPathHarness {
         Ok(self.fetch_target()?.properties)
     }
 
-    fn fetch_target(&self) -> Result<crate::grpc::pb::sekai::Object, String> {
+    fn fetch_target(&self) -> Result<sekai_chisei::grpc::pb::sekai::Object, String> {
         self.inner.runtime.block_on(self.fetch_target_async())
     }
 
-    async fn fetch_target_async(&self) -> Result<crate::grpc::pb::sekai::Object, String> {
+    async fn fetch_target_async(&self) -> Result<sekai_chisei::grpc::pb::sekai::Object, String> {
         let response = self
             .inner
             .service
@@ -531,7 +531,7 @@ impl ObjectPathHarness {
     fn evaluate(&self, mode: EvaluateMode) -> Result<(), String> {
         let descriptor = match mode {
             EvaluateMode::Filter => ObjectSetDescriptor {
-                contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                contract_version: sekai_chisei::sekai::object_set::CONTRACT_VERSION.into(),
                 namespace: self.inner.namespace.clone(),
                 kind: "Item".into(),
                 definition_digest: self.inner.definition_digest.clone(),
@@ -547,7 +547,7 @@ impl ObjectPathHarness {
                 ..Default::default()
             },
             EvaluateMode::Sort => ObjectSetDescriptor {
-                contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                contract_version: sekai_chisei::sekai::object_set::CONTRACT_VERSION.into(),
                 namespace: self.inner.namespace.clone(),
                 kind: "Item".into(),
                 definition_digest: self.inner.definition_digest.clone(),
@@ -559,7 +559,7 @@ impl ObjectPathHarness {
                 ..Default::default()
             },
             EvaluateMode::OneHop => ObjectSetDescriptor {
-                contract_version: crate::sekai::object_set::CONTRACT_VERSION.into(),
+                contract_version: sekai_chisei::sekai::object_set::CONTRACT_VERSION.into(),
                 namespace: self.inner.namespace.clone(),
                 kind: "Item".into(),
                 definition_digest: self.inner.definition_digest.clone(),
@@ -577,7 +577,7 @@ impl ObjectPathHarness {
                 ..Default::default()
             },
             EvaluateMode::TwoHop => ObjectSetDescriptor {
-                contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                contract_version: sekai_chisei::sekai::object_set::CONTRACT_VERSION_V2.into(),
                 namespace: self.inner.namespace.clone(),
                 kind: "Item".into(),
                 definition_digest: self.inner.definition_digest.clone(),
@@ -861,7 +861,7 @@ fn member(
     kind: &str,
     id: &str,
     json: &str,
-) -> Result<crate::sekai::definition_branch::DefinitionMember, String> {
+) -> Result<sekai_chisei::sekai::definition_branch::DefinitionMember, String> {
     DefinitionMemberInput {
         member_kind: kind.into(),
         member_id: id.into(),
@@ -889,7 +889,7 @@ fn seed_two_hop_index(
             _ => BTreeMap::new(),
         };
         let binding = ObjectTypeDatasource {
-            contract_version: crate::sekai::object_type_index::CONTRACT_VERSION.into(),
+            contract_version: sekai_chisei::sekai::object_type_index::CONTRACT_VERSION.into(),
             namespace: namespace.into(),
             kind: kind.into(),
             definition_digest: digest.into(),
@@ -910,7 +910,7 @@ fn seed_two_hop_index(
                     graph_id(namespace, "item", index),
                     BTreeMap::from([(
                         "region".into(),
-                        crate::sekai::object_schema::PropertyValue::from(
+                        sekai_chisei::sekai::object_schema::PropertyValue::from(
                             if index.is_multiple_of(2) { "eu" } else { "us" },
                         ),
                     )]),
@@ -919,7 +919,7 @@ fn seed_two_hop_index(
                     graph_id(namespace, "order", index),
                     BTreeMap::from([(
                         "item_id".into(),
-                        crate::sekai::object_schema::PropertyValue::from(graph_id(
+                        sekai_chisei::sekai::object_schema::PropertyValue::from(graph_id(
                             namespace, "item", index,
                         )),
                     )]),
@@ -928,7 +928,7 @@ fn seed_two_hop_index(
                     graph_id(namespace, "shipment", index),
                     BTreeMap::from([(
                         "order_id".into(),
-                        crate::sekai::object_schema::PropertyValue::from(graph_id(
+                        sekai_chisei::sekai::object_schema::PropertyValue::from(graph_id(
                             namespace, "order", index,
                         )),
                     )]),
@@ -1037,8 +1037,8 @@ fn perf_row_object(namespace: &str) -> Object {
     }
 }
 
-fn proto_perf_row(namespace: &str, id: &str) -> crate::grpc::pb::sekai::Object {
-    crate::grpc::pb::sekai::Object {
+fn proto_perf_row(namespace: &str, id: &str) -> sekai_chisei::grpc::pb::sekai::Object {
+    sekai_chisei::grpc::pb::sekai::Object {
         id: id.into(),
         kind: "perf_row".into(),
         name: id.into(),
@@ -1203,7 +1203,7 @@ fn source_batch_proto(
                 type_name: record.type_name,
                 display_name: record.display_name,
                 payload_digest: record.payload_digest,
-                properties: crate::grpc::property_map_to_proto(record.properties),
+                properties: sekai_chisei::grpc::property_map_to_proto(record.properties),
                 deleted: record.deleted,
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,

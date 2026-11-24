@@ -242,10 +242,16 @@ def evaluate_release(
 
 
 def library_packages(metadata: dict, root: pathlib.Path) -> list[tuple[str, str, str]]:
-    """Return ``(name, relative manifest, relative lib src dir)``."""
+    """Return ``(name, relative manifest, relative lib src dir)``.
+
+    Packages marked ``publish = false`` (``"publish": []`` in cargo metadata)
+    have no external consumers, so their library is not semver surface.
+    """
     packages: list[tuple[str, str, str]] = []
     root_s = str(root) + os.sep
     for package in metadata["packages"]:
+        if package.get("publish") == []:
+            continue
         lib = next(
             (t for t in package["targets"] if "lib" in t.get("kind", [])),
             None,

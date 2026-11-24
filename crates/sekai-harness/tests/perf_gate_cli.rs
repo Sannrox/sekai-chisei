@@ -8,13 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn binary() -> PathBuf {
-    // The integration test binary lives in target/<profile>/deps.
-    let mut path = std::env::current_exe().expect("test binary path");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.join("perf-gate")
+    PathBuf::from(env!("CARGO_BIN_EXE_perf-gate"))
 }
 
 fn write_report(dir: &std::path::Path, name: &str, egress_p95: f64) -> PathBuf {

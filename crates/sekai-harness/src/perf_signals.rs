@@ -10,8 +10,6 @@
 //! Other `observes` entries (latency, throughput, ...) describe what the bench
 //! measures directly and are not read from the recorder.
 
-use crate::obs::labels::CacheOutcome;
-use crate::obs::signals::{CACHE_EVENTS, DB_WAIT, QUEUE_DEPTH};
 use crate::perf_regression::{
     Ineligibility, MIN_REPETITIONS, NOISE_CEILING_RSD_PERCENT, SIGNIFICANCE_FACTOR, median,
     spread_percent,
@@ -20,6 +18,8 @@ use metrics::{
     Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, Recorder,
     SharedString, Unit,
 };
+use sekai_chisei::obs::labels::CacheOutcome;
+use sekai_chisei::obs::signals::{CACHE_EVENTS, DB_WAIT, QUEUE_DEPTH};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -436,8 +436,8 @@ pub fn compare_signals_to_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::obs::labels::{Cache, Outcome, Subsystem, WaitKind};
-    use crate::obs::signals;
+    use sekai_chisei::obs::labels::{Cache, Outcome, Subsystem, WaitKind};
+    use sekai_chisei::obs::signals;
     use std::time::Duration;
 
     fn run(signal: &str, value: f64) -> Vec<WorkloadSignals> {
