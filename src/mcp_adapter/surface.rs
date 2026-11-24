@@ -58,12 +58,12 @@ pub enum NativeRpc {
     GetOntologyClass,
     ExpandNeighborhood,
     GetLineage,
+    RunTransformChain,
+    GetTransformChainRun,
     DryRunAgent,
     SimulatePlan,
     PreviewGovernedTransform,
     DryRunDefinitionChangeBundle,
-    RunTransformChain,
-    GetTransformChainRun,
 }
 
 impl NativeRpc {
