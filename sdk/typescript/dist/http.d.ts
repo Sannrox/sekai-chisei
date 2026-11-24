@@ -1,6 +1,21 @@
 export declare const HTTP_PROJECTION_CONTRACT = "sekai.http-projection/v1";
 export declare const HTTP_UNARY_METHODS: readonly [{
     readonly service: "sekai.SekaiService";
+    readonly rpc: "AcquireLease";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetLease";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RefreshLease";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ReleaseLease";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "TakeoverExpiredLease";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "ApplySourceBatch";
 }, {
     readonly service: "sekai.SekaiService";
@@ -10,13 +25,34 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "CreateDefinitionBranch";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "GetDefinitionBranch";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "ApplyDefinitionBranchEdit";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateDefinitionProposal";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "GetDefinitionProposal";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ApproveDefinitionProposal";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "MergeDefinitionProposal";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetDefinitionMember";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetDefinitionCertificationGate";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "GetPublishedDefinitionRevision";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListPublishedDefinitionRevisions";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CompareDefinitionRevisions";
@@ -59,6 +95,18 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "PutObjectTypeIndexEdit";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListClaimableWork";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ClaimWork";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "HeartbeatWorkClaim";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "AckWork";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "AdmitGovernedDocument";
@@ -187,6 +235,9 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "CheckAccess";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "RecordDecision";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "PutGovernedActionType";
 }, {
     readonly service: "sekai.SekaiService";
@@ -194,6 +245,18 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "DecideActionInstance";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "PutActionBinding";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RunActionBinding";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetActionBinding";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListActionBindings";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "DescribeObjectAction";
@@ -214,7 +277,8 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "ListActionEffects";
 }, {
     readonly service: "sekai.SekaiService";
-    readonly rpc: "GetLineage";}, {
+    readonly rpc: "GetLineage";
+}, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "CreateCredential";
 }, {

@@ -8,12 +8,15 @@ classifies compatibility, and proposes an append-only rollback of a prior
 published revision. Rollback never rewrites history.
 `CreateDefinitionBranch`, `ApplyDefinitionBranchEdit`,
 `CompareDefinitionRevisions`, `ReportDefinitionConsumerImpact`, and
-`CreateDefinitionProposal` are `stable` (#2095). `GetPublishedDefinitionRevision`
+`CreateDefinitionProposal` are `stable` (#2095). The human review-and-publish
+calls `GetDefinitionBranch`, `GetDefinitionProposal`,
+`ApproveDefinitionProposal`, `MergeDefinitionProposal`,
+`GetDefinitionCertificationGate`, `ListPublishedDefinitionRevisions`, and
+`GetDefinitionMember` are `stable` too (#2407). `GetPublishedDefinitionRevision`
 stays `stable`. Remaining branch, proposal, rollback, compatibility, and
 fact-migration RPCs stay `experimental` and are rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is enabled.
-See [rpc-maturity.md](rpc-maturity.md). `ListPublishedDefinitionRevisions` is an
-additive experimental read of merge history. The isolated tracer in
+See [rpc-maturity.md](rpc-maturity.md). The isolated tracer in
 [definition-change-tracer.md](definition-change-tracer.md) walks the agent MCP
 path plus human approve and merge on an in-memory plane.
 
@@ -387,8 +390,7 @@ grants for every member of the selected revision, preserving revision-wide
 visibility. Missing and denied members return the same generic NotFound status;
 corrupt or incorrectly bound content returns a generic Internal status.
 
-The RPC is experimental and disabled unless the server sets
-`SEKAI_EXPERIMENTAL_RPCS=1` or builds with `experimental-rpcs`. This does not change
+The RPC is `stable`. This does not change
 credential scopes or resource grants. Merging a proposal that changes an
 agent-definition member requires a current, non-revoked, baseline-passing
 certification bound to the candidate revision
@@ -457,8 +459,7 @@ isolated-process), and rollbacks are exempt. See
 
 Scoped authenticated contexts can call qualified `sekai.SekaiService`
 `GetDefinitionBranch`, `CreateDefinitionBranch`, and `ApplyDefinitionBranchEdit`
-through the normal server-established RPC identity. `CreateDefinitionBranch` and
-`ApplyDefinitionBranchEdit` are `stable`; `GetDefinitionBranch` stays experimental.
+through the normal server-established RPC identity. All three are `stable`.
 Creation and editing require actual namespace write scope and grants; editing
 also requires revision-wide read visibility and administration of changed members.
 The server attributes writes to the authenticated subject, not caller metadata.

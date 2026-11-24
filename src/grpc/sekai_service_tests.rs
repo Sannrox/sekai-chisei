@@ -20216,9 +20216,9 @@ async fn scoped_definition_draft_authoring_crosses_server_transport() {
             .code(),
         tonic::Code::PermissionDenied
     );
-    // Create/edit/propose are stable; Get still needs the experimental gate.
-    assert!(crate::rpc_maturity::require_invokable("GetDefinitionBranch", false).is_err());
+    // Draft authoring is stable, including the branch read (#2407).
     for method in [
+        "GetDefinitionBranch",
         "CreateDefinitionBranch",
         "ApplyDefinitionBranchEdit",
         "CreateDefinitionProposal",

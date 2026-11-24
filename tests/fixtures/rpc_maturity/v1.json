@@ -117,8 +117,8 @@
       "rpc": "GetDefinitionBranch",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -144,8 +144,8 @@
       "rpc": "GetDefinitionProposal",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -153,8 +153,8 @@
       "rpc": "ApproveDefinitionProposal",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -162,8 +162,8 @@
       "rpc": "MergeDefinitionProposal",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -180,8 +180,8 @@
       "rpc": "GetDefinitionMember",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "generated gRPC client",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -198,8 +198,8 @@
       "rpc": "GetDefinitionCertificationGate",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -243,8 +243,8 @@
       "rpc": "ListPublishedDefinitionRevisions",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",
-      "consumer": "none",
-      "classification": "experimental",
+      "consumer": "host",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {

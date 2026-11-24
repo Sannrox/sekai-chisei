@@ -196,3 +196,15 @@ the shrink-only SQLite-only list.
   and PostgreSQL through the typed `sekai-client` methods on a plane with
   experimental RPCs off. Messages stay as they are: a binding travels as
   `sekai.action-binding/v1` JSON.
+- 2026-11-24, Issue [#2407](https://github.com/Sannrox/sekai-chisei/issues/2407):
+  `GetDefinitionBranch`, `GetDefinitionProposal`, `ApproveDefinitionProposal`,
+  `MergeDefinitionProposal`, `GetDefinitionCertificationGate`,
+  `ListPublishedDefinitionRevisions`, and `GetDefinitionMember` become
+  `stable`, the human half of the #2095 workflow. The owner-facing console
+  gateway calls all seven over gRPC for a human session, and
+  `tests/mcp_definition_branch.rs` runs agent propose, human read, gate,
+  approve, merge, and history on a plane with experimental RPCs off. Approve
+  and merge stay human-only and off MCP: the creating agent principal is
+  still refused. Wire, authorization, and `product_tier` are unchanged. The
+  HTTP/JSON projection and generated stable SDKs pick the seven up as unary
+  stables.

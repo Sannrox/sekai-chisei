@@ -43,8 +43,7 @@ tool.
 
 Copy `examples/definition-change-tracer/` and drive the same steps against
 `sekai-mcp` plus native gRPC. MCP JSON uses camelCase for definition tools and
-`from_id` / `to_id` / `relation` for links. Keep `experimental_rpcs` off for every step
-except approve and merge (see below).
+`from_id` / `to_id` / `relation` for links. Keep `experimental_rpcs` off for every step.
 
 | Step | Surface | Name |
 | --- | --- | --- |
@@ -56,7 +55,6 @@ except approve and merge (see below).
 | Open proposal | MCP | `sekai.definitions.proposal.create` |
 | Approve / merge | gRPC | `ApproveDefinitionProposal`, `MergeDefinitionProposal` |
 
-`ApproveDefinitionProposal` and `MergeDefinitionProposal` stay experimental.
-A live server rejects them unless `SEKAI_EXPERIMENTAL_RPCS=1` or the
-`experimental-rpcs` Cargo feature is enabled. The in-process fixture invokes
-them the same way the MCP definition-branch test already does.
+`ApproveDefinitionProposal` and `MergeDefinitionProposal` are `stable` (#2407),
+so a default build runs every step. They stay gRPC-only and human-only: the
+creating agent principal is refused.
