@@ -474,31 +474,8 @@ pub(super) async fn get_operation_receipt(
     // A marked governed Action's receipt needs clearance for the marking, as
     // the instance does (#1706); Sekai decides it, and a denial reads as
     // missing. Administrative inspection is judged like anyone else.
-    if let Some(marking) = receipt_marking(&receipt) {
-        let carrier = crate::domain::Object {
-            id: format!("operation-receipt:{}", receipt.operation_id),
-            kind: "operation_receipt".into(),
-            name: receipt.operation_id.clone(),
-            namespace: receipt.namespace.clone(),
-            external_id: String::new(),
-            properties: std::collections::HashMap::from([(
-                crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
-                marking.to_string(),
-            )]),
-            created: receipt.started_at_ms,
-            updated: receipt.started_at_ms,
-        };
-        let cleared =
-            service
-                .sekai_facts
-                .reader()
-                .marking_clearance(&receipt.operation_id, &carrier, &actor);
-        if !matches!(
-            cleared,
-            Ok(crate::chisei::principal::MarkingClearance::Cleared)
-        ) {
-            return Err(Status::not_found("operation receipt not found"));
-        }
+    if !receipt_marking_cleared(service, &receipt, &actor) {
+        return Err(Status::not_found("operation receipt not found"));
     }
     let completeness = receipt.completeness();
     let receipt_json =
@@ -512,6 +489,37 @@ pub(super) async fn get_operation_receipt(
             .map(|surface| surface.as_str().to_string())
             .collect(),
     }))
+}
+/// Whether `actor` may see a receipt's marking. Unmarked receipts pass; a
+/// marked one needs Sekai clearance, and a failed lookup fails closed.
+fn receipt_marking_cleared(
+    service: &ChiseiServiceImpl,
+    receipt: &crate::chisei::receipt::OperationReceipt,
+    actor: &str,
+) -> bool {
+    let Some(marking) = receipt_marking(receipt) else {
+        return true;
+    };
+    let carrier = crate::domain::Object {
+        id: format!("operation-receipt:{}", receipt.operation_id),
+        kind: "operation_receipt".into(),
+        name: receipt.operation_id.clone(),
+        namespace: receipt.namespace.clone(),
+        external_id: String::new(),
+        properties: std::collections::HashMap::from([(
+            crate::sekai::markings::OBJECT_CLASSIFICATION_PROPERTY.to_string(),
+            marking.to_string(),
+        )]),
+        created: receipt.started_at_ms,
+        updated: receipt.started_at_ms,
+    };
+    matches!(
+        service
+            .sekai_facts
+            .reader()
+            .marking_clearance(&receipt.operation_id, &carrier, actor),
+        Ok(crate::chisei::principal::MarkingClearance::Cleared)
+    )
 }
 /// The marking a receipt records (#1706): a governed Action's on its intent,
 /// or a reservation or commit projection's for the instance it names.
@@ -544,6 +552,105 @@ pub(super) async fn get_quality_trend(
     .map_err(map_quality_trend_error)?;
     Ok(Response::new(GetQualityTrendResponse {
         report: Some(quality_trend_report_to_proto(&report)),
+    }))
+}
+/// Experimental (ADR 0156). Splits the requested namespaces into readable and
+/// withheld by the caller's own read access; withheld namespaces are named,
+/// never counted, and a denial and an unknown namespace look the same.
+pub(super) async fn get_execution_telemetry(
+    service: &ChiseiServiceImpl,
+    req: Request<GetExecutionTelemetryRequest>,
+) -> Result<Response<GetExecutionTelemetryResponse>, Status> {
+    use crate::execution_telemetry::{
+        MAX_TELEMETRY_NAMESPACES, TelemetryDimension, TelemetryError, query_execution_telemetry,
+    };
+    let request = req.get_ref();
+    if request.namespaces.is_empty() || request.namespaces.len() > MAX_TELEMETRY_NAMESPACES {
+        return Err(Status::invalid_argument(format!(
+            "namespaces must name 1 to {MAX_TELEMETRY_NAMESPACES} namespaces"
+        )));
+    }
+    let group_by = TelemetryDimension::parse(&request.group_by).ok_or_else(|| {
+        Status::invalid_argument(
+            "group_by must be task_class, model, prompt_variant, tool, evaluator, or outcome_class",
+        )
+    })?;
+    let mut readable = std::collections::BTreeSet::new();
+    let mut withheld = std::collections::BTreeSet::new();
+    for namespace in &request.namespaces {
+        let namespace = canonical_namespace(namespace)?.to_string();
+        match require_request_namespace_read(service.sekai_facts.reader(), &req, &namespace) {
+            Ok(()) => readable.insert(namespace),
+            Err(status)
+                if matches!(
+                    status.code(),
+                    tonic::Code::PermissionDenied | tonic::Code::NotFound
+                ) =>
+            {
+                withheld.insert(namespace)
+            }
+            Err(status) => return Err(status),
+        };
+    }
+    let readable: Vec<String> = readable.into_iter().collect();
+    let withheld: Vec<String> = withheld.into_iter().collect();
+    let actor = authenticated_actor(&req);
+    let telemetry = query_execution_telemetry(
+        service.db.runtime(),
+        &readable,
+        &withheld,
+        request.since_ms,
+        request.until_ms,
+        group_by,
+        |receipt| receipt_marking_cleared(service, receipt, &actor),
+    )
+    .map_err(|error| match error {
+        TelemetryError::Invalid(message) => Status::invalid_argument(message),
+        TelemetryError::NarrowWindow(message) => {
+            Status::resource_exhausted(format!("narrow the window: {message}"))
+        }
+        TelemetryError::Store(message) => Status::internal(message),
+    })?;
+    Ok(Response::new(GetExecutionTelemetryResponse {
+        contract_version: telemetry.contract_version,
+        namespaces: telemetry.namespaces,
+        withheld_namespaces: telemetry.withheld_namespaces,
+        withheld_receipts: telemetry.withheld_receipts,
+        since_ms: telemetry.since_ms,
+        until_ms: telemetry.until_ms,
+        group_by: telemetry.group_by.as_str().into(),
+        record_kinds: telemetry.record_kinds,
+        receipts: telemetry.receipts,
+        unrecorded_receipts: telemetry.unrecorded_receipts,
+        groups: telemetry
+            .groups
+            .into_iter()
+            .map(|group| ExecutionTelemetryGroup {
+                key: group.key,
+                receipts: group.receipts,
+                model_calls: group.model_calls,
+                priced_model_calls: group.priced_model_calls,
+                spend_usd_micros: group.spend_usd_micros,
+                input_tokens: group.input_tokens,
+                output_tokens: group.output_tokens,
+                latency_samples: group.latency_samples,
+                latency_p50_ms: group.latency_p50_ms,
+                latency_p90_ms: group.latency_p90_ms,
+                latency_p99_ms: group.latency_p99_ms,
+                outcomes: group.outcomes.into_iter().collect(),
+                verifications: group.verifications,
+                verifications_passed: group.verifications_passed,
+            })
+            .collect(),
+        gaps: telemetry
+            .gaps
+            .into_iter()
+            .map(|gap| ExecutionTelemetryGap {
+                fact: gap.fact,
+                reason: gap.reason,
+            })
+            .collect(),
+        digest: telemetry.digest,
     }))
 }
 pub(super) async fn put_evaluator_definition(

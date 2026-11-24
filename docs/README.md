@@ -86,6 +86,8 @@ If you want to deploy or operate the control plane:
   receipt-authoritative deterministic and stochastic execution.
 - [Evaluation quality trends](evaluation-quality-trends.md) — authorized,
   receipt-reconciled quality, variance, regression, and baseline projections.
+- [Execution telemetry](execution-telemetry.md) — bounded, digest-bound
+  aggregates over operation receipts for improvement evidence.
 - [Evaluation gate evidence](evaluation-gate-evidence.md) — server-owned,
   digest-bound, bounded evidence for release gates.
 - [Inspectable reversible learning changes](learning-changes.md) — evidence-bound

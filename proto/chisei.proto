@@ -2015,6 +2015,56 @@ message QualityTrendReport {
 message GetQualityTrendResponse {
   QualityTrendReport report = 1;
 }
+// One to 16 namespaces and a window of at most 366 days. A namespace the
+// caller cannot read is withheld, never counted. A window holding more
+// receipts than the scan cap is refused with RESOURCE_EXHAUSTED; narrow it.
+message GetExecutionTelemetryRequest {
+  repeated string namespaces = 1;
+  int64 since_ms = 2;
+  int64 until_ms = 3; // exclusive
+  // task_class | model | prompt_variant | tool | evaluator | outcome_class
+  string group_by = 4;
+}
+// Aggregates for one group key. "unrecorded" groups receipts without the
+// dimension; "other" groups values that are not bounded identifiers.
+message ExecutionTelemetryGroup {
+  string key = 1;
+  int64 receipts = 2;
+  int64 model_calls = 3;
+  int64 priced_model_calls = 4;
+  int64 spend_usd_micros = 5;
+  int64 input_tokens = 6;
+  int64 output_tokens = 7;
+  int64 latency_samples = 8;
+  int64 latency_p50_ms = 9;
+  int64 latency_p90_ms = 10;
+  int64 latency_p99_ms = 11;
+  map<string, int64> outcomes = 12; // receipts per outcome class
+  int64 verifications = 13;
+  int64 verifications_passed = 14;
+}
+// A fact the window could not supply, reported instead of counted as zero.
+message ExecutionTelemetryGap {
+  string fact = 1;
+  string reason = 2; // no_records_in_window | not_recorded
+}
+message GetExecutionTelemetryResponse {
+  string contract_version = 1; // chisei.execution-telemetry/v1
+  repeated string namespaces = 2;
+  repeated string withheld_namespaces = 3;
+  int64 since_ms = 4;
+  int64 until_ms = 5;
+  string group_by = 6;
+  repeated string record_kinds = 7;
+  int64 receipts = 8;
+  int64 unrecorded_receipts = 9;
+  repeated ExecutionTelemetryGroup groups = 10;
+  repeated ExecutionTelemetryGap gaps = 11;
+  string digest = 12;
+  // Receipts in readable namespaces left out because they carry a marking
+  // the caller is not cleared for. Counted, never aggregated.
+  int64 withheld_receipts = 13;
+}
 
 // --- Service ---
 
@@ -2087,6 +2137,10 @@ service ChiseiService {
   rpc ReportOperationEvent(ReportOperationEventRequest) returns (ReportOperationEventResponse);
   rpc GetOperationReceipt(GetOperationReceiptRequest) returns (GetOperationReceiptResponse);
   rpc GetQualityTrend(GetQualityTrendRequest) returns (GetQualityTrendResponse);
+  // Experimental (ADR 0156). Bounded aggregates over operation receipts in
+  // readable namespaces, grouped by one closed dimension, with a digest a
+  // learning candidate can bind as evidence.
+  rpc GetExecutionTelemetry(GetExecutionTelemetryRequest) returns (GetExecutionTelemetryResponse);
   rpc ClaimGatewayDispatch(ClaimGatewayDispatchRequest) returns (ClaimGatewayDispatchResponse);
 
   // Eval

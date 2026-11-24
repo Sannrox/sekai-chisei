@@ -64,6 +64,8 @@ lives in the separate [research index](research/README.md).
   authoring, publication, inspection, dry-run resolution, and execution.
 - [Evaluation quality trends](evaluation-quality-trends.md) — authorized,
   receipt-reconciled quality, variance, regression, and baseline reporting.
+- [Execution telemetry](execution-telemetry.md) — bounded, digest-bound
+  aggregates over operation receipts for improvement evidence.
 - [Lookup-first promotion gate](lookup-first-promotion-gate.md) — deterministic
   structured golden checks with audited, explicit-only promotion evidence.
 - [Inspectable reversible learning changes](learning-changes.md) — evidence-bound

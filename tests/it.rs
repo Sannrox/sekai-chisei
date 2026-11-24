@@ -141,6 +141,7 @@ mod epistemic_federation_conformance;
 mod epistemic_interop_conformance;
 mod epistemic_metadata_conformance;
 mod evidence_backend_conformance;
+mod execution_telemetry_backend_conformance;
 mod experimental_rpc_operator_docs;
 mod federation_backend_conformance;
 mod game_ai_players;

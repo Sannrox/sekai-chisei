@@ -35,6 +35,7 @@ pub mod object_log_boot;
 pub mod obs;
 pub mod ontology_codegen;
 pub use chisei_core::operation_report;
+pub mod execution_telemetry;
 pub mod operation_statistics;
 pub mod perf_object_path;
 pub mod perf_regression;

@@ -882,6 +882,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::get_quality_trend(self, req).await
     }
 
+    async fn get_execution_telemetry(
+        &self,
+        req: Request<GetExecutionTelemetryRequest>,
+    ) -> Result<Response<GetExecutionTelemetryResponse>, Status> {
+        rpc_execution::get_execution_telemetry(self, req).await
+    }
+
     async fn put_evaluator_definition(
         &self,
         req: Request<PutEvaluatorDefinitionRequest>,

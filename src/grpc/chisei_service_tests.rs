@@ -15621,3 +15621,5 @@ async fn tenant_assertion_reads_its_namespaces_eval_datasets() {
 mod chisei_custom_rubric_tests;
 #[path = "chisei_evaluation_metrics_tests.rs"]
 mod chisei_evaluation_metrics_tests;
+#[path = "chisei_execution_telemetry_tests.rs"]
+mod chisei_execution_telemetry_tests;
