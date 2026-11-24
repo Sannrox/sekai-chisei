@@ -57,9 +57,36 @@ pub trait EvaluationPlanSekaiDbExt {
         namespace: &str,
         plan_id: Option<&str>,
     ) -> Result<Vec<EvaluationPlan>, String>;
+
+    /// The plan version in `namespace` whose content digest is
+    /// `content_digest`. The digest covers the namespace, plan id and
+    /// version, so at most one matches.
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<EvaluationPlan>, String>;
 }
 
 impl EvaluationPlanSekaiDbExt for SekaiDb {
+    fn find_evaluation_plan_by_digest(
+        &self,
+        namespace: &str,
+        content_digest: &str,
+    ) -> Result<Option<EvaluationPlan>, String> {
+        self.conn()
+            .query_row(
+                "SELECT body_json FROM chisei_evaluation_plans
+                 WHERE namespace=?1 AND content_digest=?2",
+                params![namespace, content_digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|body| decode_plan(&body))
+            .transpose()
+    }
+
     fn put_evaluator_definition(
         &self,
         definition: EvaluatorDefinition,

@@ -302,6 +302,7 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.lineage.get" => Some("GetLineage"),
         "sekai.links.get" => Some("GetLinks"),
         "sekai.links.create" => Some("CreateLink"),
+        "chisei.evaluation.plan.put" => Some("PutEvaluationPlan"),
         "chisei.evaluation.resolve" => Some("ResolveEvaluationPlan"),
         "chisei.evaluation.execute" => Some("ExecuteEvaluationManifest"),
         "sekai.definitions.branch.create" => Some("CreateDefinitionBranch"),

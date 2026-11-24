@@ -770,6 +770,33 @@ pub(super) async fn put_evaluation_plan(
         plan: Some(to_proto_evaluation_plan(&plan)),
     }))
 }
+/// One stored plan version by content digest. The caller needs write access
+/// to the namespace, as storing a plan does; a plan that is absent or not
+/// visible to the caller reads as not found.
+pub(super) async fn get_evaluation_plan(
+    service: &ChiseiServiceImpl,
+    req: Request<GetEvaluationPlanRequest>,
+) -> Result<Response<GetEvaluationPlanResponse>, Status> {
+    let actor = authenticated_actor(&req);
+    let request = req.into_inner();
+    require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
+    let not_found = || Status::not_found("evaluation plan not found");
+    let plan = service
+        .db
+        .find_evaluation_plan_by_digest(&request.namespace, &request.content_digest)
+        .map_err(Status::internal)?
+        .ok_or_else(not_found)?;
+    let facts =
+        evaluation_manifest_resolution::in_process_facts_runtime(service.sekai_facts.reader())?;
+    if !evaluation_manifest_resolution::evaluation_plan_visible(facts, &plan, &actor)
+        .map_err(Status::internal)?
+    {
+        return Err(not_found());
+    }
+    Ok(Response::new(GetEvaluationPlanResponse {
+        plan: Some(to_proto_evaluation_plan(&plan)),
+    }))
+}
 pub(super) async fn resolve_evaluation_plan(
     service: &ChiseiServiceImpl,
     req: Request<ResolveEvaluationPlanRequest>,

@@ -475,7 +475,8 @@ Edit the fixture, then regenerate with
 | `ChiseiService.GetExecutionTelemetry` | `chisei.execution` | yes | none | `experimental` |
 | `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
-| `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
+| `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli, mcp | `stable` |
+| `ChiseiService.GetEvaluationPlan` | `chisei.evaluation` | yes | mcp | `experimental` |
 | `ChiseiService.ResolveEvaluationPlan` | `chisei.evaluation` | yes | cli | `stable` |
 | `ChiseiService.GetEvaluationGateEvidence` | `chisei.evaluation` | yes | none | `experimental` |
 

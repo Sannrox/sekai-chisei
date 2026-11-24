@@ -2,7 +2,8 @@
 
 Evaluation plans are a Chisei evaluation-selection contract in 1.0.
 `PutEvaluationPlan` and `ResolveEvaluationPlan` are classified `stable`; their
-consumer is [`sekaictl admin evaluation plan`](evaluation-operator-cli.md).
+consumers are [`sekaictl admin evaluation plan`](evaluation-operator-cli.md)
+and the MCP tool `chisei.evaluation.plan.put`.
 `PutEvaluatorDefinition` stays `experimental` and is rejected unless
 `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs` Cargo feature is
 enabled, because evaluator definitions are operator-owned deployment
@@ -16,7 +17,11 @@ The v1 API exposes:
 
 - `PutEvaluatorDefinition` for immutable publication and lifecycle transitions;
 - evaluator lifecycle transitions through `PutEvaluatorDefinition`; and
-- `PutEvaluationPlan` for immutable publication.
+- `PutEvaluationPlan` for immutable publication; and
+- `GetEvaluationPlan` (experimental, served only with
+  `SEKAI_EXPERIMENTAL_RPCS`) to find one plan by namespace and content digest.
+  It needs namespace write access and answers `NotFound` for an absent plan and
+  for one whose invariant closure the caller cannot read (#3174).
 
 `ResolveEvaluationPlan` is the separate authorized pre-execution boundary that
 freezes an exact plan and its situation-specific inputs. See

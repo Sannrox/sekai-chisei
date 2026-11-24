@@ -903,6 +903,13 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_execution::put_evaluation_plan(self, req).await
     }
 
+    async fn get_evaluation_plan(
+        &self,
+        req: Request<GetEvaluationPlanRequest>,
+    ) -> Result<Response<GetEvaluationPlanResponse>, Status> {
+        rpc_execution::get_evaluation_plan(self, req).await
+    }
+
     async fn resolve_evaluation_plan(
         &self,
         req: Request<ResolveEvaluationPlanRequest>,

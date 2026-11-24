@@ -586,6 +586,20 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "GetEvaluationPlan",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "tests/chisei_evaluation_plan_backend_conformance.rs",
+        "src/grpc/chisei_service_rpc_execution.rs",
+        "src/mcp_adapter/surface.rs"
+      ],
+      "durable_dependencies": [
+        "chisei.evaluation"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "PutEvaluatorDefinition",
       "kind": "persistent",
       "surfaces": [
