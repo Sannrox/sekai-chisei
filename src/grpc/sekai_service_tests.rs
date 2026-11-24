@@ -40081,3 +40081,15 @@ mod transform_chain_rpc_tests;
 
 #[path = "operation_identity_read_tests.rs"]
 mod operation_identity_read_tests;
+
+#[path = "agent_autonomy_rpc_tests.rs"]
+mod agent_autonomy_rpc_tests;
+
+#[path = "source_discovery_rpc_tests.rs"]
+mod source_discovery_rpc_tests;
+
+#[path = "source_rpc_tests.rs"]
+mod source_rpc_tests;
+
+#[path = "agent_turn_transcript_rpc_tests.rs"]
+mod agent_turn_transcript_rpc_tests;

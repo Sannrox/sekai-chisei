@@ -3718,6 +3718,32 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "GetAgentAutonomy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_autonomy.rs",
+        "src/grpc/agent_autonomy_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
+      "rpc": "SetAgentAutonomy",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/agent_autonomy.rs",
+        "src/grpc/agent_autonomy_rpc.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "ListPendingDecisions",
       "kind": "persistent",
       "surfaces": [

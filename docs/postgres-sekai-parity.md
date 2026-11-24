@@ -105,7 +105,8 @@ create a scratch database on.
 closed; do not treat inventory “complete” as dual-backend for these) live in
 the shrink-only list
 [`tests/fixtures/sqlite_only_surfaces/v1.json`](../tests/fixtures/sqlite_only_surfaces/v1.json)
-(experimental ontology deletes and named admin projections). Kioku memory
+(experimental ontology deletes, the experimental agent autonomy RPCs from
+#3086, and named admin projections). Kioku memory
 retrieval for `PlanExecution` context is SQLite-only and is skipped on
 PostgreSQL (see [postgres-chisei-parity.md](postgres-chisei-parity.md)). Execution-evidence
 reject and record helpers used by evidence admission share SQLite and

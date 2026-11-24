@@ -4286,6 +4286,57 @@ message GetDecisionTrendRequest {
   optional uint32 max_share_shift_bps = 5;
 }
 
+// One agent's autonomy over one governed Action type (#3086).
+message AgentAutonomy {
+  string namespace = 1;
+  string principal = 2;
+  string type_id = 3;
+  // "propose": every submit of the type parks for review
+  // (rule agent_autonomy:propose_only). "apply": a live auto-apply grant
+  // applies submits within its envelope.
+  string mode = 4;
+  // The live grant's autonomous envelope; empty in propose mode.
+  string envelope_id = 5;
+  // The measured offer: reviewed submits, those approved unchanged, and
+  // denied ones (incidents).
+  uint32 reviews = 6;
+  uint32 approved_unchanged = 7;
+  uint32 incidents = 8;
+  // Whether the agent has earned apply and does not hold it yet.
+  bool eligible = 9;
+}
+
+// Experimental (#3086). Needs namespace read; a caller without it gets
+// NOT_FOUND.
+message GetAgentAutonomyRequest {
+  string namespace = 1;
+  string principal = 2;
+  string type_id = 3;
+}
+
+message GetAgentAutonomyResponse {
+  AgentAutonomy autonomy = 1;
+}
+
+// Experimental (#3086). Needs namespace admin. Every change writes the
+// existing grant or revoke Decision receipt; setting the current mode again
+// changes nothing.
+message SetAgentAutonomyRequest {
+  string namespace = 1;
+  string principal = 2;
+  string type_id = 3;
+  // "propose" or "apply". Apply is refused unless the agent is eligible.
+  string mode = 4;
+  // Required for apply: the agent's live autonomous envelope.
+  string envelope_id = 5;
+  // Recorded on a revoke; defaults to "admin".
+  string reason = 6;
+}
+
+message SetAgentAutonomyResponse {
+  AgentAutonomy autonomy = 1;
+}
+
 message GetDecisionTrendResponse {
   // The `decision_trend/v1` report as JSON, the same document
   // `sekaictl report decisions --json` prints: per action type window
@@ -6822,6 +6873,9 @@ service SekaiService {
   rpc ListActionInstances(ListActionInstancesRequest) returns (ListActionInstancesResponse);
   // The decision trend report over governed Action instances (#3090).
   rpc GetDecisionTrend(GetDecisionTrendRequest) returns (GetDecisionTrendResponse);
+  // Experimental: read and change an agent's autonomy per Action type (#3086).
+  rpc GetAgentAutonomy(GetAgentAutonomyRequest) returns (GetAgentAutonomyResponse);
+  rpc SetAgentAutonomy(SetAgentAutonomyRequest) returns (SetAgentAutonomyResponse);
   // Experimental: decisions the caller may make across review kinds (#2203).
   rpc ListPendingDecisions(ListPendingDecisionsRequest) returns (ListPendingDecisionsResponse);
   // Typed effects on admitted ActionInstances (#398).
