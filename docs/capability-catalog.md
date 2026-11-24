@@ -523,6 +523,31 @@ neighborhood walks to the session namespace: a start object outside it is not
 found, and objects outside it are left out as if unreadable, even when the
 principal may read them over direct gRPC.
 
+### Dataset branch tools
+
+An agent can develop a transform against an isolated copy of a dataset and
+propose its merge (#2433). Merge stays a human decision over gRPC
+(`MergeDatasetBranch`), and the server refuses it from the principal that
+created the proposal, as for definition branches.
+
+- `sekai.datasets.branch.create` → `CreateDatasetBranch` requires `datasetId`
+  and `name` and accepts `fromVersionId` (empty forks the latest version).
+- `sekai.transforms.run_on_branch` → `RunGovernedTransformOnBranch` requires
+  `transformId` and `branch`. The transform writes the output dataset's
+  branch, never the live dataset. Like the RPC, it needs a credential
+  administrator.
+- `sekai.datasets.branch.compare` → `CompareDatasetBranch` requires
+  `datasetId` and `name` and returns column changes, row counts, and digests.
+- `sekai.datasets.branch.propose_merge` → `ProposeDatasetBranchMerge` requires
+  `datasetId` and `name`. A proposal id it returns can be named in
+  `sekai.definitions.proposal.create` so both merge together (#2199).
+
+The server confines the dataset tools to datasets bound in the session
+namespace: any other dataset reads as not found, even when the principal may
+use it over direct gRPC. The transform run binds `namespace` to the session.
+All four RPCs are `experimental`, so these tools are listed and run only when
+experimental RPCs are enabled (`SEKAI_EXPERIMENTAL_RPCS=1`).
+
 ### Rehearsal tools
 
 Read-only tools let an agent see what a change or a run would do before it

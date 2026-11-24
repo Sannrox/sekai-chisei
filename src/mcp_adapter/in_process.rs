@@ -1422,4 +1422,212 @@ mod tests {
         .await;
         assert_eq!(drifted["error"]["code"], -32602, "{drifted}");
     }
+
+    /// The synthetic plane as `principal`, with datasets `in` and `out`
+    /// bound to widget-1 in the session namespace, `foreign` bound to an
+    /// object in another one, and transform `t1` filtering `in` into `out`.
+    async fn dataset_branch_surface(principal: &str) -> InProcessSurface {
+        use crate::sekai::dataset::{ColumnDef, Dataset};
+        use crate::sekai::governed_transform::{GovernedTransform, TransformStep};
+        let mut surface = InProcessSurface::synthetic().await.unwrap();
+        surface.principal = principal.into();
+        for (id, object_id) in [
+            ("in", OBJECT_ID),
+            ("out", OBJECT_ID),
+            ("foreign", FOREIGN_OBJECT_ID),
+        ] {
+            surface
+                .db
+                .create_dataset(&Dataset {
+                    id: id.into(),
+                    name: id.into(),
+                    columns: ["id", "keep"]
+                        .map(|name| ColumnDef {
+                            name: name.into(),
+                            col_type: "string".into(),
+                            classification: "public".into(),
+                        })
+                        .to_vec(),
+                    object_id: object_id.into(),
+                    created: 1,
+                    partition_keys: Vec::new(),
+                })
+                .unwrap();
+        }
+        let row = |id: &str, keep: &str| {
+            HashMap::from([
+                ("id".to_string(), id.to_string()),
+                ("keep".into(), keep.into()),
+            ])
+        };
+        surface
+            .db
+            .append_rows("in", &[row("1", "yes"), row("2", "no"), row("3", "yes")])
+            .unwrap();
+        let transform = GovernedTransform {
+            contract_version: crate::sekai::governed_transform::CONTRACT_VERSION.into(),
+            namespace: NAMESPACE.into(),
+            transform_id: "t1".into(),
+            input_dataset_id: "in".into(),
+            output_dataset_id: "out".into(),
+            steps: vec![TransformStep {
+                kind: "filter".into(),
+                column: "keep".into(),
+                op: "eq".into(),
+                value: "yes".into(),
+                columns: Vec::new(),
+            }],
+            quality_rule: String::new(),
+            definition_digest: String::new(),
+            analytical: None,
+            isolated_process: None,
+            schedule: None,
+            trigger: None,
+        }
+        .prepare()
+        .unwrap();
+        surface.db.put_governed_transform(&transform, 1).unwrap();
+        surface
+    }
+
+    #[tokio::test]
+    async fn an_agent_develops_a_transform_on_a_branch_and_proposes_its_merge() {
+        use crate::grpc::pb::sekai::MergeDatasetBranchRequest;
+        use crate::mcp_adapter::protocol::{
+            COMPARE_DATASET_BRANCH_TOOL, CREATE_DATASET_BRANCH_TOOL, PROPOSE_DATASET_MERGE_TOOL,
+            RUN_TRANSFORM_ON_BRANCH_TOOL,
+        };
+        let surface = dataset_branch_surface("local").await;
+        let branch = json!({"datasetId": "out", "name": "dev"});
+        let created = call(&surface, CREATE_DATASET_BRANCH_TOOL, branch.clone()).await;
+        call_output(created).unwrap_or_else(|error| panic!("{error}"));
+        let ran = call(
+            &surface,
+            RUN_TRANSFORM_ON_BRANCH_TOOL,
+            json!({"transformId": "t1", "branch": "dev"}),
+        )
+        .await;
+        let ran = call_output(ran).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(ran["output"]["rowsWritten"], 2, "{ran}");
+        let compared = call(&surface, COMPARE_DATASET_BRANCH_TOOL, branch.clone()).await;
+        let compared = call_output(compared).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(compared["output"]["branchRows"], 2, "{compared}");
+        let proposed = call(&surface, PROPOSE_DATASET_MERGE_TOOL, branch).await;
+        let proposed = call_output(proposed).unwrap_or_else(|error| panic!("{error}"));
+        let proposal_id = proposed["output"]["proposal"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{proposed}"))
+            .to_string();
+        let live = surface
+            .db
+            .query_rows("out", &crate::sekai::dataset::RowQuery::default())
+            .unwrap();
+        assert!(live.is_empty(), "live dataset changed before a merge");
+        // The proposer cannot merge its own proposal.
+        let own = surface
+            .sekai
+            .merge_dataset_branch(with_identity(
+                MergeDatasetBranchRequest {
+                    dataset_id: "out".into(),
+                    proposal_id,
+                    reason: String::new(),
+                },
+                "local",
+                NAMESPACE,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(own.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn dataset_branch_tools_reach_only_the_session_namespace() {
+        use crate::grpc::pb::sekai::CompareDatasetBranchRequest;
+        use crate::grpc::pb::sekai::CreateGrantRequest;
+        use crate::mcp_adapter::protocol::{
+            COMPARE_DATASET_BRANCH_TOOL, CREATE_DATASET_BRANCH_TOOL,
+        };
+        let surface = dataset_branch_surface("local").await;
+        // The principal may write the foreign dataset, so only the session
+        // namespace stands between the tool and it.
+        surface
+            .sekai
+            .create_grant(with_identity(
+                CreateGrantRequest {
+                    grant: Some(crate::grpc::pb::sekai::Grant {
+                        id: "foreign-writer".into(),
+                        object_id: FOREIGN_OBJECT_ID.into(),
+                        principal: "local".into(),
+                        role: "editor".into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+                FOREIGN_NAMESPACE,
+            ))
+            .await
+            .unwrap();
+        let foreign = json!({"datasetId": "foreign", "name": "dev"});
+        let created = call(&surface, CREATE_DATASET_BRANCH_TOOL, foreign.clone()).await;
+        let refused = call_output(created.clone()).unwrap_err();
+        assert!(refused.contains("\"not_found\""), "{created}");
+        // Direct gRPC still reaches it, so the refusal is the session's.
+        surface
+            .db
+            .create_dataset_branch(&crate::sekai::dataset_branch::CreateDatasetBranch {
+                dataset_id: "foreign".into(),
+                name: "dev".into(),
+                actor: "local".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        surface
+            .sekai
+            .compare_dataset_branch(with_identity(
+                CompareDatasetBranchRequest {
+                    dataset_id: "foreign".into(),
+                    name: "dev".into(),
+                },
+                "local",
+                NAMESPACE,
+            ))
+            .await
+            .unwrap();
+        let compared = call(&surface, COMPARE_DATASET_BRANCH_TOOL, foreign).await;
+        assert!(call_output(compared.clone()).is_err(), "{compared}");
+    }
+
+    #[tokio::test]
+    async fn a_branch_run_the_rpc_refuses_is_refused_the_same_way() {
+        use crate::grpc::pb::sekai::RunGovernedTransformOnBranchRequest;
+        use crate::mcp_adapter::protocol::RUN_TRANSFORM_ON_BRANCH_TOOL;
+        let surface = dataset_branch_surface(PRINCIPAL).await;
+        let rpc = surface
+            .sekai
+            .run_governed_transform_on_branch(with_identity(
+                RunGovernedTransformOnBranchRequest {
+                    namespace: NAMESPACE.into(),
+                    transform_id: "t1".into(),
+                    branch: "dev".into(),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap_err();
+        let called = call(
+            &surface,
+            RUN_TRANSFORM_ON_BRANCH_TOOL,
+            json!({"transformId": "t1", "branch": "dev"}),
+        )
+        .await;
+        let refused = call_output(called.clone()).unwrap_err();
+        let AdapterError::Projected(expected) = status_error(rpc) else {
+            unreachable!()
+        };
+        assert!(
+            refused.contains(&format!("\"{}\"", expected.code)),
+            "{called}"
+        );
+    }
 }

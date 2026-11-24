@@ -6210,7 +6210,17 @@ pub(super) fn branch_caller<T: 'static>(
         .get_dataset(dataset_id)
         .map_err(Status::internal)?
         .ok_or_else(|| Status::not_found("dataset not found"))?;
-    authorize_dataset(service, &principals, context.as_ref(), &dataset, write)?;
+    let access = authorize_dataset_access(service, &principals, context.as_ref(), &dataset, write)?;
+    // An MCP session reaches only datasets bound in its namespace; any other
+    // dataset looks absent, even one the principal may use over gRPC.
+    if let Some(session) = SekaiServiceImpl::mcp_session_namespace(req)
+        && access
+            .binding
+            .as_ref()
+            .is_none_or(|binding| binding.namespace != session)
+    {
+        return Err(Status::not_found("dataset not found"));
+    }
     let actor = principals
         .first()
         .cloned()
