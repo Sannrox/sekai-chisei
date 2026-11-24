@@ -35,6 +35,7 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.definitions.proposal.create",
             "sekai.search.query",
             "sekai.lineage.get",
+            "sekai.agents.memory.list",
             "sekai.datasets.branch.create",
             "sekai.transforms.run_on_branch",
             "sekai.datasets.branch.compare",

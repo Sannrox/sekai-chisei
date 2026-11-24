@@ -223,7 +223,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ClaimWork` | `sekai.datasets, sekai.graph, sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.HeartbeatWorkClaim` | `sekai.datasets, sekai.graph, sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.AckWork` | `sekai.graph, sekai.audit` | yes | sdk | `stable` |
-| `SekaiService.ListSiteAgentWorkingMemory` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
+| `SekaiService.ListSiteAgentWorkingMemory` | `sekai.graph, sekai.audit` | yes | mcp | `experimental` |
 | `SekaiService.HeartbeatTransformClaim` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |

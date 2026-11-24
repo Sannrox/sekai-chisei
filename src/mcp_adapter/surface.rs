@@ -68,6 +68,7 @@ pub enum NativeRpc {
     RunGovernedTransformOnBranch,
     CompareDatasetBranch,
     ProposeDatasetBranchMerge,
+    ListSiteAgentWorkingMemory,
 }
 
 impl NativeRpc {
@@ -103,6 +104,7 @@ impl NativeRpc {
             Self::RunGovernedTransformOnBranch => "RunGovernedTransformOnBranch",
             Self::CompareDatasetBranch => "CompareDatasetBranch",
             Self::ProposeDatasetBranchMerge => "ProposeDatasetBranchMerge",
+            Self::ListSiteAgentWorkingMemory => "ListSiteAgentWorkingMemory",
             Self::RunTransformChain => "RunTransformChain",
             Self::GetTransformChainRun => "GetTransformChainRun",
         }
@@ -390,6 +392,11 @@ pub async fn dispatch_native(
         NativeRpc::DryRunAgent => {
             dispatch_sekai_json(sekai.dry_run_agent(bind_json(&invocation)?).await)
         }
+        NativeRpc::ListSiteAgentWorkingMemory => dispatch_sekai_json(
+            sekai
+                .list_site_agent_working_memory(bind_json(&invocation)?)
+                .await,
+        ),
         NativeRpc::CreateDatasetBranch => {
             dispatch_sekai_json(sekai.create_dataset_branch(bind_json(&invocation)?).await)
         }
@@ -800,9 +807,10 @@ impl NativeSurface for FixtureSurface {
             | NativeRpc::CreateDatasetBranch
             | NativeRpc::RunGovernedTransformOnBranch
             | NativeRpc::CompareDatasetBranch
-            | NativeRpc::ProposeDatasetBranchMerge => Err(projected(
+            | NativeRpc::ProposeDatasetBranchMerge
+            | NativeRpc::ListSiteAgentWorkingMemory => Err(projected(
                 "unimplemented",
-                "the fixture surface holds no definitions, plans, datasets, or transforms",
+                "the fixture surface holds no definitions, plans, agents, datasets, or transforms",
                 &invocation.capability,
                 &invocation.operation_id,
             )),
@@ -1197,6 +1205,17 @@ impl NativeSurface for SdkSurface {
                 let response = with_timeout(
                     self.config.timeout,
                     client.dry_run_agent(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ListSiteAgentWorkingMemory => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.list_site_agent_working_memory(bind_json(&invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)

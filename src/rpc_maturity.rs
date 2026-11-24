@@ -313,6 +313,7 @@ pub fn capability_backing_rpc(name: &str) -> Option<&'static str> {
         "sekai.transforms.chain" | "sekai.transforms.chain.run" => Some("RunTransformChain"),
         "sekai.transforms.chain.status" => Some("GetTransformChainRun"),
         "sekai.agents.dry_run" => Some("DryRunAgent"),
+        "sekai.agents.memory.list" => Some("ListSiteAgentWorkingMemory"),
         "sekai.datasets.branch.create" => Some("CreateDatasetBranch"),
         "sekai.transforms.run_on_branch" => Some("RunGovernedTransformOnBranch"),
         "sekai.datasets.branch.compare" => Some("CompareDatasetBranch"),

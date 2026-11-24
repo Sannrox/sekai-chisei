@@ -999,7 +999,7 @@
       "rpc": "ListSiteAgentWorkingMemory",
       "storage_path": "sekai.graph, sekai.audit",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
