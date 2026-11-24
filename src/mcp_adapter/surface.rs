@@ -64,6 +64,10 @@ pub enum NativeRpc {
     SimulatePlan,
     PreviewGovernedTransform,
     DryRunDefinitionChangeBundle,
+    CreateDatasetBranch,
+    RunGovernedTransformOnBranch,
+    CompareDatasetBranch,
+    ProposeDatasetBranchMerge,
 }
 
 impl NativeRpc {
@@ -95,6 +99,10 @@ impl NativeRpc {
             Self::SimulatePlan => "SimulatePlan",
             Self::PreviewGovernedTransform => "PreviewGovernedTransform",
             Self::DryRunDefinitionChangeBundle => "DryRunDefinitionChangeBundle",
+            Self::CreateDatasetBranch => "CreateDatasetBranch",
+            Self::RunGovernedTransformOnBranch => "RunGovernedTransformOnBranch",
+            Self::CompareDatasetBranch => "CompareDatasetBranch",
+            Self::ProposeDatasetBranchMerge => "ProposeDatasetBranchMerge",
             Self::RunTransformChain => "RunTransformChain",
             Self::GetTransformChainRun => "GetTransformChainRun",
         }
@@ -382,6 +390,22 @@ pub async fn dispatch_native(
         NativeRpc::DryRunAgent => {
             dispatch_sekai_json(sekai.dry_run_agent(bind_json(&invocation)?).await)
         }
+        NativeRpc::CreateDatasetBranch => {
+            dispatch_sekai_json(sekai.create_dataset_branch(bind_json(&invocation)?).await)
+        }
+        NativeRpc::RunGovernedTransformOnBranch => dispatch_sekai_json(
+            sekai
+                .run_governed_transform_on_branch(bind_json(&invocation)?)
+                .await,
+        ),
+        NativeRpc::CompareDatasetBranch => {
+            dispatch_sekai_json(sekai.compare_dataset_branch(bind_json(&invocation)?).await)
+        }
+        NativeRpc::ProposeDatasetBranchMerge => dispatch_sekai_json(
+            sekai
+                .propose_dataset_branch_merge(bind_json(&invocation)?)
+                .await,
+        ),
         NativeRpc::SimulatePlan => {
             dispatch_sekai_json(sekai.simulate_plan(bind_json(&invocation)?).await)
         }
@@ -772,9 +796,13 @@ impl NativeSurface for FixtureSurface {
             NativeRpc::DryRunAgent
             | NativeRpc::SimulatePlan
             | NativeRpc::PreviewGovernedTransform
-            | NativeRpc::DryRunDefinitionChangeBundle => Err(projected(
+            | NativeRpc::DryRunDefinitionChangeBundle
+            | NativeRpc::CreateDatasetBranch
+            | NativeRpc::RunGovernedTransformOnBranch
+            | NativeRpc::CompareDatasetBranch
+            | NativeRpc::ProposeDatasetBranchMerge => Err(projected(
                 "unimplemented",
-                "the fixture surface holds no definitions, plans, or transforms",
+                "the fixture surface holds no definitions, plans, datasets, or transforms",
                 &invocation.capability,
                 &invocation.operation_id,
             )),
@@ -1169,6 +1197,50 @@ impl NativeSurface for SdkSurface {
                 let response = with_timeout(
                     self.config.timeout,
                     client.dry_run_agent(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::CreateDatasetBranch => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.create_dataset_branch(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::RunGovernedTransformOnBranch => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.run_governed_transform_on_branch(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::CompareDatasetBranch => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.compare_dataset_branch(bind_json(&invocation)?),
+                )
+                .await?;
+                serde_json::to_value(response)
+                    .map_err(|error| AdapterError::Protocol(error.to_string()))
+            }
+            NativeRpc::ProposeDatasetBranchMerge => {
+                let channel = self.channel().await?;
+                let mut client = SekaiServiceClient::new(channel);
+                let response = with_timeout(
+                    self.config.timeout,
+                    client.propose_dataset_branch_merge(bind_json(&invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)

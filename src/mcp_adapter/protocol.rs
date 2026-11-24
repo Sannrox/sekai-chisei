@@ -55,6 +55,14 @@ pub const DRY_RUN_AGENT_TOOL: &str = "sekai.agents.dry_run";
 pub const SIMULATE_PLAN_TOOL: &str = "sekai.plans.simulate";
 pub const PREVIEW_TRANSFORM_TOOL: &str = "sekai.transforms.preview";
 pub const DRY_RUN_CHANGE_BUNDLE_TOOL: &str = "sekai.definitions.change_bundle.dry_run";
+/// Dataset branch tools (#2433): develop a transform on an isolated copy of
+/// a dataset and propose its merge. Merge stays a human decision over gRPC.
+/// The server confines each call to datasets bound in the session namespace.
+/// All four RPCs are experimental.
+pub const CREATE_DATASET_BRANCH_TOOL: &str = "sekai.datasets.branch.create";
+pub const RUN_TRANSFORM_ON_BRANCH_TOOL: &str = "sekai.transforms.run_on_branch";
+pub const COMPARE_DATASET_BRANCH_TOOL: &str = "sekai.datasets.branch.compare";
+pub const PROPOSE_DATASET_MERGE_TOOL: &str = "sekai.datasets.branch.propose_merge";
 /// Experimental (#2119). Listed only when experimental RPCs are enabled.
 pub const RUN_TRANSFORM_CHAIN_TOOL: &str = "sekai.transforms.chain.run";
 pub const GET_TRANSFORM_CHAIN_RUN_TOOL: &str = "sekai.transforms.chain.status";
@@ -117,6 +125,10 @@ pub fn rpc_for_tool(name: &str) -> Option<NativeRpc> {
         GET_CLASS_TOOL => Some(NativeRpc::GetOntologyClass),
         NEIGHBORHOOD_TOOL => Some(NativeRpc::ExpandNeighborhood),
         GET_LINEAGE_TOOL => Some(NativeRpc::GetLineage),
+        CREATE_DATASET_BRANCH_TOOL => Some(NativeRpc::CreateDatasetBranch),
+        RUN_TRANSFORM_ON_BRANCH_TOOL => Some(NativeRpc::RunGovernedTransformOnBranch),
+        COMPARE_DATASET_BRANCH_TOOL => Some(NativeRpc::CompareDatasetBranch),
+        PROPOSE_DATASET_MERGE_TOOL => Some(NativeRpc::ProposeDatasetBranchMerge),
         DRY_RUN_AGENT_TOOL => Some(NativeRpc::DryRunAgent),
         SIMULATE_PLAN_TOOL => Some(NativeRpc::SimulatePlan),
         PREVIEW_TRANSFORM_TOOL => Some(NativeRpc::PreviewGovernedTransform),
@@ -174,7 +186,7 @@ fn initialize(params: Value) -> Result<Value, Value> {
         "protocolVersion": protocol_version,
         "capabilities": {"tools": {"listChanged": false}},
         "serverInfo": {"name":"sekai-mcp","version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, rehearsal (dry-run, simulate, preview), and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
+        "instructions": "Projection host over GetObject, EvaluateObjectSet, DescribeObjectAction, PreviewObjectAction, SubmitActionInstance, GetOperationReceipt, GetLinks, CreateLink, PutEvaluationPlan, ResolveEvaluationPlan, ExecuteEvaluationManifest, Search, GetLineage, ontology discovery, rehearsal (dry-run, simulate, preview), dataset-branch, and definition-branch tools. Discovery is not a grant. Approve and merge stay off this surface."
     }))
 }
 
@@ -511,6 +523,32 @@ fn bind_session_input(
             }
             object.insert("namespace".into(), json!(context.namespace));
         }
+        NativeRpc::CreateDatasetBranch
+        | NativeRpc::CompareDatasetBranch
+        | NativeRpc::ProposeDatasetBranchMerge => {
+            // A dataset request names no namespace; the server checks the
+            // dataset's binding against the session instead.
+            if object.contains_key("namespace") {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"dataset branch tools take no input.namespace; the session namespace applies"
+                }));
+            }
+            if rpc == NativeRpc::CreateDatasetBranch && !object.contains_key("from_version_id") {
+                object.entry("fromVersionId").or_insert_with(|| json!(""));
+            }
+        }
+        NativeRpc::RunGovernedTransformOnBranch => {
+            if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
+                && namespace != context.namespace
+            {
+                return Err(json!({
+                    "code":-32602,
+                    "message":"transform namespace must match the authenticated adapter session"
+                }));
+            }
+            object.insert("namespace".into(), json!(context.namespace));
+        }
         NativeRpc::SimulatePlan => {
             if let Some(namespace) = object.get("namespace").and_then(Value::as_str)
                 && namespace != context.namespace
@@ -828,6 +866,38 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
 
 fn experimental_entries() -> Vec<CapabilityEntry> {
     vec![
+        capability_entry(
+            CREATE_DATASET_BRANCH_TOOL,
+            "Create a named branch of a dataset, forked from its latest or a given version; the live dataset is untouched.",
+            "action",
+            "sekai.CreateDatasetBranchRequest",
+            "sekai.CreateDatasetBranchResponse",
+            "write",
+        ),
+        capability_entry(
+            RUN_TRANSFORM_ON_BRANCH_TOOL,
+            "Run a governed transform with its output written to a dataset branch instead of the live dataset.",
+            "action",
+            "sekai.RunGovernedTransformOnBranchRequest",
+            "sekai.RunGovernedTransformOnBranchResponse",
+            "write",
+        ),
+        capability_entry(
+            COMPARE_DATASET_BRANCH_TOOL,
+            "Compare a dataset branch with its base: columns added or removed, row counts, and digests.",
+            "query",
+            "sekai.CompareDatasetBranchRequest",
+            "sekai.CompareDatasetBranchResponse",
+            "read",
+        ),
+        capability_entry(
+            PROPOSE_DATASET_MERGE_TOOL,
+            "Propose merging a dataset branch; another principal merges it over gRPC.",
+            "action",
+            "sekai.ProposeDatasetBranchMergeRequest",
+            "sekai.ProposeDatasetBranchMergeResponse",
+            "write",
+        ),
         capability_entry(
             DRY_RUN_AGENT_TOOL,
             "Dry-run an agent definition revision: its model steps, tool calls, and the Actions it would propose, none submitted.",

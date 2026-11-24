@@ -1890,7 +1890,7 @@
       "rpc": "CreateDatasetBranch",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -1917,7 +1917,7 @@
       "rpc": "CompareDatasetBranch",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -1926,7 +1926,7 @@
       "rpc": "ProposeDatasetBranchMerge",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
@@ -1980,7 +1980,7 @@
       "rpc": "RunGovernedTransformOnBranch",
       "storage_path": "sekai.datasets",
       "real_backend": "yes",
-      "consumer": "none",
+      "consumer": "mcp",
       "classification": "experimental",
       "product_tier": "experimental"
     },
