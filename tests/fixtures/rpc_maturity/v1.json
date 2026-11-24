@@ -1630,7 +1630,7 @@
       "storage_path": "sekai.graph",
       "real_backend": "yes",
       "consumer": "mcp",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "experimental"
     },
     {
@@ -1729,7 +1729,7 @@
       "storage_path": "sekai.ontology-definitions",
       "real_backend": "yes",
       "consumer": "mcp",
-      "classification": "experimental",
+      "classification": "stable",
       "product_tier": "core"
     },
     {

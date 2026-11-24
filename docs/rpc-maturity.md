@@ -293,7 +293,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.PutSyncScope` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncSnapshot` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.ReadSyncDeltas` | `sekai.graph` | yes | none | `experimental` |
-| `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | mcp | `experimental` |
+| `SekaiService.ExpandNeighborhood` | `sekai.graph` | yes | mcp | `stable` |
 | `SekaiService.FindPaths` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.RetrieveContext` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
 | `SekaiService.ExpandRelations` | `sekai.graph, sekai.authorization, sekai.ontology-definitions` | yes | cli, sdk | `stable` |
@@ -304,7 +304,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ListSchemaTypes` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.CreateSchemaType` | `sekai.graph` | yes | sdk, cli | `stable` |
 | `SekaiService.ListOntologyClasses` | `sekai.ontology-definitions` | yes | mcp | `experimental` |
-| `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | mcp | `experimental` |
+| `SekaiService.GetOntologyClass` | `sekai.ontology-definitions` | yes | mcp | `stable` |
 | `SekaiService.CreateOntologyClass` | `sekai.ontology-definitions` | yes | cli | `stable` |
 | `SekaiService.DeleteOntologyClass` | `sekai.ontology-definitions` | sqlite only | none | `experimental` |
 | `SekaiService.ListOntologyRelations` | `sekai.ontology-definitions` | yes | none | `experimental` |

@@ -35,6 +35,8 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.definitions.proposal.create",
             "sekai.search.query",
             "sekai.lineage.get",
+            "sekai.ontology.classes.get",
+            "sekai.relations.neighborhood",
             "sekai.agents.memory.list",
             "sekai.datasets.branch.create",
             "sekai.transforms.run_on_branch",
@@ -45,8 +47,6 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.transforms.preview",
             "sekai.definitions.change_bundle.dry_run",
             "sekai.ontology.classes.list",
-            "sekai.ontology.classes.get",
-            "sekai.relations.neighborhood",
             "sekai.transforms.chain.run",
             "sekai.transforms.chain.status"
         ]

@@ -511,14 +511,14 @@ or refused the same way.
 - `sekai.lineage.get` → `GetLineage` (`stable`, always listed). It requires
   `object_id` and accepts `max_nodes` from 0 to 500; a larger value is refused
   rather than truncated.
-- `sekai.ontology.classes.list` → `ListOntologyClasses` takes no input.
-- `sekai.ontology.classes.get` → `GetOntologyClass` requires `name`.
-- `sekai.relations.neighborhood` → `ExpandNeighborhood` requires `seed_ids`
-  and accepts `relations`, `object_kinds`, `depth`, `fan_out_cap`, and
-  `limit`. Values past the RPC bounds are refused.
-
-The last three RPCs are `experimental`, so those tools are listed and run only
-when experimental RPCs are enabled. The server confines the lineage and
+- `sekai.ontology.classes.get` → `GetOntologyClass` (`stable`, always
+  listed) requires `name`.
+- `sekai.relations.neighborhood` → `ExpandNeighborhood` (`stable`, always
+  listed) requires `seed_ids` and accepts `relations`, `object_kinds`,
+  `depth`, `fan_out_cap`, and `limit`. Values past the RPC bounds are refused.
+- `sekai.ontology.classes.list` → `ListOntologyClasses` takes no input. It is
+  `experimental` until it pages (#2666), so it is listed and runs only when
+  experimental RPCs are enabled. The server confines the lineage and
 neighborhood walks to the session namespace: a start object outside it is not
 found, and objects outside it are left out as if unreadable, even when the
 principal may read them over direct gRPC.
