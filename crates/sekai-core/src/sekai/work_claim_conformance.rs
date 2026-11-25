@@ -327,6 +327,7 @@ impl Subject<'_> {
                     &self.id,
                     held.fence(),
                     SyncOutcome::Completed,
+                    source_sync::SyncNotes::default(),
                     now_ms,
                 )
                 .unwrap_err()

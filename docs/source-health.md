@@ -23,6 +23,13 @@ The CLI reads through `GetSourceHealth` on a running plane with
 `SEKAI_EXPERIMENTAL_RPCS=1` (`--target`, else `CHISEI_GRPC_URL`, else
 `SEKAI_SOCKET`). `--actor` is retired: the plane audits the credential.
 
+A disclosed report also carries `sync_notes`, the bounded notes the connector
+runtime reported on the last finished sync of the one Source that owns the
+`source_instance`: skipped offset ranges and skipped records by partition and
+offset, at most 64 plus an overflow count, never record content
+([ADR 0163](decisions/0163-source-sync-notes.md)). `GetSource` returns the same
+notes as `sync.last_notes`.
+
 [Ontology health](ontology-health.md) scores the namespace's visible sources
 as its `source` part.
 

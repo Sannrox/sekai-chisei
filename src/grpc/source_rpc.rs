@@ -11,7 +11,9 @@
 
 use super::*;
 use crate::sekai::source::{self, PutSource, Source, SourceError, SourceSpec, SourceStatus};
-use crate::sekai::source_sync::{self, SyncError, SyncFailure, SyncOutcome};
+use crate::sekai::source_sync::{
+    self, SkipReason, SyncError, SyncFailure, SyncNote, SyncNotes, SyncOutcome,
+};
 use crate::sekai::work_claim::{ClaimError, Fence};
 use sekai_source_sdk::{ConfigValue, SourceConfig};
 
@@ -123,6 +125,69 @@ fn spec_to_proto(spec: SourceSpec) -> ConnectorSourceSpec {
     }
 }
 
+/// The wire notes of an `AckWork` (ADR 0163); none when absent.
+pub(super) fn sync_notes_from_proto(notes: Option<SourceSyncNotes>) -> Result<SyncNotes, Status> {
+    let Some(notes) = notes else {
+        return Ok(SyncNotes::default());
+    };
+    let refuse =
+        || Status::invalid_argument("a source sync note names an offset gap or a skipped record");
+    let parsed = notes
+        .notes
+        .into_iter()
+        .map(|note| match note.note.ok_or_else(refuse)? {
+            source_sync_note::Note::OffsetGap(gap) => Ok(SyncNote::OffsetGap {
+                partition: gap.partition,
+                from_offset: gap.from_offset,
+                to_offset: gap.to_offset,
+            }),
+            source_sync_note::Note::SkippedRecord(skipped) => Ok(SyncNote::SkippedRecord {
+                partition: skipped.partition,
+                offset: skipped.offset,
+                reason: SkipReason::from_wire_name(&skipped.reason).ok_or_else(|| {
+                    Status::invalid_argument("a skipped record's reason is not_json or missing_id")
+                })?,
+            }),
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    SyncNotes::new(parsed, notes.overflow_count).map_err(Status::invalid_argument)
+}
+
+pub(super) fn sync_notes_to_proto(notes: &SyncNotes) -> SourceSyncNotes {
+    SourceSyncNotes {
+        notes: notes
+            .notes()
+            .iter()
+            .filter_map(|note| {
+                let note = match *note {
+                    SyncNote::OffsetGap {
+                        partition,
+                        from_offset,
+                        to_offset,
+                    } => source_sync_note::Note::OffsetGap(source_sync_note::OffsetGap {
+                        partition,
+                        from_offset,
+                        to_offset,
+                    }),
+                    SyncNote::SkippedRecord {
+                        partition,
+                        offset,
+                        reason,
+                    } => source_sync_note::Note::SkippedRecord(source_sync_note::SkippedRecord {
+                        partition,
+                        offset,
+                        reason: reason.wire_name().into(),
+                    }),
+                    // A note kind this wire predates has no shape here.
+                    _ => return None,
+                };
+                Some(SourceSyncNote { note: Some(note) })
+            })
+            .collect(),
+        overflow_count: notes.overflow(),
+    }
+}
+
 pub(super) fn source_to_proto(source: Source) -> ConnectorSource {
     let sync = &source.sync;
     let held = sync.claim.expires_at_ms > 0;
@@ -138,6 +203,7 @@ pub(super) fn source_to_proto(source: Source) -> ConnectorSource {
         },
         claim_expires_at_ms: sync.claim.expires_at_ms,
         due: source.status == SourceStatus::Active && sync.due_bucket > sync.done_bucket,
+        last_notes: sync.current_notes().map(sync_notes_to_proto),
     };
     ConnectorSource {
         namespace: source.namespace,
@@ -374,7 +440,8 @@ impl SekaiServiceImpl {
     }
 
     /// `AckWork` for a Source sync: `completed`, or `failed` with the
-    /// failure class as reason.
+    /// failure class as reason, either with the notes the runtime reports.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn ack_source_sync<T: std::any::Any>(
         &self,
         req: &Request<T>,
@@ -383,8 +450,10 @@ impl SekaiServiceImpl {
         fence: Fence<'_>,
         outcome: &str,
         reason: &str,
+        notes: Option<SourceSyncNotes>,
     ) -> Result<ConnectorSource, Status> {
         self.source_sync_runtime(req, namespace)?;
+        let notes = sync_notes_from_proto(notes)?;
         let outcome = match outcome {
             "completed" => SyncOutcome::Completed,
             "failed" => match SyncFailure::from_wire_name(reason) {
@@ -407,6 +476,7 @@ impl SekaiServiceImpl {
             source_id,
             fence,
             outcome,
+            notes,
             now_millis(),
         )
         .map(source_to_proto)

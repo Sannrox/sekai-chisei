@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use sekai_types::governed_transform::{
     MAX_TRANSFORM_LEASE_EXPIRIES, normalize_transform_claim_ttl_ms, placement_satisfied,
 };
@@ -48,6 +50,147 @@ pub struct SyncState {
     pub last_failure: String,
     /// The runtime that finished the last bucket.
     pub last_runtime: String,
+    /// What the runtime noted on the bucket it finished last, read through
+    /// [`SyncState::current_notes`].
+    pub last_notes: StoredSyncNotes,
+}
+
+/// The most notes one sync keeps (ADR 0163); past it only a count.
+pub const MAX_SYNC_NOTES: usize = 64;
+
+/// Why a connector skipped one record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// The record's value is not JSON.
+    NotJson,
+    /// The record has no id field.
+    MissingId,
+}
+
+impl SkipReason {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::NotJson => "not_json",
+            Self::MissingId => "missing_id",
+        }
+    }
+
+    pub fn from_wire_name(name: &str) -> Option<Self> {
+        [Self::NotJson, Self::MissingId]
+            .into_iter()
+            .find(|reason| reason.wire_name() == name)
+    }
+}
+
+/// One thing a sync could not apply and reports instead of stalling. It
+/// names positions, never record content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SyncNote {
+    /// Retention passed the stored offset: offsets `from_offset` up to,
+    /// not including, `to_offset` were never read.
+    OffsetGap {
+        partition: i32,
+        from_offset: i64,
+        to_offset: i64,
+    },
+    /// The record at `offset` was skipped.
+    SkippedRecord {
+        partition: i32,
+        offset: i64,
+        reason: SkipReason,
+    },
+}
+
+/// The bounded notes of one sync: at most [`MAX_SYNC_NOTES`], and how many
+/// more the runtime did not send.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncNotes {
+    notes: Vec<SyncNote>,
+    overflow: i64,
+}
+
+impl SyncNotes {
+    /// Refuses more than [`MAX_SYNC_NOTES`] notes, a negative count or
+    /// position, and an empty or reversed gap.
+    pub fn new(notes: Vec<SyncNote>, overflow: i64) -> Result<Self, String> {
+        if notes.len() > MAX_SYNC_NOTES {
+            return Err(format!("a sync keeps at most {MAX_SYNC_NOTES} notes"));
+        }
+        if overflow < 0 {
+            return Err("the overflow count is not negative".into());
+        }
+        for note in &notes {
+            let valid = match *note {
+                SyncNote::OffsetGap {
+                    partition,
+                    from_offset,
+                    to_offset,
+                } => partition >= 0 && from_offset >= 0 && from_offset < to_offset,
+                SyncNote::SkippedRecord {
+                    partition, offset, ..
+                } => partition >= 0 && offset >= 0,
+            };
+            if !valid {
+                return Err(
+                    "a note names a partition and offsets that are not negative, \
+                     and a gap ends after it starts"
+                        .into(),
+                );
+            }
+        }
+        Ok(Self { notes, overflow })
+    }
+
+    pub fn notes(&self) -> &[SyncNote] {
+        &self.notes
+    }
+
+    /// Notes the runtime counted but did not send.
+    pub fn overflow(&self) -> i64 {
+        self.overflow
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty() && self.overflow == 0
+    }
+}
+
+/// Notes as stored with the sync outcome, stamped with the time of the
+/// finish that wrote them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredSyncNotes {
+    pub at_ms: i64,
+    #[serde(flatten)]
+    pub notes: SyncNotes,
+}
+
+impl StoredSyncNotes {
+    /// The stored column: empty for no notes.
+    pub fn encode(&self) -> String {
+        if self.notes.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(self).unwrap_or_default()
+        }
+    }
+
+    pub fn decode(column: &str) -> Result<Self, String> {
+        if column.is_empty() {
+            return Ok(Self::default());
+        }
+        let stored: Self = serde_json::from_str(column)
+            .map_err(|error| format!("decode source sync notes: {error}"))?;
+        // Re-validates, so a hand-edited row cannot exceed the bound.
+        let SyncNotes { notes, overflow } = stored.notes;
+        Ok(Self {
+            at_ms: stored.at_ms,
+            notes: SyncNotes::new(notes, overflow)?,
+        })
+    }
 }
 
 /// Why a sync bucket failed.
@@ -153,11 +296,20 @@ impl Source {
 }
 
 impl SyncState {
+    /// The notes of the last finished bucket. Notes written by an earlier
+    /// finish read as none: a plane that predates notes finishes a bucket
+    /// without clearing them.
+    pub fn current_notes(&self) -> Option<&SyncNotes> {
+        let finished_at = self.last_success_at_ms.max(self.last_failure_at_ms);
+        let stored = &self.last_notes;
+        (!stored.notes.is_empty() && stored.at_ms == finished_at).then_some(&stored.notes)
+    }
+
     /// Ends the claimed bucket; a failure also ends every bucket due by
     /// now, so the next attempt waits for the next interval. The owner,
     /// generation and token stay, so a retried acknowledge under the same
     /// fence can be matched.
-    fn finish(&mut self, outcome: SyncOutcome, now_ms: i64) {
+    fn finish(&mut self, outcome: SyncOutcome, notes: SyncNotes, now_ms: i64) {
         self.done_bucket = match outcome {
             SyncOutcome::Completed => self.claimed_bucket,
             SyncOutcome::Failed(_) => self.claimed_bucket.max(self.due_bucket),
@@ -165,6 +317,10 @@ impl SyncState {
         self.claim.expires_at_ms = 0;
         self.claim.lease_expiries = 0;
         self.last_runtime = self.claim.owner.clone();
+        self.last_notes = StoredSyncNotes {
+            at_ms: now_ms,
+            notes,
+        };
         match outcome {
             SyncOutcome::Completed => self.last_success_at_ms = now_ms,
             SyncOutcome::Failed(failure) => {
@@ -266,7 +422,11 @@ pub fn claim(
             Err(ClaimError::LeaseLimit) => {
                 // Fails the bucket and ends the lapsed claim, so its fence
                 // cannot replay an acknowledge.
-                sync.finish(SyncOutcome::Failed(SyncFailure::LeaseExpired), now_ms);
+                sync.finish(
+                    SyncOutcome::Failed(SyncFailure::LeaseExpired),
+                    SyncNotes::default(),
+                    now_ms,
+                );
                 sync.claim.fencing_token.clear();
                 return Ok(());
             }
@@ -339,14 +499,16 @@ pub fn heartbeat(
     })
 }
 
-/// Finishes the claimed bucket under the live `fence`. A retry under the
-/// fence that finished it succeeds without writing a second outcome.
+/// Finishes the claimed bucket under the live `fence`, with the notes the
+/// runtime reports on it. A retry under the fence that finished it succeeds
+/// without writing a second outcome or replacing the notes.
 pub fn acknowledge(
     db: &RuntimeDb,
     namespace: &str,
     source_id: &str,
     fence: Fence<'_>,
     outcome: SyncOutcome,
+    notes: SyncNotes,
     now_ms: i64,
 ) -> Result<Source, SyncError> {
     db.edit_source_sync(namespace, source_id, |source| {
@@ -361,7 +523,7 @@ pub fn acknowledge(
         sync.claim
             .release(hold, fence, now_ms)
             .map_err(SyncError::Claim)?;
-        sync.finish(outcome, now_ms);
+        sync.finish(outcome, notes, now_ms);
         Ok(())
     })
 }
@@ -398,6 +560,46 @@ mod tests {
 
     fn take(db: &RuntimeDb, ns: &str, owner: &str, now_ms: i64) -> Result<Source, SyncError> {
         claim(db, ns, "repo", owner, &labels("eu"), TTL, now_ms)
+    }
+
+    #[test]
+    fn a_sync_keeps_at_most_64_notes_and_never_a_reversed_gap() {
+        let skipped = |offset| SyncNote::SkippedRecord {
+            partition: 0,
+            offset,
+            reason: SkipReason::NotJson,
+        };
+        assert!(SyncNotes::new((0..64).map(skipped).collect(), 9).is_ok());
+        assert!(SyncNotes::new((0..65).map(skipped).collect(), 0).is_err());
+        let gap = SyncNote::OffsetGap {
+            partition: 0,
+            from_offset: 5,
+            to_offset: 5,
+        };
+        assert!(SyncNotes::new(vec![gap], 0).is_err());
+    }
+
+    /// A plane that predates notes finishes a bucket without clearing the
+    /// column; the stale notes must not read as that bucket's.
+    #[test]
+    fn notes_from_an_earlier_finish_read_as_none() {
+        let notes = SyncNotes::new(
+            vec![SyncNote::SkippedRecord {
+                partition: 1,
+                offset: 7,
+                reason: SkipReason::MissingId,
+            }],
+            0,
+        )
+        .unwrap();
+        let mut sync = SyncState::default();
+        sync.finish(SyncOutcome::Completed, notes.clone(), 100);
+        let stored = StoredSyncNotes::decode(&sync.last_notes.encode()).unwrap();
+        assert_eq!(stored, sync.last_notes);
+        assert_eq!(sync.current_notes(), Some(&notes));
+        // What an older plane writes: a later outcome, the column untouched.
+        sync.last_failure_at_ms = 200;
+        assert_eq!(sync.current_notes(), None);
     }
 
     /// The source_sync kind on either backend: schedule, placement, crash
@@ -456,21 +658,35 @@ mod tests {
                 "repo",
                 fence(&crashed),
                 SyncOutcome::Completed,
+                SyncNotes::default(),
                 now + TTL + 2
             ),
             Err(SyncError::Claim(ClaimError::FenceLost))
         );
 
-        // The current claim completes; its retry changes nothing.
+        // The current claim completes with notes, which the row keeps; its
+        // retry, even with other notes, changes nothing.
+        let notes = SyncNotes::new(
+            vec![SyncNote::OffsetGap {
+                partition: 2,
+                from_offset: 10,
+                to_offset: 40,
+            }],
+            3,
+        )
+        .unwrap();
         let done = acknowledge(
             db,
             ns,
             "repo",
             fence(&current),
             SyncOutcome::Completed,
+            notes.clone(),
             now + TTL + 3,
         )
         .unwrap();
+        assert_eq!(done.sync.current_notes(), Some(&notes));
+        assert_eq!(db.get_source(ns, "repo").unwrap(), Some(done.clone()));
         assert_eq!(
             (
                 done.sync.done_bucket,
@@ -487,6 +703,7 @@ mod tests {
                 "repo",
                 fence(&current),
                 SyncOutcome::Completed,
+                SyncNotes::new(Vec::new(), 1).unwrap(),
                 now + TTL + 9
             ),
             Ok(done)
@@ -509,6 +726,7 @@ mod tests {
             "repo",
             fence(&held),
             SyncOutcome::Failed(SyncFailure::Unavailable),
+            SyncNotes::default(),
             crossed + 1,
         )
         .unwrap();
@@ -548,6 +766,7 @@ mod tests {
                 "repo",
                 fence(&held),
                 SyncOutcome::Completed,
+                SyncNotes::default(),
                 late + 2
             ),
             Err(SyncError::Claim(ClaimError::FenceLost))

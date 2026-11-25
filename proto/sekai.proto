@@ -1981,6 +1981,34 @@ message SourceDiscoveryAckOptions {
   // At most one sample per discovered record kind, each at most 8 rows.
   repeated SourceDiscoverySample samples = 2;
 }
+// Experimental (ADR 0163). One thing a source sync could not apply and
+// reports instead of stalling. It names positions, never record content.
+message SourceSyncNote {
+  // Retention passed the stored offset: offsets from_offset up to, not
+  // including, to_offset were never read. Offsets are not negative and the
+  // range is not empty.
+  message OffsetGap {
+    int32 partition = 1;
+    int64 from_offset = 2;
+    int64 to_offset = 3;
+  }
+  // The record at offset was skipped. reason is not_json or missing_id.
+  message SkippedRecord {
+    int32 partition = 1;
+    int64 offset = 2;
+    string reason = 3;
+  }
+  oneof note {
+    OffsetGap offset_gap = 1;
+    SkippedRecord skipped_record = 2;
+  }
+}
+// Experimental (ADR 0163). The notes of one source sync: at most 64, and
+// overflow_count more the runtime counted but did not send.
+message SourceSyncNotes {
+  repeated SourceSyncNote notes = 1;
+  int64 overflow_count = 2;
+}
 // Transform work is acknowledged by WriteTransformRunResult, which carries
 // its output.
 message AckWorkRequest {
@@ -2005,7 +2033,11 @@ message AckWorkRequest {
   // carries no payload. Source discovery takes completed with
   // SourceDiscoveryAckOptions, or failed with a Source sync failure class
   // as reason; either is final, and a retry under the same claim is
-  // answered without writing again.
+  // answered without writing again. A Source sync, completed or failed, may
+  // carry source_sync_notes; the plane keeps them with the outcome, and a
+  // retry under the same claim keeps the first ones. A plane older than
+  // ADR 0163 refuses the options as INVALID_ARGUMENT, so a runtime sends
+  // them only when it has notes.
   string outcome = 6;
   string reason = 7;
   // Source sync and external effects: the work's namespace.
@@ -2015,6 +2047,7 @@ message AckWorkRequest {
     AgentTurnAckOptions agent_turn = 11;
     ExportDeliveryAckOptions export_delivery = 12;
     SourceDiscoveryAckOptions source_discovery = 13;
+    SourceSyncNotes source_sync_notes = 14;
   }
 }
 message AckWorkResponse {
@@ -6146,6 +6179,11 @@ message SourceHealth {
   // Operation identity of the source batch transaction the outcome derives
   // from (#3087); empty when none does or it carries none.
   string operation_id = 12;
+  // Experimental (ADR 0163). The notes the connector runtime reported on
+  // the last finished sync of the one Source that owns this
+  // source_instance; absent when it reported none, when no single Source
+  // owns the instance, or when the source is not disclosed to the caller.
+  SourceSyncNotes sync_notes = 13;
 }
 message GetSourceHealthResponse {
   SourceHealth health = 1;
@@ -6192,6 +6230,9 @@ message ConnectorSourceSync {
   int64 claim_expires_at_ms = 6;
   // Whether a sync is due and not finished.
   bool due = 7;
+  // Experimental (ADR 0163). The notes the runtime reported on the last
+  // finished sync; absent when it reported none.
+  SourceSyncNotes last_notes = 8;
 }
 // Experimental (ADR 0148). A Source: the governed record of one
 // integration. source and source_instance are the tokens its batches carry;

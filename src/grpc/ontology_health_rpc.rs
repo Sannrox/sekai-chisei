@@ -313,7 +313,8 @@ fn source_reports(
 /// `GetSourceSyncState` and audited as `source.health`. Another tenant's
 /// namespace is refused, as on every tenant RPC; within the tenant, a
 /// namespace the caller may not read and a type it does not admit report
-/// exactly as an unknown source.
+/// exactly as an unknown source. A disclosed report carries the sync notes
+/// of the one Source that owns the instance.
 pub(super) async fn get_source_health(
     service: &SekaiServiceImpl,
     req: Request<GetSourceHealthRequest>,
@@ -351,6 +352,22 @@ pub(super) async fn get_source_health(
         authorized,
     )
     .map_err(|_| Status::internal("source health unavailable"))?;
+    // The notes of the one Source that owns the instance (ADR 0163).
+    let sync_notes = if authorized {
+        match db
+            .sources_with_instance(&query.namespace, &query.source_instance)
+            .map_err(|_| Status::internal("source health unavailable"))?
+            .as_slice()
+        {
+            [owner] => owner
+                .sync
+                .current_notes()
+                .map(super::source_rpc::sync_notes_to_proto),
+            _ => None,
+        }
+    } else {
+        None
+    };
     Ok(Response::new(GetSourceHealthResponse {
         health: Some(SourceHealth {
             contract_version: report.contract_version,
@@ -365,6 +382,7 @@ pub(super) async fn get_source_health(
             last_success_at_ms: report.last_success_at_ms,
             observed_at_ms: report.observed_at_ms,
             operation_id,
+            sync_notes,
         }),
     }))
 }
