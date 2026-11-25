@@ -512,6 +512,61 @@ impl RuntimeDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        queue_scope: &str,
+        restore_lease_expiry: bool,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.hold_transform_claim(
+                run_id,
+                runtime_id,
+                claim_generation,
+                fencing_token,
+                queue_scope,
+                restore_lease_expiry,
+            ),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.hold_transform_claim(
+                    run_id,
+                    runtime_id,
+                    claim_generation,
+                    fencing_token,
+                    queue_scope,
+                    restore_lease_expiry,
+                )
+            }),
+        }
+    }
+
+    pub fn transform_queue_ahead(
+        &self,
+        queue_scope: &str,
+        created_at_ms: i64,
+        run_id: &str,
+    ) -> Result<i64, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_queue_ahead(queue_scope, created_at_ms, run_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.transform_queue_ahead(queue_scope, created_at_ms, run_id)
+            }),
+        }
+    }
+
+    pub fn transform_queue_position(&self, run_id: &str) -> Result<Option<i64>, String> {
+        match self {
+            Self::Sqlite(db) => db.transform_queue_position(run_id),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.transform_queue_position(run_id))
+            }
+        }
+    }
+
     pub fn transform_run_finish(&self, run_id: &str) -> Result<Option<(i64, Option<i64>)>, String> {
         match self {
             Self::Sqlite(db) => db.transform_run_finish(run_id),

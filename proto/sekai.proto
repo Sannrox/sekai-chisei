@@ -1224,6 +1224,16 @@ message TransformRun {
   // The dataset version each input was read at, by dataset id (#1794). Empty
   // on runs from before pins and on runs that read nothing.
   map<string, string> input_versions = 28;
+  // Set while the run waits in a concurrency queue (#3044): its dispatch
+  // status stays pending until a claim admits it.
+  TransformRunQueue queue = 29;
+}
+// Why and where a pending run waits (#3044, ADR 0168).
+message TransformRunQueue {
+  // The limit the run waits for: concurrency.
+  string reason = 1;
+  // 1-based place in its tenant's or namespace's queue, first in first out.
+  int64 position = 2;
 }
 message TransformRunRefusal {
   // A short rule name, such as quota_exceeded; reason_withheld when the

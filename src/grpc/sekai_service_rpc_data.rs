@@ -3750,6 +3750,41 @@ pub(super) async fn claim_transform_work(
                         refuse_claimed_run(service, quota.clone(), &work, &refusal, targeted)?;
                         continue;
                     }
+                    Ok(ClaimAdmission::Queued { scope_id }) => {
+                        if prior_admission {
+                            restore_request_admission_hold(
+                                service.db.runtime(),
+                                &work,
+                                owner.as_ref(),
+                            )?;
+                        }
+                        match service.db.runtime().hold_transform_claim(
+                            &work.run_id,
+                            &work.claim_owner,
+                            work.claim_generation,
+                            &work.fencing_token,
+                            &scope_id,
+                            outcome.counted_lease_expiry,
+                        ) {
+                            Ok(()) => {}
+                            // Another claimant moved the run on and owns it now.
+                            Err(error)
+                                if error
+                                    == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM => {}
+                            Err(error) => return Err(Status::internal(error)),
+                        }
+                        if targeted
+                            || skipped.len()
+                                >= crate::sekai::governed_transform::MAX_TRANSFORM_CLAIM_QUOTA_SKIPS
+                        {
+                            return Err(Status::resource_exhausted(
+                                "transform run queued behind a full concurrency limit",
+                            ));
+                        }
+                        skipped.push(work.run_id.clone());
+                        exhausted = true;
+                        continue;
+                    }
                     Ok(ClaimAdmission::Admitted(held)) => {
                         let gate = transform_quota_gate(quota.clone())?;
                         let bind_tenant = held
@@ -4555,12 +4590,15 @@ enum ClaimAdmission {
     Admitted(Option<crate::chisei::tenant_quota::TenantQuotaAdmission>),
     /// A spent budget ends the run for good; nothing stays reserved (#3044).
     Refused(crate::enterprise::IsolatedProcessRefusal),
+    /// A full concurrency limit, or an older run already queued in the same
+    /// scope: the run is held in that scope's FIFO queue (#3044, part 3).
+    Queued { scope_id: String },
 }
 
 /// Admits a claimed run, reserving its estimated compute seconds. A full
-/// concurrency limit is `RESOURCE_EXHAUSTED`, so the run waits; a spent
-/// budget refuses it. A reclaim reserves no request, only compute, so only a
-/// spent compute budget refuses it.
+/// concurrency limit, or an older run held in one of the run's queues,
+/// queues it; a spent budget refuses it. A reclaim reserves no request, only
+/// compute, so only a spent compute budget refuses it.
 fn admit_claimed_isolated_process(
     service: &SekaiServiceImpl,
     quota: &crate::db::runtime_db::RuntimeDb,
@@ -4569,6 +4607,9 @@ fn admit_claimed_isolated_process(
     reclaim: bool,
 ) -> Result<ClaimAdmission, Status> {
     admit_extension_isolated_process(service, owner, work)?;
+    if let Some(scope_id) = queued_ahead(service, quota, owner, work)? {
+        return Ok(ClaimAdmission::Queued { scope_id });
+    }
     match tenant_transform_admission(
         quota,
         &transform_quota_gate(service.quota_runtime())?,
@@ -4579,6 +4620,11 @@ fn admit_claimed_isolated_process(
         reclaim,
     )? {
         Ok(held) => Ok(ClaimAdmission::Admitted(held)),
+        Err(crate::chisei::tenant_quota::TenantQuotaError::Exhausted {
+            metric, scope_id, ..
+        }) if metric == crate::chisei::tenant_quota::METRIC_CONCURRENCY => {
+            Ok(ClaimAdmission::Queued { scope_id })
+        }
         Err(error) => {
             match crate::composition::transform_run_admission::refusal_budget_exhausted(&error) {
                 Some(refusal) => Ok(ClaimAdmission::Refused(refusal)),
@@ -4586,6 +4632,40 @@ fn admit_claimed_isolated_process(
             }
         }
     }
+}
+
+/// The queue scope in which an older held run waits ahead of `work`, so it
+/// queues behind that run instead of overtaking it. Only scopes that still
+/// have a concurrency limit queue.
+fn queued_ahead(
+    service: &SekaiServiceImpl,
+    quota: &crate::db::runtime_db::RuntimeDb,
+    owner: Option<&crate::enterprise::AuthenticatedContext>,
+    work: &crate::sekai::governed_transform::TransformWork,
+) -> Result<Option<String>, Status> {
+    let Some(tenant_id) = owner
+        .and_then(|context| context.tenant.as_ref())
+        .map(|tenant| tenant.tenant_id.as_str())
+    else {
+        return Ok(None);
+    };
+    let limits = crate::composition::transform_run_admission::configured_run_limits(
+        quota,
+        tenant_id,
+        &work.namespace,
+    )
+    .map_err(Status::internal)?;
+    for scope_id in limits.concurrency_queue_scopes(tenant_id) {
+        let ahead = service
+            .db
+            .runtime()
+            .transform_queue_ahead(&scope_id, work.created_at_ms, &work.run_id)
+            .map_err(Status::internal)?;
+        if ahead > 0 {
+            return Ok(Some(scope_id));
+        }
+    }
+    Ok(None)
 }
 
 /// The extension's terminal refusal of this claim, if any, bounded and with
@@ -5597,6 +5677,17 @@ fn with_run_outcome(
         proto.finished_at_ms = Some(finished_at_ms);
         proto.compute_seconds = compute_ms.map(|ms| ms as f64 / 1000.0);
     }
+    if let Some(position) = service
+        .db
+        .runtime()
+        .transform_queue_position(&run.run_id)
+        .map_err(Status::internal)?
+    {
+        proto.queue = Some(TransformRunQueue {
+            reason: crate::sekai::governed_transform::TRANSFORM_QUEUE_CONCURRENCY.into(),
+            position,
+        });
+    }
     Ok(proto)
 }
 
@@ -5641,6 +5732,7 @@ fn to_proto_transform_run(
         finished_at_ms: None,
         compute_seconds: None,
         input_versions: run.input_versions.clone().into_iter().collect(),
+        queue: None,
     }
 }
 

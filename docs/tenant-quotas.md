@@ -84,8 +84,18 @@ code `quota_larger_than_budget` and the details `metric`, `limit` and
 Budgets refuse; only concurrency waits. When a claim finds the run's
 tenant or namespace request, token or compute budget spent, the run is
 marked `refused` with the code `quota_budget_exhausted` and the detail
-`metric`, and it reserves nothing. A full concurrency limit still leaves the
-run `pending` until a unit frees.
+`metric`, and it reserves nothing.
+
+A full concurrency limit queues the run instead. Its work is `held` in the
+scope that refused it, the tenant's or the namespace's, and its dispatch
+status stays `pending`. Runs leave the queue oldest first: a claim holds a
+run behind any older held run in a scope that has a concurrency limit, so a
+newer run never overtakes. A read of a held run reports
+`queue { reason: "concurrency", position }`, where position 1 is next. The
+queue lives in the store, so it survives a restart and any instance releases
+it; cancelling a held run removes it. Before rolling back to a version
+without the queue, raise the limit and let held runs drain, since older
+versions do not claim them.
 
 The claim's compute reservation is stored on the run's quota hold. When the
 run's result is written it settles to the measured seconds, rounded up, or

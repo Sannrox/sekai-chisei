@@ -49,6 +49,14 @@ pub const PREVIEW_AUTH_ALIAS: &str = "__preview_auth";
 pub const SCHEDULER_COMPUTE_CAPABILITY: &str = "sekai.transforms.scheduler";
 pub const TRANSFORM_WORK_PENDING: &str = "pending";
 pub const TRANSFORM_WORK_CLAIMED: &str = "claimed";
+/// Work waiting in a tenant or namespace concurrency queue (#3044, ADR 0168
+/// part 3). Claimable like `pending`, in `(created_at_ms, run_id)` order
+/// within its queue scope. A plane from before the queue reads it as closed,
+/// so it never claims a held run past the queue. The run's dispatch status
+/// stays `pending`.
+pub const TRANSFORM_WORK_HELD: &str = "held";
+/// Why a held run waits: a full concurrency limit.
+pub const TRANSFORM_QUEUE_CONCURRENCY: &str = "concurrency";
 pub const TRANSFORM_WORK_COMPLETED: &str = "completed";
 pub const TRANSFORM_WORK_FAILED: &str = "failed";
 pub const TRANSFORM_WORK_CANCELLED: &str = "cancelled";
@@ -1432,7 +1440,7 @@ impl TransformWork {
     /// What the work status means for its claim.
     pub fn hold(&self) -> Hold {
         match self.status.as_str() {
-            TRANSFORM_WORK_PENDING => Hold::Open,
+            TRANSFORM_WORK_PENDING | TRANSFORM_WORK_HELD => Hold::Open,
             TRANSFORM_WORK_CLAIMED => Hold::Held,
             _ => Hold::Closed,
         }
@@ -1458,6 +1466,25 @@ impl TransformWork {
         );
         self.set_claim_record(record);
         self.status = TRANSFORM_WORK_CLAIMED.into();
+    }
+
+    /// Returns the claimed work to the concurrency queue as `held` (see
+    /// [`ClaimRecord::requeue`]).
+    pub fn hold_claim(
+        &mut self,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        restore_lease_expiry: bool,
+    ) -> Result<(), ClaimError> {
+        self.requeue_claim(
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            restore_lease_expiry,
+        )?;
+        self.status = TRANSFORM_WORK_HELD.into();
+        Ok(())
     }
 
     /// Returns the claimed work to `pending` (see [`ClaimRecord::requeue`]).

@@ -26525,7 +26525,8 @@ async fn claim_ops_work(
     .map(|response| response.into_inner().work.unwrap())
 }
 
-async fn queue_ops_run(svc: &SekaiServiceImpl, transform_id: &str) {
+/// Queues a run of an `ops` transform for tenant-a; returns its run id.
+async fn queue_ops_run(svc: &SekaiServiceImpl, transform_id: &str) -> String {
     svc.run_governed_transform(with_tenant_admin(
         RunGovernedTransformRequest {
             namespace: "ops".into(),
@@ -26535,7 +26536,11 @@ async fn queue_ops_run(svc: &SekaiServiceImpl, transform_id: &str) {
         "tenant-a",
     ))
     .await
-    .unwrap();
+    .unwrap()
+    .into_inner()
+    .run
+    .unwrap()
+    .run_id
 }
 
 #[tokio::test]
@@ -26620,6 +26625,186 @@ async fn a_lost_claim_refunds_its_compute_reservation() {
     // The cancel refunded the reclaim's reservation as well.
     queue_ops_run(&svc, "t-iso-compute-reclaim").await;
     claim_ops_work(&svc, "runner-c", 60_000).await.unwrap();
+}
+
+/// Writes an empty result for claimed `work` as tenant-a, ending the run.
+async fn finish_ops_work(svc: &SekaiServiceImpl, work: TransformWork) {
+    svc.write_transform_run_result(with_tenant_admin(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            output_digest: crate::sekai::governed_transform::rows_digest(&[]),
+            ..Default::default()
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+}
+
+/// The queue position a read of `run_id` reports, and its dispatch status.
+async fn ops_run_queue(svc: &SekaiServiceImpl, run_id: &str) -> (Option<i64>, String) {
+    let run = svc
+        .list_governed_transform_runs(with_tenant_admin(
+            ListGovernedTransformRunsRequest {
+                namespace: "ops".into(),
+                limit: 50,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs
+        .into_iter()
+        .find(|run| run.run_id == run_id)
+        .unwrap();
+    if let Some(queue) = run.queue.as_ref() {
+        assert_eq!(queue.reason, "concurrency");
+    }
+    (run.queue.map(|queue| queue.position), run.dispatch_status)
+}
+
+/// #3044 part 3: plane instances over one store share the tenant's
+/// concurrency queue. `restarted` is a fresh instance standing in for
+/// `first` after a restart. Held runs keep their place across the restart,
+/// the oldest is admitted first when the unit frees, and a lapsed claim is
+/// taken over before any newer held run.
+async fn concurrency_queue_survives_restart_and_takeover(
+    first: &SekaiServiceImpl,
+    second: &SekaiServiceImpl,
+    restarted: &SekaiServiceImpl,
+) {
+    crate::composition::transform_run_admission::quota_gate(first.db.runtime_arc())
+        .unwrap()
+        .configure("tenant-a", &namespace_concurrency(1))
+        .unwrap();
+    enqueue_isolated_claim(first, "t-iso-queue").await;
+    let running = claim_ops_work(first, "runner-a", 60_000).await.unwrap();
+    let second_run = queue_ops_run(first, "t-iso-queue").await;
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let third_run = queue_ops_run(first, "t-iso-queue").await;
+
+    assert_eq!(
+        claim_ops_work(second, "runner-b", 60_000)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::ResourceExhausted
+    );
+    assert_eq!(
+        ops_run_queue(second, &second_run).await,
+        (Some(1), "pending".to_string())
+    );
+    assert_eq!(
+        ops_run_queue(second, &third_run).await,
+        (Some(2), "pending".to_string())
+    );
+
+    // The first instance restarts; the queue is in the store, not in it.
+    finish_ops_work(restarted, running).await;
+    let admitted = claim_ops_work(second, "runner-b", 1).await.unwrap();
+    assert_eq!(
+        admitted.run_id, second_run,
+        "the oldest held run goes first"
+    );
+    assert_eq!(ops_run_queue(restarted, &third_run).await.0, Some(1));
+
+    // The second instance dies holding the claim; after its lease lapses the
+    // restarted one takes the run over ahead of the newer held run.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let taken_over = claim_ops_work(restarted, "runner-c", 60_000).await.unwrap();
+    assert_eq!(taken_over.run_id, second_run);
+    assert_eq!(taken_over.claim_owner, "runner-c");
+    finish_ops_work(restarted, taken_over).await;
+    let last = claim_ops_work(restarted, "runner-c", 60_000).await.unwrap();
+    assert_eq!(last.run_id, third_run);
+    assert_eq!(ops_run_queue(restarted, &third_run).await.0, None);
+}
+
+/// A plane instance over `db` whose enterprise extension admits isolated
+/// runs.
+fn isolated_queue_service(db: RuntimeDb) -> SekaiServiceImpl {
+    SekaiServiceImpl::new(crate::db::store::SekaiStore::from_shared_runtime(Arc::new(
+        db,
+    )))
+}
+
+fn admitting_extension() -> Option<Arc<IsolatedClaimExtension>> {
+    Some(Arc::new(IsolatedClaimExtension {
+        deny: false,
+        refuse: None,
+    }))
+}
+
+#[tokio::test]
+async fn sqlite_concurrency_queue_survives_restart_and_takeover() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("queue.sqlite");
+    let instance = || {
+        let db = SekaiDb::new_with_enterprise_extension(
+            path.to_str().unwrap(),
+            admitting_extension().map(|extension| extension as _),
+        )
+        .unwrap();
+        isolated_queue_service(RuntimeDb::Sqlite(Arc::new(db)))
+    };
+    concurrency_queue_survives_restart_and_takeover(&instance(), &instance(), &instance()).await;
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+fn postgres_concurrency_queue_survives_restart_and_takeover() {
+    let scratch = crate::db::ScratchDatabase::create();
+    // The PostgreSQL clients connect and drop outside the runtime.
+    let instance = || {
+        let postgres = scratch
+            .connect()
+            .with_enterprise_extension(admitting_extension().map(|extension| extension as _));
+        isolated_queue_service(RuntimeDb::Postgres(Arc::new(postgres)))
+    };
+    let (first, second, restarted) = (instance(), instance(), instance());
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(concurrency_queue_survives_restart_and_takeover(
+            &first, &second, &restarted,
+        ));
+}
+
+#[tokio::test]
+async fn a_new_run_queues_behind_an_older_held_run_in_its_namespace() {
+    let svc = isolated_claim_service(false);
+    configure_ops_namespace(&svc, &namespace_concurrency(1));
+    enqueue_isolated_claim(&svc, "t-iso-ns-queue").await;
+    let running = claim_ops_work(&svc, "runner-a", 60_000).await.unwrap();
+    let held = queue_ops_run(&svc, "t-iso-ns-queue").await;
+    claim_ops_work(&svc, "runner-a", 60_000).await.unwrap_err();
+    finish_ops_work(&svc, running).await;
+    // A newer run would fit now, but the held one is first in the queue.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let newer = queue_ops_run(&svc, "t-iso-ns-queue").await;
+    let next = claim_ops_work(&svc, "runner-a", 60_000).await.unwrap();
+    assert_eq!(next.run_id, held);
+    // The unit is full again, so the next claim holds the newer run.
+    claim_ops_work(&svc, "runner-a", 60_000).await.unwrap_err();
+    assert_eq!(ops_run_queue(&svc, &newer).await.0, Some(1));
+    // Cancelling a held run takes it out of the queue.
+    svc.cancel_governed_transform_run(with_tenant_admin(
+        CancelGovernedTransformRunRequest {
+            run_id: newer.clone(),
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ops_run_queue(&svc, &newer).await,
+        (None, "cancelled".to_string())
+    );
 }
 
 /// Assigns `limits` to tenant-a's `ops` namespace only.

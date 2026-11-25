@@ -19,9 +19,9 @@ use crate::sekai::governed_transform::{
     TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_RUN_REFUSED,
     TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
     TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED,
-    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
-    TransformOutputState, TransformPoolDepth, TransformQueueGroup, TransformRun,
-    TransformRunInputRow, TransformRuntime, TransformWork, WriteTransformRunCommand,
+    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_HELD, TRANSFORM_WORK_PENDING,
+    TransformInputRows, TransformOutputState, TransformPoolDepth, TransformQueueGroup,
+    TransformRun, TransformRunInputRow, TransformRuntime, TransformWork, WriteTransformRunCommand,
     admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
@@ -907,13 +907,14 @@ impl PostgresDb {
             .map_err(|error| error.to_string())?;
         // An expired claim counts only if reclaiming it, which first counts
         // the lapse, leaves it under the limit the claim enforces.
-        let waiting = "(w.status = $1 OR (w.status = $2 AND w.claim_expires_at_ms <= $3
+        let waiting = "(w.status IN ($1, $5) OR (w.status = $2 AND w.claim_expires_at_ms <= $3
                         AND w.lease_expiries + 1 < $4))";
-        let args: [&(dyn postgres::types::ToSql + Sync); 4] = [
+        let args: [&(dyn postgres::types::ToSql + Sync); 5] = [
             &TRANSFORM_WORK_PENDING,
             &TRANSFORM_WORK_CLAIMED,
             &now_ms,
             &MAX_TRANSFORM_LEASE_EXPIRIES,
+            &TRANSFORM_WORK_HELD,
         ];
         let groups = tx
             .query(
@@ -1200,6 +1201,78 @@ impl PostgresDb {
         stamp_run_dispatch_pg(&mut tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// See the SQLite `hold_transform_claim`.
+    pub fn hold_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        queue_scope: &str,
+        restore_lease_expiry: bool,
+    ) -> Result<(), String> {
+        let mut connection = self.connection()?;
+        let mut tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let namespace = peek_transform_work_namespace(&mut tx, run_id)?;
+        lock_transform_work_namespace(&mut tx, &namespace)?;
+        let mut work =
+            load_transform_work_pg(&mut tx, run_id)?.ok_or("transform work not found")?;
+        work.hold_claim(
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            restore_lease_expiry,
+        )
+        .map_err(|_| STALE_TRANSFORM_CLAIM.to_string())?;
+        persist_transform_work_pg(&mut tx, &work)?;
+        tx.execute(
+            "UPDATE sekai_transform_work SET queue_scope = $2 WHERE run_id = $1",
+            &[&run_id, &queue_scope],
+        )
+        .map_err(|error| error.to_string())?;
+        stamp_run_dispatch_pg(&mut tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// See the SQLite `transform_queue_ahead`.
+    pub fn transform_queue_ahead(
+        &self,
+        queue_scope: &str,
+        created_at_ms: i64,
+        run_id: &str,
+    ) -> Result<i64, String> {
+        self.connection()?
+            .query_one(
+                "SELECT COUNT(*) FROM sekai_transform_work
+                 WHERE status = $4 AND queue_scope = $1
+                   AND (created_at_ms, run_id) < ($2, $3)",
+                &[&queue_scope, &created_at_ms, &run_id, &TRANSFORM_WORK_HELD],
+            )
+            .map(|row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    /// See the SQLite `transform_queue_position`.
+    pub fn transform_queue_position(&self, run_id: &str) -> Result<Option<i64>, String> {
+        let held = self
+            .connection()?
+            .query_opt(
+                "SELECT queue_scope, created_at_ms FROM sekai_transform_work
+                 WHERE run_id = $1 AND status = $2",
+                &[&run_id, &TRANSFORM_WORK_HELD],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+        held.map(|(scope, created_at_ms)| {
+            self.transform_queue_ahead(&scope, created_at_ms, run_id)
+                .map(|ahead| ahead + 1)
+        })
+        .transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4634,8 +4707,13 @@ fn can_admit_namespace_pg(
     let inflight: i64 = tx
         .query_one(
             "SELECT COUNT(*) FROM sekai_transform_work
-             WHERE namespace = $1 AND status IN ($2, $3)",
-            &[&namespace, &TRANSFORM_WORK_PENDING, &TRANSFORM_WORK_CLAIMED],
+             WHERE namespace = $1 AND status IN ($2, $3, $4)",
+            &[
+                &namespace,
+                &TRANSFORM_WORK_PENDING,
+                &TRANSFORM_WORK_CLAIMED,
+                &TRANSFORM_WORK_HELD,
+            ],
         )
         .map_err(|error| error.to_string())?
         .get(0);
@@ -4964,12 +5042,13 @@ fn run_caused_pg(
         let open: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM sekai_transform_work
-                 WHERE namespace = $1 AND transform_id = $2 AND status IN ($3, $4)",
+                 WHERE namespace = $1 AND transform_id = $2 AND status IN ($3, $4, $5)",
                 &[
                     &transform.namespace,
                     &transform.transform_id,
                     &TRANSFORM_WORK_PENDING,
                     &TRANSFORM_WORK_CLAIMED,
+                    &TRANSFORM_WORK_HELD,
                 ],
             )
             .map_err(|error| error.to_string())?
@@ -5194,7 +5273,10 @@ fn cancel_governed_transform_run_pg(
     let mut run = load_transform_run_pg(tx, run_id)?.ok_or("governed transform run not found")?;
     lock_transform_work_namespace(tx, &run.namespace)?;
     if let Some(work) = load_transform_work_pg(tx, run_id)?
-        && (work.status == TRANSFORM_WORK_PENDING || work.status == TRANSFORM_WORK_CLAIMED)
+        && matches!(
+            work.status.as_str(),
+            TRANSFORM_WORK_PENDING | TRANSFORM_WORK_CLAIMED | TRANSFORM_WORK_HELD
+        )
     {
         tx.execute(
             "UPDATE sekai_transform_work SET status = $2 WHERE run_id = $1",
@@ -5219,11 +5301,12 @@ fn cancel_governed_transform_run_pg(
             let pending_work: Option<String> = tx
                 .query_opt(
                     "SELECT run_id FROM sekai_transform_work
-                     WHERE namespace = $1 AND transform_id = $2 AND status = $3",
+                     WHERE namespace = $1 AND transform_id = $2 AND status IN ($3, $4)",
                     &[
                         &downstream.namespace,
                         &downstream.transform_id,
                         &TRANSFORM_WORK_PENDING,
+                        &TRANSFORM_WORK_HELD,
                     ],
                 )
                 .map_err(|error| error.to_string())?
@@ -5247,7 +5330,7 @@ fn cancel_governed_transform_run_pg(
             .map_err(|error| error.to_string())?;
             if let Some(work_run_id) = pending_work {
                 if let Some(work) = load_transform_work_pg(tx, &work_run_id)?
-                    && work.status == TRANSFORM_WORK_PENDING
+                    && (work.status == TRANSFORM_WORK_PENDING || work.status == TRANSFORM_WORK_HELD)
                 {
                     tx.execute(
                         "UPDATE sekai_transform_work SET status = $2 WHERE run_id = $1",

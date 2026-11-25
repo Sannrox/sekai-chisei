@@ -9,9 +9,9 @@ use crate::sekai::governed_transform::{
     TRANSFORM_OUTPUT_FRESH, TRANSFORM_OUTPUT_STALE, TRANSFORM_RUN_REFUSED,
     TRANSFORM_TRIGGER_CANCELLED, TRANSFORM_TRIGGER_MANUAL, TRANSFORM_TRIGGER_SCHEDULE,
     TRANSFORM_TRIGGER_UPSTREAM, TRANSFORM_WORK_CANCELLED, TRANSFORM_WORK_CLAIMED,
-    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_PENDING, TransformInputRows,
-    TransformOutputState, TransformPoolDepth, TransformQueueGroup, TransformRun,
-    TransformRunInputRow, TransformRuntime, TransformWork, WriteTransformRunCommand,
+    TRANSFORM_WORK_COMPLETED, TRANSFORM_WORK_FAILED, TRANSFORM_WORK_HELD, TRANSFORM_WORK_PENDING,
+    TransformInputRows, TransformOutputState, TransformPoolDepth, TransformQueueGroup,
+    TransformRun, TransformRunInputRow, TransformRuntime, TransformWork, WriteTransformRunCommand,
     admit_isolated_run, apply_preview_column_allowlist, bind_checkpoint,
     bind_isolated_write_lineage, bind_receipts_to_dataset, budget_quarantined_run,
     checkpoint_after_id, compute_preview_tables, compute_run_tables_until, dataset_digest,
@@ -187,9 +187,18 @@ impl SekaiDb {
                 "ALTER TABLE sekai_governed_transform_run
              ADD COLUMN input_versions TEXT NOT NULL DEFAULT '{}'",
                 "ALTER TABLE sekai_transform_run_finish ADD COLUMN output_version_id TEXT",
+                // #3044 part 3: the concurrency queue a held run waits in.
+                "ALTER TABLE sekai_transform_work
+             ADD COLUMN queue_scope TEXT NOT NULL DEFAULT ''",
             ] {
                 crate::db::add_sqlite_column(&conn, statement)?;
             }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_sekai_transform_work_queue
+                    ON sekai_transform_work(queue_scope, created_at_ms, run_id)
+                    WHERE status = 'held'",
+            )
+            .map_err(|error| error.to_string())?;
         }
         self.conn()
             .execute_batch(
@@ -1166,13 +1175,14 @@ impl SekaiDb {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         // An expired claim counts only if reclaiming it, which first counts
         // the lapse, leaves it under the limit the claim enforces.
-        let waiting = "(w.status = ?1 OR (w.status = ?2 AND w.claim_expires_at_ms <= ?3
+        let waiting = "(w.status IN (?1, ?5) OR (w.status = ?2 AND w.claim_expires_at_ms <= ?3
                         AND w.lease_expiries + 1 < ?4))";
         let args = params![
             TRANSFORM_WORK_PENDING,
             TRANSFORM_WORK_CLAIMED,
             now_ms,
-            MAX_TRANSFORM_LEASE_EXPIRIES
+            MAX_TRANSFORM_LEASE_EXPIRIES,
+            TRANSFORM_WORK_HELD
         ];
         let groups = tx
             .prepare(&format!(
@@ -1452,6 +1462,79 @@ impl SekaiDb {
         stamp_run_dispatch(&tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Releases the fenced claim into the concurrency queue of `queue_scope`
+    /// (#3044, ADR 0168 part 3). The work keeps its `created_at_ms`, so it
+    /// keeps its place; the run's dispatch status stays `pending`.
+    pub fn hold_transform_claim(
+        &self,
+        run_id: &str,
+        runtime_id: &str,
+        claim_generation: i64,
+        fencing_token: &str,
+        queue_scope: &str,
+        restore_lease_expiry: bool,
+    ) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut work = load_transform_work(&tx, run_id)?.ok_or("transform work not found")?;
+        work.hold_claim(
+            runtime_id,
+            claim_generation,
+            fencing_token,
+            restore_lease_expiry,
+        )
+        .map_err(|_| STALE_TRANSFORM_CLAIM.to_string())?;
+        persist_transform_work(&tx, &work)?;
+        tx.execute(
+            "UPDATE sekai_transform_work SET queue_scope = ?2 WHERE run_id = ?1",
+            params![run_id, queue_scope],
+        )
+        .map_err(|error| error.to_string())?;
+        stamp_run_dispatch(&tx, &work.run_id, TRANSFORM_WORK_PENDING)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Held runs queued in `queue_scope` before `(created_at_ms, run_id)`.
+    pub fn transform_queue_ahead(
+        &self,
+        queue_scope: &str,
+        created_at_ms: i64,
+        run_id: &str,
+    ) -> Result<i64, String> {
+        self.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sekai_transform_work
+                 WHERE status = 'held' AND queue_scope = ?1
+                   AND (created_at_ms < ?2 OR (created_at_ms = ?2 AND run_id < ?3))",
+                params![queue_scope, created_at_ms, run_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// The 1-based place of a held run in its queue; `None` when it is not
+    /// held.
+    pub fn transform_queue_position(&self, run_id: &str) -> Result<Option<i64>, String> {
+        let held = self
+            .conn()
+            .query_row(
+                "SELECT queue_scope, created_at_ms FROM sekai_transform_work
+                 WHERE run_id = ?1 AND status = 'held'",
+                params![run_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        held.map(|(scope, created_at_ms)| {
+            self.transform_queue_ahead(&scope, created_at_ms, run_id)
+                .map(|ahead| ahead + 1)
+        })
+        .transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4963,8 +5046,13 @@ fn namespace_limit(tx: &Transaction<'_>, namespace: &str) -> Result<i64, String>
 fn in_flight_count(tx: &Transaction<'_>, namespace: &str) -> Result<i64, String> {
     tx.query_row(
         "SELECT COUNT(*) FROM sekai_transform_work
-         WHERE namespace = ?1 AND status IN (?2, ?3)",
-        params![namespace, TRANSFORM_WORK_PENDING, TRANSFORM_WORK_CLAIMED],
+         WHERE namespace = ?1 AND status IN (?2, ?3, ?4)",
+        params![
+            namespace,
+            TRANSFORM_WORK_PENDING,
+            TRANSFORM_WORK_CLAIMED,
+            TRANSFORM_WORK_HELD
+        ],
         |row| row.get(0),
     )
     .map_err(|error| error.to_string())
@@ -5284,12 +5372,13 @@ fn has_open_work(
     let count: i64 = tx
         .query_row(
             "SELECT COUNT(*) FROM sekai_transform_work
-             WHERE namespace = ?1 AND transform_id = ?2 AND status IN (?3, ?4)",
+             WHERE namespace = ?1 AND transform_id = ?2 AND status IN (?3, ?4, ?5)",
             params![
                 namespace,
                 transform_id,
                 TRANSFORM_WORK_PENDING,
-                TRANSFORM_WORK_CLAIMED
+                TRANSFORM_WORK_CLAIMED,
+                TRANSFORM_WORK_HELD
             ],
             |row| row.get(0),
         )
@@ -5335,7 +5424,10 @@ fn cancel_governed_transform_run_tx(
 ) -> Result<TransformRun, String> {
     let mut run = load_transform_run(tx, run_id)?.ok_or("governed transform run not found")?;
     if let Some(mut work) = load_transform_work(tx, run_id)?
-        && (work.status == TRANSFORM_WORK_PENDING || work.status == TRANSFORM_WORK_CLAIMED)
+        && matches!(
+            work.status.as_str(),
+            TRANSFORM_WORK_PENDING | TRANSFORM_WORK_CLAIMED | TRANSFORM_WORK_HELD
+        )
     {
         work.status = TRANSFORM_WORK_CANCELLED.into();
         persist_transform_work(tx, &work)?;
@@ -5361,8 +5453,13 @@ fn pending_work_run_id(
 ) -> Result<Option<String>, String> {
     tx.query_row(
         "SELECT run_id FROM sekai_transform_work
-         WHERE namespace = ?1 AND transform_id = ?2 AND status = ?3",
-        params![namespace, transform_id, TRANSFORM_WORK_PENDING],
+         WHERE namespace = ?1 AND transform_id = ?2 AND status IN (?3, ?4)",
+        params![
+            namespace,
+            transform_id,
+            TRANSFORM_WORK_PENDING,
+            TRANSFORM_WORK_HELD
+        ],
         |row| row.get(0),
     )
     .optional()
@@ -5378,7 +5475,7 @@ fn cancel_pending_downstream_work_tx(
     let Some(mut work) = load_transform_work(tx, run_id)? else {
         return Ok(());
     };
-    if work.status != TRANSFORM_WORK_PENDING {
+    if work.status != TRANSFORM_WORK_PENDING && work.status != TRANSFORM_WORK_HELD {
         return Ok(());
     }
     work.status = TRANSFORM_WORK_CANCELLED.into();
@@ -8071,6 +8168,107 @@ mod tests {
         assert_eq!(second.claim_owner, "runner-b");
         assert_eq!(second.lease_expiries, 0);
         assert_eq!(second.claim_generation, 1);
+    }
+
+    #[test]
+    fn a_held_claim_queues_in_its_scope_and_stays_claimable() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (claimed, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("claim");
+        // Only the current claim can hold the run.
+        assert_eq!(
+            db.hold_transform_claim(
+                &claimed.run_id,
+                &claimed.claim_owner,
+                claimed.claim_generation - 1,
+                &claimed.fencing_token,
+                "tenant:tenant-a",
+                false,
+            )
+            .unwrap_err(),
+            STALE_TRANSFORM_CLAIM
+        );
+        db.hold_transform_claim(
+            &claimed.run_id,
+            &claimed.claim_owner,
+            claimed.claim_generation,
+            &claimed.fencing_token,
+            "tenant:tenant-a",
+            false,
+        )
+        .unwrap();
+        let stored = db
+            .get_governed_transform_run(&admitted.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.dispatch_status, TRANSFORM_WORK_PENDING);
+        assert_eq!(
+            db.transform_queue_position(&admitted.run_id).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            db.transform_queue_ahead("tenant:tenant-a", i64::MAX, "")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.transform_queue_ahead("tenant:tenant-b", i64::MAX, "")
+                .unwrap(),
+            0
+        );
+        // A held run is offered again; once claimed it leaves the queue.
+        let (again, _) = db
+            .claim_transform_work("ops", "runner-b", "", 60_000, 40)
+            .unwrap()
+            .expect("held work stays claimable");
+        assert_eq!(again.run_id, admitted.run_id);
+        assert_eq!(db.transform_queue_position(&admitted.run_id).unwrap(), None);
+    }
+
+    #[test]
+    fn a_work_table_without_a_queue_scope_gains_it() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("before-queue-scope.sqlite");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP INDEX idx_sekai_transform_work_queue;
+                 ALTER TABLE sekai_transform_work DROP COLUMN queue_scope;",
+            )
+            .unwrap();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        let admitted = db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        drop(db);
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let (claimed, _) = db
+            .claim_transform_work("ops", "runner-a", "", 60_000, 30)
+            .unwrap()
+            .expect("older pending work stays claimable");
+        assert_eq!(claimed.run_id, admitted.run_id);
+        db.hold_transform_claim(
+            &claimed.run_id,
+            &claimed.claim_owner,
+            claimed.claim_generation,
+            &claimed.fencing_token,
+            "tenant:tenant-a",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            db.transform_queue_position(&admitted.run_id).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]

@@ -264,6 +264,8 @@ const TRANSFORM_QUOTA_HOLD_SCOPE_SCHEMA: &str =
     include_str!("postgres/0183_transform_quota_hold_scope.sql");
 const TRANSFORM_QUOTA_HOLD_COMPUTE_SECONDS_SCHEMA: &str =
     include_str!("postgres/0184_transform_quota_hold_compute_seconds.sql");
+const TRANSFORM_WORK_QUEUE_SCOPE_SCHEMA: &str =
+    include_str!("postgres/0185_transform_work_queue_scope.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1333,6 +1335,12 @@ const MIGRATIONS: &[Migration] = &[
         184,
         "transform_quota_hold_compute_seconds",
         TRANSFORM_QUOTA_HOLD_COMPUTE_SECONDS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        185,
+        "transform_work_queue_scope",
+        TRANSFORM_WORK_QUEUE_SCOPE_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
