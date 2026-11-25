@@ -12,6 +12,7 @@ publish = false
 bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
+hmac = "0.12"
 # Broker wire format only; the transport, egress check and TLS stay ours.
 kafka-protocol = { version = "0.18", default-features = false, features = ["client"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame", "safe-decode", "checked-decode"] }

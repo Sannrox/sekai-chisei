@@ -3001,6 +3001,7 @@ dependencies = [
  "bytes",
  "flate2",
  "futures-util",
+ "hmac 0.12.1",
  "kafka-protocol",
  "lz4_flex",
  "native-tls",
