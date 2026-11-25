@@ -193,4 +193,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0165: A measure is a definition member evaluated as ordinary object sets](0165-a-measure-is-a-definition-member.md) (proposed)
 - [ADR 0166: Example questions bind against the definition tree, with no data](0166-example-questions-bind-against-the-tree.md) (proposed)
 - [ADR 0167: A claimed Source reads its live records by object key](0167-a-claimed-source-reads-its-live-records-by-object-key.md)
+- [ADR 0168: Tenant and namespace quota assignments](0168-tenant-and-namespace-quota-assignments.md)
 <!-- adr-index:end -->

@@ -8,6 +8,10 @@
 //!
 //! Quotas never override stricter project/namespace budgets (those remain on
 //! the hierarchical chain). Tenant admission is an additional gate.
+//!
+//! A namespace assignment (#3044, ADR 0168) is stored under
+//! `tenant:{id}/namespace:{ns}`, a child of the tenant scope on the budget
+//! chain. It is stored and validated but not yet enforced at admission.
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +40,22 @@ pub struct TenantQuotaLimits {
 }
 
 impl TenantQuotaLimits {
+    /// Refuses a negative limit. Zero is a valid limit that admits nothing.
+    pub fn validate(&self) -> Result<(), String> {
+        let negative = [
+            (METRIC_REQUESTS, self.max_requests_per_period.map(i64::from)),
+            (METRIC_TOKENS, self.max_tokens_per_period.map(i64::from)),
+            (METRIC_CONCURRENCY, self.max_concurrency.map(i64::from)),
+            (METRIC_STORAGE_BYTES, self.max_storage_bytes),
+        ]
+        .into_iter()
+        .find(|(_, limit)| limit.is_some_and(|limit| limit < 0));
+        match negative {
+            Some((metric, _)) => Err(format!("quota limit for {metric} must not be negative")),
+            None => Ok(()),
+        }
+    }
+
     pub fn unlimited(version: u64) -> Self {
         Self {
             version,
@@ -102,6 +122,45 @@ pub fn tenant_scope_id(tenant_id: &str) -> String {
     format!("tenant:{tenant_id}")
 }
 
+/// A tenant plus one of its namespaces, as the budget scope
+/// `tenant:{id}/namespace:{ns}`.
+///
+/// The budget chain splits scopes on `/`, so neither part may contain one:
+/// a namespace `a/b` would otherwise inherit the limits assigned to `a`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceQuotaScope {
+    scope_id: String,
+}
+
+/// Longest tenant id or namespace a namespace quota scope accepts.
+pub const MAX_QUOTA_SCOPE_PART_BYTES: usize = 256;
+
+impl NamespaceQuotaScope {
+    pub fn new(tenant_id: &str, namespace: &str) -> Result<Self, String> {
+        for (field, value) in [("tenant id", tenant_id), ("namespace", namespace)] {
+            if value.is_empty()
+                || value.len() > MAX_QUOTA_SCOPE_PART_BYTES
+                || value.trim() != value
+                || value.contains('/')
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "quota {field} must be 1 to {MAX_QUOTA_SCOPE_PART_BYTES} bytes without \
+                     '/', surrounding spaces or control characters"
+                ));
+            }
+        }
+        Ok(Self {
+            scope_id: format!("{}/namespace:{namespace}", tenant_scope_id(tenant_id)),
+        })
+    }
+
+    /// Budget scope id the assignment's limit rows are stored under.
+    pub fn scope_id(&self) -> &str {
+        &self.scope_id
+    }
+}
+
 /// Fields safe to place on an operation receipt (no other-tenant usage).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TenantQuotaReceiptNote {
@@ -132,28 +191,45 @@ impl TenantQuotaGate {
         tenant_id: &str,
         limits: &TenantQuotaLimits,
     ) -> Result<(), TenantQuotaError> {
-        let scope = tenant_scope_id(tenant_id);
+        self.configure_scope(&tenant_scope_id(tenant_id), limits)
+    }
+
+    /// Persist limits for one namespace of a tenant. Stored only: admission
+    /// does not read them yet (#3044 part 1b enforces them).
+    pub fn configure_namespace(
+        &self,
+        scope: &NamespaceQuotaScope,
+        limits: &TenantQuotaLimits,
+    ) -> Result<(), TenantQuotaError> {
+        self.configure_scope(scope.scope_id(), limits)
+    }
+
+    fn configure_scope(
+        &self,
+        scope: &str,
+        limits: &TenantQuotaLimits,
+    ) -> Result<(), TenantQuotaError> {
         if let Some(max) = limits.max_tokens_per_period {
             self.tracker
-                .set_limit_with_metric(&scope, METRIC_TOKENS, max, limits.period)
+                .set_limit_with_metric(scope, METRIC_TOKENS, max, limits.period)
                 .map_err(TenantQuotaError::Storage)?;
         }
         if let Some(max) = limits.max_requests_per_period {
             self.tracker
-                .set_limit_with_metric(&scope, METRIC_REQUESTS, max, limits.period)
+                .set_limit_with_metric(scope, METRIC_REQUESTS, max, limits.period)
                 .map_err(TenantQuotaError::Storage)?;
         }
         if let Some(max) = limits.max_concurrency {
             // The monthly row is only the configured cap `configured_limits`
             // reads. Live units are holder-keyed holds, not budget consume.
             self.tracker
-                .set_limit_with_metric(&scope, METRIC_CONCURRENCY, max, PeriodType::Monthly)
+                .set_limit_with_metric(scope, METRIC_CONCURRENCY, max, PeriodType::Monthly)
                 .map_err(TenantQuotaError::Storage)?;
         }
         if let Some(max) = limits.max_storage_bytes {
             let capped = i32::try_from(max.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
             self.tracker
-                .set_limit_with_metric(&scope, METRIC_STORAGE_BYTES, capped, PeriodType::Monthly)
+                .set_limit_with_metric(scope, METRIC_STORAGE_BYTES, capped, PeriodType::Monthly)
                 .map_err(TenantQuotaError::Storage)?;
         }
         Ok(())
@@ -482,6 +558,49 @@ mod tests {
             max_storage_bytes: Some(1_000),
             period: PeriodType::Daily,
         }
+    }
+
+    #[test]
+    fn a_namespace_scope_is_a_child_of_its_tenant_on_the_budget_chain() {
+        let scope = NamespaceQuotaScope::new("tenant-a", "ops").unwrap();
+        assert_eq!(scope.scope_id(), "tenant:tenant-a/namespace:ops");
+        assert!(
+            sekai_core::db::chisei_budget::scope_chain(scope.scope_id())
+                .contains(&tenant_scope_id("tenant-a"))
+        );
+        for (tenant, namespace) in [
+            ("tenant-a", "ops/prod"),
+            ("tenant/a", "ops"),
+            ("tenant-a", ""),
+            ("tenant-a", " ops"),
+            ("tenant-a", "op\ns"),
+        ] {
+            assert!(
+                NamespaceQuotaScope::new(tenant, namespace).is_err(),
+                "{tenant:?} {namespace:?} must be refused"
+            );
+        }
+        let long = "n".repeat(MAX_QUOTA_SCOPE_PART_BYTES + 1);
+        assert!(NamespaceQuotaScope::new("tenant-a", &long).is_err());
+    }
+
+    #[test]
+    fn a_negative_limit_is_invalid_and_zero_is_not() {
+        let negative = TenantQuotaLimits {
+            max_concurrency: Some(-1),
+            ..limits(1)
+        };
+        assert!(
+            negative
+                .validate()
+                .unwrap_err()
+                .contains(METRIC_CONCURRENCY)
+        );
+        let zero = TenantQuotaLimits {
+            max_requests_per_period: Some(0),
+            ..limits(1)
+        };
+        zero.validate().unwrap();
     }
 
     #[test]

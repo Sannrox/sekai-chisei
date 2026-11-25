@@ -14,7 +14,7 @@ use crate::chisei_store::ChiseiStore;
 use crate::ext::*;
 use sekai_core::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 use sekai_core::db::runtime_db::RuntimeDb;
-use sekai_core::enterprise::AuthenticatedContext;
+use sekai_core::enterprise::{AuthenticatedContext, IsolatedProcessRefusal};
 use sekai_core::sekai::governed_transform::{TRANSFORM_CLASS, TransformRun};
 
 pub fn receipt_from_transform_run(
@@ -123,6 +123,47 @@ pub fn configured_limits(
     Ok(any.then_some(limits))
 }
 
+/// Refusal code for a run that asks more of one metric than its scope's
+/// whole budget, so it could never be admitted (#3044, ADR 0168).
+pub const REFUSAL_LARGER_THAN_BUDGET: &str = "quota_larger_than_budget";
+
+/// The terminal refusal of a transform run whose own reservation exceeds a
+/// whole configured budget. Each run reserves one request and one
+/// concurrency unit, so a limit of zero for either can never admit it; a
+/// run left waiting on such a limit would wait forever. Usage, which frees
+/// with time, never refuses here.
+pub fn refusal_larger_than_budget(limits: &TenantQuotaLimits) -> Option<IsolatedProcessRefusal> {
+    const RUN_REQUESTS: i64 = 1;
+    const RUN_CONCURRENCY: i64 = 1;
+    [
+        (
+            METRIC_REQUESTS,
+            limits.max_requests_per_period.map(i64::from),
+            RUN_REQUESTS,
+        ),
+        (
+            METRIC_CONCURRENCY,
+            limits.max_concurrency.map(i64::from),
+            RUN_CONCURRENCY,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(metric, limit, requested)| {
+        let limit = limit.filter(|limit| *limit < requested)?;
+        Some(IsolatedProcessRefusal {
+            code: REFUSAL_LARGER_THAN_BUDGET.into(),
+            details: [
+                ("metric", metric.to_string()),
+                ("limit", limit.to_string()),
+                ("requested", requested.to_string()),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect(),
+        })
+    })
+}
+
 pub fn admit_transform_run(
     gate: &TenantQuotaGate,
     context: &AuthenticatedContext,
@@ -147,6 +188,7 @@ pub fn complete_transform_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chisei::tenant_quota::NamespaceQuotaScope;
     use crate::chisei::usage_ledger::UsageUnit;
     use crate::tenant_context;
     use sekai_core::db::sekai::SekaiDb;
@@ -255,6 +297,78 @@ mod tests {
         assert_eq!(limits.max_requests_per_period, Some(2));
         assert_eq!(limits.max_concurrency, Some(4));
         assert_eq!(limits.period, PeriodType::Daily);
+    }
+
+    fn requests_and_concurrency(requests: i32, concurrency: i32) -> TenantQuotaLimits {
+        TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(requests),
+            max_tokens_per_period: None,
+            max_concurrency: Some(concurrency),
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        }
+    }
+
+    #[test]
+    fn a_namespace_assignment_leaves_the_tenant_assignment_as_it_was() {
+        let db = std::sync::Arc::new(RuntimeDb::memory());
+        let gate = quota_gate(db.clone()).unwrap();
+        let tenant = requests_and_concurrency(2, 4);
+        gate.configure("tenant-a", &tenant).unwrap();
+        let before = configured_limits(&db, "tenant-a").unwrap();
+        let ops = NamespaceQuotaScope::new("tenant-a", "ops").unwrap();
+        gate.configure_namespace(&ops, &requests_and_concurrency(0, 0))
+            .unwrap();
+
+        assert_eq!(configured_limits(&db, "tenant-a").unwrap(), before);
+        let own: Vec<_> = db
+            .budget_limits_for_scope(ops.scope_id())
+            .unwrap()
+            .into_iter()
+            .filter(|(scope, ..)| scope == ops.scope_id())
+            .map(|(_, metric, max, _)| (metric, max))
+            .collect();
+        assert_eq!(
+            own.len(),
+            2,
+            "the namespace rows are stored under their own scope: {own:?}"
+        );
+        // The tenant still admits two runs and refuses the third by usage,
+        // and is never larger than its budget, although the namespace
+        // assignment would refuse every run once enforced.
+        let limits = before.expect("tenant limits");
+        assert_eq!(refusal_larger_than_budget(&limits), None);
+        let ctx = tenant_context("tenant-a", "alice");
+        for key in ["run-1", "run-2"] {
+            let held = admit_transform_run(&gate, &ctx, &limits, key, false).unwrap();
+            complete_transform_run(&gate, &held).unwrap();
+        }
+        assert!(matches!(
+            admit_transform_run(&gate, &ctx, &limits, "run-3", false),
+            Err(TenantQuotaError::Exhausted { metric, .. }) if metric == METRIC_REQUESTS
+        ));
+    }
+
+    #[test]
+    fn a_zero_budget_refuses_a_run_that_could_never_fit() {
+        let refusal = refusal_larger_than_budget(&requests_and_concurrency(5, 0))
+            .expect("no concurrency unit can ever be held");
+        assert_eq!(refusal.code, REFUSAL_LARGER_THAN_BUDGET);
+        assert_eq!(refusal.details["metric"], METRIC_CONCURRENCY);
+        assert_eq!(refusal.details["limit"], "0");
+        assert_eq!(refusal.details["requested"], "1");
+        refusal.validate().unwrap();
+        let refusal = refusal_larger_than_budget(&requests_and_concurrency(0, 1)).unwrap();
+        assert_eq!(refusal.details["metric"], METRIC_REQUESTS);
+        assert_eq!(
+            refusal_larger_than_budget(&requests_and_concurrency(1, 1)),
+            None
+        );
+        assert_eq!(
+            refusal_larger_than_budget(&TenantQuotaLimits::unlimited(1)),
+            None
+        );
     }
 
     #[test]

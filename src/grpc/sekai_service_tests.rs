@@ -25878,8 +25878,6 @@ async fn isolated_claim_without_limits_binds_the_claiming_tenant() {
 
 #[tokio::test]
 async fn isolated_quota_exhaustion_leaves_work_claimable() {
-    use crate::chisei::budget::PeriodType;
-    use crate::chisei::tenant_quota::TenantQuotaLimits;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
         CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec,
@@ -25934,20 +25932,7 @@ async fn isolated_quota_exhaustion_leaves_work_claimable() {
             10,
         )
         .unwrap();
-    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
-        .unwrap()
-        .configure(
-            "tenant-a",
-            &TenantQuotaLimits {
-                version: 1,
-                max_requests_per_period: Some(0),
-                max_tokens_per_period: None,
-                max_concurrency: None,
-                max_storage_bytes: None,
-                period: PeriodType::Daily,
-            },
-        )
-        .unwrap();
+    spend_tenant_request_budget(&svc, "tenant-a");
     svc.run_governed_transform(with_tenant_admin(
         RunGovernedTransformRequest {
             namespace: "ops".into(),
@@ -26052,18 +26037,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
         .unwrap();
     let gate =
         crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
-    gate.configure(
-        "tenant-a",
-        &TenantQuotaLimits {
-            version: 1,
-            max_requests_per_period: Some(0),
-            max_tokens_per_period: None,
-            max_concurrency: None,
-            max_storage_bytes: None,
-            period: PeriodType::Daily,
-        },
-    )
-    .unwrap();
+    spend_tenant_request_budget(&svc, "tenant-a");
     gate.configure(
         "tenant-b",
         &TenantQuotaLimits {
@@ -26188,6 +26162,33 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
     ) -> Option<crate::enterprise::IsolatedProcessRefusal> {
         self.refuse.clone()
     }
+}
+
+/// Assigns `tenant_id` a budget of one request and spends it, so its claims
+/// are denied by usage. A budget of zero would refuse the run for good.
+fn spend_tenant_request_budget(svc: &SekaiServiceImpl, tenant_id: &str) {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+
+    let limits = TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: Some(1),
+        max_tokens_per_period: None,
+        max_concurrency: None,
+        max_storage_bytes: None,
+        period: PeriodType::Daily,
+    };
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
+    gate.configure(tenant_id, &limits).unwrap();
+    crate::composition::transform_run_admission::admit_transform_run(
+        &gate,
+        &crate::provider_credentials::tenant_context(tenant_id, "local"),
+        &limits,
+        "spent-request",
+        false,
+    )
+    .unwrap();
 }
 
 fn isolated_claim_service(deny: bool) -> SekaiServiceImpl {
@@ -26400,6 +26401,38 @@ async fn isolated_process_claim_the_extension_refuses_ends_the_run_for_good() {
 }
 
 #[tokio::test]
+async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::TenantQuotaLimits;
+
+    let svc = isolated_claim_service(false);
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
+        .configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                version: 1,
+                max_requests_per_period: Some(10),
+                max_tokens_per_period: None,
+                max_concurrency: Some(0),
+                max_storage_bytes: None,
+                period: PeriodType::Daily,
+            },
+        )
+        .unwrap();
+    enqueue_isolated_claim(&svc, "t-iso-oversize").await;
+    let run = claim_refused(&svc).await;
+    assert_eq!(run.dispatch_status, "refused");
+    let refusal = run.refusal.unwrap();
+    assert_eq!(
+        refusal.code,
+        crate::composition::transform_run_admission::REFUSAL_LARGER_THAN_BUDGET
+    );
+    assert_eq!(refusal.details["metric"], "concurrency");
+    assert_eq!(refusal.details["limit"], "0");
+}
+
+#[tokio::test]
 async fn isolated_process_refusal_with_secret_like_text_is_withheld() {
     let svc = isolated_claim_service_with(IsolatedClaimExtension {
         deny: false,
@@ -26431,8 +26464,6 @@ async fn isolated_process_refusal_with_secret_like_text_is_withheld() {
 
 #[tokio::test]
 async fn scheduled_isolated_tick_claims_against_the_put_owner() {
-    use crate::chisei::budget::PeriodType;
-    use crate::chisei::tenant_quota::TenantQuotaLimits;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
         CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, TransformSchedule,
@@ -26488,20 +26519,7 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
             "tenant-a",
         )
         .unwrap();
-    let gate =
-        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
-    gate.configure(
-        "tenant-a",
-        &TenantQuotaLimits {
-            version: 1,
-            max_requests_per_period: Some(0),
-            max_tokens_per_period: None,
-            max_concurrency: None,
-            max_storage_bytes: None,
-            period: PeriodType::Daily,
-        },
-    )
-    .unwrap();
+    spend_tenant_request_budget(&svc, "tenant-a");
     svc.tick_governed_transforms(with_named_principal(
         TickGovernedTransformsRequest { now_ms: 1_500 },
         "local",
@@ -26540,8 +26558,6 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
 
 #[tokio::test]
 async fn triggered_isolated_claim_uses_the_put_owner() {
-    use crate::chisei::budget::PeriodType;
-    use crate::chisei::tenant_quota::TenantQuotaLimits;
     use crate::sekai::dataset::{ColumnDef, Dataset};
     use crate::sekai::governed_transform::{
         CONTRACT_VERSION, GovernedTransform, IsolatedProcessSpec, TransformTrigger,
@@ -26630,20 +26646,7 @@ async fn triggered_isolated_claim_uses_the_put_owner() {
     runtime
         .run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
         .unwrap();
-    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
-        .unwrap()
-        .configure(
-            "tenant-a",
-            &TenantQuotaLimits {
-                version: 1,
-                max_requests_per_period: Some(0),
-                max_tokens_per_period: None,
-                max_concurrency: None,
-                max_storage_bytes: None,
-                period: PeriodType::Daily,
-            },
-        )
-        .unwrap();
+    spend_tenant_request_budget(&svc, "tenant-a");
     let listed = svc
         .list_claimable_transform_work(with_named_principal(
             ListClaimableTransformWorkRequest {

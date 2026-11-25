@@ -12,6 +12,16 @@ Tenant quotas use the existing replica-safe budget tables with scope id:
 tenant:{tenant_id}
 ```
 
+A namespace assignment (#3044, [ADR 0168](decisions/0168-tenant-and-namespace-quota-assignments.md))
+is stored under the child scope:
+
+```text
+tenant:{tenant_id}/namespace:{namespace}
+```
+
+Neither part may contain `/`. A namespace assignment is stored and validated
+but does not yet affect admission.
+
 Project/namespace budgets remain on the hierarchical chain
 (`global` / `project:…`). Tenant admission is an **additional** gate and never
 widens a stricter project limit.
@@ -30,6 +40,9 @@ widens a stricter project limit.
 `chisei::tenant_quota::TenantQuotaGate`:
 
 - `configure(tenant_id, TenantQuotaLimits)` — operator assignment
+- `configure_namespace(NamespaceQuotaScope, TenantQuotaLimits)` — namespace
+  assignment, stored only (`DomainAdminSurface::configure_namespace_quotas`
+  checks the role, refuses negative limits and narrows by entitlement)
 - `admit(context, limits, min_version, estimated_tokens, idempotency_key)`
 - `complete(admission, actual_tokens)` — release concurrency + reconcile tokens
 - `charge_storage(tenant_id, limits, bytes)`
@@ -37,6 +50,12 @@ widens a stricter project limit.
 `AuthenticatedContext.tenant` is required. Stale assignment versions fail closed.
 Exhaustion returns stable `TenantQuotaError::Exhausted` with a retry hint and
 never includes another tenant’s usage.
+
+An isolated-process run asks for one request and one concurrency unit. When
+its tenant's limit for either is zero, the run can never fit, so the claim
+refuses it for good: the run is marked `refused` with the code
+`quota_larger_than_budget` and the details `metric`, `limit` and
+`requested`. A budget spent by usage still defers the run until it frees.
 
 Receipt-safe summary: `TenantQuotaReceiptNote` (own tenant id, assignment
 version, admitted metrics only).
