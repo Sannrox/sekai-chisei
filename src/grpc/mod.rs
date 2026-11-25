@@ -943,6 +943,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "FindByProperty"
             | "CreateLink"
             | "DeleteLink"
+            | "ApplyGraphChanges"
             | "GetLinks"
             | "GetLinkedObjects"
             | "Traverse"

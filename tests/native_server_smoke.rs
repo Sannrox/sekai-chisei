@@ -404,6 +404,7 @@ impl NativeServer {
             .await
             .create_object(CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: "palette-billing".into(),
                     kind: "component".into(),
                     name: "palette-billing".into(),
@@ -427,6 +428,7 @@ impl NativeServer {
             .await
             .create_object(CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: id.into(),
                     kind: "component".into(),
                     name: id.into(),
@@ -1267,6 +1269,7 @@ async fn dataset_commit_binding_smoke(require_approval: bool) {
     sekai
         .create_object(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "orders-table".into(),
                 kind: "table".into(),
                 name: "orders".into(),
@@ -1429,6 +1432,7 @@ async fn spawned_binary_admits_one_action_per_bound_object_change() {
         .await
         .unwrap_or_else(|error| panic!("put type: {error}\n{}", server.logs()));
     let object = Object {
+        revision: String::new(),
         id: "billing-api".into(),
         kind: "component".into(),
         name: "billing-api".into(),

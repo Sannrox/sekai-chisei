@@ -41,33 +41,11 @@ impl SekaiServiceImpl {
             {
                 return Err(Status::not_found("link endpoint not found"));
             }
-            if evaluate_active_object_policy(
-                self.db.runtime(),
-                &object,
+            self.authorize_link_endpoint(
                 &principals,
                 tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                None,
-            )? == Some(false)
-            {
-                return Err(Status::not_found("link endpoint not found"));
-            }
-            enforce_namespace_tenant_context(
-                self.db.runtime(),
-                tenant_context.as_ref(),
-                &object.namespace,
-                true,
-            )?;
-            check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-            check_write(&self.security, object_id, &principals)?;
-            enforce_object_operation_access(
-                self.db.runtime(),
                 &object,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Update,
-                &format!("create_link:{object_id}"),
-                None,
+                "create_link",
             )?;
             endpoints.push(object);
         }
@@ -151,33 +129,11 @@ impl SekaiServiceImpl {
                 .get_object(object_id)
                 .map_err(Status::internal)?
                 .ok_or(Status::not_found("link endpoint not found"))?;
-            if evaluate_active_object_policy(
-                self.db.runtime(),
-                &object,
+            self.authorize_link_endpoint(
                 &principals,
                 tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Read,
-                None,
-            )? == Some(false)
-            {
-                return Err(Status::not_found("link endpoint not found"));
-            }
-            enforce_namespace_tenant_context(
-                self.db.runtime(),
-                tenant_context.as_ref(),
-                &object.namespace,
-                true,
-            )?;
-            check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-            check_write(&self.security, object_id, &principals)?;
-            enforce_object_operation_access(
-                self.db.runtime(),
                 &object,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Update,
-                &format!("delete_link:{object_id}"),
-                None,
+                "delete_link",
             )?;
             endpoints.push(object);
         }
@@ -201,6 +157,49 @@ impl SekaiServiceImpl {
     }
 }
 
+impl SekaiServiceImpl {
+    /// Checks that the caller may link to or unlink from `object`: it must be
+    /// readable (else it answers as missing), in an admitted namespace, and
+    /// writable. `ApplyGraphChanges` runs the same check per endpoint.
+    pub(super) fn authorize_link_endpoint(
+        &self,
+        principals: &[String],
+        tenant_context: Option<&RequestEnterpriseContext>,
+        object: &domain::Object,
+        operation: &str,
+    ) -> Result<(), Status> {
+        if evaluate_active_object_policy(
+            self.db.runtime(),
+            object,
+            principals,
+            tenant_context,
+            crate::sekai::object_security::ObjectSecurityOperation::Read,
+            None,
+        )? == Some(false)
+        {
+            return Err(Status::not_found("link endpoint not found"));
+        }
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context,
+            &object.namespace,
+            true,
+        )?;
+        check_team_namespace(self.db.runtime(), principals, &object.namespace, true)?;
+        check_write(&self.security, &object.id, principals)?;
+        enforce_object_operation_access(
+            self.db.runtime(),
+            object,
+            principals,
+            tenant_context,
+            crate::sekai::object_security::ObjectSecurityOperation::Update,
+            &format!("{operation}:{}", object.id),
+            None,
+        )?;
+        Ok(())
+    }
+}
+
 fn ontology_link_violations(
     registry: &ontology::OntologyRegistry,
     relation: &ontology::OntologyRelation,
@@ -213,7 +212,7 @@ fn ontology_link_violations(
     )
 }
 
-fn validate_mapped_link(
+pub(super) fn validate_mapped_link(
     registry: &ontology::OntologyRegistry,
     mapped_relation: &str,
     from_kind: &str,

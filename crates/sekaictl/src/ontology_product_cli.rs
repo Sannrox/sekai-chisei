@@ -658,6 +658,7 @@ pub async fn seed_graph(target: &str, doc: &SeedDocument) -> Result<SeedReport, 
         let created = client
             .create_object(Request::new(CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: obj.id.clone(),
                     kind: obj.kind.clone(),
                     name: obj.name.clone(),

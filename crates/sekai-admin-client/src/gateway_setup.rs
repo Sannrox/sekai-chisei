@@ -690,6 +690,7 @@ async fn ensure_gateway_objects(
     upsert_object(
         sekai,
         Object {
+            revision: String::new(),
             id: project_id.clone(),
             kind: "project".to_string(),
             name: config.project.clone(),
@@ -704,6 +705,7 @@ async fn ensure_gateway_objects(
     upsert_object(
         sekai,
         Object {
+            revision: String::new(),
             id: agent_id.clone(),
             kind: "agent".to_string(),
             name: config.agent.clone(),
@@ -721,6 +723,7 @@ async fn ensure_gateway_objects(
     upsert_object(
         sekai,
         Object {
+            revision: String::new(),
             id: key_id.clone(),
             kind: "gateway_key".to_string(),
             name: config.gateway_key_name.clone(),
@@ -745,6 +748,7 @@ async fn ensure_gateway_objects(
     upsert_object(
         sekai,
         Object {
+            revision: String::new(),
             id: budget_id.clone(),
             kind: "budget".to_string(),
             name: format!("{} {}", config.agent, config.budget_period),
@@ -763,6 +767,7 @@ async fn ensure_gateway_objects(
     upsert_object(
         sekai,
         Object {
+            revision: String::new(),
             id: policy_id.clone(),
             kind: "policy".to_string(),
             name: config.project.clone(),

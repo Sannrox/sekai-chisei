@@ -270,6 +270,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.FindByProperty` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.CreateLink` | `sekai.graph` | yes | sdk, cli | `stable` |
 | `SekaiService.DeleteLink` | `sekai.graph` | yes | none | `stable` |
+| `SekaiService.ApplyGraphChanges` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.GetLinks` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.GetLinkedObjects` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.Traverse` | `sekai.graph` | yes | none | `stable` |

@@ -143,6 +143,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     section("sekai · typed object graph");
 
     let context_obj = Object {
+        revision: String::new(),
         id: namespace_id.to_string(),
         kind: "component".to_string(),
         name: "sekai-chisei".to_string(),
@@ -164,6 +165,7 @@ async fn sekai_demo(sekai: &mut Sekai, namespace_id: &str, service_id: &str) {
     }
 
     let service = Object {
+        revision: String::new(),
         id: service_id.to_string(),
         kind: "service".to_string(),
         name: "billing-api".to_string(),

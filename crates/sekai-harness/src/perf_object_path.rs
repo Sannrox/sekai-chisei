@@ -1039,6 +1039,7 @@ fn perf_row_object(namespace: &str) -> Object {
 
 fn proto_perf_row(namespace: &str, id: &str) -> sekai_chisei::grpc::pb::sekai::Object {
     sekai_chisei::grpc::pb::sekai::Object {
+        revision: String::new(),
         id: id.into(),
         kind: "perf_row".into(),
         name: id.into(),

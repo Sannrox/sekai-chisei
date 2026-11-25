@@ -592,6 +592,7 @@ async fn setup(operator: &mut Client, script: &GameScript) -> Result<Deployment,
         operator
             .create_object(CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: object.id.clone(),
                     kind: object.kind.clone(),
                     name: object.name.clone(),

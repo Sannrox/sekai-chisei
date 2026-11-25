@@ -27,6 +27,8 @@ mod data_export_rpc;
 mod federated_aggregate_rpc;
 #[path = "federated_allowance_rpc.rs"]
 mod federated_allowance_rpc;
+#[path = "graph_changes.rs"]
+mod graph_changes;
 use data_export_rpc::{
     EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
     run_export,
@@ -1038,6 +1040,12 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         rpc_objects::delete_link(self, req).await
+    }
+    async fn apply_graph_changes(
+        &self,
+        req: Request<ApplyGraphChangesRequest>,
+    ) -> Result<Response<ApplyGraphChangesResponse>, Status> {
+        self.apply_graph_changes_rpc(req).await
     }
     async fn get_links(
         &self,

@@ -59,6 +59,8 @@ If you want to deploy or operate the control plane:
   and governed entry paths.
 - [Ontology definitions](ontology.md) — semantic classes, relations, schemas,
   provenance, and validation.
+- [Applying graph changes](graph-changes.md) — experimental all-or-none
+  object and link writes with per-object revisions and replay.
 - [Governed definition branches](definition-branches.md) — immutable member and
   revision identity, compare-and-swap authoring heads, and proposal merge.
 - [Definition-change tracer](definition-change-tracer.md) — isolated MCP

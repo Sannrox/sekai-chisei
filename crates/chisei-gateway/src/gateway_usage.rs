@@ -1384,6 +1384,7 @@ pub(super) async fn ensure_gateway_object(
     match sekai
         .create_object(gateway_request(CreateObjectRequest {
             object: Some(SekaiObject {
+                revision: String::new(),
                 id: id.clone(),
                 kind: kind.to_string(),
                 name: name.to_string(),
