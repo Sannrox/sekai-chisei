@@ -48,6 +48,7 @@ widens a stricter project limit.
 | --- | --- |
 | `tokens` | Period token budget |
 | `requests` | Period request count |
+| `compute_seconds` | Period isolated-process compute, in whole seconds |
 | `concurrency` | In-flight operations (released on complete) |
 | `storage_bytes` | Retained storage charge |
 
@@ -61,25 +62,38 @@ widens a stricter project limit.
   role, refuses negative limits and narrows by entitlement)
 - `admit(context, limits, min_version, estimated_tokens, idempotency_key)`
 - `admit_in_namespace(context, limits, namespace, min_version,
-  estimated_tokens, idempotency_key)` — tenant and namespace together
+  estimated_tokens, estimated_compute_seconds, idempotency_key)` — tenant
+  and namespace together
 - `complete(admission, actual_tokens)` — release concurrency + reconcile tokens
+- `settle_compute(admission, actual_seconds)` — reconcile reserved compute
+  seconds; zero refunds them
 - `charge_storage(tenant_id, limits, bytes)`
 
 `AuthenticatedContext.tenant` is required. Stale assignment versions fail closed.
 Exhaustion returns stable `TenantQuotaError::Exhausted` with a retry hint and
 never includes another tenant’s usage.
 
-An isolated-process run asks for one request and one concurrency unit. When
-its tenant's or its namespace's limit for either is zero, the run can never fit, so the claim
-refuses it for good: the run is marked `refused` with the code
-`quota_larger_than_budget` and the details `metric`, `limit` and
+An isolated-process run asks for one request, one concurrency unit and its
+estimated compute seconds. The estimate is the runner's default wall clock,
+30 seconds, because the run's spec carries no time limit. When its tenant's
+or its namespace's limit for any of them is below that, the run can never
+fit, so the claim refuses it for good: the run is marked `refused` with the
+code `quota_larger_than_budget` and the details `metric`, `limit` and
 `requested`.
 
 Budgets refuse; only concurrency waits. When a claim finds the run's
-tenant or namespace request or token budget spent, the run is marked
-`refused` with the code `quota_budget_exhausted` and the detail `metric`,
-and it reserves nothing. A full concurrency limit still leaves the run
-`pending` until a unit frees.
+tenant or namespace request, token or compute budget spent, the run is
+marked `refused` with the code `quota_budget_exhausted` and the detail
+`metric`, and it reserves nothing. A full concurrency limit still leaves the
+run `pending` until a unit frees.
+
+The claim's compute reservation is stored on the run's quota hold. When the
+run's result is written it settles to the measured seconds, rounded up, or
+stays at the estimate when the run recorded no measurement. A cancelled,
+failed or refused run refunds it, and so does a claim lost on lease expiry
+when the run is claimed again; the new claim reserves its own. A crash
+between taking the reservation and storing the hold keeps the seconds
+charged until the period resets, as a request already is.
 
 Receipt-safe summary: `TenantQuotaReceiptNote` (own tenant id, assignment
 version, admitted metrics only).

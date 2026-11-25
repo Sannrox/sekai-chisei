@@ -262,6 +262,8 @@ const SOURCE_IDENTITY_OBJECT_KEY_SCHEMA: &str =
     include_str!("postgres/0182_source_identity_object_key.sql");
 const TRANSFORM_QUOTA_HOLD_SCOPE_SCHEMA: &str =
     include_str!("postgres/0183_transform_quota_hold_scope.sql");
+const TRANSFORM_QUOTA_HOLD_COMPUTE_SECONDS_SCHEMA: &str =
+    include_str!("postgres/0184_transform_quota_hold_compute_seconds.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1325,6 +1327,12 @@ const MIGRATIONS: &[Migration] = &[
         183,
         "transform_quota_hold_scope",
         TRANSFORM_QUOTA_HOLD_SCOPE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        184,
+        "transform_quota_hold_compute_seconds",
+        TRANSFORM_QUOTA_HOLD_COMPUTE_SECONDS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2801,17 +2809,18 @@ mod tests {
             .unwrap()
             .expect("the older hold survives the upgrade");
         assert_eq!(older.quota_scope, "");
+        assert_eq!(older.reserved_compute_seconds, 0);
         assert!(older.refund_request);
         let scope = "tenant:tenant-a/namespace:ops";
         assert!(
-            db.restore_abandoned_quota_hold("held-after", "tenant-a", scope, false, true, 0)
+            db.restore_abandoned_quota_hold("held-after", "tenant-a", scope, false, true, 0, 30)
                 .unwrap()
         );
         assert_eq!(
             db.take_transform_quota_hold("held-after", Some(0), false)
                 .unwrap()
-                .map(|hold| hold.quota_scope),
-            Some(scope.to_string())
+                .map(|hold| (hold.quota_scope, hold.reserved_compute_seconds)),
+            Some((scope.to_string(), 30))
         );
     }
 

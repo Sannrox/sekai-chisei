@@ -1202,12 +1202,14 @@ impl PostgresDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn put_transform_quota_hold(
         &self,
         run_id: &str,
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
         fencing_token: &str,
     ) -> Result<bool, String> {
@@ -1235,12 +1237,14 @@ impl PostgresDb {
         let changed = tx
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
-                 VALUES ($1, $2, $3, $4, $5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope,
+                     reserved_compute_seconds)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
                     quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency,
+                    reserved_compute_seconds = EXCLUDED.reserved_compute_seconds,
                     claim_generation = EXCLUDED.claim_generation
                  WHERE EXCLUDED.claim_generation >= sekai_transform_quota_hold.claim_generation",
                 &[
@@ -1249,6 +1253,7 @@ impl PostgresDb {
                     &reserved,
                     &claim_generation,
                     &quota_scope,
+                    &reserved_compute_seconds,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1262,6 +1267,7 @@ impl PostgresDb {
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
     ) -> Result<bool, String> {
         let reserved = i32::from(reserved_concurrency);
@@ -1269,24 +1275,28 @@ impl PostgresDb {
             .connection()?
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
-                 VALUES ($1, $2, $3, $4, $5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope,
+                     reserved_compute_seconds)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
                     quota_scope = EXCLUDED.quota_scope,
-                    reserved_concurrency = EXCLUDED.reserved_concurrency",
+                    reserved_concurrency = EXCLUDED.reserved_concurrency,
+                    reserved_compute_seconds = EXCLUDED.reserved_compute_seconds",
                 &[
                     &run_id,
                     &tenant_id,
                     &reserved,
                     &claim_generation,
                     &quota_scope,
+                    &reserved_compute_seconds,
                 ],
             )
             .map_err(|error| error.to_string())?;
         Ok(changed > 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_abandoned_quota_hold(
         &self,
         run_id: &str,
@@ -1295,6 +1305,7 @@ impl PostgresDb {
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
+        reserved_compute_seconds: i32,
     ) -> Result<bool, String> {
         let reserved = i32::from(reserved_concurrency);
         let refund_request = i32::from(refund_request);
@@ -1303,14 +1314,15 @@ impl PostgresDb {
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
                     (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request,
-                     refund_tokens, quota_scope)
-                 VALUES ($1, $2, $3, 0, $4, $5, $6)
+                     refund_tokens, quota_scope, reserved_compute_seconds)
+                 VALUES ($1, $2, $3, 0, $4, $5, $6, $7)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
                     quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency,
                     refund_request = EXCLUDED.refund_request,
-                    refund_tokens = EXCLUDED.refund_tokens",
+                    refund_tokens = EXCLUDED.refund_tokens,
+                    reserved_compute_seconds = EXCLUDED.reserved_compute_seconds",
                 &[
                     &run_id,
                     &tenant_id,
@@ -1318,6 +1330,7 @@ impl PostgresDb {
                     &refund_request,
                     &refund_tokens,
                     &quota_scope,
+                    &reserved_compute_seconds,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -3470,6 +3483,7 @@ fn quota_hold_row_pg(row: &Row) -> TransformQuotaHold {
         claim_generation: row.get(3),
         refund_request: row.get::<_, i32>(4) != 0,
         refund_tokens: row.get(5),
+        reserved_compute_seconds: row.get(6),
     }
 }
 

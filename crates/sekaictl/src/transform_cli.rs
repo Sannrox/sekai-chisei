@@ -104,6 +104,9 @@ pub fn run_named_with_quota(
                 context,
                 &limits,
                 &format!("transform-run:{namespace}:{transform_id}:{now_ms}"),
+                // An in-process run is not an isolated process; it has no
+                // compute estimate to reserve.
+                0,
                 false,
             )
             .map_err(|error| error.to_string())?,
@@ -144,7 +147,8 @@ pub fn run_named_with_quota(
                 && let Err(failed) = gate.abandon(admission)
                 && (failed.remaining.reserved_concurrency
                     || failed.remaining.reserved_request
-                    || failed.remaining.reserved_tokens > 0)
+                    || failed.remaining.reserved_tokens > 0
+                    || failed.remaining.reserved_compute_seconds > 0)
             {
                 let _ = db.restore_abandoned_quota_hold(
                     &failed.remaining.idempotency_key,
@@ -153,6 +157,7 @@ pub fn run_named_with_quota(
                     failed.remaining.reserved_concurrency,
                     failed.remaining.reserved_request,
                     failed.remaining.reserved_tokens,
+                    failed.remaining.reserved_compute_seconds,
                 );
             }
             Err(error)
@@ -578,6 +583,7 @@ mod tests {
                     version: 1,
                     max_requests_per_period: Some(1),
                     max_tokens_per_period: None,
+                    max_compute_seconds_per_period: None,
                     max_concurrency: None,
                     max_storage_bytes: None,
                     period: PeriodType::Daily,
@@ -647,6 +653,7 @@ mod tests {
                     version: 1,
                     max_requests_per_period: Some(1),
                     max_tokens_per_period: None,
+                    max_compute_seconds_per_period: None,
                     max_concurrency: None,
                     max_storage_bytes: None,
                     period: PeriodType::Daily,

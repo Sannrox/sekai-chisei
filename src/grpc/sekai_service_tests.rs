@@ -24107,6 +24107,7 @@ async fn run_governed_transform_applies_tenant_quota_and_records_usage() {
         version: 1,
         max_requests_per_period: Some(1),
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: None,
         max_storage_bytes: None,
         period: PeriodType::Daily,
@@ -24232,6 +24233,7 @@ async fn split_plane_run_records_usage_on_the_chisei_dest() {
         version: 1,
         max_requests_per_period: Some(1),
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: None,
         max_storage_bytes: None,
         period: PeriodType::Daily,
@@ -24322,6 +24324,7 @@ async fn in_process_run_without_tenant_meters_the_put_owner() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -24410,6 +24413,7 @@ async fn in_process_run_with_tenant_meters_the_caller_not_the_put_owner() {
         version: 1,
         max_requests_per_period: Some(1),
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: None,
         max_storage_bytes: None,
         period: PeriodType::Daily,
@@ -24812,6 +24816,7 @@ async fn isolated_claim_admits_quota_and_write_records_usage() {
             version: 1,
             max_requests_per_period: Some(1),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period: PeriodType::Daily,
@@ -24984,6 +24989,7 @@ async fn isolated_write_records_usage_for_the_claiming_tenant() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -25124,6 +25130,7 @@ async fn isolated_claim_without_tenant_context_meters_the_owner() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -25372,6 +25379,7 @@ async fn scheduled_isolated_tick_meters_the_put_owner() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -25492,6 +25500,7 @@ async fn scheduled_in_process_tick_admits_owner_quota_before_run() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -25685,6 +25694,7 @@ async fn triggered_in_process_defers_until_quota_tick() {
                 version: 1,
                 max_requests_per_period: Some(1),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -26046,6 +26056,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
             version: 1,
             max_requests_per_period: Some(1),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period: PeriodType::Daily,
@@ -26176,6 +26187,7 @@ fn fill_tenant_concurrency(svc: &SekaiServiceImpl, tenant_id: &str) {
         version: 1,
         max_requests_per_period: None,
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: Some(1),
         max_storage_bytes: None,
         period: PeriodType::Daily,
@@ -26191,6 +26203,7 @@ fn fill_tenant_concurrency(svc: &SekaiServiceImpl, tenant_id: &str) {
             namespace: None,
         },
         "held-unit",
+        0,
         false,
     )
     .unwrap();
@@ -26419,6 +26432,7 @@ async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good
                 version: 1,
                 max_requests_per_period: Some(10),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(0),
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -26450,6 +26464,7 @@ async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing()
         version: 1,
         max_requests_per_period: Some(max),
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: None,
         max_storage_bytes: None,
         period: PeriodType::Daily,
@@ -26468,6 +26483,7 @@ async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing()
                 namespace: namespace.map(|scope| (scope, requests(1))),
             },
             key,
+            0,
             false,
         )
     };
@@ -26481,6 +26497,129 @@ async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing()
     // The refused run took nothing: the tenant still has its second request.
     admit(None, "dev-1").unwrap();
     assert!(admit(None, "dev-2").is_err());
+}
+
+fn tenant_compute_seconds(max: i32) -> crate::chisei::tenant_quota::TenantQuotaLimits {
+    crate::chisei::tenant_quota::TenantQuotaLimits {
+        max_compute_seconds_per_period: Some(max),
+        ..crate::chisei::tenant_quota::TenantQuotaLimits::unlimited(1)
+    }
+}
+
+/// Claims the next queued `ops` run for tenant-a as `runtime_id`.
+async fn claim_ops_work(
+    svc: &SekaiServiceImpl,
+    runtime_id: &str,
+    ttl_ms: i64,
+) -> Result<TransformWork, tonic::Status> {
+    svc.claim_transform_work(with_tenant_admin(
+        ClaimTransformWorkRequest {
+            namespace: "ops".into(),
+            runtime_id: runtime_id.into(),
+            run_id: String::new(),
+            ttl_ms,
+        },
+        "tenant-a",
+    ))
+    .await
+    .map(|response| response.into_inner().work.unwrap())
+}
+
+async fn queue_ops_run(svc: &SekaiServiceImpl, transform_id: &str) {
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: transform_id.into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_finished_run_settles_its_compute_reservation_to_the_measured_seconds() {
+    use crate::composition::transform_run_admission::{REFUSAL_BUDGET_EXHAUSTED, quota_gate};
+
+    let svc = isolated_claim_service(false);
+    // Two 30-second reservations fit; three do not unless one settled lower.
+    quota_gate(svc.db.runtime_arc())
+        .unwrap()
+        .configure("tenant-a", &tenant_compute_seconds(61))
+        .unwrap();
+    enqueue_isolated_claim(&svc, "t-iso-compute").await;
+    let work = claim_ops_work(&svc, "runner-a", 60_000).await.unwrap();
+    svc.write_transform_run_result(with_tenant_admin(
+        WriteTransformRunResultRequest {
+            run_id: work.run_id,
+            runtime_id: work.claim_owner,
+            claim_generation: work.claim_generation,
+            fencing_token: work.fencing_token,
+            output_digest: crate::sekai::governed_transform::rows_digest(&[]),
+            ..Default::default()
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    // The finished run measured under a second, so it now holds at most one.
+    for _ in 0..2 {
+        queue_ops_run(&svc, "t-iso-compute").await;
+        claim_ops_work(&svc, "runner-b", 60_000).await.unwrap();
+    }
+    queue_ops_run(&svc, "t-iso-compute").await;
+    assert_eq!(
+        claim_ops_work(&svc, "runner-c", 60_000)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    let runs = svc
+        .list_governed_transform_runs(with_tenant_admin(
+            ListGovernedTransformRunsRequest {
+                namespace: "ops".into(),
+                limit: 10,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .runs;
+    let refusal = runs
+        .iter()
+        .find_map(|run| run.refusal.clone())
+        .expect("the third concurrent run is refused");
+    assert_eq!(refusal.code, REFUSAL_BUDGET_EXHAUSTED);
+    assert_eq!(refusal.details["metric"], "compute_seconds");
+}
+
+#[tokio::test]
+async fn a_lost_claim_refunds_its_compute_reservation() {
+    let svc = isolated_claim_service(false);
+    // Room for one claim's reservation only.
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
+        .configure("tenant-a", &tenant_compute_seconds(30))
+        .unwrap();
+    enqueue_isolated_claim(&svc, "t-iso-compute-reclaim").await;
+    claim_ops_work(&svc, "runner-a", 1).await.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let reclaimed = claim_ops_work(&svc, "runner-b", 60_000).await.unwrap();
+    assert_eq!(reclaimed.claim_owner, "runner-b");
+    svc.cancel_governed_transform_run(with_tenant_admin(
+        CancelGovernedTransformRunRequest {
+            run_id: reclaimed.run_id,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    // The cancel refunded the reclaim's reservation as well.
+    queue_ops_run(&svc, "t-iso-compute-reclaim").await;
+    claim_ops_work(&svc, "runner-c", 60_000).await.unwrap();
 }
 
 /// Assigns `limits` to tenant-a's `ops` namespace only.
@@ -26500,6 +26639,7 @@ fn namespace_concurrency(max: i32) -> crate::chisei::tenant_quota::TenantQuotaLi
         version: 1,
         max_requests_per_period: None,
         max_tokens_per_period: None,
+        max_compute_seconds_per_period: None,
         max_concurrency: Some(max),
         max_storage_bytes: None,
         period: crate::chisei::budget::PeriodType::Daily,
@@ -26885,6 +27025,7 @@ async fn isolated_expired_claim_releases_concurrency_for_reclaim() {
                 version: 1,
                 max_requests_per_period: None,
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(1),
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -26997,6 +27138,7 @@ async fn isolated_terminal_lease_failure_releases_concurrency() {
                 version: 1,
                 max_requests_per_period: None,
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(1),
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -27134,6 +27276,7 @@ async fn isolated_cancel_releases_concurrency_for_next_claim() {
                 version: 1,
                 max_requests_per_period: None,
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(1),
                 max_storage_bytes: None,
                 period: PeriodType::Daily,

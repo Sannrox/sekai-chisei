@@ -197,10 +197,19 @@ impl EntitlementRegistry {
             ceiling.period,
             requested.period,
         );
+        let ceiling_compute_seconds = scale_to_period(
+            ceiling.max_compute_seconds_per_period,
+            ceiling.period,
+            requested.period,
+        );
         Ok(TenantQuotaLimits {
             version: requested.version.max(ceiling.version),
             max_requests_per_period: min_opt(requested.max_requests_per_period, ceiling_requests),
             max_tokens_per_period: min_opt(requested.max_tokens_per_period, ceiling_tokens),
+            max_compute_seconds_per_period: min_opt(
+                requested.max_compute_seconds_per_period,
+                ceiling_compute_seconds,
+            ),
             max_concurrency: min_opt(requested.max_concurrency, ceiling.max_concurrency),
             max_storage_bytes: min_opt_i64(requested.max_storage_bytes, ceiling.max_storage_bytes),
             period: requested.period,
@@ -253,6 +262,7 @@ pub fn migration_entitlement_set(version: u64) -> EntitlementSet {
             version,
             max_requests_per_period: Some(1_000),
             max_tokens_per_period: Some(1_000_000),
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(10),
             max_storage_bytes: Some(10_000_000_000),
             period: crate::chisei::budget::PeriodType::Daily,
@@ -275,6 +285,7 @@ mod tests {
                 version,
                 max_requests_per_period: Some(5),
                 max_tokens_per_period: Some(100),
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(2),
                 max_storage_bytes: Some(1_000),
                 period: crate::chisei::budget::PeriodType::Daily,
@@ -348,6 +359,7 @@ mod tests {
             version: 9,
             max_requests_per_period: Some(100),
             max_tokens_per_period: Some(50),
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(10),
             max_storage_bytes: Some(500),
             period: crate::chisei::budget::PeriodType::Daily,
@@ -378,6 +390,7 @@ mod tests {
             version: 1,
             max_requests_per_period: Some(310),
             max_tokens_per_period: Some(500),
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period,
