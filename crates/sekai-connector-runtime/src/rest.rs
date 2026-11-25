@@ -493,7 +493,7 @@ fn json_body(response: Response) -> Option<Value> {
 }
 
 /// A string or number as text; anything else is not an id or version.
-fn scalar(value: Option<&Value>) -> Option<String> {
+pub(crate) fn scalar(value: Option<&Value>) -> Option<String> {
     match value? {
         Value::String(text) => Some(text.clone()),
         Value::Number(number) => Some(number.to_string()),
@@ -503,7 +503,7 @@ fn scalar(value: Option<&Value>) -> Option<String> {
 
 /// A field name the plane holds as a property: normalized, and not one
 /// that suggests a credential or personal data.
-fn property_key(key: &str) -> bool {
+pub(crate) fn property_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_SOURCE_PROPERTY_KEY_BYTES
         && key.chars().all(|character| {
@@ -518,7 +518,7 @@ fn property_key(key: &str) -> bool {
 }
 
 /// `text` on one line within the display limit.
-fn display_line(text: &str) -> String {
+pub(crate) fn display_line(text: &str) -> String {
     let mut line: String = text
         .chars()
         .map(|character| {
@@ -535,7 +535,7 @@ fn display_line(text: &str) -> String {
     line.trim().to_string()
 }
 
-fn digest_of(properties: &BTreeMap<String, PropertyValue>) -> String {
+pub(crate) fn digest_of(properties: &BTreeMap<String, PropertyValue>) -> String {
     let cells: BTreeMap<&str, String> = properties
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_cell()))
@@ -602,7 +602,7 @@ impl std::fmt::Display for Cursor {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -718,6 +718,7 @@ mod tests {
             connector: &REST_CONNECTOR,
             source_instance: "tickets".into(),
             config,
+            egress: Default::default(),
             credentials: BTreeMap::from([("token".into(), Secret("s3cr3t-value".into()))]),
         })
     }

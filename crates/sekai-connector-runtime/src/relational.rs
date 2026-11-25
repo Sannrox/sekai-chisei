@@ -1168,6 +1168,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| (name.to_string(), ConfigValue::Text(value.to_string())))
                 .collect::<SourceConfig>(),
+            egress: Default::default(),
             credentials: password
                 .map(|password| BTreeMap::from([("password".into(), Secret(password.into()))]))
                 .unwrap_or_default(),

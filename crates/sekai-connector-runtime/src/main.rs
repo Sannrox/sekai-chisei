@@ -17,10 +17,12 @@ use sekai_client::ClientConfig;
 use std::path::PathBuf;
 
 use sekai_connector_runtime::{
-    Connectors, CredentialBindings, Runtime, RuntimeOptions, github, llm_rows::GatewayRoute,
-    relational, rest,
+    Connectors, CredentialBindings, Runtime, RuntimeOptions, event_stream, github,
+    llm_rows::GatewayRoute, relational, rest,
 };
-use sekai_source_sdk::{GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR};
+use sekai_source_sdk::{
+    EVENT_STREAM_CONNECTOR, GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -113,13 +115,19 @@ async fn serve() -> Result<(), String> {
         .transpose()
         .map_err(|error| format!("read relational CA file: {error}"))?;
     let tls = relational::tls(ca.as_deref())?;
+    let broker_tls = native_tls::TlsConnector::new()
+        .map_err(|error| format!("build broker TLS connector: {error}"))?;
     let gateway = gateway_route(config.gateway_url, std::env::var("CHISEI_GATEWAY_KEY").ok())?;
     let connectors = Connectors::default()
         .with(&GITHUB_CONNECTOR, github::open)
         .with(&RELATIONAL_CONNECTOR, move |prepared| {
             relational::open(prepared, &tls)
         })
-        .with(&REST_CONNECTOR, rest::open);
+        .with(&REST_CONNECTOR, rest::open)
+        // Brokers off loopback are reached over TLS trusting the system roots.
+        .with(&EVENT_STREAM_CONNECTOR, move |prepared| {
+            event_stream::open(prepared, &broker_tls)
+        });
     let runtime = Runtime::connect(
         plane,
         &config.namespaces,

@@ -17,7 +17,7 @@
 
 pub mod codec;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -379,6 +379,79 @@ call!(
 call!(MetadataRequest, MetadataResponse, Metadata, 1..=12);
 call!(ListOffsetsRequest, ListOffsetsResponse, ListOffsets, 1..=7);
 call!(FetchRequest, FetchResponse, Fetch, 4..=12);
+// Tests against a real broker write their own records.
+#[cfg(test)]
+call!(
+    kafka_protocol::messages::ProduceRequest,
+    kafka_protocol::messages::ProduceResponse,
+    Produce,
+    3..=8
+);
+
+#[cfg(test)]
+call!(
+    kafka_protocol::messages::CreateTopicsRequest,
+    kafka_protocol::messages::CreateTopicsResponse,
+    CreateTopics,
+    2..=5
+);
+
+#[cfg(test)]
+impl Cluster {
+    /// Creates a topic with `partitions` partitions on one replica,
+    /// through the bootstrap broker. For tests against a real broker.
+    pub(crate) fn create_topic(&mut self, topic: &str, partitions: i32) -> Result<(), BrokerError> {
+        use kafka_protocol::messages::create_topics_request::{
+            CreatableTopic, CreateTopicsRequest,
+        };
+        let request = CreateTopicsRequest::default()
+            .with_timeout_ms(10_000)
+            .with_topics(vec![
+                CreatableTopic::default()
+                    .with_name(topic_name(topic))
+                    .with_num_partitions(partitions)
+                    .with_replication_factor(1),
+            ]);
+        let bootstrap = self.config.bootstrap.clone();
+        let response = self.call(&bootstrap, &request)?;
+        response
+            .topics
+            .iter()
+            .try_for_each(|entry| error_code(entry.error_code))
+    }
+
+    /// Writes one encoded record batch to a partition's leader and waits
+    /// for every in-sync replica. For tests against a real broker.
+    pub(crate) fn produce(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        records: Bytes,
+    ) -> Result<(), BrokerError> {
+        use kafka_protocol::messages::produce_request::{
+            PartitionProduceData, ProduceRequest, TopicProduceData,
+        };
+        let request = ProduceRequest::default()
+            .with_acks(-1)
+            .with_timeout_ms(10_000)
+            .with_topic_data(vec![
+                TopicProduceData::default()
+                    .with_name(topic_name(topic))
+                    .with_partition_data(vec![
+                        PartitionProduceData::default()
+                            .with_index(partition)
+                            .with_records(Some(records)),
+                    ]),
+            ]);
+        let leader = self.leader(topic, partition)?;
+        let response = self.call(&leader, &request)?;
+        response
+            .responses
+            .iter()
+            .flat_map(|entry| &entry.partition_responses)
+            .try_for_each(|data| error_code(data.error_code))
+    }
+}
 
 /// One authenticated connection to one broker.
 struct Session {

@@ -36,6 +36,7 @@ DiscoveredColumn
 DiscoveredRecordKind
 DiscoverySample
 DriftHandling
+EVENT_STREAM_CONNECTOR
 EgressAllowlist
 ExportArtifact
 FAMILY_OBJECT_SYNC
@@ -329,6 +330,7 @@ connector::Destination
 connector::Destination.host: String
 connector::Destination.port: Option<u16>
 connector::Destination::parse(&str) -> Option<Self>
+connector::EVENT_STREAM_CONNECTOR: ConnectorType
 connector::EgressAllowlist
 connector::EgressAllowlist::parse<S:AsRef<str>>(&[S]) -> Result<Self,ConfigError>
 connector::EgressAllowlist::permits(&self,&Destination) -> bool

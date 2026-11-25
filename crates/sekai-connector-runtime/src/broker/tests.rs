@@ -29,24 +29,24 @@ use kafka_protocol::records::{
 
 use super::*;
 
-const TOPIC: &str = "events";
+pub(crate) const TOPIC: &str = "events";
 
 /// What the fake broker serves. Each accepted connection is counted.
-struct Fake {
+pub(crate) struct Fake {
     /// Advertised brokers: node id, host, port (0 means this broker's own).
-    brokers: Vec<(i32, &'static str, i32)>,
+    pub(crate) brokers: Vec<(i32, &'static str, i32)>,
     /// Partition index and leader node.
-    partitions: Vec<(i32, i32)>,
-    offsets: Offsets,
-    records: Bytes,
-    password: String,
+    pub(crate) partitions: Vec<(i32, i32)>,
+    pub(crate) offsets: Offsets,
+    pub(crate) records: Bytes,
+    pub(crate) password: String,
     /// API key and version of every request after ApiVersions.
     seen: Mutex<Vec<(i16, i16)>>,
-    accepted: AtomicUsize,
+    pub(crate) accepted: AtomicUsize,
 }
 
 impl Fake {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             brokers: vec![(1, "127.0.0.1", 0)],
             partitions: vec![(1, 1), (0, 1)],
@@ -62,7 +62,7 @@ impl Fake {
     }
 
     /// Serves `self` on an ephemeral loopback port; returns the port.
-    fn serve(self: &Arc<Self>) -> u16 {
+    pub(crate) fn serve(self: &Arc<Self>) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let fake = Arc::clone(self);
@@ -218,7 +218,7 @@ impl Fake {
 
 /// A password made at run time, unique to the process and the call, so no
 /// credential is a literal in the source.
-fn test_password() -> String {
+pub(crate) fn test_password() -> String {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     format!(
         "pw-{}-{}",
@@ -239,7 +239,7 @@ fn config(port: u16, egress: &[String], password: &str) -> BrokerConfig {
     }
 }
 
-fn record(offset: i64, value: &str, control: bool) -> Record {
+pub(crate) fn record(offset: i64, value: &str, control: bool) -> Record {
     Record {
         transactional: control,
         control,
@@ -259,7 +259,7 @@ fn record(offset: i64, value: &str, control: bool) -> Record {
 
 /// One v2 batch of `records`, compressed with `compression` by the
 /// runtime's own codec crates.
-fn batch(records: &[Record], compression: Compression) -> Bytes {
+pub(crate) fn batch(records: &[Record], compression: Compression) -> Bytes {
     let mut out = BytesMut::new();
     RecordBatchEncoder::encode_with_custom_compression(
         &mut out,

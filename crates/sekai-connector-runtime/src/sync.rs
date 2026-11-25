@@ -74,6 +74,9 @@ pub struct Prepared {
     /// The Source's instance token, such as a GitHub `owner/repository`.
     pub source_instance: String,
     pub config: SourceConfig,
+    /// The Source's egress allowlist. A type that learns further
+    /// destinations from the remote system checks each one against it.
+    pub egress: EgressAllowlist,
     pub credentials: Credentials,
 }
 
@@ -118,6 +121,7 @@ pub fn prepare(
         connector,
         source_instance: source.source_instance.clone(),
         config,
+        egress,
         credentials,
     })
 }
