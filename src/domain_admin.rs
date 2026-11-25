@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::chisei::entitlements::{EffectiveEntitlement, EntitlementError, EntitlementRegistry};
 use crate::chisei::tenant_quota::{
-    TenantQuotaError, TenantQuotaGate, TenantQuotaLimits, TenantQuotaReceiptNote,
+    NamespaceQuotaScope, TenantQuotaError, TenantQuotaGate, TenantQuotaLimits,
+    TenantQuotaReceiptNote,
 };
 use crate::chisei::usage_ledger::{UsageAggregate, UsageUnit};
 use crate::db::runtime_db::RuntimeDb;
@@ -296,6 +297,41 @@ impl DomainAdminSurface {
         })
     }
 
+    /// Assigns limits to one namespace of a tenant. Stored and validated; not
+    /// enforced at admission until #3044 part 1b.
+    pub fn configure_namespace_quotas(
+        &self,
+        context: &AuthenticatedContext,
+        tenant_id: &str,
+        namespace: &str,
+        limits: &TenantQuotaLimits,
+    ) -> Result<TenantQuotaReceiptNote, DomainAdminError> {
+        self.require_role(context, tenant_id, AdminRole::can_manage_quotas)?;
+        let scope =
+            NamespaceQuotaScope::new(tenant_id, namespace).map_err(DomainAdminError::Invalid)?;
+        limits.validate().map_err(DomainAdminError::Invalid)?;
+        let narrowed = self
+            .entitlements
+            .narrow_quota_limits(context, limits, chrono::Utc::now().timestamp_millis())
+            .map_err(DomainAdminError::Entitlement)?;
+        self.quotas
+            .configure_namespace(&scope, &narrowed)
+            .map_err(DomainAdminError::Quota)?;
+        self.audit(
+            &context.principal.subject,
+            tenant_id,
+            "configure_namespace_quotas",
+            scope.scope_id(),
+            "ok",
+        );
+        Ok(TenantQuotaReceiptNote {
+            tenant_id: tenant_id.into(),
+            assignment_version: narrowed.version,
+            admitted_metrics: vec![],
+            exhausted_metric: None,
+        })
+    }
+
     pub fn rotate_provider_credential(
         &self,
         context: &AuthenticatedContext,
@@ -464,6 +500,69 @@ mod tests {
                 e.action == "configure_quotas" && e.actor == "alice" && e.result == "ok"
             })
         );
+    }
+
+    #[test]
+    fn a_namespace_assignment_is_stored_only_when_valid() {
+        let admin = surface();
+        admin.grant_role("tenant-a", "alice", AdminRole::Owner);
+        admin.grant_role("tenant-a", "bob", AdminRole::Member);
+        let alice = tenant_context("tenant-a", "alice");
+        admin.entitlements.assign(TenantEntitlementAssignment {
+            tenant_id: "tenant-a".into(),
+            set: EntitlementSet {
+                version: 1,
+                set_id: "starter".into(),
+                features: BTreeSet::new(),
+                quota_ceiling: None,
+                expires_at_ms: None,
+            },
+            assigned_at_ms: 1,
+            removed: false,
+        });
+        let limits = TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(3),
+            max_tokens_per_period: None,
+            max_concurrency: Some(1),
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        };
+        assert!(matches!(
+            admin.configure_namespace_quotas(
+                &tenant_context("tenant-a", "bob"),
+                "tenant-a",
+                "ops",
+                &limits
+            ),
+            Err(DomainAdminError::Unauthorized)
+        ));
+        assert!(matches!(
+            admin.configure_namespace_quotas(&alice, "tenant-a", "ops/prod", &limits),
+            Err(DomainAdminError::Invalid(_))
+        ));
+        let negative = TenantQuotaLimits {
+            max_requests_per_period: Some(-1),
+            ..limits.clone()
+        };
+        assert!(matches!(
+            admin.configure_namespace_quotas(&alice, "tenant-a", "ops", &negative),
+            Err(DomainAdminError::Invalid(_))
+        ));
+        admin
+            .configure_namespace_quotas(&alice, "tenant-a", "ops", &limits)
+            .unwrap();
+        let scope = "tenant:tenant-a/namespace:ops";
+        let stored = RuntimeDb::Sqlite(admin.db.clone())
+            .budget_limits_for_scope(scope)
+            .unwrap()
+            .into_iter()
+            .filter(|(row_scope, ..)| row_scope == scope)
+            .count();
+        assert_eq!(stored, 2);
+        assert!(admin.audit_log().iter().any(|entry| {
+            entry.action == "configure_namespace_quotas" && entry.target == scope
+        }));
     }
 
     #[test]

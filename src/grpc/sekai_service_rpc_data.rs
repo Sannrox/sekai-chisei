@@ -3677,8 +3677,13 @@ pub(super) async fn claim_transform_work(
                         "local",
                     ))
                 };
-                // A terminal refusal ends the run before any admission (#1701).
-                if let Some(refusal) = extension_refusal(service, owner.as_ref(), &work) {
+                // A terminal refusal ends the run before any admission (#1701):
+                // the extension's, else a budget the run could never fit (#3044).
+                let refusal = match extension_refusal(service, owner.as_ref(), &work) {
+                    Some(refusal) => Some(refusal),
+                    None => tenant_budget_refusal(quota.as_ref(), owner.as_ref())?,
+                };
+                if let Some(refusal) = refusal {
                     match service.db.runtime().refuse_transform_claim(
                         &work.run_id,
                         &work.claim_owner,
@@ -4609,6 +4614,23 @@ fn admit_extension_isolated_process(
             "isolated-process job not admitted",
         )),
     }
+}
+
+/// The refusal of a run larger than its tenant's whole budget. Store errors
+/// refuse the claim, as admission does.
+fn tenant_budget_refusal(
+    db: &crate::db::runtime_db::RuntimeDb,
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+) -> Result<Option<crate::enterprise::IsolatedProcessRefusal>, Status> {
+    let Some(tenant) = tenant_context.and_then(|context| context.tenant.as_ref()) else {
+        return Ok(None);
+    };
+    let limits =
+        crate::composition::transform_run_admission::configured_limits(db, &tenant.tenant_id)
+            .map_err(Status::internal)?;
+    Ok(limits
+        .as_ref()
+        .and_then(crate::composition::transform_run_admission::refusal_larger_than_budget))
 }
 
 fn admit_tenant_transform(
