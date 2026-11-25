@@ -14,9 +14,11 @@
 //! and runs requested discoveries of a Source ([`discovery`]).
 //! The connector types are [`github`] (sync and apply), [`relational`]
 //! (snapshot pages, delivery and apply) and [`rest`] (paged JSON over HTTP:
-//! sync and apply). Given a gateway route, it also runs
+//! sync and apply). [`broker`] is the event-stream broker client the
+//! event-stream type builds on. Given a gateway route, it also runs
 //! the row-wise model steps of `llm-rows` transforms ([`llm_rows`]).
 
+pub mod broker;
 pub mod credentials;
 pub mod delivery;
 pub mod discovery;

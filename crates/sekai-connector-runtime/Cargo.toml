@@ -10,18 +10,27 @@ publish = false
 # chisei-core): the runtime talks to the plane only over gRPC.
 [dependencies]
 bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
+# Broker wire format only; the transport, egress check and TLS stay ours.
+kafka-protocol = { version = "0.18", default-features = false, features = ["client"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame", "safe-decode", "checked-decode"] }
 native-tls = "0.2"
 postgres = { version = "0.19", default-features = false }
 postgres-native-tls = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+ruzstd = "0.9"
 sekai-client = { version = "1.0.0", path = "../sekai-client" }
 sekai-source-sdk = { version = "2.0.0", path = "../sekai-source-sdk" }
 sekai-types = { version = "2.0.0", path = "../sekai-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+snap = "1"
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+# The in-process fake broker decodes requests and encodes responses.
+kafka-protocol = { version = "0.18", default-features = false, features = ["client", "broker"] }
+lz4_flex = "0.14"
 tempfile = "3"
