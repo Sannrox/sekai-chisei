@@ -124,6 +124,7 @@ mod concurrent_source_ingestion;
 mod connector_certification_backend_conformance;
 mod connector_runtime;
 mod connector_runtime_effects;
+mod connector_runtime_ordered;
 mod connector_runtime_rest;
 mod connector_template;
 mod coordination_backend_conformance;

@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
 use sekai_source_sdk::{
-    ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, ExportArtifact,
-    Operation, PlaneView, RecordChange, SnapshotRead, SourceConfig, connector_type,
+    ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist,
+    ExportArtifact, GenerationSnapshotPage, Operation, PlaneView, RecordChange, SnapshotRead,
+    SourceConfig, connector_type,
 };
 
 use crate::credentials::{CredentialBindings, Credentials};
@@ -238,6 +239,39 @@ impl Connectors {
         Ok(self
             .open(prepared)?
             .read_page_with_plane(committed_cursor, max_records, plane)?)
+    }
+
+    /// Reads one page of an ordered type's snapshot after
+    /// `committed_cursor` (ADR 0023). Blocking.
+    pub fn read_snapshot_page(
+        &self,
+        prepared: &Prepared,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<GenerationSnapshotPage, SyncFailure> {
+        if !prepared.connector.supports(Operation::ReadChanges) {
+            return Err(SyncFailure::Unsupported);
+        }
+        Ok(self
+            .open(prepared)?
+            .read_snapshot_page(committed_cursor, max_records)?)
+    }
+
+    /// Reads one ordered change page after the plane's `committed_offset`
+    /// in `source_feed_epoch`. Blocking.
+    pub fn read_changes(
+        &self,
+        prepared: &Prepared,
+        source_feed_epoch: &str,
+        committed_offset: u64,
+        max_records: usize,
+    ) -> Result<ChangeFeedPage, SyncFailure> {
+        if !prepared.connector.supports(Operation::ReadChanges) {
+            return Err(SyncFailure::Unsupported);
+        }
+        Ok(self
+            .open(prepared)?
+            .read_changes(source_feed_epoch, committed_offset, max_records)?)
     }
 
     /// Delivers one verified saved-export artifact through a prepared

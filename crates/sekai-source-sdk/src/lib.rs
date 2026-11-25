@@ -32,9 +32,9 @@ pub use connector::{
     CONNECTOR_TYPES, ConfigError, ConfigField, ConfigFieldKind, ConfigValue, Connector,
     ConnectorFailure, ConnectorType, CredentialSlot, Destination, EVENT_STREAM_CONNECTOR,
     EgressAllowlist, ExportArtifact, GITHUB_CONNECTOR, KeyRange, MAX_CONFIG_FIELDS,
-    MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, OBJECT_STORAGE_CONNECTOR, Operation, PlaneView,
-    PlaneViewError, RELATIONAL_CONNECTOR, REST_CONNECTOR, RecordChange, RecordVersion,
-    SourceConfig, connector_type,
+    MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, OBJECT_STORAGE_CONNECTOR, Operation,
+    POSTGRES_CAPTURE_CONNECTOR, PlaneView, PlaneViewError, RELATIONAL_CONNECTOR, REST_CONNECTOR,
+    RecordChange, RecordVersion, SourceConfig, connector_type,
 };
 pub use contract::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,
@@ -80,8 +80,8 @@ pub use sdk::{
     FlushEntry, FlushReport, GetSourceSyncStateInput, MAX_QUARANTINE_REASON_BYTES,
     OUTBOX_FORMAT_VERSION, OutboxLimits, SourceAdapterConfig, SourceGenerationStatus, SourceOutbox,
     SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
-    TransportFailure, build_registered_source_batch, build_source_batch, build_source_batch_v2,
-    serialize_source_batch,
+    TransportFailure, build_registered_source_batch, build_registered_source_batch_v2,
+    build_source_batch, build_source_batch_v2, serialize_source_batch,
 };
 pub use sekai_types::object_schema::PropertyValue;
 pub use sekai_types::source_sync_note::{MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes};

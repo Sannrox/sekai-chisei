@@ -55,7 +55,7 @@ struct StableBatchIdentityV2<'a> {
     contract_version: &'static str,
     namespace: &'a str,
     producer_identity: &'a str,
-    source: &'static str,
+    source: &'a str,
     source_instance: &'a str,
     family: &'static str,
     adapter_id: &'static str,
@@ -201,6 +201,66 @@ pub fn build_source_batch_v2(
     if config.type_digest != GITHUB_OBJECT_SYNC_TYPE_DIGEST {
         return Err("source adapter rejected: unbound_type_revision".into());
     }
+    build_v2_batch(
+        config,
+        SOURCE_GITHUB,
+        ADAPTER_GITHUB_OBJECT_SYNC,
+        ADAPTER_GITHUB_OBJECT_SYNC_VERSION,
+        BatchWindow {
+            current_cursor,
+            proposed_next_cursor,
+            collected_at_ms,
+        },
+        records,
+        delivery,
+    )
+}
+
+/// [`build_source_batch_v2`] for a registered Source (ADR 0060): one
+/// ordered snapshot or change-feed batch under the registered adapter.
+pub fn build_registered_source_batch_v2(
+    config: &SourceAdapterConfig,
+    source: &str,
+    current_cursor: &str,
+    proposed_next_cursor: &str,
+    collected_at_ms: i64,
+    records: Vec<SourceRecord>,
+    delivery: SourceDeliveryWindow,
+) -> Result<SourceBatch, String> {
+    if source == SOURCE_GITHUB || config.type_digest == GITHUB_OBJECT_SYNC_TYPE_DIGEST {
+        return Err("registered source batches cannot reuse the GitHub profile".into());
+    }
+    build_v2_batch(
+        config,
+        source,
+        ADAPTER_REGISTERED_OBJECT_SYNC,
+        ADAPTER_REGISTERED_OBJECT_SYNC_VERSION,
+        BatchWindow {
+            current_cursor,
+            proposed_next_cursor,
+            collected_at_ms,
+        },
+        records,
+        delivery,
+    )
+}
+
+/// The cursors and collection time one batch moves between.
+struct BatchWindow<'a> {
+    current_cursor: &'a str,
+    proposed_next_cursor: &'a str,
+    collected_at_ms: i64,
+}
+
+fn build_v2_batch(
+    config: &SourceAdapterConfig,
+    source: &str,
+    adapter_id: &'static str,
+    adapter_version: &'static str,
+    window: BatchWindow<'_>,
+    records: Vec<SourceRecord>,
+    delivery: SourceDeliveryWindow,
+) -> Result<SourceBatch, String> {
     if records.len() > MAX_SOURCE_BATCH_RECORDS {
         return Err("source adapter record count exceeds the batch limit".into());
     }
@@ -208,14 +268,14 @@ pub fn build_source_batch_v2(
         contract_version: SOURCE_BATCH_V2_VERSION,
         namespace: &config.namespace,
         producer_identity: &config.producer_identity,
-        source: SOURCE_GITHUB,
+        source,
         source_instance: &config.source_instance,
         family: FAMILY_OBJECT_SYNC,
-        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC,
-        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION,
+        adapter_id,
+        adapter_version,
         type_digest: &config.type_digest,
-        current_cursor,
-        proposed_next_cursor,
+        current_cursor: window.current_cursor,
+        proposed_next_cursor: window.proposed_next_cursor,
         delivery: &delivery,
         records: &records,
     };
@@ -226,17 +286,17 @@ pub fn build_source_batch_v2(
         contract_version: SOURCE_BATCH_V2_VERSION.into(),
         namespace: config.namespace.clone(),
         producer_identity: config.producer_identity.clone(),
-        source: SOURCE_GITHUB.into(),
+        source: source.into(),
         source_instance: config.source_instance.clone(),
         family: FAMILY_OBJECT_SYNC.into(),
-        adapter_id: ADAPTER_GITHUB_OBJECT_SYNC.into(),
-        adapter_version: ADAPTER_GITHUB_OBJECT_SYNC_VERSION.into(),
+        adapter_id: adapter_id.into(),
+        adapter_version: adapter_version.into(),
         type_digest: config.type_digest.clone(),
-        current_cursor: current_cursor.into(),
-        proposed_next_cursor: proposed_next_cursor.into(),
+        current_cursor: window.current_cursor.into(),
+        proposed_next_cursor: window.proposed_next_cursor.into(),
         idempotency_key,
         batch_digest: String::new(),
-        collected_at_ms,
+        collected_at_ms: window.collected_at_ms,
         records,
         delivery: Some(delivery),
     };

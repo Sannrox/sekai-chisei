@@ -24,8 +24,8 @@ use sekai_client::{SdkError, SdkErrorCode};
 use sekai_source_sdk::{
     ConfigValue, GITHUB_OBJECT_SYNC_TYPE_DIGEST, KeyRange, MAX_SOURCE_BATCH_RECORDS, Operation,
     PlaneView, PlaneViewError, RecordVersion, SOURCE_GITHUB, SnapshotPage, SnapshotRead,
-    SourceAdapterConfig, SourceBatch, SyncNote, SyncNotes, build_registered_source_batch,
-    build_source_batch,
+    SourceAdapterConfig, SourceBatch, SourceDeliveryMode, SyncNote, SyncNotes,
+    build_registered_source_batch, build_source_batch,
 };
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use crate::runtime::Runtime;
 use crate::sync::{Prepared, SyncFailure, blocking};
 
 /// Pages one sync applies at most; the rest waits for the next interval.
-const MAX_PAGES: usize = 100;
+pub(crate) const MAX_PAGES: usize = 100;
 
 fn property_value_to_proto(value: &sekai_source_sdk::PropertyValue) -> pb::PropertyValue {
     use pb::property_value::Kind;
@@ -77,6 +77,9 @@ impl Runtime {
         prepared: Prepared,
         notes: &mut SyncNotes,
     ) -> Result<(), SyncFailure> {
+        if prepared.connector.supports(Operation::ReadChanges) {
+            return self.sync_ordered(index, source, prepared).await;
+        }
         if !prepared.connector.supports(Operation::ReadPage) {
             return Err(SyncFailure::Unsupported);
         }
@@ -289,7 +292,7 @@ fn plane_view_error(error: SdkError) -> PlaneViewError {
 /// A plane refusal as the sync's failure class. A refused batch is the
 /// Source's problem; anything else, including a checkpoint conflict
 /// (aborted), is the plane being unavailable.
-fn plane_failure(error: SdkError) -> SyncFailure {
+pub(crate) fn plane_failure(error: SdkError) -> SyncFailure {
     match error.code {
         SdkErrorCode::PermissionDenied | SdkErrorCode::Unauthenticated => {
             SyncFailure::PermissionMissing
@@ -336,7 +339,7 @@ pub(crate) fn notes_to_proto(notes: &SyncNotes) -> pb::SourceSyncNotes {
 }
 
 /// The batch on the wire, naming the Source it syncs.
-fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
+pub(crate) fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
     pb::SourceBatch {
         contract_version: batch.contract_version,
         namespace: batch.namespace,
@@ -371,7 +374,17 @@ fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
                 object_key: record.object_key,
             })
             .collect(),
-        delivery: None,
+        delivery: batch.delivery.map(|delivery| pb::SourceDeliveryWindow {
+            mode: match delivery.mode {
+                SourceDeliveryMode::Snapshot => pb::SourceDeliveryMode::Snapshot,
+                SourceDeliveryMode::ChangeFeed => pb::SourceDeliveryMode::ChangeFeed,
+            } as i32,
+            sync_generation: delivery.sync_generation,
+            source_feed_epoch: delivery.source_feed_epoch,
+            offset_start: delivery.offset_start,
+            offset_end: delivery.offset_end,
+            snapshot_complete: delivery.snapshot_complete,
+        }),
         source_id: source_id.into(),
     }
 }

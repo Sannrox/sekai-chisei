@@ -18,7 +18,7 @@ use crate::contract::{
 };
 use crate::discover::{DiscoverySample, SourceDiscovery};
 use crate::feed::ChangeFeedPage;
-use crate::snapshot::SnapshotRead;
+use crate::snapshot::{GenerationSnapshotPage, SnapshotRead};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -307,6 +307,30 @@ pub const OBJECT_STORAGE_CONNECTOR: ConnectorType = ConnectorType {
     }],
 };
 
+/// Row changes of the tables in one PostgreSQL publication, captured from
+/// the write-ahead log by a sandboxed child (ADR 0170). `slot` and
+/// `publication` name the Source's one replication slot and publication;
+/// a missing slot is created. The type syncs as an ordered feed: a
+/// snapshot, then change pages after the plane-owned offset.
+pub const POSTGRES_CAPTURE_CONNECTOR: ConnectorType = ConnectorType {
+    name: "postgres_capture",
+    version: "1",
+    fixed_source: None,
+    operations: &[Operation::Check, Operation::ReadChanges],
+    config: &[
+        field("endpoint", ConfigFieldKind::Destination, true),
+        field("database", ConfigFieldKind::Text, true),
+        field("user", ConfigFieldKind::Text, true),
+        field("slot", ConfigFieldKind::Text, true),
+        field("publication", ConfigFieldKind::Text, true),
+        field("type_digest", ConfigFieldKind::Text, true),
+    ],
+    credential_slots: &[CredentialSlot {
+        name: "password",
+        required: true,
+    }],
+};
+
 const fn field(name: &'static str, kind: ConfigFieldKind, required: bool) -> ConfigField {
     ConfigField {
         name,
@@ -322,6 +346,7 @@ pub const CONNECTOR_TYPES: &[ConnectorType] = &[
     REST_CONNECTOR,
     EVENT_STREAM_CONNECTOR,
     OBJECT_STORAGE_CONNECTOR,
+    POSTGRES_CAPTURE_CONNECTOR,
 ];
 
 /// The connector type with this name and version, if this SDK defines it.
@@ -797,6 +822,20 @@ pub trait Connector {
         _plane: &mut dyn PlaneView,
     ) -> Result<SnapshotRead, ConnectorFailure> {
         self.read_page(committed_cursor, max_records)
+    }
+
+    /// One page of an ordered type's snapshot (ADR 0023), for a type that
+    /// declares [`Operation::ReadChanges`]. The terminal page names the
+    /// feed epoch and the barrier offset the change feed continues after.
+    /// `committed_cursor` is the plane's cursor; one this type did not
+    /// write for a snapshot, such as a feed position after the plane
+    /// required recovery, starts a new snapshot.
+    fn read_snapshot_page(
+        &mut self,
+        _committed_cursor: Option<&str>,
+        _max_records: usize,
+    ) -> Result<GenerationSnapshotPage, ConnectorFailure> {
+        Err(ConnectorFailure::Unsupported)
     }
 
     fn read_changes(
