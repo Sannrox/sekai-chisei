@@ -24,6 +24,8 @@ struct QueryAttribution {
     operation_id: Option<String>,
     actor: String,
     type_denied: bool,
+    /// Withheld properties of the member kind and an aggregated leaf kind.
+    withheld_properties: Vec<WithheldProperty>,
 }
 
 impl SekaiServiceImpl {
@@ -51,10 +53,29 @@ impl SekaiServiceImpl {
             &bound.descriptor.namespace,
             &bound.descriptor.kind,
         )?;
+        let leaf_kind = bound
+            .descriptor
+            .aggregation
+            .as_ref()
+            .and_then(|_| crate::sekai::object_set::resolved_hops(&bound.descriptor).pop())
+            .map(|hop| hop.far_kind);
+        let withheld_properties = if type_denied {
+            Vec::new()
+        } else {
+            let namespace = bound.descriptor.namespace.as_str();
+            self.withheld_properties(
+                &principals,
+                tenant_context.as_ref(),
+                std::iter::once(bound.member_kind.as_str())
+                    .chain(leaf_kind.as_deref())
+                    .map(|kind| (namespace, kind)),
+            )?
+        };
         let attribution = QueryAttribution {
             operation_id,
             actor,
             type_denied,
+            withheld_properties,
         };
         if attribution.type_denied {
             return self.object_set_page(
@@ -284,6 +305,7 @@ impl SekaiServiceImpl {
                 })
                 .collect(),
             outcome: outcome.into(),
+            withheld_properties: attribution.withheld_properties.clone(),
         }))
     }
 
@@ -540,7 +562,7 @@ impl SekaiServiceImpl {
             {
                 queried_properties.push(aggregation.group_by.clone());
             }
-            ensure_property_query_allowed(
+            self.ensure_property_query_allowed(
                 &schema,
                 principals,
                 tenant_context,
@@ -561,7 +583,7 @@ impl SekaiServiceImpl {
                     .last()
                     .map(|hop| hop.far_kind.as_str())
                     .unwrap_or(bound.descriptor.kind.as_str());
-                ensure_property_query_allowed(
+                self.ensure_property_query_allowed(
                     &schema,
                     principals,
                     tenant_context,
@@ -1145,7 +1167,7 @@ impl SekaiServiceImpl {
                     .schema_definitions
                     .snapshot()
                     .map_err(map_schema_definition_lifecycle_error)?;
-                ensure_property_query_allowed(
+                self.ensure_property_query_allowed(
                     &schema,
                     authority.principals,
                     authority.tenant_context,

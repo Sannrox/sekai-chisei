@@ -167,13 +167,23 @@ pub(super) async fn expand_neighborhood(
         }
     }
     links.retain(|link| page.contains(link.from_id.as_str()) && page.contains(link.to_id.as_str()));
-    let objects = walker.project(returned)?;
+    let objects = walker
+        .project(returned)?
+        .iter()
+        .map(to_proto_obj)
+        .collect::<Vec<_>>();
+    let withheld_properties = service.withheld_properties(
+        &walker.principals,
+        walker.tenant_context.as_ref(),
+        kinds_of(&objects),
+    )?;
     Ok(Response::new(ExpandNeighborhoodResponse {
-        objects: objects.iter().map(to_proto_obj).collect(),
+        objects,
         links: links.iter().map(to_proto_link).collect(),
         total_count: total,
         total_is_lower_bound: lower_bound,
         truncated,
+        withheld_properties,
     }))
 }
 

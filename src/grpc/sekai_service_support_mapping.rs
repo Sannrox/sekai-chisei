@@ -223,7 +223,9 @@ pub(super) fn enforce_property_grant_mutation(
             }
         })
 }
-pub(super) fn ensure_property_query_allowed(
+/// Refuses a filter or sort on a restricted property unless every reader is
+/// `root` or `local`.
+pub(super) fn ensure_restricted_property_query_allowed(
     schema: &schema::SchemaRegistry,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,

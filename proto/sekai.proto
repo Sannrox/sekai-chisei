@@ -87,6 +87,8 @@ message ExpandNeighborhoodResponse {
   bool total_is_lower_bound = 4;
   // True when `objects` holds fewer than `total_count` objects.
   bool truncated = 5;
+  // Experimental (#2699). Additive; old clients ignore it.
+  repeated WithheldProperty withheld_properties = 6;
 }
 
 // Experimental (#1562). Shortest link paths between two objects over the
@@ -506,7 +508,25 @@ message CreateObjectRequest {
 }
 message CreateObjectResponse { Object object = 1; }
 message GetObjectRequest { string id = 1; }
-message GetObjectResponse { Object object = 1; }
+// Experimental (#2699, ADR 0164). A property of a returned kind that this
+// reader may not receive under its allowed egress: the gateway routes its
+// model traffic can take. Its values are absent from every returned object,
+// and filters, sorts and facets naming it are refused. Properties hidden by a
+// property grant are never listed.
+message WithheldProperty {
+  string kind = 1;
+  string property = 2;
+  // egress_not_allowed: a route the reader may use may not receive the
+  // property's data class. egress_unknown: the reader maps to no gateway
+  // principal, or a gateway policy is unreadable.
+  string reason = 3;
+}
+
+message GetObjectResponse {
+  Object object = 1;
+  // Experimental (#2699). Additive; old clients ignore it.
+  repeated WithheldProperty withheld_properties = 2;
+}
 // Experimental (#3058). The source record behind one synced object, read
 // under the same visibility, markings and redaction as GetObject: a caller who
 // cannot read the object gets the same refusal.
@@ -1008,6 +1028,9 @@ message SearchResponse {
   string fusion_profile = 8;
   // Age of the oldest object change the searched vectors have not consumed.
   int64 vector_lag_ms = 9;
+  // Experimental (#2699). Withheld properties of the returned hits' kinds;
+  // they are not matched, highlighted or faceted. Additive.
+  repeated WithheldProperty withheld_properties = 10;
 }
 message GetSearchIndexStatusRequest {
   string namespace = 1;
@@ -2359,6 +2382,9 @@ message EvaluateObjectSetResponse {
   repeated ObjectVersionRead object_versions = 11;
   // ok, empty, or denied. Additive; old clients ignore it.
   string outcome = 12;
+  // Experimental (#2699). Withheld properties of the member kind and of
+  // aggregated leaf kinds. Additive; old clients ignore it.
+  repeated WithheldProperty withheld_properties = 13;
 }
 // One object identity at the content version EvaluateObjectSet read (#2151).
 message ObjectVersionRead {
@@ -4771,7 +4797,11 @@ message DryRunActionPolicyResponse {
 }
 
 message GetLineageRequest { string object_id = 1; int32 max_nodes = 2; }
-message GetLineageResponse { LineageResult result = 1; }
+message GetLineageResponse {
+  LineageResult result = 1;
+  // Experimental (#2699). Additive; old clients ignore it.
+  repeated WithheldProperty withheld_properties = 2;
+}
 
 message ContentionScope {
   string id = 1;

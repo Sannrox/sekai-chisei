@@ -46,6 +46,7 @@ impl SekaiServiceImpl {
             runtime_token_authority: None,
             dry_run_host: None,
             embedding_route: None,
+            egress: crate::composition::gateway_egress_policy::EgressPolicies::new([]),
         }
     }
 
@@ -65,6 +66,14 @@ impl SekaiServiceImpl {
     ) -> Self {
         self.dry_run_host = host;
         self
+    }
+
+    /// Withhold read values by the allowed egress in `policies` (ADR 0164).
+    pub fn set_egress_policies(
+        &mut self,
+        policies: Arc<crate::composition::gateway_egress_policy::EgressPolicies>,
+    ) {
+        self.egress = policies;
     }
 
     pub fn with_embedding_route(

@@ -191,7 +191,8 @@ pub async fn dispatch_native(
                     "name": object.name,
                     "namespace": object.namespace,
                     "properties": object.properties,
-                }
+                },
+                "withheld_properties": response.withheld_properties,
             }))
         }
         NativeRpc::GetLinks => {
@@ -462,6 +463,7 @@ pub fn search_references(response: SearchResponse) -> Value {
         "count_is_lower_bound": response.count_is_lower_bound,
         "next_page_token": response.next_page_token,
         "fusion_profile": response.fusion_profile,
+        "withheld_properties": response.withheld_properties,
         "authority": false,
     })
 }

@@ -74,6 +74,11 @@ impl GatewayLogSource {
         }
     }
 
+    /// Key of the gateway's `log_reader` principal; it also reads the policy.
+    pub(crate) fn reader_key(&self) -> &str {
+        &self.reader_key
+    }
+
     fn health_service(&self) -> String {
         format!("chisei.gateway_log.{}", self.name)
     }

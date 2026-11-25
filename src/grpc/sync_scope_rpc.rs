@@ -193,7 +193,7 @@ impl<'a> Caller<'a> {
             .schema_definitions
             .snapshot()
             .map_err(map_schema_definition_lifecycle_error)?;
-        ensure_property_query_allowed(
+        self.service.ensure_property_query_allowed(
             &schema,
             &self.principals,
             self.tenant_context.as_ref(),

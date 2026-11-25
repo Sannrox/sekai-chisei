@@ -21,6 +21,9 @@ mod catalog_rpc;
 mod claimable_work_rpc;
 #[path = "computed_response.rs"]
 mod computed_response;
+#[path = "egress_disclosure.rs"]
+mod egress_disclosure;
+use egress_disclosure::{kinds_of, releases_property, withhold_unreleased};
 #[path = "data_export_rpc.rs"]
 mod data_export_rpc;
 #[path = "federated_aggregate_rpc.rs"]
@@ -248,6 +251,8 @@ pub struct SekaiServiceImpl {
     pub(super) dry_run_host: Option<Arc<dyn crate::sekai::agent_dry_run::AgentDryRunHost>>,
     /// Embeds hybrid Search queries (#1582); none refuses hybrid mode.
     pub(super) embedding_route: Option<crate::composition::embedding_catch_up::EmbeddingRoute>,
+    /// Gateway policies that decide what reads withhold (ADR 0164).
+    pub(super) egress: Arc<crate::composition::gateway_egress_policy::EgressPolicies>,
 }
 
 #[path = "sekai_service_construct.rs"]
@@ -345,6 +350,7 @@ impl SekaiService for SekaiServiceImpl {
         run_action_binding => run_action_binding_once(RunActionBindingRequest) -> RunActionBindingResponse;
         get_action_binding => get_action_binding_record(GetActionBindingRequest) -> GetActionBindingResponse;
         list_action_bindings => list_action_binding_records(ListActionBindingsRequest) -> ListActionBindingsResponse;
+        apply_graph_changes => apply_graph_changes_rpc(ApplyGraphChangesRequest) -> ApplyGraphChangesResponse;
     }
 
     async fn export_object_set(
@@ -1040,12 +1046,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DeleteLinkRequest>,
     ) -> Result<Response<DeleteLinkResponse>, Status> {
         rpc_objects::delete_link(self, req).await
-    }
-    async fn apply_graph_changes(
-        &self,
-        req: Request<ApplyGraphChangesRequest>,
-    ) -> Result<Response<ApplyGraphChangesResponse>, Status> {
-        self.apply_graph_changes_rpc(req).await
     }
     async fn get_links(
         &self,

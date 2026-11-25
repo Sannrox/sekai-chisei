@@ -295,7 +295,15 @@ pub(super) async fn search(
         String::new()
     };
     let facets = live_facets(&visible, &input.facets);
+    let withheld_properties = service.withheld_properties(
+        &principals,
+        tenant_context.as_ref(),
+        page.iter()
+            .filter(|hit| hit.source == "object")
+            .map(|hit| (input.namespace.as_str(), hit.kind.as_str())),
+    )?;
     Ok(Response::new(SearchResponse {
+        withheld_properties,
         hits: page,
         count,
         count_is_lower_bound: capped,
@@ -802,6 +810,24 @@ fn live_object_hit(
         {
             live.name.clear();
         }
+    }
+    let disclosure = service.egress_disclosure(principals, tenant_context);
+    if disclosure != crate::composition::gateway_egress_policy::Disclosure::Unchecked {
+        let schema = service
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        if input
+            .property_filters
+            .iter()
+            .map(|filter| filter.property.trim())
+            .chain(input.facets.iter().map(|field| field.trim()))
+            .filter(|property| !matches!(*property, "name" | "kind" | "source"))
+            .any(|property| !releases_property(&disclosure, &schema, &object.kind, property))
+        {
+            return Err(Status::permission_denied("withheld search property"));
+        }
+        live = withhold_unreleased(live, &schema, &disclosure);
     }
     if !live_object_matches_filters(&live, &input.property_filters) {
         return Ok(None);
