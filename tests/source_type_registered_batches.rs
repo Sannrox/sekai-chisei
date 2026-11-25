@@ -41,6 +41,7 @@ fn alert(key: &str, version: &str, payload: &str, deleted: bool) -> SourceRecord
         observed_at_ms: 10,
         source_sequence: None,
         payload: None,
+        object_key: None,
     }
 }
 

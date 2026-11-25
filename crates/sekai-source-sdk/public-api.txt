@@ -76,6 +76,7 @@ MAX_SOURCE_CURSOR_BYTES
 MAX_SOURCE_DISPLAY_NAME_BYTES
 MAX_SOURCE_FEED_EPOCH_BYTES
 MAX_SOURCE_IDENTIFIER_BYTES
+MAX_SOURCE_OBJECT_KEY_BYTES
 MAX_SOURCE_PAYLOAD_BYTES
 MAX_SOURCE_PROPERTY_KEY_BYTES
 MAX_SOURCE_PROPERTY_VALUE_BYTES
@@ -371,6 +372,7 @@ contract::MAX_SOURCE_CURSOR_BYTES: usize
 contract::MAX_SOURCE_DISPLAY_NAME_BYTES: usize
 contract::MAX_SOURCE_FEED_EPOCH_BYTES: usize
 contract::MAX_SOURCE_IDENTIFIER_BYTES: usize
+contract::MAX_SOURCE_OBJECT_KEY_BYTES: usize
 contract::MAX_SOURCE_PAYLOAD_BYTES: usize
 contract::MAX_SOURCE_PROPERTY_KEY_BYTES: usize
 contract::MAX_SOURCE_PROPERTY_VALUE_BYTES: usize
@@ -491,6 +493,7 @@ contract::SourceRecord
 contract::SourceRecord.deleted: bool
 contract::SourceRecord.display_name: String
 contract::SourceRecord.external_id: String
+contract::SourceRecord.object_key: Option<String>
 contract::SourceRecord.observed_at_ms: i64
 contract::SourceRecord.payload: Option<String>
 contract::SourceRecord.payload_digest: String
@@ -842,4 +845,5 @@ source_batch_uses_delivery
 source_id
 sync_github_record
 translate_github_fixture
+
 

@@ -1154,6 +1154,7 @@ fn source_batch_proto(
                 observed_at_ms: 10,
                 source_sequence: None,
                 payload: None,
+                object_key: None,
             }
         })
         .collect();
@@ -1209,6 +1210,7 @@ fn source_batch_proto(
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
                 payload: record.payload,
+                object_key: record.object_key,
             })
             .collect(),
         delivery: None,

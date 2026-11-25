@@ -61,6 +61,7 @@ pub const MAX_SOURCE_PROPERTY_KEY_BYTES: usize = 128;
 pub const MAX_SOURCE_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_SOURCE_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_SOURCE_FEED_EPOCH_BYTES: usize = 128;
+pub const MAX_SOURCE_OBJECT_KEY_BYTES: usize = 1024;
 
 /// Ordered batches (`v2` and `v3`) carry a delivery envelope.
 pub fn source_batch_uses_delivery(version: &str) -> bool {
@@ -140,6 +141,12 @@ pub struct SourceRecord {
     /// Original unmapped source body. v3 may retain it; v1 and v2 omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<String>,
+    /// Key of the stored object the record came from, for connectors over
+    /// keyed object storage (#3013). The plane stores it beside the record's
+    /// identity in byte order. Omitted from the digest when unset, so
+    /// records without it keep their digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_key: Option<String>,
 }
 
 impl SourceRecord {
@@ -939,11 +946,37 @@ fn validate_source_feed_epoch(value: &str) -> Result<(), SourceBatchValidationEr
     Ok(())
 }
 
+/// An object key is opaque bytes to the plane, but it must be non-empty,
+/// bounded, free of control characters and free of credential-like text.
+fn validate_object_key(index: usize, value: &str) -> Result<(), SourceBatchValidationError> {
+    if value.is_empty()
+        || value.len() > MAX_SOURCE_OBJECT_KEY_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(SourceBatchValidationError::new(
+            "invalid_object_key",
+            format!(
+                "records[{index}].object_key must be non-empty, at most {MAX_SOURCE_OBJECT_KEY_BYTES} bytes and free of control characters"
+            ),
+        ));
+    }
+    if contains_secret_like_text(value) {
+        return Err(SourceBatchValidationError::new(
+            "secret_like_text",
+            format!("records[{index}].object_key contains credential-like text"),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_record(
     record: &SourceRecord,
     index: usize,
     batch: &SourceBatch,
 ) -> Result<(), SourceBatchValidationError> {
+    if let Some(object_key) = &record.object_key {
+        validate_object_key(index, object_key)?;
+    }
     if let Some(source_sequence) = record.source_sequence {
         require_db_u64(
             &format!("records[{index}].source_sequence"),
@@ -1403,11 +1436,43 @@ mod tests {
                 observed_at_ms: 10,
                 source_sequence: None,
                 payload: None,
+                object_key: None,
             }],
             delivery: None,
         };
         batch.batch_digest = batch.canonical_digest().unwrap();
         batch
+    }
+
+    #[test]
+    fn object_key_enters_the_digest_only_when_set() {
+        let mut batch = github_batch(BTreeMap::new());
+        let unkeyed = batch.canonical_digest().unwrap();
+        assert!(
+            !serde_json::to_string(&batch.records[0])
+                .unwrap()
+                .contains("object_key")
+        );
+        batch.records[0].object_key = Some("exports/2026/a.csv".into());
+        assert_ne!(batch.canonical_digest().unwrap(), unkeyed);
+    }
+
+    #[test]
+    fn object_key_is_non_empty_bounded_and_free_of_control_characters() {
+        let with_key = |key: String| {
+            let mut batch = github_batch(BTreeMap::new());
+            batch.records[0].object_key = Some(key);
+            batch.batch_digest = batch.canonical_digest().unwrap();
+            batch.validate().map_err(|error| error.code)
+        };
+        assert_eq!(with_key("a".repeat(MAX_SOURCE_OBJECT_KEY_BYTES)), Ok(()));
+        for refused in [
+            String::new(),
+            "a".repeat(MAX_SOURCE_OBJECT_KEY_BYTES + 1),
+            "line\nbreak.csv".into(),
+        ] {
+            assert_eq!(with_key(refused), Err("invalid_object_key".into()));
+        }
     }
 
     #[test]

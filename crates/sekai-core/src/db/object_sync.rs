@@ -285,6 +285,7 @@ pub struct PreparedRecord {
     pub properties_json: String,
     pub source_sequence: Option<u64>,
     pub payload: Option<String>,
+    pub object_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -545,6 +546,7 @@ impl PreparedBatch {
                 properties_json,
                 source_sequence: record.source_sequence,
                 payload: record.payload.clone(),
+                object_key: record.object_key.clone(),
             });
         }
 
@@ -689,6 +691,7 @@ impl SekaiDb {
                     lineage_json TEXT NOT NULL,
                     last_transaction_id TEXT NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
+                    object_key TEXT,
                     PRIMARY KEY(namespace, source_id),
                     UNIQUE(object_id),
                     FOREIGN KEY(binding_id) REFERENCES sekai_source_bindings(binding_id)
@@ -1039,6 +1042,8 @@ impl SekaiDb {
             "ALTER TABLE sekai_source_batch_transactions ADD COLUMN dataset_row_to INTEGER",
             // Operation identity of the call that opened the batch (#3087).
             "ALTER TABLE sekai_source_batch_transactions ADD COLUMN operation_id TEXT",
+            // Key of the stored object a record came from (#3013).
+            "ALTER TABLE sekai_source_identities ADD COLUMN object_key TEXT",
         ] {
             match self.conn().execute(statement, []) {
                 Ok(_) => {}
@@ -1053,6 +1058,15 @@ impl SekaiDb {
                  ON sekai_source_batch_transactions(
                     binding_id, sync_generation, opened_at_ms
                  )",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        // Byte order (BINARY) so a range read over keys matches the order
+        // object storage lists them in (#3013).
+        self.conn()
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_sekai_source_identities_object_key
+                 ON sekai_source_identities(namespace, binding_id, object_key COLLATE BINARY)",
                 [],
             )
             .map_err(|error| error.to_string())?;
@@ -1592,9 +1606,10 @@ impl SekaiDb {
                     "INSERT INTO sekai_source_identities (
                     namespace, source_id, binding_id, type_digest, type_name, object_id,
                     source_version, payload_digest, tombstoned, synced_object_json,
-                    lineage_json, last_transaction_id, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    lineage_json, last_transaction_id, updated_at_ms, object_key
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(namespace, source_id) DO UPDATE SET
+                    object_key=excluded.object_key,
                     source_version=excluded.source_version,
                     payload_digest=excluded.payload_digest,
                     tombstoned=excluded.tombstoned,
@@ -1616,6 +1631,7 @@ impl SekaiDb {
                         lineage_json,
                         prepared.transaction_id,
                         now_ms,
+                        prepared_record.object_key,
                     ],
                 )?;
                 transaction.execute(
@@ -3755,6 +3771,7 @@ pub mod tests {
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }
     }
 
@@ -4857,6 +4874,7 @@ pub mod tests {
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }
     }
 
@@ -5580,6 +5598,120 @@ pub mod tests {
         let record = source_record(&db).expect("synced object has a source record");
         assert_eq!(record.payload.as_deref(), Some(payload));
         assert!(!record.hidden);
+    }
+
+    /// A snapshot of three records whose object keys sort differently in
+    /// byte order than in a locale collation, plus one record without a key.
+    fn keyed_snapshot(key: &str) -> SourceBatch {
+        let mut batch = snapshot_batch("", "cursor:1", key, 1, true, Some(40));
+        let keyed = [
+            ("12", Some("b/z.csv")),
+            ("13", Some("B/a.csv")),
+            ("14", Some("\u{e9}/a.csv")),
+            ("15", None),
+        ];
+        batch.records = keyed
+            .into_iter()
+            .map(|(external_id, object_key)| SourceRecord {
+                external_id: external_id.into(),
+                object_key: object_key.map(Into::into),
+                ..record()
+            })
+            .collect();
+        redigest(&mut batch);
+        batch
+    }
+
+    /// The stored object keys of `acme`, ordered by the column, and how many
+    /// identities carry none.
+    fn stored_object_keys(db: &RuntimeDb) -> (Vec<String>, i64) {
+        const KEYS: &str = "SELECT object_key FROM sekai_source_identities
+             WHERE namespace='acme' AND object_key IS NOT NULL ORDER BY object_key";
+        const UNKEYED: &str = "SELECT COUNT(*) FROM sekai_source_identities
+             WHERE namespace='acme' AND object_key IS NULL";
+        match db {
+            RuntimeDb::Sqlite(db) => {
+                let conn = db.conn();
+                let mut keys = conn.prepare(KEYS).unwrap();
+                let keys = keys
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                (keys, conn.query_row(UNKEYED, [], |row| row.get(0)).unwrap())
+            }
+            RuntimeDb::Postgres(db) => {
+                let mut conn = db.connection().unwrap();
+                let keys = conn
+                    .query(KEYS, &[])
+                    .unwrap()
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                (keys, conn.query_one(UNKEYED, &[]).unwrap().get(0))
+            }
+        }
+    }
+
+    /// Byte order puts uppercase before lowercase and the two-byte `é`
+    /// last; a locale collation would not.
+    fn assert_object_keys_stored_in_byte_order(db: &RuntimeDb) {
+        db.apply_source_batch(&keyed_snapshot("keyed"), PRODUCER, 100)
+            .unwrap();
+        assert_eq!(
+            stored_object_keys(db),
+            (
+                vec!["B/a.csv".into(), "b/z.csv".into(), "\u{e9}/a.csv".into()],
+                1
+            )
+        );
+    }
+
+    #[test]
+    fn object_keys_are_stored_beside_identities_in_byte_order() {
+        assert_object_keys_stored_in_byte_order(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_object_keys_are_stored_beside_identities_in_byte_order() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = RuntimeDb::Postgres(std::sync::Arc::new(scratch.connect()));
+        assert_object_keys_stored_in_byte_order(&db);
+    }
+
+    #[test]
+    fn sqlite_store_without_object_keys_gains_the_column_and_index() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("before-object-key.sqlite");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.apply_source_batch(&batch("", "cursor:1", "unkeyed"), PRODUCER, 100)
+            .unwrap();
+        // Return the table to the shape a store had before object keys.
+        db.conn()
+            .execute_batch(
+                "DROP INDEX idx_sekai_source_identities_object_key;
+                 ALTER TABLE sekai_source_identities DROP COLUMN object_key;",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = RuntimeDb::Sqlite(std::sync::Arc::new(
+            SekaiDb::new(path.to_str().unwrap()).unwrap(),
+        ));
+        assert_eq!(stored_object_keys(&db), (Vec::new(), 1));
+        let RuntimeDb::Sqlite(sqlite) = &db else {
+            unreachable!()
+        };
+        let index: String = sqlite
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='idx_sekai_source_identities_object_key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index.contains("object_key COLLATE BINARY"), "{index}");
     }
 
     #[test]

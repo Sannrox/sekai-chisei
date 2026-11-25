@@ -733,6 +733,7 @@ fn source_batch(
                 observed_at_ms: round as i64 + 1,
                 source_sequence: None,
                 payload: None,
+                object_key: None,
             })
         })
         .collect::<Result<Vec<_>, SoakError>>()?;
@@ -788,6 +789,7 @@ fn source_batch(
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
                 payload: record.payload,
+                object_key: record.object_key,
             })
             .collect(),
         delivery: None,

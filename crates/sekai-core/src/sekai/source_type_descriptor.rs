@@ -395,6 +395,7 @@ mod tests {
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }
     }
 
@@ -413,6 +414,7 @@ mod tests {
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }
     }
 

@@ -54,6 +54,7 @@ fn issue_record(number: u64, version: &str, payload: &str, hidden: bool) -> Sour
         observed_at_ms: 10,
         source_sequence: None,
         payload: None,
+        object_key: None,
     }
 }
 

@@ -5167,6 +5167,12 @@ message SourceRecord {
   int64 observed_at_ms = 10;
   optional uint64 source_sequence = 11;
   optional string payload = 12;
+  // Key of the stored object this record came from, at most 1 KiB, for
+  // connectors that read keyed object storage (#3013). It enters the batch
+  // digest only when set, so batches without it keep their digests. A plane
+  // that predates the field drops it, recomputes a different digest and
+  // refuses the batch, so the key is never silently lost.
+  optional string object_key = 13;
 }
 
 enum SourceDeliveryMode {

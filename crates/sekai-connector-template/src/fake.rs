@@ -51,6 +51,7 @@ impl FakeSource {
             observed_at_ms: 1_000,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }
     }
 }

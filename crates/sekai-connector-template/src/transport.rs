@@ -283,6 +283,7 @@ fn to_proto(batch: &SourceBatch) -> pb::SourceBatch {
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
                 payload: record.payload.clone(),
+                object_key: record.object_key.clone(),
             })
             .collect(),
         delivery: None,

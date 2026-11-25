@@ -2056,6 +2056,7 @@ fn canary_lifecycle_record(
         observed_at_ms: observation.observed_at_ms,
         source_sequence: None,
         payload: None,
+        object_key: None,
     })
 }
 

@@ -137,6 +137,7 @@ pub fn translate(
         observed_at_ms: fixture.observed_at_ms,
         source_sequence: None,
         payload: None,
+        object_key: None,
     };
     Ok(record)
 }

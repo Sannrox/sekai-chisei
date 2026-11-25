@@ -604,11 +604,12 @@ impl SekaiDb {
                 lineage_json,
                 last_transaction_id,
                 identity_updated_at_ms,
+                object_key,
             )) = tx
                 .query_row(
                     "SELECT binding_id, type_digest, type_name, object_id, source_version,
                             payload_digest, tombstoned, synced_object_json, lineage_json,
-                            last_transaction_id, updated_at_ms
+                            last_transaction_id, updated_at_ms, object_key
                      FROM sekai_source_identities
                      WHERE namespace=?1 AND source_id=?2 AND type_name=?3",
                     params![namespace, source_id, kind],
@@ -625,6 +626,7 @@ impl SekaiDb {
                             row.get::<_, String>(8)?,
                             row.get::<_, String>(9)?,
                             row.get::<_, i64>(10)?,
+                            row.get::<_, Option<String>>(11)?,
                         ))
                     },
                 )
@@ -701,8 +703,8 @@ impl SekaiDb {
                 "INSERT INTO sekai_source_identities (
                     namespace, source_id, binding_id, type_digest, type_name, object_id,
                     source_version, payload_digest, tombstoned, synced_object_json,
-                    lineage_json, last_transaction_id, updated_at_ms
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    lineage_json, last_transaction_id, updated_at_ms, object_key
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     namespace,
                     source_id,
@@ -716,7 +718,8 @@ impl SekaiDb {
                     synced_object_json,
                     lineage_json,
                     last_transaction_id,
-                    identity_updated_at_ms
+                    identity_updated_at_ms,
+                    object_key
                 ],
             )
             .map_err(|error| error.to_string())?;

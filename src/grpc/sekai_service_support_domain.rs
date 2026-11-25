@@ -1268,6 +1268,7 @@ pub(super) fn from_proto_source_batch(
                     observed_at_ms: record.observed_at_ms,
                     source_sequence: record.source_sequence,
                     payload: record.payload,
+                    object_key: record.object_key,
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?,

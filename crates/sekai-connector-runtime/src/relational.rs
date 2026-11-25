@@ -624,6 +624,7 @@ fn record(
         observed_at_ms: now_ms,
         source_sequence: None,
         payload: None,
+        object_key: None,
     })
 }
 
