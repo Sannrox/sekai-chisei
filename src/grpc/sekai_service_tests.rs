@@ -24913,7 +24913,8 @@ async fn isolated_claim_admits_quota_and_write_records_usage() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    // The tenant's one request is spent, so the run is refused, not handed out.
+    assert_eq!(denied.code(), tonic::Code::NotFound);
 }
 
 #[tokio::test]
@@ -25212,7 +25213,8 @@ async fn isolated_claim_without_tenant_context_meters_the_owner() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), tonic::Code::ResourceExhausted);
+    // The owner's one request is spent, so the run is refused, not handed out.
+    assert_eq!(denied.code(), tonic::Code::NotFound);
 }
 
 #[tokio::test]
@@ -25932,7 +25934,7 @@ async fn isolated_quota_exhaustion_leaves_work_claimable() {
             10,
         )
         .unwrap();
-    spend_tenant_request_budget(&svc, "tenant-a");
+    fill_tenant_concurrency(&svc, "tenant-a");
     svc.run_governed_transform(with_tenant_admin(
         RunGovernedTransformRequest {
             namespace: "ops".into(),
@@ -26037,7 +26039,7 @@ async fn untargeted_claim_skips_quota_denied_work_for_another_owner() {
         .unwrap();
     let gate =
         crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
-    spend_tenant_request_budget(&svc, "tenant-a");
+    fill_tenant_concurrency(&svc, "tenant-a");
     gate.configure(
         "tenant-b",
         &TenantQuotaLimits {
@@ -26164,17 +26166,17 @@ impl crate::enterprise::EnterpriseExtension for IsolatedClaimExtension {
     }
 }
 
-/// Assigns `tenant_id` a budget of one request and spends it, so its claims
-/// are denied by usage. A budget of zero would refuse the run for good.
-fn spend_tenant_request_budget(svc: &SekaiServiceImpl, tenant_id: &str) {
+/// Assigns `tenant_id` one concurrency unit and holds it, so its claims wait
+/// on concurrency. A spent budget would refuse the run for good (#3044).
+fn fill_tenant_concurrency(svc: &SekaiServiceImpl, tenant_id: &str) {
     use crate::chisei::budget::PeriodType;
     use crate::chisei::tenant_quota::TenantQuotaLimits;
 
     let limits = TenantQuotaLimits {
         version: 1,
-        max_requests_per_period: Some(1),
+        max_requests_per_period: None,
         max_tokens_per_period: None,
-        max_concurrency: None,
+        max_concurrency: Some(1),
         max_storage_bytes: None,
         period: PeriodType::Daily,
     };
@@ -26188,7 +26190,7 @@ fn spend_tenant_request_budget(svc: &SekaiServiceImpl, tenant_id: &str) {
             tenant: Some(limits),
             namespace: None,
         },
-        "spent-request",
+        "held-unit",
         false,
     )
     .unwrap();
@@ -26435,6 +26437,52 @@ async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good
     assert_eq!(refusal.details["limit"], "0");
 }
 
+#[tokio::test]
+async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::{NamespaceQuotaScope, TenantQuotaLimits};
+    use crate::composition::transform_run_admission::{
+        REFUSAL_BUDGET_EXHAUSTED, RunQuotaLimits, admit_transform_run, quota_gate,
+    };
+
+    let svc = isolated_claim_service(false);
+    let requests = |max| TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: Some(max),
+        max_tokens_per_period: None,
+        max_concurrency: None,
+        max_storage_bytes: None,
+        period: PeriodType::Daily,
+    };
+    let gate = quota_gate(svc.db.runtime_arc()).unwrap();
+    gate.configure("tenant-a", &requests(2)).unwrap();
+    let ops = NamespaceQuotaScope::new("tenant-a", "ops").unwrap();
+    gate.configure_namespace(&ops, &requests(1)).unwrap();
+    let ctx = crate::provider_credentials::tenant_context("tenant-a", "local");
+    let admit = |namespace: Option<NamespaceQuotaScope>, key: &str| {
+        admit_transform_run(
+            &gate,
+            &ctx,
+            &RunQuotaLimits {
+                tenant: Some(requests(2)),
+                namespace: namespace.map(|scope| (scope, requests(1))),
+            },
+            key,
+            false,
+        )
+    };
+    // Spends the ops namespace's one request, and one of the tenant's two.
+    admit(Some(ops.clone()), "spent-request").unwrap();
+
+    enqueue_isolated_claim(&svc, "t-iso-spent").await;
+    let refusal = claim_refused(&svc).await.refusal.unwrap();
+    assert_eq!(refusal.code, REFUSAL_BUDGET_EXHAUSTED);
+    assert_eq!(refusal.details["metric"], "requests");
+    // The refused run took nothing: the tenant still has its second request.
+    admit(None, "dev-1").unwrap();
+    assert!(admit(None, "dev-2").is_err());
+}
+
 /// Assigns `limits` to tenant-a's `ops` namespace only.
 fn configure_ops_namespace(
     svc: &SekaiServiceImpl,
@@ -26612,7 +26660,7 @@ async fn scheduled_isolated_tick_claims_against_the_put_owner() {
             "tenant-a",
         )
         .unwrap();
-    spend_tenant_request_budget(&svc, "tenant-a");
+    fill_tenant_concurrency(&svc, "tenant-a");
     svc.tick_governed_transforms(with_named_principal(
         TickGovernedTransformsRequest { now_ms: 1_500 },
         "local",
@@ -26739,7 +26787,7 @@ async fn triggered_isolated_claim_uses_the_put_owner() {
     runtime
         .run_governed_transform_owned("ops", "t-up", false, 20, "tenant-a", "")
         .unwrap();
-    spend_tenant_request_budget(&svc, "tenant-a");
+    fill_tenant_concurrency(&svc, "tenant-a");
     let listed = svc
         .list_claimable_transform_work(with_named_principal(
             ListClaimableTransformWorkRequest {

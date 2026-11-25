@@ -3687,32 +3687,7 @@ pub(super) async fn claim_transform_work(
                     None => tenant_budget_refusal(quota.as_ref(), owner.as_ref(), &work.namespace)?,
                 };
                 if let Some(refusal) = refusal {
-                    match service.db.runtime().refuse_transform_claim(
-                        &work.run_id,
-                        &work.claim_owner,
-                        work.claim_generation,
-                        &work.fencing_token,
-                        &refusal,
-                        now_millis(),
-                    ) {
-                        Ok(()) => release_failed_transform_quota(
-                            service.db.runtime(),
-                            quota.clone(),
-                            std::slice::from_ref(&work.run_id),
-                        )?,
-                        // Another claimant moved the run on: it owns the run
-                        // and its quota now.
-                        Err(error)
-                            if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM => {
-                        }
-                        Err(error) => return Err(Status::internal(error)),
-                    }
-                    if targeted {
-                        return Err(Status::failed_precondition(format!(
-                            "isolated-process run refused: {}",
-                            refusal.code
-                        )));
-                    }
+                    refuse_claimed_run(service, quota.clone(), &work, &refusal, targeted)?;
                     continue;
                 }
                 let prior_admission = if work.claim_generation > 1 {
@@ -3758,7 +3733,11 @@ pub(super) async fn claim_transform_work(
                     &work,
                     prior_admission,
                 ) {
-                    Ok(held) => {
+                    Ok(ClaimAdmission::Refused(refusal)) => {
+                        refuse_claimed_run(service, quota.clone(), &work, &refusal, targeted)?;
+                        continue;
+                    }
+                    Ok(ClaimAdmission::Admitted(held)) => {
                         let gate = transform_quota_gate(quota.clone())?;
                         let bind_tenant = held
                             .as_ref()
@@ -3972,6 +3951,41 @@ pub(super) async fn claim_transform_work(
             }
         }
     }
+}
+/// Ends a claimed run for good with `refusal` and releases what its quota
+/// hold still owns. A targeted claim reports the refusal; an untargeted one
+/// returns `Ok` so the caller moves on to the next run.
+fn refuse_claimed_run(
+    service: &SekaiServiceImpl,
+    quota: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
+    work: &crate::sekai::governed_transform::TransformWork,
+    refusal: &crate::enterprise::IsolatedProcessRefusal,
+    targeted: bool,
+) -> Result<(), Status> {
+    match service.db.runtime().refuse_transform_claim(
+        &work.run_id,
+        &work.claim_owner,
+        work.claim_generation,
+        &work.fencing_token,
+        refusal,
+        now_millis(),
+    ) {
+        Ok(()) => release_failed_transform_quota(
+            service.db.runtime(),
+            quota,
+            std::slice::from_ref(&work.run_id),
+        )?,
+        // Another claimant moved the run on: it owns the run and its quota now.
+        Err(error) if error == crate::sekai::governed_transform::STALE_TRANSFORM_CLAIM => {}
+        Err(error) => return Err(Status::internal(error)),
+    }
+    if targeted {
+        return Err(Status::failed_precondition(format!(
+            "isolated-process run refused: {}",
+            refusal.code
+        )));
+    }
+    Ok(())
 }
 pub(super) async fn heartbeat_transform_claim(
     service: &SekaiServiceImpl,
@@ -4527,22 +4541,41 @@ fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Stat
 /// time limit. Matches the runner's default wall clock.
 const DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS: i64 = 30;
 
+/// What admitting a claimed isolated-process run decided.
+enum ClaimAdmission {
+    /// The run may start, holding this admission (`None`: no assignment).
+    Admitted(Option<crate::chisei::tenant_quota::TenantQuotaAdmission>),
+    /// A spent budget ends the run for good; nothing stays reserved (#3044).
+    Refused(crate::enterprise::IsolatedProcessRefusal),
+}
+
+/// Admits a claimed run. A full concurrency limit is `RESOURCE_EXHAUSTED`, so
+/// the run waits; a spent budget refuses it. A reclaim reserves no request,
+/// so it is never refused here.
 fn admit_claimed_isolated_process(
     service: &SekaiServiceImpl,
     quota: &crate::db::runtime_db::RuntimeDb,
     owner: Option<&crate::enterprise::AuthenticatedContext>,
     work: &crate::sekai::governed_transform::TransformWork,
     reclaim: bool,
-) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
+) -> Result<ClaimAdmission, Status> {
     admit_extension_isolated_process(service, owner, work)?;
-    admit_tenant_transform(
+    match tenant_transform_admission(
         quota,
         &transform_quota_gate(service.quota_runtime())?,
         owner,
         &work.namespace,
         &format!("transform-claim:{}", work.run_id),
         reclaim,
-    )
+    )? {
+        Ok(held) => Ok(ClaimAdmission::Admitted(held)),
+        Err(error) => {
+            match crate::composition::transform_run_admission::refusal_budget_exhausted(&error) {
+                Some(refusal) if !reclaim => Ok(ClaimAdmission::Refused(refusal)),
+                _ => Err(map_quota_error(error)),
+            }
+        }
+    }
 }
 
 /// The extension's terminal refusal of this claim, if any, bounded and with
@@ -4653,28 +4686,50 @@ fn admit_tenant_transform(
     run_key: &str,
     reclaim: bool,
 ) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
+    tenant_transform_admission(db, gate, tenant_context, namespace, run_key, reclaim)?
+        .map_err(map_quota_error)
+}
+
+/// [`admit_tenant_transform`] with the gate's own error, so a caller can tell
+/// a spent budget from a full concurrency limit. The outer error is a store
+/// read that refuses the admission.
+fn tenant_transform_admission(
+    db: &crate::db::runtime_db::RuntimeDb,
+    gate: &crate::chisei::tenant_quota::TenantQuotaGate,
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
+    run_key: &str,
+    reclaim: bool,
+) -> Result<
+    Result<
+        Option<crate::chisei::tenant_quota::TenantQuotaAdmission>,
+        crate::chisei::tenant_quota::TenantQuotaError,
+    >,
+    Status,
+> {
     let Some(context) = tenant_context else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
     let Some(tenant_id) = context
         .tenant
         .as_ref()
         .map(|tenant| tenant.tenant_id.as_str())
     else {
-        return Ok(None);
+        return Ok(Ok(None));
     };
     let limits = crate::composition::transform_run_admission::configured_run_limits(
         db, tenant_id, namespace,
     )
     .map_err(Status::internal)?;
     if limits.is_unlimited() {
-        return Ok(None);
+        return Ok(Ok(None));
     }
-    crate::composition::transform_run_admission::admit_transform_run(
-        gate, context, &limits, run_key, reclaim,
+    Ok(
+        crate::composition::transform_run_admission::admit_transform_run(
+            gate, context, &limits, run_key, reclaim,
+        )
+        .map(Some),
     )
-    .map(Some)
-    .map_err(map_quota_error)
 }
 
 fn release_tenant_transform(
