@@ -1535,12 +1535,21 @@ pub fn run_for_plane(
         }
 
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
-        crate::composition::gateway_log_reader::spawn(
-            gateway_logs,
-            stores.handles().1,
-            stores.sekai_runtime(),
-            health_reporter.clone(),
-        );
+        if plane.serves_sekai() {
+            crate::composition::gateway_egress_policy::spawn(
+                gateway_logs.clone(),
+                sekai_svc.egress.clone(),
+                health_reporter.clone(),
+            );
+        }
+        if plane == ProcessPlane::Combined {
+            crate::composition::gateway_log_reader::spawn(
+                gateway_logs,
+                stores.handles().1,
+                stores.sekai_runtime(),
+                health_reporter.clone(),
+            );
+        }
         spawn_health_reporter(health_reporter, db.clone(), provider_registry_state_path);
 
         if let Some(socket_path) = config.sekai_socket.clone() {
@@ -1902,6 +1911,14 @@ pub fn build_services_for_plane(
             .filter(crate::identity_assertion::AssertionAuthority::can_seal)
             .map(Arc::new),
     );
+    if plane.serves_sekai() {
+        let gateways = gateway_log_sources(plane)?;
+        sekai_svc.set_egress_policies(
+            crate::composition::gateway_egress_policy::EgressPolicies::new(
+                gateways.into_iter().map(|gateway| gateway.name),
+            ),
+        );
+    }
     if plane == ProcessPlane::Combined {
         let clerk = Arc::new(
             crate::composition::cross_store_admission::CrossStoreAdmission::new(
@@ -1963,19 +1980,26 @@ fn hosted_embedding_route(
     })
 }
 
-/// The gateways whose egress logs this process reads. The receipt, row and
-/// decision writes need both stores, so only a combined process reads them.
+/// The configured gateways. A combined process reads their egress logs,
+/// whose receipt, row and decision writes need both stores. Any process that
+/// serves Sekai reads their published policies to withhold read values
+/// (ADR 0164), so the Sekai plane accepts them for that alone.
 fn gateway_log_sources(
     plane: ProcessPlane,
 ) -> Result<Vec<crate::composition::gateway_log_reader::GatewayLogSource>, String> {
     let sources = crate::composition::gateway_log_reader::sources_from_env()?;
-    if !sources.is_empty() && plane != ProcessPlane::Combined {
+    if !sources.is_empty() && !plane.serves_sekai() {
         return Err(format!(
             "{} is set, but reading gateway logs needs both stores; run the combined server \
              (sekai-chisei) instead of the {} plane",
             crate::composition::gateway_log_reader::GATEWAY_LOGS_ENV,
             plane.as_str()
         ));
+    }
+    if !sources.is_empty() && plane == ProcessPlane::Sekai {
+        tracing::info!(
+            "the sekai plane reads configured gateways' policies only; their egress logs are read by the combined server"
+        );
     }
     Ok(sources)
 }

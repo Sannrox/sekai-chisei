@@ -1747,4 +1747,206 @@ mod tests {
         .await;
         assert_eq!(unbounded["error"]["code"], -32602, "{unbounded}");
     }
+
+    /// The synthetic plane plus `account-1`, whose `ssn` is `sensitive`, read
+    /// by an object admin so only egress decides what reaches it, and one
+    /// configured gateway `edge` whose policy the test loads.
+    async fn account_surface() -> (
+        InProcessSurface,
+        Arc<crate::composition::gateway_egress_policy::EgressPolicies>,
+    ) {
+        let mut surface = InProcessSurface::synthetic().await.unwrap();
+        let mut ssn = property("ssn", false);
+        ssn.classification = "sensitive".into();
+        surface
+            .sekai
+            .create_schema_type(with_identity(
+                CreateSchemaTypeRequest {
+                    r#type: Some(ObjectType {
+                        kind: "account".into(),
+                        description: String::new(),
+                        is_builtin: false,
+                        implements: vec![],
+                        properties: vec![property("region", false), ssn],
+                    }),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap();
+        surface
+            .db
+            .create_object_with_audit(
+                &domain::Object {
+                    id: "account-1".into(),
+                    kind: "account".into(),
+                    name: "account-1".into(),
+                    namespace: NAMESPACE.into(),
+                    external_id: String::new(),
+                    properties: HashMap::from([
+                        ("region".into(), "eu".into()),
+                        ("ssn".into(), "123-45-6789".into()),
+                    ]),
+                    created: 1,
+                    updated: 1,
+                },
+                PRINCIPAL,
+            )
+            .unwrap();
+        surface
+            .sekai
+            .create_grant(with_identity(
+                crate::grpc::pb::sekai::CreateGrantRequest {
+                    grant: Some(crate::grpc::pb::sekai::Grant {
+                        id: "account-admin".into(),
+                        object_id: "account-1".into(),
+                        principal: PRINCIPAL.into(),
+                        role: "admin".into(),
+                        ..Default::default()
+                    }),
+                },
+                "local",
+                NAMESPACE,
+            ))
+            .await
+            .unwrap();
+        let policies =
+            crate::composition::gateway_egress_policy::EgressPolicies::new(["edge".to_string()]);
+        surface.sekai.set_egress_policies(policies.clone());
+        (surface, policies)
+    }
+
+    /// `edge`'s published policy with these gateway principals, each
+    /// `(name, provider)`: `openai` takes only public data, `ollama` all, and
+    /// `anthropic` has no egress rule, so it takes nothing.
+    fn load_edge_policy(
+        policies: &crate::composition::gateway_egress_policy::EgressPolicies,
+        principals: &[(&str, &str)],
+    ) {
+        let principals = principals
+            .iter()
+            .map(|(name, provider)| {
+                json!({"name": name, "routes": [{"provider": provider, "models": ["*"]}]})
+            })
+            .collect::<Vec<_>>();
+        let published = json!({
+            "format": "chisei.gateway-policy/v1",
+            "generation": 1,
+            "principals": principals,
+            "egress": [
+                {"provider": "openai", "data_classes": ["public"]},
+                {"provider": "ollama", "data_classes": ["public", "internal", "sensitive"]},
+            ],
+        });
+        policies
+            .load("edge", published.to_string().as_bytes())
+            .unwrap();
+    }
+
+    /// #2699: over MCP, a `sensitive` property is withheld from a reader
+    /// whose egress reaches a hosted provider that may not receive it, and
+    /// from a reader no gateway principal maps to, and returned to a reader
+    /// whose only route is local.
+    #[tokio::test]
+    async fn a_sensitive_property_reaches_only_a_reader_whose_egress_may_receive_it() {
+        use crate::mcp_adapter::protocol::GET_OBJECT_TOOL;
+        let (surface, policies) = account_surface().await;
+
+        for (principals, reason) in [
+            (&[(PRINCIPAL, "openai")][..], "egress_not_allowed"),
+            (
+                &[("other", "ollama"), ("another", "openai")][..],
+                "egress_unknown",
+            ),
+        ] {
+            load_edge_policy(&policies, principals);
+            let read =
+                call_output(call(&surface, GET_OBJECT_TOOL, json!({"id": "account-1"})).await)
+                    .unwrap();
+            let output = &read["output"];
+            assert_eq!(output["object"]["properties"]["region"], "eu", "{read}");
+            assert!(!read.to_string().contains("123-45-6789"), "{read}");
+            assert_eq!(
+                output["withheld_properties"],
+                json!([{"kind": "account", "property": "ssn", "reason": reason}]),
+                "{read}"
+            );
+        }
+
+        load_edge_policy(&policies, &[(PRINCIPAL, "ollama")]);
+        let read =
+            call_output(call(&surface, GET_OBJECT_TOOL, json!({"id": "account-1"})).await).unwrap();
+        assert_eq!(
+            read["output"]["object"]["properties"]["ssn"], "123-45-6789",
+            "{read}"
+        );
+        assert_eq!(read["output"]["withheld_properties"], json!([]), "{read}");
+    }
+
+    /// #2699: a withheld value takes no part in a query. A filter on it is
+    /// refused, and Search does not match it.
+    #[tokio::test]
+    async fn a_withheld_property_is_not_filtered_on_or_searched() {
+        use crate::grpc::pb::sekai::{ListFilter, ListObjectsRequest, PropertyFilter};
+        let (surface, policies) = account_surface().await;
+        for (_, outcome) in
+            crate::db::search_index::catch_up_search_pass(&surface.db, "", usize::MAX, &|| 1_000)
+                .unwrap()
+        {
+            outcome.unwrap();
+        }
+
+        // A public property, so only egress can refuse the filter.
+        load_edge_policy(&policies, &[(PRINCIPAL, "anthropic")]);
+        let filtered = surface
+            .sekai
+            .list_objects(with_identity(
+                ListObjectsRequest {
+                    filter: Some(ListFilter {
+                        kind: "account".into(),
+                        namespace: NAMESPACE.into(),
+                        property_filters: vec![PropertyFilter {
+                            key: "region".into(),
+                            op: "eq".into(),
+                            value: "eu".into(),
+                        }],
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                },
+                PRINCIPAL,
+                NAMESPACE,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(filtered.code(), tonic::Code::PermissionDenied, "{filtered}");
+
+        let search = || async {
+            surface
+                .sekai
+                .search(with_identity(
+                    SearchRequest {
+                        namespace: NAMESPACE.into(),
+                        text: "123-45-6789".into(),
+                        source: "object".into(),
+                        ..Default::default()
+                    },
+                    PRINCIPAL,
+                    NAMESPACE,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+        };
+        load_edge_policy(&policies, &[(PRINCIPAL, "ollama")]);
+        assert_eq!(
+            search().await.hits.len(),
+            1,
+            "a local reader finds the value"
+        );
+        load_edge_policy(&policies, &[(PRINCIPAL, "openai")]);
+        let searched = search().await;
+        assert!(searched.hits.is_empty(), "{searched:?}");
+    }
 }

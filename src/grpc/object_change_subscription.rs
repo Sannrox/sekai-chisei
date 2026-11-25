@@ -93,7 +93,7 @@ impl SekaiServiceImpl {
                 .iter()
                 .map(|filter| filter.key.clone())
                 .collect::<Vec<_>>();
-            ensure_property_query_allowed(
+            self.ensure_property_query_allowed(
                 &schema,
                 &principals,
                 tenant_context.as_ref(),

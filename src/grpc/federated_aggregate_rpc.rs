@@ -537,7 +537,7 @@ impl SekaiServiceImpl {
             .chain(query.measures.iter().filter_map(|m| m.property.as_ref()))
             .cloned()
             .collect();
-        match ensure_property_query_allowed(
+        match self.ensure_property_query_allowed(
             &schema,
             &[federation_principal(&record.allowance_digest)],
             None,

@@ -345,9 +345,11 @@ Back up the log directory with the policy file.
 
 The combined server reads each gateway named in `CHISEI_GATEWAY_LOGS`
 (`name=base_url`, comma-separated) with the `log_reader` key given for it in
-`CHISEI_GATEWAY_LOG_KEYS` (`name=key`). A `sekai-plane` or `chisei-plane`
-process refuses to start with either set, because the writes need both
-stores (#3096).
+`CHISEI_GATEWAY_LOG_KEYS` (`name=key`). A `chisei-plane` process refuses to
+start with either set, because the writes need both stores (#3096). A
+`sekai-plane` process accepts them only to read the gateways' policies
+([below](#reads-withhold-what-a-readers-egress-may-not-receive)) and reads no
+log.
 
 For each gateway Chisei keeps a cursor, the highest committed sequence, in
 the Sekai store. It reads the records after the cursor and:
@@ -377,6 +379,30 @@ records the cursor does not cover.
 
 Not yet in policy mode: `x-chisei-request-id` dispatch deduplication and
 cost or token quotas.
+
+### Reads withhold what a reader's egress may not receive
+
+Every process that serves Sekai polls `GET /_chisei/policy` of each gateway in
+`CHISEI_GATEWAY_LOGS` every 2 seconds with its `log_reader` key
+([ADR 0164](decisions/0164-reads-withhold-what-a-readers-egress-may-not-receive.md)).
+Reads then remove each property value whose schema `classification` may not
+reach a route the reader can use:
+
+- a Sekai principal maps to the gateway principals whose `sekai_principal`
+  (default `name`) names it, and receives the classes every provider on their
+  routes lists in `egress`;
+- an unmapped principal, or one whose mapping has no route, receives only the
+  classes every provider of every configured policy lists;
+- a gateway whose policy is unread or failed its last read releases nothing.
+  It reports `NOT_SERVING` under the gRPC health service
+  `chisei.gateway_policy.<name>` until the next good read.
+
+`GetObject`, `EvaluateObjectSet`, `Search`, `ExpandNeighborhood`, and
+`GetLineage` list the withheld properties of the returned kinds in
+`withheld_properties`, with reason `egress_not_allowed` or `egress_unknown`.
+A filter, sort, or facet naming a withheld property is refused with
+`PERMISSION_DENIED`, and Search does not match it. With no gateway configured,
+reads are unchanged.
 
 ## Native execution through the gateway
 

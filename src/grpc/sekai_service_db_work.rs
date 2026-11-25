@@ -30,6 +30,8 @@ impl SekaiServiceImpl {
             runtime_token_authority: None,
             dry_run_host: None,
             embedding_route: None,
+            // Serves no reads: the plane interceptor refuses every Sekai RPC.
+            egress: crate::composition::gateway_egress_policy::EgressPolicies::new([]),
         }
     }
 

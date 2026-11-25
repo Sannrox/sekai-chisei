@@ -97,7 +97,8 @@ impl SekaiServiceImpl {
 
     /// The properties of `object` a reader sees, without computing any: its
     /// property grants, then restricted properties redacted for the request's
-    /// actor and for `principals`.
+    /// actor and for `principals`, then values their allowed egress may not
+    /// receive removed (ADR 0164).
     pub(super) fn project_for_response(
         &self,
         object: domain::Object,
@@ -124,11 +125,11 @@ impl SekaiServiceImpl {
                 std::slice::from_ref(actor),
             );
         }
-        Ok(redact_restricted_properties(
+        let object = redact_restricted_properties(object, schema, &self.security, principals);
+        Ok(withhold_unreleased(
             object,
             schema,
-            &self.security,
-            principals,
+            &self.egress_disclosure(principals, tenant_context),
         ))
     }
 

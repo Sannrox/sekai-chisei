@@ -115,8 +115,11 @@ impl SekaiServiceImpl {
         // view hides. ApplyGraphChanges accepts it as an expected revision.
         let mut object = to_proto_obj(&obj);
         object.revision = crate::sekai::action_describe_preview::object_revision(&obj);
+        let withheld_properties =
+            self.withheld_properties(&principals, tenant_context.as_ref(), kinds_of([&object]))?;
         Ok(Response::new(GetObjectResponse {
             object: Some(object),
+            withheld_properties,
         }))
     }
     pub(super) async fn list_visible_objects(
@@ -278,7 +281,7 @@ impl SekaiServiceImpl {
             if let Some(order_property) = queried_order_property(&filter.order_by) {
                 queried_properties.push(order_property);
             }
-            ensure_property_query_allowed(
+            self.ensure_property_query_allowed(
                 &schema,
                 &principals,
                 tenant_context.as_ref(),
@@ -520,8 +523,15 @@ impl SekaiServiceImpl {
                 tenant_context.as_ref(),
                 purpose.as_ref(),
             )?;
+            let object = to_proto_obj(&obj);
+            let withheld_properties = self.withheld_properties(
+                &principals,
+                tenant_context.as_ref(),
+                kinds_of([&object]),
+            )?;
             return Ok(Response::new(GetObjectResponse {
-                object: Some(to_proto_obj(&obj)),
+                object: Some(object),
+                withheld_properties,
             }));
         }
         if let Some(status) = first_acl_denied {
@@ -560,7 +570,7 @@ impl SekaiServiceImpl {
                 .schema_definitions
                 .snapshot()
                 .map_err(map_schema_definition_lifecycle_error)?;
-            ensure_property_query_allowed(
+            self.ensure_property_query_allowed(
                 &schema,
                 &principals,
                 tenant_context.as_ref(),
@@ -880,7 +890,7 @@ impl SekaiServiceImpl {
             .map_err(map_schema_definition_lifecycle_error)?;
         let queried_properties = gq.property_filter.keys().cloned().collect::<Vec<_>>();
         if gq.kind_filter.is_empty() {
-            ensure_property_query_allowed(
+            self.ensure_property_query_allowed(
                 &schema,
                 &principals,
                 tenant_context.as_ref(),
@@ -895,7 +905,7 @@ impl SekaiServiceImpl {
             )?;
         } else {
             for kind in &gq.kind_filter {
-                ensure_property_query_allowed(
+                self.ensure_property_query_allowed(
                     &schema,
                     &principals,
                     tenant_context.as_ref(),
@@ -1132,12 +1142,18 @@ impl SekaiServiceImpl {
                 relation: e.relation.clone(),
             })
             .collect();
+        let withheld_properties = self.withheld_properties(
+            &principals,
+            tenant_context.as_ref(),
+            kinds_of(nodes.iter().filter_map(|node| node.object.as_ref())),
+        )?;
         Ok(Response::new(GetLineageResponse {
             result: Some(LineageResult {
                 nodes,
                 edges,
                 truncated: res.truncated,
             }),
+            withheld_properties,
         }))
     }
 }
