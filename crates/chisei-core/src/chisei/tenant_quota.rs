@@ -97,6 +97,10 @@ pub enum TenantQuotaError {
     Exhausted {
         metric: String,
         retry_after_hint: String,
+        /// Budget scope whose limit refused: `tenant:{id}` or
+        /// `tenant:{id}/namespace:{ns}`. A full concurrency limit queues the
+        /// run in this scope (#3044, ADR 0168 part 3).
+        scope_id: String,
     },
     Storage(String),
 }
@@ -114,6 +118,7 @@ impl std::fmt::Display for TenantQuotaError {
             Self::Exhausted {
                 metric,
                 retry_after_hint,
+                ..
             } => write!(
                 f,
                 "tenant quota exhausted for {metric}; retry_after={retry_after_hint}"
@@ -368,7 +373,7 @@ impl TenantQuotaGate {
         if either(|limits| limits.max_requests_per_period.is_some()) {
             self.tracker
                 .check_and_reserve_with_metric(&scope, 1, METRIC_REQUESTS)
-                .map_err(|_| exhausted(METRIC_REQUESTS))?;
+                .map_err(|_| exhausted(METRIC_REQUESTS, &scope))?;
             reserved.reserved_request = true;
         }
         if either(|limits| limits.max_tokens_per_period.is_some()) && estimated_tokens > 0 {
@@ -378,7 +383,7 @@ impl TenantQuotaGate {
             {
                 let _ = self.rollback_partial(&reserved);
                 let _ = err;
-                return Err(exhausted(METRIC_TOKENS));
+                return Err(exhausted(METRIC_TOKENS, &scope));
             }
             reserved.reserved_tokens = estimated_tokens;
         }
@@ -395,20 +400,26 @@ impl TenantQuotaGate {
                 .is_err()
             {
                 let _ = self.rollback_partial(&reserved);
-                return Err(exhausted(METRIC_COMPUTE_SECONDS));
+                return Err(exhausted(METRIC_COMPUTE_SECONDS, &scope));
             }
             reserved.reserved_compute_seconds = estimated_compute_seconds;
         }
         // The tenant's hold first, then the namespace's, under one holder.
+        let tenant_scope = tenant_scope_id(&tenant.tenant_id);
         let holds = [
-            (tenant.tenant_id.as_str(), limits.max_concurrency),
             (
+                tenant.tenant_id.as_str(),
+                tenant_scope.as_str(),
+                limits.max_concurrency,
+            ),
+            (
+                reserved.scope_id.as_str(),
                 reserved.scope_id.as_str(),
                 own.and_then(|limits| limits.max_concurrency),
             ),
         ];
         let holder = uuid::Uuid::new_v4().to_string();
-        for (key, max) in holds {
+        for (key, queue_scope, max) in holds {
             let Some(max) = max else { continue };
             let taken = self.store.take_tenant_concurrency_hold(
                 key,
@@ -425,7 +436,7 @@ impl TenantQuotaGate {
                 let _ = self.rollback_partial(&reserved);
                 return Err(match taken {
                     Err(err) => TenantQuotaError::Storage(err),
-                    _ => exhausted(METRIC_CONCURRENCY),
+                    _ => exhausted(METRIC_CONCURRENCY, queue_scope),
                 });
             }
             reserved.reserved_concurrency = true;
@@ -592,7 +603,7 @@ impl TenantQuotaGate {
         let scope = tenant_scope_id(tenant_id);
         self.tracker
             .check_and_reserve_with_metric(&scope, bytes, METRIC_STORAGE_BYTES)
-            .map_err(|_| exhausted(METRIC_STORAGE_BYTES))
+            .map_err(|_| exhausted(METRIC_STORAGE_BYTES, &scope))
     }
 
     fn rollback_partial(&self, admission: &TenantQuotaAdmission) -> Result<(), TenantQuotaError> {
@@ -685,9 +696,10 @@ impl TenantQuotaAdmission {
     }
 }
 
-fn exhausted(metric: &str) -> TenantQuotaError {
+fn exhausted(metric: &str, scope_id: &str) -> TenantQuotaError {
     TenantQuotaError::Exhausted {
         metric: metric.into(),
+        scope_id: scope_id.into(),
         // Period budgets reset at period boundary; concurrency may free sooner.
         retry_after_hint: if metric == METRIC_CONCURRENCY {
             "when in-flight work completes or its hold expires".into()

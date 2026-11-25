@@ -141,6 +141,23 @@ impl RunQuotaLimits {
         self.tenant.is_none() && self.namespace.is_none()
     }
 
+    /// The concurrency queues a run of `tenant_id` waits behind: the
+    /// tenant's and its namespace's scope, each only while it has a
+    /// concurrency limit (#3044, ADR 0168 part 3).
+    pub fn concurrency_queue_scopes(&self, tenant_id: &str) -> Vec<String> {
+        let tenant = self
+            .tenant
+            .as_ref()
+            .filter(|limits| limits.max_concurrency.is_some())
+            .map(|_| tenant_scope_id(tenant_id));
+        let namespace = self
+            .namespace
+            .as_ref()
+            .filter(|(_, limits)| limits.max_concurrency.is_some())
+            .map(|(scope, _)| scope.scope_id().to_string());
+        tenant.into_iter().chain(namespace).collect()
+    }
+
     /// The refusal of a run estimated at `compute_seconds` that is larger
     /// than either whole budget.
     pub fn refusal_larger_than_budget(

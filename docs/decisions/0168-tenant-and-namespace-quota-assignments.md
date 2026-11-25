@@ -69,8 +69,16 @@ The maintainer accepted the shape on 2026-11-24:
      takes no idempotency key: budget usage keys are global, and each claim
      of a run is its own reservation, refunded when that claim is lost. A
      reclaim reserves compute again, so a spent compute budget refuses it.
-   - **Part 3:** the concurrency queue, its held state, FIFO release and
-     `queued(concurrency)` with a position in `proto/`.
+   - **Part 3:** the concurrency queue. A claim that finds a concurrency
+     limit full puts the run's work in the state `held`, queued in the
+     scope whose limit refused it (`tenant:{id}` or the namespace scope).
+     The run's dispatch status stays `pending`. Older planes claim only
+     `pending` work, so they never take a held run. Held work stays
+     claimable on this version, and a claim admits it in order: a run
+     with an older held run in any of its limited scopes is held behind
+     it, so release is FIFO by `(created_at, run id)` within the scope.
+     A run read while held carries `queue { reason: "concurrency",
+     position }`, its 1-based place in that scope.
 4. How `mode` is stored is pending a maintainer decision: a dedicated
    column, or a reserved row in the budget limit table. 1c depends on it.
 
@@ -94,7 +102,7 @@ The maintainer accepted the shape on 2026-11-24:
   refused for good instead of waiting for the next period. From 2b the same
   holds for a compute budget, which only a new assignment sets.
 - A namespace assignment has no effect on admission until 1b.
-- No `proto/` change. 2b adds the hold's `reserved_compute_seconds` column,
+- Parts 1 and 2 change no `proto/`. 2b adds the hold's `reserved_compute_seconds` column,
   default zero; a hold an older plane wrote has no compute to settle. An
   older plane ignores `compute_seconds` rows and admits without them, and a
   hold it releases leaves the newer claim's reservation charged until the
@@ -104,8 +112,14 @@ The maintainer accepted the shape on 2026-11-24:
   refuses. Either way the run never executes. Likewise an older instance
   defers a run whose budget is spent; it can run it after the period
   resets unless a newer instance claims it first and refuses it.
+- Part 3 adds `TransformRun.queue` to `proto/` and the work column
+  `queue_scope` (SQLite on open, PostgreSQL migration 185). An older plane
+  does not claim, cancel or count a held run: it can enqueue a second run
+  of a transform whose run is held, and its cancel reports a held run as
+  finished.
 - Rollback leaves namespace rows that nothing reads, and refused runs stay
-  refused.
+  refused. Held runs wait until a plane of this version claims them again;
+  raise the concurrency limit and let the queue drain before rolling back.
 
 ## Validation
 
@@ -127,3 +141,11 @@ The maintainer accepted the shape on 2026-11-24:
   reclaimed run refunds the reclaim's.
 - A hold table without the compute column gains it on SQLite and
   PostgreSQL, and older holds read as zero.
+- Two plane instances over one SQLite file, and over one PostgreSQL
+  database, hold runs past a full tenant limit at positions 1 and 2, keep
+  them across a restart, admit the oldest when the unit frees, and take a
+  lapsed claim over before the next held run.
+- A run newer than a held run in its namespace waits behind it, and a
+  cancelled held run leaves the queue.
+- A work table without `queue_scope` gains it, and its pending work stays
+  claimable.
