@@ -171,3 +171,27 @@ The indexed SQL hop path now honours `direction`: an `incoming` hop follows
 the near row's join property to the far row with that key. The canary maps
 such a hop to `incoming: true` and compares it; outgoing hops keep
 `incoming: false`.
+
+## Amendment: pin mikura `v0.6.0` (#2410)
+
+The pin moves to the `v0.6.0` tag. It adds the host's fenced source ingest,
+which the drain uses (see below). It also changes the format of new logs.
+
+- An existing log keeps its `MIKURAV2` format and still opens with `v0.5.0`.
+  A deployment upgraded in place can roll back.
+- A log created by this version is `MIKURAV4`: a fixed stub plus snapshot
+  objects under `{log}.obj`. `v0.5.0` refuses it with `bad magic` and does
+  not modify it. Rolling back a deployment whose log this version created
+  needs a log from before the upgrade.
+- A host drain appends through the host's fenced source ingest
+  (`ingest_fenced`). The host merges the identity's overlay and writes its
+  conflict audit with the record, under the generation fence. The drain no
+  longer merges on the client, and no longer opens a namespace with a hidden
+  marker record.
+- The cached local writer's change stamp also covers the snapshot directory,
+  because a `MIKURAV4` commit leaves the stub unchanged.
+- `v0.6.0` answers a zero-hop, unfiltered breakdown on one root property of
+  the root's own measure from commit-time count and sum rollups. Those groups
+  carry no min, max, or average divisor. The dual-read canary skips `min`,
+  `max`, and `avg` for that shape with a fixed reason instead of reporting a
+  mismatch. Serving those answers from the object log needs an upstream fix.

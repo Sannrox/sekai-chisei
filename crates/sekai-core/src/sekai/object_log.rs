@@ -68,7 +68,7 @@ impl CachedObjectLogStore {
             .ok_or_else(|| "object log handle dropped".into())
     }
 
-    /// Drop the exclusive writer and open from disk again. mikura v0.5.0
+    /// Drop the exclusive writer and open from disk again. mikura
     /// refuses a second `Store` on the same path (`LOG_IN_USE`).
     fn reopen(&mut self) -> Result<&mut Store, String> {
         self.store = None;
@@ -79,14 +79,17 @@ impl CachedObjectLogStore {
     }
 }
 
-/// Bytes at the head of the log that hold mikura's superblock. The pinned
-/// tag writes a 4096-byte superblock at offset 0 carrying the committed page
-/// count, rewritten on every commit.
+/// Bytes at the head of the log that hold mikura's superblock. A
+/// `MIKURAV2` log (written before mikura v0.6.0) rewrites this 4096-byte
+/// superblock at offset 0 on every commit. A `MIKURAV4` log keeps a fixed
+/// stub there and commits by adding a snapshot object under `{log}.obj`.
 const SUPERBLOCK_BYTES: usize = 4096;
 
-/// Length, modification time, and a digest of the superblock. The superblock
-/// digest changes on every commit, so a write that reuses a torn tail page's
-/// length within one coarse modification-time tick is still detected.
+/// Length, modification time, and a digest of the superblock and of the
+/// snapshot directory's modification time. Either changes on every commit,
+/// so a write that reuses a torn tail page's length within one coarse
+/// modification-time tick is still detected on a `MIKURAV2` log, and a
+/// `MIKURAV4` commit, which leaves the stub as it was, is detected too.
 /// Modification time is optional: a filesystem without it keeps the cache
 /// on length and superblock digest instead of reopening on every call.
 type LogStamp = (u64, Option<std::time::SystemTime>, u64);
@@ -103,6 +106,12 @@ fn log_stamp(path: &Path) -> Option<LogStamp> {
         .ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     head.hash(&mut hasher);
+    let mut snapshots = path.as_os_str().to_os_string();
+    snapshots.push(".obj");
+    std::fs::metadata(snapshots)
+        .and_then(|snapshots| snapshots.modified())
+        .ok()
+        .hash(&mut hasher);
     Some((metadata.len(), metadata.modified().ok(), hasher.finish()))
 }
 
@@ -140,7 +149,7 @@ fn with_cached_object_log<R>(
         None => true,
     };
     if stale {
-        // Drop the exclusive writer before opening again (mikura v0.5.0).
+        // Drop the exclusive writer before opening again (`LOG_IN_USE`).
         *guard = None;
         #[cfg(test)]
         OBJECT_LOG_STORE_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
@@ -426,6 +435,19 @@ pub fn map_evaluate_request(
         .last()
         .map(|hop| hop.far_kind.clone())
         .unwrap_or_else(|| descriptor.kind.clone());
+    // mikura v0.6.0 answers a zero-hop, unfiltered, one-property breakdown of
+    // the root's own measure from commit-time count and sum rollups, leaving
+    // min, max and the avg divisor unset. Those answers cannot be compared.
+    let rollup_breakdown = hops.is_empty()
+        && predicate.is_none()
+        && group_by.len() == 1
+        && sum_kind == descriptor.kind
+        && group_by[0] != sum_property;
+    if rollup_breakdown && matches!(function.as_str(), "min" | "max" | "avg") {
+        return Err(ObjectLogCompareError::Unsupported(
+            "the object-log answers a one-property root breakdown without min, max, or avg",
+        ));
+    }
     // SQL groups by root property; the log's breakdown does the same. Count
     // and sum without grouping keep the plain top-level response.
     let breakdown = (uses_breakdown || !group_by.is_empty()).then(|| Breakdown {
@@ -850,8 +872,6 @@ fn ingested_seq(action_id: &str) -> Option<i64> {
 pub struct LogFence {
     /// The identity's generation, hidden or not; 0 when the log lacks it.
     generation: u64,
-    /// Whether the identity is hidden; a hidden one merges no overlay.
-    hidden: bool,
     /// The `seq` of the ingest intent the record was appended for; `None`
     /// when the log lacks the identity or another writer appended it.
     pub ingested_seq: Option<i64>,
@@ -885,7 +905,6 @@ pub fn configured_log_fence(object: &Object) -> Result<Option<LogFence>, String>
     };
     Ok(Some(LogFence {
         generation: record.as_ref().map_or(0, |record| record.r#gen),
-        hidden: record.as_ref().is_some_and(|record| record.hidden),
         ingested_seq: record
             .and_then(|record| record.action_id)
             .and_then(|id| ingested_seq(&id)),
@@ -911,78 +930,19 @@ pub fn configured_log_shows(object: &Object) -> Result<bool, String> {
     Ok(record.is_some_and(|record| !record.hidden && record.props == object.properties))
 }
 
-/// Kind of the hidden record that opens a namespace on the log, so the
-/// fenced append of a namespace's first object never needs an unfenced one.
-const NAMESPACE_MARKER_KIND: &str = "sekai.namespace";
-
-fn namespace_marker(namespace: &str) -> ObjectRecord {
-    ObjectRecord {
-        r#gen: 0,
-        namespace: namespace.to_string(),
-        kind: NAMESPACE_MARKER_KIND.to_string(),
-        key: "opened".to_string(),
-        hidden: true,
-        action_id: None,
-        props: HashMap::new(),
-        schema_version: 1,
-    }
-}
-
-/// `Some(applied)` for a committed or stale append, `None` when the log
-/// has not opened the namespace yet.
-fn fenced_outcome(result: Result<(), String>) -> Result<Option<bool>, String> {
+/// `true` for a committed append, `false` when the fence was stale.
+fn fenced_outcome(result: Result<(), String>) -> Result<bool, String> {
     match result {
-        Ok(()) => Ok(Some(true)),
-        Err(error) if error.contains("stale generation") => Ok(Some(false)),
-        Err(error) if error.contains("unknown namespace") => Ok(None),
+        Ok(()) => Ok(true),
+        Err(error) if error.contains("stale generation") => Ok(false),
         Err(error) => Err(error),
-    }
-}
-
-/// `props` as the host's source ingest would store them: merged with the
-/// identity's visible overlay under its schema's conflict plan. The host's
-/// only fenced write is an Action, a whole-record replace, so the drain
-/// merges first. An overlay change rematerializes the identity, so the
-/// fence refuses an append merged with an overlay that changed since. A
-/// merge whose plan logs a conflict audit fails closed: no fenced host
-/// write can carry that row, and an unfenced one could overwrite a newer
-/// write. Its intent stays in the backlog.
-fn merged_with_overlay(
-    object: &Object,
-    fence: &LogFence,
-    props: HashMap<String, String>,
-    visible: impl Fn(&str, &str) -> Result<Option<ObjectRecord>, String>,
-) -> Result<HashMap<String, String>, String> {
-    if fence.hidden {
-        return Ok(props);
-    }
-    let Some(overlay) = visible(
-        mikura::OVERLAY_KIND,
-        &OverlayPatch::identity_key(&object.kind, &object.id),
-    )?
-    else {
-        return Ok(props);
-    };
-    let plan = visible(mikura::SCHEMA_KIND, &object.kind)?
-        .map(|record| mikura::SchemaDescriptor::from_record(&record))
-        .transpose()?
-        .map(|schema| schema.conflict_plan());
-    match OverlayPatch::from_record(&overlay)?.apply_with(props, plan.as_ref())? {
-        (merged, None) => Ok(merged),
-        (_, Some(_)) => Err(format!(
-            "object-log host has no fenced write for the overlay conflict audit of {}/{}; \
-             its ingest stays in the backlog",
-            object.kind, object.id
-        )),
     }
 }
 
 /// Appends `object` for ingest intent `seq`, merged with its overlay, while
 /// its identity is still at `fence`'s generation (#2289). `Ok(false)` when
 /// another write moved the identity since the fence was read; a repeat
-/// over the same fence appends nothing. On the host, a namespace it has
-/// never seen is opened with a hidden marker record, then the fenced
-/// append runs.
+/// over the same fence appends nothing.
 pub fn apply_fenced_to_configured_log(
     seq: i64,
     object: &Object,
@@ -992,25 +952,16 @@ pub fn apply_fenced_to_configured_log(
     if FAIL_NEXT_INGEST.with(|flag| flag.replace(false)) {
         return Err("injected object-log ingest failure".into());
     }
-    let action_id = ingest_action_id(seq, fence.generation);
-    let unopened = || format!("object log did not open namespace {}", object.namespace);
+    let record = ObjectRecord {
+        action_id: Some(ingest_action_id(seq, fence.generation)),
+        ..object_record(object)
+    };
     let namespace = object.namespace.as_str();
     match configured_log()? {
         ConfiguredLog::Unconfigured => Ok(true),
-        ConfiguredLog::Host(host) => {
-            let mut record = object_record(object);
-            record.props = merged_with_overlay(object, fence, record.props, |kind, key| {
-                Ok(host
-                    .load(namespace, kind, key)?
-                    .filter(|record| !record.hidden))
-            })?;
-            let apply = || host.apply_action(&action_id, &record, fence.generation);
-            if let Some(applied) = fenced_outcome(apply())? {
-                return Ok(applied);
-            }
-            host.ingest_batch(&[namespace_marker(namespace)])?;
-            fenced_outcome(apply())?.ok_or_else(unopened)
-        }
+        // The host's fenced source ingest merges the overlay and writes its
+        // conflict audit with the record, and opens a new namespace.
+        ConfiguredLog::Host(host) => fenced_outcome(host.ingest_fenced(&record, fence.generation)),
         // This process holds the local log's single-writer lock and reaches
         // the store only under its mutex, so nothing lands between the
         // generation check and the batch: a source ingest under the fence,
@@ -1020,13 +971,7 @@ pub fn apply_fenced_to_configured_log(
             if live.map_or(0, |record| record.r#gen) != fence.generation {
                 return Ok(false);
             }
-            run_batch(
-                store,
-                vec![ObjectRecord {
-                    action_id: Some(action_id),
-                    ..object_record(object)
-                }],
-            )?;
+            run_batch(store, vec![record])?;
             Ok(true)
         }),
     }
@@ -1962,7 +1907,7 @@ fn commit_queued(
     // commits for the whole batch and publishes it with one superblock flush,
     // so a batch is never partly committed. This reads neither the error text nor per-record
     // state, so an idempotent re-admit is judged like any other record.
-    // Drop the exclusive handle before opening again (mikura v0.5.0).
+    // Drop the exclusive handle before opening again (`LOG_IN_USE`).
     let reopened = match cached.reopen() {
         Ok(reopened) => reopened,
         Err(reopen) => {
@@ -2462,36 +2407,34 @@ mod tests {
     }
 
     #[test]
-    fn every_mikura_commit_rewrites_the_superblock_the_stamp_digests() {
+    fn every_mikura_commit_changes_the_log_stamp() {
         // Contract with the pinned mikura tag: a dependency bump that moves
-        // the superblock or stops rewriting it on commit fails here.
+        // where a commit lands, so the stamp no longer sees it, fails here.
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("objects.mikura");
         let mut store = Store::create(&log).unwrap();
-        let mut previous = log_stamp(&log).unwrap().2;
+        let mut previous = log_stamp(&log).unwrap();
         for generation in 1..=3u64 {
             BatchIngest::run(
                 &mut store,
                 vec![ObjectRecord {
                     action_id: None,
                     r#gen: generation,
-
                     namespace: "sales".into(),
                     kind: "Customer".into(),
                     key: "c1".into(),
                     hidden: false,
                     props: HashMap::from([("n".into(), generation.to_string())]),
-
                     schema_version: 1,
                 }],
             )
             .unwrap();
-            let digest = log_stamp(&log).unwrap().2;
+            let stamp = log_stamp(&log).unwrap();
             assert_ne!(
-                digest, previous,
-                "commit {generation} left the superblock unchanged"
+                stamp, previous,
+                "commit {generation} left the stamp unchanged"
             );
-            previous = digest;
+            previous = stamp;
         }
     }
 
@@ -2916,7 +2859,7 @@ mod tests {
         // Canary samples share one handle instead of a Store::open each.
         assert_eq!(OBJECT_LOG_STORE_OPENS.with(|opens| opens.get()), 1);
 
-        // mikura v0.5.0 holds an exclusive writer: an out-of-band ingest
+        // mikura holds an exclusive writer: an out-of-band ingest
         // drops that handle first, then the next sample opens fresh.
         release_object_log_cache(&cache);
         let mut store = Store::open(&log).unwrap();
@@ -3415,8 +3358,17 @@ mod tests {
                     property: property.into(),
                     group_by: group_by.into(),
                 };
-                compare_shop(&log, &aggregation, &orders, shop_view())
-                    .unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
+                let compared = compare_shop(&log, &aggregation, &orders, shop_view());
+                // The object log answers this shape from count and sum
+                // rollups (#3496), so the canary skips min, max, and avg.
+                if matches!(function, "min" | "max" | "avg") {
+                    assert!(
+                        matches!(compared, Err(ObjectLogCompareError::Unsupported(_))),
+                        "{group_by} {function}: {compared:?}"
+                    );
+                } else {
+                    compared.unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
+                }
             }
         }
 
@@ -4181,56 +4133,88 @@ mod tests {
         assert_eq!(record.props["region"], "us");
     }
 
+    /// #2410: a drain over an overlay whose schema plans a conflict audit
+    /// appends the merged record and its audit, fenced. Runs against a local
+    /// log and a real host.
+    fn overlay_conflict_audit_contract() {
+        let fence = |object: &Object| configured_log_fence(object).unwrap().unwrap();
+        let object = sample_object("audited", "eu");
+        assert!(apply_fenced_to_configured_log(1, &object, &fence(&object)).unwrap());
+        let schema = mikura::SchemaDescriptor {
+            kind: object.kind.clone(),
+            properties: vec!["region".into()],
+            conflict: Some(mikura::ConflictStrategy::User),
+            ..Default::default()
+        }
+        .to_record(object.namespace.clone())
+        .unwrap();
+        let patch = OverlayPatch {
+            namespace: object.namespace.clone(),
+            kind: object.kind.clone(),
+            key: object.id.clone(),
+            props: HashMap::from([("region".into(), "edited".into())]),
+            ..Default::default()
+        };
+        let audit_key = OverlayPatch::identity_key(&object.kind, &object.id);
+        let load = |kind: &str, key: &str| match configured_log().unwrap() {
+            ConfiguredLog::Host(host) => host.load("sales", kind, key).unwrap().unwrap(),
+            ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+                Ok(live_record(store, "sales", kind, key).unwrap())
+            })
+            .unwrap(),
+            ConfiguredLog::Unconfigured => unreachable!(),
+        };
+        match configured_log().unwrap() {
+            ConfiguredLog::Host(host) => {
+                host.ingest_batch(&[schema]).unwrap();
+                host.apply_overlay(&patch, "edit-1", None).unwrap();
+            }
+            ConfiguredLog::Path(path) => with_cached_object_log_store(&path, |store| {
+                store.append(schema)?;
+                store.apply_overlay(patch, "edit-1".into(), None)
+            })
+            .unwrap(),
+            ConfiguredLog::Unconfigured => unreachable!(),
+        }
+        let moved = sample_object("audited", "us");
+        let before = fence(&moved);
+        assert!(apply_fenced_to_configured_log(2, &moved, &before).unwrap());
+        let record = load("Customer", "audited");
+        assert_eq!(ingested_seq(record.action_id.as_deref().unwrap()), Some(2));
+        assert_eq!(record.props["region"], "edited");
+        let audit = load(mikura::OVERLAY_KIND, &audit_key);
+        assert_eq!(OverlayPatch::recorded_conflict(&audit), Some("region:user"));
+        // The append is fenced: a drain over the fence it read before its
+        // own append is refused.
+        assert!(!apply_fenced_to_configured_log(3, &moved, &before).unwrap());
+    }
+
     #[test]
     fn a_drain_on_a_local_log_records_the_overlay_conflict_audit() {
-        // Autoreview on #2289: a conflict plan's merge appends with its audit.
         let dir = tempfile::tempdir().unwrap();
-        with_test_log_path(&dir.path().join("objects.mikura"), || {
-            let object = sample_object("audited", "eu");
-            let fence = |object: &Object| configured_log_fence(object).unwrap().unwrap();
-            assert!(apply_fenced_to_configured_log(1, &object, &fence(&object)).unwrap());
-            let path = configured_log_path().unwrap();
-            with_cached_object_log_store(&path, |store| {
-                store.append(
-                    mikura::SchemaDescriptor {
-                        kind: object.kind.clone(),
-                        properties: vec!["region".into()],
-                        conflict: Some(mikura::ConflictStrategy::User),
-                        ..Default::default()
-                    }
-                    .to_record(object.namespace.clone())?,
-                )?;
-                store.apply_overlay(
-                    OverlayPatch {
-                        namespace: object.namespace.clone(),
-                        kind: object.kind.clone(),
-                        key: object.id.clone(),
-                        props: HashMap::from([("region".into(), "edited".into())]),
-                        ..Default::default()
-                    },
-                    "edit-1".into(),
-                    None,
-                )
-            })
-            .unwrap();
-            let moved = sample_object("audited", "us");
-            assert!(apply_fenced_to_configured_log(2, &moved, &fence(&moved)).unwrap());
-            with_cached_object_log_store(&path, |store| {
-                let record = live_record(store, "sales", "Customer", "audited").unwrap();
-                assert_eq!(ingested_seq(record.action_id.as_deref().unwrap()), Some(2));
-                assert_eq!(record.props["region"], "edited");
-                let audit = live_record(
-                    store,
-                    "sales",
-                    mikura::OVERLAY_KIND,
-                    &OverlayPatch::identity_key("Customer", "audited"),
-                )
-                .unwrap();
-                assert_eq!(OverlayPatch::recorded_conflict(&audit), Some("region:user"));
-                Ok(())
-            })
-            .unwrap();
+        with_test_log_path(
+            &dir.path().join("objects.mikura"),
+            overlay_conflict_audit_contract,
+        );
+    }
+
+    #[test]
+    fn a_drain_on_a_host_records_the_overlay_conflict_audit() {
+        with_test_host(overlay_conflict_audit_contract);
+    }
+
+    /// Serves a fresh host log on an ephemeral port while `body` runs.
+    fn with_test_host(body: impl FnOnce()) {
+        let dir = tempfile::tempdir().unwrap();
+        let host = mikura_host::Host::open(&dir.path().join("objects.mikura"), 64).unwrap();
+        let listener = mikura_host::Host::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let _ = host.serve(listener);
         });
+        let client =
+            crate::sekai::object_log_host::ObjectLogHost::new(&addr.to_string(), None).unwrap();
+        with_test_log_host(client, body);
     }
 
     #[test]
@@ -4241,15 +4225,6 @@ mod tests {
 
     #[test]
     fn a_stale_drain_cannot_overwrite_a_newer_host_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let host = mikura_host::Host::open(&dir.path().join("objects.mikura"), 64).unwrap();
-        let listener = mikura_host::Host::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
-        let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            let _ = host.serve(listener);
-        });
-        let client =
-            crate::sekai::object_log_host::ObjectLogHost::new(&addr.to_string(), None).unwrap();
-        with_test_log_host(client, fenced_append_contract);
+        with_test_host(fenced_append_contract);
     }
 }

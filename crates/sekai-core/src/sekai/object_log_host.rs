@@ -233,6 +233,19 @@ impl ObjectLogHost {
         .map(|_| ())
     }
 
+    /// Source ingest of `record` (overlay merge and conflict audit) while
+    /// its identity is still at `expected_gen` (0: absent). `record.action_id`
+    /// is required; a repeat of a committed id is a no-op. A stale
+    /// generation reads as `stale generation`.
+    pub fn ingest_fenced(&self, record: &ObjectRecord, expected_gen: u64) -> Result<(), String> {
+        Self::require_ok(self.call(json!({
+            "op": "ingest_fenced",
+            "record": record,
+            "expected_gen": expected_gen,
+        }))?)
+        .map(|_| ())
+    }
+
     /// Admits a property overlay on the host (ADR 0009).
     pub fn apply_overlay(
         &self,
