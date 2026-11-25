@@ -32,6 +32,7 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a read may disclose to a reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Disclosure {
     /// No gateway is configured; reads behave as without this check.
     Unchecked,
@@ -44,6 +45,7 @@ pub enum Disclosure {
 
 /// Why a property was withheld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WithholdReason {
     /// A route in the reader's allowed egress may not receive the class.
     EgressNotAllowed,
