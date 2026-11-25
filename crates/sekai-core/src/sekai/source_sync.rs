@@ -26,9 +26,16 @@ use sekai_types::governed_transform::{
     MAX_TRANSFORM_LEASE_EXPIRIES, normalize_transform_claim_ttl_ms, placement_satisfied,
 };
 
+use crate::db::object_sync::RecordVersionRange;
 use crate::db::runtime_db::RuntimeDb;
+use crate::sekai::object_sync::{MAX_SOURCE_BATCH_RECORDS, source_id as record_source_id};
 use crate::sekai::source::{MAX_LIST_SOURCES, Source, SourceStatus};
 use crate::sekai::work_claim::{ClaimError, ClaimRecord, Fence, Hold};
+pub use sekai_source_sdk::{KeyRange, RecordVersion};
+
+/// The status message refusing a read by key over a Source with an
+/// unkeyed live record ([`SyncError::UnkeyedRecords`]); clients match it.
+pub const SOURCE_RECORDS_UNKEYED: &str = "source_records_unkeyed";
 
 /// A bucket fails on the lapse that reaches this count.
 pub const MAX_SOURCE_SYNC_LEASE_EXPIRIES: i64 = MAX_TRANSFORM_LEASE_EXPIRIES;
@@ -154,6 +161,9 @@ pub enum SyncError {
     Owner,
     /// The claim engine refused the transition.
     Claim(ClaimError),
+    /// A live record of the Source carries no object key, so a read by
+    /// key cannot be complete (ADR 0167).
+    UnkeyedRecords,
     Store(String),
 }
 
@@ -164,6 +174,7 @@ impl std::fmt::Display for SyncError {
             Self::Placement => formatter.write_str("runtime labels do not satisfy placement"),
             Self::Owner => formatter.write_str("claim owner is required"),
             Self::Claim(error) => error.fmt(formatter),
+            Self::UnkeyedRecords => formatter.write_str("a live source record has no object key"),
             Self::Store(error) => formatter.write_str(error),
         }
     }
@@ -425,9 +436,61 @@ pub fn acknowledge(
     })
 }
 
+/// At most `limit` (capped at the batch record cap) live records of the
+/// Source, in byte order of object key and then external id, read only
+/// under its live sync claim (ADR 0167). A stale fence is
+/// [`ClaimError::FenceLost`]; a live record without a key refuses the read
+/// as [`SyncError::UnkeyedRecords`].
+pub fn record_versions(
+    db: &RuntimeDb,
+    namespace: &str,
+    source_id: &str,
+    fence: Fence<'_>,
+    range: KeyRange<'_>,
+    limit: usize,
+    now_ms: i64,
+) -> Result<Vec<RecordVersion>, SyncError> {
+    let source = db
+        .get_source(namespace, source_id)?
+        .ok_or(SyncError::NotFound)?;
+    source
+        .sync
+        .claim
+        .require_live(source.sync_hold(), fence, now_ms)
+        .map_err(SyncError::Claim)?;
+    // Identities store `source:instance#external_id`; within one Source
+    // the prefix is constant, so it orders like the external id.
+    let prefix = record_source_id(&source.source, &source.source_instance, "");
+    let after_source_id = range.after_external_id.map(|id| format!("{prefix}{id}"));
+    let stored = db
+        .source_record_versions(&RecordVersionRange {
+            namespace,
+            source: &source.source,
+            source_instance: &source.source_instance,
+            after_object_key: range.after_object_key,
+            after_source_id: after_source_id.as_deref(),
+            through_object_key: range.through_object_key,
+            limit: limit.clamp(1, MAX_SOURCE_BATCH_RECORDS),
+        })?
+        .ok_or(SyncError::UnkeyedRecords)?;
+    Ok(stored
+        .into_iter()
+        .map(|record| RecordVersion {
+            external_id: record
+                .source_id
+                .strip_prefix(&prefix)
+                .unwrap_or(&record.source_id)
+                .to_string(),
+            object_key: record.object_key,
+            source_version: record.source_version,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sekai::object_sync::SourceRecord;
     use crate::sekai::source::{self, tests::github};
     use std::sync::Arc;
 
@@ -705,6 +768,149 @@ mod tests {
     #[test]
     fn sqlite_source_sync_contract() {
         contract(&RuntimeDb::memory(), "acme");
+    }
+
+    /// Lands `records` (external id, object key, version, deleted) for the
+    /// `acme/ops` instance [`crate::db::object_sync::tests::batch`] names.
+    fn land(db: &RuntimeDb, from: &str, to: &str, records: &[(&str, Option<&str>, &str, bool)]) {
+        use crate::db::object_sync::tests::{PRODUCER, batch, redigest};
+        let mut landed = batch(from, to, to);
+        let template = landed.records[0].clone();
+        landed.records = records
+            .iter()
+            .map(
+                |&(external_id, object_key, version, deleted)| SourceRecord {
+                    external_id: external_id.into(),
+                    object_key: object_key.map(Into::into),
+                    source_version: version.into(),
+                    deleted,
+                    ..template.clone()
+                },
+            )
+            .collect();
+        redigest(&mut landed);
+        let result = db.apply_source_batch(&landed, PRODUCER, 100).unwrap();
+        assert!(
+            result.checkpoint_advanced,
+            "{:?}",
+            result.transaction.reason
+        );
+    }
+
+    /// The claim-fenced read of a Source's live records by object key, on
+    /// either backend (ADR 0167).
+    fn record_versions_contract(db: &RuntimeDb) {
+        source::put(db, &github("acme", "repo", "acme/ops")).unwrap();
+        let now = 10 * EVERY;
+        db.tick_source_syncs("acme", now).unwrap();
+        let held = claim(db, "acme", "repo", "runtime-a", &labels("eu"), TTL, now).unwrap();
+        // Byte order: uppercase before lowercase, the two-byte é last.
+        land(
+            db,
+            "",
+            "cursor:1",
+            &[
+                ("1", Some("b/x.csv"), "etag-b", false),
+                ("2", Some("b/x.csv"), "etag-b", false),
+                ("3", Some("B/a.csv"), "etag-B", false),
+                ("4", Some("\u{e9}/a.csv"), "etag-e", false),
+            ],
+        );
+        let read = |range: KeyRange<'_>, limit| {
+            record_versions(db, "acme", "repo", fence(&held), range, limit, now + 1).map(
+                |records| {
+                    records
+                        .into_iter()
+                        .map(|record| {
+                            (record.external_id, record.object_key, record.source_version)
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+        };
+        let row = |id: &str, key: &str, version: &str| (id.into(), key.into(), version.into());
+        assert_eq!(
+            read(KeyRange::default(), 500).unwrap(),
+            vec![
+                row("3", "B/a.csv", "etag-B"),
+                row("1", "b/x.csv", "etag-b"),
+                row("2", "b/x.csv", "etag-b"),
+                row("4", "\u{e9}/a.csv", "etag-e"),
+            ]
+        );
+        // A page may end inside one object's records and go on after it.
+        let next = KeyRange {
+            after_object_key: "b/x.csv",
+            after_external_id: Some("1"),
+            through_object_key: None,
+        };
+        assert_eq!(
+            read(next, 2).unwrap(),
+            vec![
+                row("2", "b/x.csv", "etag-b"),
+                row("4", "\u{e9}/a.csv", "etag-e")
+            ]
+        );
+        let bounded = KeyRange {
+            after_object_key: "B/a.csv",
+            after_external_id: None,
+            through_object_key: Some("b/x.csv"),
+        };
+        assert_eq!(read(bounded, 500).unwrap().len(), 2);
+
+        // A tombstoned record is not live.
+        land(
+            db,
+            "cursor:1",
+            "cursor:2",
+            &[("4", Some("\u{e9}/a.csv"), "deleted", true)],
+        );
+        assert_eq!(read(KeyRange::default(), 500).unwrap().len(), 3);
+
+        // Only the live claim reads.
+        let mut stale = fence(&held);
+        stale.generation += 1;
+        assert_eq!(
+            record_versions(db, "acme", "repo", stale, KeyRange::default(), 500, now + 1),
+            Err(SyncError::Claim(ClaimError::FenceLost))
+        );
+        assert_eq!(
+            read(KeyRange::default(), 500).map(|_| ()),
+            Ok(()),
+            "the holder still reads"
+        );
+        assert_eq!(
+            record_versions(
+                db,
+                "acme",
+                "repo",
+                fence(&held),
+                KeyRange::default(),
+                500,
+                now + TTL
+            ),
+            Err(SyncError::Claim(ClaimError::FenceLost)),
+            "a lapsed lease does not read"
+        );
+
+        // A live record without a key leaves no range complete.
+        land(db, "cursor:2", "cursor:3", &[("5", None, "v", false)]);
+        assert_eq!(
+            read(KeyRange::default(), 500),
+            Err(SyncError::UnkeyedRecords)
+        );
+    }
+
+    #[test]
+    fn a_claimed_source_reads_its_live_records_by_object_key() {
+        record_versions_contract(&RuntimeDb::memory());
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_a_claimed_source_reads_its_live_records_by_object_key() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        record_versions_contract(&RuntimeDb::Postgres(Arc::new(scratch.connect())));
     }
 
     #[test]

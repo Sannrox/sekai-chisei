@@ -52,6 +52,7 @@ GenerationSnapshotSource
 GetSourceSyncStateInput
 GitHubObjectFixture
 GitHubSource
+KeyRange
 LINEAGE_KIND_ACTION
 LINEAGE_KIND_DATASET
 LINEAGE_KIND_OBJECT
@@ -90,11 +91,14 @@ Operation
 OperationOutcome
 OutboxLimits
 PROFILE_RATIO_SCALE
+PlaneView
+PlaneViewError
 PositionFamily
 PropertyValue
 RELATIONAL_CONNECTOR
 REST_CONNECTOR
 RecordChange
+RecordVersion
 ReferenceBasis
 ReferenceCandidate
 ReferenceEvidence
@@ -297,6 +301,7 @@ connector::Connector::deliver(&mut self,&ExportArtifact<'_>) -> Result<(),Connec
 connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFailure>
 connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
+connector::Connector::read_page_with_plane(&mut self,Option<&str>,usize,&mut dyn PlaneView) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectorFailure>
 connector::ConnectorFailure
 connector::ConnectorFailure::AuthFailed
@@ -335,6 +340,10 @@ connector::ExportArtifact.definition_id: &str
 connector::ExportArtifact.namespace: &str
 connector::ExportArtifact.receipt_id: &str
 connector::GITHUB_CONNECTOR: ConnectorType
+connector::KeyRange
+connector::KeyRange.after_external_id: Option<&str>
+connector::KeyRange.after_object_key: &str
+connector::KeyRange.through_object_key: Option<&str>
 connector::MAX_CONFIG_FIELDS: usize
 connector::MAX_CONFIG_VALUE_BYTES: usize
 connector::MAX_EGRESS_RULES: usize
@@ -347,6 +356,12 @@ connector::Operation::ReadChanges
 connector::Operation::ReadPage
 connector::Operation::from_wire_name(&str) -> Option<Self>
 connector::Operation::wire_name(self) -> &str
+connector::PlaneView
+connector::PlaneView::record_versions(&mut self,KeyRange<'_>,usize) -> Result<Vec<RecordVersion>,PlaneViewError>
+connector::PlaneViewError
+connector::PlaneViewError::FenceLost
+connector::PlaneViewError::Unavailable
+connector::PlaneViewError::Unkeyed
 connector::RELATIONAL_CONNECTOR: ConnectorType
 connector::REST_CONNECTOR: ConnectorType
 connector::RecordChange
@@ -355,6 +370,10 @@ connector::RecordChange.expected_version: String
 connector::RecordChange.idempotency_key: String
 connector::RecordChange.key: String
 connector::RecordChange::arguments_digest(&self,&str) -> String
+connector::RecordVersion
+connector::RecordVersion.external_id: String
+connector::RecordVersion.object_key: String
+connector::RecordVersion.source_version: String
 connector::SourceConfig = BTreeMap<String,ConfigValue>
 connector::connector_type(&str,&str) -> Option<&ConnectorType>
 connector_type

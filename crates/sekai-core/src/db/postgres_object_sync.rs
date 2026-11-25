@@ -1,7 +1,8 @@
 use postgres::{GenericClient, IsolationLevel, Row};
 
 use crate::db::object_sync::{
-    ApplyError, PreparedBatch, PreparedRecord, SourceBatchMapper, committed_source_batch_result,
+    ApplyError, PreparedBatch, PreparedRecord, RECORD_VERSIONS_FROM, RecordVersionRange,
+    SourceBatchMapper, StoredRecordVersion, committed_source_batch_result,
     committed_source_dataset_backfill, prepared_dataset_columns, prepared_dataset_rows,
     prepared_record_results, registered_descriptor_authorizes_batch,
     require_authorized_object_snapshot, source_batch_mapper, source_batch_trigger_ids,
@@ -949,6 +950,56 @@ impl PostgresDb {
             .iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect())
+    }
+
+    /// As on SQLite. `object_key` is a "C" collation column; the source id
+    /// is compared in "C" too, so ties order by bytes on every database.
+    pub fn source_record_versions(
+        &self,
+        range: &RecordVersionRange<'_>,
+    ) -> Result<Option<Vec<StoredRecordVersion>>, String> {
+        let mut conn = self.connection()?;
+        let binding: [&(dyn postgres::types::ToSql + Sync); 3] =
+            [&range.namespace, &range.source, &range.source_instance];
+        let unkeyed: bool = conn
+            .query_one(
+                &format!("SELECT EXISTS(SELECT 1 {RECORD_VERSIONS_FROM} AND object_key IS NULL)"),
+                &binding,
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if unkeyed {
+            return Ok(None);
+        }
+        let limit = i64::try_from(range.limit).unwrap_or(i64::MAX);
+        Ok(Some(
+            conn.query(
+                &format!(
+                    "SELECT source_id, object_key, source_version {RECORD_VERSIONS_FROM}
+                       AND (object_key > $4
+                            OR (object_key = $4 AND source_id COLLATE \"C\" > $5))
+                       AND ($6::TEXT IS NULL OR object_key <= $6)
+                     ORDER BY object_key, source_id COLLATE \"C\" LIMIT $7"
+                ),
+                &[
+                    &range.namespace,
+                    &range.source,
+                    &range.source_instance,
+                    &range.after_object_key,
+                    &range.after_source_id,
+                    &range.through_object_key,
+                    &limit,
+                ],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| StoredRecordVersion {
+                source_id: row.get(0),
+                object_key: row.get(1),
+                source_version: row.get(2),
+            })
+            .collect(),
+        ))
     }
 
     /// Operation identities recorded on `transaction_ids` in `namespace`

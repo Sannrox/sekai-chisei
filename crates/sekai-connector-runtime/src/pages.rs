@@ -10,18 +10,22 @@
 //! disabled Source refuses them even from a runtime whose claim has not yet
 //! lapsed. Object identity stays `source_id(source, source_instance,
 //! external_id)`. The notes each page carries are gathered for the sync's
-//! acknowledgement (ADR 0163).
+//! acknowledgement (ADR 0163). Each page reads with a view of the Source's
+//! live records, read under the sync's claim (ADR 0167).
 
-use sekai_client::CallOptions;
+use sekai_client::claim::{SOURCE_RECORDS_UNKEYED, WorkFence};
 use sekai_client::protocol::sekai::{
     self as pb, ApplySourceBatchRequest, ApplySourceBatchResponse, ConnectorSource,
-    GetSourceSyncStateRequest, GetSourceSyncStateResponse,
+    GetSourceSyncStateRequest, GetSourceSyncStateResponse, ListSourceRecordVersionsRequest,
+    ListSourceRecordVersionsResponse,
 };
+use sekai_client::{CallOptions, CoreLoopClient, GrpcTransport};
 use sekai_client::{SdkError, SdkErrorCode};
 use sekai_source_sdk::{
-    ConfigValue, GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, Operation,
-    SOURCE_GITHUB, SnapshotPage, SnapshotRead, SourceAdapterConfig, SourceBatch, SyncNote,
-    SyncNotes, build_registered_source_batch, build_source_batch,
+    ConfigValue, GITHUB_OBJECT_SYNC_TYPE_DIGEST, KeyRange, MAX_SOURCE_BATCH_RECORDS, Operation,
+    PlaneView, PlaneViewError, RecordVersion, SOURCE_GITHUB, SnapshotPage, SnapshotRead,
+    SourceAdapterConfig, SourceBatch, SyncNote, SyncNotes, build_registered_source_batch,
+    build_source_batch,
 };
 use std::sync::Arc;
 
@@ -69,6 +73,7 @@ impl Runtime {
         &self,
         index: usize,
         source: &ConnectorSource,
+        fence: &WorkFence,
         prepared: Prepared,
         notes: &mut SyncNotes,
     ) -> Result<(), SyncFailure> {
@@ -118,8 +123,14 @@ impl Runtime {
                 .filter(|cursor| !cursor.is_empty());
             let (connectors, reading, after) =
                 (self.connectors.clone(), prepared.clone(), cursor.clone());
+            let mut plane = ClaimedPlane::new(client, &adapter.namespace, fence)?;
             let page = match blocking(move || {
-                connectors.read_page(&reading, after.as_deref(), MAX_SOURCE_BATCH_RECORDS)
+                connectors.read_page_with_plane(
+                    &reading,
+                    after.as_deref(),
+                    MAX_SOURCE_BATCH_RECORDS,
+                    &mut plane,
+                )
             })
             .await?
             {
@@ -200,6 +211,78 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+}
+
+/// The plane's view of the claimed Source for a connector's blocking page
+/// read: each call is one `ListSourceRecordVersions` under the sync's
+/// fence, run on the async runtime the sync came from.
+struct ClaimedPlane {
+    client: CoreLoopClient<GrpcTransport>,
+    runtime: tokio::runtime::Handle,
+    namespace: String,
+    fence: WorkFence,
+}
+
+impl ClaimedPlane {
+    fn new(
+        client: &CoreLoopClient<GrpcTransport>,
+        namespace: &str,
+        fence: &WorkFence,
+    ) -> Result<Self, SyncFailure> {
+        Ok(Self {
+            client: CoreLoopClient::new(client.config().clone(), client.transport().clone())
+                .map_err(|_| SyncFailure::Invalid)?,
+            runtime: tokio::runtime::Handle::current(),
+            namespace: namespace.into(),
+            fence: fence.clone(),
+        })
+    }
+}
+
+impl PlaneView for ClaimedPlane {
+    fn record_versions(
+        &mut self,
+        range: KeyRange<'_>,
+        limit: usize,
+    ) -> Result<Vec<RecordVersion>, PlaneViewError> {
+        let request = ListSourceRecordVersionsRequest {
+            namespace: self.namespace.clone(),
+            source_id: self.fence.work_id.clone(),
+            runtime_id: self.fence.runtime_id.clone(),
+            claim_generation: self.fence.generation,
+            fencing_token: self.fence.fencing_token.clone(),
+            after_object_key: range.after_object_key.into(),
+            after_external_id: range.after_external_id.unwrap_or_default().into(),
+            through_object_key: range.through_object_key.map(Into::into),
+            limit: i32::try_from(limit.min(MAX_SOURCE_BATCH_RECORDS)).unwrap_or(i32::MAX),
+        };
+        let response: ListSourceRecordVersionsResponse = self
+            .runtime
+            .block_on(self.client.raw().unary(
+                "/sekai.SekaiService/ListSourceRecordVersions",
+                request,
+                CallOptions::new(),
+            ))
+            .map_err(plane_view_error)?;
+        Ok(response
+            .records
+            .into_iter()
+            .map(|record| RecordVersion {
+                external_id: record.external_id,
+                object_key: record.object_key,
+                source_version: record.source_version,
+            })
+            .collect())
+    }
+}
+
+/// A refused read as the view's error. Any other precondition is the fence.
+fn plane_view_error(error: SdkError) -> PlaneViewError {
+    match (error.code, error.reason_code) {
+        (_, Some(SOURCE_RECORDS_UNKEYED)) => PlaneViewError::Unkeyed,
+        (SdkErrorCode::FailedPrecondition, _) => PlaneViewError::FenceLost,
+        _ => PlaneViewError::Unavailable,
     }
 }
 
@@ -296,6 +379,23 @@ fn to_proto(batch: SourceBatch, source_id: &str) -> pb::SourceBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older plane serves no read: the view is unavailable, never a
+    /// lost fence, so a connector can fall back to a full pass.
+    #[test]
+    fn a_plane_without_the_read_is_unavailable_and_an_unkeyed_refusal_is_typed() {
+        assert_eq!(
+            plane_view_error(SdkError::new(SdkErrorCode::Unimplemented)),
+            PlaneViewError::Unavailable
+        );
+        assert_eq!(
+            plane_view_error(SdkError::new(SdkErrorCode::FailedPrecondition)),
+            PlaneViewError::FenceLost
+        );
+        let mut unkeyed = SdkError::new(SdkErrorCode::FailedPrecondition);
+        unkeyed.reason_code = Some(SOURCE_RECORDS_UNKEYED);
+        assert_eq!(plane_view_error(unkeyed), PlaneViewError::Unkeyed);
+    }
 
     #[test]
     fn a_checkpoint_conflict_fails_the_sync_not_the_source() {

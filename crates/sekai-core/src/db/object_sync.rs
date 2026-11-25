@@ -288,6 +288,37 @@ pub struct PreparedRecord {
     pub object_key: Option<String>,
 }
 
+/// A key range of one Source's live identities (ADR 0167). Rows start after
+/// `(after_object_key, after_source_id)`, or after every row of
+/// `after_object_key` when `after_source_id` is `None`, and end at
+/// `through_object_key` inclusive.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordVersionRange<'a> {
+    pub namespace: &'a str,
+    pub source: &'a str,
+    pub source_instance: &'a str,
+    pub after_object_key: &'a str,
+    pub after_source_id: Option<&'a str>,
+    pub through_object_key: Option<&'a str>,
+    pub limit: usize,
+}
+
+/// One live identity of a [`RecordVersionRange`], without its content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRecordVersion {
+    pub source_id: String,
+    pub object_key: String,
+    pub source_version: String,
+}
+
+/// The live identities of the binding of `(namespace, source,
+/// source_instance)`, as `$1`..`$3`. SQLite numbers `$N` names in order of
+/// first use, so both backends bind them positionally.
+pub(crate) const RECORD_VERSIONS_FROM: &str = "FROM sekai_source_identities
+     WHERE namespace = $1 AND NOT tombstoned AND binding_id = (
+         SELECT binding_id FROM sekai_source_bindings
+         WHERE namespace = $1 AND source = $2 AND source_instance = $3)";
+
 #[derive(Debug)]
 pub struct PreparedBatch {
     pub binding_id: String,
@@ -2034,6 +2065,58 @@ impl SekaiDb {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .and_then(Iterator::collect)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The live identities `range` selects, ordered by object key and then
+    /// source id in byte order (ADR 0167). `None` when a live identity of
+    /// the binding carries no object key: its place in the order is
+    /// unknown, so no range is complete.
+    pub fn source_record_versions(
+        &self,
+        range: &RecordVersionRange<'_>,
+    ) -> Result<Option<Vec<StoredRecordVersion>>, String> {
+        let conn = self.conn();
+        let binding = params![range.namespace, range.source, range.source_instance];
+        let unkeyed: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 {RECORD_VERSIONS_FROM} AND object_key IS NULL)"),
+                binding,
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if unkeyed {
+            return Ok(None);
+        }
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT source_id, object_key, source_version {RECORD_VERSIONS_FROM}
+                   AND (object_key > $4 OR (object_key = $4 AND source_id > $5))
+                   AND ($6 IS NULL OR object_key <= $6)
+                 ORDER BY object_key, source_id LIMIT $7"
+            ))
+            .map_err(|error| error.to_string())?;
+        statement
+            .query_map(
+                params![
+                    range.namespace,
+                    range.source,
+                    range.source_instance,
+                    range.after_object_key,
+                    range.after_source_id,
+                    range.through_object_key,
+                    i64::try_from(range.limit).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok(StoredRecordVersion {
+                        source_id: row.get(0)?,
+                        object_key: row.get(1)?,
+                        source_version: row.get(2)?,
+                    })
+                },
+            )
+            .and_then(Iterator::collect)
+            .map(Some)
             .map_err(|error| error.to_string())
     }
 

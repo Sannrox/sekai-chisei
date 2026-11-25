@@ -637,6 +637,56 @@ impl RecordChange {
     }
 }
 
+/// One live record of a claimed Source as the plane holds it (ADR 0167):
+/// its identity, the key of the stored object it came from, and the
+/// version it landed at. No properties and no payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordVersion {
+    pub external_id: String,
+    pub object_key: String,
+    pub source_version: String,
+}
+
+/// Where a [`PlaneView::record_versions`] read starts and ends, by object
+/// key in UTF-8 byte order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyRange<'a> {
+    /// Starts after this key; empty starts at the first.
+    pub after_object_key: &'a str,
+    /// Starts after this record of `after_object_key` instead of after all
+    /// of them, so a read can go on inside one object's records.
+    pub after_external_id: Option<&'a str>,
+    /// Inclusive; `None` reads to the last key.
+    pub through_object_key: Option<&'a str>,
+}
+
+/// Why a [`PlaneView`] read did not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PlaneViewError {
+    /// A live record of the Source has no object key, so no key range is
+    /// complete until a full pass lands every record with its key.
+    Unkeyed,
+    /// The sync's claim is no longer current; the sync must stop.
+    FenceLost,
+    /// The plane could not answer, or predates the read.
+    Unavailable,
+}
+
+/// What the plane holds for the Source a sync reads (ADR 0167). The
+/// connector runtime opens one under the sync's claim and passes it to
+/// [`Connector::read_page_with_plane`].
+pub trait PlaneView {
+    /// At most `limit` live records in `range`, ordered by object key and
+    /// then external id in byte order. Fewer than `limit` means the range
+    /// is exhausted.
+    fn record_versions(
+        &mut self,
+        range: KeyRange<'_>,
+        limit: usize,
+    ) -> Result<Vec<RecordVersion>, PlaneViewError>;
+}
+
 /// One connected Source of some connector type. The runtime opens it with
 /// the Source's configuration and resolved credentials, after the egress
 /// check, and calls only the operations the type declares; the rest keep
@@ -668,6 +718,18 @@ pub trait Connector {
         _max_records: usize,
     ) -> Result<SnapshotRead, ConnectorFailure> {
         Err(ConnectorFailure::Unsupported)
+    }
+
+    /// [`Connector::read_page`] with a view of what the plane holds for
+    /// the Source, for a type that mirrors a listing against it. The
+    /// runtime calls this one; the default ignores the view.
+    fn read_page_with_plane(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+        _plane: &mut dyn PlaneView,
+    ) -> Result<SnapshotRead, ConnectorFailure> {
+        self.read_page(committed_cursor, max_records)
     }
 
     fn read_changes(

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist, ExportArtifact,
-    Operation, RecordChange, SnapshotRead, SourceConfig, connector_type,
+    Operation, PlaneView, RecordChange, SnapshotRead, SourceConfig, connector_type,
 };
 
 use crate::credentials::{CredentialBindings, Credentials};
@@ -217,6 +217,23 @@ impl Connectors {
         Ok(self
             .open(prepared)?
             .read_page(committed_cursor, max_records)?)
+    }
+
+    /// [`Connectors::read_page`] with a view of what the plane holds for
+    /// the Source (ADR 0167). Blocking.
+    pub fn read_page_with_plane(
+        &self,
+        prepared: &Prepared,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+        plane: &mut dyn PlaneView,
+    ) -> Result<SnapshotRead, SyncFailure> {
+        if !prepared.connector.supports(Operation::ReadPage) {
+            return Err(SyncFailure::Unsupported);
+        }
+        Ok(self
+            .open(prepared)?
+            .read_page_with_plane(committed_cursor, max_records, plane)?)
     }
 
     /// Delivers one verified saved-export artifact through a prepared

@@ -298,6 +298,8 @@ impl SekaiService for SekaiServiceImpl {
         heartbeat_agent_turn_claim => heartbeat_agent_turn_claim_rpc(HeartbeatAgentTurnClaimRequest) -> HeartbeatAgentTurnClaimResponse;
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
         append_agent_turn_transcript => append_agent_turn_transcript_rpc(AppendAgentTurnTranscriptRequest) -> AppendAgentTurnTranscriptResponse;
+        disable_source => disable_source_rpc(DisableSourceRequest) -> DisableSourceResponse;
+        list_source_record_versions => list_source_record_versions_rpc(ListSourceRecordVersionsRequest) -> ListSourceRecordVersionsResponse;
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
         heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;
@@ -687,13 +689,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ListSourcesRequest>,
     ) -> Result<Response<ListSourcesResponse>, Status> {
         source_rpc::list_sources(self, req).await
-    }
-
-    async fn disable_source(
-        &self,
-        req: Request<DisableSourceRequest>,
-    ) -> Result<Response<DisableSourceResponse>, Status> {
-        source_rpc::disable_source(self, req).await
     }
 
     async fn dry_run_definition_change_bundle(
