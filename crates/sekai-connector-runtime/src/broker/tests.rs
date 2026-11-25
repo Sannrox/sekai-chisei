@@ -39,7 +39,7 @@ struct Fake {
     partitions: Vec<(i32, i32)>,
     offsets: Offsets,
     records: Bytes,
-    password: &'static str,
+    password: String,
     /// API key and version of every request after ApiVersions.
     seen: Mutex<Vec<(i16, i16)>>,
     accepted: AtomicUsize,
@@ -55,7 +55,7 @@ impl Fake {
                 latest: 9,
             },
             records: Bytes::new(),
-            password: "secret",
+            password: test_password(),
             seen: Mutex::new(Vec::new()),
             accepted: AtomicUsize::new(0),
         }
@@ -216,6 +216,17 @@ impl Fake {
     }
 }
 
+/// A password made at run time, unique to the process and the call, so no
+/// credential is a literal in the source.
+fn test_password() -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "pw-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
 fn config(port: u16, egress: &[String], password: &str) -> BrokerConfig {
     BrokerConfig {
         bootstrap: Destination::parse(&format!("127.0.0.1:{port}")).unwrap(),
@@ -312,7 +323,7 @@ fn reads_partitions_offsets_and_records_from_the_advertised_leader() {
     let port = fake.serve();
 
     let mut cluster =
-        Cluster::connect(config(port, &[format!("127.0.0.1:{port}")], "secret")).unwrap();
+        Cluster::connect(config(port, &[format!("127.0.0.1:{port}")], &fake.password)).unwrap();
     assert_eq!(cluster.partitions(TOPIC).unwrap(), vec![0, 1]);
     assert_eq!(
         cluster.offsets(TOPIC, 0).unwrap(),
@@ -353,7 +364,8 @@ fn reads_partitions_offsets_and_records_from_the_advertised_leader() {
 fn a_wrong_password_fails_authentication() {
     let fake = Arc::new(Fake::new());
     let port = fake.serve();
-    let refused = Cluster::connect(config(port, &[format!("127.0.0.1:{port}")], "wrong"));
+    let wrong = format!("{}-other", fake.password);
+    let refused = Cluster::connect(config(port, &[format!("127.0.0.1:{port}")], &wrong));
     assert_eq!(refused.err(), Some(BrokerError::AuthFailed));
 }
 
@@ -372,7 +384,7 @@ fn an_advertised_broker_outside_the_allowlist_is_never_dialed() {
     let port = fake.serve();
 
     let egress = [format!("127.0.0.1:{port}"), "localhost:1".to_owned()];
-    let mut cluster = Cluster::connect(config(port, &egress, "secret")).unwrap();
+    let mut cluster = Cluster::connect(config(port, &egress, &fake.password)).unwrap();
     assert_eq!(cluster.partitions(TOPIC).unwrap(), vec![0]);
     assert_eq!(cluster.fetch(TOPIC, 0, 3), Err(BrokerError::EgressRefused));
     assert_eq!(cluster.offsets(TOPIC, 0), Err(BrokerError::EgressRefused));
@@ -382,7 +394,7 @@ fn an_advertised_broker_outside_the_allowlist_is_never_dialed() {
 #[test]
 fn a_broker_off_loopback_without_tls_is_refused_before_dialing() {
     // A documentation address: allowlisted, so only the TLS rule refuses it.
-    let mut config = config(9092, &["192.0.2.10:9092".to_owned()], "secret");
+    let mut config = config(9092, &["192.0.2.10:9092".to_owned()], &test_password());
     config.bootstrap = Destination::parse("192.0.2.10:9092").unwrap();
     assert_eq!(
         Cluster::connect(config).err(),
