@@ -199,7 +199,13 @@ async fn a_denied_or_stale_rollback_changes_nothing() {
     );
     assert_eq!(versions(&svc).len(), 3);
 
-    // Both proposals list newest first, one per page.
+    // Both proposals list newest first, one per page. Proposals created in
+    // the same millisecond tie-break by id, which is random (#3464).
+    let (newer, older) = if (stale.created_at_ms, &stale.id) > (denied.created_at_ms, &denied.id) {
+        (&stale, &denied)
+    } else {
+        (&denied, &stale)
+    };
     let page = |token: String| {
         svc.list_dataset_rollback_proposals(with_principal(ListDatasetRollbackProposalsRequest {
             dataset_id: DATASET.into(),
@@ -208,9 +214,9 @@ async fn a_denied_or_stale_rollback_changes_nothing() {
         }))
     };
     let first = page(String::new()).await.unwrap().into_inner();
-    assert_eq!(first.proposals[0].id, stale.id);
+    assert_eq!(first.proposals[0].id, newer.id);
     let second = page(first.next_page_token).await.unwrap().into_inner();
-    assert_eq!(second.proposals[0].id, denied.id);
+    assert_eq!(second.proposals[0].id, older.id);
     assert_eq!(second.proposals.len(), 1);
     assert!(second.next_page_token.is_empty());
 }
