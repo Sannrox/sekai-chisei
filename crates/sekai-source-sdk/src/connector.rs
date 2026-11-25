@@ -275,6 +275,38 @@ pub const EVENT_STREAM_CONNECTOR: ConnectorType = ConnectorType {
     }],
 };
 
+/// Rows of the objects under one bucket prefix of an object store that
+/// speaks the S3-compatible API, mirrored listing by listing. `endpoint`
+/// is the store's origin (`https://`, or `http://` only on loopback);
+/// with `path_style` unset the bucket is addressed as a subdomain of it,
+/// which the egress allowlist must permit too. `format` is `json` (the
+/// default): each object holds one JSON object, an array of them, or one
+/// per line. Each row is one record, identified by its object key and its
+/// `id_column` value; the comma-separated `fields` become properties. The
+/// one slot `access_key` holds `<access key id>:<secret key>`.
+pub const OBJECT_STORAGE_CONNECTOR: ConnectorType = ConnectorType {
+    name: "object_storage",
+    version: "1",
+    fixed_source: None,
+    operations: &[Operation::Check, Operation::ReadPage],
+    config: &[
+        field("endpoint", ConfigFieldKind::Destination, true),
+        field("region", ConfigFieldKind::Text, true),
+        field("bucket", ConfigFieldKind::Text, true),
+        field("prefix", ConfigFieldKind::Text, false),
+        field("path_style", ConfigFieldKind::Boolean, false),
+        field("format", ConfigFieldKind::Text, false),
+        field("record_kind", ConfigFieldKind::Text, true),
+        field("type_digest", ConfigFieldKind::Text, true),
+        field("id_column", ConfigFieldKind::Text, true),
+        field("fields", ConfigFieldKind::Text, false),
+    ],
+    credential_slots: &[CredentialSlot {
+        name: "access_key",
+        required: true,
+    }],
+};
+
 const fn field(name: &'static str, kind: ConfigFieldKind, required: bool) -> ConfigField {
     ConfigField {
         name,
@@ -289,6 +321,7 @@ pub const CONNECTOR_TYPES: &[ConnectorType] = &[
     RELATIONAL_CONNECTOR,
     REST_CONNECTOR,
     EVENT_STREAM_CONNECTOR,
+    OBJECT_STORAGE_CONNECTOR,
 ];
 
 /// The connector type with this name and version, if this SDK defines it.

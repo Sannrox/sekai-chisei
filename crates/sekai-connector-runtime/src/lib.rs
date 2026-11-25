@@ -14,8 +14,10 @@
 //! and runs requested discoveries of a Source ([`discovery`]).
 //! The connector types are [`github`] (sync and apply), [`relational`]
 //! (snapshot pages, delivery and apply), [`rest`] (paged JSON over HTTP:
-//! sync and apply) and [`event_stream`] (JSON records from one topic of an
-//! event-stream cluster: sync), which reads through the [`broker`] client.
+//! sync and apply), [`event_stream`] (JSON records from one topic of an
+//! event-stream cluster: sync), which reads through the [`broker`] client,
+//! and [`object_storage`] (rows of the objects under one bucket prefix,
+//! mirrored against the plane's live records: sync).
 //! Given a gateway route, it also runs the row-wise model steps of
 //! `llm-rows` transforms ([`llm_rows`]).
 

@@ -18,10 +18,11 @@ use std::path::PathBuf;
 
 use sekai_connector_runtime::{
     Connectors, CredentialBindings, Runtime, RuntimeOptions, event_stream, github,
-    llm_rows::GatewayRoute, relational, rest,
+    llm_rows::GatewayRoute, object_storage, relational, rest,
 };
 use sekai_source_sdk::{
-    EVENT_STREAM_CONNECTOR, GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR,
+    EVENT_STREAM_CONNECTOR, GITHUB_CONNECTOR, OBJECT_STORAGE_CONNECTOR, RELATIONAL_CONNECTOR,
+    REST_CONNECTOR,
 };
 use serde::Deserialize;
 
@@ -127,7 +128,8 @@ async fn serve() -> Result<(), String> {
         // Brokers off loopback are reached over TLS trusting the system roots.
         .with(&EVENT_STREAM_CONNECTOR, move |prepared| {
             event_stream::open(prepared, &broker_tls)
-        });
+        })
+        .with(&OBJECT_STORAGE_CONNECTOR, object_storage::open);
     let runtime = Runtime::connect(
         plane,
         &config.namespaces,

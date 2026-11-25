@@ -32,9 +32,9 @@ pub use connector::{
     CONNECTOR_TYPES, ConfigError, ConfigField, ConfigFieldKind, ConfigValue, Connector,
     ConnectorFailure, ConnectorType, CredentialSlot, Destination, EVENT_STREAM_CONNECTOR,
     EgressAllowlist, ExportArtifact, GITHUB_CONNECTOR, KeyRange, MAX_CONFIG_FIELDS,
-    MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, Operation, PlaneView, PlaneViewError,
-    RELATIONAL_CONNECTOR, REST_CONNECTOR, RecordChange, RecordVersion, SourceConfig,
-    connector_type,
+    MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, OBJECT_STORAGE_CONNECTOR, Operation, PlaneView,
+    PlaneViewError, RELATIONAL_CONNECTOR, REST_CONNECTOR, RecordChange, RecordVersion,
+    SourceConfig, connector_type,
 };
 pub use contract::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,
