@@ -188,6 +188,19 @@ impl RuntimeDb {
         }
     }
 
+    /// See [`SekaiDb::source_record_versions`].
+    pub fn source_record_versions(
+        &self,
+        range: &crate::db::object_sync::RecordVersionRange<'_>,
+    ) -> Result<Option<Vec<crate::db::object_sync::StoredRecordVersion>>, String> {
+        match self {
+            Self::Sqlite(db) => db.source_record_versions(range),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.source_record_versions(range))
+            }
+        }
+    }
+
     pub fn get_source_type_descriptor(
         &self,
         namespace: &str,

@@ -192,4 +192,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0164: Reads withhold what a reader's egress may not receive](0164-reads-withhold-what-a-readers-egress-may-not-receive.md)
 - [ADR 0165: A measure is a definition member evaluated as ordinary object sets](0165-a-measure-is-a-definition-member.md) (proposed)
 - [ADR 0166: Example questions bind against the definition tree, with no data](0166-example-questions-bind-against-the-tree.md) (proposed)
+- [ADR 0167: A claimed Source reads its live records by object key](0167-a-claimed-source-reads-its-live-records-by-object-key.md)
 <!-- adr-index:end -->

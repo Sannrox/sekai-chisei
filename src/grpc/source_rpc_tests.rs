@@ -481,6 +481,115 @@ async fn a_disable_fences_the_live_sync_claim() {
     assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
 }
 
+/// Lands one `Issue` per `(external id, object key)` for the `repo` Source.
+fn land(svc: &SekaiServiceImpl, from: &str, to: &str, records: &[(&str, Option<&str>)]) {
+    use sekai_source_sdk::{SourceAdapterConfig, SourceRecord, build_source_batch};
+    let adapter = SourceAdapterConfig {
+        namespace: NS.into(),
+        producer_identity: "connector-a".into(),
+        source_instance: "acme/repo".into(),
+        type_digest: source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+    };
+    let records = records
+        .iter()
+        .map(|&(external_id, object_key)| SourceRecord {
+            source: "github".into(),
+            source_instance: "acme/repo".into(),
+            external_id: external_id.into(),
+            source_version: format!("etag-{external_id}"),
+            type_name: "Issue".into(),
+            display_name: external_id.into(),
+            payload_digest: format!("sha256:{}", "b".repeat(64)),
+            properties: Default::default(),
+            deleted: false,
+            observed_at_ms: 10,
+            source_sequence: None,
+            payload: None,
+            object_key: object_key.map(Into::into),
+        })
+        .collect();
+    let batch = build_source_batch(&adapter, from, to, 20, records).unwrap();
+    let applied = svc
+        .db
+        .runtime()
+        .apply_source_batch(&batch, "connector-a", now_millis())
+        .unwrap();
+    assert!(
+        applied.checkpoint_advanced,
+        "{}",
+        applied.transaction.reason
+    );
+}
+
+#[tokio::test]
+async fn only_the_sync_claim_holder_reads_the_sources_record_versions() {
+    let svc = service();
+    put(&svc, 60_000).await;
+    register(&svc, "connector-a", "eu").await;
+    svc.db
+        .runtime()
+        .tick_source_syncs(NS, now_millis())
+        .unwrap();
+    let work = claim(&svc, "repo").await.unwrap();
+    land(
+        &svc,
+        "",
+        "cursor:1",
+        &[("12", Some("b.csv")), ("13", Some("a.csv"))],
+    );
+    let read = |work: &SourceSyncWork, principal: &str| {
+        svc.list_source_record_versions(as_principal(
+            ListSourceRecordVersionsRequest {
+                namespace: NS.into(),
+                source_id: "repo".into(),
+                runtime_id: work.claim_owner.clone(),
+                claim_generation: work.claim_generation,
+                fencing_token: work.fencing_token.clone(),
+                ..Default::default()
+            },
+            principal,
+        ))
+    };
+    let records = read(&work, "root").await.unwrap().into_inner().records;
+    assert_eq!(
+        records,
+        vec![
+            SourceRecordVersion {
+                external_id: "13".into(),
+                object_key: "a.csv".into(),
+                source_version: "etag-13".into(),
+            },
+            SourceRecordVersion {
+                external_id: "12".into(),
+                object_key: "b.csv".into(),
+                source_version: "etag-12".into(),
+            },
+        ]
+    );
+    assert_eq!(
+        read(&work, "reader").await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let stale = SourceSyncWork {
+        fencing_token: "stale".into(),
+        ..work.clone()
+    };
+    assert_eq!(
+        read(&stale, "root").await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+
+    land(&svc, "cursor:1", "cursor:2", &[("14", None)]);
+    let unkeyed = read(&work, "root").await.unwrap_err();
+    assert_eq!(
+        (unkeyed.code(), unkeyed.message()),
+        (
+            tonic::Code::FailedPrecondition,
+            sekai_client::claim::SOURCE_RECORDS_UNKEYED
+        )
+    );
+}
+
 /// A pending `external_mutate` effect on a record of the `repo` Source.
 fn admit_external_effect(svc: &SekaiServiceImpl) -> String {
     let effect = crate::sekai::action_effect::plan_effects_for_admit(

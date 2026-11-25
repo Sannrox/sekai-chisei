@@ -24,9 +24,9 @@ use sekai_connector_runtime::{
 };
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, GITHUB_CONNECTOR, GITHUB_OBJECT_SYNC_TYPE_DIGEST,
-    GitHubObjectFixture, MAX_SYNC_NOTES, RELATIONAL_CONNECTOR, SkipReason, SnapshotPage,
-    SnapshotRead, SourceAdapterConfig, SourceConfig, SyncNote, build_source_batch, object_id_for,
-    translate_github_fixture,
+    GitHubObjectFixture, KeyRange, MAX_SYNC_NOTES, PlaneView, RELATIONAL_CONNECTOR, RecordVersion,
+    SkipReason, SnapshotPage, SnapshotRead, SourceAdapterConfig, SourceConfig, SyncNote,
+    build_source_batch, object_id_for, translate_github_fixture,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -570,6 +570,91 @@ async fn page_notes_reach_the_plane_bounded_with_an_overflow_count() {
             reason: SkipReason::NotJson,
         }
     );
+}
+
+/// A connector over keyed objects: its first page lands two issues of the
+/// object `k/1`, its second reads what the plane holds before landing a
+/// third, so the view it was handed is the one the sync's claim reads.
+struct Keyed(String, Arc<std::sync::Mutex<Vec<RecordVersion>>>);
+
+impl Connector for Keyed {
+    fn read_page_with_plane(
+        &mut self,
+        committed_cursor: Option<&str>,
+        _max_records: usize,
+        plane: &mut dyn PlaneView,
+    ) -> Result<SnapshotRead, ConnectorFailure> {
+        let issue = |number: u64, key: &str| {
+            let mut issue = translate_github_fixture(
+                GitHubObjectFixture {
+                    repository: self.0.clone(),
+                    kind: "Issue".into(),
+                    number,
+                    revision: format!("etag-{number}"),
+                    title: "keyed".into(),
+                    state: "open".into(),
+                    deleted: false,
+                    observed_at_ms: 1,
+                    properties: BTreeMap::new(),
+                },
+                &self.0,
+            )
+            .unwrap();
+            issue.object_key = Some(key.into());
+            issue
+        };
+        let (records, complete) = match committed_cursor {
+            None => (vec![issue(2, "k/1"), issue(1, "k/1")], false),
+            Some("page-0") => {
+                let held = plane
+                    .record_versions(KeyRange::default(), 500)
+                    .map_err(|_| ConnectorFailure::Unreachable)?;
+                *self.1.lock().unwrap() = held;
+                (vec![issue(3, "k/2")], true)
+            }
+            Some(_) => return Ok(SnapshotRead::Complete),
+        };
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records,
+            proposed_next_cursor: if complete { "page-1" } else { "page-0" }.into(),
+            collected_at_ms: 1,
+            complete,
+            notes: Vec::new(),
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_reads_the_sources_live_records_under_the_syncs_claim() {
+    let plane = plane().await;
+    let dir = tempfile::tempdir().unwrap();
+    plane.put_github("repo", "ops/github-bot");
+    plane.tick();
+    let held = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = held.clone();
+    let connectors = Connectors::default().with(&GITHUB_CONNECTOR, move |prepared| {
+        Ok(Box::new(Keyed(
+            prepared.source_instance.clone(),
+            seen.clone(),
+        )))
+    });
+    let runtime = runtime(&plane, "runtime-a", bindings(dir.path()), connectors).await;
+
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+    let held = held.lock().unwrap();
+    let held: Vec<_> = held
+        .iter()
+        .map(|record| (record.external_id.as_str(), record.object_key.as_str()))
+        .collect();
+    assert_eq!(held.len(), 2, "{held:?}");
+    assert!(held.iter().all(|(_, key)| *key == "k/1"), "{held:?}");
+    assert!(held[0].0 < held[1].0, "ordered by external id within a key");
 }
 
 /// Serves a GitHub REST API stand-in on an ephemeral port that lists

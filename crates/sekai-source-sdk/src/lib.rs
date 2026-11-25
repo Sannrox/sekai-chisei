@@ -31,8 +31,9 @@ pub use conformance::{
 pub use connector::{
     CONNECTOR_TYPES, ConfigError, ConfigField, ConfigFieldKind, ConfigValue, Connector,
     ConnectorFailure, ConnectorType, CredentialSlot, Destination, EgressAllowlist, ExportArtifact,
-    GITHUB_CONNECTOR, MAX_CONFIG_FIELDS, MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES, Operation,
-    RELATIONAL_CONNECTOR, REST_CONNECTOR, RecordChange, SourceConfig, connector_type,
+    GITHUB_CONNECTOR, KeyRange, MAX_CONFIG_FIELDS, MAX_CONFIG_VALUE_BYTES, MAX_EGRESS_RULES,
+    Operation, PlaneView, PlaneViewError, RELATIONAL_CONNECTOR, REST_CONNECTOR, RecordChange,
+    RecordVersion, SourceConfig, connector_type,
 };
 pub use contract::{
     ADAPTER_GITHUB_OBJECT_SYNC, ADAPTER_GITHUB_OBJECT_SYNC_VERSION, ADAPTER_REGISTERED_OBJECT_SYNC,

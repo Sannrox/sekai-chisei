@@ -627,6 +627,21 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListSourceRecordVersions",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source_sync.rs",
+        "docs/decisions/0167-a-claimed-source-reads-its-live-records-by-object-key.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RequestSourceDiscovery",
       "kind": "persistent",
       "surfaces": [

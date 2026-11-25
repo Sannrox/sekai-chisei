@@ -192,7 +192,7 @@ impl Runtime {
                     .heartbeated(
                         &claims,
                         &fence,
-                        self.sync(index, &source, prepared, &mut notes),
+                        self.sync(index, &source, &fence, prepared, &mut notes),
                     )
                     .await
                 {

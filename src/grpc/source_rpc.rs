@@ -307,27 +307,79 @@ pub(super) async fn list_sources(
     }))
 }
 
-/// `DisableSource`: stops the Source's work and raises the generation of
-/// its live claims. Idempotent.
-pub(super) async fn disable_source(
-    service: &SekaiServiceImpl,
-    req: Request<DisableSourceRequest>,
-) -> Result<Response<DisableSourceResponse>, Status> {
-    let namespace = req.get_ref().namespace.clone();
-    source_admin(service, &req, &namespace)?;
-    let source = source::disable(
-        service.db.runtime(),
-        &namespace,
-        &req.get_ref().source_id,
-        now_millis(),
-    )
-    .map_err(source_status)?;
-    Ok(Response::new(DisableSourceResponse {
-        source: Some(source_to_proto(source)),
-    }))
-}
-
 impl SekaiServiceImpl {
+    /// `DisableSource`: stops the Source's work and raises the generation of
+    /// its live claims. Idempotent.
+    pub(super) async fn disable_source_rpc(
+        &self,
+        req: Request<DisableSourceRequest>,
+    ) -> Result<Response<DisableSourceResponse>, Status> {
+        let namespace = req.get_ref().namespace.clone();
+        source_admin(self, &req, &namespace)?;
+        let source = source::disable(
+            self.db.runtime(),
+            &namespace,
+            &req.get_ref().source_id,
+            now_millis(),
+        )
+        .map_err(source_status)?;
+        Ok(Response::new(DisableSourceResponse {
+            source: Some(source_to_proto(source)),
+        }))
+    }
+
+    /// `ListSourceRecordVersions`: the claimed Source's live records by object
+    /// key, for the runtime holding its live sync claim (ADR 0167).
+    pub(super) async fn list_source_record_versions_rpc(
+        &self,
+        req: Request<ListSourceRecordVersionsRequest>,
+    ) -> Result<Response<ListSourceRecordVersionsResponse>, Status> {
+        let request = req.get_ref();
+        self.source_sync_runtime(&req, &request.namespace)?;
+        let fence = Fence {
+            owner: &request.runtime_id,
+            generation: request.claim_generation,
+            token: &request.fencing_token,
+        };
+        let range = source_sync::KeyRange {
+            after_object_key: &request.after_object_key,
+            after_external_id: Some(request.after_external_id.as_str()).filter(|id| !id.is_empty()),
+            through_object_key: request.through_object_key.as_deref(),
+        };
+        let limit = usize::try_from(request.limit)
+            .map_err(|_| Status::invalid_argument("limit must not be negative"))?;
+        let limit = if limit == 0 { usize::MAX } else { limit };
+        let records = source_sync::record_versions(
+            self.db.runtime(),
+            &request.namespace,
+            &request.source_id,
+            fence,
+            range,
+            limit,
+            now_millis(),
+        )
+        .map_err(|error| match error {
+            SyncError::Claim(ClaimError::FenceLost) => {
+                Status::failed_precondition("claim is not current")
+            }
+            SyncError::UnkeyedRecords => {
+                Status::failed_precondition(source_sync::SOURCE_RECORDS_UNKEYED)
+            }
+            SyncError::NotFound => Status::not_found("source not found"),
+            error => sync_status(error),
+        })?;
+        Ok(Response::new(ListSourceRecordVersionsResponse {
+            records: records
+                .into_iter()
+                .map(|record| SourceRecordVersion {
+                    external_id: record.external_id,
+                    object_key: record.object_key,
+                    source_version: record.source_version,
+                })
+                .collect(),
+        }))
+    }
+
     /// The caller may run sync work in `namespace`: what claiming transform
     /// work needs.
     pub(super) fn source_sync_runtime<T: std::any::Any>(

@@ -441,8 +441,18 @@ The plane stores the key beside the record's identity, indexed by namespace,
 binding and key in byte order (`COLLATE "C"` on PostgreSQL, `BINARY` on
 SQLite), which is the order object storage lists keys in. Each observation
 replaces the stored key; identities landed before the column, or by records
-without a key, hold none. Nothing reads the key yet: the claim-fenced read of
-a Source's live keys is later work on #3013.
+without a key, hold none.
+
+The runtime holding a Source's live sync claim reads what the plane holds
+for it with `ListSourceRecordVersions`
+([ADR 0167](decisions/0167-a-claimed-source-reads-its-live-records-by-object-key.md)):
+each live record's `external_id`, `object_key` and `source_version`, ordered
+by key and then external id in byte order, at most 500 per page, with no
+content. A page starts after a key, or after one record of it, and may end at
+an inclusive key. A stale fence is refused, and a live record without a key
+refuses the read as `source_records_unkeyed` until a full pass lands it with
+its key. A connector reads it through the `PlaneView` the runtime passes to
+`Connector::read_page_with_plane`.
 - Reusing the same immutable source version with a different payload digest,
   display name, or projected properties, or changing the bound type identity,
   is quarantined as a retained denial. The object and checkpoint remain

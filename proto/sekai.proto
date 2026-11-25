@@ -1828,6 +1828,38 @@ message SourceSyncWork {
   string fencing_token = 4;
   int64 claim_expires_at_ms = 5;
 }
+// Experimental (ADR 0167). Reads the live records of a claimed Source, by
+// object key, under the claim's fence. Rows are ordered by object_key and
+// then external_id, both in UTF-8 byte order, the order object storage
+// lists keys in. A page starts after (after_object_key,
+// after_external_id); an empty after_external_id starts after every row
+// of after_object_key, and an empty after_object_key starts at the first.
+message ListSourceRecordVersionsRequest {
+  string namespace = 1;
+  string source_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  string after_object_key = 6;
+  string after_external_id = 7;
+  // Inclusive upper bound on object_key; unset reads to the last key.
+  optional string through_object_key = 8;
+  // At most 500; zero reads 500.
+  int32 limit = 9;
+}
+// One live record of the Source. It carries no properties or payload.
+message SourceRecordVersion {
+  string external_id = 1;
+  string object_key = 2;
+  string source_version = 3;
+}
+// Fewer than limit rows means the range is exhausted. A live record
+// without an object key, landed by an older plane or connector, makes the
+// read refuse as FAILED_PRECONDITION with reason source_records_unkeyed
+// until a full pass lands it again with its key.
+message ListSourceRecordVersionsResponse {
+  repeated SourceRecordVersion records = 1;
+}
 // A claimable or claimed Source discovery: the request with its claim and
 // the Source as the claim granted it.
 message SourceDiscoveryWork {
@@ -6718,6 +6750,10 @@ service SekaiService {
   rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc DisableSource(DisableSourceRequest) returns (DisableSourceResponse);
+  // Experimental (ADR 0167): only the runtime holding the Source's live
+  // sync claim may read its records' versions; a stale fence is refused.
+  rpc ListSourceRecordVersions(ListSourceRecordVersionsRequest)
+      returns (ListSourceRecordVersionsResponse);
   // Experimental (#3091): discover a registered Source where its credential
   // lives. Both need a namespace administrator. A connector runtime claims
   // the request as WORK_KIND_SOURCE_DISCOVERY work. Asking again while the

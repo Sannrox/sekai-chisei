@@ -72,6 +72,9 @@ pub const DELEGATOR_DISABLED: &str = "delegator_disabled";
 pub const DELEGATOR_NOT_MEMBER: &str = "delegator_not_member";
 pub const DELEGATOR_GRANT_MISSING: &str = "delegator_grant_missing";
 pub const DELEGATOR_RECORD_MISSING: &str = "delegator_record_missing";
+/// `ListSourceRecordVersions` refusal: a live record of the claimed Source
+/// has no object key (ADR 0167).
+pub const SOURCE_RECORDS_UNKEYED: &str = "source_records_unkeyed";
 
 const LIST_WORK: &str = "/sekai.SekaiService/ListClaimableWork";
 const CLAIM_WORK: &str = "/sekai.SekaiService/ClaimWork";
@@ -165,13 +168,17 @@ pub(crate) fn allowlisted_reason_code(message: &str) -> Option<&'static str> {
         DELEGATOR_NOT_MEMBER => Some(DELEGATOR_NOT_MEMBER),
         DELEGATOR_GRANT_MISSING => Some(DELEGATOR_GRANT_MISSING),
         DELEGATOR_RECORD_MISSING => Some(DELEGATOR_RECORD_MISSING),
+        SOURCE_RECORDS_UNKEYED => Some(SOURCE_RECORDS_UNKEYED),
         _ => None,
     }
 }
 
 impl RuntimeClaimError {
     fn from_sdk(error: SdkError, owned_fence: bool) -> Self {
-        if let Some(reason) = error.reason_code {
+        if let Some(reason) = error
+            .reason_code
+            .filter(|reason| reason.starts_with("delegator_"))
+        {
             return Self::DelegatorRefused(reason);
         }
         match error.code {
