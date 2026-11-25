@@ -17,8 +17,12 @@
 //! and never runs unsandboxed.
 //!
 //! Modes: `self-test` applies the sandbox and proves it holds, writing a
-//! [`self_test`] report. The capture families are later modes.
+//! [`self_test`] report. The capture families are later modes; the
+//! [`replication`] decoder and the [`output`] line protocol they will use
+//! are pure functions here, not yet wired to a mode.
 
+pub mod output;
+pub mod replication;
 pub mod sandbox;
 pub mod self_test;
 
