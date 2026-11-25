@@ -190,4 +190,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0162: Landed source records stay in the SQL store](0162-landed-source-records-stay-in-the-sql-store.md) (proposed)
 - [ADR 0163: A source sync reports bounded notes with its outcome](0163-source-sync-notes.md)
 - [ADR 0164: Reads withhold what a reader's egress may not receive](0164-reads-withhold-what-a-readers-egress-may-not-receive.md)
+- [ADR 0165: A measure is a definition member evaluated as ordinary object sets](0165-a-measure-is-a-definition-member.md) (proposed)
 <!-- adr-index:end -->
