@@ -260,6 +260,8 @@ const GRAPH_CHANGE_REQUESTS_SCHEMA: &str = include_str!("postgres/0180_graph_cha
 const SOURCE_SYNC_NOTES_SCHEMA: &str = include_str!("postgres/0181_source_sync_notes.sql");
 const SOURCE_IDENTITY_OBJECT_KEY_SCHEMA: &str =
     include_str!("postgres/0182_source_identity_object_key.sql");
+const TRANSFORM_QUOTA_HOLD_SCOPE_SCHEMA: &str =
+    include_str!("postgres/0183_transform_quota_hold_scope.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1317,6 +1319,12 @@ const MIGRATIONS: &[Migration] = &[
         182,
         "source_identity_object_key",
         SOURCE_IDENTITY_OBJECT_KEY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        183,
+        "transform_quota_hold_scope",
+        TRANSFORM_QUOTA_HOLD_SCOPE_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2761,6 +2769,49 @@ mod tests {
         assert!(
             index.ends_with("(namespace, binding_id, object_key)"),
             "{index}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn quota_hold_scope_upgrade_reads_an_older_hold_as_tenant_scoped() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        let before = MIGRATIONS
+            .iter()
+            .position(|migration| migration.name == "transform_quota_hold_scope")
+            .unwrap();
+        db.migrate_with(&MIGRATIONS[..before]).unwrap();
+        db.connection()
+            .unwrap()
+            .batch_execute(
+                "INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request)
+                 VALUES ('held-before', 'tenant-a', 0, 0, 1);",
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        let older = db
+            .take_transform_quota_hold("held-before", Some(0), false)
+            .unwrap()
+            .expect("the older hold survives the upgrade");
+        assert_eq!(older.quota_scope, "");
+        assert!(older.refund_request);
+        let scope = "tenant:tenant-a/namespace:ops";
+        assert!(
+            db.restore_abandoned_quota_hold("held-after", "tenant-a", scope, false, true, 0)
+                .unwrap()
+        );
+        assert_eq!(
+            db.take_transform_quota_hold("held-after", Some(0), false)
+                .unwrap()
+                .map(|hold| hold.quota_scope),
+            Some(scope.to_string())
         );
     }
 

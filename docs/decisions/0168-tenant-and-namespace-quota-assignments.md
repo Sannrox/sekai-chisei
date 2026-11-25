@@ -42,8 +42,8 @@ The maintainer accepted the shape on 2026-11-24:
    chain the both-or-neither reservation will run on. Neither the tenant id
    nor the namespace may contain `/`; otherwise namespace `a/b` would
    inherit `a`'s limits. Limits are non-negative.
-2. A run that asks more of one metric than its tenant's whole budget is
-   refused for good at claim. It is marked `refused` with the code
+2. A run that asks more of one metric than its tenant's whole budget, or
+   from 1b its namespace's, is refused for good at claim. It is marked `refused` with the code
    `quota_larger_than_budget` and the details `metric`, `limit` and
    `requested`, through the terminal refusal path an enterprise extension
    already uses (#1701). Every run reserves one request and one concurrency
@@ -54,7 +54,8 @@ The maintainer accepted the shape on 2026-11-24:
      but not enforced; the oversize refusal; and this ADR.
    - **1b:** namespace enforcement. Admission reserves on both scopes or
      neither. The unused-reservation hold records the scope so a refund
-     after a crash reaches the namespace too.
+     after a crash reaches the namespace too. A hold an older plane wrote
+     records no scope and refunds only the tenant.
    - **1c:** report-only. The gate evaluates without reserving. Each would-be
      refusal or queue is recorded on the audit and on the run.
    - **Part 2:** budgets that refuse, and `compute_seconds` reserved and
