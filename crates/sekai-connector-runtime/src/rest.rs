@@ -430,6 +430,7 @@ impl Connector for Rest {
             proposed_next_cursor: proposed,
             collected_at_ms: observed_at_ms,
             complete,
+            notes: Vec::new(),
         }))
     }
 

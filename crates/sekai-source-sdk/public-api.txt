@@ -80,6 +80,7 @@ MAX_SOURCE_PAYLOAD_BYTES
 MAX_SOURCE_PROPERTY_KEY_BYTES
 MAX_SOURCE_PROPERTY_VALUE_BYTES
 MAX_SOURCE_RECORD_PROPERTIES
+MAX_SYNC_NOTES
 MIN_INFERRED_REFERENCE_MATCH_BP
 OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION
 OUTBOX_FORMAT_VERSION
@@ -109,6 +110,7 @@ SOURCE_SYNC_UNBOUND_TYPE_REVISION_MESSAGE
 SOURCE_SYNC_UNSUPPORTED_CONTRACT_MESSAGE
 SOURCE_TYPE_REVISION_VERSION
 SchemaChangeClass
+SkipReason
 SnapshotPage
 SnapshotPageSource
 SnapshotRead
@@ -144,6 +146,8 @@ SourceSyncStateView
 SourceSyncTransport
 SourceTypeRevisionDescriptor
 SyncDecision
+SyncNote
+SyncNotes
 SyncedObject
 TransportFailure
 ValueShapeCode
@@ -805,6 +809,7 @@ snapshot::GenerationSnapshotSource::read_generation_page(&mut self,Option<&str>,
 snapshot::SnapshotPage
 snapshot::SnapshotPage.collected_at_ms: i64
 snapshot::SnapshotPage.complete: bool
+snapshot::SnapshotPage.notes: Vec<SyncNote>
 snapshot::SnapshotPage.proposed_next_cursor: String
 snapshot::SnapshotPage.records: Vec<SourceRecord>
 snapshot::SnapshotPageSource

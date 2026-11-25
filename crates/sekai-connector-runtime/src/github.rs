@@ -270,6 +270,7 @@ impl Connector for GitHub {
             proposed_next_cursor: next,
             collected_at_ms: observed_at_ms,
             complete,
+            notes: Vec::new(),
         }))
     }
 }

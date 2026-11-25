@@ -1,8 +1,9 @@
 //! The connector runtime against a serving plane (ADR 0148): crash
 //! mid-claim, takeover after lease expiry, a stale fence refused, two
 //! runtime versions side by side, an unresolved credential, a GitHub
-//! repository moved under a Source with its object ids unchanged, and a
-//! pass that still claims later namespaces when an earlier one cannot.
+//! repository moved under a Source with its object ids unchanged, a
+//! pass that still claims later namespaces when an earlier one cannot, and
+//! page notes gathered into the sync's acknowledgement.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,8 +24,9 @@ use sekai_connector_runtime::{
 };
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, GITHUB_CONNECTOR, GITHUB_OBJECT_SYNC_TYPE_DIGEST,
-    GitHubObjectFixture, RELATIONAL_CONNECTOR, SnapshotPage, SnapshotRead, SourceAdapterConfig,
-    SourceConfig, build_source_batch, object_id_for, translate_github_fixture,
+    GitHubObjectFixture, MAX_SYNC_NOTES, RELATIONAL_CONNECTOR, SkipReason, SnapshotPage,
+    SnapshotRead, SourceAdapterConfig, SourceConfig, SyncNote, build_source_batch, object_id_for,
+    translate_github_fixture,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -257,6 +259,7 @@ impl Connector for Counted {
             proposed_next_cursor: format!("{}-{run}", committed_cursor.unwrap_or("run")),
             collected_at_ms: 1,
             complete: true,
+            notes: Vec::new(),
         }))
     }
 }
@@ -488,6 +491,85 @@ async fn an_unresolved_credential_fails_once_as_unavailable() {
     assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing connected");
     assert_eq!(plane.sync_of("repo").1, "unavailable");
     assert!(runtime.pass().await.unwrap().is_empty(), "no retry loop");
+}
+
+/// A connector that reads two pages of one issue each, every page noting
+/// 40 skipped records.
+struct Noted(String);
+
+impl Connector for Noted {
+    fn read_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        _max_records: usize,
+    ) -> Result<SnapshotRead, ConnectorFailure> {
+        let page: i64 = match committed_cursor {
+            None => 0,
+            Some("page-0") => 1,
+            Some(_) => return Ok(SnapshotRead::Complete),
+        };
+        let issue = translate_github_fixture(
+            GitHubObjectFixture {
+                repository: self.0.clone(),
+                kind: "Issue".into(),
+                number: page as u64 + 1,
+                revision: "r1".into(),
+                title: "noted".into(),
+                state: "open".into(),
+                deleted: false,
+                observed_at_ms: 1,
+                properties: BTreeMap::new(),
+            },
+            &self.0,
+        )
+        .unwrap();
+        Ok(SnapshotRead::Page(SnapshotPage {
+            records: vec![issue],
+            proposed_next_cursor: format!("page-{page}"),
+            collected_at_ms: 1,
+            complete: page == 1,
+            notes: (0..40)
+                .map(|n| SyncNote::SkippedRecord {
+                    partition: 0,
+                    offset: page * 100 + n,
+                    reason: SkipReason::NotJson,
+                })
+                .collect(),
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn page_notes_reach_the_plane_bounded_with_an_overflow_count() {
+    let plane = plane().await;
+    let dir = tempfile::tempdir().unwrap();
+    plane.put_github("repo", "ops/github-bot");
+    plane.tick();
+    let connectors = Connectors::default().with(&GITHUB_CONNECTOR, |prepared| {
+        Ok(Box::new(Noted(prepared.source_instance.clone())))
+    });
+    let runtime = runtime(&plane, "runtime-a", bindings(dir.path()), connectors).await;
+
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+    let sync = plane.db.get_source(NS, "repo").unwrap().unwrap().sync;
+    let notes = sync.current_notes().expect("the last sync's notes");
+    assert_eq!(notes.notes().len(), MAX_SYNC_NOTES);
+    assert_eq!(notes.overflow(), 80 - MAX_SYNC_NOTES as i64);
+    // Both pages' notes, in page order.
+    assert_eq!(
+        notes.notes()[MAX_SYNC_NOTES - 1],
+        SyncNote::SkippedRecord {
+            partition: 0,
+            offset: 123,
+            reason: SkipReason::NotJson,
+        }
+    );
 }
 
 /// Serves a GitHub REST API stand-in on an ephemeral port that lists

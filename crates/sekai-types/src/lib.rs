@@ -38,6 +38,7 @@ pub mod risk_class;
 pub mod security;
 pub mod sekai_principal;
 pub mod service_principal;
+pub mod source_sync_note;
 pub mod system_one_bind;
 pub mod transform_chain;
 pub mod transform_llm_step;

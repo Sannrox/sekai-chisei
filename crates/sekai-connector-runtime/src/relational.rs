@@ -542,6 +542,7 @@ fn page_of(
                 .to_string(),
                 collected_at_ms: now_ms,
                 complete: true,
+                notes: Vec::new(),
             }))
         };
     }
@@ -563,6 +564,7 @@ fn page_of(
         .to_string(),
         collected_at_ms: now_ms,
         complete,
+        notes: Vec::new(),
     }))
 }
 
