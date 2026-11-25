@@ -298,6 +298,31 @@ record is a `conflict` and nothing is written. Failures are typed
 (`auth_failed`, `permission_missing`, `unreachable`, `conflict`, `invalid`)
 and never carry a response body or credential.
 
+An `event_stream` Source (#3014) reads JSON records from one topic of an
+event-stream cluster over the broker wire protocol. Its configuration names
+the `bootstrap` broker (`host:port`, a destination the egress allowlist and the
+credential handle must both admit), the `topic`, the `id_field` of each
+record's JSON value, the comma-separated `fields` that become properties,
+`record_kind` and `type_digest`, and optionally `partitions` (comma-separated,
+at most 64; every partition of the topic when unset). Every broker the
+cluster's metadata advertises is checked against the egress allowlist before
+the runtime dials it, and TLS (`tls`, on by default, trusting the system
+roots) is required for any broker that is not loopback. With `username`, the
+credential slot `password` authenticates by SASL/PLAIN. The cursor holds the
+next offset of each partition; the runtime commits nothing to the cluster. A
+first sync starts at each partition's earliest retained offset. Each page keeps
+the latest record per id; a record's version is its partition and offset.
+Gzip, snappy, lz4 and zstd batches are decoded. When retention has passed the
+committed offset of a partition, the sync resumes at the earliest retained one
+and records the skipped range as an `offset_gap` note; a record whose value is
+not a JSON object, or has no usable id, is skipped and recorded as a
+`skipped_record` note with its partition and offset (see
+[source-health.md](source-health.md)). A null value is skipped as not JSON;
+objects are not deleted from compaction tombstones. A committed offset past a
+partition's end fails the sync as `invalid`. `check` proves the bootstrap
+answers, the credential authenticates and the topic has the configured
+partitions.
+
 The GitHub object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;

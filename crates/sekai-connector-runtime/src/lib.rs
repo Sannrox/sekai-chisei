@@ -13,16 +13,18 @@
 //! admitted Actions' external changes to a Source's records ([`effect`]),
 //! and runs requested discoveries of a Source ([`discovery`]).
 //! The connector types are [`github`] (sync and apply), [`relational`]
-//! (snapshot pages, delivery and apply) and [`rest`] (paged JSON over HTTP:
-//! sync and apply). [`broker`] is the event-stream broker client the
-//! event-stream type builds on. Given a gateway route, it also runs
-//! the row-wise model steps of `llm-rows` transforms ([`llm_rows`]).
+//! (snapshot pages, delivery and apply), [`rest`] (paged JSON over HTTP:
+//! sync and apply) and [`event_stream`] (JSON records from one topic of an
+//! event-stream cluster: sync), which reads through the [`broker`] client.
+//! Given a gateway route, it also runs the row-wise model steps of
+//! `llm-rows` transforms ([`llm_rows`]).
 
 pub mod broker;
 pub mod credentials;
 pub mod delivery;
 pub mod discovery;
 pub mod effect;
+pub mod event_stream;
 pub mod github;
 pub mod llm_rows;
 pub mod pages;

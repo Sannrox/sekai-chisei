@@ -245,6 +245,36 @@ pub const REST_CONNECTOR: ConnectorType = ConnectorType {
     }],
 };
 
+/// JSON records from one event-stream topic, read over the broker wire
+/// protocol. `bootstrap` is the first broker; every broker it advertises
+/// must be permitted by the egress allowlist too. `tls` (default on) is
+/// required for any broker that is not loopback. Each record's value is a
+/// JSON object whose `id_field` is the record id; the comma-separated
+/// `fields` become properties. `partitions` (comma-separated) limits the
+/// sync to those partitions, at most 64. The optional slot `password` with
+/// `username` authenticates by SASL/PLAIN.
+pub const EVENT_STREAM_CONNECTOR: ConnectorType = ConnectorType {
+    name: "event_stream",
+    version: "1",
+    fixed_source: None,
+    operations: &[Operation::Check, Operation::ReadPage],
+    config: &[
+        field("bootstrap", ConfigFieldKind::Destination, true),
+        field("tls", ConfigFieldKind::Boolean, false),
+        field("topic", ConfigFieldKind::Text, true),
+        field("record_kind", ConfigFieldKind::Text, true),
+        field("type_digest", ConfigFieldKind::Text, true),
+        field("id_field", ConfigFieldKind::Text, true),
+        field("fields", ConfigFieldKind::Text, false),
+        field("partitions", ConfigFieldKind::Text, false),
+        field("username", ConfigFieldKind::Text, false),
+    ],
+    credential_slots: &[CredentialSlot {
+        name: "password",
+        required: false,
+    }],
+};
+
 const fn field(name: &'static str, kind: ConfigFieldKind, required: bool) -> ConfigField {
     ConfigField {
         name,
@@ -254,8 +284,12 @@ const fn field(name: &'static str, kind: ConfigFieldKind, required: bool) -> Con
 }
 
 /// Every connector type this SDK version defines.
-pub const CONNECTOR_TYPES: &[ConnectorType] =
-    &[GITHUB_CONNECTOR, RELATIONAL_CONNECTOR, REST_CONNECTOR];
+pub const CONNECTOR_TYPES: &[ConnectorType] = &[
+    GITHUB_CONNECTOR,
+    RELATIONAL_CONNECTOR,
+    REST_CONNECTOR,
+    EVENT_STREAM_CONNECTOR,
+];
 
 /// The connector type with this name and version, if this SDK defines it.
 pub fn connector_type(name: &str, version: &str) -> Option<&'static ConnectorType> {

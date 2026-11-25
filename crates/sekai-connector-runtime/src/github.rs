@@ -513,6 +513,7 @@ mod tests {
             connector: &GITHUB_CONNECTOR,
             source_instance: "acme/repo".into(),
             config: SourceConfig::from([("api_url".into(), ConfigValue::Text(api_url.into()))]),
+            egress: Default::default(),
             credentials: BTreeMap::from([("token".into(), Secret("t0k".into()))]),
         })
         .unwrap();
