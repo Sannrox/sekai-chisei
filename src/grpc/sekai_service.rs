@@ -58,6 +58,8 @@ mod model_stage_review_rpc;
 mod model_stage_rpc;
 #[path = "model_version_rpc.rs"]
 mod model_version_rpc;
+#[path = "namespace_package_rpc.rs"]
+mod namespace_package_rpc;
 #[path = "object_change_subscription.rs"]
 mod object_change_subscription;
 #[path = "object_comment_rpc.rs"]
@@ -299,6 +301,7 @@ impl SekaiService for SekaiServiceImpl {
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
         append_agent_turn_transcript => append_agent_turn_transcript_rpc(AppendAgentTurnTranscriptRequest) -> AppendAgentTurnTranscriptResponse;
         disable_source => disable_source_rpc(DisableSourceRequest) -> DisableSourceResponse;
+        export_namespace_package => export_namespace_package_rpc(ExportNamespacePackageRequest) -> ExportNamespacePackageResponse;
         list_source_record_versions => list_source_record_versions_rpc(ListSourceRecordVersionsRequest) -> ListSourceRecordVersionsResponse;
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;

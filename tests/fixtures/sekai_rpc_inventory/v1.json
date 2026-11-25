@@ -402,6 +402,20 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "ExportNamespacePackage",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/namespace_package_rpc.rs",
+        "crates/sekai-core/src/sekai/namespace_package.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.datasets",
+        "sekai.definition-branch"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ImportDefinitionPackage",
       "kind": "persistent",
       "surfaces": [

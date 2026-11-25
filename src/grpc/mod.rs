@@ -1011,6 +1011,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "RebaseDefinitionBranch"
             | "SetDefinitionBranchArchived"
             | "ExportDefinitionPackage"
+            // Namespace packages (#3093) read like a definition export and
+            // check dataset grants in the handler.
+            | "ExportNamespacePackage"
             | "ImportDefinitionPackage"
             | "ImportDefinitionTree"
             | "GetGovernedFactVersion"
@@ -3778,6 +3781,7 @@ mod tests {
             "RebaseDefinitionBranch",
             "SetDefinitionBranchArchived",
             "ExportDefinitionPackage",
+            "ExportNamespacePackage",
             "ImportDefinitionPackage",
             "ImportDefinitionTree",
         ] {

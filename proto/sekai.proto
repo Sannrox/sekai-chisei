@@ -5852,6 +5852,29 @@ message ExportDefinitionPackageResponse {
   string package_digest = 2;
 }
 
+// Packages a namespace's governed resources as a signed
+// sekai.namespace-package/v1 manifest (#3093, ADR 0169) for install into a
+// namespace of another tenant. Experimental.
+message ExportNamespacePackageRequest {
+  string namespace = 1;
+  // Lowercase a-z, 0-9, '.', '_' or '-'; at most 128 bytes.
+  string package_name = 2;
+  // At least 1. Installations order upgrades by this number.
+  uint32 package_version = 3;
+  // Datasets packaged as definitions (name, typed and classified columns,
+  // partition keys); content is not carried in this version. Each
+  // must be bound to an object in the namespace and readable in every column.
+  repeated string dataset_ids = 4;
+}
+
+message ExportNamespacePackageResponse {
+  // Envelope JSON: package, provenance, signature.
+  string envelope_json = 1;
+  string package_digest = 2;
+  // Namespace-free digest of the packaged definitions.
+  string ontology_digest = 3;
+}
+
 message ImportDefinitionPackageRequest {
   string namespace = 1;
   string branch_id = 2;
@@ -6728,6 +6751,7 @@ service SekaiService {
   // envelope against this plane's trusted package keys and opens a proposal.
   rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
+  rpc ExportNamespacePackage(ExportNamespacePackageRequest) returns (ExportNamespacePackageResponse);
   // Opens a proposal with exactly the definitions a file tree changes (#1618).
   rpc ImportDefinitionTree(ImportDefinitionTreeRequest) returns (ImportDefinitionTreeResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);

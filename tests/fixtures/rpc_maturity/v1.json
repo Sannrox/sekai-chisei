@@ -285,6 +285,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ExportNamespacePackage",
+      "storage_path": "sekai.definition-branch, sekai.datasets",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ImportDefinitionPackage",
       "storage_path": "sekai.definition-branch",
       "real_backend": "yes",

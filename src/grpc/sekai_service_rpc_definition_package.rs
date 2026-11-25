@@ -52,7 +52,7 @@ fn decode_key(field: &str, value: &str) -> Result<[u8; 32], String> {
     Ok(bytes)
 }
 
-fn package_signer_from_env() -> Result<PackageSigner, Status> {
+pub(super) fn package_signer_from_env() -> Result<PackageSigner, Status> {
     let unavailable = || {
         Status::failed_precondition(format!(
             "definition package signing requires {SIGNING_KEY_ENV} and {SIGNER_ENV}"

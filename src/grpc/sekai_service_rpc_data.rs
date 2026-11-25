@@ -536,6 +536,27 @@ pub(super) fn authorize_dataset_rollback(
     Ok(access.binding.map(|binding| binding.namespace))
 }
 
+/// The access a namespace package (#3093) needs to carry a dataset's
+/// definition: read access, with every column readable, since a package
+/// carries the whole schema. Returns the namespace of its binding object.
+pub(super) fn authorize_packaged_dataset(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset: &dataset::Dataset,
+) -> Result<Option<String>, Status> {
+    let access = authorize_dataset_access(service, principals, tenant_context, dataset, false)?;
+    if let Some(readable) = readable_columns(service, dataset, &access)?
+        && dataset
+            .columns
+            .iter()
+            .any(|column| !readable.contains(&column.name))
+    {
+        return Err(Status::permission_denied("column access denied"));
+    }
+    Ok(access.binding.map(|binding| binding.namespace))
+}
+
 /// Drops the columns of snapshot rows outside `readable` (see [`readable_columns`]).
 fn hold_rows_to(rows: &mut [HashMap<String, String>], readable: Option<&[String]>) {
     if let Some(readable) = readable {

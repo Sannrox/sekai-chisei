@@ -144,6 +144,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.RebaseDefinitionBranch` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.SetDefinitionBranchArchived` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ExportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
+| `SekaiService.ExportNamespacePackage` | `sekai.definition-branch, sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionPackage` | `sekai.definition-branch` | yes | none | `experimental` |
 | `SekaiService.ImportDefinitionTree` | `sekai.definition-branch` | yes | cli | `experimental` |
 | `SekaiService.CompareDefinitionRevisions` | `sekai.definition-branch` | yes | mcp, example | `stable` |
