@@ -175,10 +175,16 @@ struct SigningPin<'a> {
     key_id: &'a str,
 }
 
-fn domain_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String> {
+/// SHA-256 over `contract`, `domain`, and the canonical JSON of `value`.
+/// Shared with namespace packages, which carry a definition package.
+pub(crate) fn contract_digest<T: Serialize>(
+    contract: &str,
+    domain: &str,
+    value: &T,
+) -> Result<String, String> {
     let canonical = crate::shomei::canonical_json_with_finite_numbers(value)?;
     let mut hasher = Sha256::new();
-    hasher.update(PACKAGE_CONTRACT.as_bytes());
+    hasher.update(contract.as_bytes());
     hasher.update(b"\n");
     hasher.update(domain.as_bytes());
     hasher.update(b"\n");
@@ -187,7 +193,8 @@ fn domain_digest<T: Serialize>(domain: &str, value: &T) -> Result<String, String
 }
 
 fn member_digest(kind: &str, id: &str, definition_json: &str) -> Result<String, String> {
-    domain_digest(
+    contract_digest(
+        PACKAGE_CONTRACT,
         "member",
         &MemberPin {
             kind,
@@ -198,7 +205,8 @@ fn member_digest(kind: &str, id: &str, definition_json: &str) -> Result<String, 
 }
 
 fn package_digest(members: &[PackageMember]) -> Result<String, String> {
-    domain_digest(
+    contract_digest(
+        PACKAGE_CONTRACT,
         "package",
         &PackagePin {
             contract_version: PACKAGE_CONTRACT,
@@ -217,6 +225,7 @@ fn package_digest(members: &[PackageMember]) -> Result<String, String> {
 }
 
 fn signing_bytes(
+    contract: &str,
     package_digest: &str,
     provenance: &PackageProvenance,
     identity: &str,
@@ -228,9 +237,57 @@ fn signing_bytes(
         identity,
         key_id,
     })?;
-    let mut bytes = format!("{PACKAGE_CONTRACT}\nsignature\n").into_bytes();
+    let mut bytes = format!("{contract}\nsignature\n").into_bytes();
     bytes.extend(canonical);
     Ok(bytes)
+}
+
+/// Signs `package_digest` and `provenance` under `contract`. Definition and
+/// namespace packages share this envelope signature and the plane's package key.
+pub(crate) fn sign_digest(
+    contract: &str,
+    package_digest: &str,
+    provenance: &PackageProvenance,
+    identity: &str,
+    key_id: &str,
+    key: &SigningKey,
+) -> Result<PackageSignature, String> {
+    let bytes = signing_bytes(contract, package_digest, provenance, identity, key_id)?;
+    let value = key
+        .sign(&bytes)
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(PackageSignature {
+        identity: identity.into(),
+        key_id: key_id.into(),
+        value,
+    })
+}
+
+/// Verifies a [`sign_digest`] signature against `keyring`. Errors carry no
+/// refusal code; the caller prefixes its own.
+pub(crate) fn verify_digest_signature(
+    contract: &str,
+    package_digest: &str,
+    provenance: &PackageProvenance,
+    signature: &PackageSignature,
+    keyring: &TrustedKeyring,
+) -> Result<(), String> {
+    let bytes = signing_bytes(
+        contract,
+        package_digest,
+        provenance,
+        &signature.identity,
+        &signature.key_id,
+    )?;
+    keyring.verify_message(
+        &signature.identity,
+        &signature.key_id,
+        &bytes,
+        &decode_signature(&signature.value)?,
+    )
 }
 
 fn canonical_member_json(kind: &str, id: &str, definition_json: &str) -> Result<String, String> {
@@ -284,21 +341,18 @@ pub fn sign_package(
     key_id: &str,
     key: &SigningKey,
 ) -> Result<PackageEnvelope, String> {
-    let bytes = signing_bytes(&package.package_digest, &provenance, identity, key_id)?;
-    let value = key
-        .sign(&bytes)
-        .to_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let signature = sign_digest(
+        PACKAGE_CONTRACT,
+        &package.package_digest,
+        &provenance,
+        identity,
+        key_id,
+        key,
+    )?;
     Ok(PackageEnvelope {
         package,
         provenance,
-        signature: PackageSignature {
-            identity: identity.into(),
-            key_id: key_id.into(),
-            value,
-        },
+        signature,
     })
 }
 
@@ -307,7 +361,7 @@ fn decode_signature(value: &str) -> Result<[u8; 64], String> {
     sekai_types::hex::decode(value)
         .ok()
         .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
-        .ok_or_else(|| format!("{REFUSAL_UNVERIFIED}: signature is malformed"))
+        .ok_or_else(|| "signature is malformed".to_string())
 }
 
 /// Parses and verifies an envelope: the format, every member and package
@@ -370,21 +424,14 @@ pub fn verify_envelope(json: &str, keyring: &TrustedKeyring) -> Result<PackageEn
             "{REFUSAL_TAMPERED}: package digest does not match its members"
         ));
     }
-    let signature = &envelope.signature;
-    let bytes = signing_bytes(
+    verify_digest_signature(
+        PACKAGE_CONTRACT,
         &package.package_digest,
         &envelope.provenance,
-        &signature.identity,
-        &signature.key_id,
-    )?;
-    keyring
-        .verify_message(
-            &signature.identity,
-            &signature.key_id,
-            &bytes,
-            &decode_signature(&signature.value)?,
-        )
-        .map_err(|error| format!("{REFUSAL_UNVERIFIED}: {error}"))?;
+        &envelope.signature,
+        keyring,
+    )
+    .map_err(|error| format!("{REFUSAL_UNVERIFIED}: {error}"))?;
     Ok(envelope)
 }
 
@@ -764,7 +811,7 @@ mod tests {
         let signed_digit = format!("+a{}", "0".repeat(126));
         assert_eq!(
             decode_signature(&signed_digit).unwrap_err(),
-            format!("{REFUSAL_UNVERIFIED}: signature is malformed")
+            "signature is malformed"
         );
         assert!(decode_signature(&"0".repeat(126)).is_err());
 

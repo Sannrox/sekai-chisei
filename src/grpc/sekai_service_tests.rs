@@ -39369,6 +39369,8 @@ mod media_upload_rpc_tests;
 mod model_stage_rpc_tests;
 #[path = "model_version_rpc_tests.rs"]
 mod model_version_rpc_tests;
+#[path = "namespace_package_rpc_tests.rs"]
+mod namespace_package_rpc_tests;
 
 #[path = "object_type_index_rpc_tests.rs"]
 mod object_type_index_rpc_tests;

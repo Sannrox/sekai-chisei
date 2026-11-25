@@ -241,6 +241,31 @@ planes as a signed `sekai.definition-package/v1` envelope.
 - Keys are read at call time, so rotating them needs no restart. Without them,
   export and import fail closed.
 
+### Namespace packages (#3093)
+
+`ExportNamespacePackage` (experimental) packages a namespace for install into
+a namespace of another tenant as a signed `sekai.namespace-package/v1`
+manifest (ADR 0169). The request names the package (`a-z`, `0-9`, `.`, `_`,
+`-`, at most 128 bytes), its version (at least 1), and the datasets to
+package.
+
+- One `definition_package` entry carries the published definitions the
+  caller may read. Its digest is the namespace-free definition package
+  digest, and the response's `ontology_digest` is the same value. Governed
+  transforms are not carried.
+- One `dataset_version` entry per selected dataset carries its name, columns
+  (name, type, classification) and partition keys, never rows. Its digest
+  covers columns and partition keys. A dataset that is missing, unreadable, or
+  has an unreadable column is `PERMISSION_DENIED` with `dataset <id> is not
+  readable`; one not bound to an object in the namespace is
+  `FAILED_PRECONDITION`.
+- `withheld` counts the definition members the caller may not read, by kind,
+  never naming them.
+- The package digest covers the whole manifest and is signed with the
+  definition package key above. Verification refuses with
+  `namespace_package_unverified`, `namespace_package_tampered`, or
+  `namespace_package_incompatible`, naming the entry. Install comes later.
+
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
 changed members in kind-then-id order. Changed object-type properties are
