@@ -113,3 +113,37 @@ identity is the object-log and SQL `object_type_index*` is a rebuildable
 serving projection. `EvaluateObjectSet` keeps that projection because the
 tagged log is `(kind, key)` and is not namespace-scoped. The host wire is
 still append plus generation load.
+
+## Amendment: one writer at a time, not one host (#2292)
+
+One writer at a time stays the contract. One host does not: mikura `v0.6.0`
+serves read-only standbys on the writer's log, reports each host's role
+(`writer`, `standby`, `fenced`) in `health`, fences the old writer when a
+standby is promoted, and serves a read at or above a requested snapshot
+(`min_version`). The clerk client uses them:
+
+- `SEKAI_OBJECT_LOG_HOST` takes one `host:port` or a comma-separated list. A
+  single host is the writer without a `health` round trip, as before. With a
+  list, the client asks each host's `health` and writes to the one that
+  reports `writer`.
+- A write refused by a standby or a fenced host is sent again to the
+  rediscovered writer. A fenced host reports `fenced` from then on, so it is
+  never written to again.
+- A write whose reply is lost is sent again only when it carries an Action
+  id. The host applies a repeated id at most once, so the log answers the
+  unknown outcome. An admit without an id is not sent again by the client;
+  its retry from the ingest intent loads first and keeps a committed
+  generation, so it cannot append twice.
+- After a write the client passes the snapshot it produced as `min_version`
+  on later reads, writer first. A host that is behind refuses, and a reply
+  without a snapshot (an older host) is not used. A read after a write
+  includes it whichever host answers.
+- With every host unreachable or refusing, the write fails closed. The
+  durable ingest intent (#2289) keeps the admitted object and sends it again;
+  `sekai_object_log_ingest_backlog` shows how many wait.
+- Operator signals: `sekai_object_log_host_writer{host}`,
+  `sekai_object_log_host_behind{host}`, and
+  `sekai_object_log_host_retries_total`.
+
+Promotion is not the client's decision. A supervisor or an operator promotes
+a standby; the clerk only follows the hosts' roles.

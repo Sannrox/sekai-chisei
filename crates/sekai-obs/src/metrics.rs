@@ -38,6 +38,18 @@ pub fn handle(pkg_version: &'static str) -> &'static PrometheusHandle {
             "sekai_object_log_ingest_backlog",
             "Admitted objects still waiting to reach the object log"
         );
+        describe_gauge!(
+            "sekai_object_log_host_writer",
+            "1 for the object-log host this process writes to, 0 for the others"
+        );
+        describe_gauge!(
+            "sekai_object_log_host_behind",
+            "Snapshots an object-log host's last reply trailed its writer"
+        );
+        describe_counter!(
+            "sekai_object_log_host_retries_total",
+            "Object-log requests sent again to another or rediscovered host"
+        );
         crate::signals::describe_all();
         gauge!(
             "sekai_build_info",
@@ -74,6 +86,22 @@ pub fn set_object_log_ingest_backlog(intents: u64) {
     gauge!("sekai_object_log_ingest_backlog").set(intents as f64);
 }
 
+/// Which configured object-log host this process writes to (#2292).
+pub fn set_object_log_host_writer(host: &str, writer: bool) {
+    gauge!("sekai_object_log_host_writer", "host" => host.to_owned())
+        .set(f64::from(u8::from(writer)));
+}
+
+/// How many snapshots an object-log host's last reply trailed its writer.
+pub fn set_object_log_host_behind(host: &str, behind: u64) {
+    gauge!("sekai_object_log_host_behind", "host" => host.to_owned()).set(behind as f64);
+}
+
+/// One object-log request sent again after a refusal, lost reply, or lag.
+pub fn record_object_log_host_retry() {
+    counter!("sekai_object_log_host_retries_total").increment(1);
+}
+
 pub fn search_index_lag_ms() -> u64 {
     SEARCH_INDEX_LAG_MS.load(Ordering::Relaxed)
 }
@@ -102,6 +130,9 @@ mod tests {
         set_search_index_lag_ms(1);
         set_embedding_index_lag_ms(1);
         set_object_log_ingest_backlog(1);
+        set_object_log_host_writer("127.0.0.1:1", true);
+        set_object_log_host_behind("127.0.0.1:1", 0);
+        record_object_log_host_retry();
         let rendered = handle.render();
         for name in [
             "sekai_build_info",
@@ -109,6 +140,9 @@ mod tests {
             "sekai_search_index_lag_ms",
             "sekai_embedding_index_lag_ms",
             "sekai_object_log_ingest_backlog",
+            "sekai_object_log_host_writer",
+            "sekai_object_log_host_behind",
+            "sekai_object_log_host_retries_total",
         ] {
             assert!(
                 rendered.contains(&format!("# HELP {name} ")),

@@ -1,21 +1,34 @@
-//! Clerk client for the mikura object-log host (ADR 0088, #1196).
+//! Clerk client for the mikura object-log hosts (ADR 0088, #1196, #2292).
 //!
-//! ADR 0088 makes one object-log host the owner of object identity and every
-//! clerk process its client. `SEKAI_OBJECT_LOG_HOST` names that host; the
-//! clerk then appends admitted objects and reads their generations through
-//! it instead of opening a log in-process (`SEKAI_OBJECT_LOG`). The two are
-//! mutually exclusive.
+//! ADR 0088 makes one object-log host at a time the writer of object
+//! identity and every clerk process its client. `SEKAI_OBJECT_LOG_HOST`
+//! names that host, or a comma-separated list of a writer and its standbys;
+//! the clerk then appends admitted objects and reads their generations
+//! through them instead of opening a log in-process (`SEKAI_OBJECT_LOG`).
+//! The two are mutually exclusive.
+//!
+//! With several hosts the client learns the writer from each host's `health`
+//! role. A write a host refuses because it is a standby or was fenced by a
+//! newer writer is sent again to the rediscovered writer. A write keyed by
+//! an Action id whose reply was lost is sent again too: the host treats a
+//! repeat of a committed id as a no-op, so the log answers the unknown
+//! outcome. After a write the client keeps the snapshot it produced and
+//! passes it as `min_version` on later reads, so a read after a write
+//! includes it whichever host answers. A reply that does not carry a
+//! snapshot at or past that version (a host that has not caught up, or an
+//! older host without versions) is not used.
 //!
 //! The wire is the pinned mikura tag's `mikura-host` contract: one JSON line
-//! per connection, envelope `{ v: 1, token?, op, … }`, one JSON line back.
-//! Every failure (unreachable host, rejected request, malformed or oversized
-//! reply, wrong wire version) fails closed. The client never falls back to a
-//! local log, and the bearer never appears in errors or `Debug` output.
+//! per connection, envelope `{ v: 1, token?, min_version?, op, … }`, one
+//! JSON line back. Every failure (unreachable hosts, rejected request,
+//! malformed or oversized reply, wrong wire version) fails closed. The
+//! client never falls back to a local log, and the bearer never appears in
+//! errors or `Debug` output.
 
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mikura::{ObjectRecord, OverlayPatch};
@@ -23,7 +36,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const HOST_ENV: &str = "SEKAI_OBJECT_LOG_HOST";
-/// Bearer the host requires (ADR 0007 on the mikura side). Required for any
+/// Bearer the hosts require (ADR 0007 on the mikura side). Required for any
 /// non-loopback host.
 pub const HOST_BEARER_ENV: &str = "SEKAI_OBJECT_LOG_HOST_BEARER";
 
@@ -31,17 +44,28 @@ const WIRE_V: u64 = 1;
 const MAX_REPLY_BYTES: usize = 4 << 20;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Client for one writer host and its standbys. Clones share the learned
+/// writer and the read-your-writes version.
 #[derive(Clone)]
 pub struct ObjectLogHost {
-    addr: SocketAddr,
+    hosts: Arc<[SocketAddr]>,
     bearer: Option<String>,
+    state: Arc<Mutex<ClientState>>,
+}
+
+#[derive(Default)]
+struct ClientState {
+    /// Index into `hosts` of the last host that reported the writer role.
+    writer: Option<usize>,
+    /// Highest snapshot this client's own writes produced.
+    written_version: Option<u64>,
 }
 
 impl fmt::Debug for ObjectLogHost {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ObjectLogHost")
-            .field("addr", &self.addr)
+            .field("hosts", &self.hosts)
             .field("bearer", &self.bearer.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -55,26 +79,79 @@ struct Reply {
     error: Option<String>,
     #[serde(default)]
     load: Option<ObjectRecord>,
+    #[serde(default)]
+    health: Option<Health>,
+    /// Snapshot the reply was answered at; absent on older hosts.
+    #[serde(default)]
+    manifest_version: Option<u64>,
+    /// How far that snapshot trails the writer's.
+    #[serde(default)]
+    behind: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct Health {
+    #[serde(default)]
+    role: String,
+}
+
+/// Why a host answered without serving the request.
+enum Refusal {
+    /// A standby, or a writer fenced by a newer one. Try the writer.
+    NotWriter,
+    /// The host has not reached the requested `min_version`.
+    Behind,
+    Other,
+}
+
+fn refusal(reply: &Reply) -> Refusal {
+    let error = reply.error.as_deref().unwrap_or("");
+    if error.starts_with(mikura::LOG_FENCED) || error == "standby refuses writes" {
+        Refusal::NotWriter
+    } else if error.starts_with("minimum manifest version") {
+        Refusal::Behind
+    } else {
+        Refusal::Other
+    }
+}
+
+/// Whether a lost reply may be resolved by sending the write again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Repeat {
+    /// Keyed by an Action id: the host applies a repeat at most once.
+    Idempotent,
+    /// Not keyed: the caller resolves a lost reply by reading the log.
+    Once,
 }
 
 impl ObjectLogHost {
-    /// A client for `host:port`. A host that is not on loopback must be
-    /// given a bearer, since it serves object identity to anyone who can
-    /// reach it.
-    pub fn new(address: &str, bearer: Option<String>) -> Result<Self, String> {
-        let addr = address
-            .trim()
-            .to_socket_addrs()
-            .map_err(|_| format!("{HOST_ENV} must be host:port"))?
-            .next()
-            .ok_or_else(|| format!("{HOST_ENV} did not resolve"))?;
+    /// A client for `host:port`, or for a comma-separated list of a writer
+    /// and its standbys. A host that is not on loopback must be given a
+    /// bearer, since it serves object identity to anyone who can reach it.
+    pub fn new(addresses: &str, bearer: Option<String>) -> Result<Self, String> {
         let bearer = bearer.filter(|bearer| !bearer.trim().is_empty());
-        if !addr.ip().is_loopback() && bearer.is_none() {
-            return Err(format!(
-                "{HOST_ENV} on a non-loopback address requires {HOST_BEARER_ENV}"
-            ));
-        }
-        Ok(Self { addr, bearer })
+        let hosts = addresses
+            .split(',')
+            .map(|address| {
+                let addr = address
+                    .trim()
+                    .to_socket_addrs()
+                    .map_err(|_| format!("{HOST_ENV} must be host:port[,host:port…]"))?
+                    .next()
+                    .ok_or_else(|| format!("{HOST_ENV} did not resolve"))?;
+                if !addr.ip().is_loopback() && bearer.is_none() {
+                    return Err(format!(
+                        "{HOST_ENV} on a non-loopback address requires {HOST_BEARER_ENV}"
+                    ));
+                }
+                Ok(addr)
+            })
+            .collect::<Result<Arc<[_]>, String>>()?;
+        Ok(Self {
+            hosts,
+            bearer,
+            state: Arc::default(),
+        })
     }
 
     /// Resolves the process host client once. Later admits reuse this
@@ -97,7 +174,15 @@ impl ObjectLogHost {
         Self::new(&address, std::env::var(HOST_BEARER_ENV).ok()).map(Some)
     }
 
-    fn call(&self, mut request: Value) -> Result<Reply, String> {
+    fn state(&self) -> std::sync::MutexGuard<'_, ClientState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// One request to one host. Transport errors mean the outcome is unknown.
+    fn call_at(&self, index: usize, mut request: Value) -> Result<Reply, String> {
+        let addr = self.hosts[index];
         request["v"] = json!(WIRE_V);
         if let Some(bearer) = &self.bearer {
             request["token"] = json!(bearer);
@@ -107,7 +192,7 @@ impl ObjectLogHost {
         let unreachable = |_| "object-log host is unreachable".to_string();
         #[cfg(test)]
         CONNECT_COUNT.with(|count| count.set(count.get() + 1));
-        let mut stream = TcpStream::connect_timeout(&self.addr, TIMEOUT).map_err(unreachable)?;
+        let mut stream = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(unreachable)?;
         stream
             .set_read_timeout(Some(TIMEOUT))
             .map_err(unreachable)?;
@@ -132,7 +217,115 @@ impl ObjectLogHost {
         if reply.v != WIRE_V {
             return Err(format!("unsupported object-log host wire v {}", reply.v));
         }
+        if let Some(behind) = reply.behind {
+            crate::obs::metrics::set_object_log_host_behind(&addr.to_string(), behind);
+        }
         Ok(reply)
+    }
+
+    /// The writer's index. One configured host is the writer without a
+    /// `health` round trip, so a single older host keeps working. With
+    /// several, the first host whose `health` role is `writer` wins; a host
+    /// fenced by a newer writer reports `fenced` and is never chosen again.
+    fn writer(&self) -> Result<usize, String> {
+        if let Some(index) = self.state().writer {
+            return Ok(index);
+        }
+        let found = if self.hosts.len() == 1 {
+            Some(0)
+        } else {
+            (0..self.hosts.len()).find(|&index| {
+                self.call_at(index, json!({ "op": "health" }))
+                    .ok()
+                    .and_then(|reply| reply.health)
+                    .is_some_and(|health| health.role == "writer")
+            })
+        };
+        let index = found.ok_or("no object-log host reports the writer role")?;
+        self.state().writer = Some(index);
+        for (other, addr) in self.hosts.iter().enumerate() {
+            crate::obs::metrics::set_object_log_host_writer(&addr.to_string(), other == index);
+        }
+        Ok(index)
+    }
+
+    fn forget_writer(&self, index: usize) {
+        let mut state = self.state();
+        if state.writer == Some(index) {
+            state.writer = None;
+        }
+    }
+
+    /// Sends a write to the writer. A standby or fenced refusal is sent
+    /// again to the rediscovered writer; a lost reply is sent again only
+    /// when `repeat` allows it. Attempts are bounded by the host count.
+    fn write(&self, request: Value, repeat: Repeat) -> Result<Reply, String> {
+        let mut last_error = String::from("no object-log host reports the writer role");
+        for attempt in 0..=self.hosts.len() {
+            if attempt > 0 {
+                crate::obs::metrics::record_object_log_host_retry();
+            }
+            let Ok(index) = self.writer() else { continue };
+            match self.call_at(index, request.clone()) {
+                Ok(reply) if reply.ok => {
+                    if let Some(version) = reply.manifest_version {
+                        let mut state = self.state();
+                        state.written_version = state.written_version.max(Some(version));
+                    }
+                    return Ok(reply);
+                }
+                Ok(reply) if matches!(refusal(&reply), Refusal::NotWriter) => {
+                    self.forget_writer(index);
+                    last_error = reply.error.unwrap_or_default();
+                }
+                Ok(reply) => return Ok(reply),
+                Err(error) => {
+                    self.forget_writer(index);
+                    if repeat == Repeat::Once {
+                        return Err(error);
+                    }
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Sends a read with this client's written version as `min_version`,
+    /// writer first. A host that is behind that version, unreachable, or
+    /// answers without a version is skipped for the next host.
+    fn read(&self, mut request: Value) -> Result<Reply, String> {
+        let min_version = self.state().written_version.filter(|version| *version > 0);
+        if let Some(version) = min_version {
+            request["min_version"] = json!(version);
+        }
+        let first = self.writer().ok();
+        let order = first
+            .into_iter()
+            .chain((0..self.hosts.len()).filter(|index| Some(*index) != first));
+        let mut last_error = String::from("object-log host is unreachable");
+        for (attempt, index) in order.enumerate() {
+            if attempt > 0 {
+                crate::obs::metrics::record_object_log_host_retry();
+            }
+            match self.call_at(index, request.clone()) {
+                Ok(reply) if matches!(refusal(&reply), Refusal::Behind) => {
+                    last_error = reply.error.unwrap_or_default();
+                }
+                Ok(reply)
+                    if min_version
+                        .is_some_and(|min| reply.manifest_version.is_none_or(|at| at < min)) =>
+                {
+                    last_error = "object-log host did not report the requested version".into();
+                }
+                Ok(reply) => return Ok(reply),
+                Err(error) => {
+                    self.forget_writer(index);
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
     }
 
     fn require_ok(reply: Reply) -> Result<Reply, String> {
@@ -148,8 +341,11 @@ impl ObjectLogHost {
 
     /// Commits `records` as one batch on the host.
     pub fn ingest_batch(&self, records: &[ObjectRecord]) -> Result<(), String> {
-        Self::require_ok(self.call(json!({ "op": "ingest_batch", "records": records }))?)
-            .map(|_| ())
+        Self::require_ok(self.write(
+            json!({ "op": "ingest_batch", "records": records }),
+            Repeat::Once,
+        )?)
+        .map(|_| ())
     }
 
     /// The identity's current record, or `None` when the host has never
@@ -160,7 +356,7 @@ impl ObjectLogHost {
         kind: &str,
         key: &str,
     ) -> Result<Option<ObjectRecord>, String> {
-        let reply = self.call(json!({
+        let reply = self.read(json!({
             "op": "load",
             "namespace": namespace,
             "kind": kind,
@@ -221,15 +417,18 @@ impl ObjectLogHost {
         record: &ObjectRecord,
         expected_gen: u64,
     ) -> Result<(), String> {
-        Self::require_ok(self.call(json!({
-            "op": "apply_action",
-            "id": action_id,
-            "namespace": record.namespace,
-            "kind": record.kind,
-            "key": record.key,
-            "props": record.props,
-            "expected_gen": expected_gen,
-        }))?)
+        Self::require_ok(self.write(
+            json!({
+                "op": "apply_action",
+                "id": action_id,
+                "namespace": record.namespace,
+                "kind": record.kind,
+                "key": record.key,
+                "props": record.props,
+                "expected_gen": expected_gen,
+            }),
+            Repeat::Idempotent,
+        )?)
         .map(|_| ())
     }
 
@@ -238,11 +437,14 @@ impl ObjectLogHost {
     /// is required; a repeat of a committed id is a no-op. A stale
     /// generation reads as `stale generation`.
     pub fn ingest_fenced(&self, record: &ObjectRecord, expected_gen: u64) -> Result<(), String> {
-        Self::require_ok(self.call(json!({
-            "op": "ingest_fenced",
-            "record": record,
-            "expected_gen": expected_gen,
-        }))?)
+        Self::require_ok(self.write(
+            json!({
+                "op": "ingest_fenced",
+                "record": record,
+                "expected_gen": expected_gen,
+            }),
+            Repeat::Idempotent,
+        )?)
         .map(|_| ())
     }
 
@@ -268,7 +470,7 @@ impl ObjectLogHost {
         if let Some(generation) = expected_gen {
             request["expected_gen"] = json!(generation);
         }
-        Self::require_ok(self.call(request)?).map(|_| ())
+        Self::require_ok(self.write(request, Repeat::Idempotent)?).map(|_| ())
     }
 }
 
@@ -310,6 +512,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     fn record(key: &str, region: &str) -> ObjectRecord {
         ObjectRecord {
@@ -563,5 +766,212 @@ mod tests {
             5,
             "first admit is load+ingest+load; later identical admits are one load each"
         );
+    }
+
+    /// A writer and a standby host on one log, each on its own loopback
+    /// port. The writer can be stopped; both stay reachable as in-process
+    /// handles for promotion and health.
+    struct Pair {
+        _dir: tempfile::TempDir,
+        writer: mikura_host::Host,
+        writer_addr: SocketAddr,
+        standby: mikura_host::Host,
+        standby_addr: SocketAddr,
+        stop_writer: Arc<std::sync::atomic::AtomicBool>,
+        writer_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Pair {
+        fn open() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("objects.mikura");
+            let writer = mikura_host::Host::open(&log, 64).unwrap();
+            // `apply_action` needs an opened namespace.
+            let seeded = writer.handle(mikura_host::HostRequest::IngestBatch {
+                records: vec![record("seed", "eu")],
+            });
+            assert!(seeded.ok, "{:?}", seeded.error);
+            let standby = mikura_host::Host::open_standby(&log, 64).unwrap();
+            let stop_writer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let listener = mikura_host::Host::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+            let writer_addr = listener.local_addr().unwrap();
+            let served = writer.clone();
+            let stop = stop_writer.clone();
+            let writer_thread = std::thread::spawn(move || {
+                let _ = served
+                    .serve_while(listener, || !stop.load(std::sync::atomic::Ordering::SeqCst));
+            });
+            let listener = mikura_host::Host::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+            let standby_addr = listener.local_addr().unwrap();
+            let served = standby.clone();
+            std::thread::spawn(move || {
+                let _ = served.serve(listener);
+            });
+            Self {
+                _dir: dir,
+                writer,
+                writer_addr,
+                standby,
+                standby_addr,
+                stop_writer,
+                writer_thread: Some(writer_thread),
+            }
+        }
+
+        fn client(&self) -> ObjectLogHost {
+            ObjectLogHost::new(&format!("{},{}", self.writer_addr, self.standby_addr), None)
+                .unwrap()
+        }
+
+        fn promote_standby(&self) {
+            let promoted = self.standby.handle(mikura_host::HostRequest::Promote);
+            assert!(promoted.ok, "{:?}", promoted.error);
+        }
+
+        /// Closes the writer's port; later connects are refused.
+        fn stop_writer(&mut self) {
+            self.stop_writer
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = TcpStream::connect(self.writer_addr);
+            self.writer_thread.take().unwrap().join().unwrap();
+        }
+
+        fn rejected(host: &mikura_host::Host) -> u64 {
+            host.handle(mikura_host::HostRequest::Health)
+                .health
+                .unwrap()
+                .rejected
+        }
+    }
+
+    fn apply_until_admitted(client: &ObjectLogHost, id: &str, record: &ObjectRecord) {
+        // A refused or unreachable write returns an error; the durable
+        // ingest intent (#2289) sends it again. Stand in for that retry.
+        for _ in 0..200 {
+            if client.apply_action(id, record, 0).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{id} was never admitted");
+    }
+
+    #[test]
+    fn the_client_learns_the_writer_from_health_whichever_host_is_listed_first() {
+        let pair = Pair::open();
+        let client =
+            ObjectLogHost::new(&format!("{},{}", pair.standby_addr, pair.writer_addr), None)
+                .unwrap();
+        let standby_rejected = Pair::rejected(&pair.standby);
+        let generation = client.admit(record("c-1", "eu")).unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(client.state().writer, Some(1));
+        assert_eq!(Pair::rejected(&pair.standby), standby_rejected);
+    }
+
+    #[test]
+    fn replacing_the_writer_under_load_loses_and_doubles_no_action() {
+        let pair = Pair::open();
+        // Two clerk replicas: independent clients, no shared state.
+        let replicas = [pair.client(), pair.client()];
+        let writes = 40;
+        let halfway = std::sync::Barrier::new(replicas.len() + 1);
+        let before = Pair::rejected(&pair.writer);
+        std::thread::scope(|scope| {
+            for (replica, client) in replicas.iter().enumerate() {
+                let halfway = &halfway;
+                scope.spawn(move || {
+                    for index in 0..writes {
+                        if index == writes / 2 {
+                            halfway.wait();
+                        }
+                        let key = format!("r{replica}-{index}");
+                        let id = format!("act-{key}");
+                        apply_until_admitted(client, &id, &record(&key, "eu"));
+                    }
+                });
+            }
+            // Both replicas have written to the first writer and still hold
+            // it as their writer when the standby takes over.
+            halfway.wait();
+            pair.promote_standby();
+        });
+
+        // Each replica's next write after the promotion was refused by the
+        // fenced host, then sent to the new writer.
+        let fenced_rejected = Pair::rejected(&pair.writer);
+        assert!(fenced_rejected >= before + replicas.len() as u64);
+        for client in &replicas {
+            assert_eq!(client.state().writer, Some(1));
+            client.admit(record("after", "eu")).unwrap();
+        }
+        // A fenced host is never written to again once it refused.
+        assert_eq!(Pair::rejected(&pair.writer), fenced_rejected);
+
+        let reader = pair.client();
+        for replica in 0..replicas.len() {
+            for index in 0..writes {
+                let key = format!("r{replica}-{index}");
+                let committed = reader.load("sales", "Customer", &key).unwrap().unwrap();
+                assert_eq!(committed.r#gen, 1, "{key} applied more than once");
+                assert_eq!(committed.action_id.as_deref(), Some(&*format!("act-{key}")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_after_a_write_includes_it_when_only_a_standby_answers() {
+        let mut pair = Pair::open();
+        let client = pair.client();
+        client
+            .apply_action("act-c-1", &record("c-1", "eu"), 0)
+            .unwrap();
+        let written = client.state().written_version.unwrap();
+        assert!(written > 0);
+        pair.stop_writer();
+
+        let seen = client.load("sales", "Customer", "c-1").unwrap().unwrap();
+        assert_eq!(seen.props["region"], "eu");
+        // With the writer gone, a write fails closed instead of reaching the
+        // standby.
+        assert!(
+            client
+                .apply_action("act-c-2", &record("c-2", "eu"), 0)
+                .is_err()
+        );
+        assert_eq!(client.load("sales", "Customer", "c-2").unwrap(), None);
+    }
+
+    #[test]
+    fn a_reply_without_the_written_version_is_not_used_for_the_read() {
+        // An older host answers without a snapshot version; a host that is
+        // behind refuses. Neither may answer a read after this client's write.
+        let older = spawn_scripted(|_| {
+            "{\"v\":1,\"ok\":true,\"load\":{\"gen\":1,\"namespace\":\"sales\",\"kind\":\"Customer\",\"key\":\"c-1\",\"hidden\":false,\"props\":{}}}\n".into()
+        });
+        let behind = spawn_scripted(|_| {
+            "{\"v\":1,\"ok\":false,\"error\":\"minimum manifest version 9 not reached (serving 3)\",\"manifest_version\":3}\n".into()
+        });
+        let client = ObjectLogHost::new(&format!("{older},{behind}"), None).unwrap();
+        client.state().writer = Some(0);
+        client.state().written_version = Some(9);
+        let error = client.load("sales", "Customer", "c-1").unwrap_err();
+        assert!(error.contains("minimum manifest version"), "{error}");
+        // Without a written version, the older host's answer stands.
+        client.state().written_version = None;
+        assert!(client.load("sales", "Customer", "c-1").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_list_rejects_any_unresolvable_or_unauthenticated_entry() {
+        assert_eq!(
+            ObjectLogHost::new("127.0.0.1:1, 127.0.0.1:2", None)
+                .unwrap()
+                .hosts
+                .len(),
+            2
+        );
+        assert!(ObjectLogHost::new("127.0.0.1:1,not-an-address", None).is_err());
+        assert!(ObjectLogHost::new("127.0.0.1:1,203.0.113.9:4000", None).is_err());
     }
 }

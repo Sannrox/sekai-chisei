@@ -122,6 +122,15 @@
         "docs/operator-console.md",
         "docs/decisions/0150-process-local-console-sessions.md"
       ]
+    },
+    {
+      "id": "sekai.object_log_client",
+      "class": "process_local_ok",
+      "notes": "The learned object-log writer and the read-your-writes snapshot are per process. Authority is the hosts: one writer, fenced on promotion, and Action ids that apply at most once. Admitted objects wait in the shared-store ingest intent (#2289), not in the process.",
+      "evidence": [
+        "crates/sekai-core/src/sekai/object_log_host.rs",
+        "docs/decisions/0088-one-object-log-host-many-clerk-clients.md"
+      ]
     }
   ],
   "required_authoritative_surfaces": [

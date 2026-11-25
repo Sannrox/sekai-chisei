@@ -81,6 +81,12 @@ curl --fail http://127.0.0.1:9464/metrics
   ingest has not completed yet; every Sekai replica drains it about every ten
   seconds. A backlog that keeps growing means the object log is unreachable
   or refusing records; the error log names each failed operation.
+  With several object-log hosts in `SEKAI_OBJECT_LOG_HOST`,
+  `sekai_object_log_host_writer{host}` is 1 for the host this replica writes
+  to, `sekai_object_log_host_behind{host}` is how many snapshots a host's
+  last reply trailed its writer, and `sekai_object_log_host_retries_total`
+  counts requests sent again after a standby or fenced refusal, a lost reply,
+  or a host that was behind.
 - `/console/*` is the authenticated operator shell (principal Bearer login,
   HttpOnly session cookie, namespace context). It always fails closed without a
   valid session. After failover onto a replica that did not mint the cookie,

@@ -26,8 +26,9 @@ pub mod obs {
     /// install the recorder before the root binary does.
     pub mod metrics {
         pub use sekai_obs::metrics::{
-            db_lock_poisoned_total, record_db_lock_poisoned, search_index_lag_ms,
-            set_embedding_index_lag_ms, set_object_log_ingest_backlog, set_search_index_lag_ms,
+            db_lock_poisoned_total, record_db_lock_poisoned, record_object_log_host_retry,
+            search_index_lag_ms, set_embedding_index_lag_ms, set_object_log_host_behind,
+            set_object_log_host_writer, set_object_log_ingest_backlog, set_search_index_lag_ms,
         };
 
         pub fn handle() -> &'static sekai_obs::metrics::PrometheusHandle {
