@@ -40,61 +40,22 @@ impl SekaiServiceImpl {
         &self,
         req: Request<GuardedCreateObjectRequest>,
     ) -> Result<Response<GuardedCreateObjectResponse>, Status> {
-        let principals = caller_principals(&req);
-        let purpose = request_purpose_presentation(&req, &principals);
-        let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let caller = ObjectWriteCaller::from_request(self.db.runtime(), &req)?;
+        let ObjectWriteCaller {
+            principals,
+            purpose,
+            tenant_context,
+            ..
+        } = &caller;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
-            require_authenticated(&principals)?;
+            require_authenticated(principals)?;
         }
         let object = input
             .object
             .ok_or(Status::invalid_argument("object required"))?;
-        if object.id.is_empty() {
-            return Err(Status::invalid_argument("id required"));
-        }
-        if object.kind == "namespace" {
-            require_credential_admin(&principals)?;
-            return Err(Status::failed_precondition(
-                "namespace objects must be managed through EnsureTeamNamespace",
-            ));
-        }
-        if object.id.starts_with("namespace:") || object.external_id.starts_with("namespace:") {
-            return Err(Status::invalid_argument(
-                "namespace:* identifiers are reserved for namespace boundaries",
-            ));
-        }
-        if object
-            .external_id
-            .starts_with(markings::PRINCIPAL_PROFILE_EXTERNAL_ID_PREFIX)
-            && object.kind != markings::PRINCIPAL_PROFILE_KIND
-        {
-            return Err(Status::invalid_argument(
-                "principal:* external IDs are reserved for principal_profile objects",
-            ));
-        }
-        enforce_collaboration_namespace(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &object.namespace,
-            true,
-        )?;
-        check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-        check_object_acl_with_audit(
-            self.db.runtime(),
-            &self.security,
-            &object.id,
-            &principals,
-            tenant_context.as_ref(),
-            crate::sekai::object_security::ObjectSecurityOperation::Create,
-        )?;
-        enforce_optional_ontology_revision_pin(
-            self.db.runtime(),
-            revision_pin.as_deref(),
-            &object.namespace,
-        )?;
+        self.admit_object_create(&caller, &object)?;
         if let Some(precondition) = &precondition {
             enforce_collaboration_namespace(
                 self.db.runtime(),
@@ -102,15 +63,10 @@ impl SekaiServiceImpl {
                 &precondition.namespace,
                 true,
             )?;
-            check_team_namespace(
-                self.db.runtime(),
-                &principals,
-                &precondition.namespace,
-                true,
-            )?;
+            check_team_namespace(self.db.runtime(), principals, &precondition.namespace, true)?;
             LeaseLifecycle::new(self.db.runtime(), &self.security, &self.site_id)
                 .with_policy_context(principal_policy_context_from(
-                    &principals,
+                    principals,
                     tenant_context.as_ref(),
                 ))
                 .validate_guarded_mutation(GuardedMutationPrecondition {
@@ -121,15 +77,7 @@ impl SekaiServiceImpl {
                 .map_err(map_lease_lifecycle_error)?;
         }
         let domain_object = from_proto_obj(&object);
-        validate_written_access_marking(self.db.runtime(), &domain_object)?;
-        if !collaboration_object_permitted(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &domain_object,
-            crate::enterprise::NamespaceAction::Write,
-        )? {
-            return Err(Status::permission_denied("access denied"));
-        }
+        self.screen_object_write(&caller, &domain_object)?;
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(self.db.runtime()),
             |precondition| {
@@ -151,7 +99,7 @@ impl SekaiServiceImpl {
             enforce_object_operation_access(
                 self.db.runtime(),
                 &created,
-                &principals,
+                principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Create,
                 &format!("guarded_create_object_replay:{}", created.id),
@@ -159,7 +107,7 @@ impl SekaiServiceImpl {
             )?;
             let created = self.resolve_computed_for_response(
                 created,
-                &principals,
+                principals,
                 tenant_context.as_ref(),
                 purpose.as_ref(),
             )?;
@@ -167,71 +115,7 @@ impl SekaiServiceImpl {
                 object: Some(to_proto_obj(&created)),
             }));
         }
-        if is_reserved_governance_kind(&domain_object.kind) {
-            return Err(Status::permission_denied(
-                "reserved governance kind; use the dedicated action RPCs",
-            ));
-        }
-        if domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
-            return Err(Status::permission_denied(
-                "catalog entries change only through RegisterCatalogEntry",
-            ));
-        }
-        if governed_action_only(&domain_object.kind) {
-            return Err(Status::permission_denied(
-                "this kind changes only through its governed Actions",
-            ));
-        }
-        self.refuse_generic_write_for_published_type(
-            &domain_object.namespace,
-            &domain_object.kind,
-        )?;
-        let mut domain_object = domain_object;
-        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
-            require_credential_admin(&principals)?;
-            validate_principal_profile_object(&object)?;
-            domain_object.properties.insert(
-                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
-                "true".into(),
-            );
-        } else {
-            self.require_schema_kind_loaded(&domain_object.kind)?;
-            let schema = self
-                .schema_definitions
-                .snapshot()
-                .map_err(map_schema_definition_lifecycle_error)?;
-            schema
-                .validate(&domain_object)
-                .map_err(Status::invalid_argument)?;
-            ensure_restricted_create_properties_allowed(
-                &schema,
-                &self.security,
-                &principals,
-                &domain_object,
-            )?;
-            if let Some(actor) = tenant_context
-                .as_ref()
-                .and_then(|context| context.act.as_ref())
-            {
-                ensure_restricted_create_properties_allowed(
-                    &schema,
-                    &self.security,
-                    std::slice::from_ref(actor),
-                    &domain_object,
-                )?;
-            }
-            drop(schema);
-        }
-        enforce_property_grant_mutation(self.db.runtime(), None, &mut domain_object)?;
-        enforce_object_operation_access(
-            self.db.runtime(),
-            &domain_object,
-            &principals,
-            tenant_context.as_ref(),
-            crate::sekai::object_security::ObjectSecurityOperation::Create,
-            &format!("guarded_create_object:{}", domain_object.id),
-            purpose.as_ref(),
-        )?;
+        let domain_object = self.authorize_object_create(&caller, &object, domain_object)?;
         let policy_generation =
             object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -267,7 +151,7 @@ impl SekaiServiceImpl {
         }
         let created = self.resolve_computed_for_response(
             created,
-            &principals,
+            principals,
             tenant_context.as_ref(),
             purpose.as_ref(),
         )?;
@@ -280,110 +164,30 @@ impl SekaiServiceImpl {
         &self,
         req: Request<GuardedUpdateObjectRequest>,
     ) -> Result<Response<GuardedUpdateObjectResponse>, Status> {
-        let principals = caller_principals(&req);
-        let purpose = request_purpose_presentation(&req, &principals);
-        let revision_pin = ontology_revision_pin(&req);
-        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let caller = ObjectWriteCaller::from_request(self.db.runtime(), &req)?;
+        let ObjectWriteCaller {
+            principals,
+            purpose,
+            tenant_context,
+            ..
+        } = &caller;
         let input = req.into_inner();
         let precondition = input.lease_precondition;
         if precondition.is_some() {
-            require_authenticated(&principals)?;
+            require_authenticated(principals)?;
         }
         let object = input
             .object
             .ok_or(Status::invalid_argument("object required"))?;
-        if object.id.is_empty() {
-            return Err(Status::invalid_argument("id required"));
-        }
-        if object.external_id.starts_with("namespace:") && object.kind != "namespace" {
-            return Err(Status::invalid_argument(
-                "namespace:* external IDs are reserved for namespace boundaries",
-            ));
-        }
         let existing = self
             .db
             .runtime()
             .get_object(&object.id)
             .map_err(Status::internal)?;
-        // A direct update of a site agent instance is never valid, and must
-        // not reveal one the caller may not read: it answers as for a
-        // missing object, before any authorization (ADR 0136).
-        if existing
-            .as_ref()
-            .is_some_and(|current| governed_action_only(&current.kind))
-        {
-            return Err(Status::not_found("not found"));
-        }
-        if let Some(current) = &existing
-            && evaluate_active_object_policy(
-                self.db.runtime(),
-                current,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Update,
-                purpose.as_ref(),
-            )? == Some(false)
-        {
-            return Err(Status::not_found("not found"));
-        }
         if precondition.is_none() && existing.is_none() {
             return Err(Status::not_found("not found"));
         }
-        if object.kind == "namespace"
-            || existing
-                .as_ref()
-                .is_some_and(|existing| existing.kind == "namespace")
-        {
-            require_credential_admin(&principals)?;
-        }
-        if object.kind == markings::PRINCIPAL_PROFILE_KIND
-            || existing
-                .as_ref()
-                .is_some_and(|existing| existing.kind == markings::PRINCIPAL_PROFILE_KIND)
-        {
-            require_credential_admin(&principals)?;
-            validate_principal_profile_object(&object)?;
-        }
-        if let Some(existing) = &existing {
-            enforce_collaboration_namespace(
-                self.db.runtime(),
-                tenant_context.as_ref(),
-                &existing.namespace,
-                true,
-            )?;
-            check_team_namespace(self.db.runtime(), &principals, &existing.namespace, true)?;
-        }
-        enforce_collaboration_namespace(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &object.namespace,
-            true,
-        )?;
-        check_team_namespace(self.db.runtime(), &principals, &object.namespace, true)?;
-        check_object_acl_with_audit(
-            self.db.runtime(),
-            &self.security,
-            &object.id,
-            &principals,
-            tenant_context.as_ref(),
-            crate::sekai::object_security::ObjectSecurityOperation::Update,
-        )?;
-        enforce_optional_ontology_revision_pin(
-            self.db.runtime(),
-            revision_pin.as_deref(),
-            &object.namespace,
-        )?;
-        if let Some(existing) = &existing {
-            enforce_object_operation_access(
-                self.db.runtime(),
-                existing,
-                &principals,
-                tenant_context.as_ref(),
-                crate::sekai::object_security::ObjectSecurityOperation::Update,
-                &format!("guarded_update_object:{}", existing.id),
-                purpose.as_ref(),
-            )?;
-        }
+        self.admit_object_update(&caller, &object, existing.as_ref())?;
         if let Some(precondition) = &precondition {
             enforce_collaboration_namespace(
                 self.db.runtime(),
@@ -391,15 +195,10 @@ impl SekaiServiceImpl {
                 &precondition.namespace,
                 true,
             )?;
-            check_team_namespace(
-                self.db.runtime(),
-                &principals,
-                &precondition.namespace,
-                true,
-            )?;
+            check_team_namespace(self.db.runtime(), principals, &precondition.namespace, true)?;
             LeaseLifecycle::new(self.db.runtime(), &self.security, &self.site_id)
                 .with_policy_context(principal_policy_context_from(
-                    &principals,
+                    principals,
                     tenant_context.as_ref(),
                 ))
                 .validate_guarded_mutation(GuardedMutationPrecondition {
@@ -412,16 +211,8 @@ impl SekaiServiceImpl {
                 })
                 .map_err(map_lease_lifecycle_error)?;
         }
-        let mut domain_object = from_proto_obj(&object);
-        validate_written_access_marking(self.db.runtime(), &domain_object)?;
-        if !collaboration_object_permitted(
-            self.db.runtime(),
-            tenant_context.as_ref(),
-            &domain_object,
-            crate::enterprise::NamespaceAction::Write,
-        )? {
-            return Err(Status::permission_denied("access denied"));
-        }
+        let domain_object = from_proto_obj(&object);
+        self.screen_object_write(&caller, &domain_object)?;
         let request_object = domain_object.clone();
         let mutation = precondition.as_ref().map_or_else(
             || ObjectMutation::direct(self.db.runtime()),
@@ -444,7 +235,7 @@ impl SekaiServiceImpl {
             enforce_object_operation_access(
                 self.db.runtime(),
                 &updated,
-                &principals,
+                principals,
                 tenant_context.as_ref(),
                 crate::sekai::object_security::ObjectSecurityOperation::Update,
                 &format!("guarded_update_object_replay:{}", updated.id),
@@ -452,7 +243,7 @@ impl SekaiServiceImpl {
             )?;
             let updated = self.resolve_computed_for_response(
                 updated,
-                &principals,
+                principals,
                 tenant_context.as_ref(),
                 purpose.as_ref(),
             )?;
@@ -460,137 +251,8 @@ impl SekaiServiceImpl {
                 object: Some(to_proto_obj(&updated)),
             }));
         }
-        if is_reserved_governance_kind(&domain_object.kind)
-            || existing
-                .as_ref()
-                .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
-            || domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
-            || existing
-                .as_ref()
-                .is_some_and(|existing| existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND)
-            || governed_action_only(&domain_object.kind)
-            || existing
-                .as_ref()
-                .is_some_and(|existing| governed_action_only(&existing.kind))
-        {
-            return Err(Status::permission_denied(
-                "reserved governance kind; use the dedicated action RPCs",
-            ));
-        }
-        self.refuse_generic_write_for_published_type(
-            &domain_object.namespace,
-            &domain_object.kind,
-        )?;
-        if let Some(existing) = &existing {
-            self.refuse_generic_write_for_published_type(&existing.namespace, &existing.kind)?;
-        }
-        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
-            domain_object.properties.insert(
-                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
-                "true".into(),
-            );
-            enforce_property_grant_mutation(
-                self.db.runtime(),
-                existing.as_ref(),
-                &mut domain_object,
-            )?;
-        } else {
-            self.require_schema_kind_loaded(&domain_object.kind)?;
-            let schema = self
-                .schema_definitions
-                .snapshot()
-                .map_err(map_schema_definition_lifecycle_error)?;
-            if existing.is_some() {
-                preserve_redacted_restricted_properties(
-                    self.db.runtime(),
-                    &schema,
-                    &self.security,
-                    &principals,
-                    &mut domain_object,
-                )?;
-            }
-            if let Some(actor) = tenant_context
-                .as_ref()
-                .and_then(|context| context.act.as_ref())
-            {
-                if existing.is_some() {
-                    preserve_redacted_restricted_properties(
-                        self.db.runtime(),
-                        &schema,
-                        &self.security,
-                        std::slice::from_ref(actor),
-                        &mut domain_object,
-                    )?;
-                } else {
-                    ensure_restricted_create_properties_allowed(
-                        &schema,
-                        &self.security,
-                        std::slice::from_ref(actor),
-                        &domain_object,
-                    )?;
-                }
-            }
-            enforce_property_grant_mutation(
-                self.db.runtime(),
-                existing.as_ref(),
-                &mut domain_object,
-            )?;
-            schema
-                .validate(&domain_object)
-                .map_err(Status::invalid_argument)?;
-            drop(schema);
-        }
-        if let Some(existing) = &existing {
-            validate_object_kind_change_access(
-                self.db.runtime(),
-                &self.security,
-                &principals,
-                existing,
-                &domain_object,
-            )?;
-            ensure_policy_driving_update_allowed(
-                self.db.runtime(),
-                &self.security,
-                existing,
-                &domain_object,
-                &principals,
-            )?;
-            if let Some(actor) = tenant_context
-                .as_ref()
-                .and_then(|context| context.act.as_ref())
-            {
-                validate_object_kind_change_access(
-                    self.db.runtime(),
-                    &self.security,
-                    std::slice::from_ref(actor),
-                    existing,
-                    &domain_object,
-                )?;
-                ensure_policy_driving_update_allowed(
-                    self.db.runtime(),
-                    &self.security,
-                    existing,
-                    &domain_object,
-                    std::slice::from_ref(actor),
-                )?;
-            }
-        }
-        enforce_object_operation_access(
-            self.db.runtime(),
-            &domain_object,
-            &principals,
-            tenant_context.as_ref(),
-            crate::sekai::object_security::ObjectSecurityOperation::Update,
-            &format!("guarded_update_object_proposed:{}", domain_object.id),
-            purpose.as_ref(),
-        )?;
-        enforce_marking_declassify(
-            self.db.runtime(),
-            existing.as_ref(),
-            &domain_object,
-            &principals,
-            tenant_context.as_ref(),
-        )?;
+        let domain_object =
+            self.authorize_object_update(&caller, existing.as_ref(), domain_object)?;
         let policy_generation =
             object_security_generation(self.db.runtime(), &domain_object.namespace)?;
         let actor = principals.first().map(String::as_str).unwrap_or_default();
@@ -606,7 +268,7 @@ impl SekaiServiceImpl {
             .map_err(map_mutation_persistence_error)?;
         let updated = self.resolve_computed_for_response(
             updated,
-            &principals,
+            principals,
             tenant_context.as_ref(),
             purpose.as_ref(),
         )?;
@@ -838,4 +500,424 @@ fn governed_action_only(kind: &str) -> bool {
         || crate::sekai::hosted_session::is_action_only_kind(kind)
         || crate::sekai::security_package::is_package_kind(kind)
         || crate::sekai::feedback_package::is_package_kind(kind)
+}
+
+/// The caller of an object write, read once from its request.
+pub(super) struct ObjectWriteCaller {
+    pub(super) principals: Vec<String>,
+    pub(super) purpose: Option<crate::sekai::purpose_authorization::PurposePresentation>,
+    pub(super) revision_pin: Option<String>,
+    pub(super) tenant_context: Option<RequestEnterpriseContext>,
+}
+
+impl ObjectWriteCaller {
+    pub(super) fn from_request(
+        db: &RuntimeDb,
+        req: &Request<impl std::any::Any>,
+    ) -> Result<Self, Status> {
+        let principals = caller_principals(req);
+        Ok(Self {
+            purpose: request_purpose_presentation(req, &principals),
+            revision_pin: ontology_revision_pin(req),
+            tenant_context: request_tenant_context(db, req)?,
+            principals,
+        })
+    }
+}
+
+/// Object create and update authorization in the order the single-record
+/// RPCs apply it: `admit_*` before any lease check, `screen_object_write`
+/// before replay, `authorize_*` after. `ApplyGraphChanges` runs the same
+/// steps per change (#3062).
+impl SekaiServiceImpl {
+    /// Identity, namespace, ACL and revision-pin admission for a create.
+    pub(super) fn admit_object_create(
+        &self,
+        caller: &ObjectWriteCaller,
+        object: &Object,
+    ) -> Result<(), Status> {
+        let ObjectWriteCaller {
+            principals,
+            revision_pin,
+            tenant_context,
+            ..
+        } = caller;
+        if object.id.is_empty() {
+            return Err(Status::invalid_argument("id required"));
+        }
+        if object.kind == "namespace" {
+            require_credential_admin(principals)?;
+            return Err(Status::failed_precondition(
+                "namespace objects must be managed through EnsureTeamNamespace",
+            ));
+        }
+        if object.id.starts_with("namespace:") || object.external_id.starts_with("namespace:") {
+            return Err(Status::invalid_argument(
+                "namespace:* identifiers are reserved for namespace boundaries",
+            ));
+        }
+        if object
+            .external_id
+            .starts_with(markings::PRINCIPAL_PROFILE_EXTERNAL_ID_PREFIX)
+            && object.kind != markings::PRINCIPAL_PROFILE_KIND
+        {
+            return Err(Status::invalid_argument(
+                "principal:* external IDs are reserved for principal_profile objects",
+            ));
+        }
+        enforce_collaboration_namespace(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &object.namespace,
+            true,
+        )?;
+        check_team_namespace(self.db.runtime(), principals, &object.namespace, true)?;
+        check_object_acl_with_audit(
+            self.db.runtime(),
+            &self.security,
+            &object.id,
+            principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Create,
+        )?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &object.namespace,
+        )?;
+        Ok(())
+    }
+
+    /// Marking and collaboration checks on the object as written.
+    pub(super) fn screen_object_write(
+        &self,
+        caller: &ObjectWriteCaller,
+        domain_object: &domain::Object,
+    ) -> Result<(), Status> {
+        validate_written_access_marking(self.db.runtime(), domain_object)?;
+        if !collaboration_object_permitted(
+            self.db.runtime(),
+            caller.tenant_context.as_ref(),
+            domain_object,
+            crate::enterprise::NamespaceAction::Write,
+        )? {
+            return Err(Status::permission_denied("access denied"));
+        }
+        Ok(())
+    }
+
+    /// Kind, schema, property-grant and operation checks for a create.
+    /// Returns the object to persist.
+    pub(super) fn authorize_object_create(
+        &self,
+        caller: &ObjectWriteCaller,
+        object: &Object,
+        domain_object: domain::Object,
+    ) -> Result<domain::Object, Status> {
+        let ObjectWriteCaller {
+            principals,
+            purpose,
+            tenant_context,
+            ..
+        } = caller;
+        if is_reserved_governance_kind(&domain_object.kind) {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
+        if domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND {
+            return Err(Status::permission_denied(
+                "catalog entries change only through RegisterCatalogEntry",
+            ));
+        }
+        if governed_action_only(&domain_object.kind) {
+            return Err(Status::permission_denied(
+                "this kind changes only through its governed Actions",
+            ));
+        }
+        self.refuse_generic_write_for_published_type(
+            &domain_object.namespace,
+            &domain_object.kind,
+        )?;
+        let mut domain_object = domain_object;
+        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
+            require_credential_admin(principals)?;
+            validate_principal_profile_object(object)?;
+            domain_object.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+        } else {
+            self.require_schema_kind_loaded(&domain_object.kind)?;
+            let schema = self
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
+            schema
+                .validate(&domain_object)
+                .map_err(Status::invalid_argument)?;
+            ensure_restricted_create_properties_allowed(
+                &schema,
+                &self.security,
+                principals,
+                &domain_object,
+            )?;
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                ensure_restricted_create_properties_allowed(
+                    &schema,
+                    &self.security,
+                    std::slice::from_ref(actor),
+                    &domain_object,
+                )?;
+            }
+            drop(schema);
+        }
+        enforce_property_grant_mutation(self.db.runtime(), None, &mut domain_object)?;
+        enforce_object_operation_access(
+            self.db.runtime(),
+            &domain_object,
+            principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Create,
+            &format!("guarded_create_object:{}", domain_object.id),
+            purpose.as_ref(),
+        )?;
+        Ok(domain_object)
+    }
+
+    /// Policy, namespace, ACL and revision-pin admission for an update of
+    /// `existing` (absent only for a guarded upsert).
+    pub(super) fn admit_object_update(
+        &self,
+        caller: &ObjectWriteCaller,
+        object: &Object,
+        existing: Option<&domain::Object>,
+    ) -> Result<(), Status> {
+        let ObjectWriteCaller {
+            principals,
+            purpose,
+            revision_pin,
+            tenant_context,
+        } = caller;
+        // A direct update of a site agent instance is never valid, and must
+        // not reveal one the caller may not read: it answers as for a
+        // missing object, before any authorization (ADR 0136).
+        if existing
+            .as_ref()
+            .is_some_and(|current| governed_action_only(&current.kind))
+        {
+            return Err(Status::not_found("not found"));
+        }
+        if let Some(current) = &existing
+            && evaluate_active_object_policy(
+                self.db.runtime(),
+                current,
+                principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
+                purpose.as_ref(),
+            )? == Some(false)
+        {
+            return Err(Status::not_found("not found"));
+        }
+        if object.kind == "namespace"
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == "namespace")
+        {
+            require_credential_admin(principals)?;
+        }
+        if object.kind == markings::PRINCIPAL_PROFILE_KIND
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == markings::PRINCIPAL_PROFILE_KIND)
+        {
+            require_credential_admin(principals)?;
+            validate_principal_profile_object(object)?;
+        }
+        if let Some(existing) = &existing {
+            enforce_collaboration_namespace(
+                self.db.runtime(),
+                tenant_context.as_ref(),
+                &existing.namespace,
+                true,
+            )?;
+            check_team_namespace(self.db.runtime(), principals, &existing.namespace, true)?;
+        }
+        enforce_collaboration_namespace(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &object.namespace,
+            true,
+        )?;
+        check_team_namespace(self.db.runtime(), principals, &object.namespace, true)?;
+        check_object_acl_with_audit(
+            self.db.runtime(),
+            &self.security,
+            &object.id,
+            principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Update,
+        )?;
+        enforce_optional_ontology_revision_pin(
+            self.db.runtime(),
+            revision_pin.as_deref(),
+            &object.namespace,
+        )?;
+        if let Some(existing) = &existing {
+            enforce_object_operation_access(
+                self.db.runtime(),
+                existing,
+                principals,
+                tenant_context.as_ref(),
+                crate::sekai::object_security::ObjectSecurityOperation::Update,
+                &format!("guarded_update_object:{}", existing.id),
+                purpose.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Kind, schema, property-grant, policy-driving and marking checks for an
+    /// update. Returns the object to persist.
+    pub(super) fn authorize_object_update(
+        &self,
+        caller: &ObjectWriteCaller,
+        existing: Option<&domain::Object>,
+        mut domain_object: domain::Object,
+    ) -> Result<domain::Object, Status> {
+        let ObjectWriteCaller {
+            principals,
+            purpose,
+            tenant_context,
+            ..
+        } = caller;
+        if is_reserved_governance_kind(&domain_object.kind)
+            || existing
+                .as_ref()
+                .is_some_and(|existing| is_reserved_governance_kind(&existing.kind))
+            || domain_object.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND
+            || existing
+                .as_ref()
+                .is_some_and(|existing| existing.kind == crate::sekai::catalog::CATALOG_ENTRY_KIND)
+            || governed_action_only(&domain_object.kind)
+            || existing
+                .as_ref()
+                .is_some_and(|existing| governed_action_only(&existing.kind))
+        {
+            return Err(Status::permission_denied(
+                "reserved governance kind; use the dedicated action RPCs",
+            ));
+        }
+        self.refuse_generic_write_for_published_type(
+            &domain_object.namespace,
+            &domain_object.kind,
+        )?;
+        if let Some(existing) = &existing {
+            self.refuse_generic_write_for_published_type(&existing.namespace, &existing.kind)?;
+        }
+        if domain_object.kind == markings::PRINCIPAL_PROFILE_KIND {
+            domain_object.properties.insert(
+                markings::PRINCIPAL_PROFILE_SEALED_PROPERTY.into(),
+                "true".into(),
+            );
+            enforce_property_grant_mutation(self.db.runtime(), existing, &mut domain_object)?;
+        } else {
+            self.require_schema_kind_loaded(&domain_object.kind)?;
+            let schema = self
+                .schema_definitions
+                .snapshot()
+                .map_err(map_schema_definition_lifecycle_error)?;
+            if existing.is_some() {
+                preserve_redacted_restricted_properties(
+                    self.db.runtime(),
+                    &schema,
+                    &self.security,
+                    principals,
+                    &mut domain_object,
+                )?;
+            }
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                if existing.is_some() {
+                    preserve_redacted_restricted_properties(
+                        self.db.runtime(),
+                        &schema,
+                        &self.security,
+                        std::slice::from_ref(actor),
+                        &mut domain_object,
+                    )?;
+                } else {
+                    ensure_restricted_create_properties_allowed(
+                        &schema,
+                        &self.security,
+                        std::slice::from_ref(actor),
+                        &domain_object,
+                    )?;
+                }
+            }
+            enforce_property_grant_mutation(self.db.runtime(), existing, &mut domain_object)?;
+            schema
+                .validate(&domain_object)
+                .map_err(Status::invalid_argument)?;
+            drop(schema);
+        }
+        if let Some(existing) = &existing {
+            validate_object_kind_change_access(
+                self.db.runtime(),
+                &self.security,
+                principals,
+                existing,
+                &domain_object,
+            )?;
+            ensure_policy_driving_update_allowed(
+                self.db.runtime(),
+                &self.security,
+                existing,
+                &domain_object,
+                principals,
+            )?;
+            if let Some(actor) = tenant_context
+                .as_ref()
+                .and_then(|context| context.act.as_ref())
+            {
+                validate_object_kind_change_access(
+                    self.db.runtime(),
+                    &self.security,
+                    std::slice::from_ref(actor),
+                    existing,
+                    &domain_object,
+                )?;
+                ensure_policy_driving_update_allowed(
+                    self.db.runtime(),
+                    &self.security,
+                    existing,
+                    &domain_object,
+                    std::slice::from_ref(actor),
+                )?;
+            }
+        }
+        enforce_object_operation_access(
+            self.db.runtime(),
+            &domain_object,
+            principals,
+            tenant_context.as_ref(),
+            crate::sekai::object_security::ObjectSecurityOperation::Update,
+            &format!("guarded_update_object_proposed:{}", domain_object.id),
+            purpose.as_ref(),
+        )?;
+        enforce_marking_declassify(
+            self.db.runtime(),
+            existing,
+            &domain_object,
+            principals,
+            tenant_context.as_ref(),
+        )?;
+        Ok(domain_object)
+    }
 }

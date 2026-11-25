@@ -65,6 +65,7 @@ fn incident_response_graph() -> (Vec<Object>, Vec<Link>) {
 
 fn object(kind: &str, id: &str, name: &str) -> Object {
     Object {
+        revision: String::new(),
         id: id.into(),
         kind: kind.into(),
         name: name.into(),

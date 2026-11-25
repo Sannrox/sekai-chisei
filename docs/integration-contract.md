@@ -50,6 +50,7 @@ Coverage:
 | Ontology relation | supported | Sekai | `SekaiService.CreateOntologyRelation` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/domain-v1.json` |
 | Object seed | supported | Sekai | `SekaiService.CreateObject` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
 | Link seed | supported | Sekai | `SekaiService.CreateLink` | [ontology.md](ontology.md) | `tests/fixtures/product_loop/seed-v1.json` |
+| Atomic graph changes (#3062) | experimental | Sekai | `SekaiService.ApplyGraphChanges` | [graph-changes.md](graph-changes.md) | `tests/graph_changes_backend_conformance.rs` |
 | Plan execution | supported | Chisei | `ChiseiService.PlanExecution` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |
 | Streamed execution | supported | Chisei | `ChiseiService.ExecutePlanStream` | [architecture.md](architecture.md) | `sdk/typescript/client.test.ts` |
 | Operation receipt | supported | Chisei | `ChiseiService.GetOperationReceipt` | [ontology.md](ontology.md) | `sdk/typescript/client.test.ts` |

@@ -100,6 +100,7 @@ pub(super) fn parse_interface_filter(interface_filter: Vec<String>) -> Result<Ve
 }
 pub(super) fn to_proto_obj(o: &domain::Object) -> Object {
     Object {
+        revision: String::new(),
         id: o.id.clone(),
         kind: o.kind.clone(),
         name: o.name.clone(),

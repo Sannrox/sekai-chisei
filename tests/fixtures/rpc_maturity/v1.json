@@ -1419,6 +1419,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ApplyGraphChanges",
+      "storage_path": "sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "core"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "GetLinks",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

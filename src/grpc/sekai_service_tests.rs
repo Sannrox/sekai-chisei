@@ -4545,6 +4545,7 @@ fn widget_schema_type() -> ObjectType {
 
 fn widget_object(id: &str, properties: HashMap<String, String>) -> Object {
     Object {
+        revision: String::new(),
         id: id.into(),
         kind: "widget".into(),
         name: "widget".into(),
@@ -4980,6 +4981,7 @@ async fn deny_unmarked_denies_unmarked_reads_and_keeps_marked_rules() {
 async fn owner_admin_cannot_declassify_without_grant_and_granted_principal_is_audited() {
     let svc = service();
     let marked = Object {
+        revision: String::new(),
         id: "marked-secret".into(),
         kind: "document".into(),
         name: "secret".into(),
@@ -5109,6 +5111,7 @@ async fn owner_admin_cannot_declassify_without_grant_and_granted_principal_is_au
 async fn delegated_actor_without_declassify_grant_cannot_strip_marking() {
     let svc = service();
     let marked = Object {
+        revision: String::new(),
         id: "delegated-marked".into(),
         kind: "document".into(),
         name: "secret".into(),
@@ -5223,6 +5226,7 @@ async fn delegated_actor_without_declassify_grant_cannot_strip_marking() {
 async fn trusted_principal_declassify_uses_profile_grant() {
     let svc = service();
     let marked = Object {
+        revision: String::new(),
         id: "trusted-marked".into(),
         kind: "document".into(),
         name: "secret".into(),
@@ -9905,6 +9909,7 @@ async fn computed_property_resolves_from_function_without_persisting() {
     .unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "cluster-1".into(),
             kind: "cluster".into(),
             name: "cluster".into(),
@@ -9920,6 +9925,7 @@ async fn computed_property_resolves_from_function_without_persisting() {
     .unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "component-1".into(),
             kind: "component".into(),
             name: "component".into(),
@@ -10413,6 +10419,7 @@ async fn unresolved_computed_property_hides_stored_value() {
     .unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "cluster-spoofed".into(),
             kind: "cluster".into(),
             name: "cluster".into(),
@@ -10453,6 +10460,7 @@ async fn object_mutations_record_audit_changes() {
     svc.create_object(with_named_principal(
         CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "audit-1".into(),
                 kind: "component".into(),
                 name: "api".into(),
@@ -10472,6 +10480,7 @@ async fn object_mutations_record_audit_changes() {
     svc.update_object(with_named_principal(
         UpdateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "audit-1".into(),
                 kind: "component".into(),
                 name: "worker".into(),
@@ -10534,6 +10543,7 @@ async fn unified_direct_admission_preserves_reserved_ids_and_missing_updates() {
     let reserved = svc
         .create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "reserved-principal-id".into(),
                 kind: "component".into(),
                 name: "ordinary".into(),
@@ -10555,6 +10565,7 @@ async fn unified_direct_admission_preserves_reserved_ids_and_missing_updates() {
     let missing = svc
         .update_object(with_principal(UpdateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "missing".into(),
                 kind: "unloaded_kind".into(),
                 name: "missing".into(),
@@ -10578,6 +10589,7 @@ async fn unified_direct_admission_preserves_reserved_ids_and_missing_updates() {
 async fn noop_update_does_not_record_audit_change() {
     let svc = service();
     let object = Object {
+        revision: String::new(),
         id: "audit-noop".into(),
         kind: "component".into(),
         name: "api".into(),
@@ -10629,6 +10641,7 @@ async fn audit_insert_failure_rolls_back_create() {
     let err = svc
         .create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "audit-fail-closed".into(),
                 kind: "component".into(),
                 name: "api".into(),
@@ -10658,6 +10671,7 @@ async fn delete_fails_closed_when_delete_audit_insert_fails() {
     let svc = service();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "delete-audit-fail".into(),
             kind: "component".into(),
             name: "api".into(),
@@ -10785,6 +10799,7 @@ async fn untyped_kind_still_writes_and_schema_types_list() {
 
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-1".into(),
             kind: "loose".into(),
             name: "loose".into(),
@@ -10824,6 +10839,7 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
     seed_definition_parent(&svc, "typed-ns");
 
     let typed = Object {
+        revision: String::new(),
         id: "ticket-generic".into(),
         kind: "Ticket".into(),
         name: "ticket".into(),
@@ -10846,6 +10862,7 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
 
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-typed-ns".into(),
             kind: "loose".into(),
             name: "loose".into(),
@@ -10937,6 +10954,7 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
 
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-from".into(),
             kind: "loose".into(),
             name: "from".into(),
@@ -10952,6 +10970,7 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
     .unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-to".into(),
             kind: "loose".into(),
             name: "to".into(),
@@ -10983,6 +11002,7 @@ async fn published_type_revision_refuses_generic_object_and_link_writes() {
 async fn object_bound_lease_requires_target_object_authorization() {
     let svc = service();
     let target = Object {
+        revision: String::new(),
         id: "coord-target".into(),
         kind: "component".into(),
         name: "target".into(),
@@ -11163,6 +11183,7 @@ async fn object_bound_lease_requires_target_object_authorization() {
 
     // Object-bound lease cannot guard a different object mutation.
     let other = Object {
+        revision: String::new(),
         id: "other-target".into(),
         kind: "component".into(),
         name: "other".into(),
@@ -11215,6 +11236,7 @@ async fn guarded_update_requires_object_and_lease_namespace_authorization() {
         .lease
         .unwrap();
     let original = Object {
+        revision: String::new(),
         id: "guarded-auth".into(),
         kind: "component".into(),
         name: "before".into(),
@@ -11296,6 +11318,7 @@ async fn update_object_with_lease_precondition_enforces_fencing() {
         .lease
         .unwrap();
     let original = Object {
+        revision: String::new(),
         id: "unified-guarded".into(),
         kind: "component".into(),
         name: "before".into(),
@@ -11371,6 +11394,7 @@ async fn update_object_with_lease_precondition_enforces_fencing() {
 async fn update_object_without_lease_precondition_remains_unguarded() {
     let svc = service();
     let original = Object {
+        revision: String::new(),
         id: "unified-unguarded".into(),
         kind: "component".into(),
         name: "before".into(),
@@ -12130,6 +12154,7 @@ async fn create_ontology_class_ensures_mapped_kind() {
 
     // Creating an object of the ensured kind must validate.
     let obj = Object {
+        revision: String::new(),
         id: "inc-ensure-1".into(),
         kind: "incident_kind".into(),
         name: "outage".into(),
@@ -13443,6 +13468,7 @@ async fn namespace_policy_requires_purpose_and_end_date() {
     svc.create_object(with_named_principal(
         CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "term-widget".into(),
                 kind: "widget".into(),
                 name: "widget".into(),
@@ -13834,6 +13860,7 @@ async fn schema_type_implements_interface_and_list_filters_by_interface() {
     .unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-2".into(),
             kind: "loose".into(),
             name: "loose".into(),
@@ -13884,6 +13911,7 @@ async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
 
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-1".into(),
             kind: "loose".into(),
             name: "loose".into(),
@@ -13901,6 +13929,7 @@ async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
     let err = svc
         .create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "broken-1".into(),
                 kind: "broken".into(),
                 name: "broken".into(),
@@ -13931,6 +13960,7 @@ async fn corrupt_schema_row_only_blocks_that_kind_until_repaired() {
 
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "broken-2".into(),
             kind: "broken".into(),
             name: "broken".into(),
@@ -13967,6 +13997,7 @@ async fn schema_table_read_failure_blocks_object_writes() {
     let err = svc
         .create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "loose-1".into(),
                 kind: "loose".into(),
                 name: "loose".into(),
@@ -13990,6 +14021,7 @@ async fn schema_table_read_failure_blocks_object_writes() {
     db.migrate_all().unwrap();
     svc.create_object(with_principal(CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: "loose-2".into(),
             kind: "loose".into(),
             name: "loose".into(),
@@ -14278,6 +14310,7 @@ async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
         .create_object(with_named_principal(
             CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: "namespace-forged".into(),
                     kind: "namespace".into(),
                     name: "forged".into(),
@@ -14299,6 +14332,7 @@ async fn team_namespace_bootstrap_is_atomic_and_admin_only() {
         .create_object(with_named_principal(
             CreateObjectRequest {
                 object: Some(Object {
+                    revision: String::new(),
                     id: "ordinary-object".into(),
                     kind: "note".into(),
                     name: "forged identity".into(),
@@ -15982,6 +16016,7 @@ async fn reserved_governance_objects_are_hidden_from_generic_crud() {
     let err = svc
         .create_object(with_principal(CreateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: "forged".into(),
                 kind: "action_policy".into(),
                 name: "forged".into(),
@@ -16296,6 +16331,7 @@ async fn blast_radius_object_not_writable_via_update_object() {
     let err = svc
         .update_object(with_principal(UpdateObjectRequest {
             object: Some(Object {
+                revision: String::new(),
                 id: counter_id,
                 kind: "widget".into(),
                 name: "tamper".into(),
@@ -38324,6 +38360,7 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
         svc.security.add_grant(&grant);
     }
     let ticket = |id: &str, status: &str, cost: &str| Object {
+        revision: String::new(),
         id: id.into(),
         kind: "ticket".into(),
         name: id.into(),
@@ -38470,6 +38507,7 @@ async fn a_failing_change_wake_does_not_stop_the_other_instances() {
             properties.insert(OBJECT_CLASSIFICATION_PROPERTY.into(), marking.into());
         }
         Object {
+            revision: String::new(),
             id: id.into(),
             kind: "ticket".into(),
             name: id.into(),
@@ -40026,6 +40064,7 @@ async fn a_failed_profile_admin_grant_reverses_the_guarded_create() {
         .unwrap();
     let create = |id: &str, actor: &str| {
         let profile = Object {
+            revision: String::new(),
             id: id.into(),
             kind: markings::PRINCIPAL_PROFILE_KIND.into(),
             name: actor.into(),

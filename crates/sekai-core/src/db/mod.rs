@@ -97,6 +97,7 @@ pub mod postgres_function;
 pub mod postgres_governed_action_type;
 pub mod postgres_governed_transform;
 pub mod postgres_grants;
+pub mod postgres_graph_changes;
 pub mod postgres_guarded_mutation;
 pub mod postgres_gunshi;
 pub mod postgres_handoff;

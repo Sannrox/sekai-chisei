@@ -4,6 +4,38 @@
 use super::*;
 
 impl RuntimeDb {
+    /// Commits an authorized graph change batch, or replays its stored result.
+    pub fn apply_graph_changes(
+        &self,
+        batch: &crate::sekai::graph_changes::GraphChangeBatch,
+    ) -> Result<
+        crate::sekai::graph_changes::GraphChangeOutcome,
+        crate::sekai::graph_changes::GraphChangeError,
+    > {
+        match self {
+            Self::Sqlite(db) => db.apply_graph_changes(batch),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.apply_graph_changes(batch))
+            }
+        }
+    }
+
+    pub fn get_graph_change_request(
+        &self,
+        namespace: &str,
+        request_id: &str,
+    ) -> Result<
+        Option<crate::sekai::graph_changes::StoredGraphChangeRequest>,
+        crate::sekai::graph_changes::GraphChangeError,
+    > {
+        match self {
+            Self::Sqlite(db) => db.get_graph_change_request(namespace, request_id),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_graph_change_request(namespace, request_id)
+            }),
+        }
+    }
+
     pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
         #[cfg(any(test, feature = "gateway-test-support"))]
         source_batch_auth_counters::OBJECT_LOOKUPS.with(|c| c.set(c.get() + 1));

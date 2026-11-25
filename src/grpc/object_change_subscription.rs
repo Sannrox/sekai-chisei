@@ -551,6 +551,7 @@ mod tests {
 
     fn proto_customer(id: &str, name: &str, region: &str) -> Object {
         Object {
+            revision: String::new(),
             id: id.into(),
             kind: "Customer".into(),
             name: name.into(),

@@ -555,6 +555,12 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "ApplyGraphChanges") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::apply_graph_changes(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "GetLinks") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::get_links(&*svc, req).await

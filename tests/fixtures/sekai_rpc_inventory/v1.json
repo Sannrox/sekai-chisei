@@ -2287,6 +2287,18 @@
       "product_tier": "core"
     },
     {
+      "rpc": "ApplyGraphChanges",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "tests/graph_changes_backend_conformance.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "core"
+    },
+    {
       "rpc": "GetLinks",
       "kind": "persistent",
       "surfaces": [

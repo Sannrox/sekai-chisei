@@ -12,6 +12,11 @@ message Object {
   map<string, string> properties = 6;
   int64 created = 7;
   int64 updated = 8;
+  // Output only, set by GetObject and ApplyGraphChanges: a digest of the
+  // object as returned to this caller. It changes whenever the visible
+  // object does; ApplyGraphChanges takes it as a patch precondition.
+  // Ignored on writes.
+  string revision = 9;
 }
 
 message Link {
@@ -2928,6 +2933,48 @@ message CreateLinkRequest { Link link = 1; bool fail_if_exists = 2; }
 message CreateLinkResponse { Link link = 1; }
 message DeleteLinkRequest { string id = 1; }
 message DeleteLinkResponse {}
+// One property patch for ApplyGraphChanges. Only the named properties change.
+message GraphObjectPatch {
+  string object_id = 1;
+  // Object.revision as the caller read it. The call fails unless the object
+  // still has this revision.
+  string expected_revision = 2;
+  map<string, string> set_properties = 3;
+  repeated string remove_properties = 4;
+}
+message GraphChange {
+  oneof change {
+    // A new object; its namespace must be the request's.
+    Object create_object = 1;
+    GraphObjectPatch patch_object = 2;
+    // A new link. A link id that already exists fails the call.
+    Link create_link = 3;
+    // The id of an existing link. A missing link fails the call.
+    string delete_link_id = 4;
+  }
+}
+message ApplyGraphChangesRequest {
+  // Every object a change creates, patches or links lives here.
+  string namespace = 1;
+  // Required. A repeat with the same body returns the first result and
+  // writes nothing; the same id with a different body is refused.
+  string request_id = 2;
+  // Applied in order, all or none. At most 256.
+  repeated GraphChange changes = 3;
+  // Optional. When set, the call applies only while this Action instance is
+  // admitted in the namespace, was submitted by the caller, and has not been
+  // applied; it is marked applied in the same transaction.
+  string action_instance_id = 4;
+}
+message ApplyGraphChangesResponse {
+  // Each created or patched object as GetObject returns it to the caller,
+  // with its revision, in change order.
+  repeated Object objects = 1;
+  // Each created link as stored, in change order.
+  repeated Link links = 2;
+  // True when this is the stored result of an earlier call.
+  bool replayed = 3;
+}
 message GetLinksRequest { string object_id = 1; string relation = 2; string direction = 3; }
 message GetLinksResponse { repeated Link links = 1; }
 message GetLinkedObjectsRequest { string object_id = 1; string relation = 2; string direction = 3; }
@@ -6769,6 +6816,10 @@ service SekaiService {
 
   rpc CreateLink(CreateLinkRequest) returns (CreateLinkResponse);
   rpc DeleteLink(DeleteLinkRequest) returns (DeleteLinkResponse);
+  // Experimental: apply object creates, property patches, link creates and
+  // link deletes in one transaction, with a revision check per patch,
+  // request-id replay and an optional Action instance binding (#3062).
+  rpc ApplyGraphChanges(ApplyGraphChangesRequest) returns (ApplyGraphChangesResponse);
   rpc GetLinks(GetLinksRequest) returns (GetLinksResponse);
   rpc GetLinkedObjects(GetLinkedObjectsRequest) returns (GetLinkedObjectsResponse);
 

@@ -111,8 +111,12 @@ impl SekaiServiceImpl {
             tenant_context.as_ref(),
             purpose.as_ref(),
         )?;
+        // The revision digests this caller's view, so it reveals nothing the
+        // view hides. ApplyGraphChanges accepts it as an expected revision.
+        let mut object = to_proto_obj(&obj);
+        object.revision = crate::sekai::action_describe_preview::object_revision(&obj);
         Ok(Response::new(GetObjectResponse {
-            object: Some(to_proto_obj(&obj)),
+            object: Some(object),
         }))
     }
     pub(super) async fn list_visible_objects(

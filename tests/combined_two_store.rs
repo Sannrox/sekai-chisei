@@ -58,6 +58,7 @@ fn test_config() -> Config {
 fn create_object_request() -> CreateObjectRequest {
     CreateObjectRequest {
         object: Some(Object {
+            revision: String::new(),
             id: OBJECT_ID.into(),
             kind: "component".into(),
             name: OBJECT_ID.into(),
