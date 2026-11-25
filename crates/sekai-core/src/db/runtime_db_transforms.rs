@@ -568,6 +568,7 @@ impl RuntimeDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
         fencing_token: &str,
@@ -576,6 +577,7 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.put_transform_quota_hold(
                 run_id,
                 tenant_id,
+                quota_scope,
                 reserved_concurrency,
                 claim_generation,
                 fencing_token,
@@ -584,6 +586,7 @@ impl RuntimeDb {
                 db.put_transform_quota_hold(
                     run_id,
                     tenant_id,
+                    quota_scope,
                     reserved_concurrency,
                     claim_generation,
                     fencing_token,
@@ -596,6 +599,7 @@ impl RuntimeDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
     ) -> Result<bool, String> {
@@ -603,6 +607,7 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.restore_transform_quota_hold(
                 run_id,
                 tenant_id,
+                quota_scope,
                 reserved_concurrency,
                 claim_generation,
             ),
@@ -610,6 +615,7 @@ impl RuntimeDb {
                 db.restore_transform_quota_hold(
                     run_id,
                     tenant_id,
+                    quota_scope,
                     reserved_concurrency,
                     claim_generation,
                 )
@@ -621,6 +627,7 @@ impl RuntimeDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
@@ -629,6 +636,7 @@ impl RuntimeDb {
             Self::Sqlite(db) => db.restore_abandoned_quota_hold(
                 run_id,
                 tenant_id,
+                quota_scope,
                 reserved_concurrency,
                 refund_request,
                 refund_tokens,
@@ -637,6 +645,7 @@ impl RuntimeDb {
                 db.restore_abandoned_quota_hold(
                     run_id,
                     tenant_id,
+                    quota_scope,
                     reserved_concurrency,
                     refund_request,
                     refund_tokens,
@@ -650,7 +659,7 @@ impl RuntimeDb {
         run_id: &str,
         claim_generation: i64,
         fencing_token: &str,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<crate::db::governed_transform::TransformQuotaHold>, String> {
         match self {
             Self::Sqlite(db) => {
                 db.reclaim_transform_quota_hold(run_id, claim_generation, fencing_token)
@@ -666,7 +675,7 @@ impl RuntimeDb {
         run_id: &str,
         claim_generation: Option<i64>,
         older_than: bool,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<crate::db::governed_transform::TransformQuotaHold>, String> {
         match self {
             Self::Sqlite(db) => db.take_transform_quota_hold(run_id, claim_generation, older_than),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
@@ -679,7 +688,7 @@ impl RuntimeDb {
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<crate::db::governed_transform::TakenTransformQuotaHold>, String> {
+    ) -> Result<Option<crate::db::governed_transform::TransformQuotaHold>, String> {
         match self {
             Self::Sqlite(db) => db.take_retryable_quota_hold(run_id, claim_generation),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
@@ -701,7 +710,7 @@ impl RuntimeDb {
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<crate::db::governed_transform::TransformQuotaHold>, String> {
         match self {
             Self::Sqlite(db) => db.peek_transform_quota_hold(run_id, claim_generation),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {

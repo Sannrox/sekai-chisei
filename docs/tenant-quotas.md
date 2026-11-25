@@ -19,8 +19,24 @@ is stored under the child scope:
 tenant:{tenant_id}/namespace:{namespace}
 ```
 
-Neither part may contain `/`. A namespace assignment is stored and validated
-but does not yet affect admission.
+Neither part may contain `/`.
+
+A transform run in a namespace reserves against its tenant and its namespace
+together, or against neither. Each scope checks its own limit and the stricter
+one wins. Requests and tokens reserve on the budget chain in one step.
+Concurrency takes the tenant's hold first and then the namespace's under one
+holder; if the namespace refuses, the tenant hold and the request are given
+back. A namespace with no assignment shares what is left of its tenant. A
+namespace assignment applies even when the tenant has none.
+
+The claim's stored quota hold records the scope it reserved on
+(`sekai_transform_quota_hold.quota_scope`). Every refund taken from the hold,
+after a crash, a lease expiry, a cancel or a retry, reaches both scopes, and a
+hold is taken once, so nothing is refunded twice. A hold written by an older
+plane has an empty scope and refunds only the tenant. The namespace then stays
+counted until its period or hold expires, which refuses rather than
+over-admits. During a rolling deploy an older plane refunds a newer hold the
+same way.
 
 Project/namespace budgets remain on the hierarchical chain
 (`global` / `project:…`). Tenant admission is an **additional** gate and never
@@ -41,9 +57,11 @@ widens a stricter project limit.
 
 - `configure(tenant_id, TenantQuotaLimits)` — operator assignment
 - `configure_namespace(NamespaceQuotaScope, TenantQuotaLimits)` — namespace
-  assignment, stored only (`DomainAdminSurface::configure_namespace_quotas`
-  checks the role, refuses negative limits and narrows by entitlement)
+  assignment (`DomainAdminSurface::configure_namespace_quotas` checks the
+  role, refuses negative limits and narrows by entitlement)
 - `admit(context, limits, min_version, estimated_tokens, idempotency_key)`
+- `admit_in_namespace(context, limits, namespace, min_version,
+  estimated_tokens, idempotency_key)` — tenant and namespace together
 - `complete(admission, actual_tokens)` — release concurrency + reconcile tokens
 - `charge_storage(tenant_id, limits, bytes)`
 
@@ -52,7 +70,7 @@ Exhaustion returns stable `TenantQuotaError::Exhausted` with a retry hint and
 never includes another tenant’s usage.
 
 An isolated-process run asks for one request and one concurrency unit. When
-its tenant's limit for either is zero, the run can never fit, so the claim
+its tenant's or its namespace's limit for either is zero, the run can never fit, so the claim
 refuses it for good: the run is marked `refused` with the code
 `quota_larger_than_budget` and the details `metric`, `limit` and
 `requested`. A budget spent by usage still defers the run until it frees.

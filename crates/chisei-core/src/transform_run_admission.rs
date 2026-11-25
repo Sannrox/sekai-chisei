@@ -6,8 +6,8 @@
 use crate::chisei::budget::PeriodType;
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt};
 use crate::chisei::tenant_quota::{
-    METRIC_CONCURRENCY, METRIC_STORAGE_BYTES, TenantQuotaAdmission, TenantQuotaError,
-    TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
+    METRIC_CONCURRENCY, METRIC_STORAGE_BYTES, NamespaceQuotaScope, TenantQuotaAdmission,
+    TenantQuotaError, TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
 };
 use crate::chisei::usage_ledger::UsageEvent;
 use crate::chisei_store::ChiseiStore;
@@ -92,6 +92,65 @@ pub fn configured_limits(
     let Some(rows) = budget_rows(db.budget_limits_for_scope(&tenant_scope_id(tenant_id)))? else {
         return Ok(None);
     };
+    Ok(limits_from_rows(rows))
+}
+
+/// The namespace's own assignment (#3044, ADR 0168): only the rows stored
+/// under its scope, not the tenant's it would inherit on the budget chain.
+/// `None` when the namespace has none, or the plane has no budget tables.
+pub fn configured_namespace_limits(
+    db: &RuntimeDb,
+    scope: &NamespaceQuotaScope,
+) -> Result<Option<TenantQuotaLimits>, String> {
+    let Some(rows) = budget_rows(db.budget_limits_for_scope(scope.scope_id()))? else {
+        return Ok(None);
+    };
+    Ok(limits_from_rows(
+        rows.into_iter()
+            .filter(|(row_scope, ..)| row_scope == scope.scope_id())
+            .collect(),
+    ))
+}
+
+/// The tenant and namespace assignments a transform run in `namespace` is
+/// admitted against. The namespace part is `None` when it has no assignment
+/// or is a name no assignment can be stored under.
+pub fn configured_run_limits(
+    db: &RuntimeDb,
+    tenant_id: &str,
+    namespace: &str,
+) -> Result<RunQuotaLimits, String> {
+    let tenant = configured_limits(db, tenant_id)?;
+    let namespace = match NamespaceQuotaScope::new(tenant_id, namespace) {
+        Ok(scope) => configured_namespace_limits(db, &scope)?.map(|limits| (scope, limits)),
+        Err(_) => None,
+    };
+    Ok(RunQuotaLimits { tenant, namespace })
+}
+
+/// A transform run's tenant assignment and its namespace's, either absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunQuotaLimits {
+    pub tenant: Option<TenantQuotaLimits>,
+    pub namespace: Option<(NamespaceQuotaScope, TenantQuotaLimits)>,
+}
+
+impl RunQuotaLimits {
+    /// True when neither the tenant nor the namespace has an assignment.
+    pub fn is_unlimited(&self) -> bool {
+        self.tenant.is_none() && self.namespace.is_none()
+    }
+
+    /// The refusal of a run larger than either whole budget.
+    pub fn refusal_larger_than_budget(&self) -> Option<IsolatedProcessRefusal> {
+        self.tenant
+            .iter()
+            .chain(self.namespace.as_ref().map(|(_, limits)| limits))
+            .find_map(refusal_larger_than_budget)
+    }
+}
+
+fn limits_from_rows(rows: BudgetLimitRows) -> Option<TenantQuotaLimits> {
     let mut limits = TenantQuotaLimits::unlimited(1);
     let mut any = false;
     let mut request_period = None;
@@ -120,7 +179,7 @@ pub fn configured_limits(
     if let Some(period) = request_period.or(token_period) {
         limits.period = period;
     }
-    Ok(any.then_some(limits))
+    any.then_some(limits)
 }
 
 /// Refusal code for a run that asks more of one metric than its scope's
@@ -164,18 +223,41 @@ pub fn refusal_larger_than_budget(limits: &TenantQuotaLimits) -> Option<Isolated
     })
 }
 
+/// Admit a transform run against its tenant and namespace assignments. A
+/// reclaimed run already holds its request on both scopes, so it reserves
+/// none again.
 pub fn admit_transform_run(
     gate: &TenantQuotaGate,
     context: &AuthenticatedContext,
-    limits: &TenantQuotaLimits,
+    limits: &RunQuotaLimits,
     run_key: &str,
     reclaim: bool,
 ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
-    let mut limits = limits.clone();
-    if reclaim {
-        limits.max_requests_per_period = None;
-    }
-    gate.admit(context, &limits, 1, 0, run_key)
+    let without_request = |limits: &TenantQuotaLimits| {
+        let mut limits = limits.clone();
+        if reclaim {
+            limits.max_requests_per_period = None;
+        }
+        limits
+    };
+    let tenant = without_request(
+        limits
+            .tenant
+            .as_ref()
+            .unwrap_or(&TenantQuotaLimits::unlimited(1)),
+    );
+    let namespace = limits
+        .namespace
+        .as_ref()
+        .map(|(scope, limits)| (scope, without_request(limits)));
+    gate.admit_in_namespace(
+        context,
+        &tenant,
+        namespace.as_ref().map(|(scope, limits)| (*scope, limits)),
+        1,
+        0,
+        run_key,
+    )
 }
 
 pub fn complete_transform_run(
@@ -299,6 +381,14 @@ mod tests {
         assert_eq!(limits.period, PeriodType::Daily);
     }
 
+    /// Run limits with only a tenant assignment, as before namespaces.
+    fn tenant_only(limits: &TenantQuotaLimits) -> RunQuotaLimits {
+        RunQuotaLimits {
+            tenant: Some(limits.clone()),
+            namespace: None,
+        }
+    }
+
     fn requests_and_concurrency(requests: i32, concurrency: i32) -> TenantQuotaLimits {
         TenantQuotaLimits {
             version: 1,
@@ -341,13 +431,170 @@ mod tests {
         assert_eq!(refusal_larger_than_budget(&limits), None);
         let ctx = tenant_context("tenant-a", "alice");
         for key in ["run-1", "run-2"] {
-            let held = admit_transform_run(&gate, &ctx, &limits, key, false).unwrap();
+            let held = admit_transform_run(&gate, &ctx, &tenant_only(&limits), key, false).unwrap();
             complete_transform_run(&gate, &held).unwrap();
         }
         assert!(matches!(
-            admit_transform_run(&gate, &ctx, &limits, "run-3", false),
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", false),
             Err(TenantQuotaError::Exhausted { metric, .. }) if metric == METRIC_REQUESTS
         ));
+    }
+
+    fn requests_only(requests: i32) -> TenantQuotaLimits {
+        TenantQuotaLimits {
+            max_concurrency: None,
+            ..requests_and_concurrency(requests, 0)
+        }
+    }
+
+    fn exhausted_on(result: Result<TenantQuotaAdmission, TenantQuotaError>, expected: &str) {
+        assert!(
+            matches!(&result, Err(TenantQuotaError::Exhausted { metric, .. }) if metric == expected),
+            "expected {expected} exhausted, got {result:?}"
+        );
+    }
+
+    /// A gate on a fresh store with `tenant-a` and its `ops` namespace
+    /// assigned as given.
+    fn namespace_gate(
+        tenant: Option<TenantQuotaLimits>,
+        ops: TenantQuotaLimits,
+    ) -> (std::sync::Arc<RuntimeDb>, TenantQuotaGate) {
+        let db = std::sync::Arc::new(RuntimeDb::memory());
+        let gate = quota_gate(db.clone()).unwrap();
+        if let Some(tenant) = tenant {
+            gate.configure("tenant-a", &tenant).unwrap();
+        }
+        let ops_scope = NamespaceQuotaScope::new("tenant-a", "ops").unwrap();
+        gate.configure_namespace(&ops_scope, &ops).unwrap();
+        (db, gate)
+    }
+
+    fn admit_in(
+        db: &RuntimeDb,
+        gate: &TenantQuotaGate,
+        namespace: &str,
+        key: &str,
+    ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
+        let limits = configured_run_limits(db, "tenant-a", namespace).unwrap();
+        admit_transform_run(
+            gate,
+            &tenant_context("tenant-a", "alice"),
+            &limits,
+            key,
+            false,
+        )
+    }
+
+    #[test]
+    fn a_run_reserves_on_its_tenant_and_namespace_and_the_stricter_wins() {
+        let (db, gate) = namespace_gate(Some(requests_only(3)), requests_only(1));
+        complete_transform_run(&gate, &admit_in(&db, &gate, "ops", "run-1").unwrap()).unwrap();
+        // The namespace's one request is spent although the tenant has two.
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_REQUESTS);
+        // A namespace without an assignment shares what is left of the tenant:
+        // the ops run counted there too.
+        for key in ["run-3", "run-4"] {
+            complete_transform_run(&gate, &admit_in(&db, &gate, "dev", key).unwrap()).unwrap();
+        }
+        exhausted_on(admit_in(&db, &gate, "dev", "run-5"), METRIC_REQUESTS);
+    }
+
+    #[test]
+    fn a_namespace_refusal_leaves_nothing_reserved_on_the_tenant() {
+        let (db, gate) = namespace_gate(
+            Some(requests_and_concurrency(2, 5)),
+            requests_and_concurrency(10, 1),
+        );
+        let held = admit_in(&db, &gate, "ops", "run-1").unwrap();
+        // The tenant request and concurrency taken for run-2 are rolled back
+        // when the namespace's concurrency refuses it.
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_CONCURRENCY);
+        complete_transform_run(&gate, &admit_in(&db, &gate, "dev", "run-3").unwrap()).unwrap();
+        exhausted_on(admit_in(&db, &gate, "dev", "run-4"), METRIC_REQUESTS);
+        // Completing run-1 frees the namespace hold again.
+        complete_transform_run(&gate, &held).unwrap();
+        let limits = configured_run_limits(&db, "tenant-a", "ops").unwrap();
+        let reclaim = admit_transform_run(
+            &gate,
+            &tenant_context("tenant-a", "alice"),
+            &limits,
+            "run-1",
+            true,
+        );
+        assert!(reclaim.is_ok(), "{reclaim:?}");
+    }
+
+    #[test]
+    fn a_namespace_assignment_without_a_tenant_assignment_is_enforced() {
+        let (db, gate) = namespace_gate(None, requests_only(1));
+        let limits = configured_run_limits(&db, "tenant-a", "ops").unwrap();
+        assert_eq!(limits.tenant, None);
+        assert!(!limits.is_unlimited());
+        assert!(
+            configured_run_limits(&db, "tenant-a", "dev")
+                .unwrap()
+                .is_unlimited()
+        );
+        complete_transform_run(&gate, &admit_in(&db, &gate, "ops", "run-1").unwrap()).unwrap();
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_REQUESTS);
+    }
+
+    #[test]
+    fn a_run_larger_than_its_namespace_budget_is_refused() {
+        let (db, _gate) = namespace_gate(
+            Some(requests_and_concurrency(5, 5)),
+            requests_and_concurrency(5, 0),
+        );
+        let refusal = configured_run_limits(&db, "tenant-a", "ops")
+            .unwrap()
+            .refusal_larger_than_budget()
+            .expect("the namespace can never hold a concurrency unit");
+        assert_eq!(refusal.details["metric"], METRIC_CONCURRENCY);
+        assert_eq!(refusal.details["limit"], "0");
+        let dev = configured_run_limits(&db, "tenant-a", "dev").unwrap();
+        assert_eq!(dev.refusal_larger_than_budget(), None);
+    }
+
+    /// What a successor refunds for a crashed claim from its stored hold.
+    fn stored_hold_refund(tenant_scope: &str, run_key: &str) -> TenantQuotaAdmission {
+        TenantQuotaAdmission {
+            reserved_request: true,
+            reserved_concurrency: true,
+            ..TenantQuotaAdmission::from_hold("tenant-a", tenant_scope, run_key)
+        }
+    }
+
+    #[test]
+    fn a_stored_hold_refunds_the_tenant_and_the_namespace_it_names() {
+        let (db, gate) = namespace_gate(
+            Some(requests_and_concurrency(1, 1)),
+            requests_and_concurrency(1, 1),
+        );
+        let crashed = admit_in(&db, &gate, "ops", "run-1").unwrap();
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_REQUESTS);
+        gate.abandon(&stored_hold_refund(&crashed.scope_id, "run-1"))
+            .unwrap();
+        // Both scopes got their request and concurrency back.
+        let next = admit_in(&db, &gate, "ops", "run-2").unwrap();
+        assert!(next.reserved_request && next.reserved_concurrency);
+    }
+
+    #[test]
+    fn an_older_hold_without_a_scope_refunds_only_the_tenant() {
+        let (db, gate) = namespace_gate(Some(requests_only(2)), requests_only(1));
+        admit_in(&db, &gate, "ops", "run-1").unwrap();
+        // A hold written before namespaces carries no scope. Its refund
+        // reaches the tenant without error and leaves the namespace counted,
+        // which refuses rather than over-admits.
+        let older = stored_hold_refund("", "run-1");
+        assert_eq!(older.scope_id, tenant_scope_id("tenant-a"));
+        gate.abandon(&older).unwrap();
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_REQUESTS);
+        for key in ["run-3", "run-4"] {
+            complete_transform_run(&gate, &admit_in(&db, &gate, "dev", key).unwrap()).unwrap();
+        }
+        exhausted_on(admit_in(&db, &gate, "dev", "run-5"), METRIC_REQUESTS);
     }
 
     #[test]
@@ -385,11 +632,12 @@ mod tests {
         };
         gate.configure("tenant-a", &limits).unwrap();
         let ctx = tenant_context("tenant-a", "alice");
-        let a1 = admit_transform_run(&gate, &ctx, &limits, "run-1", false).unwrap();
+        let a1 = admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", false).unwrap();
         complete_transform_run(&gate, &a1).unwrap();
-        let a2 = admit_transform_run(&gate, &ctx, &limits, "run-2", false).unwrap();
+        let a2 = admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", false).unwrap();
         complete_transform_run(&gate, &a2).unwrap();
-        let err = admit_transform_run(&gate, &ctx, &limits, "run-3", false).unwrap_err();
+        let err =
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", false).unwrap_err();
         assert!(matches!(
             err,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_REQUESTS
@@ -410,10 +658,12 @@ mod tests {
         };
         gate.configure("tenant-a", &limits).unwrap();
         let ctx = tenant_context("tenant-a", "alice");
-        let first = admit_transform_run(&gate, &ctx, &limits, "run-1", false).unwrap();
+        let first =
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", false).unwrap();
         complete_transform_run(&gate, &first).unwrap();
-        admit_transform_run(&gate, &ctx, &limits, "run-1", true).unwrap();
-        let err = admit_transform_run(&gate, &ctx, &limits, "run-2", false).unwrap_err();
+        admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", true).unwrap();
+        let err =
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", false).unwrap_err();
         assert!(matches!(
             err,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_REQUESTS

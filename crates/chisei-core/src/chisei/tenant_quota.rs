@@ -11,7 +11,10 @@
 //!
 //! A namespace assignment (#3044, ADR 0168) is stored under
 //! `tenant:{id}/namespace:{ns}`, a child of the tenant scope on the budget
-//! chain. It is stored and validated but not yet enforced at admission.
+//! chain. [`TenantQuotaGate::admit_in_namespace`] reserves on that scope, so
+//! the chain reserves on the tenant and the namespace or on neither, and the
+//! stricter limit wins. A namespace concurrency limit is a second hold beside
+//! the tenant's.
 
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +164,17 @@ impl NamespaceQuotaScope {
     }
 }
 
+/// The budget scope a stored hold refunds: `quota_scope` when it is a scope
+/// under the tenant's, otherwise the tenant scope. A hold an older plane
+/// wrote has no scope and refunds the tenant only.
+pub fn hold_refund_scope(tenant_id: &str, quota_scope: &str) -> String {
+    let tenant = tenant_scope_id(tenant_id);
+    match quota_scope.strip_prefix(tenant.as_str()) {
+        Some(rest) if rest.starts_with('/') => quota_scope.to_string(),
+        _ => tenant,
+    }
+}
+
 /// Fields safe to place on an operation receipt (no other-tenant usage).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TenantQuotaReceiptNote {
@@ -194,8 +208,8 @@ impl TenantQuotaGate {
         self.configure_scope(&tenant_scope_id(tenant_id), limits)
     }
 
-    /// Persist limits for one namespace of a tenant. Stored only: admission
-    /// does not read them yet (#3044 part 1b enforces them).
+    /// Persist limits for one namespace of a tenant, enforced by
+    /// [`Self::admit_in_namespace`].
     pub fn configure_namespace(
         &self,
         scope: &NamespaceQuotaScope,
@@ -248,10 +262,35 @@ impl TenantQuotaGate {
         estimated_tokens: i32,
         idempotency_key: &str,
     ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
+        self.admit_in_namespace(
+            context,
+            limits,
+            None,
+            min_assignment_version,
+            estimated_tokens,
+            idempotency_key,
+        )
+    }
+
+    /// [`Self::admit`] against the tenant and, when given, one of its
+    /// namespaces (#3044, ADR 0168). Request and token budgets reserve on the
+    /// namespace scope, so the budget chain reserves on both scopes or on
+    /// neither. A namespace concurrency limit takes a second hold under the
+    /// namespace scope, given back when the tenant's or its own is refused.
+    pub fn admit_in_namespace(
+        &self,
+        context: &AuthenticatedContext,
+        limits: &TenantQuotaLimits,
+        namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
+        min_assignment_version: u64,
+        estimated_tokens: i32,
+        idempotency_key: &str,
+    ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
         let now = wall_ms();
         self.admit_at(
             context,
             limits,
+            namespace,
             min_assignment_version,
             estimated_tokens,
             idempotency_key,
@@ -260,10 +299,12 @@ impl TenantQuotaGate {
     }
 
     /// Admit with an explicit hold window `[now, until]` so expiry is testable.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_at(
         &self,
         context: &AuthenticatedContext,
         limits: &TenantQuotaLimits,
+        namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
         min_assignment_version: u64,
         estimated_tokens: i32,
         idempotency_key: &str,
@@ -281,7 +322,12 @@ impl TenantQuotaGate {
                 need: min_assignment_version,
             });
         }
-        let scope = tenant_scope_id(&tenant.tenant_id);
+        let scope = match namespace {
+            Some((namespace, _)) => namespace.scope_id().to_string(),
+            None => tenant_scope_id(&tenant.tenant_id),
+        };
+        let own = namespace.map(|(_, limits)| limits);
+        let either = |pick: fn(&TenantQuotaLimits) -> bool| pick(limits) || own.is_some_and(pick);
         let mut reserved = TenantQuotaAdmission {
             tenant_id: tenant.tenant_id.clone(),
             scope_id: scope.clone(),
@@ -293,13 +339,13 @@ impl TenantQuotaGate {
             concurrency_holder: String::new(),
         };
 
-        if limits.max_requests_per_period.is_some() {
+        if either(|limits| limits.max_requests_per_period.is_some()) {
             self.tracker
                 .check_and_reserve_with_metric(&scope, 1, METRIC_REQUESTS)
                 .map_err(|_| exhausted(METRIC_REQUESTS))?;
             reserved.reserved_request = true;
         }
-        if limits.max_tokens_per_period.is_some() && estimated_tokens > 0 {
+        if either(|limits| limits.max_tokens_per_period.is_some()) && estimated_tokens > 0 {
             if let Err(err) =
                 self.tracker
                     .check_and_reserve_idempotent(&scope, estimated_tokens, idempotency_key)
@@ -310,31 +356,52 @@ impl TenantQuotaGate {
             }
             reserved.reserved_tokens = estimated_tokens;
         }
-        if let Some(max) = limits.max_concurrency {
-            let holder = uuid::Uuid::new_v4().to_string();
-            match self.store.take_tenant_concurrency_hold(
-                &tenant.tenant_id,
+        // The tenant's hold first, then the namespace's, under one holder.
+        let holds = [
+            (tenant.tenant_id.as_str(), limits.max_concurrency),
+            (
+                reserved.scope_id.as_str(),
+                own.and_then(|limits| limits.max_concurrency),
+            ),
+        ];
+        let holder = uuid::Uuid::new_v4().to_string();
+        for (key, max) in holds {
+            let Some(max) = max else { continue };
+            let taken = self.store.take_tenant_concurrency_hold(
+                key,
                 idempotency_key,
                 &holder,
                 max,
                 now_ms,
                 until_ms,
-            ) {
-                Ok(true) => {
-                    reserved.reserved_concurrency = true;
-                    reserved.concurrency_holder = holder;
+            );
+            if !matches!(taken, Ok(true)) {
+                if reserved.reserved_concurrency {
+                    let _ = self.release_concurrency(&reserved);
                 }
-                Ok(false) => {
-                    let _ = self.rollback_partial(&reserved);
-                    return Err(exhausted(METRIC_CONCURRENCY));
-                }
-                Err(err) => {
-                    let _ = self.rollback_partial(&reserved);
-                    return Err(TenantQuotaError::Storage(err));
-                }
+                let _ = self.rollback_partial(&reserved);
+                return Err(match taken {
+                    Err(err) => TenantQuotaError::Storage(err),
+                    _ => exhausted(METRIC_CONCURRENCY),
+                });
             }
+            reserved.reserved_concurrency = true;
+            reserved.concurrency_holder = holder.clone();
         }
         Ok(reserved)
+    }
+
+    /// Gives back the tenant's concurrency hold and, for a namespace
+    /// admission, the namespace's. A hold that is not there is a no-op.
+    fn release_concurrency(&self, admission: &TenantQuotaAdmission) -> Result<(), String> {
+        for key in admission.concurrency_hold_keys() {
+            self.store.release_tenant_concurrency_hold(
+                key,
+                &admission.idempotency_key,
+                &admission.concurrency_holder,
+            )?;
+        }
+        Ok(())
     }
 
     /// Extends a live concurrency hold. False when another holder has it or
@@ -347,15 +414,22 @@ impl TenantQuotaGate {
         if !admission.reserved_concurrency {
             return Ok(true);
         }
-        self.store
-            .renew_tenant_concurrency_hold(
-                &admission.tenant_id,
-                &admission.idempotency_key,
-                &admission.concurrency_holder,
-                now_ms,
-                now_ms.saturating_add(CONCURRENCY_HOLD_MS),
-            )
-            .map_err(TenantQuotaError::Storage)
+        // True while this holder still has at least one of its holds; a
+        // namespace admission without a tenant limit holds only the second.
+        let mut renewed = false;
+        for key in admission.concurrency_hold_keys() {
+            renewed |= self
+                .store
+                .renew_tenant_concurrency_hold(
+                    key,
+                    &admission.idempotency_key,
+                    &admission.concurrency_holder,
+                    now_ms,
+                    now_ms.saturating_add(CONCURRENCY_HOLD_MS),
+                )
+                .map_err(TenantQuotaError::Storage)?;
+        }
+        Ok(renewed)
     }
 
     /// Drop a reservation when the admitted work did not run.
@@ -392,11 +466,7 @@ impl TenantQuotaGate {
             remaining.reserved_tokens = 0;
         }
         if remaining.reserved_concurrency {
-            if let Err(error) = self.store.release_tenant_concurrency_hold(
-                &remaining.tenant_id,
-                &remaining.idempotency_key,
-                &remaining.concurrency_holder,
-            ) {
+            if let Err(error) = self.release_concurrency(&remaining) {
                 return Err(Box::new(QuotaAbandonError {
                     error: TenantQuotaError::Storage(error),
                     remaining,
@@ -427,12 +497,7 @@ impl TenantQuotaGate {
             // Holder-matched release. A missing row is a no-op so a second
             // complete cannot free another unit. Storage errors surface; the
             // row stays until expiry.
-            self.store
-                .release_tenant_concurrency_hold(
-                    &admission.tenant_id,
-                    &admission.idempotency_key,
-                    &admission.concurrency_holder,
-                )
+            self.release_concurrency(admission)
                 .map_err(TenantQuotaError::Storage)?;
         }
         Ok(TenantQuotaReceiptNote {
@@ -495,6 +560,30 @@ pub struct TenantQuotaAdmission {
 }
 
 impl TenantQuotaAdmission {
+    /// The admission a stored hold stands for after its process is gone: it
+    /// reserves nothing until the caller marks what the hold still owns, and
+    /// its empty holder lets a successor drop the concurrency holds by key.
+    pub fn from_hold(tenant_id: &str, quota_scope: &str, idempotency_key: &str) -> Self {
+        Self {
+            tenant_id: tenant_id.to_string(),
+            scope_id: hold_refund_scope(tenant_id, quota_scope),
+            assignment_version: 1,
+            reserved_tokens: 0,
+            reserved_request: false,
+            reserved_concurrency: false,
+            idempotency_key: idempotency_key.to_string(),
+            concurrency_holder: String::new(),
+        }
+    }
+
+    /// Keys of the concurrency holds this admission may own: the tenant, then
+    /// the namespace scope when it reserved on one.
+    fn concurrency_hold_keys(&self) -> impl Iterator<Item = &str> {
+        let namespace =
+            (self.scope_id != tenant_scope_id(&self.tenant_id)).then_some(self.scope_id.as_str());
+        std::iter::once(self.tenant_id.as_str()).chain(namespace)
+    }
+
     fn admitted_metric_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if self.reserved_request {
@@ -557,6 +646,25 @@ mod tests {
             max_concurrency: Some(1),
             max_storage_bytes: Some(1_000),
             period: PeriodType::Daily,
+        }
+    }
+
+    #[test]
+    fn a_hold_refunds_the_scope_it_names_only_under_its_own_tenant() {
+        let ops = "tenant:tenant-a/namespace:ops";
+        assert_eq!(hold_refund_scope("tenant-a", ops), ops);
+        for other in [
+            "",
+            "tenant:tenant-b/namespace:ops",
+            "tenant:tenant-ab/namespace:ops",
+            "tenant:tenant-a",
+            "garbage",
+        ] {
+            assert_eq!(
+                hold_refund_scope("tenant-a", other),
+                "tenant:tenant-a",
+                "{other}"
+            );
         }
     }
 
@@ -864,13 +972,16 @@ mod tests {
         let lim = concurrency_only();
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
-        gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
-        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 5..=15).unwrap_err();
+        gate.admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+            .unwrap();
+        let blocked = gate
+            .admit_at(&a, &lim, None, 1, 0, "run-2", 5..=15)
+            .unwrap_err();
         assert!(matches!(
             blocked,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
         ));
-        gate.admit_at(&a, &lim, 1, 0, "run-3", 11..=21)
+        gate.admit_at(&a, &lim, None, 1, 0, "run-3", 11..=21)
             .expect("expired hold must free the slot");
     }
 
@@ -880,12 +991,16 @@ mod tests {
         let lim = concurrency_only();
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
-        let held = gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
+        let held = gate
+            .admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+            .unwrap();
         assert!(
             gate.renew_concurrency(&held, 9).unwrap(),
             "live holder must extend the hold"
         );
-        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 11..=21).unwrap_err();
+        let blocked = gate
+            .admit_at(&a, &lim, None, 1, 0, "run-2", 11..=21)
+            .unwrap_err();
         assert!(matches!(
             blocked,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
@@ -903,15 +1018,15 @@ mod tests {
             let first = gate_on_file(path);
             first.configure("tenant-a", &lim).unwrap();
             first
-                .admit_at(&a, &lim, 1, 0, "run-crashed", 0..=10)
+                .admit_at(&a, &lim, None, 1, 0, "run-crashed", 0..=10)
                 .unwrap();
         }
         let second = gate_on_file(path);
         second
-            .admit_at(&a, &lim, 1, 0, "run-next", 11..=21)
+            .admit_at(&a, &lim, None, 1, 0, "run-next", 11..=21)
             .expect("a new process must reclaim the expired hold");
         let still_blocked = second
-            .admit_at(&a, &lim, 1, 0, "run-extra", 12..=22)
+            .admit_at(&a, &lim, None, 1, 0, "run-extra", 12..=22)
             .unwrap_err();
         assert!(matches!(
             still_blocked,
@@ -931,10 +1046,10 @@ mod tests {
         second.complete(&held, 0).unwrap();
         second.complete(&held, 0).unwrap();
         second
-            .admit_at(&a, &lim, 1, 0, "run-after-double", 13..=23)
+            .admit_at(&a, &lim, None, 1, 0, "run-after-double", 13..=23)
             .expect("one complete frees one unit");
         let over = second
-            .admit_at(&a, &lim, 1, 0, "run-over", 14..=24)
+            .admit_at(&a, &lim, None, 1, 0, "run-over", 14..=24)
             .unwrap_err();
         assert!(
             matches!(
@@ -951,18 +1066,22 @@ mod tests {
         let lim = concurrency_only();
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
-        let stale = gate.admit_at(&a, &lim, 1, 0, "run-1", 0..=10).unwrap();
+        let stale = gate
+            .admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+            .unwrap();
         let live = gate
-            .admit_at(&a, &lim, 1, 0, "run-1", 11..=21)
+            .admit_at(&a, &lim, None, 1, 0, "run-1", 11..=21)
             .expect("expired same key is reclaimable");
         gate.complete(&stale, 0).unwrap();
-        let blocked = gate.admit_at(&a, &lim, 1, 0, "run-2", 12..=22).unwrap_err();
+        let blocked = gate
+            .admit_at(&a, &lim, None, 1, 0, "run-2", 12..=22)
+            .unwrap_err();
         assert!(matches!(
             blocked,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
         ));
         gate.complete(&live, 0).unwrap();
-        gate.admit_at(&a, &lim, 1, 0, "run-2", 13..=23)
+        gate.admit_at(&a, &lim, None, 1, 0, "run-2", 13..=23)
             .expect("the live holder still owned the slot");
     }
 }

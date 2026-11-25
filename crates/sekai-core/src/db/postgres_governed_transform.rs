@@ -6,6 +6,7 @@ use postgres::types::ToSql;
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
+use crate::db::governed_transform::{QUOTA_HOLD_COLUMNS, TransformQuotaHold};
 use crate::db::postgres::{PostgresDb, advisory_lock_key, lock_dataset_rows};
 use crate::db::postgres_audit::lock_object_lifecycle;
 use crate::domain::storage_properties_json;
@@ -1205,6 +1206,7 @@ impl PostgresDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
         fencing_token: &str,
@@ -1233,14 +1235,21 @@ impl PostgresDb {
         let changed = tx
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES ($1, $2, $3, $4)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
+                    quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency,
                     claim_generation = EXCLUDED.claim_generation
                  WHERE EXCLUDED.claim_generation >= sekai_transform_quota_hold.claim_generation",
-                &[&run_id, &tenant_id, &reserved, &claim_generation],
+                &[
+                    &run_id,
+                    &tenant_id,
+                    &reserved,
+                    &claim_generation,
+                    &quota_scope,
+                ],
             )
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1251,6 +1260,7 @@ impl PostgresDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
     ) -> Result<bool, String> {
@@ -1259,12 +1269,19 @@ impl PostgresDb {
             .connection()?
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES ($1, $2, $3, $4)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
+                    quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency",
-                &[&run_id, &tenant_id, &reserved, &claim_generation],
+                &[
+                    &run_id,
+                    &tenant_id,
+                    &reserved,
+                    &claim_generation,
+                    &quota_scope,
+                ],
             )
             .map_err(|error| error.to_string())?;
         Ok(changed > 0)
@@ -1274,6 +1291,7 @@ impl PostgresDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
@@ -1284,10 +1302,12 @@ impl PostgresDb {
             .connection()?
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens)
-                 VALUES ($1, $2, $3, 0, $4, $5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request,
+                     refund_tokens, quota_scope)
+                 VALUES ($1, $2, $3, 0, $4, $5, $6)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
+                    quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency,
                     refund_request = EXCLUDED.refund_request,
                     refund_tokens = EXCLUDED.refund_tokens",
@@ -1297,6 +1317,7 @@ impl PostgresDb {
                     &reserved,
                     &refund_request,
                     &refund_tokens,
+                    &quota_scope,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1308,7 +1329,7 @@ impl PostgresDb {
         run_id: &str,
         claim_generation: i64,
         fencing_token: &str,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let mut connection = self.connection()?;
         let mut tx = connection
             .transaction()
@@ -1318,24 +1339,21 @@ impl PostgresDb {
         }
         let held = tx
             .query_opt(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE ctid IN (
-                    SELECT ctid FROM sekai_transform_quota_hold
-                    WHERE run_id = $1 AND claim_generation < $2
-                    ORDER BY reserved_concurrency DESC, claim_generation ASC
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE ctid IN (
+                        SELECT ctid FROM sekai_transform_quota_hold
+                        WHERE run_id = $1 AND claim_generation < $2
+                        ORDER BY reserved_concurrency DESC, claim_generation ASC
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 &[&run_id, &claim_generation],
             )
             .map_err(|error| error.to_string())?
-            .map(|row| {
-                let tenant_id: String = row.get(0);
-                let reserved: i32 = row.get(1);
-                let generation: i64 = row.get(2);
-                (tenant_id, reserved != 0, generation)
-            });
-        let Some((tenant_id, reserved_concurrency, held_generation)) = held else {
+            .map(|row| quota_hold_row_pg(&row));
+        let Some(held) = held else {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
@@ -1348,19 +1366,26 @@ impl PostgresDb {
             let reserved = 0_i32;
             tx.execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES ($1, $2, $3, $4)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES ($1, $2, $3, $4, $5)
                  ON CONFLICT (run_id, claim_generation) DO UPDATE SET
                     tenant_id = EXCLUDED.tenant_id,
+                    quota_scope = EXCLUDED.quota_scope,
                     reserved_concurrency = EXCLUDED.reserved_concurrency,
                     claim_generation = EXCLUDED.claim_generation
                  WHERE EXCLUDED.claim_generation >= sekai_transform_quota_hold.claim_generation",
-                &[&run_id, &tenant_id, &reserved, &claim_generation],
+                &[
+                    &run_id,
+                    &held.tenant_id,
+                    &reserved,
+                    &claim_generation,
+                    &held.quota_scope,
+                ],
             )
             .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(Some((tenant_id, reserved_concurrency, held_generation)))
+        Ok(Some(held))
     }
 
     pub fn take_transform_quota_hold(
@@ -1368,64 +1393,69 @@ impl PostgresDb {
         run_id: &str,
         claim_generation: Option<i64>,
         older_than: bool,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let row = match (claim_generation, older_than) {
             (Some(generation), true) => self.connection()?.query_opt(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE ctid IN (
-                    SELECT ctid FROM sekai_transform_quota_hold
-                    WHERE run_id = $1 AND claim_generation < $2
-                    ORDER BY reserved_concurrency DESC, claim_generation ASC
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE ctid IN (
+                        SELECT ctid FROM sekai_transform_quota_hold
+                        WHERE run_id = $1 AND claim_generation < $2
+                        ORDER BY reserved_concurrency DESC, claim_generation ASC
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 &[&run_id, &generation],
             ),
             (Some(generation), false) => self.connection()?.query_opt(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE run_id = $1 AND claim_generation = $2
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE run_id = $1 AND claim_generation = $2
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 &[&run_id, &generation],
             ),
             (None, _) => self.connection()?.query_opt(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE ctid IN (
-                    SELECT ctid FROM sekai_transform_quota_hold WHERE run_id = $1 LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE ctid IN (
+                        SELECT ctid FROM sekai_transform_quota_hold WHERE run_id = $1 LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 &[&run_id],
             ),
         };
-        Ok(row.map_err(|error| error.to_string())?.map(|row| {
-            let tenant_id: String = row.get(0);
-            let reserved: i32 = row.get(1);
-            let generation: i64 = row.get(2);
-            (tenant_id, reserved != 0, generation)
-        }))
+        Ok(row
+            .map_err(|error| error.to_string())?
+            .map(|row| quota_hold_row_pg(&row)))
     }
 
     pub fn take_retryable_quota_hold(
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<crate::db::governed_transform::TakenTransformQuotaHold>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let row = self
             .connection()?
             .query_opt(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE ctid IN (
-                    SELECT h.ctid
-                    FROM sekai_transform_quota_hold h
-                    LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
-                    WHERE h.run_id = $1 AND h.claim_generation = $2
-                      AND (
-                        w.run_id IS NULL
-                        OR w.status IN ($3, $4, $5)
-                        OR h.claim_generation <> w.claim_generation
-                      )
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE ctid IN (
+                        SELECT h.ctid
+                        FROM sekai_transform_quota_hold h
+                        LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
+                        WHERE h.run_id = $1 AND h.claim_generation = $2
+                          AND (
+                            w.run_id IS NULL
+                            OR w.status IN ($3, $4, $5)
+                            OR h.claim_generation <> w.claim_generation
+                          )
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 &[
                     &run_id,
                     &claim_generation,
@@ -1435,20 +1465,7 @@ impl PostgresDb {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        Ok(row.map(|row| {
-            let tenant_id: String = row.get(0);
-            let reserved: i32 = row.get(1);
-            let generation: i64 = row.get(2);
-            let refund_request: i32 = row.get(3);
-            let refund_tokens: i32 = row.get(4);
-            (
-                tenant_id,
-                reserved != 0,
-                generation,
-                refund_request != 0,
-                refund_tokens,
-            )
-        }))
+        Ok(row.map(|row| quota_hold_row_pg(&row)))
     }
 
     pub fn list_retryable_quota_holds(&self) -> Result<Vec<(String, String, bool, i64)>, String> {
@@ -1484,22 +1501,18 @@ impl PostgresDb {
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let row = self
             .connection()?
             .query_opt(
-                "SELECT tenant_id, reserved_concurrency, claim_generation
-                 FROM sekai_transform_quota_hold
-                 WHERE run_id = $1 AND claim_generation = $2",
+                &format!(
+                    "SELECT {QUOTA_HOLD_COLUMNS} FROM sekai_transform_quota_hold
+                     WHERE run_id = $1 AND claim_generation = $2"
+                ),
                 &[&run_id, &claim_generation],
             )
             .map_err(|error| error.to_string())?;
-        Ok(row.map(|row| {
-            let tenant_id: String = row.get(0);
-            let reserved: i32 = row.get(1);
-            let generation: i64 = row.get(2);
-            (tenant_id, reserved != 0, generation)
-        }))
+        Ok(row.map(|row| quota_hold_row_pg(&row)))
     }
 
     pub fn defer_transform_work(&self, run_id: &str, now_ms: i64) -> Result<(), String> {
@@ -3449,6 +3462,17 @@ fn persist_transform_work_pg(
     upsert_transform_work_pg(tx, work, "")
 }
 
+fn quota_hold_row_pg(row: &Row) -> TransformQuotaHold {
+    TransformQuotaHold {
+        tenant_id: row.get(0),
+        quota_scope: row.get(1),
+        reserved_concurrency: row.get::<_, i32>(2) != 0,
+        claim_generation: row.get(3),
+        refund_request: row.get::<_, i32>(4) != 0,
+        refund_tokens: row.get(5),
+    }
+}
+
 fn carry_transform_quota_request_admission_pg(
     tx: &mut postgres::Transaction<'_>,
     run_id: &str,
@@ -3456,8 +3480,8 @@ fn carry_transform_quota_request_admission_pg(
 ) -> Result<(), String> {
     tx.execute(
         "INSERT INTO sekai_transform_quota_hold
-            (run_id, tenant_id, reserved_concurrency, claim_generation)
-         SELECT run_id, tenant_id, 0, $2
+            (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+         SELECT run_id, tenant_id, 0, $2, quota_scope
          FROM sekai_transform_quota_hold
          WHERE run_id = $1 AND claim_generation < $2
          ORDER BY reserved_concurrency DESC, claim_generation DESC

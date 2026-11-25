@@ -31,7 +31,35 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
-pub type TakenTransformQuotaHold = (String, bool, i64, bool, i32);
+/// One unused-reservation hold of a transform run: whose quota it holds,
+/// whether it holds a concurrency unit, and what an abandoned admission still
+/// has to refund.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformQuotaHold {
+    pub tenant_id: String,
+    /// Budget scope the admission reserved on (#3044): the tenant scope, a
+    /// namespace scope under it, or empty on a hold an older plane wrote.
+    pub quota_scope: String,
+    pub reserved_concurrency: bool,
+    pub claim_generation: i64,
+    pub refund_request: bool,
+    pub refund_tokens: i32,
+}
+
+/// Columns every hold read returns, in [`TransformQuotaHold`] order.
+pub(crate) const QUOTA_HOLD_COLUMNS: &str =
+    "tenant_id, quota_scope, reserved_concurrency, claim_generation, refund_request, refund_tokens";
+
+fn quota_hold_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformQuotaHold> {
+    Ok(TransformQuotaHold {
+        tenant_id: row.get(0)?,
+        quota_scope: row.get(1)?,
+        reserved_concurrency: row.get::<_, i64>(2)? != 0,
+        claim_generation: row.get(3)?,
+        refund_request: row.get::<_, i64>(4)? != 0,
+        refund_tokens: i32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+    })
+}
 
 impl SekaiDb {
     pub fn migrate_governed_transforms(&self) -> Result<(), String> {
@@ -195,6 +223,7 @@ impl SekaiDb {
                     claim_generation INTEGER NOT NULL,
                     refund_request INTEGER NOT NULL DEFAULT 0,
                     refund_tokens INTEGER NOT NULL DEFAULT 0,
+                    quota_scope TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (run_id, claim_generation)
                 );
                 CREATE TABLE IF NOT EXISTS sekai_transform_quota_owner (
@@ -299,6 +328,13 @@ impl SekaiDb {
                 ",
             )
             .map_err(|error| error.to_string())?;
+        // #3044: the budget scope a hold's refund reaches. Empty on holds an
+        // older plane wrote, which refund the tenant scope only.
+        crate::db::add_sqlite_column(
+            &self.conn(),
+            "ALTER TABLE sekai_transform_quota_hold
+             ADD COLUMN quota_scope TEXT NOT NULL DEFAULT ''",
+        )?;
         Ok(())
     }
 
@@ -1410,6 +1446,7 @@ impl SekaiDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
         fencing_token: &str,
@@ -1447,10 +1484,11 @@ impl SekaiDb {
         let changed = tx
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES (?1, ?2, ?3, ?4)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
+                    quota_scope = excluded.quota_scope,
                     reserved_concurrency = excluded.reserved_concurrency,
                     claim_generation = excluded.claim_generation
                  WHERE excluded.claim_generation >= sekai_transform_quota_hold.claim_generation",
@@ -1458,7 +1496,8 @@ impl SekaiDb {
                     run_id,
                     tenant_id,
                     i64::from(reserved_concurrency),
-                    claim_generation
+                    claim_generation,
+                    quota_scope
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1470,6 +1509,7 @@ impl SekaiDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         claim_generation: i64,
     ) -> Result<bool, String> {
@@ -1477,16 +1517,18 @@ impl SekaiDb {
             .conn()
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES (?1, ?2, ?3, ?4)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
+                    quota_scope = excluded.quota_scope,
                     reserved_concurrency = excluded.reserved_concurrency",
                 params![
                     run_id,
                     tenant_id,
                     i64::from(reserved_concurrency),
-                    claim_generation
+                    claim_generation,
+                    quota_scope
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1497,6 +1539,7 @@ impl SekaiDb {
         &self,
         run_id: &str,
         tenant_id: &str,
+        quota_scope: &str,
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
@@ -1505,10 +1548,11 @@ impl SekaiDb {
             .conn()
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens, quota_scope)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
+                    quota_scope = excluded.quota_scope,
                     reserved_concurrency = excluded.reserved_concurrency,
                     refund_request = excluded.refund_request,
                     refund_tokens = excluded.refund_tokens",
@@ -1517,7 +1561,8 @@ impl SekaiDb {
                     tenant_id,
                     i64::from(reserved_concurrency),
                     i64::from(refund_request),
-                    refund_tokens
+                    refund_tokens,
+                    quota_scope
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1529,33 +1574,29 @@ impl SekaiDb {
         run_id: &str,
         claim_generation: i64,
         fencing_token: &str,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let held = tx
             .query_row(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE rowid IN (
-                    SELECT rowid FROM sekai_transform_quota_hold
-                    WHERE run_id = ?1 AND claim_generation < ?2
-                    ORDER BY reserved_concurrency DESC, claim_generation ASC
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE rowid IN (
+                        SELECT rowid FROM sekai_transform_quota_hold
+                        WHERE run_id = ?1 AND claim_generation < ?2
+                        ORDER BY reserved_concurrency DESC, claim_generation ASC
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 params![run_id, claim_generation],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                quota_hold_row,
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((tenant_id, reserved_concurrency, held_generation)) = held else {
+        let Some(held) = held else {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(None);
         };
@@ -1577,19 +1618,20 @@ impl SekaiDb {
         if still_claimed {
             tx.execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation)
-                 VALUES (?1, ?2, 0, ?3)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES (?1, ?2, 0, ?3, ?4)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
+                    quota_scope = excluded.quota_scope,
                     reserved_concurrency = 0,
                     claim_generation = excluded.claim_generation
                  WHERE excluded.claim_generation >= sekai_transform_quota_hold.claim_generation",
-                params![run_id, tenant_id, claim_generation],
+                params![run_id, held.tenant_id, claim_generation, held.quota_scope],
             )
             .map_err(|error| error.to_string())?;
         }
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(Some((tenant_id, reserved_concurrency, held_generation)))
+        Ok(Some(held))
     }
 
     pub fn take_transform_quota_hold(
@@ -1597,53 +1639,41 @@ impl SekaiDb {
         run_id: &str,
         claim_generation: Option<i64>,
         older_than: bool,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         let held = match (claim_generation, older_than) {
             (Some(generation), true) => self.conn().query_row(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE rowid IN (
-                    SELECT rowid FROM sekai_transform_quota_hold
-                    WHERE run_id = ?1 AND claim_generation < ?2
-                    ORDER BY reserved_concurrency DESC, claim_generation ASC
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE rowid IN (
+                        SELECT rowid FROM sekai_transform_quota_hold
+                        WHERE run_id = ?1 AND claim_generation < ?2
+                        ORDER BY reserved_concurrency DESC, claim_generation ASC
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 params![run_id, generation],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                quota_hold_row,
             ),
             (Some(generation), false) => self.conn().query_row(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE run_id = ?1 AND claim_generation = ?2
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE run_id = ?1 AND claim_generation = ?2
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 params![run_id, generation],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                quota_hold_row,
             ),
             (None, _) => self.conn().query_row(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE rowid IN (
-                    SELECT rowid FROM sekai_transform_quota_hold WHERE run_id = ?1 LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE rowid IN (
+                        SELECT rowid FROM sekai_transform_quota_hold WHERE run_id = ?1 LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 params![run_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                quota_hold_row,
             ),
         };
         held.optional().map_err(|error| error.to_string())
@@ -1653,23 +1683,25 @@ impl SekaiDb {
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<TakenTransformQuotaHold>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         self.conn()
             .query_row(
-                "DELETE FROM sekai_transform_quota_hold
-                 WHERE rowid IN (
-                    SELECT h.rowid
-                    FROM sekai_transform_quota_hold h
-                    LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
-                    WHERE h.run_id = ?1 AND h.claim_generation = ?2
-                      AND (
-                        w.run_id IS NULL
-                        OR w.status IN (?3, ?4, ?5)
-                        OR h.claim_generation != w.claim_generation
-                      )
-                    LIMIT 1
-                 )
-                 RETURNING tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens",
+                &format!(
+                    "DELETE FROM sekai_transform_quota_hold
+                     WHERE rowid IN (
+                        SELECT h.rowid
+                        FROM sekai_transform_quota_hold h
+                        LEFT JOIN sekai_transform_work w ON w.run_id = h.run_id
+                        WHERE h.run_id = ?1 AND h.claim_generation = ?2
+                          AND (
+                            w.run_id IS NULL
+                            OR w.status IN (?3, ?4, ?5)
+                            OR h.claim_generation != w.claim_generation
+                          )
+                        LIMIT 1
+                     )
+                     RETURNING {QUOTA_HOLD_COLUMNS}"
+                ),
                 params![
                     run_id,
                     claim_generation,
@@ -1677,15 +1709,7 @@ impl SekaiDb {
                     TRANSFORM_WORK_CANCELLED,
                     TRANSFORM_WORK_FAILED
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)? != 0,
-                        i32::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
-                    ))
-                },
+                quota_hold_row,
             )
             .optional()
             .map_err(|error| error.to_string())
@@ -1728,20 +1752,15 @@ impl SekaiDb {
         &self,
         run_id: &str,
         claim_generation: i64,
-    ) -> Result<Option<(String, bool, i64)>, String> {
+    ) -> Result<Option<TransformQuotaHold>, String> {
         self.conn()
             .query_row(
-                "SELECT tenant_id, reserved_concurrency, claim_generation
-                 FROM sekai_transform_quota_hold
-                 WHERE run_id = ?1 AND claim_generation = ?2",
+                &format!(
+                    "SELECT {QUOTA_HOLD_COLUMNS} FROM sekai_transform_quota_hold
+                     WHERE run_id = ?1 AND claim_generation = ?2"
+                ),
                 params![run_id, claim_generation],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
+                quota_hold_row,
             )
             .optional()
             .map_err(|error| error.to_string())
@@ -3144,8 +3163,8 @@ fn carry_transform_quota_request_admission(
 ) -> Result<(), String> {
     tx.execute(
         "INSERT INTO sekai_transform_quota_hold
-            (run_id, tenant_id, reserved_concurrency, claim_generation)
-         SELECT run_id, tenant_id, 0, ?2
+            (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+         SELECT run_id, tenant_id, 0, ?2, quota_scope
          FROM sekai_transform_quota_hold
          WHERE run_id = ?1 AND claim_generation < ?2
          ORDER BY reserved_concurrency DESC, claim_generation DESC
@@ -8049,6 +8068,18 @@ mod tests {
         );
     }
 
+    /// A hold of `tenant-a` with no recorded scope and nothing to refund.
+    fn hold(reserved_concurrency: bool, claim_generation: i64) -> TransformQuotaHold {
+        TransformQuotaHold {
+            tenant_id: "tenant-a".into(),
+            quota_scope: String::new(),
+            reserved_concurrency,
+            claim_generation,
+            refund_request: false,
+            refund_tokens: 0,
+        }
+    }
+
     #[test]
     fn put_quota_hold_restores_after_isolated_write() {
         let db = db();
@@ -8073,6 +8104,7 @@ mod tests {
             db.put_transform_quota_hold(
                 &work.run_id,
                 "tenant-a",
+                "",
                 true,
                 work.claim_generation,
                 &work.fencing_token,
@@ -8104,6 +8136,7 @@ mod tests {
             !db.put_transform_quota_hold(
                 &work.run_id,
                 "tenant-a",
+                "",
                 true,
                 work.claim_generation,
                 &work.fencing_token,
@@ -8111,13 +8144,19 @@ mod tests {
             .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&work.run_id, "tenant-a", true, work.claim_generation)
-                .unwrap()
+            db.restore_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                "",
+                true,
+                work.claim_generation
+            )
+            .unwrap()
         );
         assert_eq!(
             db.take_transform_quota_hold(&work.run_id, Some(work.claim_generation), false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, work.claim_generation))
+            Some(hold(true, work.claim_generation))
         );
     }
 
@@ -8145,6 +8184,7 @@ mod tests {
             db.put_transform_quota_hold(
                 &work.run_id,
                 "tenant-a",
+                "",
                 true,
                 work.claim_generation,
                 &work.fencing_token,
@@ -8161,6 +8201,7 @@ mod tests {
             !db.put_transform_quota_hold(
                 &work.run_id,
                 "tenant-a",
+                "",
                 true,
                 work.claim_generation,
                 &work.fencing_token,
@@ -8168,8 +8209,14 @@ mod tests {
             .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&work.run_id, "tenant-a", true, work.claim_generation)
-                .unwrap()
+            db.restore_transform_quota_hold(
+                &work.run_id,
+                "tenant-a",
+                "",
+                true,
+                work.claim_generation
+            )
+            .unwrap()
         );
         assert_eq!(
             db.list_retryable_quota_holds().unwrap(),
@@ -8183,7 +8230,7 @@ mod tests {
         assert_eq!(
             db.take_transform_quota_hold(&work.run_id, None, false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, work.claim_generation))
+            Some(hold(true, work.claim_generation))
         );
     }
 
@@ -8191,7 +8238,7 @@ mod tests {
     fn restore_quota_hold_without_work_is_retryable_in_process() {
         let db = db();
         assert!(
-            db.restore_transform_quota_hold("run-in-process", "tenant-a", true, 0)
+            db.restore_transform_quota_hold("run-in-process", "tenant-a", "", true, 0)
                 .unwrap()
         );
         assert_eq!(
@@ -8201,7 +8248,7 @@ mod tests {
         assert_eq!(
             db.take_transform_quota_hold("run-in-process", Some(0), false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, 0))
+            Some(hold(true, 0))
         );
         assert!(db.list_retryable_quota_holds().unwrap().is_empty());
     }
@@ -8210,22 +8257,22 @@ mod tests {
     fn restore_older_hold_keeps_the_current_claim_hold() {
         let db = db();
         assert!(
-            db.restore_transform_quota_hold("run-overlap", "tenant-a", true, 1)
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 1)
                 .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold("run-overlap", "tenant-a", true, 2)
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 2)
                 .unwrap()
         );
         assert_eq!(
             db.take_transform_quota_hold("run-overlap", Some(1), false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, 1))
+            Some(hold(true, 1))
         );
         assert_eq!(
             db.take_transform_quota_hold("run-overlap", Some(2), false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, 2))
+            Some(hold(true, 2))
         );
     }
 
@@ -8254,6 +8301,7 @@ mod tests {
             db.put_transform_quota_hold(
                 &first.run_id,
                 "tenant-a",
+                "",
                 true,
                 first.claim_generation,
                 &first.fencing_token,
@@ -8267,12 +8315,13 @@ mod tests {
         assert_eq!(second.claim_generation, 2);
         assert_eq!(
             db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
-            Some(("tenant-a".into(), false, 2))
+            Some(hold(false, 2))
         );
         assert!(
             db.put_transform_quota_hold(
                 &second.run_id,
                 "tenant-a",
+                "",
                 true,
                 second.claim_generation,
                 &second.fencing_token,
@@ -8280,7 +8329,7 @@ mod tests {
             .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 1)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 1)
                 .unwrap()
         );
         assert_eq!(
@@ -8289,7 +8338,7 @@ mod tests {
         );
         assert_eq!(
             db.take_retryable_quota_hold(&second.run_id, 1).unwrap(),
-            Some(("tenant-a".into(), true, 1, false, 0))
+            Some(hold(true, 1))
         );
         assert!(
             db.take_retryable_quota_hold(&second.run_id, 2)
@@ -8299,7 +8348,7 @@ mod tests {
         assert_eq!(
             db.take_transform_quota_hold(&second.run_id, Some(2), false)
                 .unwrap(),
-            Some(("tenant-a".into(), true, 2))
+            Some(hold(true, 2))
         );
     }
 
@@ -8329,11 +8378,11 @@ mod tests {
             .expect("reclaim after lease expiry");
         assert_eq!(second.claim_generation, 2);
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 0)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 0)
                 .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", true, 1)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 1)
                 .unwrap()
         );
         assert_eq!(
@@ -8343,7 +8392,7 @@ mod tests {
                 &second.fencing_token,
             )
             .unwrap(),
-            Some(("tenant-a".into(), true, 0))
+            Some(hold(true, 0))
         );
         assert_eq!(
             db.list_retryable_quota_holds().unwrap(),
@@ -8352,7 +8401,7 @@ mod tests {
         assert_eq!(
             db.take_transform_quota_hold(&second.run_id, Some(2), false)
                 .unwrap(),
-            Some(("tenant-a".into(), false, 2))
+            Some(hold(false, 2))
         );
     }
 
@@ -8380,6 +8429,7 @@ mod tests {
             db.put_transform_quota_hold(
                 &first.run_id,
                 "tenant-a",
+                "",
                 true,
                 first.claim_generation,
                 &first.fencing_token,
@@ -8393,11 +8443,11 @@ mod tests {
         assert_eq!(second.claim_generation, 2);
         assert_eq!(
             db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
-            Some(("tenant-a".into(), false, 2))
+            Some(hold(false, 2))
         );
         assert_eq!(
             db.take_retryable_quota_hold(&second.run_id, 1).unwrap(),
-            Some(("tenant-a".into(), true, 1, false, 0))
+            Some(hold(true, 1))
         );
         assert!(
             db.reclaim_transform_quota_hold(
@@ -8410,8 +8460,79 @@ mod tests {
         );
         assert_eq!(
             db.peek_transform_quota_hold(&second.run_id, 2).unwrap(),
-            Some(("tenant-a".into(), false, 2))
+            Some(hold(false, 2))
         );
+    }
+
+    #[test]
+    fn a_reclaim_carries_the_hold_scope_to_the_next_claim() {
+        let db = db();
+        db.create_dataset(&dataset("in")).unwrap();
+        db.create_dataset(&dataset("out")).unwrap();
+        db.append_rows("in", &[HashMap::from([("id".into(), "1".into())])])
+            .unwrap();
+        db.put_governed_transform(&isolated_transform(), 10)
+            .unwrap();
+        db.run_governed_transform("ops", "iso1", false, 20).unwrap();
+        let (first, _) = db
+            .claim_transform_work("ops", "runner-a", "", 5, 30)
+            .unwrap()
+            .expect("first claim");
+        let scope = "tenant:tenant-a/namespace:ops";
+        assert!(
+            db.put_transform_quota_hold(
+                &first.run_id,
+                "tenant-a",
+                scope,
+                true,
+                first.claim_generation,
+                &first.fencing_token,
+            )
+            .unwrap()
+        );
+        let (second, _) = db
+            .claim_transform_work("ops", "runner-b", "", 5, first.claim_expires_at_ms + 1)
+            .unwrap()
+            .expect("reclaim after lease expiry");
+        let carried = db
+            .peek_transform_quota_hold(&second.run_id, second.claim_generation)
+            .unwrap()
+            .expect("the request admission is carried");
+        assert_eq!(carried.quota_scope, scope);
+        let reclaimed = db
+            .reclaim_transform_quota_hold(
+                &second.run_id,
+                second.claim_generation,
+                &second.fencing_token,
+            )
+            .unwrap()
+            .expect("the older hold");
+        assert_eq!(reclaimed.quota_scope, scope);
+        assert!(reclaimed.reserved_concurrency);
+    }
+
+    #[test]
+    fn a_hold_table_without_a_scope_gains_it_and_reads_older_holds_as_unscoped() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("before-quota-scope.sqlite");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE sekai_transform_quota_hold DROP COLUMN quota_scope;
+                 INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request)
+                 VALUES ('held-before', 'tenant-a', 0, 0, 1);",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let older = db
+            .take_transform_quota_hold("held-before", Some(0), false)
+            .unwrap()
+            .expect("the older hold survives the upgrade");
+        assert_eq!(older.quota_scope, "");
+        assert!(older.refund_request);
     }
 
     #[test]

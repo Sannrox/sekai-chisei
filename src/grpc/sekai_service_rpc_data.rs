@@ -2699,6 +2699,7 @@ pub(super) async fn run_adhoc_governed_transform(
             quota.as_ref(),
             &gate,
             tenant_context.as_ref(),
+            &request.namespace,
             &format!("transform-adhoc:{}", request.identity()),
             false,
         )?
@@ -3077,6 +3078,7 @@ pub(super) async fn run_governed_transform(
             quota.as_ref(),
             &gate,
             owner_ctx.as_ref(),
+            &input.namespace,
             &format!(
                 "transform-run:{}:{}:{}",
                 input.namespace,
@@ -3297,6 +3299,7 @@ pub(super) async fn run_transform_chain(
             quota.as_ref(),
             &gate,
             tenant_context.as_ref(),
+            &input.namespace,
             &format!(
                 "transform-chain:{}:{}:{}",
                 input.namespace, input.chain_id, input.idempotency_key
@@ -3681,7 +3684,7 @@ pub(super) async fn claim_transform_work(
                 // the extension's, else a budget the run could never fit (#3044).
                 let refusal = match extension_refusal(service, owner.as_ref(), &work) {
                     Some(refusal) => Some(refusal),
-                    None => tenant_budget_refusal(quota.as_ref(), owner.as_ref())?,
+                    None => tenant_budget_refusal(quota.as_ref(), owner.as_ref(), &work.namespace)?,
                 };
                 if let Some(refusal) = refusal {
                     match service.db.runtime().refuse_transform_claim(
@@ -3718,18 +3721,19 @@ pub(super) async fn claim_transform_work(
                         work.claim_generation,
                         &work.fencing_token,
                     ) {
-                        Ok(Some((tenant_id, reserved_concurrency, held_generation))) => {
-                            if reserved_concurrency {
+                        Ok(Some(hold)) => {
+                            if hold.reserved_concurrency {
                                 if let Err(status) = complete_reserved_transform_quota(
                                     quota.clone(),
                                     &work.run_id,
-                                    &tenant_id,
+                                    &hold,
                                 ) {
                                     let _ = service.db.runtime().restore_transform_quota_hold(
                                         &work.run_id,
-                                        &tenant_id,
+                                        &hold.tenant_id,
+                                        &hold.quota_scope,
                                         true,
-                                        held_generation,
+                                        hold.claim_generation,
                                     );
                                     return Err(status);
                                 }
@@ -3845,6 +3849,7 @@ pub(super) async fn claim_transform_work(
                             match service.db.runtime().put_transform_quota_hold(
                                 &work.run_id,
                                 &admission.tenant_id,
+                                &admission.scope_id,
                                 admission.reserved_concurrency,
                                 work.claim_generation,
                                 &work.fencing_token,
@@ -4158,13 +4163,14 @@ pub(super) async fn write_transform_run_result(
             .take_transform_quota_hold(&run.run_id, Some(claim_generation), false)
             .map_err(Status::internal)?;
         let quota = service.quota_runtime();
-        if let Some((tenant_id, true, held_generation)) = hold.as_ref() {
-            if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, tenant_id) {
+        if let Some(hold) = hold.as_ref().filter(|hold| hold.reserved_concurrency) {
+            if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, hold) {
                 let _ = service.db.runtime().restore_transform_quota_hold(
                     &run.run_id,
-                    tenant_id,
+                    &hold.tenant_id,
+                    &hold.quota_scope,
                     true,
-                    *held_generation,
+                    hold.claim_generation,
                 );
                 return Err(status);
             }
@@ -4193,7 +4199,7 @@ pub(super) async fn write_transform_run_result(
         .map(|tenant| tenant.tenant_id.clone());
     let usage_tenant = hold
         .as_ref()
-        .map(|(tenant_id, _, _)| tenant_id.as_str())
+        .map(|hold| hold.tenant_id.as_str())
         .or(owner_tenant.as_deref())
         .or(caller_tenant.as_deref());
     let quota = service.quota_runtime();
@@ -4206,13 +4212,14 @@ pub(super) async fn write_transform_run_result(
         .unwrap_or_else(now_millis);
     let usage =
         record_tenant_transform_usage(quota.as_ref(), usage_tenant, &run, &actor, completed_at_ms);
-    if let Some((tenant_id, true, held_generation)) = hold.as_ref() {
-        if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, tenant_id) {
+    if let Some(hold) = hold.as_ref().filter(|hold| hold.reserved_concurrency) {
+        if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, hold) {
             let _ = service.db.runtime().restore_transform_quota_hold(
                 &run.run_id,
-                tenant_id,
+                &hold.tenant_id,
+                &hold.quota_scope,
                 true,
-                *held_generation,
+                hold.claim_generation,
             );
             return Err(status);
         }
@@ -4532,6 +4539,7 @@ fn admit_claimed_isolated_process(
         quota,
         &transform_quota_gate(service.quota_runtime())?,
         owner,
+        &work.namespace,
         &format!("transform-claim:{}", work.run_id),
         reclaim,
     )
@@ -4616,27 +4624,32 @@ fn admit_extension_isolated_process(
     }
 }
 
-/// The refusal of a run larger than its tenant's whole budget. Store errors
-/// refuse the claim, as admission does.
+/// The refusal of a run larger than its tenant's or its namespace's whole
+/// budget. Store errors refuse the claim, as admission does.
 fn tenant_budget_refusal(
     db: &crate::db::runtime_db::RuntimeDb,
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
 ) -> Result<Option<crate::enterprise::IsolatedProcessRefusal>, Status> {
     let Some(tenant) = tenant_context.and_then(|context| context.tenant.as_ref()) else {
         return Ok(None);
     };
-    let limits =
-        crate::composition::transform_run_admission::configured_limits(db, &tenant.tenant_id)
-            .map_err(Status::internal)?;
-    Ok(limits
-        .as_ref()
-        .and_then(crate::composition::transform_run_admission::refusal_larger_than_budget))
+    let limits = crate::composition::transform_run_admission::configured_run_limits(
+        db,
+        &tenant.tenant_id,
+        namespace,
+    )
+    .map_err(Status::internal)?;
+    Ok(limits.refusal_larger_than_budget())
 }
 
+/// Admits a transform run in `namespace` against its tenant's and its
+/// namespace's assignments (#3044). `None` when neither has one.
 fn admit_tenant_transform(
     db: &crate::db::runtime_db::RuntimeDb,
     gate: &crate::chisei::tenant_quota::TenantQuotaGate,
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
     run_key: &str,
     reclaim: bool,
 ) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
@@ -4650,12 +4663,13 @@ fn admit_tenant_transform(
     else {
         return Ok(None);
     };
-    let Some(limits) =
-        crate::composition::transform_run_admission::configured_limits(db, tenant_id)
-            .map_err(Status::internal)?
-    else {
+    let limits = crate::composition::transform_run_admission::configured_run_limits(
+        db, tenant_id, namespace,
+    )
+    .map_err(Status::internal)?;
+    if limits.is_unlimited() {
         return Ok(None);
-    };
+    }
     crate::composition::transform_run_admission::admit_transform_run(
         gate, context, &limits, run_key, reclaim,
     )
@@ -4701,6 +4715,7 @@ fn abandon_or_persist_quota_hold(
             db.restore_abandoned_quota_hold(
                 &failed.remaining.idempotency_key,
                 &failed.remaining.tenant_id,
+                &failed.remaining.scope_id,
                 failed.remaining.reserved_concurrency,
                 failed.remaining.reserved_request,
                 failed.remaining.reserved_tokens,
@@ -4743,18 +4758,22 @@ fn release_claimed_transform_quota(
 ) -> Result<bool, Status> {
     let mut released = false;
     loop {
-        let Some((tenant_id, reserved_concurrency, held_generation)) = db
+        let Some(hold) = db
             .take_transform_quota_hold(run_id, claim_generation, older_than)
             .map_err(Status::internal)?
         else {
             return Ok(released);
         };
         released = true;
-        if reserved_concurrency {
-            if let Err(status) =
-                complete_reserved_transform_quota(runtime.clone(), run_id, &tenant_id)
-            {
-                let _ = db.restore_transform_quota_hold(run_id, &tenant_id, true, held_generation);
+        if hold.reserved_concurrency {
+            if let Err(status) = complete_reserved_transform_quota(runtime.clone(), run_id, &hold) {
+                let _ = db.restore_transform_quota_hold(
+                    run_id,
+                    &hold.tenant_id,
+                    &hold.quota_scope,
+                    true,
+                    hold.claim_generation,
+                );
                 return Err(status);
             }
         }
@@ -4767,22 +4786,23 @@ fn release_retryable_transform_quota(
     run_id: &str,
     claim_generation: i64,
 ) -> Result<bool, Status> {
-    let Some((tenant_id, reserved_concurrency, held_generation, refund_request, refund_tokens)) =
-        db.take_retryable_quota_hold(run_id, claim_generation)
-            .map_err(Status::internal)?
+    let Some(hold) = db
+        .take_retryable_quota_hold(run_id, claim_generation)
+        .map_err(Status::internal)?
     else {
         return Ok(false);
     };
-    if refund_request || refund_tokens > 0 {
+    if hold.refund_request || hold.refund_tokens > 0 {
+        // A hold an older plane wrote has no scope and refunds the tenant.
         let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
-            tenant_id: tenant_id.clone(),
-            scope_id: crate::chisei::tenant_quota::tenant_scope_id(&tenant_id),
-            assignment_version: 1,
-            reserved_tokens: refund_tokens,
-            reserved_request: refund_request,
-            reserved_concurrency,
-            idempotency_key: run_id.to_string(),
-            concurrency_holder: String::new(),
+            reserved_tokens: hold.refund_tokens,
+            reserved_request: hold.refund_request,
+            reserved_concurrency: hold.reserved_concurrency,
+            ..crate::chisei::tenant_quota::TenantQuotaAdmission::from_hold(
+                &hold.tenant_id,
+                &hold.quota_scope,
+                run_id,
+            )
         };
         match transform_quota_gate(runtime.clone())?.abandon(&admission) {
             Ok(()) => return Ok(true),
@@ -4790,6 +4810,7 @@ fn release_retryable_transform_quota(
                 let _ = db.restore_abandoned_quota_hold(
                     run_id,
                     &failed.remaining.tenant_id,
+                    &failed.remaining.scope_id,
                     failed.remaining.reserved_concurrency,
                     failed.remaining.reserved_request,
                     failed.remaining.reserved_tokens,
@@ -4798,9 +4819,15 @@ fn release_retryable_transform_quota(
             }
         }
     }
-    if reserved_concurrency {
-        if let Err(status) = complete_reserved_transform_quota(runtime, run_id, &tenant_id) {
-            let _ = db.restore_transform_quota_hold(run_id, &tenant_id, true, held_generation);
+    if hold.reserved_concurrency {
+        if let Err(status) = complete_reserved_transform_quota(runtime, run_id, &hold) {
+            let _ = db.restore_transform_quota_hold(
+                run_id,
+                &hold.tenant_id,
+                &hold.quota_scope,
+                true,
+                hold.claim_generation,
+            );
             return Err(status);
         }
     }
@@ -4825,6 +4852,7 @@ fn restore_request_admission_hold(
     db.put_transform_quota_hold(
         &work.run_id,
         tenant_id,
+        "",
         false,
         work.claim_generation,
         &work.fencing_token,
@@ -4833,20 +4861,20 @@ fn restore_request_admission_hold(
     .map_err(Status::internal)
 }
 
+/// Drops the concurrency holds a stored hold stands for: the tenant's and,
+/// when it recorded a namespace scope, the namespace's.
 fn complete_reserved_transform_quota(
     runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
     run_id: &str,
-    tenant_id: &str,
+    hold: &crate::db::governed_transform::TransformQuotaHold,
 ) -> Result<(), Status> {
     let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
-        tenant_id: tenant_id.into(),
-        scope_id: crate::chisei::tenant_quota::tenant_scope_id(tenant_id),
-        assignment_version: 1,
-        reserved_tokens: 0,
-        reserved_request: false,
         reserved_concurrency: true,
-        idempotency_key: format!("transform-claim:{run_id}"),
-        concurrency_holder: String::new(),
+        ..crate::chisei::tenant_quota::TenantQuotaAdmission::from_hold(
+            &hold.tenant_id,
+            &hold.quota_scope,
+            &format!("transform-claim:{run_id}"),
+        )
     };
     crate::composition::transform_run_admission::complete_transform_run(
         &transform_quota_gate(runtime)?,
@@ -5633,6 +5661,7 @@ pub(crate) async fn run_schedule_tick(
             quota.as_ref(),
             &gate,
             Some(&owner),
+            &item.namespace,
             &format!(
                 "transform-tick:{}:{}:{}:{}",
                 item.namespace, item.transform_id, item.cause, item.cause_ref
@@ -6601,6 +6630,7 @@ pub(super) async fn run_governed_transform_on_branch(
         quota.as_ref(),
         &gate,
         owner_ctx.as_ref(),
+        &input.namespace,
         &admission_id,
         false,
     )?;
@@ -6727,12 +6757,20 @@ fn admit_replay<T: 'static>(
 fn with_transform_quota<R>(
     service: &SekaiServiceImpl,
     owner_ctx: Option<&crate::enterprise::AuthenticatedContext>,
+    namespace: &str,
     admission_id: String,
     work: impl FnOnce() -> Result<R, String>,
 ) -> Result<R, Status> {
     let quota = service.quota_runtime();
     let gate = transform_quota_gate(quota.clone())?;
-    let held = admit_tenant_transform(quota.as_ref(), &gate, owner_ctx, &admission_id, false)?;
+    let held = admit_tenant_transform(
+        quota.as_ref(),
+        &gate,
+        owner_ctx,
+        namespace,
+        &admission_id,
+        false,
+    )?;
     match work() {
         Ok(result) => {
             release_tenant_transform(service.db.runtime(), &gate, &admission_id, held.as_ref())?;
@@ -6775,28 +6813,34 @@ pub(super) async fn replay_governed_transform(
         input.transform_id,
         uuid::Uuid::new_v4()
     );
-    let replay = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
-        service
-            .db
-            .runtime()
-            .replay_governed_transform_with_object_sets(
-                &crate::sekai::transform_replay::ReplayTransform {
-                    namespace: input.namespace,
-                    transform_id: input.transform_id,
-                    input_versions,
-                    as_of_ms: input.as_of_ms,
-                    definition_json: input.definition_json,
-                    baseline_version_id: input.baseline_version_id,
-                    key_column: input.key_column,
-                    // The definition whose inputs and output were checked.
-                    expected_definition_digest: admission.stored.definition_digest.clone(),
-                    actor: admission.actor,
-                    tenant: admission.tenant,
-                },
-                &object_sets,
-                now_millis(),
-            )
-    })?;
+    let replay = with_transform_quota(
+        service,
+        admission.owner_ctx.as_ref(),
+        &input.namespace.clone(),
+        admission_id,
+        || {
+            service
+                .db
+                .runtime()
+                .replay_governed_transform_with_object_sets(
+                    &crate::sekai::transform_replay::ReplayTransform {
+                        namespace: input.namespace,
+                        transform_id: input.transform_id,
+                        input_versions,
+                        as_of_ms: input.as_of_ms,
+                        definition_json: input.definition_json,
+                        baseline_version_id: input.baseline_version_id,
+                        key_column: input.key_column,
+                        // The definition whose inputs and output were checked.
+                        expected_definition_digest: admission.stored.definition_digest.clone(),
+                        actor: admission.actor,
+                        tenant: admission.tenant,
+                    },
+                    &object_sets,
+                    now_millis(),
+                )
+        },
+    )?;
     Ok(Response::new(ReplayGovernedTransformResponse {
         replay: Some(to_proto_replay(replay)),
     }))
@@ -6828,23 +6872,29 @@ pub(super) async fn shadow_governed_transform(
         input.transform_id,
         uuid::Uuid::new_v4()
     );
-    let report = with_transform_quota(service, admission.owner_ctx.as_ref(), admission_id, || {
-        service.db.runtime().shadow_governed_transform(
-            &crate::sekai::transform_shadow::ShadowTransform {
-                namespace: input.namespace,
-                transform_id: input.transform_id,
-                definition_json: input.definition_json,
-                run_ids: input.run_ids,
-                limit: input.limit as usize,
-                key_column: input.key_column,
-                expected_definition_digest: admission.stored.definition_digest.clone(),
-                require_for_promotion: input.require_for_promotion,
-                actor: admission.actor,
-                tenant: admission.tenant,
-            },
-            now_millis(),
-        )
-    })?;
+    let report = with_transform_quota(
+        service,
+        admission.owner_ctx.as_ref(),
+        &input.namespace.clone(),
+        admission_id,
+        || {
+            service.db.runtime().shadow_governed_transform(
+                &crate::sekai::transform_shadow::ShadowTransform {
+                    namespace: input.namespace,
+                    transform_id: input.transform_id,
+                    definition_json: input.definition_json,
+                    run_ids: input.run_ids,
+                    limit: input.limit as usize,
+                    key_column: input.key_column,
+                    expected_definition_digest: admission.stored.definition_digest.clone(),
+                    require_for_promotion: input.require_for_promotion,
+                    actor: admission.actor,
+                    tenant: admission.tenant,
+                },
+                now_millis(),
+            )
+        },
+    )?;
     Ok(Response::new(ShadowGovernedTransformResponse {
         report: Some(to_proto_shadow_report(report)),
     }))

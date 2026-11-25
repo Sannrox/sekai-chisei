@@ -26184,7 +26184,10 @@ fn spend_tenant_request_budget(svc: &SekaiServiceImpl, tenant_id: &str) {
     crate::composition::transform_run_admission::admit_transform_run(
         &gate,
         &crate::provider_credentials::tenant_context(tenant_id, "local"),
-        &limits,
+        &crate::composition::transform_run_admission::RunQuotaLimits {
+            tenant: Some(limits),
+            namespace: None,
+        },
         "spent-request",
         false,
     )
@@ -26430,6 +26433,96 @@ async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good
     );
     assert_eq!(refusal.details["metric"], "concurrency");
     assert_eq!(refusal.details["limit"], "0");
+}
+
+/// Assigns `limits` to tenant-a's `ops` namespace only.
+fn configure_ops_namespace(
+    svc: &SekaiServiceImpl,
+    limits: &crate::chisei::tenant_quota::TenantQuotaLimits,
+) {
+    let ops = crate::chisei::tenant_quota::NamespaceQuotaScope::new("tenant-a", "ops").unwrap();
+    crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc())
+        .unwrap()
+        .configure_namespace(&ops, limits)
+        .unwrap();
+}
+
+fn namespace_concurrency(max: i32) -> crate::chisei::tenant_quota::TenantQuotaLimits {
+    crate::chisei::tenant_quota::TenantQuotaLimits {
+        version: 1,
+        max_requests_per_period: None,
+        max_tokens_per_period: None,
+        max_concurrency: Some(max),
+        max_storage_bytes: None,
+        period: crate::chisei::budget::PeriodType::Daily,
+    }
+}
+
+#[tokio::test]
+async fn an_isolated_run_larger_than_its_namespace_budget_is_refused_for_good() {
+    let svc = isolated_claim_service(false);
+    configure_ops_namespace(&svc, &namespace_concurrency(0));
+    enqueue_isolated_claim(&svc, "t-iso-ns-oversize").await;
+    let refusal = claim_refused(&svc).await.refusal.unwrap();
+    assert_eq!(
+        refusal.code,
+        crate::composition::transform_run_admission::REFUSAL_LARGER_THAN_BUDGET
+    );
+    assert_eq!(refusal.details["metric"], "concurrency");
+}
+
+#[tokio::test]
+async fn a_reclaimed_then_cancelled_run_frees_its_namespace_concurrency() {
+    let svc = isolated_claim_service(false);
+    configure_ops_namespace(&svc, &namespace_concurrency(1));
+    enqueue_isolated_claim(&svc, "t-iso-ns-reclaim").await;
+    let claim = |runtime_id: &str, ttl_ms| {
+        svc.claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: runtime_id.into(),
+                run_id: String::new(),
+                ttl_ms,
+            },
+            "tenant-a",
+        ))
+    };
+    claim("runner-a", 1).await.unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let reclaimed = claim("runner-b", 60_000)
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(reclaimed.claim_owner, "runner-b");
+    svc.cancel_governed_transform_run(with_tenant_admin(
+        CancelGovernedTransformRunRequest {
+            run_id: reclaimed.run_id,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    // The holds name the namespace, so the cancel gives its one concurrency
+    // unit back at once instead of leaving it until the hold expires.
+    svc.run_governed_transform(with_tenant_admin(
+        RunGovernedTransformRequest {
+            namespace: "ops".into(),
+            transform_id: "t-iso-ns-reclaim".into(),
+            incremental: false,
+        },
+        "tenant-a",
+    ))
+    .await
+    .unwrap();
+    let next = claim("runner-c", 60_000)
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(next.claim_owner, "runner-c");
 }
 
 #[tokio::test]

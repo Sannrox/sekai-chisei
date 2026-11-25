@@ -88,12 +88,16 @@ pub fn run_named_with_quota(
     let runtime = Arc::new(quota.clone());
     let gate = chisei_core::transform_run_admission::quota_gate(runtime)?;
     let ctx = (!owner.is_empty()).then(|| chisei_core::tenant_context(&owner, "local"));
-    let held = if isolated || owner.is_empty() {
+    let limits = if isolated || owner.is_empty() {
         None
-    } else if let (Some(limits), Some(context)) = (
-        chisei_core::transform_run_admission::configured_limits(quota, &owner)?,
-        ctx.as_ref(),
-    ) {
+    } else {
+        Some(chisei_core::transform_run_admission::configured_run_limits(
+            quota, &owner, namespace,
+        )?)
+    };
+    let held = if let (Some(limits), Some(context)) =
+        (limits.filter(|limits| !limits.is_unlimited()), ctx.as_ref())
+    {
         Some(
             chisei_core::transform_run_admission::admit_transform_run(
                 &gate,
@@ -145,6 +149,7 @@ pub fn run_named_with_quota(
                 let _ = db.restore_abandoned_quota_hold(
                     &failed.remaining.idempotency_key,
                     &failed.remaining.tenant_id,
+                    &failed.remaining.scope_id,
                     failed.remaining.reserved_concurrency,
                     failed.remaining.reserved_request,
                     failed.remaining.reserved_tokens,
