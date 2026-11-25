@@ -35,6 +35,7 @@ pub mod event_stream;
 pub mod github;
 pub mod llm_rows;
 pub mod object_storage;
+mod ordered;
 pub mod pages;
 pub mod relational;
 pub mod rest;

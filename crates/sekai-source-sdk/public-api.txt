@@ -92,6 +92,7 @@ ObjectLineage
 Operation
 OperationOutcome
 OutboxLimits
+POSTGRES_CAPTURE_CONNECTOR
 PROFILE_RATIO_SCALE
 PlaneView
 PlaneViewError
@@ -172,6 +173,7 @@ attach_value_findings
 bind_sync_lineage
 bind_writeback
 build_registered_source_batch
+build_registered_source_batch_v2
 build_source_batch
 build_source_batch_v2
 cap_discovery_sample
@@ -304,6 +306,7 @@ connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFai
 connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::read_page_with_plane(&mut self,Option<&str>,usize,&mut dyn PlaneView) -> Result<SnapshotRead,ConnectorFailure>
+connector::Connector::read_snapshot_page(&mut self,Option<&str>,usize) -> Result<GenerationSnapshotPage,ConnectorFailure>
 connector::Connector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectorFailure>
 connector::ConnectorFailure
 connector::ConnectorFailure::AuthFailed
@@ -360,6 +363,7 @@ connector::Operation::ReadChanges
 connector::Operation::ReadPage
 connector::Operation::from_wire_name(&str) -> Option<Self>
 connector::Operation::wire_name(self) -> &str
+connector::POSTGRES_CAPTURE_CONNECTOR: ConnectorType
 connector::PlaneView
 connector::PlaneView::record_versions(&mut self,KeyRange<'_>,usize) -> Result<Vec<RecordVersion>,PlaneViewError>
 connector::PlaneViewError
@@ -816,6 +820,7 @@ sdk::TransportFailure
 sdk::TransportFailure::Ambiguous
 sdk::TransportFailure::Unavailable
 sdk::build_registered_source_batch(&SourceAdapterConfig,&str,&str,&str,i64,Vec<SourceRecord>) -> Result<SourceBatch,String>
+sdk::build_registered_source_batch_v2(&SourceAdapterConfig,&str,&str,&str,i64,Vec<SourceRecord>,SourceDeliveryWindow) -> Result<SourceBatch,String>
 sdk::build_source_batch(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>) -> Result<SourceBatch,String>
 sdk::build_source_batch_v2(&SourceAdapterConfig,&str,&str,i64,Vec<SourceRecord>,SourceDeliveryWindow) -> Result<SourceBatch,String>
 sdk::serialize_source_batch(&SourceBatch) -> Result<Vec<u8>,String>
