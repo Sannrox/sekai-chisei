@@ -718,7 +718,10 @@ fn a_worker_that_hangs_crashes_or_writes_too_much_is_cut_off_as_invalid() {
         );
         (result.err(), started.elapsed())
     };
-    let (hung, elapsed) = run("sleep 30");
+    // The trailing command makes every shell fork `sleep` rather than
+    // replace itself with it, so the cut-off must reach a grandchild that
+    // holds the output pipe.
+    let (hung, elapsed) = run("sleep 30; :");
     assert_eq!(hung, Some(ConnectorFailure::Invalid));
     assert!(elapsed < Duration::from_secs(10), "killed at the time cap");
     assert_eq!(run("kill -SEGV $$").0, Some(ConnectorFailure::Invalid));

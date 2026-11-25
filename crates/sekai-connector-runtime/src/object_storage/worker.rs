@@ -4,8 +4,8 @@
 //! one JSON object per row on stdout, exit 0; a refusal exits 2.
 //!
 //! The runtime bounds the worker from outside: an empty environment, a
-//! wall-time limit after which it is killed, and a cap on the bytes it may
-//! write. A worker that crashes, overruns either bound or refuses fails
+//! wall-time limit after which it and every process it started are killed,
+//! and a cap on the bytes it may write. A worker that crashes, overruns either bound or refuses fails
 //! the page as invalid; the worker also caps its own CPU time and memory.
 
 use std::io::{Read, Write};
@@ -70,15 +70,19 @@ impl Worker {
         bytes: &[u8],
         max_rows: usize,
     ) -> Result<Vec<u8>, ConnectorFailure> {
-        let mut child = Command::new(&self.path)
+        let mut command = Command::new(&self.path);
+        command
             .args(&self.leading_args)
             .args([format.arg(), &max_rows.to_string()])
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ConnectorFailure::Unreachable)?;
+            .stderr(Stdio::null());
+        // Its own process group, so a deadline kill reaches anything it
+        // started too; one left holding stdout would stall the read below.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let mut child = command.spawn().map_err(|_| ConnectorFailure::Unreachable)?;
         let mut stdin = child.stdin.take().ok_or(ConnectorFailure::Unreachable)?;
         let mut stdout = child.stdout.take().ok_or(ConnectorFailure::Unreachable)?;
         // Feed and drain on their own threads so neither pipe can stall the
@@ -104,7 +108,7 @@ impl Worker {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     _ => {
-                        let _ = child.kill();
+                        kill_group(&mut child);
                         let _ = child.wait();
                         break None;
                     }
@@ -121,4 +125,17 @@ impl Worker {
             }
         })
     }
+}
+
+/// Kills the worker's process group, or the worker alone where there are
+/// no groups.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill only sends a signal; the group is the one the worker
+        // was started in, which nothing else joins.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        return;
+    }
+    let _ = child.kill();
 }

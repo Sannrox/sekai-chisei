@@ -3029,6 +3029,7 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "kafka-protocol",
+ "libc",
  "lz4_flex",
  "native-tls",
  "postgres",
