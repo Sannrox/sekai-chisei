@@ -30,6 +30,10 @@ sha2 = "0.10"
 snap = "1"
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
+[target.'cfg(unix)'.dependencies]
+# Only to kill a parser worker's whole process group at its deadline.
+libc = "0.2"
+
 [dev-dependencies]
 # The in-process fake broker decodes requests and encodes responses.
 kafka-protocol = { version = "0.18", default-features = false, features = ["client", "broker"] }

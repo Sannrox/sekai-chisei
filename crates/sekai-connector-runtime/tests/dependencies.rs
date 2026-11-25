@@ -1,5 +1,6 @@
 //! The runtime talks to the plane only over gRPC: no control-plane package
-//! is in its dependency graph, directly or transitively.
+//! is in its dependency graph, directly or transitively. Nor is the Parquet
+//! reader: CSV and Parquet parse in the `sekai-object-parser` worker.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,19 +37,29 @@ fn lock_graph() -> BTreeMap<String, Vec<String>> {
     graph
 }
 
-#[test]
-fn the_runtime_never_links_the_control_plane() {
+/// Every package `root` depends on, directly or transitively, and itself.
+fn reachable(root: &str) -> BTreeSet<String> {
     let graph = lock_graph();
     let mut seen = BTreeSet::new();
-    let mut stack = vec!["sekai-connector-runtime".to_string()];
+    let mut stack = vec![root.to_string()];
     while let Some(package) = stack.pop() {
         if !seen.insert(package.clone()) {
             continue;
         }
         stack.extend(graph.get(&package).into_iter().flatten().cloned());
     }
+    seen
+}
+
+#[test]
+fn the_runtime_never_links_the_control_plane_or_the_parquet_reader() {
+    let seen = reachable("sekai-connector-runtime");
     assert!(seen.contains("sekai-client"), "the walk reached the client");
-    for package in CONTROL_PLANE {
+    for package in CONTROL_PLANE
+        .into_iter()
+        .chain(["parquet", "sekai-object-parser"])
+    {
         assert!(!seen.contains(package), "the runtime depends on {package}");
     }
+    assert!(reachable("sekai-object-parser").contains("parquet"));
 }

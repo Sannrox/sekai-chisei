@@ -36,8 +36,11 @@
 //! Parsing is bounded: an object larger than [`MAX_OBJECT_BYTES`] or with
 //! more than [`MAX_OBJECT_ROWS`] rows, a row without a usable id, an id
 //! twice in one object, or a key the plane cannot hold fails the page as
-//! invalid instead of being cut short. Only `json` objects parse here; a
-//! Source that asks for another format is refused.
+//! invalid instead of being cut short. The Source's `format` names how
+//! every object under its prefix parses: `json` (the default) parses here;
+//! `csv` and `parquet` parse in the bounded worker process ([`worker`]),
+//! never in the runtime's address space. A runtime installed without the
+//! worker refuses a Source that needs it as unsupported.
 
 use std::collections::BTreeMap;
 
@@ -55,9 +58,12 @@ use crate::rest::{digest_of, display_line, now_ms, property_key, scalar};
 use crate::sync::Prepared;
 
 mod store;
+mod worker;
 
 pub use store::MAX_LISTING_BYTES;
 use store::{Listed, Store};
+pub use worker::{MAX_WORKER_OUTPUT_BYTES, MAX_WORKER_SECONDS, WORKER_NAME};
+use worker::{Worker, WorkerFormat};
 
 /// The largest object the type parses.
 pub const MAX_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
@@ -80,6 +86,8 @@ pub struct ObjectStorage {
     record_kind: String,
     id_column: String,
     fields: Vec<String>,
+    /// Where CSV and Parquet objects parse; `None` for JSON.
+    parser: Option<(WorkerFormat, Worker)>,
     /// The secret key, only to refuse text that would carry it.
     secret: String,
 }
@@ -97,9 +105,20 @@ fn open_object_storage(prepared: &Prepared) -> Result<ObjectStorage, ConnectorFa
         _ => None,
     };
     let required = |name: &str| text(name).ok_or(ConnectorFailure::Invalid);
-    if text("format").is_some_and(|format| format != "json") {
-        return Err(ConnectorFailure::Invalid);
-    }
+    let parser = match text("format").as_deref() {
+        None | Some("json") => None,
+        Some(format) => {
+            let format = match format {
+                "csv" => WorkerFormat::Csv,
+                "parquet" => WorkerFormat::Parquet,
+                _ => return Err(ConnectorFailure::Invalid),
+            };
+            Some((
+                format,
+                Worker::beside_runtime().ok_or(ConnectorFailure::Unsupported)?,
+            ))
+        }
+    };
     let endpoint = Url::parse(&required("endpoint")?).map_err(|_| ConnectorFailure::Invalid)?;
     let host = endpoint
         .host_str()
@@ -179,6 +198,7 @@ fn open_object_storage(prepared: &Prepared) -> Result<ObjectStorage, ConnectorFa
         record_kind: required("record_kind")?,
         id_column,
         fields,
+        parser,
         secret,
     })
 }
@@ -491,7 +511,11 @@ impl ObjectStorage {
         }
         let (bytes, etag) = self.store.get_object(key, MAX_OBJECT_BYTES)?;
         let mut rows = BTreeMap::new();
-        for row in json_rows(&bytes)? {
+        let parsed = match &self.parser {
+            None => json_rows(&bytes)?,
+            Some((format, worker)) => json_rows(&worker.rows(*format, &bytes, MAX_OBJECT_ROWS)?)?,
+        };
+        for row in parsed {
             let id = scalar(row.get(&self.id_column))
                 .filter(|id| self.carried(id, MAX_SOURCE_IDENTIFIER_BYTES))
                 .ok_or(ConnectorFailure::Invalid)?;

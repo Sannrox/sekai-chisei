@@ -1,0 +1,19 @@
+[package]
+name = "sekai-object-parser"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Bounded worker that parses one CSV or Parquet object for the object_storage connector type."
+publish = false
+
+# The Parquet reader lives only here, so the connector runtime never links
+# it and never parses these formats in its own address space.
+[dependencies]
+bytes = "1"
+csv = "1"
+parquet = { version = "60", default-features = false, features = ["json", "snap", "lz4", "flate2-rust_backend"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

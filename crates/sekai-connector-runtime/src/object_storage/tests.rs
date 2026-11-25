@@ -606,16 +606,22 @@ fn an_endpoint_outside_the_allowlist_or_a_carried_credential_is_refused() {
         Some(ConnectorFailure::Invalid)
     );
     assert!(open_object_storage(&prepared(virtual_host, &["data.store.example"], &pair)).is_ok());
-    // TLS off loopback, and only the formats this version parses.
+    // TLS off loopback, and only the formats the type knows.
     let plain = config("http://store.example:9000", &[]);
     assert_eq!(
         open_object_storage(&prepared(plain, &["store.example"], &pair)).err(),
         Some(ConnectorFailure::Invalid)
     );
+    let xml = config(endpoint, &[("format", ConfigValue::Text("xml".into()))]);
+    assert_eq!(
+        open_object_storage(&prepared(xml, &["store.example"], &pair)).err(),
+        Some(ConnectorFailure::Invalid)
+    );
+    // No worker is installed beside a test binary.
     let csv = config(endpoint, &[("format", ConfigValue::Text("csv".into()))]);
     assert_eq!(
         open_object_storage(&prepared(csv, &["store.example"], &pair)).err(),
-        Some(ConnectorFailure::Invalid)
+        Some(ConnectorFailure::Unsupported)
     );
     // A credential value in a field is refused by the type's schema.
     let carried = config(
@@ -639,6 +645,107 @@ fn record_ids_follow_rule_v1() {
         )
     );
     assert_ne!(external_id("a", "b.c"), external_id("a.b", "c"));
+}
+
+/// A worker run as `sh -c script worker <format> <max_rows>`, killed
+/// after `timeout`.
+#[cfg(unix)]
+fn shell_worker(script: &str, timeout: std::time::Duration) -> Worker {
+    Worker {
+        path: "/bin/sh".into(),
+        leading_args: vec!["-c".into(), script.into(), "worker".into()],
+        timeout,
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn csv_and_parquet_objects_parse_through_the_worker_under_the_same_mirror() {
+    let (pair, fake, port) = store();
+    let (mut plane, mut cursor) = (Plane::default(), None);
+    let mut storage = connect(port, &pair);
+    // A stand-in worker that checks the protocol's arguments and passes
+    // rows through; the real one is tested in its own crate.
+    let script = r#"[ "$1" = csv ] && [ "$2" = 50000 ] || exit 3; cat"#;
+    storage.parser = Some((
+        WorkerFormat::Csv,
+        shell_worker(script, std::time::Duration::from_secs(10)),
+    ));
+    let first = sync(&mut storage, &mut plane, &mut cursor, 10);
+    assert_eq!(first.len(), 1);
+    assert_eq!(plane.live.len(), 5);
+    // Unchanged objects are not fetched or parsed again.
+    assert!(sync(&mut storage, &mut plane, &mut cursor, 10).is_empty());
+    assert_eq!(fake.fetched("orders/a.json"), 1);
+    fake.put("orders/b.json", "{\"id\":\"2\"}\n");
+    let changed = sync(&mut storage, &mut plane, &mut cursor, 10);
+    let records: Vec<_> = changed[0]
+        .records
+        .iter()
+        .map(|record| (record.external_id.clone(), record.deleted))
+        .collect();
+    assert_eq!(
+        records,
+        [
+            (external_id("orders/b.json", "2"), false),
+            (external_id("orders/b.json", "1"), true),
+        ]
+    );
+    // A worker that refuses the object fails the page.
+    storage.parser = Some((
+        WorkerFormat::Csv,
+        shell_worker("exit 2", std::time::Duration::from_secs(10)),
+    ));
+    fake.put("orders/b.json", "id\n3\n");
+    assert_eq!(
+        storage
+            .read_page_with_plane(cursor.as_deref(), 10, &mut plane)
+            .err(),
+        Some(ConnectorFailure::Invalid)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worker_that_hangs_crashes_or_writes_too_much_is_cut_off_as_invalid() {
+    use std::time::{Duration, Instant};
+    let run = |script: &str| {
+        let started = Instant::now();
+        let result = shell_worker(script, Duration::from_millis(300)).rows(
+            WorkerFormat::Parquet,
+            &[0; 4096],
+            MAX_OBJECT_ROWS,
+        );
+        (result.err(), started.elapsed())
+    };
+    // The trailing command makes every shell fork `sleep` rather than
+    // replace itself with it, so the cut-off must reach a grandchild that
+    // holds the output pipe.
+    let (hung, elapsed) = run("sleep 30; :");
+    assert_eq!(hung, Some(ConnectorFailure::Invalid));
+    assert!(elapsed < Duration::from_secs(10), "killed at the time cap");
+    assert_eq!(run("kill -SEGV $$").0, Some(ConnectorFailure::Invalid));
+    let oversize = format!("head -c {} /dev/zero", MAX_WORKER_OUTPUT_BYTES + 1);
+    assert_eq!(run(&oversize).0, Some(ConnectorFailure::Invalid));
+    // Exactly at the cap is accepted, and leaves the rows to the JSON caps.
+    assert_eq!(
+        shell_worker(
+            "cat >/dev/null; echo '{\"id\":\"1\"}'",
+            Duration::from_secs(10)
+        )
+        .rows(WorkerFormat::Csv, b"id\n1\n", MAX_OBJECT_ROWS)
+        .unwrap(),
+        b"{\"id\":\"1\"}\n"
+    );
+    let missing = Worker {
+        path: std::env::temp_dir().join(format!("no-worker-{}", std::process::id())),
+        leading_args: Vec::new(),
+        timeout: Duration::from_secs(1),
+    };
+    assert_eq!(
+        missing.rows(WorkerFormat::Csv, b"", 1).err(),
+        Some(ConnectorFailure::Unreachable)
+    );
 }
 
 /// Against a real store, ignored by default. Run with a local
