@@ -347,6 +347,7 @@ impl Rest {
             observed_at_ms,
             source_sequence: None,
             payload: None,
+            object_key: None,
         })
     }
 

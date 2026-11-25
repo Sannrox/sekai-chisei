@@ -593,11 +593,12 @@ impl PostgresDb {
                     "INSERT INTO sekai_source_identities (
                     namespace, source_id, binding_id, type_digest, type_name, object_id,
                     source_version, payload_digest, tombstoned, synced_object_json,
-                    lineage_json, last_transaction_id, updated_at_ms
+                    lineage_json, last_transaction_id, updated_at_ms, object_key
                  ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
                  )
                  ON CONFLICT(namespace, source_id) DO UPDATE SET
+                    object_key = EXCLUDED.object_key,
                     source_version = EXCLUDED.source_version,
                     payload_digest = EXCLUDED.payload_digest,
                     tombstoned = EXCLUDED.tombstoned,
@@ -619,6 +620,7 @@ impl PostgresDb {
                         &lineage_json,
                         &prepared.transaction_id,
                         &now_ms,
+                        &prepared_record.object_key,
                     ],
                 )?;
                 transaction.execute(

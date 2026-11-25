@@ -430,6 +430,19 @@ Object-sync identity has two admitted grammars. They share the
   and its issue number are one identity, and a batch cannot submit both.
 - A later observation may refresh properties and source version but cannot
   change type kind, type revision, source binding, or object id.
+
+A record read from keyed object storage may carry `object_key`, the key of the
+stored object it came from: non-empty, at most 1 KiB, no control characters
+and no credential-like text, or the batch fails as `invalid_object_key` or
+`secret_like_text`. Any contract version may carry it. It enters the batch
+digest only when set, so batches without it keep their digests; a plane that
+predates the field drops it, computes a different digest and refuses the batch.
+The plane stores the key beside the record's identity, indexed by namespace,
+binding and key in byte order (`COLLATE "C"` on PostgreSQL, `BINARY` on
+SQLite), which is the order object storage lists keys in. Each observation
+replaces the stored key; identities landed before the column, or by records
+without a key, hold none. Nothing reads the key yet: the claim-fenced read of
+a Source's live keys is later work on #3013.
 - Reusing the same immutable source version with a different payload digest,
   display name, or projected properties, or changing the bound type identity,
   is quarantined as a retained denial. The object and checkpoint remain

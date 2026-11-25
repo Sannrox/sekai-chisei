@@ -258,6 +258,8 @@ const EXPORT_RECEIPTS_RECOVERABLE_INDEX_SCHEMA: &str =
     include_str!("postgres/0179_export_receipts_recoverable_index.sql");
 const GRAPH_CHANGE_REQUESTS_SCHEMA: &str = include_str!("postgres/0180_graph_change_requests.sql");
 const SOURCE_SYNC_NOTES_SCHEMA: &str = include_str!("postgres/0181_source_sync_notes.sql");
+const SOURCE_IDENTITY_OBJECT_KEY_SCHEMA: &str =
+    include_str!("postgres/0182_source_identity_object_key.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1309,6 +1311,12 @@ const MIGRATIONS: &[Migration] = &[
         181,
         "source_sync_notes",
         SOURCE_SYNC_NOTES_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        182,
+        "source_identity_object_key",
+        SOURCE_IDENTITY_OBJECT_KEY_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];
@@ -2687,6 +2695,73 @@ mod tests {
             assert_eq!(preserved, marker);
             assert_eq!(migration_rows(&db), shared_history());
         }
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn object_key_upgrade_keeps_identities_unkeyed_and_orders_keys_by_byte() {
+        let _guard = POSTGRES_MIGRATION_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let db = test_database();
+        reset_database(&db);
+        let before = MIGRATIONS
+            .iter()
+            .position(|migration| migration.name == "source_identity_object_key")
+            .unwrap();
+        db.migrate_with(&MIGRATIONS[..before]).unwrap();
+        db.connection()
+            .unwrap()
+            .batch_execute(
+                "INSERT INTO sekai_source_bindings (
+                    binding_id, namespace, producer_identity, source, source_instance, family,
+                    adapter_id, adapter_version, type_digest, created_at_ms, active, updated_at_ms
+                 ) VALUES
+                    ('binding-1', 'acme', 'producer', 'github', 'acme/ops', 'object-sync',
+                     'adapter', '1', 'digest', 1, TRUE, 1);
+                 INSERT INTO sekai_source_identities (
+                    namespace, source_id, binding_id, type_digest, type_name, object_id,
+                    source_version, payload_digest, tombstoned, synced_object_json,
+                    lineage_json, last_transaction_id, updated_at_ms
+                 ) VALUES ('acme', 'landed-before', 'binding-1', 'digest', 'Issue', 'object-1',
+                    'v1', 'digest', FALSE, '{}', '{}', 'transaction-1', 1);",
+            )
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        let mut conn = db.connection().unwrap();
+        let unkeyed: Option<String> = conn
+            .query_one(
+                "SELECT object_key FROM sekai_source_identities WHERE source_id='landed-before'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(unkeyed, None);
+        let collation: String = conn
+            .query_one(
+                "SELECT collation_name FROM information_schema.columns
+                 WHERE table_name='sekai_source_identities' AND column_name='object_key'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(collation, "C");
+        let index: String = conn
+            .query_one(
+                "SELECT indexdef FROM pg_indexes
+                 WHERE indexname='idx_sekai_source_identities_object_key'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        // PostgreSQL omits an index collation equal to the column's, which is
+        // "C" as asserted above.
+        assert!(
+            index.ends_with("(namespace, binding_id, object_key)"),
+            "{index}"
+        );
     }
 
     #[test]

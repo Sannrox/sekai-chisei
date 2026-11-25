@@ -3599,6 +3599,7 @@ fn source_batch(
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }],
         delivery: None,
     };
@@ -3634,6 +3635,7 @@ fn source_batch(
                 observed_at_ms: record.observed_at_ms,
                 source_sequence: record.source_sequence,
                 payload: record.payload,
+                object_key: record.object_key,
             })
             .collect(),
         delivery: None,

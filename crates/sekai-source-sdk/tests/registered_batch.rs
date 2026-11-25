@@ -30,6 +30,7 @@ fn record(source: &str, id: &str) -> SourceRecord {
         observed_at_ms: 1,
         source_sequence: None,
         payload: None,
+        object_key: None,
     }
 }
 

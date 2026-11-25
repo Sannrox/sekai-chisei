@@ -77,6 +77,7 @@ fn batch(prefix: &str, current_cursor: &str, next_cursor: &str, key: &str) -> So
             observed_at_ms: 10,
             source_sequence: None,
             payload: None,
+            object_key: None,
         }],
         delivery: None,
     };
