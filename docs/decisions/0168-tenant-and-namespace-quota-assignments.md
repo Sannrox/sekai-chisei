@@ -58,8 +58,14 @@ The maintainer accepted the shape on 2026-11-24:
      records no scope and refunds only the tenant.
    - **1c:** report-only. The gate evaluates without reserving. Each would-be
      refusal or queue is recorded on the audit and on the run.
-   - **Part 2:** budgets that refuse, and `compute_seconds` reserved and
-     settled (#3043). Sequenced with #2753.
+   - **2a:** budgets refuse. A claim that finds a request or token budget
+     of the run's tenant or namespace spent marks the run `refused` with
+     the code `quota_budget_exhausted` and the detail `metric`, through the
+     same terminal path. The gate has already rolled back what it took, so
+     the run reserves nothing. A full concurrency limit still defers.
+   - **2b:** `compute_seconds` reserved at claim from the run's estimate,
+     settled to the measured seconds (#3043), and released on lease expiry.
+     The stored quota hold gains the reserved seconds.
    - **Part 3:** the concurrency queue, its held state, FIFO release and
      `queued(concurrency)` with a position in `proto/`.
 4. How `mode` is stored is pending a maintainer decision: a dedicated
@@ -79,13 +85,17 @@ The maintainer accepted the shape on 2026-11-24:
 ## Consequences
 
 - A tenant with only today's assignments keeps today's limits, scope and
-  admission. One exception: a limit of zero requests or zero concurrency
-  used to defer every run forever and now refuses each run for good.
+  admission. Two exceptions: a limit of zero requests or zero concurrency
+  used to defer every run forever and now refuses each run for good; and
+  from 2a an isolated run whose request or token budget is spent is
+  refused for good instead of waiting for the next period.
 - A namespace assignment has no effect on admission until 1b.
 - No schema, migration or `proto/` change. An older plane ignores namespace
   rows, because it reads only `tenant:{id}` and its parents. During a
   rolling deploy an older instance defers a zero-budget run that a newer one
-  refuses. Either way the run never executes.
+  refuses. Either way the run never executes. Likewise an older instance
+  defers a run whose budget is spent; it can run it after the period
+  resets unless a newer instance claims it first and refuses it.
 - Rollback leaves namespace rows that nothing reads, and refused runs stay
   refused.
 
@@ -99,3 +109,6 @@ The maintainer accepted the shape on 2026-11-24:
   `quota_larger_than_budget`. Positive limits never do.
 - Over gRPC, an isolated run whose tenant allows no concurrency is refused
   for good and never claimed again.
+- Over gRPC, an isolated run whose namespace request budget is spent is
+  refused with `quota_budget_exhausted` and leaves the tenant's remaining
+  request unreserved.

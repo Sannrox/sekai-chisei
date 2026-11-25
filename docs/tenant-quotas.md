@@ -73,7 +73,13 @@ An isolated-process run asks for one request and one concurrency unit. When
 its tenant's or its namespace's limit for either is zero, the run can never fit, so the claim
 refuses it for good: the run is marked `refused` with the code
 `quota_larger_than_budget` and the details `metric`, `limit` and
-`requested`. A budget spent by usage still defers the run until it frees.
+`requested`.
+
+Budgets refuse; only concurrency waits. When a claim finds the run's
+tenant or namespace request or token budget spent, the run is marked
+`refused` with the code `quota_budget_exhausted` and the detail `metric`,
+and it reserves nothing. A full concurrency limit still leaves the run
+`pending` until a unit frees.
 
 Receipt-safe summary: `TenantQuotaReceiptNote` (own tenant id, assignment
 version, admitted metrics only).

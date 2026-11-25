@@ -223,6 +223,25 @@ pub fn refusal_larger_than_budget(limits: &TenantQuotaLimits) -> Option<Isolated
     })
 }
 
+/// Refusal code for a run whose tenant or namespace budget is spent (#3044,
+/// ADR 0168): budgets refuse, only concurrency waits.
+pub const REFUSAL_BUDGET_EXHAUSTED: &str = "quota_budget_exhausted";
+
+/// The terminal refusal an admission error stands for, with the spent
+/// `metric`. `None` for a full concurrency limit, which frees as runs
+/// finish, and for every error that is not exhaustion.
+pub fn refusal_budget_exhausted(error: &TenantQuotaError) -> Option<IsolatedProcessRefusal> {
+    match error {
+        TenantQuotaError::Exhausted { metric, .. } if metric != METRIC_CONCURRENCY => {
+            Some(IsolatedProcessRefusal {
+                code: REFUSAL_BUDGET_EXHAUSTED.into(),
+                details: [("metric".to_string(), metric.clone())].into(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Admit a transform run against its tenant and namespace assignments. A
 /// reclaimed run already holds its request on both scopes, so it reserves
 /// none again.
