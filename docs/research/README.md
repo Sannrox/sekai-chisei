@@ -49,6 +49,7 @@ reference pages.
 | [Foresight claims](2155-foresight-claims.md) | No native claim kind; scheduled bindings, ObjectSets, governed write-back and the change log cover projections |
 | [Landed records in open tables](2411-landed-records-open-tables.md) | Recommendation complete; [ADR 0162](../decisions/0162-landed-source-records-stay-in-the-sql-store.md) (proposed) keeps landed records in the SQL store; the measured limit is full-copy dataset versions (#3475) |
 | [Reviewed measures](2299-reviewed-measures.md) | Recommendation complete; [ADR 0165](../decisions/0165-a-measure-is-a-definition-member.md) (proposed) makes a measure a definition member evaluated as at most two ordinary object sets under the caller's rights |
+| [Draft example questions](2300-draft-example-questions.md) | Recommendation complete; [ADR 0166](../decisions/0166-example-questions-bind-against-the-tree.md) (proposed) checks a drafted tree by binding named object-set questions client-side, with no data |
 
 For current usage and operations, return to the [documentation guide](../README.md)
 or browse the [reference catalog](../reference.md).
