@@ -85,6 +85,7 @@ MAX_SOURCE_PROPERTY_VALUE_BYTES
 MAX_SOURCE_RECORD_PROPERTIES
 MAX_SYNC_NOTES
 MIN_INFERRED_REFERENCE_MATCH_BP
+OBJECT_STORAGE_CONNECTOR
 OBJECT_SYNC_LIFECYCLE_CONFORMANCE_VERSION
 OUTBOX_FORMAT_VERSION
 ObjectLineage
@@ -349,6 +350,7 @@ connector::KeyRange.through_object_key: Option<&str>
 connector::MAX_CONFIG_FIELDS: usize
 connector::MAX_CONFIG_VALUE_BYTES: usize
 connector::MAX_EGRESS_RULES: usize
+connector::OBJECT_STORAGE_CONNECTOR: ConnectorType
 connector::Operation
 connector::Operation::Apply
 connector::Operation::Check

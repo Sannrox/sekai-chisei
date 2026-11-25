@@ -323,6 +323,45 @@ partition's end fails the sync as `invalid`. `check` proves the bootstrap
 answers, the credential authenticates and the topic has the configured
 partitions.
 
+An `object_storage` Source (#3013) mirrors the rows of the objects under one
+`prefix` of one `bucket` in a store that speaks the S3-compatible API. Its
+configuration names the `endpoint` (the store's origin: `https://`, or
+`http://` only on loopback; a destination the egress allowlist and the
+credential handle must both admit), the `region`, the `bucket`, the optional
+`prefix`, the `id_column` of each row, the comma-separated `fields` that become
+properties, `record_kind` and `type_digest`. With `path_style` unset the bucket
+is addressed as a subdomain of the endpoint, and that host must be permitted by
+the egress allowlist too. The one credential slot `access_key` holds
+`<access key id>:<secret key>`; requests are signed with Signature Version 4.
+`format` is `json` (the default): an object holds one JSON object, an array of
+them, or one per line. Other formats are refused until a later version parses
+them in a bounded worker.
+
+Each row is one record. Its id follows rule `v1`: `v1.`, the first 32 hex
+digits of the SHA-256 of the object key, `.`, and the `id_column` value with
+every byte other than ASCII letters, digits, `-`, `_`, `.` and `~` written as
+`%XX`. Record ids are stored identity, so a later rule gets a new prefix rather
+than changing this one. The object key is the record's `object_key` and its
+`object_key` property; its version is the object's ETag.
+
+Each page walks the prefix listing and the Source's live records, read from the
+plane under the sync's claim (`ListSourceRecordVersions`, ADR 0167), together
+in byte order of object key. An object whose live records all carry its current
+ETag is not fetched again. Any other object is fetched; its rows not already at
+that ETag upsert and its live records it no longer has are tombstoned. A key the
+plane holds that the listing no longer returns has all its live records
+tombstoned. The cursor is the walk's position in its pass. An object whose
+changes do not fit one page resumes at that object, and is always fetched
+again. A walk that started mid-pass and finds nothing to apply through the end
+of the listing wraps into a new pass from the first key, up to where it
+started. A pass that reaches the end completes the sync, and the next sync
+starts a new pass, so each sync lists the whole prefix. An object larger than
+8 MiB or with more than 50,000 rows, a row without a usable id, an id twice in
+one object, or a key with a `.` or `..` segment fails the sync as `invalid`.
+An object with no rows is fetched again on every pass. `check` proves the
+endpoint answers, the key pair signs and the prefix can be listed, and reports
+`auth_failed`, `permission_missing`, `unreachable` or `invalid`.
+
 The GitHub object-sync profile admits exactly one code-owned type revision:
 
 - contract: `sekai.source-type-revision/v1`;
