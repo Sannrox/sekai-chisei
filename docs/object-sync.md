@@ -333,9 +333,25 @@ properties, `record_kind` and `type_digest`. With `path_style` unset the bucket
 is addressed as a subdomain of the endpoint, and that host must be permitted by
 the egress allowlist too. The one credential slot `access_key` holds
 `<access key id>:<secret key>`; requests are signed with Signature Version 4.
-`format` is `json` (the default): an object holds one JSON object, an array of
-them, or one per line. Other formats are refused until a later version parses
-them in a bounded worker.
+`format` names how every object under the prefix parses:
+
+- `json` (the default): one JSON object, an array of them, or one per line,
+  parsed in the runtime.
+- `csv`: a header line of distinct column names, then rows of exactly that many
+  fields, UTF-8. Every value is text.
+- `parquet`: each row's top-level columns, with numbers and booleans kept,
+  dates, times and decimals as text, and nested values ignored as properties.
+  Uncompressed, Snappy, LZ4 and gzip column chunks decode; other codecs are
+  refused.
+
+CSV and Parquet parse in `sekai-object-parser`, a worker process installed
+beside `sekai-connector-runtime` (both are built by `cargo build`), never in
+the runtime itself. The runtime gives each run an empty environment, kills it
+after 30 seconds, and stops reading after 64 MiB of output; the worker caps its
+own CPU time and memory where the platform allows. A worker that crashes,
+overruns a bound or refuses the object fails the page as `invalid`. A runtime
+installed without the worker refuses a `csv` or `parquet` Source as
+`unsupported`. The row and object-size caps below apply to every format.
 
 Each row is one record. Its id follows rule `v1`: `v1.`, the first 32 hex
 digits of the SHA-256 of the object key, `.`, and the `id_column` value with
