@@ -3358,8 +3358,17 @@ mod tests {
                     property: property.into(),
                     group_by: group_by.into(),
                 };
-                compare_shop(&log, &aggregation, &orders, shop_view())
-                    .unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
+                let compared = compare_shop(&log, &aggregation, &orders, shop_view());
+                // The object log answers this shape from count and sum
+                // rollups (#3496), so the canary skips min, max, and avg.
+                if matches!(function, "min" | "max" | "avg") {
+                    assert!(
+                        matches!(compared, Err(ObjectLogCompareError::Unsupported(_))),
+                        "{group_by} {function}: {compared:?}"
+                    );
+                } else {
+                    compared.unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
+                }
             }
         }
 
