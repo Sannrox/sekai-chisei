@@ -3,17 +3,17 @@
 //! space. The protocol is documented in that crate: object bytes on stdin,
 //! one JSON object per row on stdout, exit 0; a refusal exits 2.
 //!
-//! The runtime bounds the worker from outside: an empty environment, a
-//! wall-time limit after which it and every process it started are killed,
-//! and a cap on the bytes it may write. A worker that crashes, overruns either bound or refuses fails
-//! the page as invalid; the worker also caps its own CPU time and memory.
+//! The runtime bounds the worker from outside ([`crate::child`]). A worker
+//! that crashes, overruns either bound or refuses fails the page as
+//! invalid; the worker also caps its own CPU time and memory.
 
-use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use sekai_source_sdk::ConnectorFailure;
+
+use crate::child::{self, Bounds, ChildError};
 
 /// The worker's executable name, installed beside the runtime's.
 pub const WORKER_NAME: &str = "sekai-object-parser";
@@ -52,10 +52,7 @@ impl Worker {
     /// The worker installed beside this runtime's executable, if there is
     /// one.
     pub(super) fn beside_runtime() -> Option<Self> {
-        let path = std::env::current_exe()
-            .ok()?
-            .with_file_name(format!("{WORKER_NAME}{}", std::env::consts::EXE_SUFFIX));
-        path.is_file().then_some(Self {
+        child::beside_runtime(WORKER_NAME).map(|path| Self {
             path,
             leading_args: Vec::new(),
             timeout: Duration::from_secs(MAX_WORKER_SECONDS),
@@ -73,69 +70,15 @@ impl Worker {
         let mut command = Command::new(&self.path);
         command
             .args(&self.leading_args)
-            .args([format.arg(), &max_rows.to_string()])
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        // Its own process group, so a deadline kill reaches anything it
-        // started too; one left holding stdout would stall the read below.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut child = command.spawn().map_err(|_| ConnectorFailure::Unreachable)?;
-        let mut stdin = child.stdin.take().ok_or(ConnectorFailure::Unreachable)?;
-        let mut stdout = child.stdout.take().ok_or(ConnectorFailure::Unreachable)?;
-        // Feed and drain on their own threads so neither pipe can stall the
-        // other. A worker that stops reading early just closes its stdin.
-        std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let _ = stdin.write_all(bytes);
-            });
-            // Reading stops one byte past the cap and closes the pipe, so an
-            // oversize worker cannot block on a full pipe.
-            let output = scope.spawn(move || {
-                let mut output = Vec::new();
-                let read = (&mut stdout)
-                    .take(MAX_WORKER_OUTPUT_BYTES + 1)
-                    .read_to_end(&mut output);
-                read.map(|_| output)
-            });
-            let deadline = Instant::now() + self.timeout;
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Some(status),
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    _ => {
-                        kill_group(&mut child);
-                        let _ = child.wait();
-                        break None;
-                    }
-                }
-            };
-            let output = output.join().ok().and_then(Result::ok);
-            match (status, output) {
-                (Some(status), Some(output))
-                    if status.success() && output.len() as u64 <= MAX_WORKER_OUTPUT_BYTES =>
-                {
-                    Ok(output)
-                }
-                _ => Err(ConnectorFailure::Invalid),
-            }
-        })
+            .args([format.arg(), &max_rows.to_string()]);
+        let bounds = Bounds {
+            timeout: self.timeout,
+            max_output: MAX_WORKER_OUTPUT_BYTES,
+        };
+        match child::run_bounded(command, bytes, bounds) {
+            Ok(finished) if finished.status.success() => Ok(finished.output),
+            Err(ChildError::Spawn) => Err(ConnectorFailure::Unreachable),
+            _ => Err(ConnectorFailure::Invalid),
+        }
     }
-}
-
-/// Kills the worker's process group, or the worker alone where there are
-/// no groups.
-fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    if let Ok(group) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: kill only sends a signal; the group is the one the worker
-        // was started in, which nothing else joins.
-        unsafe { libc::kill(-group, libc::SIGKILL) };
-        return;
-    }
-    let _ = child.kill();
 }

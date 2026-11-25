@@ -18,10 +18,15 @@
 //! event-stream cluster: sync), which reads through the [`broker`] client,
 //! and [`object_storage`] (rows of the objects under one bucket prefix,
 //! mirrored against the plane's live records: sync).
+//! Change capture starts the sandboxed child of [`capture`] over a
+//! connection the runtime dialed (Linux only).
 //! Given a gateway route, it also runs the row-wise model steps of
 //! `llm-rows` transforms ([`llm_rows`]).
 
 pub mod broker;
+#[cfg(unix)]
+pub mod capture;
+mod child;
 pub mod credentials;
 pub mod delivery;
 pub mod discovery;
