@@ -9,7 +9,8 @@
 //! the Source as invalid. Batches name the Source, so a
 //! disabled Source refuses them even from a runtime whose claim has not yet
 //! lapsed. Object identity stays `source_id(source, source_instance,
-//! external_id)`.
+//! external_id)`. The notes each page carries are gathered for the sync's
+//! acknowledgement (ADR 0163).
 
 use sekai_client::CallOptions;
 use sekai_client::protocol::sekai::{
@@ -19,8 +20,8 @@ use sekai_client::protocol::sekai::{
 use sekai_client::{SdkError, SdkErrorCode};
 use sekai_source_sdk::{
     ConfigValue, GITHUB_OBJECT_SYNC_TYPE_DIGEST, MAX_SOURCE_BATCH_RECORDS, Operation,
-    SOURCE_GITHUB, SnapshotRead, SourceAdapterConfig, SourceBatch, build_registered_source_batch,
-    build_source_batch,
+    SOURCE_GITHUB, SnapshotPage, SnapshotRead, SourceAdapterConfig, SourceBatch, SyncNote,
+    SyncNotes, build_registered_source_batch, build_source_batch,
 };
 use std::sync::Arc;
 
@@ -61,12 +62,15 @@ fn property_map_to_proto(
 
 impl Runtime {
     /// Reads and applies the Source's pages from the committed cursor
-    /// until the Source reports them complete.
+    /// until the Source reports them complete, gathering each page's notes
+    /// into `notes`, also when a later page fails. A connector's invalid
+    /// note fails the sync as invalid.
     pub(crate) async fn sync(
         &self,
         index: usize,
         source: &ConnectorSource,
         prepared: Prepared,
+        notes: &mut SyncNotes,
     ) -> Result<(), SyncFailure> {
         if !prepared.connector.supports(Operation::ReadPage) {
             return Err(SyncFailure::Unsupported);
@@ -124,16 +128,24 @@ impl Runtime {
                 SnapshotRead::Complete => return Err(SyncFailure::Invalid),
                 SnapshotRead::Page(page) => page,
             };
-            if page.proposed_next_cursor.is_empty()
-                || Some(&page.proposed_next_cursor) == cursor.as_ref()
-            {
+            let SnapshotPage {
+                records,
+                proposed_next_cursor,
+                collected_at_ms,
+                complete,
+                notes: page_notes,
+            } = page;
+            for note in page_notes {
+                notes.push(note).map_err(|_| SyncFailure::Invalid)?;
+            }
+            if proposed_next_cursor.is_empty() || Some(&proposed_next_cursor) == cursor.as_ref() {
                 return Err(SyncFailure::Invalid);
             }
             // A batch carries at least one record, so an empty page commits
             // nothing: a last page leaves the cursor where it is, and any
             // other could never move it.
-            if page.records.is_empty() {
-                return if page.complete {
+            if records.is_empty() {
+                return if complete {
                     Ok(())
                 } else {
                     Err(SyncFailure::Invalid)
@@ -143,12 +155,12 @@ impl Runtime {
                 build_source_batch(
                     &adapter,
                     cursor.as_deref().unwrap_or_default(),
-                    &page.proposed_next_cursor,
-                    page.collected_at_ms,
-                    page.records,
+                    &proposed_next_cursor,
+                    collected_at_ms,
+                    records,
                 )
             } else {
-                let mut records = page.records;
+                let mut records = records;
                 for record in &mut records {
                     record.source = source.source.clone();
                     record.source_instance = source.source_instance.clone();
@@ -157,8 +169,8 @@ impl Runtime {
                     &adapter,
                     &source.source,
                     cursor.as_deref().unwrap_or_default(),
-                    &page.proposed_next_cursor,
-                    page.collected_at_ms,
+                    &proposed_next_cursor,
+                    collected_at_ms,
                     records,
                 )
             }
@@ -183,7 +195,7 @@ impl Runtime {
             if !committed {
                 return Err(SyncFailure::Invalid);
             }
-            if page.complete {
+            if complete {
                 return Ok(());
             }
         }
@@ -201,6 +213,42 @@ fn plane_failure(error: SdkError) -> SyncFailure {
         }
         SdkErrorCode::InvalidArgument | SdkErrorCode::FailedPrecondition => SyncFailure::Invalid,
         _ => SyncFailure::Unavailable,
+    }
+}
+
+/// A sync's notes on the wire. A note kind the wire predates is left out.
+pub(crate) fn notes_to_proto(notes: &SyncNotes) -> pb::SourceSyncNotes {
+    use pb::source_sync_note::{Note, OffsetGap, SkippedRecord};
+    pb::SourceSyncNotes {
+        notes: notes
+            .notes()
+            .iter()
+            .filter_map(|note| {
+                let note = match *note {
+                    SyncNote::OffsetGap {
+                        partition,
+                        from_offset,
+                        to_offset,
+                    } => Note::OffsetGap(OffsetGap {
+                        partition,
+                        from_offset,
+                        to_offset,
+                    }),
+                    SyncNote::SkippedRecord {
+                        partition,
+                        offset,
+                        reason,
+                    } => Note::SkippedRecord(SkippedRecord {
+                        partition,
+                        offset,
+                        reason: reason.wire_name().into(),
+                    }),
+                    _ => return None,
+                };
+                Some(pb::SourceSyncNote { note: Some(note) })
+            })
+            .collect(),
+        overflow_count: notes.overflow(),
     }
 }
 

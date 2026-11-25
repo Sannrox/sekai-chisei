@@ -55,109 +55,7 @@ pub struct SyncState {
     pub last_notes: StoredSyncNotes,
 }
 
-/// The most notes one sync keeps (ADR 0163); past it only a count.
-pub const MAX_SYNC_NOTES: usize = 64;
-
-/// Why a connector skipped one record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SkipReason {
-    /// The record's value is not JSON.
-    NotJson,
-    /// The record has no id field.
-    MissingId,
-}
-
-impl SkipReason {
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::NotJson => "not_json",
-            Self::MissingId => "missing_id",
-        }
-    }
-
-    pub fn from_wire_name(name: &str) -> Option<Self> {
-        [Self::NotJson, Self::MissingId]
-            .into_iter()
-            .find(|reason| reason.wire_name() == name)
-    }
-}
-
-/// One thing a sync could not apply and reports instead of stalling. It
-/// names positions, never record content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum SyncNote {
-    /// Retention passed the stored offset: offsets `from_offset` up to,
-    /// not including, `to_offset` were never read.
-    OffsetGap {
-        partition: i32,
-        from_offset: i64,
-        to_offset: i64,
-    },
-    /// The record at `offset` was skipped.
-    SkippedRecord {
-        partition: i32,
-        offset: i64,
-        reason: SkipReason,
-    },
-}
-
-/// The bounded notes of one sync: at most [`MAX_SYNC_NOTES`], and how many
-/// more the runtime did not send.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SyncNotes {
-    notes: Vec<SyncNote>,
-    overflow: i64,
-}
-
-impl SyncNotes {
-    /// Refuses more than [`MAX_SYNC_NOTES`] notes, a negative count or
-    /// position, and an empty or reversed gap.
-    pub fn new(notes: Vec<SyncNote>, overflow: i64) -> Result<Self, String> {
-        if notes.len() > MAX_SYNC_NOTES {
-            return Err(format!("a sync keeps at most {MAX_SYNC_NOTES} notes"));
-        }
-        if overflow < 0 {
-            return Err("the overflow count is not negative".into());
-        }
-        for note in &notes {
-            let valid = match *note {
-                SyncNote::OffsetGap {
-                    partition,
-                    from_offset,
-                    to_offset,
-                } => partition >= 0 && from_offset >= 0 && from_offset < to_offset,
-                SyncNote::SkippedRecord {
-                    partition, offset, ..
-                } => partition >= 0 && offset >= 0,
-            };
-            if !valid {
-                return Err(
-                    "a note names a partition and offsets that are not negative, \
-                     and a gap ends after it starts"
-                        .into(),
-                );
-            }
-        }
-        Ok(Self { notes, overflow })
-    }
-
-    pub fn notes(&self) -> &[SyncNote] {
-        &self.notes
-    }
-
-    /// Notes the runtime counted but did not send.
-    pub fn overflow(&self) -> i64 {
-        self.overflow
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.notes.is_empty() && self.overflow == 0
-    }
-}
+pub use sekai_types::source_sync_note::{MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes};
 
 /// Notes as stored with the sync outcome, stamped with the time of the
 /// finish that wrote them.
@@ -185,10 +83,9 @@ impl StoredSyncNotes {
         let stored: Self = serde_json::from_str(column)
             .map_err(|error| format!("decode source sync notes: {error}"))?;
         // Re-validates, so a hand-edited row cannot exceed the bound.
-        let SyncNotes { notes, overflow } = stored.notes;
         Ok(Self {
             at_ms: stored.at_ms,
-            notes: SyncNotes::new(notes, overflow)?,
+            notes: SyncNotes::new(stored.notes.notes().to_vec(), stored.notes.overflow())?,
         })
     }
 }

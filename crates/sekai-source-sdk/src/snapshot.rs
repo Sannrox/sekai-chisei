@@ -8,6 +8,8 @@
 use crate::contract::{
     MAX_SOURCE_BATCH_RECORDS, SourceDeliveryMode, SourceDeliveryWindow, SourceRecord,
 };
+use sekai_types::source_sync_note::SyncNote;
+
 use crate::sdk::{
     FlushDisposition, GetSourceSyncStateInput, SourceAdapterConfig, SourceGenerationStatus,
     SourceOutbox, SourceRunDisposition, SourceRunReport, SourceSyncStateView, SourceSyncTransport,
@@ -38,6 +40,11 @@ pub struct SnapshotPage {
     pub collected_at_ms: i64,
     /// Local source knowledge. The cursor remains opaque to the control plane.
     pub complete: bool,
+    /// What this page could not apply, by position (ADR 0163). The
+    /// connector runtime gathers a sync's notes across pages and reports
+    /// them when it acknowledges the sync; [`SnapshotPageSource`] runs
+    /// acknowledge no work and drop them.
+    pub notes: Vec<SyncNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

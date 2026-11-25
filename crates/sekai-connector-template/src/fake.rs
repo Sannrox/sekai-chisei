@@ -110,6 +110,7 @@ impl SnapshotPageSource for FakeSource {
             proposed_next_cursor: format!("page-{}", next + 1),
             collected_at_ms: 1_000 + next as i64,
             complete: next + 1 == PAGES.len(),
+            notes: Vec::new(),
         }))
     }
 }

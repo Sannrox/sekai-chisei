@@ -1435,6 +1435,7 @@ fn snapshot_runner_pages_from_plane_state_and_preserves_cross_page_identity() {
                 proposed_next_cursor: page_one_cursor.into(),
                 collected_at_ms: 1_787_511_100_000,
                 complete: false,
+                notes: Vec::new(),
             })),
         ),
         (
@@ -1444,6 +1445,7 @@ fn snapshot_runner_pages_from_plane_state_and_preserves_cross_page_identity() {
                 proposed_next_cursor: complete_cursor.into(),
                 collected_at_ms: 1_787_511_160_000,
                 complete: true,
+                notes: Vec::new(),
             })),
         ),
     ]);
@@ -1498,6 +1500,7 @@ fn snapshot_runner_restart_uses_durable_plane_checkpoint_not_local_page_state() 
             proposed_next_cursor: page_one_cursor.into(),
             collected_at_ms: 1_787_511_100_000,
             complete: false,
+            notes: Vec::new(),
         })),
     )]);
     let first_outbox = SourceOutbox::open(&root, OutboxLimits::default()).unwrap();
@@ -1529,6 +1532,7 @@ fn snapshot_runner_restart_uses_durable_plane_checkpoint_not_local_page_state() 
             proposed_next_cursor: complete_cursor.into(),
             collected_at_ms: 1_787_511_160_000,
             complete: true,
+            notes: Vec::new(),
         })),
     )]);
     let restarted = run_snapshot(
@@ -1569,6 +1573,7 @@ fn snapshot_runner_retains_ambiguous_page_and_replays_it_before_collecting_more(
             proposed_next_cursor: complete_cursor.into(),
             collected_at_ms: 1_787_511_100_000,
             complete: true,
+            notes: Vec::new(),
         })),
     )]);
     let mut transport = CheckpointTransport {
@@ -1687,6 +1692,7 @@ fn snapshot_runner_does_not_treat_historical_replay_as_checkpoint_advance() {
                 proposed_next_cursor: cursor_a.into(),
                 collected_at_ms: 1_787_511_100_000,
                 complete: false,
+                notes: Vec::new(),
             })),
         ),
         (
@@ -1696,6 +1702,7 @@ fn snapshot_runner_does_not_treat_historical_replay_as_checkpoint_advance() {
                 proposed_next_cursor: cursor_b.into(),
                 collected_at_ms: 1_787_511_160_000,
                 complete: false,
+                notes: Vec::new(),
             })),
         ),
     ]);
@@ -1743,6 +1750,7 @@ fn snapshot_runner_does_not_treat_historical_replay_as_checkpoint_advance() {
             proposed_next_cursor: cursor_b.into(),
             collected_at_ms: 1_787_511_160_000,
             complete: true,
+            notes: Vec::new(),
         })),
     )]);
     assert_eq!(
@@ -1835,6 +1843,7 @@ fn snapshot_runner_fails_closed_for_open_foreign_and_invalid_progress() {
             proposed_next_cursor: "ghp_not-a-checkpoint".into(),
             collected_at_ms: 1_787_511_100_000,
             complete: false,
+            notes: Vec::new(),
         })),
     )]);
     assert_eq!(

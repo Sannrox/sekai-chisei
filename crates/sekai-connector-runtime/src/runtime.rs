@@ -16,8 +16,11 @@ use std::time::Duration;
 use sekai_client::claim::{
     ClaimAttempt, RuntimeClaimClient, RuntimeClaimError, WorkFence, WorkKind,
 };
-use sekai_client::protocol::sekai::{SourceSyncWork, ack_work_response, claim_work_response};
+use sekai_client::protocol::sekai::{
+    SourceSyncWork, ack_work_request, ack_work_response, claim_work_response,
+};
 use sekai_client::{ClientConfig, CoreLoopClient, GrpcTransport, SdkError};
+use sekai_source_sdk::SyncNotes;
 
 use crate::credentials::CredentialBindings;
 use crate::sync::{Connectors, SyncFailure, prepare};
@@ -167,8 +170,9 @@ impl Runtime {
     }
 
     /// Runs a claimed sync, heartbeating while it runs, and acknowledges
-    /// its outcome. A failure is acknowledged once; the plane does not hand
-    /// the Source out again before its next interval.
+    /// its outcome with the notes its pages carried. A failure is
+    /// acknowledged once; the plane does not hand the Source out again
+    /// before its next interval.
     pub async fn run(&self, index: usize, work: SourceSyncWork) -> Result<Ran, RuntimeClaimError> {
         let claims = self.clients[index].runtime_claim();
         let source = work.source.unwrap_or_default();
@@ -180,11 +184,16 @@ impl Runtime {
             generation: work.claim_generation,
             fencing_token: work.fencing_token,
         };
+        let mut notes = SyncNotes::default();
         let outcome = match prepare(&source, &self.bindings) {
             Err(failure) => Err(failure),
             Ok(prepared) => {
                 match self
-                    .heartbeated(&claims, &fence, self.sync(index, &source, prepared))
+                    .heartbeated(
+                        &claims,
+                        &fence,
+                        self.sync(index, &source, prepared, &mut notes),
+                    )
                     .await
                 {
                     Some(outcome) => outcome,
@@ -196,7 +205,11 @@ impl Runtime {
             Ok(()) => ("completed", String::new()),
             Err(failure) => ("failed", failure.wire_name().to_string()),
         };
-        match claims.ack_work(&fence, status, reason, None).await {
+        let acked = ack_with_notes(&notes, |options| {
+            claims.ack_work(&fence, status, reason.clone(), options)
+        })
+        .await;
+        match acked {
             Ok(ack_work_response::Payload::SourceSync(_)) | Ok(_) => {
                 Ok(Ran::Finished { source_id, outcome })
             }
@@ -303,6 +316,31 @@ impl Runtime {
     }
 }
 
+/// Acknowledges a source sync through `ack`, with `notes` when there are
+/// any. A plane that predates notes refuses options on this kind as
+/// `INVALID_ARGUMENT`, so the acknowledgement goes again without them: the
+/// outcome is kept and only the notes are lost, visibly in the log.
+async fn ack_with_notes<F, Fut>(
+    notes: &SyncNotes,
+    ack: F,
+) -> Result<ack_work_response::Payload, RuntimeClaimError>
+where
+    F: Fn(Option<ack_work_request::Options>) -> Fut,
+    Fut: Future<Output = Result<ack_work_response::Payload, RuntimeClaimError>>,
+{
+    if notes.is_empty() {
+        return ack(None).await;
+    }
+    let options = ack_work_request::Options::SourceSyncNotes(crate::pages::notes_to_proto(notes));
+    match ack(Some(options)).await {
+        Err(RuntimeClaimError::Invalid(_)) => {
+            eprintln!("the plane refused source sync notes; acknowledged without them");
+            ack(None).await
+        }
+        acked => acked,
+    }
+}
+
 /// The shortest timer period; `tokio::time::interval` panics on zero.
 const MIN_PERIOD: Duration = Duration::from_millis(1);
 
@@ -312,8 +350,60 @@ fn heartbeat_period(lease: Duration) -> Duration {
 }
 
 #[cfg(test)]
-mod period_tests {
+mod tests {
     use super::*;
+    use sekai_client::SdkErrorCode;
+    use sekai_source_sdk::{SkipReason, SyncNote};
+    use std::sync::Mutex;
+
+    fn acknowledged() -> ack_work_response::Payload {
+        ack_work_response::Payload::SourceSync(Default::default())
+    }
+
+    /// Acknowledges as a plane would that refuses any options, recording
+    /// what each attempt sent.
+    async fn ack_on_older_plane(
+        notes: &SyncNotes,
+    ) -> (
+        Result<ack_work_response::Payload, RuntimeClaimError>,
+        Vec<bool>,
+    ) {
+        let sent = Mutex::new(Vec::new());
+        let acked = ack_with_notes(notes, |options| {
+            let with_notes = options.is_some();
+            sent.lock().unwrap().push(with_notes);
+            async move {
+                if with_notes {
+                    Err(RuntimeClaimError::Invalid(SdkError::new(
+                        SdkErrorCode::InvalidArgument,
+                    )))
+                } else {
+                    Ok(acknowledged())
+                }
+            }
+        })
+        .await;
+        (acked, sent.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_older_plane_gets_the_outcome_without_the_notes() {
+        let mut notes = SyncNotes::default();
+        notes
+            .push(SyncNote::SkippedRecord {
+                partition: 0,
+                offset: 7,
+                reason: SkipReason::MissingId,
+            })
+            .unwrap();
+        let (acked, sent) = ack_on_older_plane(&notes).await;
+        assert_eq!(acked.unwrap(), acknowledged());
+        assert_eq!(sent, [true, false]);
+        // No notes, no options: an older plane accepts the first attempt.
+        let (acked, sent) = ack_on_older_plane(&SyncNotes::default()).await;
+        assert_eq!(acked.unwrap(), acknowledged());
+        assert_eq!(sent, [false]);
+    }
 
     #[test]
     fn a_tiny_lease_still_gets_a_nonzero_heartbeat_period() {
